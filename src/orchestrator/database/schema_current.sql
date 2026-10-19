@@ -14303,6 +14303,32 @@ $$;
 
 
 --
+-- Name: pinned_canonical_virtual_binding(jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_canonical_virtual_binding(binding jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $_$
+    SELECT CASE
+        WHEN jsonb_typeof(binding) IS DISTINCT FROM 'object' THEN false
+        ELSE COALESCE(
+            binding ?& ARRAY['generation', 'kind', 'backing_id', 'ssh_host_key_fingerprint']
+            AND binding - ARRAY['generation', 'kind', 'backing_id', 'ssh_host_key_fingerprint']
+                = '{}'::jsonb
+            AND binding->'kind' = '"virtual"'::jsonb
+            AND jsonb_typeof(binding->'backing_id') = 'string'
+            AND binding->>'backing_id' ~ '^rclone:[0-9a-f]{64}$'
+            AND jsonb_typeof(binding->'generation') = 'string'
+            AND binding->>'generation'
+                ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            AND binding->'ssh_host_key_fingerprint' = 'null'::jsonb,
+            false
+        )
+    END
+$_$;
+
+
+--
 -- Name: thread_agent_warm_binding_protections; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -14931,7 +14957,12 @@ BEGIN
             ELSE 'external_none_v1'
         END;
     ELSIF backend IN ('vm', 'remote') THEN
-        IF workspace_evidence OR binding_evidence THEN
+        -- A Session upgraded from the virtual tier keeps the binding of its
+        -- old object-store files. Nothing runs behind it; the VM teardown is
+        -- still the whole cleanup.
+        IF workspace_evidence OR (binding_evidence AND NOT (
+            backend = 'vm' AND public.pinned_canonical_virtual_binding(binding)
+        )) THEN
             RETURN NULL;
         END IF;
         workspace_protocol := CASE
@@ -15286,7 +15317,9 @@ BEGIN
        OR NULLIF(vm->>'vm_uid','') IS NULL
        OR (vm->>'_runtime_incarnation' IS NOT NULL AND vm->>'_runtime_incarnation' IS DISTINCT FROM vm->>'vm_uid')
        OR (owner_row.runtime_retirement_permanent AND NULLIF(vm->>'rootdisk_pvc_uid','') IS NULL)
-       OR COALESCE(context->'workspace_binding','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+       OR (COALESCE(context->'workspace_binding','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+           AND NOT (context->>'workspace_backend' = 'vm'
+                    AND public.pinned_canonical_virtual_binding(context->'workspace_binding')))
        OR COALESCE(context->'workspace_provision_intent','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
        OR public.pinned_retirement_external_cleanup_expected(context, owner_row.runtime_generation,
             owner_row.runtime_retirement_token)->>'workspace_cleanup_protocol' IS DISTINCT FROM 'workspace_actuator_zero_v1'

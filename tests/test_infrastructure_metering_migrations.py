@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0555_validate_thread_permission_mode_read_only.sql"
+    / "src/orchestrator/database/migrations/app/0556_vm_end_accepts_upgrade_virtual_binding.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

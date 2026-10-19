@@ -134,6 +134,7 @@ from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedJobRecipient, PinnedSessionBinding
 from shared.pinned_workspace_evidence import (
+    canonical_virtual_binding,
     has_pinned_physical_workspace_evidence,
     never_published_workspace_create,
     soft_fenced_workspace,
@@ -2830,7 +2831,11 @@ def _pinned_retirement_external_cleanup_expected(
             "sandbox_actuator_zero_v1" if sandbox_evidence else "external_none_v1"
         )
     elif backend in {"vm", "remote"}:
-        if sandbox_evidence:
+        # A Session upgraded from the virtual tier before the VM install dropped
+        # its binding (E3) captured the binding of its old object-store files;
+        # nothing runs behind it. 0556 accepts the same in SQL.
+        upgrade_left_binding = backend == "vm" and canonical_virtual_binding(binding)
+        if workspace_physical_evidence or (binding and not upgrade_left_binding):
             return False, None
         workspace_protocol = (
             "workspace_actuator_zero_v1" if vm_evidence else "external_none_v1"
@@ -26829,6 +26834,13 @@ class PostgresDB:
                     workspace.pop("remote", None)
                     config_override["workspace"] = workspace
                     metadata["config_override"] = config_override
+                    # The virtual tier's binding names only the old object-store
+                    # files, and neither End nor an attach takes it next to a VM
+                    # (E3). The seed doesn't need it: the bound agent copies with
+                    # the mounts it holds, and a new agent of a C2 lane switch
+                    # reads the copy in metadata.vm.upgrade_seed.
+                    if canonical_virtual_binding(metadata.get("_workspace_binding")):
+                        metadata.pop("_workspace_binding")
 
                 next_vm = {**(current_vm or {}), **proposed}
                 metadata["vm"] = next_vm

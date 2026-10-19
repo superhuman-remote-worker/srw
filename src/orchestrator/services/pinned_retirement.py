@@ -36,6 +36,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     complete_vm_cleanup_permit,
 )
 from shared.pinned_workspace_evidence import (
+    canonical_virtual_binding,
     has_pinned_physical_workspace_evidence,
     never_published_workspace_create,
     soft_fenced_workspace,
@@ -1879,30 +1880,11 @@ class PinnedRetirementOperations:
 
         if str(context.get("workspace_backend") or "") != "virtual":
             return False
-        raw_generation = str(binding.get("generation") or "")
-        try:
-            canonical_generation = str(UUID(raw_generation))
-        except (TypeError, ValueError):
-            return False
         return bool(
             not workspace
             and context.get("vm") in (None, {})
             and context.get("workspace_provision_intent") in (None, {})
-            and set(binding)
-            == {
-                "generation",
-                "kind",
-                "backing_id",
-                "ssh_host_key_fingerprint",
-            }
-            and binding.get("kind") == "virtual"
-            and re.fullmatch(
-                r"rclone:[0-9a-f]{64}",
-                str(binding.get("backing_id") or ""),
-            )
-            is not None
-            and canonical_generation == raw_generation
-            and binding.get("ssh_host_key_fingerprint") is None
+            and canonical_virtual_binding(binding)
         )
 
     def _captured_lite_backend_agent_zero_only(
@@ -1942,17 +1924,22 @@ class PinnedRetirementOperations:
         """
         from orchestrator.services.vm_provisioner import VMTeardownIdentity
 
-        if str(context.get("workspace_backend") or "") not in {"vm", "remote"}:
+        backend = str(context.get("workspace_backend") or "")
+        if backend not in {"vm", "remote"}:
             return None
         vm = context.get("vm")
         workspace = context.get("workspace_container")
         binding = context.get("workspace_binding")
         provision_intent = context.get("workspace_provision_intent")
+        # A Session upgraded from the virtual tier before the VM install
+        # dropped its binding (E3) captured it here. It names only the old
+        # object-store files: the VM teardown is still the whole cleanup.
+        upgrade_left_binding = backend == "vm" and canonical_virtual_binding(binding)
         if (
             not isinstance(vm, Mapping)
             or not isinstance(workspace, (Mapping, type(None)))
             or has_pinned_physical_workspace_evidence(workspace or {})
-            or binding not in (None, {})
+            or (binding not in (None, {}) and not upgrade_left_binding)
             or provision_intent not in (None, {})
         ):
             return None
