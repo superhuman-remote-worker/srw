@@ -96,10 +96,20 @@ WHERE (
 """
 
 _ADOPT_PINNED_SQL = """
-WITH oldest AS MATERIALIZED (
+WITH owner AS MATERIALIZED (
+    -- End's retirement Begin holds this row FOR UPDATE while it passes an
+    -- upgrade request no agent took. Waiting here and re-reading the token
+    -- once it commits keeps an adoption from following that decision.
+    SELECT thread.id
+    FROM threads thread
+    WHERE thread.id = $1::uuid
+      AND thread.runtime_retirement_token IS NULL
+    FOR KEY SHARE
+), oldest AS MATERIALIZED (
     SELECT request.id
     FROM thread_control_requests request
     WHERE request.thread_id = $1::uuid
+      AND request.thread_id IN (SELECT owner.id FROM owner)
       AND request.outcome IS NULL
       AND request.runtime_generation = $3::uuid
     ORDER BY request.request_seq

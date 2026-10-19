@@ -43227,22 +43227,31 @@ class PostgresDB:
                 # row serializes this proof with public control admission.
                 # One exception (C2, spec D3): a stateless -> VM lane switch
                 # leaves its upgrade request pending for the first pinned
-                # owner.  With no owner bound there is no consumer to strand,
-                # so End settles past it; Resume (0185) re-stamps it and the
-                # next owner rejects its older payload generation as
-                # ``upgrade_cancelled``.  Suspend still waits: skipping there
-                # would cancel the upgrade on Resume.
+                # owner.  With no owner bound, or a bound owner that never
+                # took the request (no adoption, no receipt: its attach can
+                # fail first), there is no consumer to strand, so End settles
+                # past it; Resume (0185) re-stamps it and the next owner
+                # rejects its older payload generation as
+                # ``upgrade_cancelled``.  Adoption re-checks the retirement
+                # token under this row lock, so none can follow this token.
+                # Suspend still waits: skipping there would cancel the
+                # upgrade on Resume.
                 from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
 
                 if await conn.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                    "WHERE thread_id=$1::uuid AND outcome IS NULL "
-                    "AND runtime_generation=$2::uuid "
-                    "AND NOT ($3::boolean AND verb=$4))",
+                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests r "
+                    "WHERE r.thread_id=$1::uuid AND r.outcome IS NULL "
+                    "AND r.runtime_generation=$2::uuid "
+                    "AND NOT ($3::boolean AND r.verb=$4 AND ($5::boolean "
+                    "OR (r.accepted_agent_id IS NULL AND NOT EXISTS ("
+                    "SELECT 1 FROM thread_events receipt "
+                    "WHERE receipt.thread_id=r.thread_id "
+                    "AND receipt.control_request_id=r.id)))))",
                     parsed_thread_id,
                     UUID(generation),
-                    settle_status == "ended" and thread.get("agent_id") is None,
+                    settle_status == "ended",
                     WORKSPACE_UPGRADE_VERB,
+                    thread.get("agent_id") is None,
                 ):
                     return {
                         "state": "conflict",

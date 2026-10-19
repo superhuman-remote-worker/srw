@@ -6,6 +6,7 @@ stay unedited and run as regression neighbours. Fixtures are C1's.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -1138,12 +1139,117 @@ async def assert_end_refused(database, monkeypatch, thread_id, **options):
 
 
 @pytest.mark.asyncio
-async def test_end_still_waits_for_a_bound_agent_to_take_the_upgrade_request(
+async def test_end_passes_an_upgrade_request_the_bound_agent_never_took(
+    database, actor
+):
+    """Dev 2026-10-18 (E2): the warm agent's attach failed before it adopted
+    the request, and End refused while that agent stayed bound. A request no
+    agent took has no consumer to strand: End passes it and leaves it pending
+    for the next owner to cancel, as with no agent bound."""
+    thread_id, admitted = await switched(database, actor)
+    await _bind_cold_agent(database, thread_id)
+
+    begun = await database.begin_pinned_thread_retirement(
+        str(thread_id), permanent=False
+    )
+
+    assert begun["state"] == "pending"
+    assert (await database.get_thread(thread_id))["runtime_retirement_token"]
+    [request] = await upgrade_requests(database, thread_id)
+    assert (request["id"], request["outcome"], request["accepted_agent_id"]) == (
+        admitted.id,
+        None,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_end_starts_retiring_a_session_whose_agent_never_took_the_upgrade(
+    database, actor, monkeypatch
+):
+    """The dev wedge's way out: the owner's forced End is admitted and the
+    pinned retirement takes over the bound agent."""
+    thread_id, _ = await switched(database, actor)
+    await _bind_cold_agent(database, thread_id)
+
+    result = await end_session(database, monkeypatch, thread_id, force=True)
+
+    assert result["status"] == "ending"
+    assert (await database.get_thread(thread_id))["runtime_retirement_token"]
+
+
+@pytest.mark.asyncio
+async def test_end_still_waits_for_an_upgrade_request_the_bound_agent_took(
     database, actor, monkeypatch
 ):
     thread_id, _ = await switched(database, actor)
-    await _bind_cold_agent(database, thread_id)
+    bound = await _bind_cold_agent(database, thread_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            assert await adopt_next_pinned_control_request(conn, **_owner(bound))
     await assert_end_refused(database, monkeypatch, thread_id, force=True)
+
+
+@pytest.mark.asyncio
+async def test_suspend_still_waits_for_an_upgrade_request_no_agent_took(
+    database, actor
+):
+    """Skipping on Suspend would cancel the upgrade on Resume (spec D3)."""
+    thread_id, _ = await switched(database, actor)
+    await _bind_cold_agent(database, thread_id)
+
+    begun = await database.begin_pinned_thread_retirement(
+        str(thread_id), permanent=False, settle_status="suspended"
+    )
+
+    assert begun == {"state": "conflict", "reason": "pending_control_requests"}
+
+
+async def _wait_for_lock_waiters(database, count):
+    for _ in range(200):
+        waiting = await database.fetchval(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+        )
+        if waiting >= count:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"expected {count} lock waiter(s)")
+
+
+@pytest.mark.asyncio
+async def test_an_adoption_queued_behind_end_finds_the_session_retiring(
+    database, actor
+):
+    """End passes the request because no agent took it, so no agent may take
+    it once End has its token: the adoption waits for End's row lock and then
+    sees the retirement."""
+    thread_id, admitted = await switched(database, actor)
+    bound = await _bind_cold_agent(database, thread_id)
+
+    async def adopt():
+        async with database.acquire() as conn:
+            async with conn.transaction():
+                return await adopt_next_pinned_control_request(conn, **_owner(bound))
+
+    async with database.acquire() as holder:
+        hold = holder.transaction()
+        await hold.start()
+        await holder.execute(
+            "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE", thread_id
+        )
+        begin = asyncio.create_task(
+            database.begin_pinned_thread_retirement(str(thread_id), permanent=False)
+        )
+        await _wait_for_lock_waiters(database, 1)
+        adoption = asyncio.create_task(adopt())
+        await asyncio.sleep(0.5)
+        await hold.rollback()
+
+    assert (await begin)["state"] == "pending"
+    assert await adoption is False
+    [request] = await upgrade_requests(database, thread_id)
+    assert (request["id"], request["accepted_agent_id"]) == (admitted.id, None)
 
 
 @pytest.mark.asyncio
