@@ -2339,6 +2339,7 @@
       "approveAll": "Approve all",
       "autoAccept": "Auto-accept",
       "autoAcceptHint": "Approves these calls and switches to Auto-accept. Workspace file changes then run without asking; commands and irreversible or outbound actions still ask.",
+      "childRunsUnattended": "The subagent then runs its own tools without asking, including commands and outbound actions.",
       "stop": "Stop"
     },
     "control": {

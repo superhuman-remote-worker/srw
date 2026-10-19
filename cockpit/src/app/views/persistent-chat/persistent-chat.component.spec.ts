@@ -13,6 +13,7 @@ import {
     filterRewindCandidates,
     formatPermissionArgs,
     permissionApproveKey,
+    permissionNoteKey,
     permissionTitleKey,
     formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
@@ -487,6 +488,18 @@ describe('permissionApproveKey', () => {
     it('says "Approve all" once there is a batch to approve', () => {
         expect(permissionApproveKey(2)).toBe('chat.permission.approveAll');
         expect(permissionApproveKey(4)).toBe('chat.permission.approveAll');
+    });
+});
+
+describe('permissionNoteKey', () => {
+    it('warns that an approved subagent runs unattended', () => {
+        expect(permissionNoteKey('delegate_agent')).toBe('chat.permission.childRunsUnattended');
+        expect(permissionNoteKey('message_agent')).toBe('chat.permission.childRunsUnattended');
+    });
+
+    it('adds nothing for any other tool', () => {
+        expect(permissionNoteKey('write_file')).toBeNull();
+        expect(permissionNoteKey('run_command')).toBeNull();
     });
 });
 

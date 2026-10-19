@@ -66,7 +66,7 @@ class TestPermissionCheckOutcomeMapping:
             ),
             patch.object(pa, "_broadcast", MagicMock()),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_1")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_1")
 
         assert outcome is PermissionOutcome.NO_ANSWER
         # Audit must keep the distinction too.
@@ -94,7 +94,7 @@ class TestPermissionCheckOutcomeMapping:
             ),
             patch.object(pa, "_broadcast", broadcast),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_9")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_9")
 
         assert outcome is PermissionOutcome.NO_ANSWER
         # Audit distinguishes an infrastructure failure from a user's refusal
@@ -120,7 +120,7 @@ class TestPermissionCheckOutcomeMapping:
             ),
             patch.object(pa, "_broadcast", MagicMock()),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_2")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_2")
 
         assert outcome is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc_2"] == "denied"
@@ -142,7 +142,7 @@ class TestPermissionCheckOutcomeMapping:
             ),
             patch.object(pa, "_broadcast", MagicMock()),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_3")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_3")
 
         assert outcome is PermissionOutcome.APPROVED
 
@@ -183,7 +183,7 @@ class TestPermissionCheckOutcomeMapping:
         """A gone session can't ever be answered — that's a real stop, not a
         pending question, so it must not park the turn forever."""
         with patch.object(pa, "_session", None):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_5")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_5")
         assert outcome is PermissionOutcome.DECLINED
 
     @pytest.mark.asyncio
@@ -198,7 +198,7 @@ class TestPermissionCheckOutcomeMapping:
                 pa, "_insert_permission_request", AsyncMock(return_value=None)
             ),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_6")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_6")
 
         assert outcome is PermissionOutcome.DECLINED
 
@@ -673,7 +673,7 @@ class TestPendingGatesResurfaceOnAttach:
         row = {
             "id": "req-9",
             "tool_call_id": "tc_9",
-            "tool_name": "web_search",
+            "tool_name": "write_file",
             "tool_args": '{"query": "capital of Japan"}',
         }
 
@@ -696,7 +696,7 @@ class TestPendingGatesResurfaceOnAttach:
         assert len(pending) == 1
         assert pending[0]["id"] == "tc_9"
         assert pending[0]["approval_id"] == "req-9"
-        assert pending[0]["tool"] == "web_search"
+        assert pending[0]["tool"] == "write_file"
         # args are decoded for the client, not handed over as a raw JSON blob
         assert pending[0]["args"] == {"query": "capital of Japan"}
 

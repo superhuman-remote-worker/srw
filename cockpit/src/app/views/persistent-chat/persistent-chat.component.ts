@@ -589,6 +589,15 @@ export function permissionApproveKey(count: number): string {
     return count === 1 ? 'chat.permission.approve' : 'chat.permission.approveAll';
 }
 
+/** Tools whose approval starts a subagent that then asks for nothing
+ *  (tool_permission_tiers.md, D10): the card says so. */
+const UNATTENDED_CHILD_TOOLS = new Set(['delegate_agent', 'message_agent']);
+
+/** A one-line note under an approval row, or null for none. */
+export function permissionNoteKey(tool: string): string | null {
+    return UNATTENDED_CHILD_TOOLS.has(tool) ? 'chat.permission.childRunsUnattended' : null;
+}
+
 /** The workspace-upgrade card to render, or null when there's nothing to show. */
 export type WorkspaceOfferCard =
     | {state: 'provisioning'; tier: string; elapsed?: number; willContinue: boolean}
@@ -1961,6 +1970,9 @@ export function clearDraft(threadId: string | null): void {
                   <code class="permission-tool">{{ perm.tool }}</code>
                   <code class="permission-args">{{ permissionArgs(perm) }}</code>
                 </li>
+                @if (permissionNoteKey(perm.tool); as noteKey) {
+                  <li class="permission-note">{{ noteKey | transloco }}</li>
+                }
               }
             </ul>
             <div class="mile-actions">
@@ -4891,6 +4903,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Template bridges to the pure key-pickers (see their definitions). */
     permissionTitleKey = permissionTitleKey;
     permissionApproveKey = permissionApproveKey;
+    permissionNoteKey = permissionNoteKey;
 
     permissionArgs(perm: PermissionRequest): string {
         return formatPermissionArgs(perm.args);

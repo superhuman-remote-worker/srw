@@ -2339,6 +2339,7 @@
       "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
       "autoAcceptHint": "Genehmigt diese Aufrufe und wechselt zu Auto-akzeptieren. Änderungen an Workspace-Dateien laufen danach ohne Rückfrage; Befehle sowie unumkehrbare oder nach außen gerichtete Aktionen fragen weiterhin nach.",
+      "childRunsUnattended": "Der Subagent führt danach seine eigenen Werkzeuge ohne Rückfrage aus, auch Befehle und Aktionen nach außen.",
       "stop": "Stoppen"
     },
     "control": {

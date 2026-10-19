@@ -126,9 +126,11 @@ from shared import event_journal as _event_journal
 from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
 from shared.permission_modes import (
     DEFAULT_PERMISSION_MODE,
+    effect_asks,
     is_permission_mode,
     normalize_permission_mode,
 )
+from shared.tool_catalog import tool_effect
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
@@ -6219,20 +6221,18 @@ async def _insert_permission_request(
         return None
 
 
-_SHELL_TOOLS = {"run_command", "shell_execute", "shell_read"}
-
-
 def _gate_needed(mode: str, tool_name: str) -> bool:
     """Whether this call would actually hit a permission gate.
 
-    Mirrors the early-returns in ``_loop_permission_check`` so the announce
-    never creates a row for a call that auto-approves.
+    The one decision the batch announce, the mid-batch sweep and
+    ``_loop_permission_check`` all use, so the announce never creates a row
+    for a call that runs freely and a gated call always has one. The tool's
+    declared effect decides (knowledge-base/knowledge/features/
+    tool_permission_tiers.md, D8): read_only runs reads and bookkeeping,
+    auto_accept also runs workspace writes, autonomous runs everything. An
+    undeclared tool counts as external and an unknown mode asks for all.
     """
-    if mode == "autonomous":
-        return False
-    if mode == "auto_accept":
-        return tool_name in _SHELL_TOOLS
-    return True
+    return effect_asks(mode, tool_effect(tool_name))
 
 
 async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
@@ -6300,8 +6300,9 @@ _active_permission_request_id: Optional[str] = None
 # claim SELECT until the gate returns. `_active_permission_request_id` cannot
 # cover that whole span: the row id is not known until after the awaited
 # SELECT, and `async with pool.acquire()` exits through a yield point. A
-# fire-and-forget `mode.set` sweep landing in that window would CAS-expire the
-# very row the gate is about to wait on, and the waiter's re-SELECT would read
+# concurrent sweep (session termination, or another gate's mode-scoped sweep)
+# landing in that window would CAS-expire the very row the gate is about to
+# wait on, and the waiter's re-SELECT would read
 # 'expired' -> NO_ANSWER — parking the turn the user had just unblocked. The
 # reservation is keyed on tool_call_id, which IS known up front.
 _gates_in_flight: Set[str] = set()
@@ -6908,7 +6909,7 @@ async def _resolve_pending_permission(
 async def _loop_permission_check(
     tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
 ) -> PermissionOutcome:
-    """Resolve a supervised gate. INSERTs a pending row and waits for the DB
+    """Resolve a permission gate. INSERTs a pending row and waits for the DB
     status to flip via short-acquisition polling.
 
     Returns a THREE-state outcome, because a gate is a question to the user:
@@ -6940,34 +6941,27 @@ async def _loop_permission_check(
 
     mode = _session.permission_mode
 
-    # A mid-batch mode downgrade takes these early exits *before* the claim
-    # block below, so this call's announced row — and every later one the new
-    # mode auto-approves — would never be retired by anyone. Sweep them here,
-    # scoped by the new mode so a shell call still gating under auto_accept
-    # keeps the row its own gate is about to claim.
-    if mode == "autonomous":
-        await _retire_announced_permission_rows("mode downgraded to autonomous", mode)
+    # A call the mode runs freely takes this exit *before* the claim block
+    # below. After a mid-batch mode change its own announced row — and every
+    # later one the new mode runs freely — would never be retired by anyone,
+    # so sweep them here, scoped by the mode so a call that still gates keeps
+    # the row its own gate is about to claim. Without announced rows the sweep
+    # returns at once, so a read in read_only costs nothing.
+    if not _gate_needed(mode, tool_name):
+        await _retire_announced_permission_rows(
+            f"mode {mode} runs the call without asking", mode
+        )
         return PermissionOutcome.APPROVED
-
-    if mode == "auto_accept":
-        # Auto-accept reads and writes; still ask for shell commands. Reads
-        # the shared _SHELL_TOOLS constant (not a local copy) so this stays
-        # in lockstep with _gate_needed — two independently-maintained sets
-        # could silently drift and leave a gated call with no announced row.
-        if tool_name not in _SHELL_TOOLS:
-            await _retire_announced_permission_rows(
-                "mode downgraded to auto_accept", mode
-            )
-            return PermissionOutcome.APPROVED
 
     # Reserve this gate BEFORE the claim SELECT. `async with pool.acquire()`
     # exits through a yield point and the row id is not known until after the
     # awaited SELECT, so `_active_permission_request_id` cannot cover the gap:
-    # a fire-and-forget mode.set sweep landing there would CAS-expire the very
-    # row this gate is about to wait on, and the waiter's re-SELECT would read
+    # a concurrent sweep (session termination, or another gate's mode-scoped
+    # sweep) landing there would CAS-expire the very row this gate is about to
+    # wait on, and the waiter's re-SELECT would read
     # 'expired' -> NO_ANSWER, parking the turn the user had just unblocked. The
     # tool_call_id IS known up front. Nothing may await between the add and the
-    # try, and the finally must cover EVERY exit below — including the two
+    # try, and the finally must cover EVERY exit below — including the
     # early returns — or the reservation strands a row no sweep will touch.
     _gates_in_flight.add(tool_call_id)
     try:
@@ -7080,9 +7074,9 @@ async def _loop_permission_check(
                     name="phase5-flip-awaiting-user-sudo",
                 )
 
-        # Publish the row we are blocked on so a concurrent sweep (mode.set from
-        # the WS task) can't expire it under us and turn a live question into a
-        # parked turn.
+        # Publish the row we are blocked on so a concurrent sweep (another
+        # gate's mode-scoped sweep, session termination) can't expire it under
+        # us and turn a live question into a parked turn.
         global _active_permission_request_id
         _active_permission_request_id = request_id
         try:

@@ -4511,38 +4511,6 @@ async def test_ambiguous_begin_never_reopens_without_exact_proof(lifecycle_mode)
 
 
 # ---------------------------------------------------------------------------
-# 3.10 permission_check() logic (tested via closure behavior)
-# ---------------------------------------------------------------------------
-
-
-class TestPermissionCheck:
-    """Tests the permission_check closure behavior.
-
-    Since permission_check is a local function inside ws_chat, we test
-    the logic patterns directly.
-    """
-
-    def test_autonomous_returns_true_immediately(self):
-        """In autonomous mode, all tools approved without WS event."""
-        # Simulate the logic
-        mode = "autonomous"
-        assert mode == "autonomous"  # would return True
-
-    def test_auto_accept_approves_non_shell_tools(self):
-        """auto_accept approves any tool not in shell set."""
-        shell_tools = {"run_command", "shell_execute", "shell_read"}
-        assert "web_search" not in shell_tools
-        assert "read_file" not in shell_tools
-
-    def test_auto_accept_asks_for_shell_tools(self):
-        """auto_accept falls through for shell tools."""
-        shell_tools = {"run_command", "shell_execute", "shell_read"}
-        assert "run_command" in shell_tools
-        assert "shell_execute" in shell_tools
-        assert "shell_read" in shell_tools
-
-
-# ---------------------------------------------------------------------------
 # 3.11 on_tool_result truncation
 # ---------------------------------------------------------------------------
 
@@ -4640,16 +4608,6 @@ class TestWSMessageRouting:
         data = {"method": "message", "content": ""}
         content = data.get("content", "")
         assert not content  # would not be queued
-
-    def test_valid_modes(self):
-        """Valid mode set values."""
-        valid_modes = ("read_only", "auto_accept", "autonomous")
-        for mode in valid_modes:
-            assert mode in valid_modes
-
-    def test_invalid_mode_rejected(self):
-        """Invalid mode not in valid set."""
-        assert "invalid" not in ("read_only", "auto_accept", "autonomous")
 
 
 # ---------------------------------------------------------------------------
