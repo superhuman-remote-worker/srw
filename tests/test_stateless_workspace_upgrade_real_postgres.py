@@ -900,6 +900,58 @@ async def test_claims_before_ready_back_off_without_parking_the_upgrade(
         await claimant.bundle(await claim_now(database, case.thread_id))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handle", ["earlier_claim", "this_claim"])
+async def test_a_warm_replica_releases_its_pre_ready_claim(
+    database, actor, monkeypatch, handle
+):
+    """Dev 2026-10-18: on a replica that served the Session's lite turn, the
+    shared lease handle still names that turn's claim when the bundle answers
+    425, and the old session's fence has marked it lost. That loss is not this
+    claim's: skipping the release left the lease to expire, and the reaper's
+    steals parked the queue. Only a loss of this exact claim skips it."""
+    claimant = upgrade_claimant(database, monkeypatch, attach=LITE_ATTACH)
+    case = await upgraded_create(
+        database,
+        actor,
+        monkeypatch,
+        first_wait="not_ready",
+        earlier_turn=lambda thread_id: run_a_lite_turn(
+            database, thread_id, claimant=claimant
+        ),
+    )
+    claim = await claim_now(database, case.thread_id)
+    assert claim.lease_token == 2
+    lease = claimant.executor._lease
+    lease.update(
+        case.thread_id,
+        1 if handle == "earlier_claim" else claim.lease_token,
+        executor_id=CLAIMANT_POD,
+        pod_uid=CLAIMANT_POD_UID,
+    )
+    lease.mark_lost()
+    with pytest.raises(HTTPException) as refused:
+        await claimant.bundle(claim)
+    assert refused.value.status_code == 425
+
+    await claimant.executor._release(
+        claim, reason=f"bundle_{refused.value.status_code}"
+    )
+
+    if handle == "earlier_claim":
+        assert await queue_row(database, case.thread_id) == {
+            "state": "queued",
+            "lease_token": 2,
+            "leased_by": None,
+        }
+    else:
+        assert await queue_row(database, case.thread_id) == {
+            "state": "leased",
+            "lease_token": 2,
+            "leased_by": CLAIMANT_POD,
+        }
+
+
 from orchestrator.services.thread_retirement import end_thread_flow  # noqa: E402
 
 END_AUTHORITY_CHANGED = "Stateless retirement authority is malformed or changed"

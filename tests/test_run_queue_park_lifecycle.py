@@ -519,7 +519,13 @@ def executor(monkeypatch):
     monkeypatch.setattr(ex, "_quiesce_claim_before_transition", AsyncMock())
     monkeypatch.setattr(ex, "_ack_terminal_claim_loss", AsyncMock())
     monkeypatch.setattr(ex, "_clear_claim_tool_effect", MagicMock())
-    monkeypatch.setattr(ex, "_exact_claim_handle_lost", MagicMock(return_value=True))
+    # The shared handle names every claim these tests release: its loss is
+    # the claim's own (the warm-replica case is pinned on real PostgreSQL).
+    monkeypatch.setattr(
+        ex,
+        "_exact_claim_handle_lost",
+        MagicMock(side_effect=lambda _claim: ex._lease.lost.is_set()),
+    )
     return ex
 
 

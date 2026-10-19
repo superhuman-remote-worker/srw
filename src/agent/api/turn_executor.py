@@ -6060,7 +6060,12 @@ class StatelessTurnExecutor:
             reason=f"release_{reason}",
             claim=claim,
         )
-        if self._lease.lost.is_set():
+        # Only a loss of this exact claim skips the release. Before attach the
+        # shared handle still names the previous warm claim, whose old fence
+        # marks it lost once the queue moved on; skipping on that left this
+        # live lease to expire into a counted reaper steal. A claim that is
+        # really gone makes the token-guarded release a no-op.
+        if self._exact_claim_handle_lost(claim):
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s "
                 "skipped after local ownership loss",
@@ -6068,8 +6073,7 @@ class StatelessTurnExecutor:
                 claim.lease_token,
                 reason,
             )
-            if self._exact_claim_handle_lost(claim):
-                await self._ack_terminal_claim_loss(claim)
+            await self._ack_terminal_claim_loss(claim)
             return
 
         deterministic = _release_is_deterministic(reason)
