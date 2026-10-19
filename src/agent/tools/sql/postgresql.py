@@ -64,7 +64,10 @@ def create_postgresql_tools(context: ToolContext) -> List[Any]:
             with conn.cursor() as cur:
                 # Use a read-only transaction
                 cur.execute("SET TRANSACTION READ ONLY")
-                cur.execute(query)
+                # prepare=True sends the query over the extended protocol, which
+                # accepts one statement only. The simple protocol would run
+                # "COMMIT; DELETE ..." and write after the read-only transaction.
+                cur.execute(query, prepare=True)
 
                 if cur.description is None:
                     conn.rollback()
