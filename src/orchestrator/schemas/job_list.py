@@ -70,6 +70,15 @@ class PublicJobListItem(BaseModel):
     completion_outcome_kind: str | None
     origin: str
     config_name: str | None
+    expert_id: UUID | None = Field(
+        description="The account/global Expert the job ran; null for bundled experts."
+    )
+    expert_display_name: str | None = Field(
+        description=(
+            "That Expert's display name. Its jobs store config_name "
+            "'worker_base', so label the expert from this when it is set."
+        )
+    )
     assigned_agent_id: UUID | None
     user_id: UUID | None
     project_id: UUID | None

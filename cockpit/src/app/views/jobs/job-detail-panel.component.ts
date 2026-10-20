@@ -94,6 +94,21 @@ export function jobModelLabel(detail: Job | null): string | null {
   return typeof model === 'string' && model.trim() ? model.trim() : null;
 }
 
+/**
+ * What the panel names a job's expert by.
+ *
+ * A DB (account/global) expert's job stores `config_name: 'worker_base'` — the
+ * framework root, which tells a reader nothing — and identifies the expert
+ * only by id, so the list carries its display name. A bundled expert has no
+ * display name there and keeps its config name; older rows carry neither.
+ */
+export function jobExpertLabel(
+  job: Pick<JobSummary, 'config_name' | 'expert_display_name'>,
+): string | null {
+  const name = job.expert_display_name?.trim();
+  return name || job.config_name || null;
+}
+
 function safeParse(value: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(value);
@@ -306,7 +321,7 @@ export function failureReason(
         </div>
         <div class="fact">
           <span class="fact-label">{{ 'jobs.detail.expert' | transloco }}</span>
-          <span class="fact-value">{{ job().config_name || '—' }}</span>
+          <span class="fact-value">{{ expertLabel() || '—' }}</span>
         </div>
         <div class="fact">
           <span class="fact-label">{{ 'jobs.detail.model' | transloco }}</span>
@@ -1093,6 +1108,7 @@ export class JobDetailPanelComponent {
    */
   readonly subtreeJobCount = computed(() => this.data()?.usageSubtree?.job_count ?? 0);
   readonly modelLabel = computed(() => jobModelLabel(this.data()?.detail ?? null));
+  readonly expertLabel = computed(() => jobExpertLabel(this.job()));
 
   readonly durationLabel = computed(() =>
     formatDurationSeconds(this.data()?.progress?.elapsed_seconds),

@@ -4271,7 +4271,12 @@ class PostgresDB:
                 )
                 SELECT j.id, j.description, j.status,
                        j.completion_outcome_kind, j.origin,
-                       j.config_name, j.assigned_agent_id, j.user_id,
+                       j.config_name,
+                       -- A DB expert's job stores config_name='worker_base'
+                       -- (the framework root) and names the expert only by
+                       -- id, so the list carries the display name to label it.
+                       j.expert_id, ex.display_name AS expert_display_name,
+                       j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.exported_folder_handle,
@@ -4322,6 +4327,7 @@ class PostgresDB:
                   OR (j.parent_job_id = page.id
                       AND j.id IN (SELECT id FROM matched))
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN experts ex ON ex.id = j.expert_id
                 LEFT JOIN subtree_counts sc ON sc.root_id = j.id
                 LEFT JOIN LATERAL (
                     SELECT s.id FROM sudo_approval_requests s

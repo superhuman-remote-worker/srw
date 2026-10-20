@@ -47,6 +47,8 @@ def row(**fields):
         "completion_outcome_kind": None,
         "origin": "user",
         "config_name": None,
+        "expert_id": None,
+        "expert_display_name": None,
         "assigned_agent_id": None,
         "user_id": UUID(USER),
         "project_id": UUID(PROJECT),
