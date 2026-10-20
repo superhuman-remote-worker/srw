@@ -239,13 +239,48 @@ describe('phone sessions in lazy job detail', () => {
     component.toggleExpand('job-1');
     await vi.advanceTimersByTimeAsync(30_000);
     expect(getSessions).toHaveBeenCalledTimes(2);
-    expect(component.jobDetails()['job-1'].loading).toBe(true);
+    expect(component.jobDetails()['job-1'].loading).toBe(false);
+    expect(component.jobDetails()['job-1'].refreshing).toBe(true);
     expect(component.jobDetails()['job-1'].sessions).toEqual([liveSessionFixture()]);
     const ended = liveSessionFixture({status: 'ended'});
     pending.next({sessions: [ended]});
     pending.complete();
     expect(component.jobDetails()['job-1'].sessions).toEqual([ended]);
-    expect(component.jobDetails()['job-1'].loading).toBe(false);
+    expect(component.jobDetails()['job-1'].refreshing).toBe(false);
+  });
+
+  it('keeps the figures on screen while the 30s poll refreshes an open panel', async () => {
+    // Resetting to the first-load state swapped the figures for a spinner on
+    // every poll, which made the open panel blink and shift the rows below.
+    const detail = {id: 'job-1'} as never;
+    const usage = {job_count: 1, state: 'measured'} as never;
+    const pendingUsage = new Subject<never>();
+    const getJobUsage = vi.fn().mockReturnValueOnce(of(usage)).mockReturnValue(pendingUsage);
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('job-1', {status: 'processing'})]))),
+        getJob: vi.fn().mockReturnValue(of(detail)),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobUsage).toHaveBeenCalledTimes(2);
+    let state = component.jobDetails()['job-1'];
+    expect(state.loading).toBe(false);
+    expect(state.detail).toBe(detail);
+    expect(state.usage).toBe(usage);
+
+    // A source that fails on refresh keeps its last answer rather than
+    // dropping the figure to "unknown" until the next poll.
+    pendingUsage.next(null as never);
+    pendingUsage.complete();
+    state = component.jobDetails()['job-1'];
+    expect(state.usage).toBe(usage);
+    expect(state.refreshing).toBe(false);
+    expect(state.error).toBe(false);
   });
 
   it('refreshes sessions on completed jobs for post-call follow-ups and retains them on failed reads', async () => {
@@ -697,6 +732,38 @@ describe('JobListComponent — server-resolved tree', () => {
     // own + subtree again, not own alone.
     expect(getJobUsage).toHaveBeenCalledTimes(4);
     expect(getJobUsage).toHaveBeenLastCalledWith('root-1', true);
+  });
+
+  it('keeps the subtree figure on screen while a refresh re-asks for it', () => {
+    const subtree = {job_count: 3, state: 'measured'} as never;
+    const pendingSubtree = new Subject<never>();
+    const getJobUsage = vi
+      .fn()
+      .mockImplementation((_id: string, includeSubtree?: boolean) =>
+        includeSubtree ? pendingSubtree : of(null),
+      )
+      .mockReturnValueOnce(of(null))
+      .mockReturnValueOnce(of(subtree));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    component.loadSubtreeUsage('root-1');
+    component.refresh();
+    let state = component.jobDetails()['root-1'];
+    expect(state.loadingSubtree).toBe(false);
+    expect(state.usageSubtree).toBe(subtree);
+
+    pendingSubtree.next(null as never);
+    pendingSubtree.complete();
+    state = component.jobDetails()['root-1'];
+    expect(state.usageSubtree).toBe(subtree);
+    expect(state.subtreeAttempted).toBe(true);
   });
 
   it('refreshes nothing when no panel is open', () => {

@@ -37,7 +37,13 @@ export type UsageScope = 'job' | 'subtree';
 
 /** Everything the panel loads lazily for one job, plus its load state. */
 export interface JobDetailState {
+  /** The first load only: there is nothing to show yet, so the panel shows a spinner. */
   loading: boolean;
+  /**
+   * A refresh is in flight. The panel keeps rendering what it has — swapping
+   * the figures for a spinner every poll made an open panel blink.
+   */
+  refreshing?: boolean;
   /** Set only when every lazy call failed — a partial load still renders. */
   error: boolean;
   detail: Job | null;
