@@ -560,6 +560,109 @@ def test_srw_private_authority_and_tool_smuggling_are_rejected(fragment):
     assert fragment == before
 
 
+_DESK_GREETING = "Hello, this is the Example desk's AI assistant."
+_DESK_FACTS = "The Example desk is open Monday to Friday."
+
+
+async def _admit_expert(config, *, base="worker_base"):
+    """Admit a Job for a DB expert whose fragment is ``config`` on ``base``."""
+    db = SimpleNamespace(
+        get_user_settings=AsyncMock(return_value={"default_model": "gpt-4o"}),
+        resolve_default_for_capability=AsyncMock(return_value=None),
+        get_system_setting=AsyncMock(return_value={"value": {"enabled": False}}),
+        get_user=AsyncMock(return_value={"id": USER, "is_admin": False}),
+    )
+    return await snapshots.prepare_srw_snapshot(
+        db,
+        work_kind="Job",
+        work_id=WORK,
+        owner_id=USER,
+        project_ids=[],
+        config_name="worker_base",
+        expert_id=None,
+        expert_row={
+            "name": "example-desk",
+            "expert_type": "worker",
+            "harness_config_name": base,
+            "harness_asset_name": base if base != "worker_base" else None,
+            "config": config,
+            "prompts": {},
+        },
+        description="Answer the call",
+        config_override={"workspace": {"backend": "none"}},
+        datasource_ids=[],
+        policy_revisions={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_partial_override_of_an_inherited_live_entry_is_admitted():
+    """A DB expert on the receptionist overrides only the voice's greeting
+    and facts; it inherits `driver: live` (it was refused with 422
+    `subagents.roster.voice.live: requires driver: live`)."""
+    result = await _admit_expert(
+        {
+            "subagents": {
+                "roster": {
+                    "voice": {
+                        "live": {"greeting": _DESK_GREETING, "facts": _DESK_FACTS}
+                    }
+                }
+            }
+        },
+        base="receptionist",
+    )
+    blob, policy = snapshots.srw_snapshot_config(result)
+    voice = blob["agent"]["subagents"]["roster"]["voice"]
+    assert voice["driver"] == "live"
+    assert voice["live"]["greeting"] == _DESK_GREETING
+    assert voice["live"]["facts"] == _DESK_FACTS
+    assert voice["live"]["persona"].startswith("You are the receptionist")
+    assert policy["subagents"]["roster"]["voice"]["driver"] == "live"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "base", "message"),
+    [
+        # A live block on an entry that is not a live voice entry: each layer
+        # is well formed, the merged entry is not.
+        (
+            {
+                "subagents": {
+                    "roster": {
+                        "helper": {
+                            "description": "An LLM helper.",
+                            "live": {"greeting": _DESK_GREETING},
+                        }
+                    }
+                }
+            },
+            "worker_base",
+            "subagents.roster.helper.live: requires driver: live",
+        ),
+        (
+            {"subagents": {"roster": {"voice": {"driver": None}}}},
+            "receptionist",
+            "subagents.roster.voice.live: requires driver: live",
+        ),
+        # Refused by the authored-fragment gate already.
+        (
+            {"subagents": {"roster": {"voice": {"driver": "phone"}}}},
+            "receptionist",
+            "'phone' is not a driver",
+        ),
+    ],
+)
+async def test_a_roster_that_breaks_the_live_contract_is_refused_at_admission(
+    config, base, message
+):
+    with pytest.raises(HTTPException) as refused:
+        await _admit_expert(config, base=base)
+    assert refused.value.status_code == 422
+    assert message in str(refused.value.detail)
+
+
 @pytest.mark.asyncio
 async def test_saved_native_expert_uses_runner_visibility_too():
     db = SimpleNamespace(

@@ -236,6 +236,7 @@ async def prepare_srw_snapshot(
     )
     from shared.runtime.core.model_registry import resolve_model
     from shared.runtime.core.skill_resolution import filter_bound_skills
+    from shared.runtime.core.subagent_roster import RosterResolutionError
 
     if workspace_selection is not None:
         from orchestrator.services.manifest_workspace_selection import (
@@ -357,17 +358,23 @@ async def prepare_srw_snapshot(
         else None
     )
     capture: dict[str, Any] = {}
-    blob = resolve_config(
-        base_config_name=config_name,
-        base_defaults=defaults,
-        expert_row=expert,
-        project_overrides=project_override,
-        request_override=requested,
-        expert_type=role,
-        capture=capture,
-        skills=skills,
-        db_refs=refs,
-    )
+    try:
+        blob = resolve_config(
+            base_config_name=config_name,
+            base_defaults=defaults,
+            expert_row=expert,
+            project_overrides=project_override,
+            request_override=requested,
+            expert_type=role,
+            capture=capture,
+            skills=skills,
+            db_refs=refs,
+        )
+    except RosterResolutionError as exc:
+        # The fragments above passed one layer at a time; a merged roster
+        # entry that breaks the live voice contract is refused here (a
+        # `live` block on an entry that is not `driver: live`).
+        raise HTTPException(422, str(exc)) from exc
     filter_bound_skills(blob)
     policy = capture["merged_fragment"]
     if await user_experts_enabled(dependencies=deps):

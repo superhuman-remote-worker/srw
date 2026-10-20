@@ -122,6 +122,7 @@ async def resolve_live_voice(
     """The live voice of the job's expert, as dispatch will resolve it."""
     from orchestrator.services.config_resolver import resolve_config
     from shared.runtime.core.loader import canonical_config_name
+    from shared.runtime.core.subagent_roster import RosterResolutionError
 
     row = expert_row
     if row is None and expert_id:
@@ -137,6 +138,12 @@ async def resolve_live_voice(
             expert_type="worker",
             db_refs={},
         )
+    except RosterResolutionError as exc:
+        # An authoring error in the merged roster (a `live` block on an entry
+        # that is not `driver: live`): its message names the entry and the fix.
+        raise LiveVoiceError(
+            f"The expert's subagent roster is invalid: {exc}"
+        ) from None
     except Exception as exc:
         logger.warning("Live admission: the expert's config did not resolve (%s)", exc)
         raise LiveVoiceError(

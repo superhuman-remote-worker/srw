@@ -249,6 +249,23 @@ def test_validate_fragment_422s_an_unknown_ref():
         assert ei.value.status_code == 422, bad
 
 
+def test_validate_fragment_accepts_a_partial_override_of_an_inherited_live_entry():
+    """An expert extending the receptionist overrides only the voice's
+    greeting and facts; the entry inherits `driver: live`, so the save takes
+    it. A driver that is not `live` is still refused."""
+    voice = {"live": {"greeting": "Hello, an AI assistant.", "facts": "Open 9-5."}}
+    out = catalogue_service().validate_expert_fragment(
+        {"subagents": {"roster": {"voice": voice}}}
+    )
+    assert out["subagents"]["roster"]["voice"] == voice
+    with pytest.raises(HTTPException) as ei:
+        catalogue_service().validate_expert_fragment(
+            {"subagents": {"roster": {"voice": {**voice, "driver": "phone"}}}}
+        )
+    assert ei.value.status_code == 422
+    assert "is not a driver" in str(ei.value.detail)
+
+
 def test_validate_fragment_runs_the_tool_gate_on_roster_entries():
     """The same vocabulary gate as the top level (400), naming the entry: a
     cross-category smuggle inside a child is refused like one on the parent."""

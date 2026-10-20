@@ -2434,7 +2434,7 @@
         },
         "live": {
           "type": "object",
-          "description": "The live voice entry's session settings (with `driver: live`). The orchestrator builds the voice's instructions from `persona` + `facts` + the framework's voice rules and `texts.fallback`, and its first words from `greeting`; the job's voice subagent reads `answer_timeout_s`, `texts.follow_up` and `texts.goodbye`. Persona and facts are plain text: the six assembler placeholders are rejected. Keep customer content in a DB expert, not in a bundled one.",
+          "description": "The live voice entry's session settings. The resolved entry needs `driver: live`; an expert that extends one may set only the keys it changes (e.g. `live: {greeting, facts}`) and inherits the driver. The orchestrator builds the voice's instructions from `persona` + `facts` + the framework's voice rules and `texts.fallback`, and its first words from `greeting`; the job's voice subagent reads `answer_timeout_s`, `texts.follow_up` and `texts.goodbye`. Persona and facts are plain text: the six assembler placeholders are rejected. Keep customer content in a DB expert, not in a bundled one.",
           "properties": {
             "persona": {
               "type": "string",

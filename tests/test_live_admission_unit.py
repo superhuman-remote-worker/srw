@@ -425,6 +425,76 @@ class TestRefuseSessionContradictions:
 
 
 # =============================================================================
+# resolve_live_voice against the real resolver
+# =============================================================================
+
+
+def _desk_row(config: dict[str, Any]) -> dict[str, Any]:
+    """A DB expert on the bundled receptionist, as a manifest saves it."""
+    return {
+        "name": "example-desk",
+        "expert_type": "worker",
+        "harness_config_name": "receptionist",
+        "harness_asset_name": "receptionist",
+        "config": config,
+        "prompts": {},
+    }
+
+
+class TestResolveLiveVoice:
+    @pytest.mark.asyncio
+    async def test_a_partial_override_keeps_the_inherited_live_entry(self):
+        """The expert sets only `voice.live.{greeting, facts}`; the voice is
+        the receptionist's entry with its organisation's greeting and facts."""
+        row = _desk_row(
+            {
+                "subagents": {
+                    "roster": {
+                        "voice": {
+                            "live": {
+                                "greeting": "Hello, this is Example's AI assistant.",
+                                "facts": "Example is open Monday to Friday.",
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        voice = await admission.resolve_live_voice(
+            SimpleNamespace(),
+            config_name="worker_base",
+            expert_id=None,
+            expert_row=row,
+            config_override=None,
+        )
+        assert voice.entry == "voice"
+        assert "Hello, this is Example's AI assistant." in voice.greeting_instruction
+        assert "Example is open Monday to Friday." in voice.instructions
+        assert "You are the receptionist" in voice.instructions
+        assert voice.voice == "marin"
+
+    @pytest.mark.asyncio
+    async def test_a_live_block_without_a_live_driver_is_refused_by_name(self):
+        row = _desk_row(
+            {
+                "subagents": {
+                    "default": "desk",
+                    "roster": {"desk": {"live": {"greeting": GREETING}}},
+                }
+            }
+        )
+        with pytest.raises(LiveVoiceError) as refused:
+            await admission.resolve_live_voice(
+                SimpleNamespace(),
+                config_name="worker_base",
+                expert_id=None,
+                expert_row=row,
+                config_override=None,
+            )
+        assert "subagents.roster.desk.live: requires driver: live" in str(refused.value)
+
+
+# =============================================================================
 # prepare_live_session and the INSERT-transaction bind
 # =============================================================================
 
