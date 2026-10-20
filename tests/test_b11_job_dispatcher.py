@@ -1177,6 +1177,105 @@ class TestTriggerDispatch:
         else:
             assert store.calls == []
 
+    @staticmethod
+    def _follower(monkeypatch) -> None:
+        from orchestrator.services import leader_election
+
+        monkeypatch.setattr(leader_election, "is_leader", asyncio.Event())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("auto_assign", "stateless"), [(True, False), (False, True), (True, True)]
+    )
+    async def test_a_follower_asks_the_leader_and_runs_no_pass(
+        self, monkeypatch, auto_assign, stateless
+    ):
+        """The live-call job of 2026-10-20 was created on the replica that
+        was not the leader: the trigger did nothing and the job waited 28 s
+        for the leader's catch-all pass while warm agents sat ready."""
+        self._follower(monkeypatch)
+        asked = AsyncMock()
+        store = FakeStore(pinned=[_job("j1")])
+        deps = dataclasses.replace(
+            _deps(
+                store,
+                auto_assign_enabled=auto_assign,
+                stateless_worker_enabled=stateless,
+            ),
+            request_leader_dispatch=asked,
+        )
+
+        trigger_dispatch(dependencies=deps)
+        (task,) = deps.state.tasks
+        await asyncio.wait_for(task, 1.0)
+
+        asked.assert_awaited_once_with()
+        assert store.calls == []
+        assert deps.state.runner is None
+        assert deps.state.leader_bound is False
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_or_closing_follower_asks_nothing(self, monkeypatch):
+        self._follower(monkeypatch)
+        asked = AsyncMock()
+        disabled = dataclasses.replace(
+            _deps(
+                FakeStore(), auto_assign_enabled=False, stateless_worker_enabled=False
+            ),
+            request_leader_dispatch=asked,
+        )
+        closing = dataclasses.replace(_deps(FakeStore()), request_leader_dispatch=asked)
+        closing.state.closing = True
+
+        trigger_dispatch(dependencies=disabled)
+        trigger_dispatch(dependencies=closing)
+
+        assert disabled.state.tasks == set() and closing.state.tasks == set()
+        asked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_request_is_logged_not_raised(self, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=LOGGER_NAME)
+        self._follower(monkeypatch)
+        deps = dataclasses.replace(
+            _deps(FakeStore()),
+            request_leader_dispatch=AsyncMock(side_effect=OSError("pool closed")),
+        )
+
+        trigger_dispatch(dependencies=deps)
+        (task,) = deps.state.tasks
+        await asyncio.wait_for(task, 1.0)
+
+        assert task.exception() is None
+        assert any(
+            r.getMessage().startswith("Dispatch: could not ask the leader")
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_request_notifies_the_channel_the_leader_listens_on(self):
+        store = SimpleNamespace(notify_channel=AsyncMock())
+
+        await job_dispatcher.request_leader_dispatch(store)
+
+        store.notify_channel.assert_awaited_once_with(job_dispatcher.DISPATCH_CHANNEL)
+
+    @pytest.mark.asyncio
+    async def test_the_leader_listens_on_that_channel(self, monkeypatch):
+        from orchestrator.services import connector_service_hosting
+
+        heard: list[tuple] = []
+
+        async def fake_listen(store, wake, shutdown, *, channel):
+            heard.append((store, wake, shutdown, channel))
+
+        monkeypatch.setattr(connector_service_hosting, "_listen", fake_listen)
+        store, wake, shutdown = object(), asyncio.Event(), asyncio.Event()
+
+        await job_dispatcher.listen_for_dispatch_requests(store, wake, shutdown)
+
+        assert heard == [(store, wake, shutdown, job_dispatcher.DISPATCH_CHANNEL)]
+
 
 # =============================================================================
 # auto_assign_dispatcher
@@ -1249,6 +1348,93 @@ class TestAutoAssignDispatcher:
             and r.getMessage() == "Error in auto-assign dispatcher: store down"
             for r in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_a_peer_request_schedules_a_pass_and_the_catch_all_keeps_time(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(job_dispatcher, "DISPATCH_INTERVAL_SECONDS", 0.3)
+        shutdown = asyncio.Event()
+        events: list[str] = []
+
+        async def tick(*, dependencies):
+            events.append("catch-all")
+            if events.count("catch-all") == 2:
+                shutdown.set()
+
+        def request(dependencies, *, discover):
+            assert dependencies is deps and discover is True
+            events.append("requested")
+
+        async def listen(wake, stop):
+            assert stop is shutdown
+            await asyncio.sleep(0.05)
+            wake.set()  # one peer replica's NOTIFY
+            await stop.wait()
+
+        monkeypatch.setattr(job_dispatcher, "dispatch_pending_jobs", tick)
+        monkeypatch.setattr(job_dispatcher, "_request_dispatch", request)
+        deps = dataclasses.replace(
+            _deps(FakeStore()), listen_for_dispatch_requests=listen
+        )
+        started = asyncio.get_running_loop().time()
+
+        await asyncio.wait_for(auto_assign_dispatcher(shutdown, dependencies=deps), 2.0)
+
+        # Heard at once, then the catch-all pass on its own schedule.
+        assert events == ["catch-all", "requested", "catch-all"]
+        assert asyncio.get_running_loop().time() - started >= 0.3
+
+    @pytest.mark.asyncio
+    async def test_the_listener_ends_with_the_loop(self, monkeypatch):
+        shutdown = asyncio.Event()
+        listening, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def tick(*, dependencies):
+            await listening.wait()
+            shutdown.set()
+
+        async def listen(wake, stop):
+            listening.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(job_dispatcher, "dispatch_pending_jobs", tick)
+        deps = dataclasses.replace(
+            _deps(FakeStore()), listen_for_dispatch_requests=listen
+        )
+
+        await asyncio.wait_for(auto_assign_dispatcher(shutdown, dependencies=deps), 1.0)
+
+        assert cancelled.is_set()
+
+    def test_the_application_wires_both_halves_to_its_store(self):
+        from orchestrator.application import jobs as jobs_composition
+
+        store = object()
+        deps = jobs_composition.job_dispatch_dependencies(
+            SimpleNamespace(
+                job_dispatch_state=JobDispatchState(),
+                postgres_db=store,
+                completion_control_boundary=object(),
+                settings=SimpleNamespace(
+                    auto_assign_enabled=True, stateless_worker_enabled=False
+                ),
+            )
+        )
+
+        for bound_half, owner in (
+            (deps.request_leader_dispatch, job_dispatcher.request_leader_dispatch),
+            (
+                deps.listen_for_dispatch_requests,
+                job_dispatcher.listen_for_dispatch_requests,
+            ),
+        ):
+            assert isinstance(bound_half, functools.partial)
+            assert bound_half.func is owner and bound_half.args == (store,)
 
 
 # --------------------------------------------------------------------------- #

@@ -170,6 +170,14 @@ def job_dispatch_dependencies(
             preparation_composition.job_start_bundle_dependencies,
             resources,
         ),
+        # A trigger on a replica that is not the leader NOTIFYs the leader's
+        # loop, which LISTENs while it leads.
+        request_leader_dispatch=functools.partial(
+            job_dispatcher.request_leader_dispatch, resources.postgres_db
+        ),
+        listen_for_dispatch_requests=functools.partial(
+            job_dispatcher.listen_for_dispatch_requests, resources.postgres_db
+        ),
     )
 
 
