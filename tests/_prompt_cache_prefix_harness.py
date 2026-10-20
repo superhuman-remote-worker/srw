@@ -228,8 +228,13 @@ class Family:
 FAMILIES: Dict[str, Family] = {
     f.id: f
     for f in (
-        # GPT on first-party OpenAI Chat Completions.
-        Family("openai-chat", "openai_chat", "gpt-5.6-sol", "openai", None, "high"),
+        # GPT on first-party OpenAI Chat Completions: a non-reasoning model,
+        # since OpenAI's own reasoning models take the Responses route there.
+        Family("openai-chat", "openai_chat", "gpt-4.1", "openai"),
+        # GPT-5.6 on first-party OpenAI: the Responses route the openai factory
+        # takes for o-series/gpt-5*/gpt-6* (Chat Completions rejects their
+        # function tools once a reasoning effort applies).
+        Family("responses-openai", "responses", "gpt-5.6-sol", "openai", None, "high"),
         # Claude through the subscription proxy on its OpenAI-compatible route:
         # Chat Completions plus the explicit cache_control breakpoints SRW
         # moves every request. Kill-switch fallback since the native route.

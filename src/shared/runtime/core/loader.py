@@ -4742,24 +4742,48 @@ def _create_openai_llm(
     # receive it in the request body; skip it for native api.openai.com
     # since the SDK rejects unknown kwargs.
     extra_body: dict = {}
+    wire_model = wire_model_name(config)
+    # Which wire API this client speaks. Chat Completions everywhere except:
+    #  - Sol 6.1, on any endpoint: it needs Responses for tool calls, including
+    #    when no effort is injected and the provider's default reasoning applies.
+    #  - OpenAI's own reasoning models (o-series, gpt-5*, gpt-6*) on OpenAI's
+    #    own endpoint, ALWAYS — not only when an effort is sent. OpenAI rejects
+    #    function tools with any reasoning effort on /v1/chat/completions for
+    #    gpt-6-sol/-luna, gpt-6.1-sol, gpt-5.6-*, and (with an explicit effort)
+    #    gpt-5.5 and gpt-5.4-mini/-nano. Leaving the effort out does not help:
+    #    the provider default is not `none` for gpt-6* and gpt-5.6, so they 400
+    #    with no `reasoning_effort` sent too (measured 2026-10-20). Keeping the
+    #    route per model also keeps one wire format for a whole conversation
+    #    when the reasoning level changes between turns.
+    # Other endpoints keep Chat Completions: an OpenAI-compatible server may
+    # not serve /v1/responses, and a subscription-proxy row reaches this
+    # factory precisely because it chose `openai-chat`.
+    # langchain#34660 (streamed tool calls) no longer blocks this on the
+    # langchain-openai we pin; the codex lane runs these models on Responses
+    # with tools daily (model_config_matrix.yaml, `gpt-5` block).
+    from shared.runtime.core.transport_resolution import is_openai_default_endpoint
+
     sol_6_1 = family_of(config.model) == "gpt-6.1-sol"
-    if config.top_k is not None and base_url and not sol_6_1:
+    responses_api = sol_6_1 or (
+        is_openai_default_endpoint(base_url)
+        and _should_use_reasoning_summary(wire_model)
+    )
+    if config.top_k is not None and base_url and not responses_api:
         extra_body["top_k"] = config.top_k
 
-    # Build kwargs for ChatOpenAI.
-    # Force Chat Completions API — LangChain auto-detects Responses API for
-    # gpt-5.*/o3/o4 models, but its streaming is broken for tool calls
-    # (https://github.com/langchain-ai/langchain/issues/34660, still open).
+    # Build kwargs for ChatOpenAI. `use_responses_api` is always explicit:
+    # LangChain would otherwise pick the API itself per request.
     llm_kwargs = {
-        "model": wire_model_name(config),
-        "temperature": None if sol_6_1 else config.temperature,
+        "model": wire_model,
+        # The Responses reasoning models reject custom sampling values. The
+        # matrix value for these families is 1.0, the provider default, so
+        # omitting it changes nothing for a family default.
+        "temperature": None if responses_api else config.temperature,
         "api_key": api_key,
         "max_retries": config.max_retries,
-        # Sol 6.1 requires Responses for tool calls, including when no effort
-        # is injected and the provider's default reasoning applies.
-        "use_responses_api": sol_6_1,
+        "use_responses_api": responses_api,
     }
-    if config.top_p is not None and not sol_6_1:
+    if config.top_p is not None and not responses_api:
         llm_kwargs["top_p"] = config.top_p
 
     # Reasoning delivery is driven by the family's `reasoning` capability
@@ -4777,7 +4801,7 @@ def _create_openai_llm(
         level = _clamp_reasoning_level(
             _rplan["value"], _supported_efforts(_rplan["cap"])
         )
-        if sol_6_1:
+        if responses_api:
             llm_kwargs["reasoning"] = {"effort": level, "summary": "auto"}
             reasoning_mode = f"responses_api(effort={level})"
         else:
@@ -4902,7 +4926,8 @@ def _create_openai_llm(
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created OpenAI LLM: model={config.model}, "
-        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
+        f"served={served_model_of(config) or 'none'}, temp={llm_kwargs['temperature']}, "
+        f"api={'responses' if responses_api else 'chat_completions'}, "
         f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "

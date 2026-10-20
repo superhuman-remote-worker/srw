@@ -913,9 +913,10 @@ gpt-5.6:
 #      reaches the wire anyway: resolve_reasoning_plan() maps it to "inject
 #      nothing" and the provider default applies, so the UI value stays safe.
 #   3. Tool calling requires the RESPONSES API. Chat Completions serves Astra
-#      only WITHOUT tools, so the graph loop must run this family on the
-#      codex/Responses lane — never the `openai` factory, which hard-forces
-#      use_responses_api=False.
+#      only WITHOUT tools, so the graph loop must run this family on Responses:
+#      the codex lane, or the `openai` factory on OpenAI's own endpoint (it
+#      routes o-series/gpt-5*/gpt-6* there). On any other endpoint the `openai`
+#      factory stays on Chat Completions.
 #
 # `max` effort is likewise Responses-API-only. That is why
 # _should_use_reasoning_summary() in loader.py matches gpt-6: without it the
@@ -948,7 +949,8 @@ gpt-6:
     # custom value — same posture as gpt-5/gpt-5.6, which run this exact wire
     # today. OpenAI's migration note phrases it as "remove temperature", so if a
     # live call ever 400s on this param, the fix is to stop sending it at all
-    # (loader.py factories pass config.temperature unconditionally).
+    # (the codex factory passes config.temperature; the openai factory omits
+    # it on its Responses route).
     temperature: 1.0
     multimodal: true  # text + image in, text out (no audio/video)
     parallel_tool_calls: true
