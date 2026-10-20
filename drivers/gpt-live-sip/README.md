@@ -31,6 +31,26 @@ ordinary TCP and verified TLS. Clipping fixtures were generated directly from
   specified journal/SSE shapes and never enter logs.
 - An omitted voice defaults to `marin`, as in the Python client. An empty greeting
   or fallback suppresses that recorder append; the driver invents no call text.
+- GPT-Live does not speak first. An instructions append that arrives before the
+  call's audio is running is taken as context, and the voice waits for the
+  caller. So the greeting append (`srw_greeting_{session}`) waits for both
+  `session.started` (live or replayed) and a settle delay after accept:
+  `greeting_delay_ms`, default 1500. A transcript of either side also counts as
+  started. The sideband replays only 3 seconds, so if the driver never sees
+  `session.started`, the greeting goes out 4 seconds after accept anyway.
+  If no assistant transcript arrives within `greeting_retry_ms` (default 2500;
+  0 turns the retry off), the driver re-sends the same text once, as
+  `srw_greeting_retry_{session}`, on the same sideband. Both settings are
+  optional `connector.config` keys (delay 0..10000, retry 0..30000). The
+  orchestrator's phone-line schema does not offer them yet, so lines run the
+  defaults.
+- The greeting goes out at most once per session, and so does the retry. A
+  reconnect or adoption never greets again: adoption restores
+  `sent_event_ids`. If the sideband changes during the retry window, the retry
+  is dropped, because assistant speech in the gap may have been missed. Log
+  events (without call text): `greeting_sent` (`after_accept_ms`, `started`),
+  `greeting_retry_sent`, `greeting_retry_skipped` (`assistant_spoke` or
+  `sideband_changed`), and `greeting_skipped` (`already_sent`).
 - The 8 MiB WebSocket limit and 1 MiB exchange limit conflict for oversized
   individual journal rows. Such a row becomes a `kind: error` row with code
   `journal_event_too_large`, original kind, serialized byte size, and SHA-256

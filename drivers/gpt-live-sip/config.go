@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const driverName = "srw.gpt-live-sip/v1"
@@ -17,6 +18,15 @@ const maxJSON = 1024 * 1024
 var identityShape = regexp.MustCompile(`\Asdi_[0-9A-Za-z]{49}\z`)
 var leaseShape = regexp.MustCompile(`\Ascl_[0-9A-Za-z]{49}\z`)
 var controlShape = regexp.MustCompile(`\A[A-Za-z0-9_-]{32,}\z`)
+
+// Greeting timing (README, implementation choices). The greeting waits for session.started
+// and a settle delay after accept; the start wait bounds that gate when the
+// sideband missed session.started. One re-prompt follows a silent voice.
+const (
+	defaultGreetingDelay     = 1500 * time.Millisecond
+	defaultGreetingRetry     = 2500 * time.Millisecond
+	defaultGreetingStartWait = 4 * time.Second
+)
 
 type limits struct {
 	MaxDuration int `json:"max_duration_s"`
@@ -29,6 +39,8 @@ type connectorConfig struct {
 	TransferTarget string `json:"transfer_target"`
 	APIHost        string `json:"api_host"`
 	APIPort        int    `json:"api_port"`
+	GreetingDelay  *int   `json:"greeting_delay_ms"`
+	GreetingRetry  *int   `json:"greeting_retry_ms"`
 }
 type requestFile struct {
 	ProtocolVersion string `json:"protocol_version"`
@@ -52,6 +64,9 @@ type requestFile struct {
 type config struct {
 	connectorID, exchangeURL, identity, controlToken, port, transferTarget string
 	limits                                                                 limits
+	// Zero values greet as soon as a sideband is attached, with no re-prompt.
+	// parseConfig always sets the defaults above.
+	greetingDelay, greetingRetry, greetingStartWait time.Duration
 }
 
 func loadConfig(getenv func(string) string) (*config, error) {
@@ -130,7 +145,20 @@ func parseConfig(r requestFile, identity string) (*config, error) {
 	if !l.valid() {
 		return nil, errors.New("invalid connector limits: duration 60..14400, fallback 1..120")
 	}
-	return &config{connectorID: r.Connector.ID, exchangeURL: strings.TrimRight(r.Exchange.URL, "/"), identity: identity, controlToken: r.Control.Token, port: strconv.Itoa(r.Service.Port), transferTarget: r.Connector.Config.TransferTarget, limits: l}, nil
+	delay, retry := defaultGreetingDelay, defaultGreetingRetry
+	if v := r.Connector.Config.GreetingDelay; v != nil {
+		if *v < 0 || *v > 10000 {
+			return nil, errors.New("greeting_delay_ms must be 0..10000")
+		}
+		delay = time.Duration(*v) * time.Millisecond
+	}
+	if v := r.Connector.Config.GreetingRetry; v != nil {
+		if *v < 0 || *v > 30000 {
+			return nil, errors.New("greeting_retry_ms must be 0..30000")
+		}
+		retry = time.Duration(*v) * time.Millisecond
+	}
+	return &config{connectorID: r.Connector.ID, exchangeURL: strings.TrimRight(r.Exchange.URL, "/"), identity: identity, controlToken: r.Control.Token, port: strconv.Itoa(r.Service.Port), transferTarget: r.Connector.Config.TransferTarget, limits: l, greetingDelay: delay, greetingRetry: retry, greetingStartWait: defaultGreetingStartWait}, nil
 }
 func (l limits) valid() bool {
 	return l.MaxDuration >= 60 && l.MaxDuration <= 14400 && l.Fallback >= 1 && l.Fallback <= 120
