@@ -190,6 +190,18 @@ async def export_expert(
     return await deps.authoring.export_expert(expert_id=expert_id, user=user)
 
 
+@router.get("/api/experts/{expert_id}/source")
+async def get_expert_source(
+    request: Request, expert_id: str, *, deps: CatalogDeps
+) -> dict[str, Any]:
+    """An expert's authored fields (raw fragment + prompts) in the export
+    bundle's shape, for the editor and its read-only view. Unlike export, it
+    answers for experts backed by an installed asset."""
+    deps.catalog.require_experts_db()
+    user = await deps.require_approved_user(request)
+    return await deps.authoring.expert_source(expert_id=expert_id, user=user)
+
+
 @router.post("/api/experts/import")
 async def import_expert(
     request: Request, body: ExpertCreate, *, deps: CatalogDeps

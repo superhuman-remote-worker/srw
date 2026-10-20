@@ -8,6 +8,7 @@ import {chatModelLabel, ModelService} from '../../core/services/model.service';
 import type {
   EffectiveModels,
   ExpertCreateRequest,
+  ExpertExportBundle,
   ExpertRole,
   ExpertUpdateRequest,
   GrantCatalog,
@@ -226,6 +227,8 @@ export function stripEmptySubagents(config: Record<string, unknown>): Record<str
  */
 export interface ExpertEditorNavigationState {
   dropped?: string[];
+  /** The fork was the read-only view's "Duplicate to edit", not a new default. */
+  duplicated?: boolean;
 }
 
 /**
@@ -245,9 +248,17 @@ export interface ExpertEditorNavigationState {
  */
 export function forkNoticeTranslationArgs(
   dropped: string[] | undefined,
+  duplicated = false,
 ): [key: string, params: Record<string, string>] | null {
   if (!dropped || dropped.length === 0) return null;
-  return ['experts.forkedMissingGrants', {grants: dropped.join(', ')}];
+  const key = duplicated ? 'experts.duplicatedMissingGrants' : 'experts.forkedMissingGrants';
+  return [key, {grants: dropped.join(', ')}];
+}
+
+/** The editor's heading: read-only view, edit of a stored expert, or create. */
+export function expertEditorHeadingKey(readOnly: boolean, isEdit: boolean): string {
+  if (readOnly) return 'experts.view';
+  return isEdit ? 'experts.edit' : 'experts.new';
 }
 
 interface EditorForm {
@@ -297,16 +308,22 @@ interface EditorForm {
              here too — otherwise the off-canvas nav is unreachable on mobile.
              Renders nothing on desktop (sidebar always expanded). -->
         <app-sidebar-toggle />
-        <h1>{{ (isEdit() ? 'experts.edit' : 'experts.new') | transloco }}</h1>
+        <h1>{{ headingKey() | transloco }}</h1>
       </header>
 
       @if (forkNotice()) {
         <div class="banner info">{{ forkNotice() }}</div>
       }
+      @if (readOnly()) {
+        <div class="banner info">{{ 'experts.readonlyNotice' | transloco }}</div>
+      }
+      @if (loadError()) {
+        <div class="banner err">{{ loadError() }}</div>
+      }
 
       <section class="card">
         <app-form-field label="Display name" [required]="true">
-          <app-input [value]="form.display_name" (valueChange)="onDisplayName($event)" />
+          <app-input [value]="form.display_name" [readonly]="readOnly()" (valueChange)="onDisplayName($event)" />
         </app-form-field>
         <app-form-field label="Name (slug)" [required]="true" hint="lowercase; immutable after create">
           <app-input [value]="form.name" [disabled]="isEdit()" (valueChange)="onNameEdit($event)" />
@@ -318,15 +335,15 @@ interface EditorForm {
           </app-select>
         </app-form-field>
         <app-form-field label="Description">
-          <app-input [value]="form.description" (valueChange)="form.description = $event" />
+          <app-input [value]="form.description" [readonly]="readOnly()" (valueChange)="form.description = $event" />
         </app-form-field>
         <div class="row">
           <app-form-field label="Icon (Material Symbol)">
-            <app-input [value]="form.icon" (valueChange)="form.icon = $event" placeholder="smart_toy" />
+            <app-input [value]="form.icon" [readonly]="readOnly()" (valueChange)="form.icon = $event" placeholder="smart_toy" />
           </app-form-field>
           <app-icon size="xl" [style.color]="form.color">{{ form.icon || 'smart_toy' }}</app-icon>
           <app-form-field label="Color (hex)">
-            <app-input [value]="form.color" (valueChange)="form.color = $event" placeholder="#6B7280" />
+            <app-input [value]="form.color" [readonly]="readOnly()" (valueChange)="form.color = $event" placeholder="#6B7280" />
           </app-form-field>
         </div>
       </section>
@@ -341,7 +358,7 @@ interface EditorForm {
             @for (role of expertRoles; track role) {
               <app-chip
                 [selected]="hasRoleTag(role)"
-                [disabled]="role === form.expert_type"
+                [disabled]="readOnly() || role === form.expert_type"
                 [ariaLabel]="role === form.expert_type ? ('experts.tags.roleLocked' | transloco: {role}) : role"
                 (clicked)="toggleRoleTag(role)"
               >{{ role }}</app-chip>
@@ -351,6 +368,7 @@ interface EditorForm {
         <app-form-field [label]="'experts.tags.free' | transloco">
           <app-input
             [value]="form.tags"
+            [readonly]="readOnly()"
             [placeholder]="'experts.tags.freePlaceholder' | transloco"
             (valueChange)="form.tags = $event"
           />
@@ -362,11 +380,17 @@ interface EditorForm {
         <app-textarea
           [value]="form.persona"
           [rows]="8"
+          [readonly]="readOnly()"
           (valueChange)="form.persona = $event"
           placeholder="The expert's persona / system style…"
         />
         <h2>Instructions (optional)</h2>
-        <app-textarea [value]="form.instructions" [rows]="5" (valueChange)="form.instructions = $event" />
+        <app-textarea
+          [value]="form.instructions"
+          [rows]="5"
+          [readonly]="readOnly()"
+          (valueChange)="form.instructions = $event"
+        />
       </section>
 
       <section class="card">
@@ -381,6 +405,7 @@ interface EditorForm {
           <app-textarea
             [value]="form.strategic"
             [rows]="6"
+            [readonly]="readOnly()"
             (valueChange)="form.strategic = $event"
             placeholder="Inherit framework default…"
           />
@@ -388,6 +413,7 @@ interface EditorForm {
           <app-textarea
             [value]="form.tactical"
             [rows]="6"
+            [readonly]="readOnly()"
             (valueChange)="form.tactical = $event"
             placeholder="Inherit framework default…"
           />
@@ -396,6 +422,7 @@ interface EditorForm {
         <app-textarea
           [value]="form.summarization"
           [rows]="5"
+          [readonly]="readOnly()"
           (valueChange)="form.summarization = $event"
           placeholder="Inherit framework default…"
         />
@@ -409,7 +436,7 @@ interface EditorForm {
         <app-execution-group
           [config]="baseForGroups()"
           [mode]="mode()"
-          [disabled]="false"
+          [disabled]="readOnly()"
           [showProjectMemory]="false"
           [gatedCapabilities]="gatedCapabilities()"
           [catalog]="catalog()"
@@ -422,7 +449,7 @@ interface EditorForm {
       <section class="card">
         <h2>{{ 'experts.model.title' | transloco }}</h2>
         <label class="ml">{{ 'experts.model.model' | transloco }}
-          <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.model" (ngModelChange)="form.model = $event">
+          <select class="model-select" [disabled]="readOnly() || isModelGated()" [ngModel]="form.model" (ngModelChange)="form.model = $event">
             <option [ngValue]="''">{{ baseDefaultLabel('model') }}</option>
             @for (g of models(); track g.group) {
               <optgroup [label]="g.group">
@@ -433,7 +460,7 @@ interface EditorForm {
         </label>
         @if (mode() === 'job') {
           <label class="ml">{{ 'experts.model.subagent' | transloco }}
-            <select class="model-select" [disabled]="isModelGated()" [ngModel]="form.subagentModel" (ngModelChange)="form.subagentModel = $event">
+            <select class="model-select" [disabled]="readOnly() || isModelGated()" [ngModel]="form.subagentModel" (ngModelChange)="form.subagentModel = $event">
               <option [ngValue]="''">{{ baseDefaultLabel('subagent') }}</option>
               @for (g of models(); track g.group) {
                 <optgroup [label]="g.group">
@@ -457,6 +484,7 @@ interface EditorForm {
           [models]="models()"
           [modelGated]="isModelGated()"
           [modelAllowed]="modelAllowed"
+          [disabled]="readOnly()"
         />
       </section>
 
@@ -465,7 +493,7 @@ interface EditorForm {
         <app-tools-group
           [config]="baseForGroups()"
           [mode]="mode()"
-          [disabled]="false"
+          [disabled]="readOnly()"
           [enumerateOnly]="enumerateOnly()"
           [gatedCapabilities]="gatedCapabilities()"
           [resolved]="toolPreview()"
@@ -478,7 +506,7 @@ interface EditorForm {
         <app-advanced-accordion
           [config]="baseForGroups()"
           [mode]="mode()"
-          [disabled]="false"
+          [disabled]="readOnly()"
           [settingsMatrix]="settingsMatrix()"
           [modelOverride]="form.model || null"
           [backendOverride]="execBackendOverride()"
@@ -494,6 +522,7 @@ interface EditorForm {
         <app-textarea
           [value]="form.configText"
           [rows]="6"
+          [readonly]="readOnly()"
           (valueChange)="form.configText = $event"
           placeholder='{ "instruction_files": [] }'
         />
@@ -504,10 +533,17 @@ interface EditorForm {
       }
 
       <footer class="actions">
-        <app-button variant="secondary" (clicked)="cancel()">{{ 'experts.cancel' | transloco }}</app-button>
-        <app-button variant="primary" [loading]="saving()" (clicked)="save()">
-          {{ 'experts.save' | transloco }}
-        </app-button>
+        @if (readOnly()) {
+          <app-button variant="secondary" (clicked)="cancel()">{{ 'experts.back' | transloco }}</app-button>
+          <app-button variant="primary" [loading]="saving()" (clicked)="duplicate()">
+            {{ 'experts.duplicateToEdit' | transloco }}
+          </app-button>
+        } @else {
+          <app-button variant="secondary" (clicked)="cancel()">{{ 'experts.cancel' | transloco }}</app-button>
+          <app-button variant="primary" [loading]="saving()" [disabled]="!!loadError()" (clicked)="save()">
+            {{ 'experts.save' | transloco }}
+          </app-button>
+        }
       </footer>
     </div>
   `,
@@ -627,8 +663,14 @@ export class ExpertEditorComponent implements OnInit {
   protected readonly execBackendOverride = computed(() => this.execGroup()?.workspaceBackend() ?? null);
 
   editingId = signal<string | null>(null);
+  /** The `/experts/:id/view` route: every control read-only, no save — the
+   *  way to read an expert the caller may not edit (every bundled one). */
+  readonly readOnly = signal(this.route.snapshot.data['readOnly'] === true);
   saving = signal(false);
   errorMessage = signal('');
+  /** Set when the stored expert could not be read. Save stays off then: the
+   *  form is still blank, and saving it would wipe the expert's prompts. */
+  loadError = signal('');
   /** Set once, from router state, when this editor was landed on right after
    *  a fork-as-default that stripped something (see `forkNoticeTranslationArgs`
    *  and `ExpertEditorNavigationState`). Empty when there is nothing to say. */
@@ -734,6 +776,7 @@ export class ExpertEditorComponent implements OnInit {
 
   private readonly expertType = signal<'worker' | 'session'>('worker');
   isEdit = computed(() => this.editingId() !== null);
+  headingKey = computed(() => expertEditorHeadingKey(this.readOnly(), this.isEdit()));
   mode = computed<'job' | 'session'>(() => expertEditorMode(this.expertType()));
   /** Base config for the structured controls' "default: X" displays: the type
    *  base merged with the expert's own fragment. */
@@ -748,7 +791,7 @@ export class ExpertEditorComponent implements OnInit {
     // reading `history.state` later would.
     const navState = this.router.getCurrentNavigation()?.extras
       .state as ExpertEditorNavigationState | undefined;
-    const notice = forkNoticeTranslationArgs(navState?.dropped);
+    const notice = forkNoticeTranslationArgs(navState?.dropped, navState?.duplicated);
     if (notice) {
       const [key, params] = notice;
       this.forkNotice.set(this.transloco.translate(key, params));
@@ -788,39 +831,49 @@ export class ExpertEditorComponent implements OnInit {
       return;
     }
     this.editingId.set(id);
-    // Prefill from the export bundle = the RAW fragment (never the merged result).
-    this.api.exportExpert(id).subscribe((bundle) => {
-      const b = (bundle ?? {}) as Record<string, unknown>;
-      this.form.name = (b['name'] as string) ?? '';
-      this.form.display_name = (b['display_name'] as string) ?? '';
-      this.form.description = (b['description'] as string) ?? '';
-      this.form.icon = (b['icon'] as string) ?? 'smart_toy';
-      this.form.color = (b['color'] as string) ?? '#6B7280';
-      const {roles, free} = splitTags(Array.isArray(b['tags']) ? (b['tags'] as string[]) : []);
-      this.form.tags = free;
-      this.roleTags.set(roles);
-      this.form.expert_type = b['expert_type'] === 'session' ? 'session' : 'worker';
-      this.expertType.set(this.form.expert_type);
-      this.loadFrameworkDefaults(this.form.expert_type);
-      const prompts = (b['prompts'] ?? {}) as Record<string, unknown>;
-      this.form.persona = (prompts['persona'] as string) ?? '';
-      this.form.instructions = (prompts['instructions'] as string) ?? '';
-      this.form.strategic = (prompts['strategic'] as string) ?? '';
-      this.form.tactical = (prompts['tactical'] as string) ?? '';
-      this.form.summarization = (prompts['summarization'] as string) ?? '';
-      // A pre-U1 fragment's per-phase tiers are lifted onto llm.model /
-      // subagents.llm here, once, layer-locally (an explicit llm.model wins) —
-      // the same mapping the loader applies — so the controls prefill from
-      // the single-model shape and the save writes it back that way.
-      const cfg = liftLegacyTiers((b['config'] ?? {}) as Record<string, unknown>);
-      // Raw flap shows only the keys the structured controls don't own.
-      const {rawRemainderText} = splitExpertConfig(cfg);
-      this.form.configText = rawRemainderText;
-      this.rawFragment.set(cfg); // triggers the prefill effect
-      // The only read on this path: it needs both the stored type (which picks
-      // the base) and the fragment, and neither exists until here.
-      this.loadToolPreview();
+    // Prefill from the source bundle = the RAW fragment (never the merged
+    // result). Not the export: that 409s for every bundled expert and every
+    // copy of one, which used to leave this form blank.
+    this.api.getExpertSource(id).subscribe({
+      next: (b) => this.applySource(b),
+      error: (err) => {
+        const d = (err as {error?: {detail?: unknown}})?.error?.detail;
+        const detail = typeof d === 'string' ? d : String((err as {message?: unknown})?.message ?? '');
+        this.loadError.set(this.transloco.translate('experts.loadFailed', {detail}));
+      },
     });
+  }
+
+  private applySource(b: ExpertExportBundle): void {
+    this.form.name = b.name ?? '';
+    this.form.display_name = b.display_name ?? '';
+    this.form.description = b.description ?? '';
+    this.form.icon = b.icon ?? 'smart_toy';
+    this.form.color = b.color ?? '#6B7280';
+    const {roles, free} = splitTags(Array.isArray(b.tags) ? b.tags : []);
+    this.form.tags = free;
+    this.roleTags.set(roles);
+    this.form.expert_type = b.expert_type === 'session' ? 'session' : 'worker';
+    this.expertType.set(this.form.expert_type);
+    this.loadFrameworkDefaults(this.form.expert_type);
+    const prompts = b.prompts ?? {};
+    this.form.persona = (prompts['persona'] as string) ?? '';
+    this.form.instructions = (prompts['instructions'] as string) ?? '';
+    this.form.strategic = (prompts['strategic'] as string) ?? '';
+    this.form.tactical = (prompts['tactical'] as string) ?? '';
+    this.form.summarization = (prompts['summarization'] as string) ?? '';
+    // A pre-U1 fragment's per-phase tiers are lifted onto llm.model /
+    // subagents.llm here, once, layer-locally (an explicit llm.model wins) —
+    // the same mapping the loader applies — so the controls prefill from
+    // the single-model shape and the save writes it back that way.
+    const cfg = liftLegacyTiers(b.config ?? {});
+    // Raw flap shows only the keys the structured controls don't own.
+    const {rawRemainderText} = splitExpertConfig(cfg);
+    this.form.configText = rawRemainderText;
+    this.rawFragment.set(cfg); // triggers the prefill effect
+    // The only read on this path: it needs both the stored type (which picks
+    // the base) and the fragment, and neither exists until here.
+    this.loadToolPreview();
   }
 
   /** Seed the structured controls + model selects from the (lifted) fragment. */
@@ -945,6 +998,7 @@ export class ExpertEditorComponent implements OnInit {
   }
 
   save(): void {
+    if (this.readOnly() || this.loadError()) return;
     this.errorMessage.set('');
     const parsed = parseConfigText(this.form.configText);
     if (parsed.error) {
@@ -994,6 +1048,27 @@ export class ExpertEditorComponent implements OnInit {
         const d = (err as {error?: {detail?: unknown}})?.error?.detail;
         this.errorMessage.set(
           typeof d === 'string' ? d : this.transloco.translate('experts.saveFailed'),
+        );
+      },
+    });
+  }
+
+  /** The read-only view's way to edit: copy the expert, open the copy here. */
+  duplicate(): void {
+    const id = this.editingId();
+    if (!id) return;
+    this.errorMessage.set('');
+    this.saving.set(true);
+    this.api.duplicateExpert(id).subscribe({
+      next: (copy) => {
+        const state: ExpertEditorNavigationState = {dropped: copy.dropped, duplicated: true};
+        this.router.navigate(['/experts', copy.id, 'edit'], {state});
+      },
+      error: (err) => {
+        this.saving.set(false);
+        const d = (err as {error?: {detail?: unknown}})?.error?.detail;
+        this.errorMessage.set(
+          typeof d === 'string' ? d : this.transloco.translate('experts.duplicateFailed'),
         );
       },
     });

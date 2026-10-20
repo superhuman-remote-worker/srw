@@ -460,3 +460,75 @@ async def test_legacy_export_refuses_to_drop_a_canonical_asset_selection():
     with pytest.raises(HTTPException, match="manifest") as refused:
         await authoring.export_expert(str(EXPERT), user={"id": USER})
     assert refused.value.status_code == 409
+
+
+def _source_authoring(*, row=None, bundled=None):
+    from orchestrator.services.expert_authoring import ExpertAuthoringService
+
+    return ExpertAuthoringService(
+        store=SimpleNamespace(get_expert_visible_by_id=AsyncMock(return_value=row)),
+        catalog=SimpleNamespace(
+            deps=SimpleNamespace(
+                looks_like_uuid=lambda value: value == str(EXPERT),
+                visible_project_ids=AsyncMock(return_value=[]),
+            ),
+            bundled_expert_source=AsyncMock(return_value=bundled),
+        ),
+        resolve_default_models=None,
+        prefetch_roster_refs=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_reads_an_asset_backed_copy_that_export_refuses():
+    authoring = _source_authoring(
+        row=expert_row(
+            harness_asset_name="developer",
+            harness_config_name="worker_base",
+            harness_config_layers=[{"config": {"limits": {"max_turns": 9}}}],
+        )
+    )
+
+    source = await authoring.expert_source(str(EXPERT), user={"id": USER})
+
+    assert source["name"] == "helper"
+    assert source["display_name"] == "Helper"
+    assert source["config"] == expert_row()["config"]
+    assert source["prompts"] == {"persona": "Keep the authored persona."}
+    assert not any(key.startswith("harness_") for key in source)
+
+
+@pytest.mark.asyncio
+async def test_source_reads_a_bundled_expert_with_its_prompt_files():
+    authoring = _source_authoring(
+        bundled={
+            "name": "developer",
+            "display_name": "Developer",
+            "expert_type": "worker",
+            "tags": ["worker"],
+            "config": {"limits": {"max_turns": 9}},
+            "prompts": {"persona": "From persona.txt", "tactical": "From the skill"},
+            "harness_asset_name": "developer",
+        }
+    )
+
+    source = await authoring.expert_source("developer", user={"id": USER})
+
+    assert source["prompts"] == {
+        "persona": "From persona.txt",
+        "tactical": "From the skill",
+    }
+    assert "harness_asset_name" not in source
+
+
+@pytest.mark.asyncio
+async def test_source_hides_a_missing_or_invisible_expert():
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as missing_row:
+        await _source_authoring().expert_source(str(EXPERT), user={"id": USER})
+    with pytest.raises(HTTPException) as missing_bundled:
+        await _source_authoring().expert_source("nobody", user={"id": USER})
+
+    assert missing_row.value.status_code == 404
+    assert missing_bundled.value.status_code == 404

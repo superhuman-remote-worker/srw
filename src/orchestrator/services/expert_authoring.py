@@ -306,11 +306,12 @@ class ExpertAuthoringService:
         await self.store.delete_expert(expert_id)
         return {"deleted": True}
 
-    async def duplicate_expert(
-        self, expert_id: str, *, user: dict[str, Any], write_policy: ExpertWritePolicy
+    async def _visible_expert_source(
+        self, expert_id: str, *, user: dict[str, Any]
     ) -> dict[str, Any]:
-        """Fork any visible expert (bundled or DB) into an owned copy — 'start from
-        scholar' (decision 4: copy, not live link)."""
+        """The bundle source of any expert visible to ``user`` — a DB row by UUID,
+        else a bundled expert by name — with its ``harness_*`` keys. 404 for a
+        missing or invisible one."""
         if self.catalog.deps.looks_like_uuid(expert_id):
             visible = await self.catalog.deps.visible_project_ids(user, self.store)
             row = await self.store.get_expert_visible_by_id(
@@ -321,11 +322,18 @@ class ExpertAuthoringService:
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Expert not found")
-            src = db_expert_to_bundle_src(row)
-        else:
-            src = await self.catalog.bundled_expert_source(expert_id)
-            if not src:
-                raise HTTPException(status_code=404, detail="Expert not found")
+            return db_expert_to_bundle_src(row)
+        src = await self.catalog.bundled_expert_source(expert_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Expert not found")
+        return src
+
+    async def duplicate_expert(
+        self, expert_id: str, *, user: dict[str, Any], write_policy: ExpertWritePolicy
+    ) -> dict[str, Any]:
+        """Fork any visible expert (bundled or DB) into an owned copy — 'start from
+        scholar' (decision 4: copy, not live link)."""
+        src = await self._visible_expert_source(expert_id, user=user)
         # A fork is a new write by a new principal, and the source row may be
         # someone else's (visibility, not ownership, is the test above). Validating
         # here is what stops a legacy smuggled fragment being copied forward — the
@@ -362,31 +370,28 @@ class ExpertAuthoringService:
         their raw fragment; bundled experts export their on-disk config."""
         from shared.runtime.core.expert_resolution import to_export_bundle
 
-        if self.catalog.deps.looks_like_uuid(expert_id):
-            visible = await self.catalog.deps.visible_project_ids(user, self.store)
-            row = await self.store.get_expert_visible_by_id(
-                expert_id,
-                user_id=str(user["id"]),
-                project_ids=[] if visible == "all" else [str(p) for p in visible],
-                is_admin=bool(user.get("is_admin")),
-            )
-            if not row:
-                raise HTTPException(status_code=404, detail="Expert not found")
-            if row.get("harness_config_layers") or row.get("harness_asset_name"):
-                raise HTTPException(
-                    409,
-                    "Export this Expert through its manifest to retain private layers and installed asset selections.",
-                )
-            return to_export_bundle(db_expert_to_bundle_src(row))
-        bundle = await self.catalog.bundled_expert_source(expert_id)
-        if not bundle:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        if bundle.get("harness_config_layers") or bundle.get("harness_asset_name"):
+        src = await self._visible_expert_source(expert_id, user=user)
+        if src.get("harness_config_layers") or src.get("harness_asset_name"):
             raise HTTPException(
                 409,
                 "Export this Expert through its manifest to retain private layers and installed asset selections.",
             )
-        return to_export_bundle(bundle)
+        return to_export_bundle(src)
+
+    async def expert_source(
+        self, expert_id: str, *, user: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The authored fields of a visible expert, in the export bundle's shape —
+        what the cockpit editor and its read-only view show.
+
+        Export refuses an expert with private layers or an installed asset (every
+        bundled expert and every copy of one), because a downloaded file would
+        drop them. A read for display drops nothing: the row keeps both, and a
+        save through ``update_expert`` writes only the authored fragment.
+        """
+        from shared.runtime.core.expert_resolution import to_export_bundle
+
+        return to_export_bundle(await self._visible_expert_source(expert_id, user=user))
 
     async def import_expert(
         self,

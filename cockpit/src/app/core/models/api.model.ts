@@ -2630,6 +2630,8 @@ export interface ExpertExportBundle {
   name?: string;
   display_name?: string;
   description?: string;
+  icon?: string;
+  color?: string;
   expert_type?: string;
   tags?: string[];
   config: Record<string, unknown>;

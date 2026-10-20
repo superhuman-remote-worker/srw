@@ -105,6 +105,12 @@ export const routes: Routes = [
   { path: 'experts/new', loadComponent: loadExpertEditor, canActivate: [authGuard] },
   { path: 'experts/:id/edit', loadComponent: loadExpertEditor, canActivate: [authGuard] },
   {
+    path: 'experts/:id/view',
+    loadComponent: loadExpertEditor,
+    canActivate: [authGuard],
+    data: {readOnly: true},
+  },
+  {
     path: 'skills',
     loadComponent: () =>
       import('./views/skills/skills-page.component').then((m) => m.SkillsPageComponent),

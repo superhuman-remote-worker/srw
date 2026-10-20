@@ -253,6 +253,13 @@ describe('forkNoticeTranslationArgs', () => {
     ]);
   });
 
+  it('says "duplicated", not "new default", after the view\'s Duplicate to edit', () => {
+    expect(forkNoticeTranslationArgs(['shell_tools'], true)).toEqual([
+      'experts.duplicatedMissingGrants',
+      {grants: 'shell_tools'},
+    ]);
+  });
+
   it('handles a single dropped grant without a trailing separator', () => {
     expect(forkNoticeTranslationArgs(['shell_tools'])).toEqual([
       'experts.forkedMissingGrants',

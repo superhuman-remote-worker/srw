@@ -2683,6 +2683,12 @@
     "inUse": "Expert is in use by {{count}} job(s)",
     "saveFailed": "Save failed",
     "invalidJson": "Invalid JSON file",
+    "view": "View",
+    "back": "Back",
+    "readonlyNotice": "You can't edit this expert. Duplicate it to get an editable copy.",
+    "duplicateToEdit": "Duplicate to edit",
+    "duplicateFailed": "Duplicate failed",
+    "loadFailed": "Couldn't load this expert: {{detail}}",
     "model": {
       "title": "Model",
       "model": "Model",

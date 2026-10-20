@@ -878,6 +878,19 @@ export class ApiService {
   }
 
   /**
+   * An expert's authored fields (raw fragment + prompts, the export bundle's
+   * shape) — what the editor and its read-only view show. Export 409s for an
+   * expert backed by an installed asset (every bundled expert and every copy
+   * of one) because a downloaded file would drop that selection; this read
+   * does not.
+   */
+  getExpertSource(id: string): Observable<ExpertExportBundle> {
+    return this.http.get<ExpertExportBundle>(
+      `${this.baseUrl}/experts/${encodeURIComponent(id)}/source`,
+    );
+  }
+
+  /**
    * Create an owned expert from a posted bundle (fork-on-import).
    */
   importExpert(body: ExpertCreateRequest): Observable<ExpertDetail> {

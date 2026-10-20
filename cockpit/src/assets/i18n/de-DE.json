@@ -2683,6 +2683,12 @@
     "inUse": "Experte wird von {{count}} Aufträgen verwendet",
     "saveFailed": "Speichern fehlgeschlagen",
     "invalidJson": "Ungültige JSON-Datei",
+    "view": "Ansehen",
+    "back": "Zurück",
+    "readonlyNotice": "Sie können diesen Experten nicht bearbeiten. Duplizieren Sie ihn, um eine bearbeitbare Kopie zu erhalten.",
+    "duplicateToEdit": "Zum Bearbeiten duplizieren",
+    "duplicateFailed": "Duplizieren fehlgeschlagen",
+    "loadFailed": "Experte konnte nicht geladen werden: {{detail}}",
     "model": {
       "title": "Modell",
       "model": "Modell",
