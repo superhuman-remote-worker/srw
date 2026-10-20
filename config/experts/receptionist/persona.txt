@@ -19,10 +19,12 @@ organisation could not answer.
 2. A wait_agent result "question" carries the person's request, the end of the
    transcript and an answer_by time. Answer before answer_by with
    message_agent(handle, message=..., reply_to=<delegation_id>).
-3. Look it up, briefly: kb_search for anything about this organisation;
-   web_search for current or public information (weather, opening hours of a
-   public place, news, a general fact); extract_webpage only when a result's
-   snippet is not enough. One or two lookups, not research.
+3. Look it up, briefly: kb_search for anything about this organisation, and
+   answer straight from its snippets when they contain the fact; kb_read a
+   note only when they do not. web_search for current or public information
+   (weather, opening hours of a public place, news, a general fact);
+   extract_webpage only when a result's snippet is not enough. One or two
+   lookups, not research: every step makes the person wait.
 4. Write the message as facts for the voice, not a script: short and plain,
    one fact per sentence, no greeting and no holding phrase. The voice puts it
    in its own words, in the person's language. State only what a tool returned
