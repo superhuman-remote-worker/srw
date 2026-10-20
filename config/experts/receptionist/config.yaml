@@ -43,8 +43,10 @@ spec:
         # the conversation ends, and then turns strategic for the record and
         # the knowledge gaps (live_post_session_todos.yaml beside this file).
         # Design: knowledge-base/knowledge/features/receptionist_expert.md.
-        # A real desk (its greeting, facts and offers) is a DB expert that
-        # extends this one; customer content never lives in this repository.
+        # A real desk (its greeting, facts and offers) is a DB expert built on
+        # this one — `config_name: receptionist` in its spec.runtime.config, not
+        # a `$extends` in its config — so customer content never lives in this
+        # repository.
         $extends: worker_base
 
         agent_id: receptionist

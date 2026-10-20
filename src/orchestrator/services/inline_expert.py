@@ -8,10 +8,11 @@ carries no ``id`` and no ``manifest_uid``: an inline Expert is owned by its
 work and records no resource dependency.
 
 The gates are the manifest path's: the installed-image and launch-envelope
-check, the authored-fragment write gates (credentials, runtime authority, tool
-vocabulary, roster shape) and the persona placeholder rule, plus the DB-expert
-prompt-key allowlist. They run at admission so a bad definition is refused
-before any write; the snapshot re-runs the fragment gates inside the insert.
+check, a ``$extends`` that contradicts ``config_name``, the authored-fragment
+write gates (credentials, runtime authority, tool vocabulary, roster shape)
+and the persona placeholder rule, plus the DB-expert prompt-key allowlist.
+They run at admission so a bad definition is refused before any write; the
+snapshot re-runs the fragment gates inside the insert.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ def admit_inline_expert(
     from orchestrator.services.manifest_execution_snapshot import (
         validate_srw_authored_fragment,
     )
+    from orchestrator.services.manifest_experts import refuse_contradicting_extends
     from orchestrator.services.manifest_runtime_ownership import (
         require_srw_launch_configuration,
     )
@@ -69,6 +71,13 @@ def admit_inline_expert(
     config_name = private.get("config_name")
     if config_name is not None:
         config_name = validated_config_name(config_name)
+    # Without a config_name the work's role base is the base (see above).
+    refuse_contradicting_extends(
+        private.get("config"),
+        config_name=config_name,
+        expert_type=role,
+        layers=private.get("layers", []),
+    )
     asset_name = private.get("asset_name")
     if asset_name is not None:
         try:

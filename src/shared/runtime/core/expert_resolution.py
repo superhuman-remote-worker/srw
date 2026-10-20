@@ -261,6 +261,95 @@ def expert_layer_source(row: dict) -> str:
     return f"db-expert:{row.get('name') or row.get('id') or '?'}"
 
 
+#: The loader's inheritance directive. A saved Expert's base is its
+#: ``spec.runtime.config.config_name`` (``harness_config_name`` on the row) and
+#: its fragment is merged ONTO that base, so a ``$extends`` inside the fragment
+#: is not a link: nothing follows it. It may restate the base (account copies
+#: carry ``$extends: worker_base`` beside ``config_name: worker_base``, and so
+#: does every shipped manifest) but never name another one —
+#: :func:`extends_contradiction` is the save-time refusal, and
+#: :func:`build_expert_config` drops the key before the merge so it never rides
+#: into the resolved config as a literal.
+EXTENDS_KEY = "$extends"
+
+
+def role_base_name(expert_type: str | None) -> str:
+    """The base an Expert without a ``config_name`` resolves on: its role's root
+    (the default ``manifest_experts.expert_manifest`` persists)."""
+    return "session_base" if expert_type == "session" else "worker_base"
+
+
+def same_config_base(left: str, right: str) -> bool:
+    """Whether two config selectors name one base as the resolver reads it.
+
+    Every chain root (``worker_base`` / ``session_base`` / ``subagent_base`` /
+    ``expert_base`` and their aliases) is the same base: ``resolve_config``
+    re-roots any of them onto the overlay of the role the work runs in
+    (``reroot_extends``). Any other selector is the same base as another when
+    both canonicalise to one name or resolve to one installed file
+    (``receptionist`` and ``experts/receptionist``).
+    """
+    from pathlib import Path
+
+    from shared.runtime.core.loader import (
+        ROOT_NAMES,
+        canonical_config_name,
+        resolve_config_path,
+    )
+
+    a, b = canonical_config_name(str(left)), canonical_config_name(str(right))
+    if a in ROOT_NAMES or b in ROOT_NAMES:
+        return a in ROOT_NAMES and b in ROOT_NAMES
+    if a == b:
+        return True
+    try:
+        return (
+            Path(resolve_config_path(a)[0]).resolve()
+            == Path(resolve_config_path(b)[0]).resolve()
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def extends_contradiction(
+    fragment: Any,
+    config_name: str | None,
+    *,
+    expert_type: str | None = None,
+    label: str = "config",
+) -> str | None:
+    """The refusal for a fragment whose ``$extends`` names another base.
+
+    ``config_name`` is the Expert's base (absent: its role's root, see
+    :func:`role_base_name`). Returns ``None`` when the fragment has no
+    ``$extends``, an empty one, or one naming the same base
+    (:func:`same_config_base`); otherwise the message the save path answers
+    with. ``label`` names the fragment in that message (``config`` or
+    ``layers[0]``). Pure: never raises, never mutates.
+    """
+    if not isinstance(fragment, dict) or EXTENDS_KEY not in fragment:
+        return None
+    named = fragment[EXTENDS_KEY]
+    if named is None or named == "":
+        return None
+    named = str(named)
+    base = str(config_name) if config_name else role_base_name(expert_type)
+    if same_config_base(named, base):
+        return None
+    return (
+        f"{label}.$extends names {named} but the expert's base "
+        f"(spec.runtime.config.config_name) is {base}; "
+        f"set config_name: {named} to extend it."
+    )
+
+
+def _without_extends(fragment: Any) -> Any:
+    """``fragment`` minus its ``$extends`` (a new dict; the row is never mutated)."""
+    if not isinstance(fragment, dict) or EXTENDS_KEY not in fragment:
+        return fragment
+    return {key: value for key, value in fragment.items() if key != EXTENDS_KEY}
+
+
 def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     """Merge a DB expert fragment onto its expert_type base (RFC 7396 via
     deep_merge). Returns (merged_config_dict, prompts_dict). Tolerates JSONB
@@ -300,6 +389,10 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     # (``_db_prompt_keys`` and friends): those belong to the resolver that
     # marks this row's prompts as DB-authored, never to the row itself.
     config = strip_loader_owned_keys(config)
+    # The base was chosen by ``config_name`` before this merge; a ``$extends``
+    # here restates it (contradicting ones are refused at save) and would
+    # otherwise land in the agent config as an unknown ``extra`` key.
+    config = _without_extends(config)
     merged = deep_merge(base, config)
     layers = row.get("harness_config_layers", [])
     if not isinstance(layers, list) or any(
@@ -316,7 +409,7 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
                 source=source,
             )
         )
-        merged = deep_merge(merged, layer)
+        merged = deep_merge(merged, _without_extends(layer))
     merged.pop("connections", None)  # belt-and-braces; deny-scan already ran at save
     return merged, prompts
 

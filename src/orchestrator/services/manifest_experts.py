@@ -67,6 +67,52 @@ def _object(value: Any) -> dict[str, Any]:
     return deepcopy(value)
 
 
+def refuse_contradicting_extends(
+    config: Any,
+    *,
+    config_name: str | None,
+    expert_type: str | None = None,
+    layers: Any = (),
+) -> None:
+    """422 when an authored Expert's ``$extends`` names a base other than its own.
+
+    The base is ``config_name`` (absent: the role's root); the private config
+    and layers merge onto it and never follow a ``$extends`` of their own. A
+    ``$extends`` that restates the base stays allowed. Save paths only: stored
+    rows still resolve exactly as before (the resolver drops the key).
+    """
+    from shared.runtime.core.expert_resolution import extends_contradiction
+
+    fragments = [("config", config)]
+    if isinstance(layers, list):
+        fragments += [(f"layers[{index}]", layer) for index, layer in enumerate(layers)]
+    for label, fragment in fragments:
+        message = extends_contradiction(
+            fragment, config_name, expert_type=expert_type, label=label
+        )
+        if message:
+            raise HTTPException(422, message)
+
+
+def refuse_contradicting_spec_extends(
+    spec: Any, *, expert_type: str | None = None
+) -> None:
+    """:func:`refuse_contradicting_extends` for an authored Expert manifest spec
+    (an applied document, a Project's inline Expert or a Job's inline Expert)."""
+    runtime = spec.get("runtime") if isinstance(spec, dict) else None
+    if not isinstance(runtime, dict) or runtime.get("adapter") != SRW_HARNESS_ADAPTER:
+        return
+    private = runtime.get("config")
+    if not isinstance(private, dict):
+        return
+    refuse_contradicting_extends(
+        private.get("config"),
+        config_name=private.get("config_name"),
+        expert_type=expert_type,
+        layers=private.get("layers", ()),
+    )
+
+
 def expert_resource_name(row: dict[str, Any]) -> str:
     """Preserve ordinary names; disambiguate legacy underscores/long names."""
     name = str(row["name"])

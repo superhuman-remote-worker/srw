@@ -47,6 +47,23 @@ from orchestrator.services.expert_catalog_contracts import (
 logger = logging.getLogger(__name__)
 
 
+def _refuse_contradicting_extends(
+    config: Any, source: dict[str, Any], *, expert_type: str | None
+) -> None:
+    """422 when the fragment's ``$extends`` names a base other than the one the
+    saved Expert resolves on: ``source``'s ``harness_config_name`` (a copy
+    keeps its source's base; a new row has none) or the role's root. Copies
+    also carry ``source``'s private layers."""
+    from orchestrator.services.manifest_experts import refuse_contradicting_extends
+
+    refuse_contradicting_extends(
+        config,
+        config_name=source.get("harness_config_name"),
+        expert_type=expert_type,
+        layers=source.get("harness_config_layers") or [],
+    )
+
+
 def default_expert_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if not row:
         return None
@@ -182,6 +199,7 @@ class ExpertAuthoringService:
 
         if body.config:
             body.config = self.catalog.validate_expert_fragment(body.config)
+            _refuse_contradicting_extends(body.config, {}, expert_type=body.expert_type)
             await self.catalog.require_visible_roster_refs(body.config, user=user)
         await write_policy.enforce_save(body.config or {}, user=user)
         try:
@@ -229,6 +247,13 @@ class ExpertAuthoringService:
             )
         if body.config is not None:
             body.config = self.catalog.validate_expert_fragment(body.config)
+            # Only the authored fragment is checked: the row keeps its base and
+            # private layers, and a metadata-only edit never reaches here.
+            _refuse_contradicting_extends(
+                body.config,
+                {"harness_config_name": existing.get("harness_config_name")},
+                expert_type=existing.get("expert_type"),
+            )
             await self.catalog.require_visible_roster_refs(body.config, user=user)
         await write_policy.enforce_save(body.config or {}, user=user)
         fields = body.model_dump(exclude_unset=True)
@@ -308,6 +333,9 @@ class ExpertAuthoringService:
         # `_bundled_expert_bundle` and `_db_expert_to_bundle_src` build a fresh
         # dict, so assigning into `src` cannot corrupt a cache or the source row.
         src["config"] = self.catalog.validate_expert_fragment(src.get("config") or {})
+        _refuse_contradicting_extends(
+            src["config"], src, expert_type=src.get("expert_type")
+        )
         # Fifth of five expert-write routes. The other four call
         # _enforce_expert_save right after validating theirs — the kill-switch
         # half of that is NOT optional here just because the row already existed:
@@ -373,6 +401,7 @@ class ExpertAuthoringService:
 
         if body.config:
             body.config = self.catalog.validate_expert_fragment(body.config)
+            _refuse_contradicting_extends(body.config, {}, expert_type=body.expert_type)
             await self.catalog.require_visible_roster_refs(body.config, user=user)
         await write_policy.enforce_save(body.config or {}, user=user)
         name = body.name
@@ -532,6 +561,9 @@ class ExpertAuthoringService:
 
         source["config"] = self.catalog.validate_expert_fragment(
             source.get("config") or {}
+        )
+        _refuse_contradicting_extends(
+            source["config"], source, expert_type=source.get("expert_type")
         )
         source["prompts"] = (
             validate_expert_prompt_source_or_422(source.get("prompts") or {}) or {}
