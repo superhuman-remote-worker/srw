@@ -1164,7 +1164,7 @@ matches the chart's `appVersion`, which exists only for released charts.
 
 ### Container startup stage rollout
 
-`orchestrator.containerStartupStageAuthority.enabled` defaults to `false`
+`orchestrator.containerStartupStageAuthority.enabled` defaults to `true`
 (`CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED`). It admits version-1 container
 startup receipts for Jobs and stateless Sessions. Scheduling waits do not spend
 readiness, image-pull or SSH budgets. The exact Pod's scheduling transition starts
@@ -1175,8 +1175,10 @@ with the exit code (`container_exited`); a container the cluster stopped
 (for example `OOMKilled`, an evicted Pod or `ContainerStatusUnknown`) still waits for the budget. A Job's execution
 deadline remains independent and can cancel it while it waits for capacity.
 
-Deploy the capable application and migrations `0309`/`0310` with this value off
-first. Before enabling it in a separate rollout, verify that every pre-bridge
+The capable application and migrations `0309`/`0310` shipped in v0.0.29. An
+installation on v0.0.29 or later can take the default as is. Upgrading from
+v0.0.28 or older, deploy the new version with this value set to `false` first.
+Before enabling it in a separate rollout, verify that every pre-bridge
 orchestrator Pod UID and process is gone, including detached Job workspace
 creators and Session creation callbacks. Ready replica counts, dispatcher drain
 and lease expiry alone do not prove those older writers have stopped. The chart
@@ -1190,8 +1192,9 @@ the new observer does not reopen them or issue a second Pod create.
 
 Stateless Session workspace upgrades (`virtual`/`none` → container) need this
 value on: without it a Pod that never becomes Ready has no terminal state, so
-`/connection` doesn't offer the upgrade and a request answers 409. Turn it on
-together with `agent.stateless.enabled`, after the two-stage activation above.
+`/connection` doesn't offer the upgrade and a request answers 409. Both are on
+by default; keep them on together. `agent.stateless.enabled: false` keeps
+every Session pinned.
 Stateless Sessions upgrade to a VM by moving to a dedicated agent, so keep
 pinned agent provisioning (the warm pool or fresh Pods) available when
 `agent.stateless.enabled` is on. In production, turn stateless Sessions on

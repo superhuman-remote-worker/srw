@@ -551,12 +551,14 @@ orchestrator:
   # generation admitted before the flag closes may finish without stranding
   # its process-zero/maintenance fence.
   workspaceCleanupReconciliationEnabled: false
-  # -- Admit container startup v1 receipts only after the capable bridge and
-  # migrations 0309/0310 are deployed and all pre-bridge orchestrator processes
-  # and their in-flight creators are gone. Disable to stop new adoption;
-  # existing v1 work continues. Roll back only to a v1-capable image.
+  # -- On by default: admits container startup v1 receipts (the capable bridge
+  # and migrations 0309/0310 shipped in v0.0.29). Upgrading from v0.0.28 or
+  # older, set it false for that upgrade and enable it in a second rollout once
+  # every pre-bridge orchestrator process and in-flight creator is gone (README,
+  # "Container startup stage rollout"). Disable to stop new adoption; existing
+  # v1 work continues. Roll back only to a v1-capable image.
   containerStartupStageAuthority:
-    enabled: false
+    enabled: true
   # -- One-release coordinated cutover for the 0197/0198 workspace lifecycle
   # authority epoch. Keep true while advancing the ServiceAccount generation:
   # the namespace RoleBinding revokes the predecessor account and Recreate
@@ -1109,11 +1111,12 @@ agent:
   # plane: the pods carry distinct class labels so the agent Service/PDB,
   # reap/scale sweeps, and per-session routing never touch them.
   stateless:
-    # -- DEFAULT OFF (prod-safe). This renders the executor pool and opens
-    # stateless admission for supported session workspace tiers. Disabled
-    # preserves pinned session behavior. VM/remote tiers remain pinned/refused
-    # even when enabled.
-    enabled: false
+    # -- On by default. This renders the executor pool and opens stateless
+    # admission for supported session workspace tiers; their Sessions upgrade
+    # in place to a container (needs orchestrator.containerStartupStageAuthority,
+    # also on by default) or to a VM (a dedicated agent). Off keeps every
+    # Session pinned. VM/remote tiers remain pinned/refused even when enabled.
+    enabled: true
     # -- Warm floor of executor pods (§5.8: interactive floor ≥ 2). KEDA/HPA
     # autoscaling is a later, separately-gated addition.
     replicas: 2

@@ -67,8 +67,11 @@ def test_stateless_worker_gate_is_independent_and_default_off() -> None:
     # validate the KEDA ScaledObject against its CRD schema -- a rendering
     # convenience, not the product default -- so that overlay can no longer
     # answer "what does a stock install do?".
+    # Stateless Sessions are on by default since 2026-10-21; the worker gate
+    # and autoscaling stay off independently.
     defaults = yaml.safe_load((CHART / "values.yaml").read_text())
-    assert defaults["agent"]["stateless"]["enabled"] is False
+    assert defaults["agent"]["stateless"]["enabled"] is True
+    assert defaults["agent"]["stateless"]["worker"]["enabled"] is False
     assert defaults["agent"]["stateless"]["autoscaling"]["enabled"] is False
 
     config_map = _only_kind(

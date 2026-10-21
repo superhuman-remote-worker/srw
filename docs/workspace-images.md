@@ -270,9 +270,9 @@ project template, write `scope: {kind: Project, name: <project UUID>}`.
 
 **Try a new image with a Job first.** A Job shows more about why its workspace
 didn't start; see [When it doesn't start](#when-it-doesnt-start). A Session may
-show nothing. On a default installation a container Session has no workspace
-status line at all. Where your operator runs Sessions on stateless executors
-(`agent.stateless.enabled`) without startup-stage tracking, it keeps saying
+show nothing. A container Session on a pinned agent (`agent.stateless.enabled:
+false`) has no workspace status line at all. Where your operator runs stateless
+Sessions (the default) with startup-stage tracking turned off, it keeps saying
 "Checking workspace scheduling; the result is not yet confirmed." You can still
 End a Session whose image can't be pulled when it first starts. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
@@ -305,8 +305,8 @@ have your tools either. See
 | A cloud folder of a Session is shown as left out. | SRW did not mount it at all: no level it may have is offered on this tier, it is beside a protected folder, its own cloud account is not ready, My cloud is not connected… The Session names the reason; nothing is mounted in its place. | See [When a folder is left out](cloud-folders.md#when-a-folder-is-left-out). |
 | "command not found" for a tool your Dockerfile installed. | It was installed under `/home/agent-host`, which the workspace volume hides, for example by `npm` without unsetting `npm_config_prefix`. Or it is in a directory your Dockerfile added to `PATH` with `ENV`, which the agent's SSH sessions don't inherit. | Install system-wide, as in step 2. For a `PATH` entry, run `write-agent-environment` after your `ENV` lines. |
 
-Startup stages are reported when the operator enables Helm
-`orchestrator.containerStartupStageAuthority.enabled` (off by default); see
+Startup stages are reported while Helm
+`orchestrator.containerStartupStageAuthority.enabled` is on (the default); see
 [Container startup stage rollout](../helm/README.md#container-startup-stage-rollout).
 
 An operator can read a Job's pod status and events with

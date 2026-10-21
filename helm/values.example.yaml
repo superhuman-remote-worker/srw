@@ -65,10 +65,10 @@ orchestrator:
   kbGitAllowedHosts: ""
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
-  # First deploy the capable bridge with this off. Enable only after proving
-  # all pre-bridge processes/creators are gone; existing v1 work continues off.
+  # On by default. Upgrading from v0.0.28 or older: set it false for that
+  # upgrade, then enable it once all pre-bridge processes/creators are gone.
   containerStartupStageAuthority:
-    enabled: false
+    enabled: true
   vmProvisioning:
     creationRetryEnabled: false
     rootdiskStallTimeoutSeconds: 2700
