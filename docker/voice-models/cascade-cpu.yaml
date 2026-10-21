@@ -1,0 +1,30 @@
+# The `cascade-cpu` test profile for the servers in compose.yaml
+# (local_voice_gateway.md §4.3). In a gateway config it goes under
+# `profiles:`; scripts/voice_cascade_try.py and voice_cascade_eval.py read
+# this file directly. Local servers need no key; a hosted stage takes
+# `api_key_file: /absolute/path`.
+cascade-cpu:
+  engine: cascade
+  language: de
+  stt:
+    base_url: http://127.0.0.1:18450/v1
+    model: Systran/faster-whisper-small
+  llm:
+    base_url: http://127.0.0.1:18451/v1
+    model: gemma-4-12b-it
+    temperature: 0.3
+    max_tokens: 300
+    # Thinking is off on the server (--reasoning-budget 0). Do not also send
+    # chat_template_kwargs.enable_thinking: false: with it, Gemma 4 loops on
+    # empty thought markers in longer calls and answers nothing.
+  tts:
+    base_url: http://127.0.0.1:18452/v1
+    model: de_DE-mls-medium
+    # An MLS speaker id; 10 reads at a natural pace and survives G.711.
+    voice: "10"
+    # The rate comes in the WAV header (22.05 kHz); the engine resamples.
+    response_format: wav
+  # Silero v6.2.3 instead of the v6.0 bundled with Pipecat: an absolute path
+  # in a gateway config; the scripts fill it in from the models directory.
+  # turn:
+  #   vad_model_file: /models/vad/silero_vad-v6.2.3.onnx

@@ -1,0 +1,96 @@
+# Model servers for the voice gateway's `cascade-cpu` test profile
+# (local_voice_gateway.md §4.3, §6.2). Fetch the pinned models first:
+#   python docker/voice-models/models.py fetch
+#   docker compose -f docker/voice-models/compose.yaml up -d
+# Details, licences and the SELinux/GPU notes: docker/voice-models/README.md.
+name: srw-voice-models
+
+services:
+  # STT: faster-whisper behind Speaches' OpenAI-compatible API, on the CPU.
+  # Offline: it only reads the pinned snapshot in the HF cache.
+  speech:
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu@sha256:21e3df06d842fb7802ab470dd77c25f0e8c0d22950e8d8c6ae886e851af53ef8
+    user: "${VOICE_MODELS_UID:-1000}:${VOICE_MODELS_GID:-1000}"
+    environment:
+      HOME: /tmp
+      HF_HUB_CACHE: /hf
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      DO_NOT_TRACK: "1"
+      # Speaches logs transcriptions at debug.
+      LOG_LEVEL: warning
+      ENABLE_UI: "false"
+      WHISPER__COMPUTE_TYPE: int8
+      WHISPER__CPU_THREADS: "${VOICE_STT_THREADS:-8}"
+      # Keep the model loaded.
+      WHISPER__TTL: "-1"
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/hf:/hf:z
+    ports:
+      - "127.0.0.1:${VOICE_SPEECH_PORT:-18450}:8000"
+    restart: unless-stopped
+
+  # TTS: Piper with a chosen MLS speaker (Speaches always takes the first,
+  # which reads at half speed). Build: see Dockerfile.piper.
+  tts:
+    image: srw-voice-piper:2023.11.14-2
+    build:
+      context: .
+      dockerfile: Dockerfile.piper
+    environment:
+      PIPER_MODEL: /models/de_DE-mls-medium.onnx
+      PIPER_SPEAKER: "${VOICE_TTS_SPEAKER:-10}"
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/piper:/models:ro,z
+    ports:
+      - "127.0.0.1:${VOICE_TTS_PORT:-18452}:8000"
+    restart: unless-stopped
+
+  # The voice LLM: llama.cpp's server on an AMD (or any Vulkan) GPU. Pass
+  # only the card's render node, or llama.cpp also splits onto an iGPU.
+  # SELinux keeps containers off /dev/dri unless labels are off for this one.
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b11459@sha256:815720cb50a090db0c1d48b6e3b2b4ca656c3b99409cf4f31e63ff154ce586c4
+    # Same path inside: libdrm finds the card's sysfs entry by the node name.
+    devices:
+      - "${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}:${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}"
+    security_opt:
+      - label=disable
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/llm:/models:ro
+    command: &llm-args
+      - --model
+      - /models/${VOICE_LLM_MODEL:-gemma-4-12b-it-qat-q4_0.gguf}
+      - --alias
+      - ${VOICE_LLM_ALIAS:-gemma-4-12b-it}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-gpu-layers
+      - "999"
+      - --ctx-size
+      - "${VOICE_LLM_CONTEXT:-16384}"
+      - --parallel
+      - "${VOICE_LLM_SLOTS:-1}"
+      # The model's own chat template (tool calls), thinking off.
+      - --jinja
+      - --reasoning-budget
+      - "0"
+      # The prompt cache (on by default) keeps each call's fixed prefix;
+      # --cache-reuse does not work with Gemma's sliding-window attention.
+    ports:
+      - "127.0.0.1:${VOICE_LLM_PORT:-18451}:8080"
+    restart: unless-stopped
+
+  # Fallback without a GPU: the same server on the CPU (`--profile cpu`,
+  # stop `llm` first). A 12B model answers in seconds there; point
+  # VOICE_LLM_MODEL at a smaller GGUF for function tests.
+  llm-cpu:
+    profiles: [cpu]
+    image: ghcr.io/ggml-org/llama.cpp:server-b11459@sha256:33868c035b21dc63f7c60b7438774283fd99215bc319114eb03de5df4ce7cd6b
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/llm:/models:ro,z
+    command: *llm-args
+    ports:
+      - "127.0.0.1:${VOICE_LLM_PORT:-18451}:8080"
