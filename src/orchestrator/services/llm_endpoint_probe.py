@@ -41,9 +41,21 @@ class ProbeResult:
 
 
 def _is_live_voice_id(name: str) -> bool:
-    """A live (full-duplex voice) model: never a chat row, so it is
-    classified before the chat fallback."""
+    """A live (full-duplex voice) model by its name: never a chat row, so it
+    is classified before the chat fallback."""
     return "gpt-live" in name or "realtime" in name
+
+
+def declares_live_voice(item: Any) -> bool:
+    """A model listing entry that says it is a live voice model.
+
+    SRW's voice gateway lists each profile with ``"capabilities":
+    ["live_voice"]``: a profile's id is the operator's name for it and need
+    not contain ``gpt-live`` or ``realtime``. Only this declaration is
+    honoured; other servers' capability vocabularies differ from the
+    catalog's."""
+    capabilities = item.get("capabilities") if isinstance(item, dict) else None
+    return isinstance(capabilities, list) and "live_voice" in capabilities
 
 
 def _capability_hint(model_id: str) -> str:
@@ -210,7 +222,11 @@ async def probe_endpoint_models(
             {
                 "id": model_id,
                 "owned_by": owned_by,
-                "capability_hints": _capability_hints(model_id),
+                "capability_hints": (
+                    ["live_voice"]
+                    if declares_live_voice(item)
+                    else _capability_hints(model_id)
+                ),
                 "family": family,
                 "context_window": context_window,
             }

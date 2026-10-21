@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from orchestrator.services import family_matcher
+from orchestrator.services.llm_endpoint_probe import declares_live_voice
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,8 @@ def _is_multimodal_chat(model_id: str) -> bool:
 def _capability_from_model_id(model_id: str) -> str:
     """Best-effort PRIMARY capability guess from a provider model ID.
 
-    Heuristics, evaluated top-down:
+    Heuristics, evaluated top-down (a listing entry that declares
+    ``live_voice`` skips them, see :func:`_candidate_from_id`):
     - ``gpt-live``/``realtime`` substring → ``live_voice``
     - ``embedding`` substring → ``embedding``
     - ``whisper`` substring → ``whisper``
@@ -152,7 +154,7 @@ def _capabilities_from_model_id(model_id: str) -> list[str]:
 
 
 def _candidate_from_id(
-    model_id: str, *, display_label: str | None = None
+    model_id: str, *, display_label: str | None = None, live_voice: bool = False
 ) -> dict[str, Any]:
     """Wrap a provider-native model ID in the shape the cockpit expects.
 
@@ -167,7 +169,9 @@ def _candidate_from_id(
         "model_id": model_id,
         "detected_family": detection.family,
         "supported": detection.family != "default",
-        "suggested_capabilities": _capabilities_from_model_id(model_id),
+        "suggested_capabilities": (
+            ["live_voice"] if live_voice else _capabilities_from_model_id(model_id)
+        ),
         "suggested_display_label": display_label or model_id,
     }
 
@@ -182,7 +186,7 @@ async def _fetch_openai(api_key: str) -> list[dict[str, Any]]:
         resp.raise_for_status()
         data = resp.json().get("data") or []
     return [
-        _candidate_from_id(item["id"])
+        _candidate_from_id(item["id"], live_voice=declares_live_voice(item))
         for item in data
         if isinstance(item, dict) and item.get("id")
     ]
@@ -198,7 +202,7 @@ async def _fetch_groq(api_key: str) -> list[dict[str, Any]]:
         resp.raise_for_status()
         data = resp.json().get("data") or []
     return [
-        _candidate_from_id(item["id"])
+        _candidate_from_id(item["id"], live_voice=declares_live_voice(item))
         for item in data
         if isinstance(item, dict) and item.get("id")
     ]
@@ -268,7 +272,7 @@ async def _fetch_mistral(api_key: str) -> list[dict[str, Any]]:
         resp.raise_for_status()
         data = resp.json().get("data") or []
     return [
-        _candidate_from_id(item["id"])
+        _candidate_from_id(item["id"], live_voice=declares_live_voice(item))
         for item in data
         if isinstance(item, dict) and item.get("id")
     ]

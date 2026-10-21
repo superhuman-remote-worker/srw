@@ -7,14 +7,21 @@ from it: the instructions (persona, facts, then SRW's short rules, which come
 last so they win), the exact greeting instruction, the voice and the no-job
 fallback text. The engine model comes from the connector.
 
+The voice: the expert's ``live.voice``; else the line's catalog row's
+``params.voice`` (Admin → Models offers it for a ``live_voice`` row; see
+:func:`with_default_voice`); else :data:`DEFAULT_VOICE`, a GPT-Live voice. An
+engine that does not know the name (SRW's voice gateway) maps it to its own
+default.
+
 An expert without such an entry cannot run a live job (a phone job with
 nothing that can talk): admission refuses it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from shared.runtime.live.contract import MAX_APPEND_CHARS
@@ -26,15 +33,19 @@ __all__ = [
     "LiveVoice",
     "LiveVoiceError",
     "build_live_voice",
+    "catalog_voice",
     "find_live_entry",
     "greeting_instruction",
     "live_voice_of",
     "session_instructions",
+    "with_default_voice",
 ]
 
 #: The engine's instruction budget (16k tokens at three characters each).
 MAX_INSTRUCTION_CHARS = 16_000 * 3
 MAX_GREETING_CHARS = MAX_APPEND_CHARS
+#: GPT-Live's voice, when neither the expert nor the line's catalog row names
+#: one (the pod falls back to it for an empty voice too).
 DEFAULT_VOICE = "marin"
 LIVE_VOICE_RULES = """## Rules for this conversation
 You are an AI assistant speaking with a person on a live call.
@@ -57,6 +68,9 @@ class LiveVoice:
     greeting_instruction: str
     voice: str
     fallback: str
+    #: The expert named ``voice``; otherwise it is :data:`DEFAULT_VOICE` and
+    #: the line's catalog row may name another (:func:`with_default_voice`).
+    voice_named: bool = True
 
 
 def find_live_entry(agent: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]] | None:
@@ -108,7 +122,8 @@ def build_live_voice(name: str, entry: Mapping[str, Any]) -> LiveVoice:
     greeting = live.get("greeting")
     if not isinstance(greeting, str) or not greeting.strip():
         raise LiveVoiceError(f"The live voice entry {name!r} has no greeting")
-    voice = live.get("voice") or DEFAULT_VOICE
+    named = live.get("voice")
+    voice = named or DEFAULT_VOICE
     if not isinstance(voice, str):
         raise LiveVoiceError("live.voice is a voice name")
     texts = live.get("texts") if isinstance(live.get("texts"), Mapping) else {}
@@ -125,7 +140,27 @@ def build_live_voice(name: str, entry: Mapping[str, Any]) -> LiveVoice:
         greeting_instruction=greeting_instruction(greeting.strip()),
         voice=voice,
         fallback=fallback.strip()[:MAX_APPEND_CHARS],
+        voice_named=bool(named),
     )
+
+
+def catalog_voice(row: Mapping[str, Any] | None) -> str | None:
+    """The default voice a ``live_voice`` catalog row names (``params.voice``)."""
+    params = (row or {}).get("params_json")
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return None
+    voice = params.get("voice") if isinstance(params, Mapping) else None
+    return voice.strip() if isinstance(voice, str) and voice.strip() else None
+
+
+def with_default_voice(voice: LiveVoice, default: str | None) -> LiveVoice:
+    """``voice`` with the line's catalog default when the expert named none."""
+    if voice.voice_named or not default:
+        return voice
+    return replace(voice, voice=default)
 
 
 def live_voice_of(agent: Mapping[str, Any]) -> LiveVoice:

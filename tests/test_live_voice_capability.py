@@ -123,3 +123,67 @@ async def test_the_ledger_prices_gpt_live_until_a_rate_is_configured():
     await record_session_usage(ledger, Mock(), session)
     event = ledger.record_events.await_args.args[0][0]
     assert event.rate_usd is None  # the configured rate is snapshotted
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_prices_a_model_by_its_catalog_rows_rate():
+    """A voice gateway profile prices at its row's rate (0, or an operator's
+    rate the chart seeds); a configured rate still wins; a model with neither
+    a row rate nor a list price stays unpriced."""
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from unittest.mock import AsyncMock, Mock
+
+    from orchestrator.services.live.ledger import record_session_usage
+
+    def session(model: str) -> dict:
+        return {
+            "id": "00000000-0000-0000-0000-0000000000ab",
+            "model": model,
+            "usage_seconds": 120,
+            "ended_at": datetime(2026, 10, 21, tzinfo=timezone.utc),
+            "job_id": None,
+        }
+
+    def ledger(configured=None) -> Mock:
+        found = Mock(is_available=True)
+        found.resolve_rate = AsyncMock(return_value=configured)
+        found.record_events = AsyncMock(return_value=1)
+        return found
+
+    def db(params) -> Mock:
+        found = Mock()
+        found.resolve_catalog_model = AsyncMock(
+            return_value=None if params is None else {"params_json": params}
+        )
+        return found
+
+    async def event(model, params, configured=None):
+        books = ledger(configured)
+        await record_session_usage(books, db(params), session(model))
+        return books.record_events.await_args.args[0][0]
+
+    zero = await event(
+        "cascade-cpu", {"adapter": "openai-live", "rate_usd_per_minute": 0}
+    )
+    assert (zero.rate_usd, zero.cost_usd) == (Decimal(0), Decimal(0))
+    rated = await event("cascade-gpu", '{"rate_usd_per_minute": "0.03"}')
+    assert rated.cost_usd == Decimal("0.06")
+    # The row's rate replaces the list price of a GPT-Live row too.
+    assert (
+        await event("gpt-live-1", {"rate_usd_per_minute": 0.06})
+    ).cost_usd == Decimal("0.12")
+    configured = await event("cascade-cpu", {"rate_usd_per_minute": 0}, Decimal("1"))
+    assert configured.rate_usd is None and configured.cost_usd is None
+    for unusable in (
+        {},
+        {"rate_usd_per_minute": -1},
+        {"rate_usd_per_minute": True},
+        {"rate_usd_per_minute": "x"},
+        {"rate_usd_per_minute": "NaN"},
+        None,
+    ):
+        unpriced = await event("cascade-cpu", unusable)
+        assert unpriced.rate_usd is None and unpriced.cost_usd is None
+    # Without a row rate, a GPT-Live row keeps its list price.
+    assert (await event("gpt-live-1", {})).cost_usd == Decimal("0.10")

@@ -1488,6 +1488,22 @@ GPT_LIVE_SIP_SPEC = DriverSpec(
                 "maxLength": 512,
                 "pattern": "^(sip|tel):",
             },
+            # When the pod sends the exact greeting after accept, and when it
+            # re-sends it once if the engine has not spoken by then (0: never).
+            # GPT-Live needs the wait; an engine that speaks an exact greeting
+            # at once (SRW's voice gateway) can take 0 for both.
+            "greeting_delay_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000,
+                "default": 1500,
+            },
+            "greeting_retry_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 30000,
+                "default": 2500,
+            },
             # Server-derived from the model's endpoint: the pod's egress.
             "api_host": _MIRROR,
             "api_port": {"type": "integer", "readOnly": True},

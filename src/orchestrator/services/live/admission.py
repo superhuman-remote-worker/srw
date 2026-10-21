@@ -31,7 +31,9 @@ from fastapi import HTTPException
 from orchestrator.services.live.instructions import (
     LiveVoice,
     LiveVoiceError,
+    catalog_voice,
     live_voice_of,
+    with_default_voice,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError
 from orchestrator.services.live.store import LiveSessionStore
@@ -152,6 +154,21 @@ async def resolve_live_voice(
     return live_voice_of(blob.get("agent") or {})
 
 
+async def line_default_voice(db: Any, connector: dict[str, Any]) -> str | None:
+    """The voice the line's ``live_voice`` catalog row names, if any.
+
+    Never fails admission: an unreadable row leaves the built-in default."""
+    model = (connector.get("config") or {}).get("model")
+    if not isinstance(model, str) or not model:
+        return None
+    try:
+        row = await db.resolve_catalog_model(model, capability="live_voice")
+    except Exception:
+        logger.warning("Live admission: the catalog row of %s was not read", model)
+        return None
+    return catalog_voice(row)
+
+
 async def prepare_live_session(
     *,
     command: Any,
@@ -197,6 +214,10 @@ async def prepare_live_session(
         )
     except LiveVoiceError as exc:
         raise HTTPException(422, str(exc)) from None
+    if not voice.voice_named:
+        voice = with_default_voice(
+            voice, await line_default_voice(dependencies.db, connector)
+        )
     sessions = LiveSessionStore(dependencies.db)
     async with dependencies.db.acquire() as conn:
         session = await sessions.ensure_session(

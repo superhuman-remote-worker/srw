@@ -76,3 +76,31 @@ async def test_json_error_body_stays_verbatim(serve):
     assert result.ok is False
     assert result.status == 401
     assert result.error == '{"error":{"message":"Invalid API key"}}'
+
+
+@pytest.mark.asyncio
+async def test_a_declared_live_voice_model_needs_no_name_hint(serve):
+    """SRW's voice gateway lists each profile with capabilities [live_voice]:
+    a profile's id is the operator's name and need not say gpt-live or
+    realtime. Any other declaration is the server's own vocabulary and is
+    not taken over."""
+    serve(
+        httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "cascade-cpu", "capabilities": ["live_voice"]},
+                    {"id": "llava-13b", "capabilities": ["completion", "vision"]},
+                    {"id": "gpt-live-1"},
+                ],
+            },
+        )
+    )
+    result = await probe_endpoint_models("http://gateway.test/v1", "k")
+    hints = {model["id"]: model["capability_hints"] for model in result.models}
+    assert hints == {
+        "cascade-cpu": ["live_voice"],
+        "llava-13b": ["chat", "auxiliary"],
+        "gpt-live-1": ["live_voice"],
+    }

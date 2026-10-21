@@ -109,6 +109,7 @@ class Gateway:
         self.app = web.Application(
             middlewares=[errors, self.authorize], client_max_size=1024 * 1024
         )
+        self.app.router.add_get("/v1/models", self.models)
         self.app.router.add_post("/v1/live/sessions/{sid}/{action}", self.control)
         self.app.router.add_get("/v1/live/sessions/{sid}/attach", self.attach)
         if config.test_control:
@@ -160,6 +161,25 @@ class Gateway:
                 await session.close("connection_lost")
         await asyncio.gather(
             *(ws.close() for ws in tuple(self.sockets)), return_exceptions=True
+        )
+
+    async def models(self, request: web.Request) -> web.Response:
+        """The profiles as an OpenAI-style model list, each declaring
+        ``live_voice``: SRW's Admin → Models tests the endpoint and imports
+        the profiles from it, whatever they are named."""
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": name,
+                        "object": "model",
+                        "owned_by": "srw-voice-gateway",
+                        "capabilities": ["live_voice"],
+                    }
+                    for name in sorted(self.config.profiles)
+                ],
+            }
         )
 
     def spawn(self, coroutine) -> None:

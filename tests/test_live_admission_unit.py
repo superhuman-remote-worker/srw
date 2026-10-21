@@ -48,10 +48,12 @@ from orchestrator.services.live.instructions import (
     LiveVoice,
     LiveVoiceError,
     build_live_voice,
+    catalog_voice,
     find_live_entry,
     greeting_instruction,
     live_voice_of,
     session_instructions,
+    with_default_voice,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError, pod_endpoint
 from shared.runtime.live.contract import MAX_APPEND_CHARS, SessionStatus
@@ -193,6 +195,39 @@ class TestBuildLiveVoice:
     def test_an_unusable_entry_is_refused(self, entry, message):
         with pytest.raises(LiveVoiceError, match=message):
             build_live_voice("voice", entry)
+
+
+class TestDefaultVoice:
+    """The expert's voice, else the line's catalog row's ``params.voice``
+    (Admin → Models offers it), else GPT-Live's ``marin``."""
+
+    def test_an_unnamed_voice_is_the_built_in_default(self):
+        voice = build_live_voice("voice", _entry())
+        assert (voice.voice, voice.voice_named) == (DEFAULT_VOICE, False)
+        named = build_live_voice("voice", _entry(voice="cedar"))
+        assert (named.voice, named.voice_named) == ("cedar", True)
+
+    @pytest.mark.parametrize(
+        "row, expected",
+        [
+            ({"params_json": {"adapter": "openai-live", "voice": " de-1 "}}, "de-1"),
+            ({"params_json": '{"voice": "de-1"}'}, "de-1"),
+            ({"params_json": {"voice": "  "}}, None),
+            ({"params_json": {"voice": 3}}, None),
+            ({"params_json": "not json"}, None),
+            ({"params_json": None}, None),
+            (None, None),
+        ],
+    )
+    def test_the_catalog_rows_voice(self, row, expected):
+        assert catalog_voice(row) == expected
+
+    def test_the_catalog_default_applies_only_without_the_experts_voice(self):
+        unnamed = build_live_voice("voice", _entry())
+        assert with_default_voice(unnamed, "de-1").voice == "de-1"
+        assert with_default_voice(unnamed, None).voice == DEFAULT_VOICE
+        named = build_live_voice("voice", _entry(voice="cedar"))
+        assert with_default_voice(named, "de-1").voice == "cedar"
 
 
 class TestEntryFiles:
@@ -602,6 +637,36 @@ class TestPrepareLiveSession:
         assert voice_resolved.await_args.kwargs["config_override"] == {
             "autonomy": "full"
         }
+
+    @pytest.mark.asyncio
+    async def test_an_unnamed_voice_takes_the_lines_catalog_voice(self, monkeypatch):
+        monkeypatch.setattr(
+            admission,
+            "resolve_live_voice",
+            AsyncMock(return_value=_voice(voice=DEFAULT_VOICE, voice_named=False)),
+        )
+        db = _Db(connector=_connector(model="cascade-cpu"), rows=[_session_row()])
+        db.resolve_catalog_model = AsyncMock(
+            return_value={"params_json": {"adapter": "openai-live", "voice": "10"}}
+        )
+        result, _ = await _prepare(db)
+        assert result.voice.voice == "10"
+        db.resolve_catalog_model.assert_awaited_once_with(
+            "cascade-cpu", capability="live_voice"
+        )
+        # An unreadable row never fails the call: the built-in default stays.
+        db = _Db(connector=_connector(), rows=[_session_row()])
+        db.resolve_catalog_model = AsyncMock(side_effect=RuntimeError("down"))
+        result, _ = await _prepare(db)
+        assert result.voice.voice == DEFAULT_VOICE
+
+    @pytest.mark.asyncio
+    async def test_the_experts_voice_needs_no_catalog_lookup(self, voice_resolved):
+        db = _Db(connector=_connector(), rows=[_session_row()])
+        db.resolve_catalog_model = AsyncMock()
+        result, _ = await _prepare(db)
+        assert result.voice.voice == "cedar"
+        db.resolve_catalog_model.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_existing_ringing_session_is_reused(self, voice_resolved):

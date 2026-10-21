@@ -860,3 +860,26 @@ def test_continuing_transcript_pieces_carry_their_space():
         "Der Check-out ist bis 11 Uhr möglich. Möchten Sie später auschecken?"
         " Schon mit Leerzeichen.",
     ]
+
+
+@pytest.mark.asyncio
+async def test_models_lists_the_profiles_as_live_voice(running):
+    """SRW's Admin → Models tests and imports the gateway's endpoint through
+    GET /v1/models; each profile declares live_voice, whatever its name."""
+    gateway, client, _ = await running(enabled=False)
+    response = await client.get("/v1/models")
+    assert response.status == 200
+    assert await response.json() == {
+        "object": "list",
+        "data": [
+            {
+                "id": "scripted",
+                "object": "model",
+                "owned_by": "srw-voice-gateway",
+                "capabilities": ["live_voice"],
+            }
+        ],
+    }
+    assert (
+        await client.get("/v1/models", headers={"Authorization": "x"})
+    ).status == 401
