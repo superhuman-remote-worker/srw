@@ -6,6 +6,7 @@ Needs no Pipecat, so it runs in the main suite as well as the voice venv.
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -131,10 +132,10 @@ class TestParseSettings:
 
     def test_the_kind_needs_pipecat(self):
         if HAS_PIPECAT:
-            assert callable(cascade_kind("p", profile()))
+            assert callable(cascade_kind("p", profile(), Path(".")))
         else:
             with pytest.raises(ConfigError, match="pipecat"):
-                cascade_kind("p", profile())
+                cascade_kind("p", profile(), Path("."))
 
     def test_profiles_reach_the_kind_through_the_config(self, tmp_path):
         (tmp_path / "api.key").write_text("gateway-key")
@@ -147,6 +148,20 @@ class TestParseSettings:
         with pytest.raises(ConfigError, match="profile cascade-cpu has unknown fields"):
             load_config(tmp_path / "gateway.yaml")
         assert set(build_engines({"s": {"engine": "scripted"}})) == {"s"}
+
+    def test_files_resolve_against_the_config_directory(self, tmp_path):
+        (tmp_path / "llm.key").write_text("stage-key")
+        (tmp_path / "silero.onnx").write_bytes(b"onnx")
+        raw = profile(
+            llm={"base_url": "http://x/v1", "model": "m", "api_key_file": "llm.key"},
+            turn={"vad_model_file": "silero.onnx"},
+        )
+        settings = parse_settings("p", raw, tmp_path)
+        assert settings.llm.api_key == "stage-key"
+        assert settings.turn.vad_model_file == str(tmp_path / "silero.onnx")
+        # Without a config file (the scripts) a relative file is refused.
+        with pytest.raises(ConfigError, match="absolute"):
+            parse_settings("p", raw)
 
 
 class TestPrompt:

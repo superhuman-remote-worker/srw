@@ -2,7 +2,8 @@
 # (local_voice_gateway.md §4.3). In a gateway config it goes under
 # `profiles:`; scripts/voice_cascade_try.py and voice_cascade_eval.py read
 # this file directly. Local servers need no key; a hosted stage takes
-# `api_key_file: /absolute/path`.
+# `api_key_file` (relative to the gateway config's directory; the scripts
+# need an absolute path).
 cascade-cpu:
   engine: cascade
   language: de
@@ -24,7 +25,8 @@ cascade-cpu:
     voice: "10"
     # The rate comes in the WAV header (22.05 kHz); the engine resamples.
     response_format: wav
-  # Silero v6.2.3 instead of the v6.0 bundled with Pipecat: an absolute path
-  # in a gateway config; the scripts fill it in from the models directory.
+  # Silero v6.2.3 instead of the v6.0 bundled with Pipecat, relative to the
+  # gateway config's directory; the scripts fill it in from the models
+  # directory.
   # turn:
   #   vad_model_file: /models/vad/silero_vad-v6.2.3.onnx

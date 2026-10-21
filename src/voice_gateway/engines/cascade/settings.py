@@ -204,15 +204,24 @@ def _base_url(raw: dict, label: str) -> str:
     return url
 
 
-def _key(raw: dict, label: str) -> str | None:
+def _file(value: str, base: Path | None, label: str) -> Path:
+    """A settings file, relative to the config file's directory; without a
+    config file (the scripts read a profile directly) it must be absolute."""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if base is None:
+        raise ConfigError(f"{label} must be an absolute path")
+    return base / path
+
+
+def _key(raw: dict, label: str, base: Path | None) -> str | None:
     value = raw.get("api_key_file")
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{label}.api_key_file must be a nonempty string")
-    path = Path(value.strip())
-    if not path.is_absolute():
-        raise ConfigError(f"{label}.api_key_file must be an absolute path")
+    path = _file(value.strip(), base, f"{label}.api_key_file")
     try:
         key = path.read_text().strip()
     except (OSError, UnicodeError, ValueError):
@@ -234,23 +243,25 @@ def _extra_body(raw: dict, label: str) -> dict:
 _STAGE_KEYS = {"base_url", "model", "api_key_file", "extra_body"}
 
 
-def _stage(raw, label: str, extra: set[str]) -> dict:
+def _stage(raw, label: str, extra: set[str], base: Path | None) -> dict:
     raw = _mapping(raw, label, _STAGE_KEYS | extra)
     return {
         "base_url": _base_url(raw, label),
         "model": _text(raw, "model", label),
-        "api_key": _key(raw, label),
+        "api_key": _key(raw, label, base),
         "extra_body": _extra_body(raw, label),
     }
 
 
-def _stt(raw, label: str) -> SttSettings:
-    stage = _stage(raw, label, {"prompt"})
+def _stt(raw, label: str, base: Path | None) -> SttSettings:
+    stage = _stage(raw, label, {"prompt"}, base)
     return SttSettings(**stage, prompt=_optional_text(raw, "prompt", label))
 
 
-def _llm(raw, label: str) -> LlmSettings:
-    stage = _stage(raw, label, {"temperature", "max_tokens", "note_role", "prewarm"})
+def _llm(raw, label: str, base: Path | None) -> LlmSettings:
+    stage = _stage(
+        raw, label, {"temperature", "max_tokens", "note_role", "prewarm"}, base
+    )
     role = raw.get("note_role", "system")
     if role not in {"system", "user", "developer"}:
         raise ConfigError(f"{label}.note_role must be system, user or developer")
@@ -263,9 +274,12 @@ def _llm(raw, label: str) -> LlmSettings:
     )
 
 
-def _tts(raw, label: str) -> TtsSettings:
+def _tts(raw, label: str, base: Path | None) -> TtsSettings:
     stage = _stage(
-        raw, label, {"voice", "voices", "response_format", "sample_rate", "speed"}
+        raw,
+        label,
+        {"voice", "voices", "response_format", "sample_rate", "speed"},
+        base,
     )
     voice = raw.get("voice", "")
     if not isinstance(voice, str):
@@ -290,15 +304,14 @@ def _tts(raw, label: str) -> TtsSettings:
     )
 
 
-def _turn(raw, label: str) -> TurnSettings:
+def _turn(raw, label: str, base: Path | None) -> TurnSettings:
     raw = _mapping(raw, label, set(TurnSettings.__dataclass_fields__))
     model_file = _optional_text(raw, "vad_model_file", label)
     if model_file is not None:
-        path = Path(model_file)
-        if not path.is_absolute() or not path.is_file():
-            raise ConfigError(
-                f"{label}.vad_model_file must be an existing absolute path"
-            )
+        path = _file(model_file, base, f"{label}.vad_model_file")
+        if not path.is_file():
+            raise ConfigError(f"{label}.vad_model_file must be an existing file")
+        model_file = str(path)
     return TurnSettings(
         vad_confidence=_number(raw, "vad_confidence", label, 0.7, 0.05, 0.99),
         vad_start_secs=_number(raw, "vad_start_secs", label, 0.2, 0.05, 1.0),
@@ -342,8 +355,10 @@ _PROFILE_KEYS = {
 }
 
 
-def parse_settings(name: str, raw: dict) -> CascadeSettings:
-    """Validate one profile's settings (without ``engine``); ConfigError if unusable."""
+def parse_settings(name: str, raw: dict, base: Path | None = None) -> CascadeSettings:
+    """Validate one profile's settings (without ``engine``); ConfigError if unusable.
+
+    Relative files resolve against ``base``, the config file's directory."""
     label = f"profile {name}"
     raw = _mapping(raw, label, _PROFILE_KEYS)
     for stage in ("stt", "llm", "tts"):
@@ -362,12 +377,12 @@ def parse_settings(name: str, raw: dict) -> CascadeSettings:
         raise ConfigError(f"{label}.prompt must be a string")
     return CascadeSettings(
         name=name,
-        stt=_stt(raw["stt"], f"{label}.stt"),
-        llm=_llm(raw["llm"], f"{label}.llm"),
-        tts=_tts(raw["tts"], f"{label}.tts"),
+        stt=_stt(raw["stt"], f"{label}.stt", base),
+        llm=_llm(raw["llm"], f"{label}.llm", base),
+        tts=_tts(raw["tts"], f"{label}.tts", base),
         language=language,
         filler=filler.strip(),
-        turn=_turn(raw.get("turn", {}), f"{label}.turn"),
+        turn=_turn(raw.get("turn", {}), f"{label}.turn", base),
         barge_in=_barge_in(raw.get("barge_in", {}), f"{label}.barge_in", language),
         playout_lead_ms=_integer(raw, "playout_lead_ms", label, 200, 40, 2000),
         prompt=prompt.strip(),

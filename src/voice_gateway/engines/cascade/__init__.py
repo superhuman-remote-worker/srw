@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 from collections.abc import Callable
+from pathlib import Path
 
 from voice_gateway.engines.cascade.settings import CascadeSettings, parse_settings
 from voice_gateway.errors import ConfigError
@@ -18,9 +19,9 @@ from voice_gateway.errors import ConfigError
 __all__ = ["CascadeSettings", "cascade_kind", "parse_settings"]
 
 
-def cascade_kind(name: str, settings: dict) -> Callable[[], object]:
+def cascade_kind(name: str, settings: dict, base: Path) -> Callable[[], object]:
     """The ``cascade`` profile kind: validate settings, return a per-call factory."""
-    parsed = parse_settings(name, settings)
+    parsed = parse_settings(name, settings, base)
     if importlib.util.find_spec("pipecat") is None:
         raise ConfigError(
             f"profile {name}: the cascade engine needs the gateway's voice "

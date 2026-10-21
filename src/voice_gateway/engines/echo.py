@@ -9,6 +9,7 @@ soon as it arrives.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from voice_gateway.errors import ConfigError
@@ -43,7 +44,7 @@ class EchoEngine:
             self.task = None
 
 
-def echo_kind(name: str, settings: dict) -> type[EchoEngine]:
+def echo_kind(name: str, settings: dict, base: Path) -> type[EchoEngine]:
     """The ``echo`` profile kind; it takes no settings."""
     if settings:
         raise ConfigError(f"profile {name}: the echo engine takes no settings")

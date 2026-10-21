@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from voice_gateway.errors import ConfigError
@@ -42,7 +43,7 @@ class ScriptedEngine:
         pass
 
 
-def scripted_kind(name: str, settings: dict) -> type[ScriptedEngine]:
+def scripted_kind(name: str, settings: dict, base: Path) -> type[ScriptedEngine]:
     """The ``scripted`` profile kind; it takes no settings."""
     if settings:
         raise ConfigError(f"profile {name}: the scripted engine takes no settings")

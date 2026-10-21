@@ -93,7 +93,9 @@ class Gateway:
             else build_source(config.source, config.base_dir)()
         )
         self.engines = (
-            engines if engines is not None else build_engines(config.profiles)
+            engines
+            if engines is not None
+            else build_engines(config.profiles, config.base_dir)
         )
         self.ringing_timeout_s, self.replay_window_s = (
             ringing_timeout_s,

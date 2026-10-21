@@ -9,6 +9,7 @@ per call. A new kind registers itself in ``KINDS``.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 from voice_gateway.engines.cascade import cascade_kind
 from voice_gateway.engines.echo import echo_kind
@@ -17,7 +18,7 @@ from voice_gateway.interfaces import Engine
 from voice_gateway.scripted import scripted_kind
 
 EngineFactory = Callable[[], Engine]
-EngineKind = Callable[[str, dict], EngineFactory]
+EngineKind = Callable[[str, dict, Path], EngineFactory]
 
 KINDS: dict[str, EngineKind] = {
     "scripted": scripted_kind,
@@ -26,8 +27,12 @@ KINDS: dict[str, EngineKind] = {
 }
 
 
-def build_engines(profiles: Mapping[str, object]) -> dict[str, EngineFactory]:
-    """One factory per profile; raises ConfigError for an unusable profile."""
+def build_engines(
+    profiles: Mapping[str, object], base: Path = Path(".")
+) -> dict[str, EngineFactory]:
+    """One factory per profile; raises ConfigError for an unusable profile.
+
+    ``base`` is the config file's directory: relative files resolve there."""
     factories = {}
     for name, profile in profiles.items():
         if not isinstance(profile, dict):
@@ -38,5 +43,5 @@ def build_engines(profiles: Mapping[str, object]) -> dict[str, EngineFactory]:
             raise ConfigError(
                 f"profile {name}: engine must be one of {', '.join(sorted(KINDS))}"
             )
-        factories[name] = KINDS[kind](name, settings)
+        factories[name] = KINDS[kind](name, settings, base)
     return factories

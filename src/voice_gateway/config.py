@@ -173,7 +173,7 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("profiles must be a nonempty mapping")
     for name in profiles:
         _text(name, "profile name")
-    build_engines(profiles)
+    build_engines(profiles, path.parent)
     source = raw.get("source", {"kind": "scripted"})
     if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
         raise ConfigError("source must be a mapping with a kind")
