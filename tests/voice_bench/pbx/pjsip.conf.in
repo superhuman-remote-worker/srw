@@ -1,0 +1,216 @@
+; =============================================================================
+; WP0 voice bench: the PBX (Asterisk imitating a customer phone system)
+; =============================================================================
+; Rendered by tests/voice_bench/bench.py into the gitignored run directory.
+; Placeholders (a NAME between two pairs of at signs) are filled from the
+; bench settings (addresses) and the gitignored env file (throwaway passwords).
+;
+; Extensions:
+;   1000      caller (outside line stand-in), default media path via the PBX
+;   1001      caller for the re-INVITE profile (direct media allowed)
+;   2000      the AI extension: the device under test (DUT) registers here
+;   3000      the "human" extension a transfer must reach
+;
+; Every profile has its own endpoint for the AI extension. All of them share
+; the AOR "2000", so whatever registered as 2000 (the stand-in or WP2's
+; Asterisk addon) receives the call with that profile's settings. Only the
+; peer profile uses a static contact instead of the registration.
+
+[global]
+type = global
+user_agent = SRW-Voice-Bench-PBX
+default_realm = srw-voice-bench
+; Registering devices identify by the From user first; the IP identify below
+; then only catches requests from the peer that carry no known user.
+endpoint_identifier_order = username,ip,anonymous
+; Log every SIP message (the bench reads them in external-DUT mode).
+debug = yes
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+local_net = @@BENCH_SUBNET@@
+@@EXTERNAL_ADDRESS_LINES@@
+
+[transport-tcp]
+type = transport
+protocol = tcp
+bind = 0.0.0.0:5060
+local_net = @@BENCH_SUBNET@@
+@@EXTERNAL_ADDRESS_LINES@@
+
+; ---- templates ---------------------------------------------------------------
+
+[phone](!)
+type = endpoint
+transport = transport-udp
+disallow = all
+allow = alaw,ulaw,g722
+dtmf_mode = rfc4733
+direct_media = no
+rtp_symmetric = yes
+force_rport = yes
+rewrite_contact = no
+send_pai = yes
+trust_id_outbound = yes
+send_diversion = no
+send_history_info = no
+allow_transfer = no
+timers = yes
+language = de
+
+[digest](!)
+type = auth
+auth_type = digest
+
+; ---- caller (stand-in for the outside line) ----------------------------------
+
+[1000](digest)
+username = 1000
+password = @@CALLER_PASSWORD@@
+
+[1000](phone)
+auth = 1000
+aors = 1000
+context = from-caller
+callerid = "Anrufer Test" <1000>
+
+[1000]
+type = aor
+max_contacts = 1
+remove_existing = yes
+
+[1001](digest)
+username = 1001
+password = @@CALLER_PASSWORD@@
+
+[1001](phone)
+auth = 1001
+aors = 1001
+context = from-caller
+callerid = "Anrufer Test" <1001>
+allow = !all,alaw
+direct_media = yes
+direct_media_method = invite
+
+[1001]
+type = aor
+max_contacts = 1
+remove_existing = yes
+
+; ---- the human extension (transfer target) -----------------------------------
+
+[3000](digest)
+username = 3000
+password = @@HUMAN_PASSWORD@@
+
+[3000](phone)
+auth = 3000
+aors = 3000
+context = from-internal
+callerid = "Rezeption" <3000>
+
+[3000]
+type = aor
+max_contacts = 1
+remove_existing = yes
+
+; ---- the AI extension: registration home + profile "register" ----------------
+
+[2000](digest)
+username = 2000
+password = @@AI_PASSWORD@@
+
+[2000]
+type = aor
+max_contacts = 1
+remove_existing = yes
+
+[2000](phone)
+auth = 2000
+aors = 2000
+context = from-ai
+; HD voice first, like a FRITZ!Box or 3CX offering G.722 to an IP phone.
+allow = !all,g722,alaw,ulaw
+
+; ---- per-profile endpoints for the AI extension --------------------------------
+
+; peer: the PBX sends the call to a fixed address, no registration (an
+; IP trunk/peer to the DUT).
+[2000-peer]
+type = aor
+contact = sip:2000@@@DUT_PEER_HOST@@:@@DUT_PEER_PORT@@
+
+[2000-peer](phone)
+aors = 2000-peer
+context = from-ai
+
+[2000-peer]
+type = identify
+endpoint = 2000-peer
+match = @@DUT_PEER_HOST@@
+
+; alaw-only: the PBX offers G.711 A-law and nothing else.
+[2000-alaw](phone)
+aors = 2000
+context = from-ai
+allow = !all,alaw
+
+; dtmf-info: DTMF only as SIP INFO, no telephone-event in the SDP (Swyx
+; registered devices).
+[2000-dtmf-info](phone)
+aors = 2000
+context = from-ai
+dtmf_mode = info
+
+; dtmf-rfc4733: DTMF only as RFC 2833/4733 telephone-events (OpenScape Business).
+[2000-dtmf-rfc4733](phone)
+aors = 2000
+context = from-ai
+dtmf_mode = rfc4733
+
+; reinvite: once the call is bridged the PBX re-INVITEs the DUT and moves its
+; media to another address (the caller's), as AGFEO re-anchors audio mid-call.
+[2000-reinvite](phone)
+aors = 2000
+context = from-ai
+allow = !all,alaw
+direct_media = yes
+direct_media_method = invite
+
+; session-timer: 90 s session timer, the PBX asks for it on every call.
+[2000-timer](phone)
+aors = 2000
+context = from-ai
+timers = always
+timers_sess_expires = 90
+timers_min_se = 90
+
+; refer-accept: blind REFER from the DUT is accepted; the target is dialled in
+; the transfer-targets context.
+[2000-refer-ok](phone)
+aors = 2000
+context = transfer-targets
+allow_transfer = yes
+
+; refer-refuse: REFER is refused (Asterisk answers 603 Decline).
+[2000-refer-no](phone)
+aors = 2000
+context = transfer-targets
+allow_transfer = no
+
+; diversion-on / diversion-off: a forwarded (hunt-group style) call. The
+; dialplan sets the redirecting party; "on" signals it as Diversion and
+; History-Info, "off" sends neither (3CX, STARFACE, OpenScape hunt groups).
+[2000-div-on](phone)
+aors = 2000
+context = from-ai
+send_diversion = yes
+send_history_info = yes
+
+[2000-div-off](phone)
+aors = 2000
+context = from-ai
+send_diversion = no
+send_history_info = no

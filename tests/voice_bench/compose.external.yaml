@@ -1,0 +1,10 @@
+# External-DUT mode, option B (scripts/voice-bench.sh run --dut external
+# --external-address <host LAN IP>): publish the bench PBX on the host so a
+# device elsewhere on the LAN can register to it. The RTP range is published
+# 1:1 because the PBX advertises these ports in its SDP.
+services:
+  pbx:
+    ports:
+      - "${VOICE_BENCH_SIP_PORT:-5060}:5060/udp"
+      - "${VOICE_BENCH_SIP_PORT:-5060}:5060/tcp"
+      - "10000-10099:10000-10099/udp"
