@@ -1,9 +1,23 @@
-# Model servers for the voice gateway's `cascade-cpu` test profile
+# Model servers for the voice gateway's cascade test profiles
 # (local_voice_gateway.md §4.3, §6.2). Fetch the pinned models first:
-#   python docker/voice-models/models.py fetch
-#   docker compose -f docker/voice-models/compose.yaml up -d
+#   python docker/voice-models/models.py fetch [--set cpu,gpu,judge]
+#   docker compose -f docker/voice-models/compose.yaml up -d                  # cascade-cpu
+#   docker compose -f docker/voice-models/compose.yaml --profile gpu up -d    # + cascade-gpu
 # Details, licences and the SELinux/GPU notes: docker/voice-models/README.md.
 name: srw-voice-models
+
+# A Vulkan GPU for llama.cpp and whisper.cpp: only the card's render node
+# (all of /dev/dri would also hand them an iGPU), and SELinux labels off,
+# since containers may not open /dev/dri devices otherwise.
+x-vulkan-gpu: &vulkan-gpu
+  devices:
+    - "${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}:${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}"
+  security_opt:
+    - label=disable
+  # Nothing in these servers writes; what they read is mounted read-only.
+  read_only: true
+  tmpfs:
+    - /tmp
 
 services:
   # STT: faster-whisper behind Speaches' OpenAI-compatible API, on the CPU.
@@ -54,12 +68,9 @@ services:
   # only the card's render node, or llama.cpp also splits onto an iGPU.
   # SELinux keeps containers off /dev/dri unless labels are off for this one.
   llm:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b11459@sha256:815720cb50a090db0c1d48b6e3b2b4ca656c3b99409cf4f31e63ff154ce586c4
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b11783@sha256:57350ca6eb16ea4470e784499290e703e5ca92219d63b14232ddd0e1556b0856
     # Same path inside: libdrm finds the card's sysfs entry by the node name.
-    devices:
-      - "${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}:${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}"
-    security_opt:
-      - label=disable
+    <<: *vulkan-gpu
     volumes:
       - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/llm:/models:ro
     command: &llm-args
@@ -74,15 +85,26 @@ services:
       - --n-gpu-layers
       - "999"
       - --ctx-size
-      - "${VOICE_LLM_CONTEXT:-16384}"
+      - "${VOICE_LLM_CONTEXT:-12288}"
       - --parallel
       - "${VOICE_LLM_SLOTS:-1}"
       # The model's own chat template (tool calls), thinking off.
       - --jinja
       - --reasoning-budget
       - "0"
-      # The prompt cache (on by default) keeps each call's fixed prefix;
-      # --cache-reuse does not work with Gemma's sliding-window attention.
+      # The prompt cache (on by default) keeps each call's fixed prefix. With
+      # Gemma's sliding-window layers it only helps with a full-size window
+      # cache: without --swa-full each turn re-processed its ~50 new tokens
+      # around llama.cpp's window checkpoints, ~0.5 s to the first token on
+      # an RX 9070 XT; with it, ~0.12 s (WP4). The 8-bit KV cache (needs
+      # flash attention) pays for most of the extra memory.
+      - --swa-full
+      - --flash-attn
+      - "on"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
     ports:
       - "127.0.0.1:${VOICE_LLM_PORT:-18451}:8080"
     restart: unless-stopped
@@ -98,3 +120,125 @@ services:
     command: *llm-args
     ports:
       - "127.0.0.1:${VOICE_LLM_PORT:-18451}:8080"
+
+  # --- cascade-gpu (WP4): STT and TTS on the GPU, `--profile gpu` ---------
+  # STT: whisper.cpp's server with whisper-large-v3-turbo on Vulkan, behind
+  # OpenAI's /v1/audio/transcriptions. Built locally (Dockerfile.whisper-vulkan).
+  speech-gpu:
+    profiles: [gpu]
+    image: srw-voice-whisper-vulkan:1.9.5
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper-vulkan
+    <<: *vulkan-gpu
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/stt:/models:ro
+    command:
+      - --model
+      - /models/${VOICE_STT_GPU_MODEL:-ggml-large-v3-turbo-q8_0.bin}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --inference-path
+      - /v1/audio/transcriptions
+      - --language
+      - de
+      - --threads
+      - "4"
+      - --no-timestamps
+      # Beam search: on the phone clips WER 0.33 instead of 0.40 greedy, for
+      # a few milliseconds on the GPU (WP4).
+      - --beam-size
+      - "5"
+    ports:
+      - "127.0.0.1:${VOICE_SPEECH_GPU_PORT:-18453}:8080"
+    restart: unless-stopped
+
+  # TTS: Qwen3-TTS 1.7B Base on llama.cpp (Vulkan; streamed /tts), with the
+  # adapter in front for OpenAI's /v1/audio/speech and the reference voice.
+  tts-gpu-model:
+    profiles: [gpu]
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b11783@sha256:57350ca6eb16ea4470e784499290e703e5ca92219d63b14232ddd0e1556b0856
+    <<: *vulkan-gpu
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/tts:/models:ro
+    command:
+      - --model
+      - /models/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf
+      - --mmproj
+      - /models/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-gpu-layers
+      - "999"
+      # One sentence at a time per call; a sentence and the voice's reference
+      # need well under 4k tokens (12.5 audio frames per second).
+      - --parallel
+      - "${VOICE_TTS_SLOTS:-1}"
+      - --ctx-size
+      - "4096"
+    restart: unless-stopped
+
+  tts-gpu:
+    profiles: [gpu]
+    image: srw-voice-audio-adapter:1
+    build:
+      context: .
+      dockerfile: Dockerfile.audio-adapter
+    environment:
+      TTS_UPSTREAM: http://tts-gpu-model:8080
+      TTS_VOICE: "${VOICE_TTS_GPU_VOICE:-de-1}"
+      TTS_LANG: de
+    volumes:
+      - ./voices:/voices:ro,z
+    read_only: true
+    ports:
+      - "127.0.0.1:${VOICE_TTS_GPU_PORT:-18454}:8000"
+    depends_on: [tts-gpu-model]
+    restart: unless-stopped
+
+  # --- the bench's judge (WP4), `--profile judge` ---------------------------
+  # Qwen3-ASR 0.6B on llama.cpp: transcribes what a caller heard, for
+  # voice_models_bench.py, voice_cascade_try.py --judge-url and the bench
+  # call's --judge-url. Another model family than the STT stage it judges.
+  judge-model:
+    profiles: [judge]
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b11783@sha256:57350ca6eb16ea4470e784499290e703e5ca92219d63b14232ddd0e1556b0856
+    <<: *vulkan-gpu
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/judge:/models:ro
+    command:
+      - --model
+      - /models/Qwen3-ASR-0.6B-Q8_0.gguf
+      - --mmproj
+      - /models/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-gpu-layers
+      - "999"
+      # A clip of a few seconds and its text; the model's own context would
+      # reserve gigabytes of KV cache.
+      - --parallel
+      - "1"
+      - --ctx-size
+      - "4096"
+    restart: unless-stopped
+
+  judge:
+    profiles: [judge]
+    image: srw-voice-audio-adapter:1
+    build:
+      context: .
+      dockerfile: Dockerfile.audio-adapter
+    environment:
+      ASR_UPSTREAM: http://judge-model:8080
+    read_only: true
+    ports:
+      - "127.0.0.1:${VOICE_JUDGE_PORT:-18455}:8000"
+    depends_on: [judge-model]
+    restart: unless-stopped

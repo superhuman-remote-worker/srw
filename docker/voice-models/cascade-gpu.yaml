@@ -1,0 +1,37 @@
+# The `cascade-gpu` test profile for the servers in compose.yaml
+# (local_voice_gateway.md §4.3, §6.2; WP4): every stage on one Vulkan GPU.
+# Start them with `docker compose -f docker/voice-models/compose.yaml
+# --profile gpu up -d llm speech-gpu tts-gpu`. In a gateway config it goes
+# under `profiles:`; scripts/voice_cascade_try.py and voice_cascade_eval.py
+# read this file directly. Local servers need no key.
+cascade-gpu:
+  engine: cascade
+  language: de
+  stt:
+    # whisper.cpp (Vulkan) with whisper-large-v3-turbo; the server ignores
+    # the model name.
+    base_url: http://127.0.0.1:18453/v1
+    model: whisper-large-v3-turbo
+  llm:
+    base_url: http://127.0.0.1:18451/v1
+    model: gemma-4-12b-it
+    temperature: 0.3
+    max_tokens: 300
+    # Thinking is off on the server (--reasoning-budget 0). Do not also send
+    # chat_template_kwargs.enable_thinking: false: with it, Gemma 4 loops on
+    # empty thought markers in longer calls and answers nothing.
+  tts:
+    # Qwen3-TTS 1.7B on llama.cpp behind the audio adapter; the voice is a
+    # reference clip in docker/voice-models/voices/ (de-1: a synthetic voice
+    # Qwen3-TTS made up itself, no real person's).
+    base_url: http://127.0.0.1:18454/v1
+    model: qwen3-tts
+    voice: de-1
+    # 16-bit PCM as it is generated, at the model's 24 kHz.
+    response_format: pcm
+    sample_rate: 24000
+  # Silero v6.2.3 instead of the v6.0 bundled with Pipecat, relative to the
+  # gateway config's directory; the scripts fill it in from the models
+  # directory.
+  # turn:
+  #   vad_model_file: /models/vad/silero_vad-v6.2.3.onnx

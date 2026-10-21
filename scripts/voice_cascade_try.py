@@ -7,7 +7,8 @@ One call on the real gateway ``Session`` with a ``FileAudioPort`` as the
 phone: accept with the test set's instructions, the greeting as an
 ``instructions`` append 1.5 s later (as the driver sends it), then the
 steps in ``--turns``. Each step plays a test-set clip (8 kHz A-law, upsampled,
-so it sounds like a phone) and waits for the reply; a delegation gets the
+so it sounds like a phone; ``--clips DIR`` takes ``<id>.phone.wav`` files in
+another voice instead) and waits for the reply; a delegation gets the
 step's canned answer as ``commentary`` after ``--answer-delay`` seconds.
 ``barge:A/B`` plays A and, once the voice has talked for ``--barge-after``
 seconds, B over it.
@@ -84,10 +85,18 @@ class PortSource:
 
 
 class Harness:
-    def __init__(self, settings, *, answer_delay: float, barge_after: float):
+    def __init__(
+        self,
+        settings,
+        *,
+        answer_delay: float,
+        barge_after: float,
+        clips: Path | None = None,
+    ):
         self.settings = settings
         self.answer_delay = answer_delay
         self.barge_after = barge_after
+        self.clips = clips
         self.port = FileAudioPort()
         self.engine: CascadeEngine | None = None
         self.events: list[dict] = []
@@ -185,7 +194,11 @@ class Harness:
         self.current_step = utterance_id
         self.log(f"caller clip {utterance_id}")
         clips = len(self.port.clip_ends)
-        pcm = read_wav(testset.clip(utterance_id))
+        pcm = read_wav(
+            self.clips / f"{utterance_id}.phone.wav"
+            if self.clips
+            else testset.clip(utterance_id)
+        )
         self.port.say(pcm)
         while len(self.port.clip_ends) == clips:
             await asyncio.sleep(0.02)
@@ -346,6 +359,11 @@ def main() -> None:
     parser.add_argument("--turns", default=DEFAULT_TURNS)
     parser.add_argument("--answer-delay", type=float, default=3.0)
     parser.add_argument("--barge-after", type=float, default=1.5)
+    parser.add_argument(
+        "--clips",
+        type=Path,
+        help="caller clips <id>.phone.wav (another voice) instead of the bench's",
+    )
     parser.add_argument("--asr-check", action="store_true")
     parser.add_argument(
         "--judge-url", help="OpenAI-compatible transcription server for --asr-check"
@@ -361,7 +379,10 @@ def main() -> None:
     ).strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True, exist_ok=True)
     harness = Harness(
-        settings, answer_delay=args.answer_delay, barge_after=args.barge_after
+        settings,
+        answer_delay=args.answer_delay,
+        barge_after=args.barge_after,
+        clips=args.clips,
     )
     turns = [t.strip() for t in args.turns.split(",") if t.strip()]
     asyncio.run(harness.run(turns, testset.instructions()))

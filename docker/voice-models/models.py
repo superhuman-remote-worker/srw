@@ -1,7 +1,7 @@
-"""Fetch the pinned models of the `cascade-cpu` test profile; local_voice_gateway.md §6.2.
+"""Fetch the pinned models of the cascade test profiles; local_voice_gateway.md §6.2.
 
-    python docker/voice-models/models.py fetch [--dir DIR] [--with-medium-stt]
-    python docker/voice-models/models.py check [--dir DIR]
+    python docker/voice-models/models.py fetch [--set cpu,gpu,judge] [--dir DIR] [--with-medium-stt]
+    python docker/voice-models/models.py check [--set ...] [--dir DIR]
 
 Every file comes from its official repository at a fixed revision and must
 match the sha256 below. Files land in DIR (default ``.cache/voice-models`` at
@@ -9,6 +9,12 @@ the repo root, gitignored): ``llm/`` for llama.cpp, ``piper/`` for the TTS,
 ``vad/`` for Silero, ``hf/`` as a Hugging Face cache for Speaches' STT (downloaded by Speaches' own
 ``huggingface_hub`` in its pinned image, then marked as ``main`` so the
 offline server finds it). Standard library only.
+
+Sets: ``cpu`` (default) is the ``cascade-cpu`` profile with the voice LLM;
+``gpu`` adds the ``cascade-gpu`` stages (``stt/`` whisper-large-v3-turbo for
+whisper.cpp, ``tts/`` Qwen3-TTS for llama.cpp; WP4); ``judge`` the bench's
+transcription judge (``judge/`` Qwen3-ASR, another model family than the STT
+it judges).
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ class File:
     url: str
     sha256: str
     licence: str
+    group: str = "cpu"  # the model set it belongs to
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,57 @@ FILES = (
     ),
 )
 
+_WHISPER = (
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/"
+    "5359861c739e955e79d9a303bcbc70fb988958b1"
+)
+_QWEN_TTS = (
+    "https://huggingface.co/ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF/resolve/"
+    "ca27d74bc954b73dadab5b71ca265d87fc861a7c"
+)
+_QWEN_ASR = (
+    "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/"
+    "928ab958557df9aa2ef1c93e0e83c7ad0933fae2"
+)
+
+FILES += (
+    File(
+        "stt/ggml-large-v3-turbo-q8_0.bin",
+        f"{_WHISPER}/ggml-large-v3-turbo-q8_0.bin",
+        "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
+        "MIT (OpenAI Whisper large-v3-turbo, ggml conversion by ggerganov)",
+        "gpu",
+    ),
+    File(
+        "tts/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+        f"{_QWEN_TTS}/Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+        "ac7931aeb2e7aad1a6ed6602d353a5679c9d096b18ce8204ac730a8408d572e1",
+        "Apache-2.0 (Qwen/Qwen3-TTS-12Hz-1.7B-Base, GGUF by ggml-org)",
+        "gpu",
+    ),
+    File(
+        "tts/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+        f"{_QWEN_TTS}/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+        "6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2",
+        "Apache-2.0 (Qwen3-TTS 12 Hz speech tokenizer, GGUF by ggml-org)",
+        "gpu",
+    ),
+    File(
+        "judge/Qwen3-ASR-0.6B-Q8_0.gguf",
+        f"{_QWEN_ASR}/Qwen3-ASR-0.6B-Q8_0.gguf",
+        "bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971",
+        "Apache-2.0 (Qwen/Qwen3-ASR-0.6B, GGUF by ggml-org)",
+        "judge",
+    ),
+    File(
+        "judge/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+        f"{_QWEN_ASR}/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+        "41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d",
+        "Apache-2.0 (Qwen3-ASR audio encoder, GGUF by ggml-org)",
+        "judge",
+    ),
+)
+
 SNAPSHOTS = (
     Snapshot(
         "Systran/faster-whisper-small",
@@ -119,10 +177,26 @@ def fetch_file(root: Path, item: File) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_suffix(target.suffix + ".part")
     print(f"get  {item.path}")
-    # curl resumes large downloads; urllib is the fallback.
+    # curl resumes large downloads, also after a stalled connection (under
+    # 10 kB/s for a minute counts as a timeout, which --retry retries);
+    # urllib is the fallback.
     try:
         subprocess.run(
-            ["curl", "-fsSL", "--retry", "20", "-C", "-", "-o", str(part), item.url],
+            [
+                "curl",
+                "-fsSL",
+                "--retry",
+                "20",
+                "--speed-limit",
+                "10000",
+                "--speed-time",
+                "60",
+                "-C",
+                "-",
+                "-o",
+                str(part),
+                item.url,
+            ],
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):
@@ -199,19 +273,34 @@ def main() -> None:
     parser.add_argument(
         "--with-medium-stt", action="store_true", help="also faster-whisper medium"
     )
+    parser.add_argument(
+        "--set",
+        default="cpu",
+        help="comma-separated model sets: cpu (default), gpu, judge, or all",
+    )
     args = parser.parse_args()
     root = args.dir.resolve()
-    snapshots = [s for s in SNAPSHOTS if not s.optional or args.with_medium_stt]
+    sets = {"cpu", "gpu", "judge"} if args.set == "all" else set(args.set.split(","))
+    unknown = sets - {"cpu", "gpu", "judge"}
+    if unknown:
+        sys.exit(f"unknown model set(s): {', '.join(sorted(unknown))}")
+    files = [f for f in FILES if f.group in sets]
+    # Speaches' snapshots serve the CPU profile's STT.
+    snapshots = [
+        s
+        for s in SNAPSHOTS
+        if "cpu" in sets and (not s.optional or args.with_medium_stt)
+    ]
     if args.command == "check":
         bad = [
             f.path
-            for f in FILES
+            for f in files
             if not (root / f.path).exists() or sha256_of(root / f.path) != f.sha256
         ]
         bad += [s.repo for s in snapshots if not snapshot_ok(root, s)]
         print("\n".join(f"missing {b}" for b in bad) or f"all models present in {root}")
         sys.exit(1 if bad else 0)
-    for item in FILES:
+    for item in files:
         fetch_file(root, item)
     for snap in snapshots:
         fetch_snapshot(root, snap)
