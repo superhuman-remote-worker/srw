@@ -1,0 +1,171 @@
+# =============================================================================
+# srw-asterisk — Asterisk 22 LTS with only the modules SRW's voice path needs
+# =============================================================================
+# Built from the official source tarball on downloads.asterisk.org. The tarball
+# is checked twice: its sha256 is pinned below and its detached signature must
+# come from the Asterisk Development Team key (docker/asterisk/
+# asterisk-release-key.asc, fingerprint pinned below). The bundled pjproject
+# tarball comes from Asterisk's own third-party mirror; its sha256 is pinned
+# here and the build checks the md5 that ships inside the signed tree.
+#
+#   docker build -f docker/Dockerfile.asterisk -t srw-asterisk:22.11.0 .
+#
+# One image serves two roles, so it carries NO SIP, dialplan or ARI config:
+#   - the WP0 phone test bench (tests/voice_bench/) runs it as a customer PBX;
+#   - the WP2 addon runs it as the extension that registers on that PBX.
+# Mount a full /etc/asterisk for either. The baked-in /etc/asterisk only lets
+# the image start on its own (no endpoints, no listeners besides the CLI
+# socket). Nothing in the image records audio.
+#
+# Module set (menuselect --disable-all, then OPTIONAL_API and the list below):
+#   SIP        chan_pjsip, res_pjsip and the res_pjsip_* modules for digest
+#              auth, registrar + outbound registration, session timers
+#              (res_pjsip_session), SDP/RTP, REFER, Diversion/History-Info,
+#              SIP INFO DTMF, header functions (PJSIP_HEADER), logger/history
+#   ARI        res_ari, res_ari_*, res_stasis, res_stasis_*, app_stasis,
+#              res_http_websocket
+#   media WS   chan_websocket + res_websocket_client (22.6+)
+#   codecs     codec_alaw, codec_ulaw, codec_g722, codec_a_mu, codec_resample
+#   other      app_dial, app_echo, app_playback, app_stack, app_senddtmf,
+#              app_transfer, app_verbose, format_wav/pcm/sln, func_* helpers,
+#              pbx_config, bridges, res_rtp_asterisk, res_timing_timerfd
+# =============================================================================
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS build
+
+ARG ASTERISK_VERSION=22.11.0
+ARG ASTERISK_SHA256=3bd5ee040509a3d3cd9b1ba9520c18e6ec0a7e7981ca68c457dcd36ba3c54d94
+ARG ASTERISK_GPG_FINGERPRINT=F2FC93DB7587BD1FB49E045A5D984BE337191CE7
+# Must match third-party/versions.mak of the Asterisk release above.
+ARG PJPROJECT_VERSION=2.17
+ARG PJPROJECT_SHA256=04b2eb1f0f01aa0ad1945b167171843448a51aa6b7c3e806496d434f13a112b7
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential pkg-config ca-certificates curl gnupg bzip2 patch \
+        libedit-dev libjansson-dev libsqlite3-dev uuid-dev libxml2-dev \
+        libssl-dev zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY docker/asterisk/asterisk-release-key.asc /tmp/asterisk-release-key.asc
+
+WORKDIR /usr/src
+RUN set -eux; \
+    base="https://downloads.asterisk.org/pub/telephony/asterisk/releases"; \
+    tarball="asterisk-${ASTERISK_VERSION}.tar.gz"; \
+    curl -fsSLo "$tarball" "$base/$tarball"; \
+    curl -fsSLo "$tarball.asc" "$base/$tarball.asc"; \
+    echo "${ASTERISK_SHA256}  $tarball" | sha256sum -c -; \
+    export GNUPGHOME="$(mktemp -d)"; \
+    gpg --batch --import /tmp/asterisk-release-key.asc; \
+    gpg --batch --status-fd 1 --verify "$tarball.asc" "$tarball" \
+        | grep -q "^\[GNUPG:\] VALIDSIG ${ASTERISK_GPG_FINGERPRINT} "; \
+    rm -rf "$GNUPGHOME"; \
+    tar xzf "$tarball"; \
+    mv "asterisk-${ASTERISK_VERSION}" asterisk; \
+    grep -qx "PJPROJECT_VERSION=${PJPROJECT_VERSION}" asterisk/third-party/versions.mak; \
+    mkdir -p /usr/src/externals; \
+    pj="pjproject-${PJPROJECT_VERSION}.tar.bz2"; \
+    curl -fsSLo "/usr/src/externals/$pj" \
+        "https://raw.githubusercontent.com/asterisk/third-party/master/pjproject/${PJPROJECT_VERSION}/$pj"; \
+    echo "${PJPROJECT_SHA256}  /usr/src/externals/$pj" | sha256sum -c -
+
+WORKDIR /usr/src/asterisk
+RUN set -eux; \
+    ./configure --with-pjproject-bundled --with-jansson-bundled=no \
+        --with-externals-cache=/usr/src/externals \
+        --without-dahdi --without-pri --without-ss7 --without-radius \
+        --without-postgres --without-unixodbc --without-ldap \
+        --without-gtk2 --without-x11 --without-sdl --without-bluetooth \
+        > /tmp/configure.log; \
+    make menuselect.makeopts; \
+    menuselect/menuselect --disable-all menuselect.makeopts; \
+    # --disable-all also clears the default OPTIONAL_API compile flag; without
+    # it optional dependencies (res_statsd, res_agi, ...) become hard ones.
+    menuselect/menuselect --enable OPTIONAL_API \
+        --enable app_dial --enable app_echo --enable app_playback \
+        --enable app_stasis --enable app_stack --enable app_senddtmf \
+        --enable app_transfer --enable app_verbose \
+        --enable bridge_simple --enable bridge_native_rtp \
+        --enable bridge_softmix --enable bridge_holding \
+        --enable chan_pjsip --enable chan_websocket --enable chan_bridge_media \
+        --enable codec_alaw --enable codec_ulaw --enable codec_g722 \
+        --enable codec_a_mu --enable codec_resample \
+        --enable format_wav --enable format_pcm --enable format_sln \
+        --enable func_callerid --enable func_channel --enable func_cut \
+        --enable func_logic --enable func_strings --enable func_timeout \
+        --enable func_pjsip_endpoint --enable func_pjsip_contact \
+        --enable func_pjsip_aor \
+        --enable pbx_config \
+        --enable res_pjproject --enable res_pjsip --enable res_pjsip_session \
+        --enable res_pjsip_pubsub --enable res_pjsip_authenticator_digest \
+        --enable res_pjsip_outbound_authenticator_digest \
+        --enable res_pjsip_endpoint_identifier_ip \
+        --enable res_pjsip_endpoint_identifier_user \
+        --enable res_pjsip_registrar --enable res_pjsip_outbound_registration \
+        --enable res_pjsip_sdp_rtp --enable res_pjsip_dtmf_info \
+        --enable res_pjsip_empty_info --enable res_pjsip_refer \
+        --enable res_pjsip_diversion --enable res_pjsip_header_funcs \
+        --enable res_pjsip_caller_id --enable res_pjsip_nat \
+        --enable res_pjsip_rfc3326 --enable res_pjsip_acl \
+        --enable res_pjsip_config_wizard --enable res_pjsip_logger \
+        --enable res_pjsip_history --enable res_pjsip_notify \
+        --enable res_rtp_asterisk --enable res_timing_timerfd \
+        --enable res_sorcery_config --enable res_sorcery_memory \
+        --enable res_sorcery_astdb --enable res_clioriginate \
+        --enable res_http_websocket --enable res_websocket_client \
+        --enable res_ari --enable res_ari_model --enable res_ari_applications \
+        --enable res_ari_asterisk --enable res_ari_bridges \
+        --enable res_ari_channels --enable res_ari_device_states \
+        --enable res_ari_endpoints --enable res_ari_events \
+        --enable res_ari_playbacks --enable res_ari_recordings \
+        --enable res_ari_sounds \
+        --enable res_stasis --enable res_stasis_answer \
+        --enable res_stasis_device_state --enable res_stasis_playback \
+        --enable res_stasis_recording --enable res_stasis_snoop \
+        menuselect.makeopts; \
+    menuselect/menuselect --check-deps menuselect.makeopts; \
+    make -j"$(nproc)" > /tmp/make.log 2>&1 || { tail -80 /tmp/make.log; exit 1; }; \
+    make install DESTDIR=/out > /tmp/install.log 2>&1 || { tail -80 /tmp/install.log; exit 1; }; \
+    rm -rf /out/usr/include /out/var/lib/asterisk/sounds/* /out/var/lib/asterisk/moh/*; \
+    ls /out/usr/lib/asterisk/modules | sed 's/\.so$//' | sort > /out/usr/lib/asterisk/MODULES.txt
+# Debian's /var/run is a symlink to /run; the runtime stage creates the
+# directory through it instead of copying a real /var/run over the link.
+RUN rm -rf /out/var/run
+
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+
+ARG ASTERISK_VERSION=22.11.0
+LABEL org.opencontainers.image.title="srw-asterisk" \
+      org.opencontainers.image.version="${ASTERISK_VERSION}" \
+      org.opencontainers.image.licenses="GPL-2.0-only" \
+      org.opencontainers.image.description="Asterisk ${ASTERISK_VERSION} (PJSIP, ARI, chan_websocket) for SRW's voice path"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libedit2 libjansson4 libsqlite3-0 libuuid1 libxml2 libssl3t64 \
+        zlib1g ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid 10001 asterisk; \
+    useradd --system --uid 10001 --gid asterisk --home-dir /var/lib/asterisk \
+        --no-create-home --shell /usr/sbin/nologin asterisk
+
+COPY --from=build /out/ /
+COPY docker/asterisk/etc/ /etc/asterisk/
+
+RUN set -eux; \
+    ldconfig; \
+    for d in /var/lib/asterisk /var/spool/asterisk /var/log/asterisk \
+             /var/run/asterisk /var/cache/asterisk; do \
+        mkdir -p "$d"; chown -R asterisk:asterisk "$d"; \
+    done; \
+    asterisk -V
+
+USER 10001:10001
+WORKDIR /var/lib/asterisk
+# SIP (UDP/TCP), ARI/HTTP and the default RTP range of the baked-in rtp.conf.
+EXPOSE 5060/udp 5060/tcp 8088/tcp 10000-10099/udp
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["asterisk", "-rx", "core show uptime"]
+ENTRYPOINT ["asterisk", "-f", "-n"]
