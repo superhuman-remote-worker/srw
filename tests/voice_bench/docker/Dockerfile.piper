@@ -1,0 +1,33 @@
+# =============================================================================
+# srw-voice-bench-piper — Piper TTS + sox for the WP0 German test audio
+# =============================================================================
+# Piper 2023.11.14-2 (MIT) from the rhasspy/piper GitHub release, sha256
+# pinned; it bundles onnxruntime and espeak-ng. The voice (de_DE-mls-medium)
+# is NOT in the image: scripts/voice-bench.sh downloads it from the official
+# rhasspy/piper-voices Hugging Face repo at a pinned revision and mounts it at
+# /models. sox resamples to 16 kHz PCM and 8 kHz G.711 A-law.
+#
+#   docker build -f tests/voice_bench/docker/Dockerfile.piper \
+#       -t srw-voice-bench-piper:2023.11.14-2 tests/voice_bench
+# =============================================================================
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+
+ARG PIPER_VERSION=2023.11.14-2
+ARG PIPER_SHA256=a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl sox; \
+    curl -fsSLo /tmp/piper.tar.gz \
+        "https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/piper_linux_x86_64.tar.gz"; \
+    echo "${PIPER_SHA256}  /tmp/piper.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/piper.tar.gz -C /opt; \
+    rm /tmp/piper.tar.gz; \
+    apt-get purge -y curl; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/*; \
+    /opt/piper/piper --version
+
+COPY docker/piper-render.sh /usr/local/bin/piper-render
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/piper-render"]

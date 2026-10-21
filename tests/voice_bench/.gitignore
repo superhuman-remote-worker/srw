@@ -1,0 +1,5 @@
+# Generated and downloaded bench state; never commit.
+/.run/
+/.cache/
+/results/
+/.env
