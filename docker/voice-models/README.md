@@ -33,7 +33,7 @@ understand of the voice; it is another model family than the STT it judges.
 | PyTorch 2.14.1 ROCm 7.2 wheel (bundles ROCm libraries) | BSD-3-Clause and permissive third-party licences | — |
 | faster-qwen3-tts 0.5.4 | MIT | — |
 | qwen-tts-hf 0.1.1.post1 (Qwen3-TTS's package for Transformers 5) | Apache-2.0 | — |
-| Transformers 5.15.1, Accelerate 1.12.0 and the other pinned packages of `qwen-tts-rocm.requirements.txt` | Apache-2.0, BSD, MIT, ISC | — |
+| Transformers 5.15.1, Accelerate 1.12.0 and the other pinned packages of `qwen-tts-rocm.requirements.txt` | Apache-2.0, BSD, MIT, ISC; weak copyleft, used unmodified: soxr (LGPL-2.1+), certifi and tqdm (MPL-2.0) | — |
 | Qwen3-ASR 0.6B (GGUF by ggml-org), judge only | — | Apache-2.0 |
 | `audio_adapter.py`, `piper_server.py`, `qwen_tts_server.py`, `qwen_tts_stubs/` (here) | this repository | — |
 | Silero VAD v6.2.3 | MIT | MIT |
