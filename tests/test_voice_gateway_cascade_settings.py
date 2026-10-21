@@ -211,7 +211,8 @@ class TestPrompt:
         assert "Never mention the back office" in prompt
         assert "at most one short sentence" in prompt
         assert "Never add a second holding sentence" in prompt
-        assert "Ich verbinde Sie" in prompt and "decided after the check" in prompt
+        assert "Until the answer is back, never say that you connect" in prompt
+        assert "Ich verbinde Sie" in prompt and "never your own reasoning" in prompt
         assert "without saying who answered" in prompt
         assert "Do not start with a holding sentence again" in prompt
         assert "never that you connect or forward" in DELEGATE_DESCRIPTION
