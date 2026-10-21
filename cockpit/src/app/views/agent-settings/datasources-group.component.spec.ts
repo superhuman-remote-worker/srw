@@ -5,6 +5,7 @@ import {
   datasourceSelectionDifferenceCount,
   datasourceSetKey,
   isRepositoryDatasource,
+  liteHoldsBack,
   requiresShellWorkspace,
   selectedDatasourceIds,
   tierHiddenAttachedIds,
@@ -183,6 +184,25 @@ describe('datasources-group selection logic', () => {
     // The explicit empty list the create form sends: no connector at all.
     expect(selectedDatasourceIds(ds, none, false)).toEqual([]);
     expect(datasourceSelectionDifferenceCount(ds, none)).toBe(2);
+  });
+
+  it('keeps cloud folders on a Virtual default a cloud folder takes to a Container, and only them', () => {
+    const folder = makeDs('folder', 'cloud_folder', true);
+    const outbox = makeDs('outbox', 'cloud_outbox', true);
+    const repo = makeDs('repo', 'repository', true);
+    const kb = makeDs('kb', 'kb', true);
+    const ds = [folder, outbox, repo, kb];
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, true)).toBe(false);
+    expect(liteHoldsBack('cloud_outbox', BUILTIN_DRIVERS, true)).toBe(false);
+    expect(liteHoldsBack('repository', BUILTIN_DRIVERS, true)).toBe(true);
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS)).toBe(true);
+    // Ticked on Virtual, the cloud folders are sent (they take the Session
+    // to a Container); a repository still waits for a shell.
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS, true))
+      .toEqual(['folder', 'outbox', 'kb']);
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS))
+      .toEqual(['kb']);
+    expect(allDatasourcesSelected(ds, null, true, undefined, [], true, BUILTIN_DRIVERS, true)).toBe(true);
   });
 
   it('isRepositoryDatasource is case-insensitive', () => {

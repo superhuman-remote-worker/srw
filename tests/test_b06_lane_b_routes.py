@@ -344,7 +344,12 @@ class TestCreationPreview:
             "/api/persistent/threads/preview", json={"use_datasource_defaults": True}
         )
         assert response.status_code == 200, response.text
-        assert response.json() == {
+        body = response.json()
+        # The draft's picker names where the tier came from.
+        assert body.pop("workspace_sources")["tier"] == "installation"
+        assert "workspace_template_name" in body
+        body.pop("workspace_template_name")
+        assert body == {
             "project_ids": [],
             "workspace_backend": backend,
             "datasource_ids": (

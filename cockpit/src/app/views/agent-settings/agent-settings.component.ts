@@ -274,6 +274,7 @@ import type {BadgeTone} from '../../ui/badge';
             [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
             [isLiteBackend]="mode() === 'live' ? liteBackend() : workspacePicker() ? isLite(pickerBackend()) : false"
+            [cloudFoldersTakeContainer]="workspacePicker() && cloudFoldersTakeContainer()"
             [initialSelectedIds]="mode() === 'live' || mode() === 'session' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
             [accessMode]="datasourceAccessMode()"
@@ -504,6 +505,9 @@ export class AgentSettingsComponent {
   workspacePicker = input(false);
   /** The backend the picker's choice runs on, for the lite-tier greying. */
   pickerBackend = input<string | null>(null);
+  /** A cloud folder would take the picker's default Virtual tier to a
+   *  Container: cloud folders stay selectable on it. */
+  cloudFoldersTakeContainer = input(false);
   /** Expert detail loading state. */
   loadingExpert = input(false);
   /** Display name of the Expert template the form started from (create), or
@@ -803,6 +807,11 @@ export class AgentSettingsComponent {
   /** Return selected datasource IDs (not part of config_override). */
   getSelectedDatasourceIds(): string[] {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
+  }
+
+  /** Whether the user changed which connectors are selected. */
+  hasDatasourceSelection(): boolean {
+    return this.datasourcesGroup?.hasUserSelection() ?? false;
   }
 
   /** How a connector with access levels shows its level: a new session

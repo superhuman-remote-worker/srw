@@ -69,6 +69,9 @@ class SessionToolViewDependencies:
     #: Admission's ``cloud_folders_need_a_container``: whether a default
     #: Session in a project gets a Container for its cloud connectors.
     cloud_folders_need_a_container: Callable[..., Awaitable[bool]]
+    #: Admission's ``cloud_folders_can_take_a_container``: whether a cloud
+    #: folder would take such a Session to a Container at all.
+    cloud_folders_can_take_a_container: Callable[..., Awaitable[bool]]
 
 
 async def session_tool_grants(
@@ -348,7 +351,10 @@ async def preview_tool_groups(
     )
     # Admission's rule (resolve_thread_creation_plan): a Session whose tier
     # came from the defaults and whose cloud connectors would attach gets a
-    # Container. The form then lists and submits those connectors.
+    # Container. The form then lists and submits those connectors, and keeps
+    # its cloud folders selectable while it predicts Virtual: ticking one
+    # takes the Session to a Container rather than being refused.
+    cloud_folders_take_container = False
     if (
         not is_worker
         and workspace_selection is not None
@@ -360,7 +366,13 @@ async def preview_tool_groups(
     ):
         try:
             needs_container = await dependencies.cloud_folders_need_a_container(
-                user, project_id=body.project_id
+                user, project_id=body.project_id, datasource_ids=body.datasource_ids
+            )
+            cloud_folders_take_container = (
+                needs_container
+                or await dependencies.cloud_folders_can_take_a_container(
+                    user, project_id=body.project_id
+                )
             )
         except Exception:
             logger.warning(
@@ -401,6 +413,7 @@ async def preview_tool_groups(
     if workspace_source == "default" and body.workspace_preference is not None:
         workspace_config = {"backend": body.workspace_preference}
         workspace_source = "recommendation"
+        cloud_folders_take_container = False
         # The client submits this binding as its explicit choice, so it names
         # the recommended tier, never the default template it replaces.
         workspace_selection = None
@@ -421,6 +434,7 @@ async def preview_tool_groups(
         ),
         "sources": sources,
         "template_name": template_name,
+        "cloud_folders_take_container": cloud_folders_take_container,
     }
 
     # The legacy branch models ONE agent's behaviour: persistent_session's

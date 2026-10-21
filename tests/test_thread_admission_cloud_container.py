@@ -237,3 +237,44 @@ async def test_a_refused_project_predicts_no_container():
         )
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_the_form_predicts_from_the_connectors_it_submits():
+    """Unticked in the form, the cloud folder takes no Container; ticked, it
+    does, even where it isn't a default."""
+    deps = _deps_with([_folder_row()])
+    deps.store.list_default_datasource_candidates = AsyncMock(return_value=[_kb_row()])
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER, project_id=PROJECT, datasource_ids=[FOLDER], dependencies=deps
+        )
+        is True
+    )
+
+    deps = _deps_with([_kb_row()])
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER, project_id=PROJECT, datasource_ids=[KB], dependencies=deps
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unavailable", "expected"),
+    [({}, True), ({"containers": False}, False), ({"container_granted": False}, False)],
+    ids=["container", "no-container-provisioner", "container-not-granted"],
+)
+async def test_the_form_knows_whether_a_cloud_folder_can_take_a_container(
+    unavailable, expected
+):
+    deps = _deps_with([], **unavailable)
+
+    assert (
+        await ta.cloud_folders_can_take_a_container(
+            USER, project_id=PROJECT, dependencies=deps
+        )
+        is expected
+    )

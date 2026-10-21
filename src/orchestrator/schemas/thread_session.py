@@ -157,6 +157,10 @@ class ToolGroupPreviewRequest(BaseModel):
     config_override: Optional[dict[str, Any]] = None
     workspace: Optional[dict[str, Any]] = None
     workspace_preference: Literal["none", "virtual", "sandbox", "vm"] | None = None
+    #: The connectors the form will submit, once its user changed them; the
+    #: tier a cloud folder takes is predicted from them. ``None`` predicts
+    #: from the defaults.
+    datasource_ids: Optional[list[str]] = None
     #: Which surface is asking. ``worker`` is the job-create form and defaults
     #: the base to ``worker_base``; ``session`` is the New Session form. Default
     #: stays ``session`` so the shipped cockpit's payloads keep their meaning.

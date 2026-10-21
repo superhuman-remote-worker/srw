@@ -54,9 +54,15 @@ def account_workspace_defaults(fake_db):
 def no_cloud_connectors():
     """The admission rule a Virtual preview asks has its own tests below and
     in test_thread_admission_cloud_container.py."""
-    with patch(
-        "orchestrator.services.thread_admission.cloud_folders_need_a_container",
-        AsyncMock(return_value=False),
+    with (
+        patch(
+            "orchestrator.services.thread_admission.cloud_folders_need_a_container",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "orchestrator.services.thread_admission.cloud_folders_can_take_a_container",
+            AsyncMock(return_value=False),
+        ),
     ):
         yield
 
@@ -1445,6 +1451,7 @@ async def test_explicit_workspace_preview_overrides_expert_recommendation(
         "binding": selected,
         "sources": {"tier": "explicit", "template": "explicit"},
         "template_name": None,
+        "cloud_folders_take_container": False,
     }
     assert result["origin"] == ORIGIN_PREDICTION
     if backend != "sandbox":
@@ -1531,6 +1538,7 @@ async def test_a_recommendation_replaces_the_installation_default_binding(
         "binding": {"template": {"inline": {"backend": "virtual"}}},
         "sources": {"tier": "explicit", "template": "explicit"},
         "template_name": None,
+        "cloud_folders_take_container": False,
     }
 
 
@@ -1565,14 +1573,18 @@ def _container_default():
     )
 
 
-async def _preview_cloud_folders(user, db, request, *, need_container, **fields):
-    """A Virtual default; admission's rule answers ``need_container``."""
+async def _preview_cloud_folders(
+    user, db, request, *, need_container, can_take=True, **fields
+):
+    """A Virtual default; admission's rule answers ``need_container``, and
+    whether a Container is there to take ``can_take``."""
     select = AsyncMock(
         side_effect=lambda *_a, upgrade=None, **_kw: (
             _container_default() if upgrade else _virtual_default()
         )
     )
     need = AsyncMock(return_value=need_container)
+    take = AsyncMock(return_value=can_take)
     with (
         patch("orchestrator.security.auth.require_approved_user", _approved(user)),
         patch("orchestrator.main.app.state.resources.postgres_db", db),
@@ -1588,6 +1600,10 @@ async def _preview_cloud_folders(user, db, request, *, need_container, **fields)
         patch(
             "orchestrator.services.thread_admission.cloud_folders_need_a_container",
             need,
+        ),
+        patch(
+            "orchestrator.services.thread_admission.cloud_folders_can_take_a_container",
+            take,
         ),
     ):
         result = await _preview_tool_groups(
@@ -1624,19 +1640,51 @@ async def test_the_form_predicts_the_container_its_cloud_folders_get(
         "template": "builtin",
     }
     assert result["workspace"]["template_name"] == "container-full"
+    assert result["workspace"]["cloud_folders_take_container"] is True
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("can_take", [True, False])
 async def test_without_cloud_connectors_the_form_predicts_virtual(
-    user_a, fake_db, fake_request
+    user_a, fake_db, fake_request, can_take
 ):
+    """Still Virtual; where a Container is there to take, the form keeps
+    its cloud folders selectable (ticking one takes the Session there)."""
     result, select, _ = await _preview_cloud_folders(
-        user_a, fake_db, fake_request, need_container=False, project_id=_PROJECT
+        user_a,
+        fake_db,
+        fake_request,
+        need_container=False,
+        can_take=can_take,
+        project_id=_PROJECT,
     )
 
     assert select.await_count == 1
     assert result["workspace"]["backend"] == "virtual"
     assert result["workspace"]["sources"]["tier"] == "installation"
+    assert result["workspace"]["cloud_folders_take_container"] is can_take
+
+
+@pytest.mark.asyncio
+async def test_the_form_predicts_from_the_connectors_it_will_submit(
+    user_a, fake_db, fake_request
+):
+    """Unticked cloud folders: admission judges the list the form submits,
+    and so does the prediction (none sent: the defaults)."""
+    _, _, need = await _preview_cloud_folders(
+        user_a,
+        fake_db,
+        fake_request,
+        need_container=False,
+        project_id=_PROJECT,
+        datasource_ids=["kb-1"],
+    )
+    assert need.await_args.kwargs["datasource_ids"] == ["kb-1"]
+
+    _, _, need = await _preview_cloud_folders(
+        user_a, fake_db, fake_request, need_container=False, project_id=_PROJECT
+    )
+    assert need.await_args.kwargs["datasource_ids"] is None
 
 
 @pytest.mark.asyncio
@@ -1652,12 +1700,13 @@ async def test_a_chosen_tier_or_a_job_keeps_the_prediction(
     user_a, fake_db, fake_request, fields
 ):
     """Admission keeps a chosen tier, and the rule is a Session's."""
-    _, select, need = await _preview_cloud_folders(
+    result, select, need = await _preview_cloud_folders(
         user_a, fake_db, fake_request, need_container=True, **fields
     )
 
     need.assert_not_awaited()
     assert select.await_count == 1
+    assert result["workspace"]["cloud_folders_take_container"] is False
 
 
 class TestPreviewTakesAnInlineExpert:

@@ -788,17 +788,23 @@ async def cloud_folders_need_a_container(
     user: dict[str, Any],
     *,
     project_id: str | None,
+    datasource_ids: list[str] | None = None,
     dependencies: ThreadAdmissionDependencies,
 ) -> bool:
     """Whether a default Session in ``project_id`` gets a Container for its
     cloud connectors.
 
     The New Session form's prediction of the rule in
-    ``resolve_thread_creation_plan``: the form submits the connectors its
-    picker defaults on the tier it predicts, and those are the defaults.
+    ``resolve_thread_creation_plan``, for the connectors the form will
+    submit: ``datasource_ids`` once its user changed them, else the
+    defaults its picker starts from.
     """
-    request_body = ThreadCreateRequest(
-        project_id=project_id, use_datasource_defaults=True
+    request_body = (
+        ThreadCreateRequest(project_id=project_id, use_datasource_defaults=True)
+        if datasource_ids is None
+        else ThreadCreateRequest(
+            project_id=project_id, datasource_ids=list(datasource_ids)
+        )
     )
     try:
         effective_project_ids = await dependencies.authorize_thread_project_ids(
@@ -815,6 +821,30 @@ async def cloud_folders_need_a_container(
             dependencies=dependencies,
         )
     ) and await _container_allowed(
+        user,
+        effective_project_ids=effective_project_ids,
+        dependencies=dependencies,
+    )
+
+
+async def cloud_folders_can_take_a_container(
+    user: dict[str, Any],
+    *,
+    project_id: str | None,
+    dependencies: ThreadAdmissionDependencies,
+) -> bool:
+    """Whether a cloud folder would take a default Session in ``project_id``
+    to a Container: the tier runs here and its owner may use it. The New
+    Session form keeps its cloud folders selectable on a Virtual default
+    then, since ticking one changes the tier rather than being refused."""
+    request_body = ThreadCreateRequest(project_id=project_id)
+    try:
+        effective_project_ids = await dependencies.authorize_thread_project_ids(
+            user, thread_creation_project_ids(request_body, user)
+        )
+    except HTTPException:
+        return False
+    return await _container_allowed(
         user,
         effective_project_ids=effective_project_ids,
         dependencies=dependencies,
@@ -2137,6 +2167,7 @@ __all__ = [
     "ThreadAdmissionStore",
     "ThreadCreationPlan",
     "build_session_config_override",
+    "cloud_folders_can_take_a_container",
     "cloud_folders_need_a_container",
     "commit_thread_creation",
     "create_thread",

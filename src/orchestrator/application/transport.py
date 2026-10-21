@@ -91,6 +91,11 @@ def session_tool_view_dependencies(
             sessions_composition.thread_admission_dependencies,
             resources,
         ),
+        cloud_folders_can_take_a_container=bound(
+            thread_admission_service.cloud_folders_can_take_a_container,
+            sessions_composition.thread_admission_dependencies,
+            resources,
+        ),
     )
 
 

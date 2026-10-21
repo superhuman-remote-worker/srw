@@ -2673,14 +2673,27 @@ export class PersistentChatService {
       // Keep the reviewed IDs explicit at create so later auto-attach edits
       // cannot add a connector the user did not see here.
       const preview = await firstValueFrom(
-        this.http.post<{project_ids: string[]; workspace_backend: string; datasource_ids: string[]}>(
+        this.http.post<{
+          project_ids: string[];
+          workspace_backend: string;
+          workspace_sources?: {tier: string | null; template: string | null} | null;
+          workspace_template_name?: string | null;
+          datasource_ids: string[];
+        }>(
           `${environment.apiUrl}/persistent/threads/preview`, body,
         ),
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       this.draftProjectIds = preview.project_ids;
       this.draftProjectId.set(preview.project_ids[0] ?? null);
-      this.draftWorkspacePreview.set({backend: preview.workspace_backend, source: 'default', binding: null});
+      // Its sources let the picker say a Container is the cloud folders'.
+      this.draftWorkspacePreview.set({
+        backend: preview.workspace_backend,
+        source: 'default',
+        binding: null,
+        ...(preview.workspace_sources ? {sources: preview.workspace_sources} : {}),
+        template_name: preview.workspace_template_name ?? null,
+      });
       this.draftDatasourceIds.set(preview.datasource_ids);
     } catch (err) {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;

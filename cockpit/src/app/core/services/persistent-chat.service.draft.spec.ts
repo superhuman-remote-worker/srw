@@ -55,6 +55,7 @@ function createService(opts: {
     createFails?: boolean;
     createError?: unknown;
     policyAvailable?: boolean;
+    workspaceSources?: {tier: string; template: string};
 } = {}) {
     const mockHttp: any = {
         get: vi.fn().mockImplementation((url: string) => {
@@ -69,6 +70,9 @@ function createService(opts: {
             if (url.endsWith('/persistent/threads/preview')) return of({
                 project_ids: body.project_ids ?? [],
                 workspace_backend: body.config_override?.workspace?.backend ?? 'virtual',
+                ...(opts.workspaceSources
+                    ? {workspace_sources: opts.workspaceSources, workspace_template_name: 'container-full'}
+                    : {}),
                 datasource_ids: body.datasource_ids ?? opts.datasourceIds ?? [],
             });
             if (isThreadsCreate(url)) {
@@ -270,6 +274,27 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
             title: 'hello',
             project_ids: ['p-def'],
             datasource_ids: ['my-cloud', 'outbox'],
+        });
+    });
+
+    it("tells the picker a Container is its cloud folders'", async () => {
+        // Admission takes a default Session with cloud folders to a Container;
+        // without the tier's source the picker said "Default: Virtual".
+        const ctx = createService({
+            policyAvailable: false,
+            projects: [{id: 'p-def', is_default: true, user_role: 'owner'}],
+            datasourceIds: ['outbox'],
+            workspaceSources: {tier: 'cloud_connectors', template: 'builtin'},
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        expect(ctx.service.draftWorkspacePreview()).toEqual({
+            backend: 'virtual',
+            source: 'default',
+            binding: null,
+            sources: {tier: 'cloud_connectors', template: 'builtin'},
+            template_name: 'container-full',
         });
     });
 

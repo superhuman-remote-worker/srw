@@ -2229,6 +2229,10 @@ export class ApiService {
         expert_id?: string | null;
         project_id?: string | null;
         config_override?: Record<string, unknown> | null;
+        /** The connectors the form will submit, once its user changed them;
+         *  the tier a cloud folder takes is predicted from them. Omitted:
+         *  the defaults. */
+        datasource_ids?: string[];
         /** Which surface is asking. Omitted = `session`, so existing callers
          *  keep their meaning; job create must send `worker` or it gets a
          *  session's prediction (different base, different code floors). */

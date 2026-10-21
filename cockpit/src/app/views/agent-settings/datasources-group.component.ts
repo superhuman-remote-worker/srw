@@ -75,6 +75,19 @@ export function requiresShellWorkspace(
   return SHELL_WORKSPACE_TYPES.has((type || '').toString().toLowerCase());
 }
 
+/** Whether a lite tier holds a connector back from the picker. A cloud
+ *  folder is not held back where one takes a default Virtual Session to a
+ *  Container (`cloudFoldersTakeContainer`, the server's rule): ticking it
+ *  changes the tier rather than being refused. */
+export function liteHoldsBack(
+  type: DatasourceType | string,
+  drivers?: readonly ConnectorDriver[] | null,
+  cloudFoldersTakeContainer = false,
+): boolean {
+  if (cloudFoldersTakeContainer && CLOUD_MOUNT_TYPES.has((type || '').toString())) return false;
+  return requiresShellWorkspace(type, drivers);
+}
+
 /** How the picker shows the access level of a connector with strict levels
  *  (a cloud folder): chosen in a select on a selected row (New Session),
  *  shown (a job binds at its project link's level), or shown in a disabled
@@ -211,12 +224,13 @@ export function selectedDatasourceIds(
   defaultIds?: Set<string> | null,
   serverDefaultsEnabled = false,
   drivers?: readonly ConnectorDriver[] | null,
+  cloudFoldersTakeContainer = false,
 ): string[] {
   const active = activeDatasourceIds(
     datasources, selection, defaultIds, serverDefaultsEnabled,
   );
   return datasources
-    .filter(d => active.has(d.id) && !(isLiteBackend && requiresShellWorkspace(d.type, drivers)))
+    .filter(d => active.has(d.id) && !(isLiteBackend && liteHoldsBack(d.type, drivers, cloudFoldersTakeContainer)))
     .map(d => d.id);
 }
 
@@ -246,10 +260,11 @@ export function allDatasourcesSelected(
   lockedIds?: string[],
   serverDefaultsEnabled = false,
   drivers?: readonly ConnectorDriver[] | null,
+  cloudFoldersTakeContainer = false,
 ): boolean {
   const locked = new Set(lockedIds ?? []);
   const selectable = datasources.filter(
-    d => !(isLiteBackend && requiresShellWorkspace(d.type, drivers)) && !locked.has(d.id),
+    d => !(isLiteBackend && liteHoldsBack(d.type, drivers, cloudFoldersTakeContainer)) && !locked.has(d.id),
   );
   if (selectable.length === 0) return false;
   const active = activeDatasourceIds(
@@ -772,6 +787,9 @@ export class DatasourcesGroupComponent {
    * the orchestrator, so they remain selectable.
    */
   isLiteBackend = input(false);
+  /** New Session on a default Virtual tier that a cloud folder takes to a
+   *  Container: cloud folders stay selectable (see `liteHoldsBack`). */
+  cloudFoldersTakeContainer = input(false);
   /**
    * Default selection when the user hasn't touched the picker (live mode:
    * the session's currently attached set — possibly empty). Null keeps the
@@ -884,7 +902,7 @@ export class DatasourcesGroupComponent {
   readonly selectedList = computed<Datasource[]>(() => {
     const ids = new Set(selectedDatasourceIds(
       this.datasources(), this.selection(), this.isLiteBackend(), this.defaultIds(),
-      this.datasourceDefaultsEnabled(), this.drivers(),
+      this.datasourceDefaultsEnabled(), this.drivers(), this.cloudFoldersTakeContainer(),
     ));
     return this.datasources().filter(d => ids.has(d.id));
   });
@@ -926,12 +944,13 @@ export class DatasourcesGroupComponent {
       this.datasources().filter(ds => this.isLocked(ds)).map(ds => ds.id),
       this.datasourceDefaultsEnabled(),
       this.drivers(),
+      this.cloudFoldersTakeContainer(),
     )
   );
 
   /** A driver that needs a shell is held back on a lite workspace. */
   isLiteExcluded(ds: Datasource): boolean {
-    return this.isLiteBackend() && requiresShellWorkspace(ds.type, this.drivers());
+    return this.isLiteBackend() && liteHoldsBack(ds.type, this.drivers(), this.cloudFoldersTakeContainer());
   }
 
   /** Frozen at its current state — rendered, never toggleable. */
@@ -1133,7 +1152,14 @@ export class DatasourcesGroupComponent {
       this.defaultIds(),
       this.datasourceDefaultsEnabled(),
       this.drivers(),
+      this.cloudFoldersTakeContainer(),
     );
+  }
+
+  /** Whether the user has ticked or unticked a connector here: until then
+   *  the selection is the server's defaults. */
+  hasUserSelection(): boolean {
+    return this.selection() !== null;
   }
 
   private loadIndexStatus(id: string): void {
