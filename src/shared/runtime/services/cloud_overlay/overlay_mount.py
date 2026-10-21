@@ -665,7 +665,7 @@ if _srw_mount_present; then
   timeout 10 fusermount3 -uz "$merged" >/dev/null 2>&1 || timeout 10 fusermount -uz "$merged" >/dev/null 2>&1 || true
 fi
 if _srw_mount_present; then
-  timeout 10 sudo -n umount -l -- "$merged" >/dev/null 2>&1 || true
+  timeout 10 umount -l -- "$merged" >/dev/null 2>&1 || timeout 10 sudo -n umount -l -- "$merged" >/dev/null 2>&1 || true
 fi
 ! _srw_mount_present || exit 88
 ! _srw_any_merged_overlay || exit 85

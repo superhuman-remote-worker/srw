@@ -906,7 +906,7 @@ _srw_detach() {{
     timeout 10 fusermount3 -uz "$1" >/dev/null 2>&1 || timeout 10 fusermount -uz "$1" >/dev/null 2>&1 || true
   fi
   if _srw_mounted "$1"; then
-    timeout 10 sudo -n umount -l -- "$1" >/dev/null 2>&1 || true
+    timeout 10 umount -l -- "$1" >/dev/null 2>&1 || timeout 10 sudo -n umount -l -- "$1" >/dev/null 2>&1 || true
   fi
 }}
 _srw_unlink() {{
@@ -1812,7 +1812,7 @@ fi
 if _srw_mount_present || ! [ -d "$target" ]; then
   # Workspace images normally permit their agent user to manage its FUSE
   # mount. A bounded lazy umount is the final recovery for a dead transport.
-  timeout 10 sudo -n umount -l -- "$target" >/dev/null 2>&1 || true
+  timeout 10 umount -l -- "$target" >/dev/null 2>&1 || timeout 10 sudo -n umount -l -- "$target" >/dev/null 2>&1 || true
 fi
 _srw_target_ready=
 for _srw_i in $(seq 1 20); do
@@ -1915,7 +1915,7 @@ if _srw_mount_present; then
   timeout 10 fusermount3 -uz "$target" >/dev/null 2>&1 || timeout 10 fusermount -uz "$target" >/dev/null 2>&1 || true
 fi
 if _srw_mount_present; then
-  timeout 10 sudo -n umount -l -- "$target" >/dev/null 2>&1 || true
+  timeout 10 umount -l -- "$target" >/dev/null 2>&1 || timeout 10 sudo -n umount -l -- "$target" >/dev/null 2>&1 || true
 fi
 ! _srw_mount_present || exit 88
 ! _srw_any_exact_process || exit 85
