@@ -126,7 +126,8 @@ call) to Asterisk, so Asterisk needs an address on your LAN:
   the profile's name. Insert-only: rows you changed in Admin → Models stay as
   they are. Per profile you can set a display name, a price per minute for the
   usage ledger (`ratePerMinuteUsd`, default 0) and the voice an expert that
-  names none gets.
+  names none gets. The endpoint's URL is the gateway's in-cluster `http://`
+  Service: editing it in Admin → Models needs "allow insecure".
 - The phone-line driver's pods reach the gateway's in-cluster Service: the
   Service admits `srw.gpt-live-sip/v1` (annotation `srw.io/driver-egress`) and
   the driver pod's egress is pinned to the gateway's pods. The gateway admits

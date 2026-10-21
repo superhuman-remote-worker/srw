@@ -142,7 +142,11 @@ profiles), and the transfer request. `refer-refuse` asserts SRW's fallback
 instead of the stand-in's behaviour: after the 603 the addon dials 3000
 itself through its line, the human answers, and the caller, who never left,
 hears the human (the bench PBX lets extension 2000 call 3000, as any PBX
-lets an internal phone call the reception). After the last profile,
+lets an internal phone call the reception). Once the human answered, the
+runner restarts the gateway (`gateway_restart.json` per profile): the
+handed-over call lives in the addon's dialplan, outside the gateway's app, so
+the caller must still hear the human after the restart and hang up on
+schedule (`handed_over_call_survives_gateway_restart`). After the last profile,
 `no_audio_written` in the report lists every file the addon, the gateway and
 the driver changed in their containers (`docker diff`): the gateway and the
 driver run read-only, and the addon may only keep its astdb and control
