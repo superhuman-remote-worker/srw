@@ -315,6 +315,17 @@ def test_hostnetwork_pins_asterisk_and_the_gateway_beside_it(voice_docs):
     assert asterisk["nodeSelector"] == {"kubernetes.io/hostname": "voice-node"}
     (render_container,) = asterisk["initContainers"]
     assert render_container["args"][-2:] == ["--ari-bind", "$(POD_IP):8088"]
+    # Rendered into a directory of its own, which Asterisk mounts read-only.
+    assert render_container["args"][2:4] == ["--out", "/etc/asterisk-rendered/etc"]
+    (mount,) = [
+        m for m in asterisk["containers"][0]["volumeMounts"] if m["name"] == "config"
+    ]
+    assert mount == {
+        "name": "config",
+        "mountPath": "/etc/asterisk",
+        "subPath": "etc",
+        "readOnly": True,
+    }
     affinity = _pod(voice_docs, "voice-gateway")["affinity"]["podAffinity"]
     (term,) = affinity["requiredDuringSchedulingIgnoredDuringExecution"]
     assert term["labelSelector"]["matchLabels"]["app.kubernetes.io/component"] == (

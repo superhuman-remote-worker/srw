@@ -93,8 +93,10 @@ spec:
           args:
             - --values
             - /etc/srw-voice/asterisk.yaml
+            # A directory of its own in the volume: the renderer makes it
+            # 0750 (the volume's root belongs to the kubelet).
             - --out
-            - /etc/asterisk-rendered
+            - /etc/asterisk-rendered/etc
             # ARI on the pod's own address, never every interface.
             - --ari-bind
             - {{ printf "$(POD_IP):%d" $ariPort | quote }}
@@ -157,6 +159,7 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/asterisk
+              subPath: etc
               readOnly: true
             - name: run
               mountPath: /run/asterisk
