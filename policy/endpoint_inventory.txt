@@ -220,6 +220,7 @@ GET    /api/experts/{expert_id}                                                 
 PUT    /api/experts/{expert_id}                                                         pat=admin           gated:require_approved_user
 POST   /api/experts/{expert_id}/duplicate                                               pat=admin           gated:require_approved_user
 GET    /api/experts/{expert_id}/export                                                  pat=jobs:read       gated:require_approved_user
+GET    /api/experts/{expert_id}/source                                                  pat=jobs:read       gated:require_approved_user
 GET    /api/graph/changes/{job_id}                                                      pat=knowledge:read  gated:require_job_access
 GET    /api/health                                                                      pat=any             public:k8s-liveness-probe
 DELETE /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
