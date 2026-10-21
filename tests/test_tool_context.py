@@ -417,6 +417,70 @@ class TestInstructionPinning:
         assert ctx.was_recently_read("notes/facts.md") is False
         assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
 
+    def test_refusal_delivers_the_guide_and_the_next_batch_passes(self):
+        # Bench jobs paid a refused call, then a read_file round trip, per gate.
+        ws = _make_workspace_manager()
+        ws.read_file.return_value = "GUIDE BODY"
+        ctx = self._ctx_with_guide()
+        ctx.workspace_manager = ws
+        ctx.set_current_phase("strategic", phase_number=0, turn_count=3)
+
+        refusal = ctx.check_tool_enforcement("next_phase_todos")
+
+        assert "GUIDE BODY" in refusal
+        assert "Not run yet" in refusal
+        ctx.set_current_phase("strategic", phase_number=0, turn_count=4)
+        assert ctx.check_tool_enforcement("next_phase_todos") is None
+
+    def test_same_batch_calls_stay_refused_without_repeating_the_guide(self):
+        ws = _make_workspace_manager()
+        ws.read_file.return_value = "GUIDE BODY"
+        ctx = self._ctx_with_guide()
+        ctx.workspace_manager = ws
+        ctx.set_current_phase("strategic", phase_number=0, turn_count=3)
+
+        first = ctx.check_tool_enforcement("next_phase_todos")
+        second = ctx.check_tool_enforcement("next_phase_todos")
+
+        assert "GUIDE BODY" in first
+        assert second is not None and "GUIDE BODY" not in second
+        assert ws.read_file.call_count == 1
+
+    def test_session_response_id_opens_the_gate_for_the_next_response(self):
+        ws = _make_workspace_manager()
+        ws.read_file.return_value = "GUIDE BODY"
+        ctx = self._ctx_with_guide()
+        ctx.workspace_manager = ws
+        ctx._current_turn_count = 7  # a session turn spans many responses
+        ctx._current_ai_message_id = "msg-1"
+
+        assert "GUIDE BODY" in ctx.check_tool_enforcement("next_phase_todos")
+        assert ctx.check_tool_enforcement("next_phase_todos") is not None
+        ctx._current_ai_message_id = "msg-2"
+        assert ctx.check_tool_enforcement("next_phase_todos") is None
+
+    def test_context_without_a_response_clock_never_holds_the_gate(self):
+        # A child context has no phase and may lack a response id: delivery
+        # must open the gate rather than refuse forever.
+        ws = _make_workspace_manager()
+        ws.read_file.return_value = "GUIDE BODY"
+        ctx = self._ctx_with_guide()
+        ctx.workspace_manager = ws
+
+        assert "GUIDE BODY" in ctx.check_tool_enforcement("next_phase_todos")
+        assert ctx.check_tool_enforcement("next_phase_todos") is None
+
+    def test_unreadable_guide_falls_back_to_asking_for_a_read(self):
+        ws = _make_workspace_manager()
+        ws.read_file.side_effect = FileNotFoundError("gone")
+        ctx = self._ctx_with_guide()
+        ctx.workspace_manager = ws
+
+        refusal = ctx.check_tool_enforcement("next_phase_todos")
+
+        assert "You must read `skills/todo-guide/SKILL.md`" in refusal
+        assert ctx.check_tool_enforcement("next_phase_todos") is not None
+
     def test_writing_an_unread_instruction_file_does_not_satisfy_its_gate(self):
         ctx = self._ctx_with_guide()
 

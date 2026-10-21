@@ -74,6 +74,9 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     "empty_response_recovery": set(),
     # src/tools/context.py, src/tools/registry.py, src/tools/workspace/files.py
     "read_file_required_error": {"file_path", "tool_name"},
+    # src/agent/tools/context.py — an enforced instruction delivered in the refusal
+    "read_file_delivered_with_refusal": {"file_path", "tool_name", "content"},
+    "read_file_delivered_in_batch": {"file_path", "tool_name"},
 }
 
 

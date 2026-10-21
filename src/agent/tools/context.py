@@ -1424,6 +1424,13 @@ class ToolContext:
         if not self.was_recently_read(path):
             return False
 
+        stamp = self._instruction_read_stamps.get(path)
+        token = self._tool_batch_token()
+        if token is not None and stamp and stamp.get("delivered_in") == token:
+            # Delivered by a refusal in this same batch: calls the model
+            # wrote before the text arrived have still not seen it.
+            return False
+
         read_scope = getattr(entry, "read_scope", "job")
         max_age = getattr(entry, "max_read_age_turns", None)
         if read_scope == "job" and max_age is None:
@@ -1482,16 +1489,69 @@ class ToolContext:
         """
         for entry in self.get_enforcement_entries(tool_name):
             if not self.instruction_read_is_valid(entry):
-                from shared.runtime.services.guardrails import format_nudge
-
-                model = self._llm_config.model if self._llm_config is not None else None
-                return format_nudge(
-                    "read_file_required_error",
-                    model=model,
-                    file_path=entry.path,
-                    tool_name=tool_name,
-                )
+                return self._refuse_with_instruction(entry, tool_name)
         return None
+
+    def _tool_batch_token(self) -> Optional[str]:
+        """Identify the LLM response whose tool calls are running now.
+
+        The session loop (which also drives subagent children) stamps each
+        response's id; the worker graph advances ``turn_count`` once per
+        response. None when neither identifies a response.
+        """
+        ai_id = self._current_ai_message_id
+        if ai_id and ai_id != "None":
+            return f"ai:{ai_id}"
+        if self._current_phase is not None:
+            return f"turn:{self._current_turn_count}"
+        return None
+
+    def _refuse_with_instruction(self, entry: Any, tool_name: str) -> str:
+        """Refuse ``tool_name`` once, carrying the unread instruction file.
+
+        The refusal holds the file's full text and counts as its read, so the
+        next call goes through without a separate read_file round trip, and
+        the model sees the whole file rather than a slice. Other calls in the
+        same batch stay refused without repeating the text. An unreadable
+        file falls back to asking for a read_file.
+        """
+        from shared.runtime.services.guardrails import format_nudge
+
+        model = self._llm_config.model if self._llm_config is not None else None
+        path = (entry.path or "").lstrip("/").strip()
+        token = self._tool_batch_token()
+        stamp = self._instruction_read_stamps.get(path)
+        if token is not None and stamp and stamp.get("delivered_in") == token:
+            return format_nudge(
+                "read_file_delivered_in_batch",
+                model=model,
+                file_path=entry.path,
+                tool_name=tool_name,
+            )
+        content = None
+        if self.workspace_manager is not None:
+            try:
+                content = self.workspace_manager.read_file(path)
+            except Exception as exc:
+                logger.debug(f"Instruction {path} unreadable for delivery: {exc}")
+        if not isinstance(content, str) or not content.strip():
+            return format_nudge(
+                "read_file_required_error",
+                model=model,
+                file_path=entry.path,
+                tool_name=tool_name,
+            )
+        self.record_file_read(path, content)
+        delivered = self._instruction_read_stamps.get(path)
+        if delivered is not None:
+            delivered["delivered_in"] = token
+        return format_nudge(
+            "read_file_delivered_with_refusal",
+            model=model,
+            file_path=entry.path,
+            tool_name=tool_name,
+            content=content,
+        )
 
     def get_phase_instruction_files(self, phase: str) -> List[Any]:
         """Get instruction files eligible for once-only phase-start delivery.

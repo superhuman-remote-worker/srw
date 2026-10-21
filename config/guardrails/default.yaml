@@ -375,3 +375,16 @@ nudges:
   read_file_required_error: |-
     Error: You must read `{file_path}` before using {tool_name}. It contains critical instructions for this operation.
     Read it first by invoking the `read_file` tool, then invoke {tool_name} again.
+
+  # An enforced instruction file arrives inside the refusal and counts as read
+  # (src/agent/tools/context.py). Placeholders: {file_path}, {tool_name}, {content}
+  read_file_delivered_with_refusal: |-
+    Not run yet: {tool_name} needs the instructions in `{file_path}`, which you have not read here. They are below and now count as read. Follow them, then invoke {tool_name} again.
+
+    <instructions path="{file_path}">
+    {content}
+    </instructions>
+
+  # Placeholders: {file_path}, {tool_name}
+  read_file_delivered_in_batch: |-
+    Not run yet: the instructions for {tool_name} (`{file_path}`) came with an earlier refusal in this same batch. Follow them, then invoke {tool_name} again.

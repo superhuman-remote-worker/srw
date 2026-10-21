@@ -230,6 +230,16 @@ nudges:
     Error: You must read `{file_path}` before using {tool_name}. It contains critical instructions for this operation.
     Read it first by invoking the `read_file` tool, then invoke {tool_name} again. Use the canonical Gemma tool-call format — braces only.
 
+  read_file_delivered_with_refusal: |-
+    Not run yet: {tool_name} needs the instructions in `{file_path}`, which you have not read here. They are below and now count as read. Follow them, then invoke {tool_name} again. Use the canonical Gemma tool-call format — braces only.
+
+    <instructions path="{file_path}">
+    {content}
+    </instructions>
+
+  read_file_delivered_in_batch: |-
+    Not run yet: the instructions for {tool_name} (`{file_path}`) came with an earlier refusal in this same batch. Follow them, then invoke {tool_name} again. Use the canonical Gemma tool-call format — braces only.
+
   phase_transition_tactical_to_strategic: |-
     [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update plan.md and record key learnings, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool. All tool invocations use the canonical Gemma brace format from your system prompt.
 
