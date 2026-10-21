@@ -2038,7 +2038,7 @@
       },
       "state": {
         "mounted": "mounted",
-        "pending": "connecting…"
+        "pending": "confirmed when the agent starts"
       },
       "review": "Go to the review",
       "notAttachedKind": {

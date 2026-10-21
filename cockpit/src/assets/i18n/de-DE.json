@@ -2038,7 +2038,7 @@
       },
       "state": {
         "mounted": "eingebunden",
-        "pending": "wird verbunden…"
+        "pending": "wird beim Start des Agenten bestätigt"
       },
       "review": "Zur Prüfung",
       "notAttachedKind": {

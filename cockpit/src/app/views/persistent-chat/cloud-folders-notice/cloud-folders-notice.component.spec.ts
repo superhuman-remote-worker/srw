@@ -294,7 +294,7 @@ describe('CloudFoldersNoticeComponent', () => {
     const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
     expect(rows.map((r) => r.dataset['state'])).toEqual(['mounted', 'pending', 'excluded']);
     expect(text(rows[0])).toBe('workspace/cloud/acme · Project folder Read-only · mounted');
-    expect(text(rows[1])).toBe('workspace/cloud/outbox · Session outbox Read-write · connecting…');
+    expect(text(rows[1])).toBe('workspace/cloud/outbox · Session outbox Read-write · confirmed when the agent starts');
     expect(text(rows[2])).toBe(
       'My cloud was not attached · no cloud account yet: connect your cloud under Settings → Connectors Connect your cloud',
     );
