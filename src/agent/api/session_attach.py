@@ -1294,6 +1294,15 @@ class SessionAttachCoordinator:
                             )
                     elif not cloud_mount_cfg:
                         cloud_mount_cfg = cloud_mount_payload(ws_info)
+                    if workspace_override is None and ws_info.get(
+                        "cloud_folders_excluded"
+                    ):
+                        # A lite session has no pod payload, but the cloud
+                        # folders its tier left out still reach its prompt
+                        # (setup reads an absent override as empty).
+                        workspace_override = {
+                            "cloud_folders_excluded": ws_info["cloud_folders_excluded"]
+                        }
                 elif protected_cloud:
                     raise ProtectedCloudUnavailable(
                         "protected-cloud workspace authority is unavailable"

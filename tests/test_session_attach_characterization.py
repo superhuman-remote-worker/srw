@@ -1502,3 +1502,60 @@ async def test_failed_attach_release_cannot_clear_successor_identity(monkeypatch
         identity()["attach_token"],
     ) == (TB, G2, T2)
     assert identity()["status_contract"] is True
+
+
+# ---------------------------------------------------------------------------
+# A lite session's cloud folders (owner 2026-10-21)
+# ---------------------------------------------------------------------------
+
+
+def _lite_workspace(**extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "ready",
+        "backend": "virtual",
+        "protected_cloud": False,
+        "config_override": {"workspace": {"backend": "virtual"}},
+    }
+    payload.update(extra)
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_a_lite_session_names_the_cloud_folders_its_tier_left_out(monkeypatch):
+    """A Virtual Session has no pod payload to poll, but the folders its
+    creation left out reach its prompt (dev 827cb83c: never told)."""
+    excluded = [
+        {
+            "source_ref": "folder-1",
+            "mount_kind": "project",
+            "reason": "mount_unsupported",
+            "detail": "virtual_workspace",
+        }
+    ]
+    client = _client()
+    client.get_thread_workspace = AsyncMock(
+        return_value=_lite_workspace(cloud_folders_excluded=excluded)
+    )
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    poll_calls = _poll(monkeypatch, _workspace())
+
+    await attach(thread_id=TA)
+
+    assert poll_calls == []
+    (session,) = FakeSession.instances
+    assert session.setup_kwargs["workspace_override"] == {
+        "cloud_folders_excluded": excluded
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_lite_session_without_left_out_folders_keeps_no_override(monkeypatch):
+    client = _client()
+    client.get_thread_workspace = AsyncMock(return_value=_lite_workspace())
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    _poll(monkeypatch, _workspace())
+
+    await attach(thread_id=TA)
+
+    (session,) = FakeSession.instances
+    assert session.setup_kwargs["workspace_override"] is None
