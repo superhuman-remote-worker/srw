@@ -19,6 +19,7 @@ import {
     toolsFragment,
 } from '../agent-settings/resolved-toolset';
 import {deepMergeConfig} from '../agent-settings/config-merge';
+import {tierHiddenAttachedIds} from '../agent-settings/datasources-group.component';
 import {
     SESSION_DELEGATION_CAP,
     sessionDelegationCapValue,
@@ -637,14 +638,21 @@ export class SettingsPaneComponent {
 
     /** The full desired selection: the picker's checked set plus attached ids
      *  the picker doesn't show (kb hidden entries, revoked-visibility rows,
-     *  eligible-fetch failures) — those must survive every dispatch, or an
-     *  unrelated toggle would silently detach them. Sorted for stable
-     *  comparison. */
+     *  eligible-fetch failures) or that a lite tier leaves out — those must
+     *  survive every dispatch, or an unrelated toggle would silently detach
+     *  them. Sorted for stable comparison. */
     private canonicalDatasourceIds(): string[] {
         const groupIds = this.settings()?.getSelectedDatasourceIds() ?? [];
         const pickerIds = new Set(this.pickerDatasources().map((ds) => ds.id));
         const hidden = this.attachedIds().filter((id) => !pickerIds.has(id));
-        return [...new Set([...groupIds, ...hidden])].sort();
+        // An unavailable placeholder stays detachable by an explicit uncheck.
+        const tierHidden = tierHiddenAttachedIds(
+            this.pickerDatasources().filter((ds) => !ds.unavailable),
+            this.attachedIds(),
+            this.isLiteBackend(),
+            this.connectorDrivers.drivers(),
+        );
+        return [...new Set([...groupIds, ...hidden, ...tierHidden])].sort();
     }
 
     /** Flatten the pane's tracked surface into path → value. Tool groups

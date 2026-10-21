@@ -10033,6 +10033,15 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     expect(inputCalls(ctx)).toHaveLength(0);
   });
 
+  it('disconnect forgets the workspace tier so the next Session reads its own', async () => {
+    // 10-19: the first Session opened in a tab fixed the tier for every later
+    // one, so a container Session's settings ran as virtual.
+    const ctx = await readySession();
+    ctx.service.workspaceTier.set('virtual');
+    ctx.service.disconnect();
+    expect(ctx.service.workspaceTier()).toBeNull();
+  });
+
   it('disconnect clears the upgrade state so it cannot bleed across threads', async () => {
     const ctx = await readySession();
     offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
@@ -12237,6 +12246,31 @@ describe('PersistentChatService — control transport is declared, never inferre
     TestBed.tick();
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
     expect(ctx.service.continueAfterUpgrade()).toBe(true);
+  });
+
+  it('a refused upgrade leaves no provisioning line behind', async () => {
+    // 10-19: each refused try left a "provisioning…" line in the chat.
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(
+      throwError(() => ({
+        status: 409,
+        error: {
+          detail:
+            "This Session's workspace can't be upgraded in place. " +
+            'Start a new Session with a container workspace.',
+        },
+      })),
+    );
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    ctx.service.upgradeWorkspace('sandbox');
+
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceOffer.provisioning'),
+    ).toHaveLength(0);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    // Shown in the user's language, not as the server's English detail.
+    expect(ctx.service.error()).toBe('chat.workspaceUpgrade.notPossible');
   });
 
   it('a second /upgrade-workspace while one is provisioning posts nothing and keeps the first', async () => {

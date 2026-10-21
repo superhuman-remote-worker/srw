@@ -220,6 +220,22 @@ export function selectedDatasourceIds(
     .map(d => d.id);
 }
 
+/** Attached ids a lite tier leaves out of `selectedDatasourceIds`. They aren't
+ *  the user's to toggle there, so a save must keep them: the server refuses
+ *  whatever a tier can't serve. */
+export function tierHiddenAttachedIds(
+  datasources: Datasource[],
+  attachedIds: readonly string[],
+  isLiteBackend: boolean,
+  drivers?: readonly ConnectorDriver[] | null,
+): string[] {
+  if (!isLiteBackend) return [];
+  const attached = new Set(attachedIds);
+  return datasources
+    .filter(d => attached.has(d.id) && requiresShellWorkspace(d.type, drivers))
+    .map(d => d.id);
+}
+
 /** True when every selectable datasource (i.e. not lite-excluded and not
  *  locked) is selected. */
 export function allDatasourcesSelected(
@@ -318,7 +334,7 @@ export function allDatasourcesSelected(
                   }
                 </span>
                 @if (isLiteExcluded(ds)) {
-                  <span class="ds-desc">Requires a sandbox or VM workspace</span>
+                  <span class="ds-desc">{{ 'agentSettings.datasources.requiresShellWorkspace' | transloco }}</span>
                 } @else if (ds.unavailable && ds.type === 'credentials') {
                   <span class="ds-desc">{{ 'agentSettings.datasources.credentialsUnavailable' | transloco }}</span>
                 } @else if (ds.unavailable) {

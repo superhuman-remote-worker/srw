@@ -139,6 +139,13 @@ export function workspaceTierLabel(tier: string): string {
   return tier;
 }
 
+/** Server refusals of a control shown in the user's language; any other
+ *  detail is shown as the server wrote it. */
+const CONTROL_REFUSAL_KEYS: Readonly<Record<string, string>> = {
+  "This Session's workspace can't be upgraded in place. Start a new Session with a container workspace.":
+    'chat.workspaceUpgrade.notPossible',
+};
+
 /** Session title from a landing draft's first message: first line, collapsed
  *  whitespace, capped at 60 chars (on a word boundary when one is near). */
 export function draftTitleFrom(message: string): string {
@@ -1366,6 +1373,9 @@ export class PersistentChatService {
   readonly workspaceUpgrade = signal<WorkspaceUpgradeView | null>(null);
   readonly workspaceUpgradeFailed = computed(() => this.workspaceUpgrade()?.phase === 'failed');
   private workspaceUpgradeFailureAnnounced: string | null = null;
+  /** The provisioning line owed for the upgrade being admitted: posted on
+   *  its 202, dropped on a refusal (a refused try used to leave its line). */
+  private pendingUpgradeAnnouncement: {template?: string} | null = null;
   /** An upgrade asked for mid-response, sent when the session is idle. */
   private deferredWorkspaceUpgrade: {
     threadId: string;
@@ -4929,6 +4939,11 @@ export class PersistentChatService {
         String(admission.request_id ?? item.request.client_request_id),
       );
     }
+    if (item.request.method === 'upgrade-to-workspace' && this.pendingUpgradeAnnouncement) {
+      const announcement = this.pendingUpgradeAnnouncement;
+      this.pendingUpgradeAnnouncement = null;
+      if (item.threadId === this.threadId()) this._announceWorkspaceUpgradeProvisioning(announcement);
+    }
     if (item.request.method === 'upgrade-to-workspace' && item.threadId === this.threadId()) {
       // The create starts now: show its startup line without waiting 5 s.
       void this.loadThreadMeta(item.threadId, this.connectGeneration, {
@@ -4980,16 +4995,20 @@ export class PersistentChatService {
     if (item.request.method === 'upgrade-to-workspace') {
       this.workspaceUpgradeInProgress.set(null);
       this.continueAfterUpgrade.set(false);
+      this.pendingUpgradeAnnouncement = null;
     }
     if (!this.intentionalClose && this.threadId() === item.threadId) {
       const detail = (err as { error?: { detail?: unknown }; message?: unknown })?.error?.detail;
+      const known = typeof detail === 'string' ? CONTROL_REFUSAL_KEYS[detail] : undefined;
       this._setDurableControlError(
         { method: item.request.method, ordinal: item.ordinal },
         upgradeRetriesExhausted
           ? this.transloco.translate('chat.control.upgradeBusy')
-          : typeof detail === 'string'
-            ? this.sanitizeError(detail)
-            : this.transloco.translate('chat.control.admissionFailed'),
+          : known
+            ? this.transloco.translate(known)
+            : typeof detail === 'string'
+              ? this.sanitizeError(detail)
+              : this.transloco.translate('chat.control.admissionFailed'),
       );
     }
     this._flushDurableControlOutbox();
@@ -5377,6 +5396,10 @@ export class PersistentChatService {
     this.workspaceUpgradeInProgress.set(null);
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(false);
+    this.pendingUpgradeAnnouncement = null;
+    // So is the tier: the settings pane sets it from the next thread's own
+    // config, and a stale one made it filter that thread's connectors.
+    this.workspaceTier.set(null);
     this.sessionTitle.set(null);
     this.modelName.set(null);
     this.isOfficerThread.set(false);
@@ -7516,17 +7539,23 @@ export class PersistentChatService {
     const control: DurableControl = {method: 'upgrade-to-workspace'};
     if (tier) control.target_tier = tier;
     if (template) control.template = template;
-    if (!this._sendDurableControl(control)) return;
+    // Set before sending: the admission (or refusal) may settle synchronously.
+    const inProgress = this.workspaceUpgradeInProgress();
+    const announcement = this.pendingUpgradeAnnouncement;
     if (tier === 'vm') {
       // The 202 (or the lane_changed frame) says "moving to a VM".
       this.workspaceUpgradeInProgress.set({tier: 'vm'});
     } else if (!tier && template) {
       // A named template's tier is the server's call.
       this.workspaceUpgradeInProgress.set({tier: 'next'});
-      this._announceWorkspaceUpgradeProvisioning({template});
+      this.pendingUpgradeAnnouncement = {template};
     } else {
       this.workspaceUpgradeInProgress.set({tier: 'sandbox'});
-      this._announceWorkspaceUpgradeProvisioning();
+      this.pendingUpgradeAnnouncement = {};
+    }
+    if (!this._sendDurableControl(control)) {
+      this.workspaceUpgradeInProgress.set(inProgress);
+      this.pendingUpgradeAnnouncement = announcement;
     }
   }
 

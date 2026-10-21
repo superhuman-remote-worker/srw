@@ -7,6 +7,7 @@ import {
   isRepositoryDatasource,
   requiresShellWorkspace,
   selectedDatasourceIds,
+  tierHiddenAttachedIds,
   DatasourcesGroupComponent,
 } from './datasources-group.component';
 import {DatasourceType, EligibleDatasource} from '../../core/models/api.model';
@@ -43,6 +44,12 @@ function makeDs(id: string, type: string, defaultSelected = false): EligibleData
 }
 
 describe('datasources-group selection logic', () => {
+  it('names the attached connectors a lite tier hides, so a save keeps them', () => {
+    const ds = [makeDs('key', 'credentials'), makeDs('kb', 'kb'), makeDs('spare', 'credentials')];
+    expect(tierHiddenAttachedIds(ds, ['key', 'kb'], true)).toEqual(['key']);
+    expect(tierHiddenAttachedIds(ds, ['key', 'kb'], false)).toEqual([]);
+  });
+
   it('excludes credentials from workspaces without a shell', () => {
     const ds = [makeDs('key', 'credentials'), makeDs('kb', 'kb')];
     const selection = {key: datasourceSetKey(ds), ids: new Set(['key', 'kb'])};

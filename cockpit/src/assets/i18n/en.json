@@ -2367,6 +2367,7 @@
     },
     "workspaceUpgrade": {
       "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept.",
+      "notPossible": "This Session's workspace can't be upgraded in place. Start a new Session with a container workspace.",
       "movingToVm": "Moving this session to a VM workspace (the session reconnects first)…",
       "provisioningTemplate": "Provisioning the {{template}} workspace…",
       "skippedFiles": "These files were over the 100 MB copy limit and weren't copied; they're still in the old storage: {{files}}",
@@ -3978,6 +3979,7 @@
       "loadFailed": "Connectors could not be loaded for this project context. Creation is disabled.",
       "retry": "Retry",
       "unavailableName": "Unavailable connector",
+      "requiresShellWorkspace": "Needs a Container or VM workspace",
       "unavailableLive": "This attached connector is no longer authorized or in scope. Detach it before continuing.",
       "unavailableBadge": "Unavailable",
       "notReady": "Not fully indexed yet — the agent may see incomplete results.",

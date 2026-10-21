@@ -839,6 +839,28 @@ describe('SettingsPaneComponent datasources (Slice B)', () => {
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, []);
   });
 
+  it('a lite tier never drops an attached connector it hides from the picker', () => {
+    // 10-19: a stale virtual tier made the picker leave out a container
+    // Session's cloud folder and outbox, and the next save detached them. The
+    // server refuses whatever a tier can't serve; the pane never decides that.
+    const SHELL_ONLY = {id: 'ds-folder', type: 'credentials', name: 'Folder'};
+    const {component, chat, fakeSettings} = createPane({
+      override: {workspace: {backend: 'virtual'}},
+      attachedIds: ['ds-folder', 'ds-pg'],
+      eligible: [SHELL_ONLY, PG, WEB],
+    });
+    // The picker's lite filter returns the selection without the shell row.
+    fakeSettings.getSelectedDatasourceIds.mockReturnValue(['ds-pg', 'ds-web']);
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith(
+      {},
+      ['ds-folder', 'ds-pg', 'ds-web'],
+    );
+  });
+
   it('a config-only edit sends no datasource_ids at all', () => {
     const {component, chat, fakeSettings} = createPane({
       attachedIds: ['ds-pg'],

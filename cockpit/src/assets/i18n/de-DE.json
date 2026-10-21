@@ -2367,6 +2367,7 @@
     },
     "workspaceUpgrade": {
       "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten.",
+      "notPossible": "Der Workspace dieser Sitzung lässt sich nicht direkt aufrüsten. Starte stattdessen eine neue Sitzung mit einem Container-Workspace.",
       "movingToVm": "Diese Sitzung wird auf einen VM-Workspace verschoben (die Sitzung verbindet sich zuerst neu)…",
       "provisioningTemplate": "Der Workspace {{template}} wird bereitgestellt…",
       "skippedFiles": "Diese Dateien waren größer als das Kopierlimit von 100 MB und wurden nicht kopiert; sie liegen weiter im alten Speicher: {{files}}",
@@ -3978,6 +3979,7 @@
       "loadFailed": "Konnektoren konnten für diesen Projektkontext nicht geladen werden. Die Erstellung ist deaktiviert.",
       "retry": "Erneut versuchen",
       "unavailableName": "Nicht verfügbarer Konnektor",
+      "requiresShellWorkspace": "Braucht einen Container- oder VM-Workspace",
       "unavailableLive": "Dieser angehängte Konnektor ist nicht mehr autorisiert oder im Geltungsbereich. Entfernen Sie ihn, bevor Sie fortfahren.",
       "unavailableBadge": "Nicht verfügbar",
       "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
