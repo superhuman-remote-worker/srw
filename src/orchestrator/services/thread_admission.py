@@ -1027,8 +1027,18 @@ async def resolve_thread_creation_plan(
         )
         == "virtual"
     ):
+        # A Virtual the request chose leaves out its defaults' cloud folders
+        # even when it lists its connectors: the cockpit always sends a list,
+        # and greys out what a chosen Virtual can't serve. A list beside a
+        # defaulted tier is the user's own choice (owner 2026-10-21).
+        chosen_with_list = "workspace" in request_body.model_fields_set and (
+            "datasource_ids" in request_body.model_fields_set
+            or request_body.execution is not None
+        )
         cloud_rows = await _cloud_rows_a_container_gets(
-            request_body,
+            ThreadCreateRequest(use_datasource_defaults=True)
+            if chosen_with_list
+            else request_body,
             user,
             effective_project_ids=effective_project_ids,
             dependencies=dependencies,

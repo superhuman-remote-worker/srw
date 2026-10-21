@@ -278,3 +278,41 @@ async def test_the_form_knows_whether_a_cloud_folder_can_take_a_container(
         )
         is expected
     )
+
+
+def _listing_deps(**over: Any):
+    """Defaults hold the owner's outbox; the store resolves the ids asked."""
+    deps = _defaults_deps(**over)
+    rows = {OUTBOX: _outbox_row(), KB: _kb_row()}
+    deps.store.resolve_datasources_for_thread = AsyncMock(
+        side_effect=lambda datasource_ids=None, **_kw: [
+            rows[cid] for cid in datasource_ids or [] if cid in rows
+        ]
+    )
+    return deps
+
+
+@pytest.mark.asyncio
+async def test_a_chosen_virtual_with_a_list_records_the_defaults_it_cannot_serve():
+    """The cockpit always sends a list and greys out what a chosen Virtual
+    can't serve: the defaults' cloud folders are still named as left out,
+    so the notice, the agent and an upgrade know them (owner 2026-10-21)."""
+    plan = await _plan(
+        _listing_deps(),
+        datasource_ids=[KB],
+        workspace={"template": {"inline": {"backend": "virtual"}}},
+    )
+
+    assert _backend(plan) == "virtual"
+    assert plan.selected_datasource_ids == [KB]
+    assert [entry["source_ref"] for entry in _left_out(plan)] == [OUTBOX]
+
+
+@pytest.mark.asyncio
+async def test_a_list_beside_a_defaulted_tier_is_the_users_own_choice():
+    """Unticked in the New Session form: no Container and nothing recorded."""
+    plan = await _plan(_listing_deps(), datasource_ids=[KB])
+
+    assert _backend(plan) == "virtual"
+    assert plan.selected_datasource_ids == [KB]
+    assert _left_out(plan) == []
