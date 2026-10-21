@@ -84,13 +84,20 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         </div>
       }
 
-      <!-- Empty State -->
+      <!-- Empty State (or the list could not be loaded at all) -->
       @if (!isLoading() && agents().length === 0) {
-        <div class="empty-state">
-          <span class="empty-icon">&#x1F916;</span>
-          <span>{{ 'agentList.empty' | transloco }}</span>
-          <span class="empty-hint">{{ 'agentList.emptyHint' | transloco }}</span>
-        </div>
+        @if (loadFailed()) {
+          <div class="empty-state load-failed">
+            <span class="load-failed-title">{{ 'agentList.loadFailed' | transloco }}</span>
+            <span class="empty-hint">{{ 'agentList.loadFailedHint' | transloco }}</span>
+          </div>
+        } @else {
+          <div class="empty-state">
+            <span class="empty-icon">&#x1F916;</span>
+            <span>{{ 'agentList.empty' | transloco }}</span>
+            <span class="empty-hint">{{ 'agentList.emptyHint' | transloco }}</span>
+          </div>
+        }
       }
 
       <!-- Agent Table -->
@@ -297,6 +304,10 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         opacity: 0.6;
       }
 
+      .load-failed-title {
+        color: var(--danger);
+      }
+
       /* Table */
       .table-container {
         flex: 1;
@@ -390,6 +401,8 @@ export class AgentListComponent implements OnInit, OnDestroy {
   readonly agents = signal<Agent[]>([]);
   readonly availableJobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
+  /** The last refresh could not load the list (not the same as "no agents"). */
+  readonly loadFailed = signal(false);
   readonly autoRefreshEnabled = signal(true);
 
   // Assignment dialog state
@@ -420,7 +433,15 @@ export class AgentListComponent implements OnInit, OnDestroy {
   refresh(): void {
     this.isLoading.set(true);
     this.api.getAgents().subscribe((agents) => {
-      this.agents.set(agents);
+      // `null` = the request failed. Keep the rows already shown rather than
+      // presenting the failure as an empty fleet, and say so.
+      if (agents === null) {
+        this.loadFailed.set(true);
+        this.showStatus(this.transloco.translate('agentList.loadFailed'), true);
+      } else {
+        this.loadFailed.set(false);
+        this.agents.set(agents);
+      }
       this.isLoading.set(false);
     });
   }

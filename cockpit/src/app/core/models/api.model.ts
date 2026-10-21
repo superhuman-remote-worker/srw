@@ -2843,7 +2843,7 @@ export type DiffRejectOutcome<T> =
 
 /**
  * Staged protected-cloud diff summary for a thread (GET
- * .../agents/threads/{id}/cloud-diff). `epoch` must be threaded back into
+ * /api/persistent/threads/{id}/cloud-diff). `epoch` must be threaded back into
  * apply/reject as an optimistic-concurrency pin. All-zero/epoch-0/empty
  * `files` (never null from the endpoint) means nothing has been staged yet.
  */

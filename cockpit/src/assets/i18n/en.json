@@ -4301,6 +4301,8 @@
     "loadingAgents": "Loading agents...",
     "empty": "No agents registered",
     "emptyHint": "Agents will appear here when they connect to the orchestrator",
+    "loadFailed": "Couldn't load agents",
+    "loadFailedHint": "The orchestrator did not return the agent list. Refresh to try again.",
     "table": {
       "status": "Status",
       "config": "Config",

@@ -367,7 +367,7 @@ const server = createServer(async (req, res) => {
     if (pathname.startsWith(`/api/jobs/${JOB_ID}/`)) return json(res, 200, {});
 
     // ---- the review API ----
-    if (pathname === `/api/agents/threads/${THREAD_ID}/cloud-diff` && req.method === 'GET') {
+    if (pathname === `/api/persistent/threads/${THREAD_ID}/cloud-diff` && req.method === 'GET') {
       state.summaryCalls += 1;
       if (state.scenario === 'forbidden') return json(res, 403, { detail: 'Not your thread' });
       if (state.scenario === 'offline') {
@@ -384,11 +384,11 @@ const server = createServer(async (req, res) => {
       return json(res, 200, summaryBody());
     }
     if (
-      pathname.startsWith(`/api/agents/threads/${THREAD_ID}/cloud-diff/`) &&
+      pathname.startsWith(`/api/persistent/threads/${THREAD_ID}/cloud-diff/`) &&
       req.method === 'GET'
     ) {
       const path = decodeURIComponent(
-        pathname.slice(`/api/agents/threads/${THREAD_ID}/cloud-diff/`.length),
+        pathname.slice(`/api/persistent/threads/${THREAD_ID}/cloud-diff/`.length),
       );
       state.fileCalls += 1;
       // Fails once, then succeeds: the per-file Retry button used to be inert
@@ -417,7 +417,7 @@ const server = createServer(async (req, res) => {
       }
       return json(res, 200, { thread_id: THREAD_ID, path, ...content });
     }
-    if (pathname === `/api/agents/threads/${THREAD_ID}/cloud-diff/apply`) {
+    if (pathname === `/api/persistent/threads/${THREAD_ID}/cloud-diff/apply`) {
       state.applyCalls += 1;
       // A real apply has been observed at 34.4 seconds. This one waits until
       // the test says so, which is the same window without the wall clock.
@@ -461,7 +461,7 @@ const server = createServer(async (req, res) => {
         overlay_reset: false,
       });
     }
-    if (pathname === `/api/agents/threads/${THREAD_ID}/cloud-diff/reject`) {
+    if (pathname === `/api/persistent/threads/${THREAD_ID}/cloud-diff/reject`) {
       state.rejectCalls += 1;
       if (state.scenario === 'rejectStale') {
         return json(res, 409, { detail: { code: 'epoch_stale', staged_epoch: 9 } });

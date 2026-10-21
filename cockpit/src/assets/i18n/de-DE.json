@@ -4301,6 +4301,8 @@
     "loadingAgents": "Agenten werden geladen…",
     "empty": "Keine Agenten registriert",
     "emptyHint": "Agenten erscheinen hier, sobald sie sich mit dem Orchestrator verbinden",
+    "loadFailed": "Agenten konnten nicht geladen werden",
+    "loadFailedHint": "Der Orchestrator hat die Agentenliste nicht geliefert. Zum erneuten Versuch aktualisieren.",
     "table": {
       "status": "Status",
       "config": "Konfiguration",

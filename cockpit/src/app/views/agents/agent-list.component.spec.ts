@@ -1,12 +1,16 @@
-import { describe, it, expect } from 'vitest';
-import { AgentStatus } from '../../core/models/api.model';
+import { CUSTOM_ELEMENTS_SCHEMA, Pipe, PipeTransform, ɵresolveComponentResources } from '@angular/core';
+import { TestBed } from '@angular/core/testing';
+import { TranslocoService } from '@jsverse/transloco';
+import { Observable, of } from 'rxjs';
+import { afterEach, beforeAll, beforeEach, describe, it, expect, vi } from 'vitest';
+import { Agent, AgentStatus } from '../../core/models/api.model';
+import { ApiService } from '../../core/services/api.service';
+import { AgentListComponent } from './agent-list.component';
 
 /**
- * Unit tests for AgentListComponent utility functions.
- *
- * Note: These tests focus on pure utility functions extracted from the component.
- * Full component testing with Angular TestBed is not set up in this project.
- * Integration testing should be done via e2e tests.
+ * Unit tests for AgentListComponent utility functions, mirrored from the
+ * component, and (at the end) for how the panel reports a list it could not
+ * load.
  */
 
 // Extract utility functions from component for testing
@@ -250,5 +254,88 @@ describe('AgentListComponent utilities', () => {
       // degraded flag present but no model/count/tasks → nothing to append.
       expect(auxTooltip({aux: {degraded: true}}, PREFIX)).toBe(PREFIX);
     });
+  });
+});
+
+
+/** Keys straight through — the template is asserted on structure, not copy. */
+@Pipe({ name: 'transloco', standalone: true })
+class TranslocoStubPipe implements PipeTransform {
+  transform(key: string): string {
+    return key;
+  }
+}
+
+describe('AgentListComponent — loading the fleet', () => {
+  const agent = {
+    id: 'agent-1',
+    status: 'offline',
+    config_name: 'assistant',
+    hostname: 'srw-agent-1',
+    current_job_id: null,
+    last_heartbeat: new Date().toISOString(),
+  } as unknown as Agent;
+  let next: Observable<Agent[] | null>;
+  const api = { getAgents: vi.fn(() => next), getJobs: vi.fn(() => of([])) };
+  const transloco = { translate: vi.fn((key: string) => key) };
+
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  beforeEach(() => {
+    api.getAgents.mockClear();
+    TestBed.configureTestingModule({
+      imports: [AgentListComponent],
+      providers: [
+        { provide: ApiService, useValue: api },
+        { provide: TranslocoService, useValue: transloco },
+      ],
+    });
+    TestBed.overrideComponent(AgentListComponent, {
+      set: { imports: [TranslocoStubPipe], schemas: [CUSTOM_ELEMENTS_SCHEMA] },
+    });
+  });
+
+  afterEach(() => TestBed.resetTestingModule());
+
+  function render() {
+    const fixture = TestBed.createComponent(AgentListComponent);
+    fixture.detectChanges();
+    return fixture;
+  }
+
+  it('says the list could not be loaded instead of showing an empty fleet', () => {
+    next = of(null);
+    const fixture = render();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+
+    expect(text).toContain('agentList.loadFailed');
+    expect(text).not.toContain('agentList.empty');
+    expect(fixture.componentInstance.statusIsError()).toBe(true);
+    fixture.destroy();
+  });
+
+  it('still shows the empty state when the fleet really is empty', () => {
+    next = of([]);
+    const fixture = render();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+
+    expect(text).toContain('agentList.empty');
+    expect(text).not.toContain('agentList.loadFailed');
+    fixture.destroy();
+  });
+
+  it('keeps the rows it has when a later refresh fails', () => {
+    next = of([agent]);
+    const fixture = render();
+    next = of(null);
+    fixture.componentInstance.refresh();
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.agents()).toEqual([agent]);
+    expect(fixture.componentInstance.loadFailed()).toBe(true);
+    expect((fixture.nativeElement as HTMLElement).querySelector('.agent-table')).not.toBeNull();
+    fixture.destroy();
   });
 });

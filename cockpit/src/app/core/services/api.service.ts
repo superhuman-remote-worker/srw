@@ -948,20 +948,27 @@ export class ApiService {
   }
 
   // ===== Agent Management Endpoints =====
+  //
+  // The admin fleet view lives under /api/admin/agents. /api/agents is the
+  // agent-internal prefix (registration, heartbeats, session callbacks) and
+  // an edge may block it outright, so nothing the browser calls goes there;
+  // the orchestrator keeps the old paths as deprecated aliases for one
+  // release.
 
   /**
-   * Get list of registered agents.
+   * Get list of registered agents, or `null` when the list could not be
+   * loaded — an admin panel must be able to tell that apart from "none".
    */
-  getAgents(status?: string, limit: number = 100): Observable<Agent[]> {
+  getAgents(status?: string, limit: number = 100): Observable<Agent[] | null> {
     let params = new HttpParams().set('limit', limit.toString());
     if (status) {
       params = params.set('status', status);
     }
 
-    return this.http.get<Agent[]>(`${this.baseUrl}/agents`, { params }).pipe(
+    return this.http.get<Agent[]>(`${this.baseUrl}/admin/agents`, { params }).pipe(
       catchError((error) => {
         console.error('Failed to fetch agents:', error);
-        return of([]);
+        return of(null);
       }),
     );
   }
@@ -970,7 +977,7 @@ export class ApiService {
    * Get a single agent by ID.
    */
   getAgent(agentId: string): Observable<Agent | null> {
-    return this.http.get<Agent>(`${this.baseUrl}/agents/${agentId}`).pipe(
+    return this.http.get<Agent>(`${this.baseUrl}/admin/agents/${agentId}`).pipe(
       catchError((error) => {
         console.error(`Failed to fetch agent ${agentId}:`, error);
         return of(null);
@@ -982,7 +989,7 @@ export class ApiService {
    * Delete (deregister) an agent.
    */
   deleteAgent(agentId: string): Observable<{ status: string } | null> {
-    return this.http.delete<{ status: string }>(`${this.baseUrl}/agents/${agentId}`).pipe(
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/admin/agents/${agentId}`).pipe(
       catchError((error) => {
         console.error(`Failed to delete agent ${agentId}:`, error);
         return of(null);
@@ -3278,9 +3285,11 @@ export class ApiService {
   //
   // Thread-mode counterpart to the Mode A diff review above — same
   // JobDiffReviewComponent, different backend surface:
-  // GET/POST .../agents/threads/{id}/cloud-diff[...]. See
-  // .superpowers/sdd/task-8-brief.md / task-10-brief.md for the response
-  // shapes this mirrors.
+  // GET/POST /api/persistent/threads/{id}/cloud-diff[...]. (It used to sit
+  // under /api/agents/threads/..., the agent-internal prefix an edge may
+  // block; the orchestrator keeps that path as a deprecated alias for one
+  // release.) See .superpowers/sdd/task-8-brief.md / task-10-brief.md for
+  // the response shapes this mirrors.
 
   /**
    * Fetch the staged protected-cloud diff summary for a thread. The
@@ -3292,7 +3301,7 @@ export class ApiService {
     threadId: string,
   ): Observable<DiffLoadOutcome<ThreadCloudDiffSummary>> {
     return this.http
-      .get<ThreadCloudDiffSummary>(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff`)
+      .get<ThreadCloudDiffSummary>(`${this.baseUrl}/persistent/threads/${threadId}/cloud-diff`)
       .pipe(
         map((data): DiffLoadOutcome<ThreadCloudDiffSummary> => ({ kind: 'ok', data })),
         catchError((err: HttpErrorResponse) =>
@@ -3325,7 +3334,7 @@ export class ApiService {
   ): Observable<DiffLoadOutcome<ThreadCloudDiffFile>> {
     const encoded = filePath.split('/').map(encodeURIComponent).join('/');
     return this.http
-      .get<ThreadCloudDiffFile>(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff/${encoded}`)
+      .get<ThreadCloudDiffFile>(`${this.baseUrl}/persistent/threads/${threadId}/cloud-diff/${encoded}`)
       .pipe(
         map((data): DiffLoadOutcome<ThreadCloudDiffFile> => ({ kind: 'ok', data })),
         catchError((err: HttpErrorResponse) =>
@@ -3355,7 +3364,7 @@ export class ApiService {
   applyThreadCloudDiff(threadId: string, epoch: number): Observable<JobAcceptOutcome> {
     return this.http
       .post<ThreadCloudApplyResult>(
-        `${this.baseUrl}/agents/threads/${threadId}/cloud-diff/apply`, { epoch },
+        `${this.baseUrl}/persistent/threads/${threadId}/cloud-diff/apply`, { epoch },
       )
       .pipe(
         map((data): JobAcceptOutcome => ({ kind: 'ok', data })),
@@ -3392,7 +3401,7 @@ export class ApiService {
   ): Observable<DiffRejectOutcome<ThreadCloudRejectResult>> {
     return this.http
       .post<ThreadCloudRejectResult>(
-        `${this.baseUrl}/agents/threads/${threadId}/cloud-diff/reject`, { epoch },
+        `${this.baseUrl}/persistent/threads/${threadId}/cloud-diff/reject`, { epoch },
       )
       .pipe(
         map((data): DiffRejectOutcome<ThreadCloudRejectResult> => ({ kind: 'ok', data })),
@@ -3410,7 +3419,7 @@ export class ApiService {
    */
   restageThreadCloudDiff(threadId: string): Observable<unknown> {
     return this.http
-      .post(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff/restage`, {})
+      .post(`${this.baseUrl}/persistent/threads/${threadId}/cloud-diff/restage`, {})
       .pipe(
         catchError((err) => {
           console.error(`Failed to restage thread ${threadId} cloud diff:`, err);
