@@ -145,6 +145,23 @@ def cut_loop(text: str, longest: int = 6) -> str:
     return text
 
 
+#: Gemma 4's special-token markup ("<|channel>thought<channel|>"), which now
+#: and then lands in the content although thinking is off; spoken, it would
+#: read "channel thought". A thought marker takes the word after it along.
+_MARKUP = re.compile(r"<\|[a-z_]+>(?:thought)?|<[a-z_]+\|>")
+_MARKUP_START = re.compile(r"<\|?[a-z_]*\|?$")
+
+
+def strip_markup(text: str) -> tuple[str, str]:
+    """``text`` without special-token markup, and a tail held back because
+    it may be the start of a marker the next chunk completes."""
+    text = _MARKUP.sub("", text)
+    held = _MARKUP_START.search(text)
+    if held is None:
+        return text, ""
+    return text[: held.start()], text[held.start() :]
+
+
 class VoiceLLM(OpenAILLMService):
     """Streaming chat completions with the delegate tool, thinking off."""
 
@@ -167,6 +184,7 @@ class VoiceLLM(OpenAILLMService):
         self._first_token = False
         #: Whether the response in flight said anything before a tool call.
         self.spoke = False
+        self._held = ""
 
     async def prewarm(self, context) -> None:
         """One 1-token completion over the call's fixed prefix; the server's
@@ -199,6 +217,7 @@ class VoiceLLM(OpenAILLMService):
     async def _process_context(self, context):
         self.spoke = False
         self._first_token = False
+        self._held = ""  # a lone "<" at a reply's end is no speech either
         self._timings.llm_started()
         await super()._process_context(context)
 
@@ -209,6 +228,9 @@ class VoiceLLM(OpenAILLMService):
 
     async def _push_llm_text(self, text: str):
         self._token()
+        text, self._held = strip_markup(self._held + text)
+        if not text:
+            return
         if text.strip():
             self.spoke = True
         await super()._push_llm_text(text)

@@ -34,6 +34,7 @@ from voice_gateway.engines.cascade.fileport import FileAudioPort  # noqa: E402
 from voice_gateway.engines.cascade.services import (  # noqa: E402
     PHRASES,
     SpokenTextAggregator,
+    strip_markup,
 )
 from voice_gateway.engines.cascade.transport import heard_prefix  # noqa: E402
 from voice_gateway.session import Session  # noqa: E402
@@ -443,6 +444,33 @@ async def test_clause_chars_zero_waits_for_the_whole_sentence(fakes):
         ]
     finally:
         await call.close()
+
+
+def test_gemma_markup_never_reaches_the_tts():
+    # Seen once in WP4's eval: the content began with empty thought markers.
+    text, held = strip_markup(
+        "<|channel>thought<channel|><|channel>thought<channel|><channel|>Einen Moment"
+    )
+    assert (text, held) == ("Einen Moment", "")
+    # A marker split across chunks is held back, then dropped.
+    text, held = strip_markup("Gern. <|chan")
+    assert (text, held) == ("Gern. ", "<|chan")
+    assert strip_markup(held + "nel>thought<channel|>Bis 11 Uhr.") == (
+        "Bis 11 Uhr.",
+        "",
+    )
+    assert strip_markup("Zimmer 3 < 4") == ("Zimmer 3 < 4", "")
+
+
+@pytest.mark.asyncio
+async def test_markup_in_a_reply_is_not_spoken(call, fakes):
+    fakes.stt_texts = ["Wann ist Check-out?"]
+    fakes.llm_replies = ["<|channel>thought<channel|><channel|>Bis 11 Uhr."]
+    call.port.say(tone(1.0))
+    await call.until(lambda: call.transcripts("assistant"))
+    await call.quiet()
+    assert "".join(call.transcripts("assistant")).strip() == "Bis 11 Uhr."
+    assert fakes.tts_inputs == ["Bis 11 Uhr."]
 
 
 async def _pieces(aggregator, text: str, step: int = 3) -> list[str]:
