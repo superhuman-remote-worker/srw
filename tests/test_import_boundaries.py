@@ -27,6 +27,7 @@ def boundary_tree(tmp_path):
         "orchestrator/services/connector_drivers",
         "mcp_server",
         "vm_controller",
+        "voice_gateway",
         "shared",
         "shared/runtime",
         "shared/contracts",
@@ -144,7 +145,7 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 33 since D1c kept the drivers' internal rules to the drivers;
     # 34 since D1b fenced the agent's connector materializers off the runtime.
     # 35 since P2 fenced the phone front and routes off application composition.
-    assert "Contracts: 35 kept, 0 broken" in result.stdout
+    assert "Contracts: 36 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
