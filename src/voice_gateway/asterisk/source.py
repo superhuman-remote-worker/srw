@@ -416,12 +416,14 @@ class AsteriskCallSource:
             await self.ari.add_to_bridge(call.bridge, call.media)
         except (*_FAILURES, ConnectionError) as exc:
             entered.cancel()
-            if isinstance(exc, TimeoutError):
+            if isinstance(exc, (TimeoutError, ConnectionError)):
+                # The media channel gave up (Asterisk logs "WebSocket
+                # connection failed") or never came.
                 logger.error(
-                    "call %s: no audio within %.0f s; does websocket_client.conf "
-                    "entry %s point at this gateway's media listener (%s)?",
+                    "call %s: no audio (%s); does websocket_client.conf entry %s "
+                    "point at this gateway's media listener (%s)?",
                     call.sid,
-                    self.settings.media_timeout_s,
+                    "timeout" if isinstance(exc, TimeoutError) else "channel ended",
                     self.settings.media_connection,
                     self.settings.media_listen,
                 )

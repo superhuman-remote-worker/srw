@@ -152,6 +152,10 @@ class FakeAsterisk:
                 self.spawn(
                     self.connect_media(params["channelId"], params["external_host"])
                 )
+            elif self.media_mode == "fail":
+                # chan_websocket could not reach the gateway: ARI said 200,
+                # then the channel ends.
+                self.spawn(self.emit("ChannelDestroyed", params["channelId"], cause=3))
             return web.json_response({"id": params["channelId"]})
         if request.method == "POST" and parts[-1] == "continue":
             self.spawn(self.run_transfer(parts[1]))
@@ -373,10 +377,11 @@ def test_reject_cause_falls_back_to_the_status_class(status, cause):
     assert reject_cause(status) == cause
 
 
+@pytest.mark.parametrize("mode", ["never", "fail"])
 @pytest.mark.asyncio
-async def test_audio_that_never_starts_fails_the_accept_cleanly(stack):
+async def test_audio_that_never_starts_fails_the_accept_cleanly(stack, mode):
     gateway, client, fake, deliveries = await stack(media_timeout_s=0.5)
-    fake.media_mode = "never"
+    fake.media_mode = mode
     session = await ring(fake, deliveries, gateway)
     response = await client.post(f"/v1/live/sessions/{session.id}/accept", json=ACCEPT)
     assert response.status == 502
