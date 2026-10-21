@@ -16,6 +16,9 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 
+from orchestrator.database.stateless_workspace_upgrade import (
+    stateless_upgrade_refusal,
+)
 from orchestrator.services.container_startup_config import (
     startup_stage_activation_enabled,
 )
@@ -275,8 +278,10 @@ def workspace_upgrade_targets(
     if declared_thread_workspace_backend(thread) not in LITE_BACKENDS:
         return []
     targets: list[str] = []
-    if startup_stage_activation_enabled() and container_provisioner_available(
-        container_provisioner
+    if (
+        startup_stage_activation_enabled()
+        and container_provisioner_available(container_provisioner)
+        and stateless_upgrade_refusal(thread.get("metadata")) is None
     ):
         targets.append("container")
     if (

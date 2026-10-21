@@ -78,6 +78,34 @@ def _refuse() -> StatelessUpgradeRefused:
     return StatelessUpgradeRefused(UPGRADE_NOT_POSSIBLE)
 
 
+def stateless_upgrade_refusal(metadata: Any) -> str | None:
+    """Why a lite row can't take the upgrade, from its metadata alone, or None.
+
+    ``/connection`` offers the container only where this passes. Any
+    ``workspace_container`` content refuses: the lifecycle guards treat a
+    non-empty record without a provisioner as authority to retire.
+    """
+    metadata = metadata_object(metadata)
+    config_override = metadata.get("config_override")
+    if not isinstance(config_override, dict) or not isinstance(
+        config_override.get("workspace"), dict
+    ):
+        return "workspace_config_malformed"
+    if config_override["workspace"].get("backend") not in LITE_BACKENDS:
+        return "backend_not_lite"
+    if metadata.get("vm") not in (None, {}):
+        return "vm_context_present"
+    if metadata.get("protected_cloud") not in (None, False):
+        return "protected_cloud"
+    if any(key in metadata for key in STATELESS_STOP_KEYS) or (
+        "_stateless_workspace_retirement_settled" in metadata
+    ):
+        return "session_ending"
+    if metadata.get("workspace_container") not in (None, {}):
+        return "workspace_context_present"
+    return None
+
+
 async def begin_stateless_session_workspace_upgrade(
     conn: Any,
     thread: Mapping[str, Any],
@@ -89,27 +117,17 @@ async def begin_stateless_session_workspace_upgrade(
 
     thread_id = UUID(str(thread["id"]))
     metadata = metadata_object(thread.get("metadata"))
-    config_override = metadata.get("config_override")
-    if not isinstance(config_override, dict):
+    refusal = stateless_upgrade_refusal(metadata)
+    if refusal is None and await conn.fetchval(_HISTORY_SQL, thread_id):
+        refusal = "container_history"
+    if refusal is not None:
+        logger.warning(
+            "Stateless workspace upgrade of thread %s refused: %s", thread_id, refusal
+        )
         raise _refuse()
-    workspace = config_override.get("workspace")
-    if not isinstance(workspace, dict):
-        raise _refuse()
-    backend = workspace.get("backend")
-    if backend not in LITE_BACKENDS:
-        raise _refuse()
-    if metadata.get("vm") not in (None, {}):
-        raise _refuse()
-    if metadata.get("protected_cloud") not in (None, False):
-        raise _refuse()
-    if any(key in metadata for key in STATELESS_STOP_KEYS) or (
-        "_stateless_workspace_retirement_settled" in metadata
-    ):
-        raise _refuse()
-    if metadata.get("workspace_container") not in (None, {}):
-        raise _refuse()
-    if await conn.fetchval(_HISTORY_SQL, thread_id):
-        raise _refuse()
+    config_override = metadata["config_override"]
+    workspace = config_override["workspace"]
+    backend = workspace["backend"]
 
     generation = str(UUID(str(thread["runtime_generation"])))
     binding = metadata.get("_workspace_binding")
@@ -160,4 +178,5 @@ __all__ = [
     "StatelessUpgradeRefused",
     "UPGRADE_NOT_POSSIBLE",
     "begin_stateless_session_workspace_upgrade",
+    "stateless_upgrade_refusal",
 ]

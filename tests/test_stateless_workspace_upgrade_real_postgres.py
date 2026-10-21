@@ -219,6 +219,7 @@ async def test_a_none_session_records_a_none_source(database, actor):
         "vm_context",
         "stop_marker",
         "foreign_container_keys",
+        "resumed_before_the_fix",
         "stale_generation",
     ],
 )
@@ -240,6 +241,11 @@ async def test_transition_refuses_rows_it_cannot_upgrade(database, actor, change
             "foreign_container_keys": (
                 "jsonb_set(metadata, '{workspace_container}', "
                 '\'{"repo_name": "thread-x"}\'::jsonb)'
+            ),
+            # Ended and Resumed before End stopped stamping lite rows.
+            "resumed_before_the_fix": (
+                "jsonb_set(metadata, '{workspace_container}', "
+                "'{\"volume_reclaimed\": false}'::jsonb)"
             ),
         }[change]
         overrides["metadata"] = await database.fetchval(

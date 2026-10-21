@@ -221,6 +221,18 @@ async def test_prepare_refuses_a_vm_target_it_is_not_given(tracking, record):
         (_thread(backend="sandbox"), True, _provisioner(), []),
         (_thread(lane="pinned"), True, _provisioner(), []),
         (_thread(), True, _provisioner(in_cluster=False), []),
+        # What the transition refuses is never offered (E4-era bug: a resumed
+        # Session was offered the container, then refused).
+        (
+            _thread(workspace_container={"volume_reclaimed": False}),
+            True,
+            _provisioner(),
+            [],
+        ),
+        (_thread(workspace_container={"repo_name": "r"}), True, _provisioner(), []),
+        (_thread(workspace_container={"pod_name": "p"}), True, _provisioner(), []),
+        (_thread(vm={"status": "failed"}), True, _provisioner(), []),
+        (_thread(_stateless_claim_retirement={}), True, _provisioner(), []),
     ],
 )
 def test_workspace_upgrade_targets(
