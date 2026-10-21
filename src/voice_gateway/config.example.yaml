@@ -1,0 +1,22 @@
+# WP1 scripted protocol gate; local_voice_gateway.md §4.1.
+# Save a copy outside the repo and supply the two secret files. The API key
+# must match the live_voice catalog endpoint; the webhook secret must match
+# the line's SRW connector. File paths may also be relative to this YAML file.
+listen: 0.0.0.0:18440
+api_key_files:
+  - /run/secrets/voice-gateway-api-key
+orchestrator_url: https://localhost
+# Local k3d's self-signed certificate only; production defaults to true.
+webhook_verify_ssl: false
+lines:
+  - name: demo
+    connector_id: 00000000-0000-0000-0000-000000000001
+    webhook_secret_file: /run/secrets/voice-gateway-demo-webhook
+profiles:
+  scripted:
+    engine: scripted
+# Test control uses the same Bearer keys and listener as the protocol API.
+# These flags are explicit because the driver pod reaches this LAN listener.
+# Both default to false; remove them for a deployment without test control.
+test_control: true
+allow_remote_test_control: true
