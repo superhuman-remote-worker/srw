@@ -147,6 +147,7 @@ _check "code-server"               _on_path "code-server"
 _check "rclone"                    _on_path "rclone"
 _check "rclone >= 1.70.0"          _at_least "$(_rclone_version)" "1.70.0"
 _check "fusermount3"               _on_path "fusermount3"
+_check "/etc/mtab"                 test -e /etc/mtab
 _check "mountpoint"                _on_path "mountpoint"
 _check "fuse-overlayfs"            _on_path "fuse-overlayfs"
 _check "fuse-overlayfs >= 1.13"    _at_least "$(_fuse_overlayfs_version)" "1.13"

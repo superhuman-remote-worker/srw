@@ -173,6 +173,13 @@ def test_the_entrypoint_and_user_are_set_once_in_minimal():
     assert "/home/agent-host" not in full
 
 
+def test_minimal_links_etc_mtab_for_unprivileged_fuse_unmounts():
+    # fusermount3 refuses an unprivileged unmount without /etc/mtab, and
+    # containerd, unlike Docker, doesn't add it.
+    assert "RUN ln -sfn /proc/self/mounts /etc/mtab" in stages()["minimal"]
+    assert "test -e /etc/mtab" in CONTRACT.read_text()
+
+
 def test_each_target_names_its_variant():
     assert 'LABEL io.srw.workspace.variant="minimal"' in stages()["minimal"]
     assert 'LABEL io.srw.workspace.variant="full"' in stages()["full"]

@@ -124,6 +124,11 @@ RUN fuse-overlayfs --version \
     && dpkg --compare-versions "$v" ge 1.13 \
         || { echo "fuse-overlayfs $v < 1.13 (big-dir/readdir fixes needed)"; exit 1; }
 
+# An unprivileged fusermount3 reads /etc/mtab to unmount and refuses without
+# it, so a FUSE mount the agent made could never be unmounted again. Docker
+# adds this link to every container it runs; containerd (Kubernetes) doesn't.
+RUN ln -sfn /proc/self/mounts /etc/mtab
+
 # ---------------------------------------------------------------------------
 # 2b. Chromium via Playwright (replaces apt chromium-browser, which on Ubuntu
 #     Noble is a snap shim — see docker/agent-vm-base/scripts/provision-stage1.sh).
