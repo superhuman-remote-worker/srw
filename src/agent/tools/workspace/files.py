@@ -1114,7 +1114,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # catches Canvas/user edits even when a best-effort invalidation was
             # missed while the agent was detached.
             existed = workspace.exists(path)
-            had_recent_read = context.was_recently_read(path)
             existing = workspace.read_file(path) if existed else ""
             if adds_redaction_marker(existing, content):
                 return redaction_marker_refusal(path, "write_file")
@@ -1140,8 +1139,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 context._snapshot_callback(path)
 
             workspace.write_file(path, content)
-            if existed and had_recent_read:
-                context.record_file_read(path, content)
+            context.record_own_write(path, content)
 
             # Absolute, not the caller's own string: `output/x.md` here and
             # `output/x.md` in a shell that has cd'd elsewhere are different
@@ -1207,7 +1205,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Enforce read-before-write discipline (skip for empty files), and
             # reject a stale versioned read after an out-of-band edit.
             content = workspace.read_file(path)
-            had_recent_read = context.was_recently_read(path)
             if content.strip() and not context.recent_read_matches(path, content):
                 context.invalidate_recent_read(path)
                 from shared.runtime.services.guardrails import format_nudge
@@ -1250,15 +1247,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if position == "end":
                 new_content = content + new_string
                 workspace.write_file(path, new_content)
-                if had_recent_read:
-                    context.record_file_read(path, new_content)
+                context.record_own_write(path, new_content)
                 return f"Appended to: {path}"
 
             if position == "start":
                 new_content = new_string + content
                 workspace.write_file(path, new_content)
-                if had_recent_read:
-                    context.record_file_read(path, new_content)
+                context.record_own_write(path, new_content)
                 return f"Prepended to: {path}"
 
             # Replace mode (default) - requires old_string
@@ -1298,8 +1293,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             new_content = content.replace(old_string, new_string, 1)
             workspace.write_file(path, new_content)
-            if had_recent_read:
-                context.record_file_read(path, new_content)
+            context.record_own_write(path, new_content)
 
             return f"Edited: {path}"
 

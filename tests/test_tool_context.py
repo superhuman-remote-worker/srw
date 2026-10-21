@@ -417,6 +417,22 @@ class TestInstructionPinning:
         assert ctx.was_recently_read("notes/facts.md") is False
         assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
 
+    def test_writing_an_unread_instruction_file_does_not_satisfy_its_gate(self):
+        ctx = self._ctx_with_guide()
+
+        ctx.record_own_write("skills/todo-guide/SKILL.md", "agent-written body")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is False
+        assert ctx.check_tool_enforcement("next_phase_todos") is not None
+
+    def test_own_write_records_ordinary_file_with_its_version(self):
+        ctx = self._ctx_with_guide()
+
+        ctx.record_own_write("/plan.md", "v1")
+
+        assert ctx.recent_read_matches("plan.md", "v1") is True
+        assert ctx.recent_read_matches("plan.md", "changed") is False
+
     def test_invalidate_clears_pin(self):
         ctx = self._ctx_with_guide()
         ctx.record_file_read("skills/todo-guide/SKILL.md")

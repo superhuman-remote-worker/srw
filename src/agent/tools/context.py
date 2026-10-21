@@ -1224,6 +1224,21 @@ class ToolContext:
         else:
             self._recent_read_versions[normalized] = content_version
 
+    def record_own_write(self, path: str, content: str | bytes) -> None:
+        """Record text this agent just wrote as its known version of the file.
+
+        The agent authored every byte, so writing or editing the same file
+        again needs no fresh read; the version hash still demands one after
+        any out-of-band change. A configured instruction file is refreshed
+        only when it was already read: writing one never satisfies a gate.
+        """
+        normalized = path.lstrip("/").strip()
+        if self._is_instruction_path(normalized) and not self.was_recently_read(
+            normalized
+        ):
+            return
+        self.record_file_read(normalized, content)
+
     def _is_instruction_path(self, normalized: str) -> bool:
         """Whether a normalized path is a configured instruction file."""
         for entry in self._instruction_files:
