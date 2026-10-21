@@ -90,6 +90,9 @@ export const CLOUD_FOLDER_REASONS = [
   'delivery_unsupported',
   // A workspace that can mount none (container mounts off, FUSE denied).
   'mount_unsupported',
+  // A Virtual Session's workspace holds none (`mount_unsupported` with the
+  // detail `virtual_workspace`): a Container gets it.
+  'virtual_workspace',
 ] as const;
 
 /** What a cloud folder is, as the notice names it: a project's folder, the
@@ -109,6 +112,13 @@ const KINDS = new Set<string>(CLOUD_FOLDER_KINDS);
 
 function reasonOf(value: unknown): string {
   return typeof value === 'string' && KNOWN.has(value) ? value : 'mount_failed';
+}
+
+/** A left-out folder's reason, the Virtual tier's named as such. */
+function excludedReason(entry: Record<string, unknown>): string {
+  return entry['reason'] === 'mount_unsupported' && entry['detail'] === 'virtual_workspace'
+    ? 'virtual_workspace'
+    : reasonOf(entry['reason']);
 }
 
 function kindOf(value: unknown): string {
@@ -131,7 +141,7 @@ function excludedProblems(excluded: unknown): CloudFolderProblem[] {
     name: '',
     path: '',
     kind: kindOf(entry['mount_kind']),
-    reason: reasonOf(entry['reason']),
+    reason: excludedReason(entry),
   }));
 }
 
@@ -143,7 +153,7 @@ function excludedBindings(excluded: unknown): CloudFolderBinding[] {
     // The level it would have bound at, once the server resolved one.
     level: levelValue(entry['level']),
     state: 'excluded',
-    reason: reasonOf(entry['reason']),
+    reason: excludedReason(entry),
     connectorId: typeof entry['source_ref'] === 'string' ? entry['source_ref'] : '',
     title: typeof entry['title'] === 'string' ? entry['title'] : '',
   }));

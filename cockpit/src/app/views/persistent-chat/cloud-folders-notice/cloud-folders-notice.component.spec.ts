@@ -282,6 +282,28 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(root.querySelector('[data-testid="cloud-folders-notice"]')).toBeNull();
   });
 
+  it('names the Virtual tier and the way to a Container for a folder it left out', async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: {},
+      excluded: [
+        {
+          source_ref: 'ds-folder',
+          mount_kind: 'project',
+          reason: 'mount_unsupported',
+          detail: 'virtual_workspace',
+          title: 'Acme cloud folder',
+        },
+        {source_ref: 'ds-other', mount_kind: 'project', reason: 'mount_unsupported', title: 'Other'},
+      ],
+    });
+    const root = await render({problems: state.problems, folders: state.folders, agentOutdated: false});
+    const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
+    expect(text(rows[0])).toBe(
+      "Acme cloud folder · a Virtual workspace can't hold cloud folders; a Container gets it: upgrade this session, or start a new one with a Container",
+    );
+    expect(text(rows[1])).toBe("Other · this workspace can't mount cloud folders; they aren't delivered here");
+  });
+
   it("shows each folder's binding state, and a failed one names why", async () => {
     const state = cloudFolderStateFromStatus({
       mounts: {
