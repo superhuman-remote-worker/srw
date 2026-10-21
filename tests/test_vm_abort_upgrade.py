@@ -159,7 +159,7 @@ class TestAbortThreadVmUpgrade:
             "tid", provision_generation="generation"
         )
         db.merge_thread_vm_context_if_provision_generation.assert_awaited_once_with(
-            "tid", "generation", {"status": "aborted"}
+            "tid", "generation", {"status": "aborted"}, require_not_retiring=True
         )
         db.merge_thread_vm_context.assert_not_awaited()
         assert out == {"status": "aborted", "thread_id": "tid", "vm_deleted": True}
@@ -181,6 +181,29 @@ class TestAbortThreadVmUpgrade:
         db.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
         db.merge_thread_vm_context.assert_not_awaited()
         assert out == {"status": "aborted", "thread_id": "tid", "vm_deleted": True}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ending",
+        [{"runtime_retirement_token": "token"}, {"status": "ended"}],
+        ids=["retiring", "ended"],
+    )
+    async def test_once_the_session_ends_its_end_owns_the_vm(self, ending):
+        """E4b review: End releases the VM itself (and finishes an abort left
+        open), so a late abort must neither purge the disk a soft End keeps nor
+        overwrite End's record of the VM."""
+        db = _db({**_installed(), **ending})
+        prov = _provisioner(available=True, delete_result=True)
+
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await _abort(db, prov)
+
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "vm_upgrade_abort_after_end"
+        prov.capture_vm_teardown_identity.assert_not_called()
+        prov.release_vm_captured.assert_not_called()
+        db.undo_thread_vm_upgrade.assert_not_awaited()
+        db.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

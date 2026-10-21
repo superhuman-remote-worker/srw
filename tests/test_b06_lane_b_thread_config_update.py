@@ -560,7 +560,7 @@ class TestAbortVmUpgrade:
             THREAD, provision_generation=VM_GENERATION
         )
         deps.store.merge_thread_vm_context_if_provision_generation.assert_awaited_once_with(
-            THREAD, VM_GENERATION, {"status": "aborted"}
+            THREAD, VM_GENERATION, {"status": "aborted"}, require_not_retiring=True
         )
 
 

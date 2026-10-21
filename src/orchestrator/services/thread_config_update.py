@@ -1434,6 +1434,16 @@ async def agent_abort_thread_vm_upgrade(
         # Nothing to release: no install happened, or a completed abort
         # already undid it. The agent retries an abort until it gets a 200.
         return {"status": "aborted", "thread_id": thread_id, "vm_deleted": False}
+    if thread.get("runtime_retirement_token") is not None or (
+        thread.get("status") == "ended"
+    ):
+        # End releases the VM itself and finishes an abort left open (E4b).
+        # A late abort would purge the disk a soft End keeps and overwrite
+        # End's record of the VM; the agent stops asking on a 409.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "vm_upgrade_abort_after_end", "retryable": False},
+        )
 
     deleted = False
     identity = None
@@ -1469,7 +1479,10 @@ async def agent_abort_thread_vm_upgrade(
         thread_id, provision_generation=identity.provision_generation
     ):
         await dependencies.store.merge_thread_vm_context_if_provision_generation(
-            thread_id, identity.provision_generation, {"status": "aborted"}
+            thread_id,
+            identity.provision_generation,
+            {"status": "aborted"},
+            require_not_retiring=True,
         )
     return {"status": "aborted", "thread_id": thread_id, "vm_deleted": deleted}
 

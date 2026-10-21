@@ -10,6 +10,11 @@ from uuid import UUID
 
 from shared.vm_resource_admission import ResourceAdmissionError
 from orchestrator.services.vm_resource_reservation_store import _json
+from orchestrator.services.vm_upgrade_abort_cleanup import (
+    DISK_PURGED_BY_UPGRADE_ABORT,
+    cleanup_stop_pvc_disposition,
+    upgrade_abort_purged_disk,
+)
 
 
 async def thread_cleanup_scope(conn, recovery_store, permit, proof):
@@ -221,7 +226,10 @@ class ThreadCleanupResource:
                 "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
                 charge["id"],
             )
-        return self.candidate(authority)
+        candidate = self.candidate(authority)
+        if await upgrade_abort_purged_disk(conn, authority):
+            candidate[DISK_PURGED_BY_UPGRADE_ABORT] = True
+        return candidate
 
     @staticmethod
     def candidate(authority):
@@ -254,13 +262,17 @@ class ThreadCleanupResource:
         expected = {
             "version": 1,
             "kind": "vm_cleanup_physical_stop",
-            **{key: value for key, value in candidate.items() if key != "purge_disk"},
+            **{
+                key: value
+                for key, value in candidate.items()
+                if key not in {"purge_disk", DISK_PURGED_BY_UPGRADE_ABORT}
+            },
             "vm_absent": True,
             "vmi_absent": True,
             "launcher_absent": True,
             "same_generation_replacement": False,
             "controller_authenticated": True,
-            "pvc_disposition": "purged" if candidate["purge_disk"] else "retained",
+            "pvc_disposition": cleanup_stop_pvc_disposition(candidate),
         }
         if proof != expected:
             raise ResourceAdmissionError("resource_cleanup_stop_unproven")

@@ -23669,7 +23669,9 @@ BEGIN
         'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
         'same_generation_replacement',false,'controller_authenticated',true,
         'pvc_disposition',CASE WHEN a.purge_disk THEN 'purged' ELSE 'retained' END);
-    IF s.stop_evidence IS DISTINCT FROM expected
+    IF (s.stop_evidence IS DISTINCT FROM expected
+           AND NOT (public.vm_thread_cleanup_disk_purged_by_upgrade_abort(a)
+               AND s.stop_evidence=expected||'{"pvc_disposition":"purged_by_upgrade_abort"}'::jsonb))
        OR (NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r
            WHERE r.id=a.reservation_id AND (r.state='teardown' OR (allow_released AND r.state='released')))
            AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries source WHERE source.request_id=a.request_id
@@ -23880,7 +23882,9 @@ BEGIN
         '{"compute_cleanup_admission_id":"%s","owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","retirement_token":"%s","runtime_generation":"%s","source":"pinned_thread_retained_disk_purge","vm_uid":"%s"}',
         a.cleanup_admission_id,a.thread_id,a.provision_generation,a.pvc_uid,d.retirement_token,d.runtime_generation,a.vm_uid),'UTF8')),'hex');
     IF a.cleanup_admission_id IS NULL OR a.purge_disk IS DISTINCT FROM false
-       OR s.cleanup_admission_id IS NULL OR s.stop_evidence IS DISTINCT FROM expected_stop
+       OR s.cleanup_admission_id IS NULL OR (s.stop_evidence IS DISTINCT FROM expected_stop
+           AND NOT (public.vm_thread_cleanup_disk_purged_by_upgrade_abort(a)
+               AND s.stop_evidence=expected_stop||'{"pvc_disposition":"purged_by_upgrade_abort"}'::jsonb))
        OR old_cleanup.id IS NULL OR old_cleanup.owner_kind IS DISTINCT FROM 'thread'
        OR old_cleanup.owner_id IS DISTINCT FROM a.thread_id OR old_cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
        OR old_cleanup.parent_admission_id IS NOT NULL
@@ -26117,6 +26121,25 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
+$$;
+
+
+--
+-- Name: vm_thread_cleanup_disk_purged_by_upgrade_abort(public.vm_resource_thread_cleanup_authorities); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_cleanup_disk_purged_by_upgrade_abort(a public.vm_resource_thread_cleanup_authorities) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT NOT a.purge_disk AND EXISTS (
+        SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+        WHERE c.owner_kind='thread' AND c.owner_id=a.thread_id AND c.pvc_uid=a.pvc_uid
+          AND c.source='abort_thread_vm_upgrade' AND c.parent_admission_id IS NULL
+          AND c.completed_at IS NOT NULL AND c.outcome='completed'
+          -- cleanup_intent_digest's compact JSON, keys sorted, as in 0295.
+          AND c.intent_digest='sha256:' || encode(sha256(convert_to(format(
+              '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","source":"abort_thread_vm_upgrade","vm_uid":"%s"}',
+              a.thread_id,a.provision_generation,a.pvc_uid,a.vm_uid),'UTF8')),'hex'))
 $$;
 
 

@@ -27034,8 +27034,13 @@ class PostgresDB:
         vm_updates: Dict[str, Any],
         *,
         require_status_not_ready: bool = False,
+        require_not_retiring: bool = False,
     ) -> bool:
-        """Atomically merge only into the current thread VM provision."""
+        """Atomically merge only into the current thread VM provision.
+
+        ``require_not_retiring`` also refuses once End began or the Session
+        ended: End owns the VM record then.
+        """
         import json as json_module
 
         try:
@@ -27055,6 +27060,9 @@ class PostgresDB:
             "  AND metadata->'vm'->>'provision_generation' = $3 "
             "  AND ($4::boolean = FALSE "
             "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready') "
+            "  AND ($5::boolean = FALSE "
+            "       OR (runtime_retirement_token IS NULL "
+            "           AND status IS DISTINCT FROM 'ended')) "
             "  AND NOT EXISTS ("
             "      SELECT 1 FROM vm_workspace_recoveries recovery "
             "      WHERE recovery.owner_kind='thread' "
@@ -27069,6 +27077,7 @@ class PostgresDB:
                 uuid_val,
                 expected_generation,
                 require_status_not_ready,
+                require_not_retiring,
             )
 
         return result == "UPDATE 1"
