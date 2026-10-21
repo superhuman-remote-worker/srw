@@ -14,7 +14,12 @@ from voice_gateway.config import load_config
 from voice_gateway.engines import build_engines
 from voice_gateway.engines.cascade import cascade_kind, parse_settings
 from voice_gateway.engines.cascade.clauses import clause_end
-from voice_gateway.engines.cascade.prompt import exact_words, note, system_prompt
+from voice_gateway.engines.cascade.prompt import (
+    DELEGATE_DESCRIPTION,
+    exact_words,
+    note,
+    system_prompt,
+)
 from voice_gateway.engines.cascade.timings import Timings
 from voice_gateway.errors import ConfigError
 
@@ -197,6 +202,19 @@ class TestPrompt:
         assert "do not answer it now" in note("thinking", "x")
         assert "follow it now" in note("instructions", "x")
         assert "in your own words" in note("commentary", "x")
+        assert "without naming the back office" in note("commentary", "x")
+
+    def test_rules_keep_the_back_office_and_handovers_off_the_line(self):
+        # A1: the voice named the back office, said "Ich verbinde Sie" before
+        # the back office decided, and said two holding sentences in a row.
+        prompt = system_prompt("Persona", "de")
+        assert "Never mention the back office" in prompt
+        assert "at most one short sentence" in prompt
+        assert "Never add a second holding sentence" in prompt
+        assert "Ich verbinde Sie" in prompt and "decided after the check" in prompt
+        assert "without saying who answered" in prompt
+        assert "Do not start with a holding sentence again" in prompt
+        assert "never that you connect or forward" in DELEGATE_DESCRIPTION
 
 
 class TestClauses:

@@ -15,6 +15,13 @@ note) and the ``delegate`` tool. A reply counts as right when:
   no call) gets one more caller turn with a name and number, reported as
   "then delegated".
 
+Wording (A1 findings, WP4) is scored on every reply: the caller never hears
+the back office named; with a ``delegate`` call the voice says at most one
+holding sentence and promises no transfer or forwarding ("Ich verbinde
+Sie") before the back office decided. Each delegation then gets the
+back office's canned answer as the tool result, and the reply that relays
+it must name no back office and add no new holding sentence.
+
 ``--from-audio`` first transcribes each phone clip with the profile's STT,
 so the score includes what STT makes of the test voice. Reports accuracy
 per expected class and writes ``report.json`` to ``--out``.
@@ -26,6 +33,7 @@ import argparse
 import asyncio
 import io
 import json
+import re
 import time
 import wave
 from collections import Counter, defaultdict
@@ -92,8 +100,77 @@ async def transcribe(http, settings, utterance_id: str) -> str:
         return (await response.json(content_type=None)).get("text", "").strip()
 
 
+#: Wording the caller must never hear (A1): the back office named, or a
+#: transfer or forwarding promised before the back office decided.
+BACK_OFFICE = re.compile(r"back[\s-]*office", re.IGNORECASE)
+HANDOVER = re.compile(
+    r"\b(verbinde|durchstell|stelle\s+\w+\s+durch|weiterleit|weitergeleitet"
+    r"|leite\b[^.!?]*\bweiter|gebe\b[^.!?]*\bweiter|weitergeb)",
+    re.IGNORECASE,
+)
+#: A holding phrase: the voice says it is checking instead of answering.
+HOLDING = re.compile(
+    r"\b(moment|schaue|prüfe|frage\b[^.!?]*\bnach|kläre|kümmere)", re.IGNORECASE
+)
+
+
+def sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+
+
+def wording(reply: str, delegated: bool) -> list[str]:
+    """What is wrong with a reply's wording; empty when it is fine."""
+    faults = []
+    if BACK_OFFICE.search(reply):
+        faults.append("names_back_office")
+    if delegated and HANDOVER.search(reply):
+        faults.append("promises_handover")
+    holding = [s for s in sentences(reply) if HOLDING.search(s) or HANDOVER.search(s)]
+    if delegated and len(holding) > 1:
+        faults.append("two_holding_sentences")
+    return faults
+
+
+def relay_wording(reply: str) -> list[str]:
+    """Faults of the reply that tells the caller the back office's answer."""
+    faults = []
+    if not reply.strip():
+        faults.append("silent")
+    if BACK_OFFICE.search(reply):
+        faults.append("names_back_office")
+    if HOLDING.search(reply):
+        faults.append("holds_again")
+    return faults
+
+
 #: The caller's second turn when the voice asked for details first.
 FOLLOW_UP = "Mein Name ist Jana Probe, meine Nummer ist 0150 123456."
+
+
+async def relay(
+    http, settings, system: str, turns: list[dict], message: dict, answer: str
+) -> dict:
+    """The reply once the back office answered: the delegate call's result
+    in place, as Pipecat writes it when the answer comes before anything else."""
+    call = next(
+        c for c in message["tool_calls"] if c["function"]["name"] == DELEGATE_TOOL
+    )
+    # Pipecat's context: what the voice said (the engine's filler when the
+    # LLM said nothing), then the call on its own.
+    said = (message.get("content") or "").strip() or settings.filler
+    turns = [
+        *turns,
+        *([{"role": "assistant", "content": said}] if said else []),
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "content": json.dumps(answer, ensure_ascii=False),
+        },
+    ]
+    second, _ = await ask(http, settings, system, turns)
+    reply = (second.get("content") or "").strip()
+    return {"reply": reply, "faults": relay_wording(reply)}
 
 
 async def ask(http, settings, system: str, turns: list[dict]) -> tuple[dict, float]:
@@ -150,6 +227,7 @@ def judge(utterance: dict, message: dict) -> dict:
         "asked_first": expect != "answer" and not calls and reply.endswith("?"),
         "reply": reply,
         "request": request,
+        "wording": wording(reply, bool(calls)),
     }
 
 
@@ -175,6 +253,13 @@ async def run(args) -> dict:
             turns = [{"role": "user", "content": said}]
             message, seconds = await ask(http, settings, system, turns)
             verdict = judge(utterance, message)
+            if verdict["got"] == "delegate":
+                answer = testset.CANNED_ANSWERS.get(
+                    utterance["id"], testset.DEFAULT_ANSWER
+                )
+                verdict["relay"] = await relay(
+                    http, settings, system, turns, message, answer
+                )
             if verdict["asked_first"]:
                 # A message usually needs a name and a number first: does the
                 # voice hand it over once the caller gave them?
@@ -198,6 +283,15 @@ async def run(args) -> dict:
             print(
                 f"{mark} {utterance['id']:22s} {verdict['got']:8s} {seconds:4.1f}s | {said}\n    -> {shown}"
             )
+            if verdict["got"] == "delegate" and verdict["reply"]:
+                print(f"    says: {verdict['reply']}")
+            if "relay" in verdict:
+                print(f"    then: {verdict['relay']['reply']}")
+            faults = verdict["wording"] + [
+                "relay_" + f for f in verdict.get("relay", {}).get("faults", [])
+            ]
+            if faults:
+                print(f"    WORDING {', '.join(faults)}")
     per_class = defaultdict(Counter)
     for item in results:
         per_class[item["expect"]]["n"] += 1
@@ -216,6 +310,13 @@ async def run(args) -> dict:
         for expect, c in per_class.items()
     }
     total = sum(item["right"] for item in results)
+    faults = Counter(f for item in results for f in item["wording"])
+    faults.update(
+        "relay_" + f
+        for item in results
+        for f in item.get("relay", {}).get("faults", [])
+    )
+    relayed = sum("relay" in item for item in results)
     print("\nexpect     n  right  with details  asked first  then delegated")
     for expect, row in summary.items():
         print(
@@ -225,10 +326,15 @@ async def run(args) -> dict:
     print(
         f"overall {total}/{len(results)}; median {sorted(r['seconds'] for r in results)[len(results) // 2]:.2f}s per reply"
     )
+    print(
+        f"wording faults over {len(results)} replies and {relayed} relayed answers: "
+        + (", ".join(f"{k} {v}" for k, v in sorted(faults.items())) or "none")
+    )
     return {
         "profile": args.profile,
         "from_audio": args.from_audio,
         "summary": summary,
+        "wording": {"replies": len(results), "relayed": relayed, **dict(faults)},
         "results": results,
     }
 
