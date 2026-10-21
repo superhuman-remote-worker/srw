@@ -43,7 +43,7 @@ orchestrator = [
   "config/prompts/*.md",
 ]
 mcp_server = ["templates/*.html"]
-voice_gateway = ["config.example.yaml", "requirements.txt"]
+voice_gateway = ["config.example.yaml", "requirements.txt", "asterisk/addon.example.yaml"]
 shared = [
   "**/*.sql",
   "manifests/schema.json",

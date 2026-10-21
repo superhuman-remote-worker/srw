@@ -1,0 +1,43 @@
+# Asterisk addon values; local_voice_gateway.md §4.4. Render with
+#   python -m voice_gateway.asterisk.render --values addon.yaml --out /etc/asterisk
+# Secret files are read relative to this file and never printed.
+sip:
+  bind: 0.0.0.0
+  port: 5060                       # UDP and TCP
+  # When the PBX reaches Asterisk through NAT or a LoadBalancer IP, advertise
+  # that address to everything outside local_net (SIP Contact and SDP).
+  # external_address: 192.0.2.10
+  # local_net: [10.42.0.0/16]
+rtp:                               # two ports per concurrent call
+  start: 10000
+  end: 10099
+ari:
+  bind: 127.0.0.1:8088             # loopback or the pod's own address only
+  user: srw
+  # Shared secret of Asterisk and the gateway: ARI, and the gateway's media
+  # listener (the gateway's source.password_file names the same secret).
+  password_file: /run/secrets/asterisk-password
+  app: srw-voice
+gateway:
+  media_uri: ws://127.0.0.1:18441/media   # the gateway's source.media_listen
+  connection: srw-gateway                 # the gateway's source.media_connection
+codecs: [alaw, ulaw, g722]         # offered to the PBX, in this order
+dtmf_mode: auto                    # RFC 4733 when offered, else in-band; SIP INFO always
+lines:
+  # Registers as an extension: the simplest attach on every PBX.
+  - name: reception                # lowercase letters, digits and dashes
+    mode: register
+    pbx: 192.0.2.1                 # host[:port]
+    transport: udp                 # or tcp
+    extension: "2000"              # AOR user, Contact user and From user
+    # username: "2000"             # digest user when the PBX has an auth ID
+    password_file: /run/secrets/line-reception-password
+    # The gateway's part of the same line (ignored by the renderer):
+    connector_id: 00000000-0000-0000-0000-000000000001
+    webhook_secret_file: /run/secrets/line-reception-webhook
+  # The PBX sends calls to this address without a registration (IP peer).
+  - name: hotline
+    mode: peer
+    pbx: 192.0.2.1
+    # match: [192.0.2.1]           # addresses the PBX calls from (default: pbx)
+    # extension, username and password_file for calls to the PBX (transfers)
