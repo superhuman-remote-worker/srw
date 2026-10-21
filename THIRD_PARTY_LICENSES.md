@@ -179,6 +179,27 @@ Four of them ship NOTICE files, carried in the image: `aiofiles`, `propcache`
 and `yarl` (`*.dist-info/licenses/NOTICE`) and `onnxruntime`
 (`onnxruntime/ThirdPartyNotices.txt`).
 
+### Local model servers (`docker/voice-models/`)
+
+The STT, voice LLM and TTS servers a cascade profile points at are not SRW
+images and not part of the chart: `docker/voice-models/compose.yaml` builds or
+pulls them for development and on-premises setups, and `models.py` fetches
+their pinned, sha256-checked weights. Every component (code and weights)
+allows commercial use; the full table with versions is in
+[`docker/voice-models/README.md`](docker/voice-models/README.md#licences-code-and-weights-all-allow-commercial-use).
+
+| Component | License |
+|---|---|
+| llama.cpp, whisper.cpp, Piper, Speaches, faster-qwen3-tts | MIT |
+| Gemma 4 12B, Qwen3-TTS 0.6B/1.7B Base, Qwen3-ASR 0.6B (bench judge only) | Apache-2.0 |
+| whisper-large-v3-turbo, faster-whisper small, Piper `de_DE-mls-medium` | MIT |
+| PyTorch (ROCm wheel, bundling the ROCm libraries), Transformers, Accelerate, qwen-tts-hf | BSD-3-Clause / Apache-2.0 |
+| soxr (LGPL-2.1-or-later), certifi and tqdm (MPL-2.0) in the ROCm TTS runtime | weak copyleft, used unmodified |
+
+The bundled voice sample `docker/voice-models/voices/de-1.wav` was generated
+by Qwen3-TTS (Apache-2.0) without a reference recording; it is no real
+person's voice.
+
 ---
 
 ## Adapted prompt text
