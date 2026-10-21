@@ -35,8 +35,10 @@ class Config:
     test_control: bool = False
     webhook_verify_ssl: bool = True
     # Where calls come from: {"kind": "scripted"} or a source's own settings
-    # (WP2 adds Asterisk); the source module validates the rest.
+    # (sources.py); the source module validates the rest.
     source: dict = field(default_factory=lambda: {"kind": "scripted"})
+    # Relative secret files in ``source`` resolve against the config file.
+    base_dir: Path = Path(".")
 
 
 def _text(value, label: str) -> str:
@@ -175,6 +177,10 @@ def load_config(path: str | Path) -> Config:
     source = raw.get("source", {"kind": "scripted"})
     if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
         raise ConfigError("source must be a mapping with a kind")
+    # Imported here: a source imports the session, which imports this module.
+    from voice_gateway.sources import build_source
+
+    build_source(source, path.parent)
     return Config(
         host,
         port,
@@ -185,4 +191,5 @@ def load_config(path: str | Path) -> Config:
         test_control,
         _boolean(raw, "webhook_verify_ssl", True),
         source,
+        path.parent.absolute(),
     )

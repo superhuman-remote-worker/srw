@@ -15,12 +15,25 @@ lines:
 profiles:
   scripted:
     engine: scripted
+  # Plays the caller's audio back; needs a source with audio (Asterisk).
+  # echo:
+  #   engine: echo
 # Test control uses the same Bearer keys and listener as the protocol API.
 # These flags are explicit because the driver pod reaches this LAN listener.
 # Both default to false; remove them for a deployment without test control.
 test_control: true
 allow_remote_test_control: true
-# Where calls come from. Omitted = scripted (test control only); WP2 adds
-# Asterisk over ARI.
+# Where calls come from. Omitted = scripted (test control only). Asterisk
+# (the addon, local_voice_gateway.md §4.2) runs over ARI; render its config
+# with python -m voice_gateway.asterisk.render (asterisk/addon.example.yaml)
+# and use the same password, app and media connection here.
 # source:
-#   kind: scripted
+#   kind: asterisk
+#   ari_url: http://127.0.0.1:8088
+#   ari_user: srw
+#   password_file: /run/secrets/asterisk-password  # ARI and the media listener
+#   app: srw-voice
+#   media_listen: 127.0.0.1:18441    # websocket_client.conf's URI points here
+#   media_connection: srw-gateway    # the websocket_client.conf entry
+#   media_timeout_s: 5               # accept fails (502) without audio by then
+#   dial_timeout_s: 30               # fallback transfer: how long the target rings

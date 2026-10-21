@@ -19,8 +19,8 @@ from aiohttp import web
 from voice_gateway.config import Config
 from voice_gateway.engines import build_engines
 from voice_gateway.interfaces import CallSource, Engine
-from voice_gateway.scripted import ScriptedCallSource
 from voice_gateway.session import ProtocolError, Session
+from voice_gateway.sources import build_source
 
 # One line per call event: session id, line, outcome. Never phone numbers,
 # instructions or anything the caller or the voice says.
@@ -87,7 +87,11 @@ class Gateway:
         if retention_s is None:
             retention_s = 600.0 if config.test_control else 60.0
         self.retention_s = retention_s
-        self.source = source if source is not None else ScriptedCallSource()
+        self.source = (
+            source
+            if source is not None
+            else build_source(config.source, config.base_dir)()
+        )
         self.engines = (
             engines if engines is not None else build_engines(config.profiles)
         )
@@ -132,8 +136,16 @@ class Gateway:
             timeout=aiohttp.ClientTimeout(total=5)
         ) as http:
             self.http = http
+            # A source with connections of its own (Asterisk) runs alongside
+            # the app; the scripted source has nothing to start.
+            start = getattr(self.source, "start", None)
+            if start is not None:
+                await start(self)
             yield
             await self.shutdown(app)
+            stop = getattr(self.source, "stop", None)
+            if stop is not None:
+                await stop()
             self.http = None
 
     async def shutdown(self, app) -> None:

@@ -37,7 +37,10 @@ class AudioPort(Protocol):
 
 
 class CallSource(Protocol):
-    """The real call's controls. Sources enter through Gateway.incoming_call()."""
+    """The real call's controls. Sources enter through Gateway.incoming_call().
+
+    A source with connections of its own may also define ``start(gateway)``
+    and ``stop()``; the gateway runs them with its app (sources.py)."""
 
     async def answer(self, session: Session) -> None: ...
     async def reject(self, session: Session, status_code: int) -> None: ...
