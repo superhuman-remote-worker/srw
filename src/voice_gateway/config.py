@@ -11,9 +11,10 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from voice_gateway.engines import build_engines
+from voice_gateway.errors import ConfigError
 
-class ConfigError(ValueError):
-    """An invalid operator setting, without secret values in the message."""
+__all__ = ["Config", "ConfigError", "Line", "load_config"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,9 @@ class Config:
     profiles: dict[str, dict]
     test_control: bool = False
     webhook_verify_ssl: bool = True
+    # Where calls come from: {"kind": "scripted"} or a source's own settings
+    # (WP2 adds Asterisk); the source module validates the rest.
+    source: dict = field(default_factory=lambda: {"kind": "scripted"})
 
 
 def _text(value, label: str) -> str:
@@ -77,6 +81,7 @@ def load_config(path: str | Path) -> Config:
         "test_control",
         "allow_remote_test_control",
         "webhook_verify_ssl",
+        "source",
     }
     if raw.keys() - allowed:
         raise ConfigError("config contains unknown fields")
@@ -164,10 +169,12 @@ def load_config(path: str | Path) -> Config:
     profiles = raw.get("profiles")
     if not isinstance(profiles, dict) or not profiles:
         raise ConfigError("profiles must be a nonempty mapping")
-    for name, profile in profiles.items():
+    for name in profiles:
         _text(name, "profile name")
-        if not isinstance(profile, dict) or profile != {"engine": "scripted"}:
-            raise ConfigError("each profile must contain engine: scripted")
+    build_engines(profiles)
+    source = raw.get("source", {"kind": "scripted"})
+    if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
+        raise ConfigError("source must be a mapping with a kind")
     return Config(
         host,
         port,
@@ -177,4 +184,5 @@ def load_config(path: str | Path) -> Config:
         profiles,
         test_control,
         _boolean(raw, "webhook_verify_ssl", True),
+        source,
     )

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from voice_gateway.errors import ConfigError
+
 if TYPE_CHECKING:
     from voice_gateway.session import Session
 
@@ -38,3 +40,10 @@ class ScriptedEngine:
 
     async def stop(self, session: Session) -> None:
         pass
+
+
+def scripted_kind(name: str, settings: dict) -> type[ScriptedEngine]:
+    """The ``scripted`` profile kind; it takes no settings."""
+    if settings:
+        raise ConfigError(f"profile {name}: the scripted engine takes no settings")
+    return ScriptedEngine

@@ -17,8 +17,9 @@ import aiohttp
 from aiohttp import web
 
 from voice_gateway.config import Config
+from voice_gateway.engines import build_engines
 from voice_gateway.interfaces import CallSource, Engine
-from voice_gateway.scripted import ScriptedCallSource, ScriptedEngine
+from voice_gateway.scripted import ScriptedCallSource
 from voice_gateway.session import ProtocolError, Session
 
 # One line per call event: session id, line, outcome. Never phone numbers,
@@ -88,9 +89,7 @@ class Gateway:
         self.retention_s = retention_s
         self.source = source if source is not None else ScriptedCallSource()
         self.engines = (
-            engines
-            if engines is not None
-            else {name: ScriptedEngine for name in config.profiles}
+            engines if engines is not None else build_engines(config.profiles)
         )
         self.ringing_timeout_s, self.replay_window_s = (
             ringing_timeout_s,

@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from voice_gateway.config import Line
-from voice_gateway.interfaces import CallSource, Engine
+from voice_gateway.interfaces import AudioPort, CallSource, Engine
 
 # GPT-Live counts its append budget in tokens (500). The driver clips to 1500
 # code points and may add " …", so the gateway must accept a little more than
@@ -46,6 +46,7 @@ class Session:
         self.line, self.sip_headers, self.source = line, headers, source
         self.engine_factory = engine_factory
         self.engine: Engine | None = None
+        self.audio: AudioPort | None = None
         self.state = "ringing"
         self.decision: str | None = None
         self.accept_config: dict | None = None

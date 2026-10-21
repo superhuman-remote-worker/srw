@@ -20,3 +20,7 @@ profiles:
 # Both default to false; remove them for a deployment without test control.
 test_control: true
 allow_remote_test_control: true
+# Where calls come from. Omitted = scripted (test control only); WP2 adds
+# Asterisk over ARI.
+# source:
+#   kind: scripted
