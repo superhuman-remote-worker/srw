@@ -70,6 +70,9 @@ class LlmSettings(Stage):
     #: steering instructions): "system" when the model's chat template accepts
     #: a system message mid-conversation, else "user".
     note_role: str = "system"
+    #: Prefill the fixed prompt prefix (rules, instructions, tool) while the
+    #: greeting plays, so the caller's first turn hits a warm cache.
+    prewarm: bool = True
 
 
 @dataclass(frozen=True)
@@ -247,7 +250,7 @@ def _stt(raw, label: str) -> SttSettings:
 
 
 def _llm(raw, label: str) -> LlmSettings:
-    stage = _stage(raw, label, {"temperature", "max_tokens", "note_role"})
+    stage = _stage(raw, label, {"temperature", "max_tokens", "note_role", "prewarm"})
     role = raw.get("note_role", "system")
     if role not in {"system", "user", "developer"}:
         raise ConfigError(f"{label}.note_role must be system, user or developer")
@@ -256,6 +259,7 @@ def _llm(raw, label: str) -> LlmSettings:
         temperature=_number(raw, "temperature", label, 0.3, 0.0, 2.0),
         max_tokens=_integer(raw, "max_tokens", label, 300, 16, 4096),
         note_role=role,
+        prewarm=_boolean(raw, "prewarm", label, True),
     )
 
 

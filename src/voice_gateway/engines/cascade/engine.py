@@ -115,6 +115,7 @@ class CascadeEngine:
         self._llm: VoiceLLM | None = None
         self._audioless = False
         self._stopped = False
+        self._prewarm: asyncio.Task | None = None
         self.output: CallOutput | None = None
         self.context: LLMContext | None = None
 
@@ -155,6 +156,8 @@ class CascadeEngine:
     async def stop(self, session: Session) -> None:
         self._stopped = True
         self._pending.clear()
+        if self._prewarm is not None:
+            self._prewarm.cancel()
         if self._runner is not None:
             await self._runner.cancel()
         elif self._task is not None:
@@ -199,6 +202,9 @@ class CascadeEngine:
                     await worker.queue_frame(early)
                 self._early.clear()
                 self._ready.set()
+                if self.settings.llm.prewarm:
+                    prefix = LLMContext(tools=self.context.tools)
+                    self._prewarm = asyncio.create_task(self._llm.prewarm(prefix))
 
             await self._runner.run()
         except asyncio.CancelledError:

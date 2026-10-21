@@ -156,6 +156,24 @@ class VoiceLLM(OpenAILLMService):
         #: Whether the response in flight said anything before a tool call.
         self.spoke = False
 
+    async def prewarm(self, context) -> None:
+        """One 1-token completion over the call's fixed prefix; the server's
+        prompt cache then holds it for the first real turn."""
+        self._compose_system_instruction()
+        params = self.get_llm_adapter().get_llm_invocation_params(
+            context,
+            system_instruction=self._settings.system_instruction,
+            convert_developer_to_user=not self.supports_developer_role,
+        )
+        params = self.build_chat_completion_params(params)
+        params.pop("stream_options", None)
+        params.pop("max_completion_tokens", None)
+        params.update(stream=False, max_tokens=1)
+        try:
+            await self._client.chat.completions.create(**params)
+        except Exception:  # noqa: BLE001 - a cold cache only costs latency
+            pass
+
     def build_chat_completion_params(self, params_from_context) -> dict:
         params = super().build_chat_completion_params(params_from_context)
         params["messages"] = note_messages(params["messages"], self._stage.note_role)

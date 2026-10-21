@@ -68,6 +68,7 @@ class Fakes:
         self.stt_texts: list[str] = []
         self.stt_calls = 0
         self.llm_requests: list[dict] = []
+        self.prewarms: list[dict] = []
         self.llm_replies: list = []  # each: str (text) or ("delegate", request[, text])
         self.tts_inputs: list[str] = []
         self.ms_per_char = 40
@@ -81,6 +82,21 @@ class Fakes:
 
     async def completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
+        if not body.get("stream"):
+            # The engine's prewarm: one token over the fixed prefix.
+            self.prewarms.append(body)
+            message = {"role": "assistant", "content": "G"}
+            return web.json_response(
+                {
+                    "id": "p",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": body["model"],
+                    "choices": [
+                        {"index": 0, "message": message, "finish_reason": "length"}
+                    ],
+                }
+            )
         self.llm_requests.append(body)
         reply = self.llm_replies.pop(0) if self.llm_replies else "Gern."
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
@@ -297,6 +313,9 @@ async def test_greeting_is_spoken_verbatim_without_the_llm(call, fakes):
         >= 0.8 * len("Guten Tag, hier ist das Hotel.") * fakes.ms_per_char
     )
     assert fakes.llm_requests == []
+    prewarm = fakes.prewarms[0]
+    assert prewarm["max_tokens"] == 1 and prewarm["messages"][0]["role"] == "system"
+    assert prewarm["tools"][0]["function"]["name"] == "delegate"
 
 
 @pytest.mark.asyncio
