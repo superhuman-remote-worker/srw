@@ -531,6 +531,16 @@ async def test_delegation_follows_the_transcript_then_filler_then_phrased_answer
     tool = [m for m in answer_request if m["role"] == "tool"]
     assert tool and "129 Euro" in tool[-1]["content"]
     assert call.engine.timings.turns[0].delegated
+    # The filler stands in front of the call, as if the LLM had said it, and
+    # nothing after the result asks for another holding sentence.
+    roles = [(m["role"], bool(m.get("tool_calls"))) for m in answer_request]
+    filler = next(
+        i
+        for i, m in enumerate(answer_request)
+        if m["role"] == "assistant" and m.get("content") == FILLER
+    )
+    assert roles[filler + 1 : filler + 3] == [("assistant", True), ("tool", False)]
+    assert filler + 3 == len(answer_request)
 
 
 @pytest.mark.asyncio

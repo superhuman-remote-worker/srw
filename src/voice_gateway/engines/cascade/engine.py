@@ -15,7 +15,10 @@ assistant context. How the protocol's appends map onto it:
 A ``delegate`` call emits ``session.delegation.created`` (after the caller's
 transcript, which STT emitted first) and plays the filler unless the LLM
 already said it was checking. Pipecat runs the call as an async tool, so
-the conversation goes on until the answer arrives.
+the conversation goes on until the answer arrives. The filler enters the
+LLM's context in front of the call, where the LLM's own holding sentence
+would stand, when the answer arrives; appended after the call's result it
+made the LLM open the answer with a second holding sentence.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import dataclass
 
 import aiohttp
 from loguru import logger as pipecat_logger
@@ -82,6 +86,18 @@ from voice_gateway.session import ProtocolError, Session
 
 # Session ids and counts only, like the rest of the gateway.
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _Delegation:
+    """A ``delegate`` call waiting for the back office's answer."""
+
+    answer: object  # the call's result callback
+    tool_call_id: str
+    #: The filler the engine spoke for it (not yet in the LLM's context).
+    filler: str | None = None
+
+
 _quiet = False
 
 
@@ -114,7 +130,7 @@ class CascadeEngine:
         self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
         self._early: list[Frame] = []
-        self._pending: dict[str, object] = {}
+        self._pending: dict[str, _Delegation] = {}
         self._llm: VoiceLLM | None = None
         self._audioless = False
         self._stopped = False
@@ -148,8 +164,10 @@ class CascadeEngine:
                 self._say("assistant", content)
             return
         if kind == "commentary" and delegation_id in self._pending:
-            answer = self._pending.pop(delegation_id)
-            await answer(content)
+            pending = self._pending.pop(delegation_id)
+            if pending.filler:
+                self._said_before_call(pending.tool_call_id, pending.filler)
+            await pending.answer(content)
             return
         if kind == "instructions" and (words := exact_words(content)):
             # One TTS request per sentence: a TTS that answers once a
@@ -355,10 +373,25 @@ class CascadeEngine:
             )
             return
         self.timings.delegated()
-        self._pending[delegation_id] = params.result_callback
+        pending = _Delegation(params.result_callback, params.tool_call_id)
+        self._pending[delegation_id] = pending
         if self.settings.filler and not (self._llm and self._llm.spoke):
-            await params.llm.push_frame(TTSSpeakFrame(self.settings.filler))
+            pending.filler = self.settings.filler
+            await params.llm.push_frame(
+                TTSSpeakFrame(self.settings.filler, append_to_context=False)
+            )
         logger.info("call %s delegated", self._session.id)
+
+    def _said_before_call(self, tool_call_id: str, text: str) -> None:
+        """Put ``text`` into the context in front of the tool call, as an
+        assistant message, where the LLM's own words would stand."""
+        messages = list(self.context.messages)
+        for index, message in enumerate(messages):
+            calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if calls and any(call.get("id") == tool_call_id for call in calls):
+                messages.insert(index, {"role": "assistant", "content": text})
+                self.context.set_messages(messages)
+                return
 
     def _say(self, speaker: str, text: str) -> None:
         try:
