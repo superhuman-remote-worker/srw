@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
+from voice_gateway.engines.cascade import cascade_kind
 from voice_gateway.engines.echo import echo_kind
 from voice_gateway.errors import ConfigError
 from voice_gateway.interfaces import Engine
@@ -21,6 +22,7 @@ EngineKind = Callable[[str, dict], EngineFactory]
 KINDS: dict[str, EngineKind] = {
     "scripted": scripted_kind,
     "echo": echo_kind,
+    "cascade": cascade_kind,
 }
 
 

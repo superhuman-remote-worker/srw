@@ -36,6 +36,8 @@ tilt_modules/
 # Python virtual environment
 venv/
 .venv/
+# The voice gateway's own venv (Pipecat; src/voice_gateway/requirements.txt)
+.venv-voice/
 env/
 
 # Local environment
