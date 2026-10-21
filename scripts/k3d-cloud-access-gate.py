@@ -254,7 +254,7 @@ class AccessGate:
         status, applied = 0, None
         for _attempt in range(2):
             status, diff = self.d7.api.call(
-                "GET", f"/api/agents/threads/{thread}/cloud-diff"
+                "GET", f"/api/persistent/threads/{thread}/cloud-diff"
             )
             if status != 200 or not any(
                 f.get("path") == filename for f in (diff.get("files") or [])
@@ -262,7 +262,7 @@ class AccessGate:
                 return status, diff
             status, applied = self.d7.api.call(
                 "POST",
-                f"/api/agents/threads/{thread}/cloud-diff/apply",
+                f"/api/persistent/threads/{thread}/cloud-diff/apply",
                 {"epoch": diff.get("epoch")},
             )
             if not (
@@ -463,7 +463,7 @@ class AccessGate:
 
         def staged() -> dict[str, Any] | None:
             status, body = self.d7.api.call(
-                "GET", f"/api/agents/threads/{thread}/cloud-diff"
+                "GET", f"/api/persistent/threads/{thread}/cloud-diff"
             )
             files = (body.get("files") or []) if status == 200 else []
             return body if any(f.get("path") == filename for f in files) else None

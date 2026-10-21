@@ -1744,7 +1744,7 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {"limit": limit}
         if status:
             params["status"] = status
-        resp = await self._client.get("/api/agents", params=params)
+        resp = await self._client.get("/api/admin/agents", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1876,7 +1876,7 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._mutation_request("DELETE", f"/api/agents/{agent_id}")
+        resp = await self._mutation_request("DELETE", f"/api/admin/agents/{agent_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -2249,7 +2249,7 @@ class AsyncCockpitClient:
             Dict with cpu, memory, disk, listening_ports, processes,
             network_connections, and agent info
         """
-        resp = await self._client.get(f"/api/agents/{agent_id}/system-info")
+        resp = await self._client.get(f"/api/admin/agents/{agent_id}/system-info")
         resp.raise_for_status()
         return resp.json()
 

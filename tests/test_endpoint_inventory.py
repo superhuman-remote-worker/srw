@@ -126,3 +126,71 @@ def test_vm_resource_inventory_publish_has_its_distinct_hmac_gate():
     ]
     assert len(matches) == 1
     assert matches[0].classification == "internal:require_vm_inventory_authority"
+
+
+# Routes under the agent-internal ``/api/agents`` prefix that a user calls
+# rather than an agent. That prefix is meant for agent ↔ orchestrator traffic
+# (in-cluster, never through the public edge), and the dev tunnel 403s all of
+# it, so a browser-facing route there is unreachable from the Cockpit. Each
+# entry here is either a deprecated alias of a route that moved out — keyed to
+# the moved route, and removed together with the alias in a later release —
+# or a route left on purpose, with the reason.
+DEPRECATED_AGENT_PREFIX_ALIASES = {
+    ("GET", "/api/agents"): "/api/admin/agents",
+    ("GET", "/api/agents/{agent_id}"): "/api/admin/agents/{agent_id}",
+    (
+        "GET",
+        "/api/agents/{agent_id}/system-info",
+    ): "/api/admin/agents/{agent_id}/system-info",
+    # Also the agent's own internal-key deregistration, which stays.
+    ("DELETE", "/api/agents/{agent_id}"): "/api/admin/agents/{agent_id}",
+    **{
+        (method, f"/api/agents/threads/{{thread_id}}/cloud-diff{suffix}"): (
+            f"/api/persistent/threads/{{thread_id}}/cloud-diff{suffix}"
+        )
+        for method, suffix in (
+            ("GET", ""),
+            ("GET", "/{file_path:path}"),
+            ("POST", "/restage"),
+            ("POST", "/apply"),
+            ("POST", "/reject"),
+        )
+    },
+}
+_USER_ROUTES_KEPT_UNDER_AGENT_PREFIX = {
+    ("POST", "/api/agents/threads/{thread_id}/rewind"): (
+        "detached-session rewind; no Cockpit caller — the Cockpit rewinds "
+        "through /api/persistent/threads/{thread_id}/rewinds"
+    ),
+}
+
+
+def test_only_agent_runtime_routes_live_under_the_agent_prefix():
+    """A user-facing route under ``/api/agents`` must be acknowledged above."""
+    endpoints = _load_script().collect_endpoints()
+    user_facing = {
+        (e.method, e.path)
+        for e in endpoints
+        if (e.path == "/api/agents" or e.path.startswith("/api/agents/"))
+        and e.classification != "internal:require_internal"
+    }
+    assert user_facing == (
+        set(DEPRECATED_AGENT_PREFIX_ALIASES) | set(_USER_ROUTES_KEPT_UNDER_AGENT_PREFIX)
+    ), (
+        "A route under the agent-internal /api/agents prefix is not agent-only. "
+        "Serve browser-facing routes elsewhere (/api/persistent, /api/admin, …): "
+        "the public edge may block /api/agents entirely."
+    )
+
+
+def test_each_deprecated_alias_mirrors_its_moved_route():
+    """Same handler, same gate: the moved route and its alias classify alike."""
+    endpoints = {(e.method, e.path): e for e in _load_script().collect_endpoints()}
+    for (method, alias), moved in DEPRECATED_AGENT_PREFIX_ALIASES.items():
+        assert (method, moved) in endpoints, (method, moved)
+        assert endpoints[(method, alias)].func_name == (
+            endpoints[(method, moved)].func_name
+        )
+        assert endpoints[(method, alias)].classification == (
+            endpoints[(method, moved)].classification
+        )

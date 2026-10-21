@@ -1,13 +1,23 @@
 """HTTP adapters for the protected-cloud diff review surface (Slice C, Task 8).
 
-Five routes, one gate. ``require_thread_owner`` is awaited first on every one
-of them — before the protected-mode check, before any mount row is read — so
-the ordering of refusals is unchanged: a non-owner never learns whether the
-thread is protected, and a non-protected thread answers 404 rather than 403.
+Five routes (each also on a deprecated alias path, below), one gate.
+``require_thread_owner`` is awaited first on every one of them — before the
+protected-mode check, before any mount row is read — so the ordering of
+refusals is unchanged: a non-owner never learns whether the thread is
+protected, and a non-protected thread answers 404 rather than 403.
 
 Route order is part of the contract: ``GET .../cloud-diff`` is declared before
 ``GET .../cloud-diff/{file_path:path}``, and the three POST verbs keep the
 positions they had in ``main``.
+
+The routes are served under ``/api/persistent/threads/{thread_id}/cloud-diff``.
+They used to live under ``/api/agents/threads/...``, which is the
+agent-internal prefix: an edge that blocks ``/api/agents/*`` (the dev tunnel
+does) made the browser's review unreachable. Each handler still answers on
+that old path through a second, ``deprecated=True`` decorator — the same
+handler, gate and response — so a Cockpit that is already loaded or held by
+the service worker keeps working for one release. **Remove the
+``/api/agents/threads/...`` decorators in a later release.**
 
 The owner gate returns ``(user, thread)``; only the thread row travels into the
 operations, which re-derive metadata themselves.
@@ -44,6 +54,10 @@ def get_thread_cloud_diff_dependencies(
 # =============================================================================
 # Protected cloud mode (Slice C, Task 8): owner-facing cloud-diff review.
 #
+# Each route carries two decorators: the ``/api/persistent`` path, applied
+# first, and above it the DEPRECATED ``/api/agents`` alias (see the module
+# docstring; remove it in a later release).
+#
 # Three read/restage endpoints share one gate (``_require_protected``) and one
 # resolver (``_thread_cloud_diff_source``) that builds a Task 7
 # ``UpperdirDiffSource`` from the thread's ``cloud_ro_mounts`` row alone (its
@@ -54,7 +68,8 @@ def get_thread_cloud_diff_dependencies(
 # =============================================================================
 
 
-@router.get("/api/agents/threads/{thread_id}/cloud-diff")
+@router.get("/api/agents/threads/{thread_id}/cloud-diff", deprecated=True)
+@router.get("/api/persistent/threads/{thread_id}/cloud-diff")
 async def get_thread_cloud_diff_summary(
     thread_id: str,
     request: Request,
@@ -80,7 +95,10 @@ async def get_thread_cloud_diff_summary(
     )
 
 
-@router.get("/api/agents/threads/{thread_id}/cloud-diff/{file_path:path}")
+@router.get(
+    "/api/agents/threads/{thread_id}/cloud-diff/{file_path:path}", deprecated=True
+)
+@router.get("/api/persistent/threads/{thread_id}/cloud-diff/{file_path:path}")
 async def get_thread_cloud_diff_file(
     thread_id: str,
     file_path: str,
@@ -116,7 +134,8 @@ async def get_thread_cloud_diff_file(
     )
 
 
-@router.post("/api/agents/threads/{thread_id}/cloud-diff/restage")
+@router.post("/api/agents/threads/{thread_id}/cloud-diff/restage", deprecated=True)
+@router.post("/api/persistent/threads/{thread_id}/cloud-diff/restage")
 async def restage_thread_cloud_diff(
     thread_id: str,
     request: Request,
@@ -148,7 +167,8 @@ async def restage_thread_cloud_diff(
     )
 
 
-@router.post("/api/agents/threads/{thread_id}/cloud-diff/apply")
+@router.post("/api/agents/threads/{thread_id}/cloud-diff/apply", deprecated=True)
+@router.post("/api/persistent/threads/{thread_id}/cloud-diff/apply")
 async def apply_thread_cloud_diff(
     request: Request,
     thread_id: str,
@@ -177,7 +197,8 @@ async def apply_thread_cloud_diff(
     )
 
 
-@router.post("/api/agents/threads/{thread_id}/cloud-diff/reject")
+@router.post("/api/agents/threads/{thread_id}/cloud-diff/reject", deprecated=True)
+@router.post("/api/persistent/threads/{thread_id}/cloud-diff/reject")
 async def reject_thread_cloud_diff(
     request: Request,
     thread_id: str,

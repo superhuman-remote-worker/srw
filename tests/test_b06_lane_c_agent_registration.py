@@ -8,6 +8,11 @@ What is under test is the identity discipline (port contract §P6/§P7): the
 persistent bind fence refuses *before* the hostname upsert, every refusal keeps
 its exact ``code``, and each runtime-actor bootstrap refusal writes its
 ``runtime_actor_denied`` security event.
+
+The fleet admin routes moved to ``/api/admin/agents``; their old ``/api/agents``
+paths stay as deprecated aliases for one release, so each admin test runs on
+both (``DELETE /api/agents/{agent_id}`` is also the agent's own
+deregistration and is not deprecated).
 """
 
 from __future__ import annotations
@@ -819,62 +824,91 @@ def test_graph_progress_folds_into_metrics():
 
 # --- admin reads and deregistration ------------------------------------------
 
+# The moved fleet admin prefix, and its deprecated pre-move alias.
+_FLEET_PREFIXES = pytest.mark.parametrize("fleet", ["/api/admin/agents", "/api/agents"])
 
-def test_list_agents_is_admin_only():
+
+@_FLEET_PREFIXES
+def test_list_agents_is_admin_only(fleet):
     deps = _deps(
         require_admin=AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Admin required")
         )
     )
-    resp = _client(deps).get("/api/agents")
+    resp = _client(deps).get(fleet)
     assert resp.status_code == 403
     deps.store.list_agents.assert_not_awaited()
 
 
-def test_list_agents_enforces_its_limit_bounds():
+@_FLEET_PREFIXES
+def test_list_agents_enforces_its_limit_bounds(fleet):
     deps = _deps()
-    assert _client(deps).get("/api/agents?limit=501").status_code == 422
-    assert _client(deps).get("/api/agents?limit=0").status_code == 422
+    assert _client(deps).get(f"{fleet}?limit=501").status_code == 422
+    assert _client(deps).get(f"{fleet}?limit=0").status_code == 422
     deps.store.list_agents.assert_not_awaited()
 
 
-def test_list_agents_passes_the_status_filter_through():
+@_FLEET_PREFIXES
+def test_list_agents_passes_the_status_filter_through(fleet):
     store = _store(list_agents=AsyncMock(return_value=[{"id": AGENT_ID}]))
     deps = _deps(store=store)
-    resp = _client(deps).get("/api/agents?status=ready&limit=5")
+    resp = _client(deps).get(f"{fleet}?status=ready&limit=5")
     assert resp.status_code == 200
     assert resp.json() == [{"id": AGENT_ID}]
     store.list_agents.assert_awaited_once_with(status="ready", limit=5)
 
 
-def test_get_agent_missing_is_404():
+@_FLEET_PREFIXES
+def test_list_agents_defaults_its_limit(fleet):
     deps = _deps()
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}")
+    assert _client(deps).get(fleet).json() == []
+    deps.store.list_agents.assert_awaited_once_with(status=None, limit=100)
+
+
+@_FLEET_PREFIXES
+def test_get_agent_missing_is_404(fleet):
+    deps = _deps()
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 404
     assert resp.json() == {"detail": f"Agent '{AGENT_ID}' not found"}
 
 
-def test_system_info_refuses_an_offline_agent():
+@_FLEET_PREFIXES
+def test_get_agent_is_admin_only(fleet):
+    deps = _deps(
+        require_admin=AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Admin required")
+        )
+    )
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}")
+    assert resp.status_code == 403
+    deps.store.get_agent.assert_not_awaited()
+
+
+@_FLEET_PREFIXES
+def test_system_info_refuses_an_offline_agent(fleet):
     store = _store(
         get_agent=AsyncMock(return_value={"status": "offline", "pod_ip": "10.0.0.9"})
     )
     deps = _deps(store=store)
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}/system-info")
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}/system-info")
     assert resp.status_code == 400
     assert resp.json() == {"detail": "Agent is offline"}
 
 
-def test_system_info_refuses_an_agent_with_no_pod_ip():
+@_FLEET_PREFIXES
+def test_system_info_refuses_an_agent_with_no_pod_ip(fleet):
     store = _store(
         get_agent=AsyncMock(return_value={"status": "ready", "pod_ip": None})
     )
     deps = _deps(store=store)
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}/system-info")
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}/system-info")
     assert resp.status_code == 400
     assert resp.json() == {"detail": "Agent has no pod IP configured"}
 
 
-def test_system_info_proxies_and_maps_a_transport_error_to_502(monkeypatch):
+@_FLEET_PREFIXES
+def test_system_info_proxies_and_maps_a_transport_error_to_502(monkeypatch, fleet):
     import httpx
 
     class _Boom:
@@ -897,12 +931,13 @@ def test_system_info_proxies_and_maps_a_transport_error_to_502(monkeypatch):
         )
     )
     deps = _deps(store=store)
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}/system-info")
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}/system-info")
     assert resp.status_code == 502
     assert "Failed to connect to agent" in resp.json()["detail"]
 
 
-def test_delete_agent_accepts_the_internal_key_without_admin():
+@_FLEET_PREFIXES
+def test_delete_agent_accepts_the_internal_key_without_admin(fleet):
     store = _store()
     deps = _deps(
         store=store,
@@ -911,25 +946,53 @@ def test_delete_agent_accepts_the_internal_key_without_admin():
             side_effect=AssertionError("admin gate must not run for internal callers")
         ),
     )
-    resp = _client(deps).delete(f"/api/agents/{AGENT_ID}")
+    resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 200
     assert resp.json() == {"status": "deleted"}
 
 
-def test_delete_agent_requires_admin_for_everyone_else():
+@_FLEET_PREFIXES
+def test_delete_agent_requires_admin_for_everyone_else(fleet):
     deps = _deps(
         require_admin=AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Admin required")
         )
     )
-    resp = _client(deps).delete(f"/api/agents/{AGENT_ID}")
+    resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 403
     deps.store.delete_agent.assert_not_awaited()
 
 
-def test_delete_agent_missing_is_404():
+@_FLEET_PREFIXES
+def test_delete_agent_missing_is_404(fleet):
     store = _store(delete_agent=AsyncMock(return_value=False))
     deps = _deps(store=store)
-    resp = _client(deps).delete(f"/api/agents/{AGENT_ID}")
+    resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 404
     assert resp.json() == {"detail": f"Agent '{AGENT_ID}' not found"}
+
+
+def test_the_fleet_aliases_are_published_as_deprecated():
+    """The old admin reads are deprecated; the agent's own DELETE is not, and
+    neither is any moved route or agent-internal route."""
+    app = FastAPI()
+    app.include_router(router_mod.router)
+    published = {
+        (method.upper(), path): operation.get("deprecated", False)
+        for path, operations in app.openapi()["paths"].items()
+        for method, operation in operations.items()
+    }
+
+    assert published == {
+        ("POST", "/api/agents/register"): False,
+        ("POST", "/api/agents/{agent_id}/runtime-actor/session"): False,
+        ("POST", "/api/agents/{agent_id}/heartbeat"): False,
+        ("GET", "/api/admin/agents"): False,
+        ("GET", "/api/agents"): True,
+        ("GET", "/api/admin/agents/{agent_id}"): False,
+        ("GET", "/api/agents/{agent_id}"): True,
+        ("DELETE", "/api/admin/agents/{agent_id}"): False,
+        ("DELETE", "/api/agents/{agent_id}"): False,
+        ("GET", "/api/admin/agents/{agent_id}/system-info"): False,
+        ("GET", "/api/agents/{agent_id}/system-info"): True,
+    }

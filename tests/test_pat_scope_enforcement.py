@@ -419,3 +419,174 @@ class TestOtherCredentialsAreUnaffected:
             for method, path in ALL_ROUTES:
                 response = await client.request(method, path, headers=headers)
                 assert response.status_code == 200, (method, path, response.text)
+
+
+# --------------------------------------------------------------------------- #
+# Routes moved out of /api/agents, through the real routers
+# --------------------------------------------------------------------------- #
+
+THREAD_ID = "thread-1"
+AGENT_ID = "agent-1"
+# The protected-cloud review and the fleet view each answer on their moved
+# path and on a deprecated /api/agents alias (one handler, two route
+# templates). The resolver reads the matched template, so both are driven.
+DIFF_PREFIXES = (
+    f"/api/persistent/threads/{THREAD_ID}/cloud-diff",
+    f"/api/agents/threads/{THREAD_ID}/cloud-diff",
+)
+FLEET_PREFIXES = ("/api/admin/agents", "/api/agents")
+
+
+class _ThreadStore(_Store):
+    async def get_thread(self, thread_id: str):
+        return {"id": thread_id, "user_id": OWNER_ID}
+
+
+def _moved_routes_app(store: _ThreadStore, monkeypatch) -> FastAPI:
+    from types import SimpleNamespace
+
+    from orchestrator.routers import agent_registration as fleet_routes
+    from orchestrator.routers import thread_cloud_diff as diff_routes
+    from orchestrator.security.access import require_thread_owner
+    from orchestrator.services import agent_registration as fleet_ops
+    from orchestrator.services import thread_cloud_diff as diff_ops
+
+    def _served(name: str):
+        async def _operation(*_args, **_kwargs):
+            # The fleet list's handler is annotated as a list.
+            return [{"served": name}] if name == "list_agents" else {"served": name}
+
+        return _operation
+
+    for name in (
+        "get_thread_cloud_diff_summary",
+        "get_thread_cloud_diff_file",
+        "restage_thread_cloud_diff",
+        "apply_thread_cloud_diff",
+        "reject_thread_cloud_diff",
+    ):
+        monkeypatch.setattr(diff_ops, name, _served(name))
+    for name in ("list_agents", "get_agent", "get_agent_system_info", "delete_agent"):
+        monkeypatch.setattr(fleet_ops, name, _served(name))
+
+    async def _require_admin(request):
+        return await require_admin(request, store)
+
+    app = FastAPI()
+    app.state.thread_cloud_diff_dependencies_factory = lambda: (
+        diff_routes.ThreadCloudDiffRouteDependencies(
+            store=store, operations=None, require_thread_owner=require_thread_owner
+        )
+    )
+    app.state.agent_registration_dependencies_factory = lambda: SimpleNamespace(
+        require_admin=_require_admin, is_internal_call=lambda _request: False
+    )
+    app.include_router(diff_routes.router)
+    app.include_router(fleet_routes.router)
+    return app
+
+
+@pytest.fixture
+def moved(monkeypatch):
+    store = _ThreadStore()
+    transport = httpx.ASGITransport(app=_moved_routes_app(store, monkeypatch))
+    return store, httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+def _diff_calls(prefix: str) -> list[tuple[str, str, dict | None]]:
+    return [
+        ("GET", prefix, None),
+        ("GET", f"{prefix}/a/b.txt", None),
+        ("POST", f"{prefix}/restage", None),
+        ("POST", f"{prefix}/apply", {"epoch": 1}),
+        ("POST", f"{prefix}/reject", {"epoch": 1}),
+    ]
+
+
+def _fleet_calls(prefix: str) -> list[tuple[str, str, dict | None]]:
+    return [
+        ("GET", prefix, None),
+        ("GET", f"{prefix}/{AGENT_ID}", None),
+        ("GET", f"{prefix}/{AGENT_ID}/system-info", None),
+        ("DELETE", f"{prefix}/{AGENT_ID}", None),
+    ]
+
+
+class TestRoutesMovedOutOfTheAgentPrefix:
+    """Same reach on the moved path and its deprecated alias, for every token."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", DIFF_PREFIXES)
+    @pytest.mark.parametrize(
+        ("scopes", "allowed"),
+        [
+            # Read the review, never act on it.
+            (["chat:read"], {"GET"}),
+            # Act on it; a write scope does not imply the read.
+            (["chat:write"], {"POST"}),
+            (["chat:read", "chat:write"], {"GET", "POST"}),
+            (["jobs:write", "knowledge:write"], set()),
+            (["admin"], {"GET", "POST"}),
+        ],
+    )
+    async def test_the_cloud_review_needs_chat_scopes(
+        self, moved, prefix, scopes, allowed
+    ):
+        store, client = moved
+        token = store.mint("api", scopes=scopes)
+        async with client:
+            for method, path, body in _diff_calls(prefix):
+                response = await client.request(
+                    method, path, json=body, headers=_bearer(token)
+                )
+                if method in allowed:
+                    assert response.status_code == 200, (method, path, response.text)
+                    assert '"served"' in response.text
+                else:
+                    assert response.status_code == 403, (method, path, response.text)
+                    assert response.json()["detail"].startswith(
+                        "Insufficient token scope"
+                    )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", FLEET_PREFIXES)
+    @pytest.mark.parametrize(
+        ("scopes", "allowed"),
+        [
+            (["admin"], True),
+            (["chat:read", "chat:write", "jobs:read", "jobs:write"], False),
+        ],
+    )
+    async def test_the_fleet_view_needs_the_admin_scope(
+        self, moved, prefix, scopes, allowed
+    ):
+        store, client = moved
+        token = store.mint("api", scopes=scopes)
+        async with client:
+            for method, path, body in _fleet_calls(prefix):
+                response = await client.request(
+                    method, path, json=body, headers=_bearer(token)
+                )
+                if allowed:
+                    assert response.status_code == 200, (method, path, response.text)
+                    assert '"served"' in response.text
+                else:
+                    assert response.status_code == 403, (method, path, response.text)
+                    assert response.json()["detail"].startswith(
+                        "Insufficient token scope"
+                    )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", (*DIFF_PREFIXES, *FLEET_PREFIXES))
+    async def test_a_legacy_mcp_token_is_not_scope_checked_on_either_path(
+        self, moved, prefix
+    ):
+        store, client = moved
+        token = store.mint("mcp", scope="user")
+        calls = _diff_calls(prefix) if "cloud-diff" in prefix else _fleet_calls(prefix)
+        async with client:
+            for method, path, body in calls:
+                response = await client.request(
+                    method, path, json=body, headers=_bearer(token)
+                )
+                assert response.status_code == 200, (method, path, response.text)

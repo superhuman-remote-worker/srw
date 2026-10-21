@@ -14,7 +14,10 @@ change:
 * apply/reject map ``StagedApplyError`` verbatim, answer 422 on a malformed
   epoch, and 502 on a partial write;
 * overlay reset is captured against the producer of the reviewed bytes, and
-  refuses when the current runtime is a different generation.
+  refuses when the current runtime is a different generation;
+* the routes moved from the agent-internal ``/api/agents/threads/...`` prefix
+  to ``/api/persistent/threads/...``; the old path stays a deprecated alias
+  for one release and answers exactly as the moved route does.
 """
 
 from __future__ import annotations
@@ -36,7 +39,22 @@ from orchestrator.routers import thread_cloud_diff as route_module
 
 THREAD_ID = "thread-cd-1"
 USER = {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "email": "u@example.test"}
-BASE = f"/api/agents/threads/{THREAD_ID}/cloud-diff"
+BASE = f"/api/persistent/threads/{THREAD_ID}/cloud-diff"
+# The pre-move path, kept as a deprecated alias for one release.
+ALIAS_BASE = f"/api/agents/threads/{THREAD_ID}/cloud-diff"
+# The five route shapes, relative to either base.
+_SHAPES = [
+    ("get", ""),
+    ("get", "/a/b.txt"),
+    ("post", "/restage"),
+    ("post", "/apply"),
+    ("post", "/reject"),
+]
+_EVERY_ROUTE = [
+    (method, f"{base}{suffix}")
+    for base in (BASE, ALIAS_BASE)
+    for method, suffix in _SHAPES
+]
 
 RUNTIME_GENERATION = "44444444-4444-4444-8444-444444444444"
 AGENT_ID = "55555555-5555-4555-8555-555555555555"
@@ -186,16 +204,7 @@ def _call(client, method, path):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "method,path",
-    [
-        ("get", BASE),
-        ("get", f"{BASE}/a/b.txt"),
-        ("post", f"{BASE}/restage"),
-        ("post", f"{BASE}/apply"),
-        ("post", f"{BASE}/reject"),
-    ],
-)
+@pytest.mark.parametrize("method,path", _EVERY_ROUTE)
 def test_the_owner_gate_refuses_before_anything_is_read(method, path):
     async def deny(_thread_id):
         raise HTTPException(status_code=403, detail="Not your thread")
@@ -210,16 +219,7 @@ def test_the_owner_gate_refuses_before_anything_is_read(method, path):
     wired.store.get_ro_mount_by_thread.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "method,path",
-    [
-        ("get", BASE),
-        ("get", f"{BASE}/a/b.txt"),
-        ("post", f"{BASE}/restage"),
-        ("post", f"{BASE}/apply"),
-        ("post", f"{BASE}/reject"),
-    ],
-)
+@pytest.mark.parametrize("method,path", _EVERY_ROUTE)
 def test_a_non_protected_thread_is_404_with_a_string_detail(method, path):
     wired = _wire(thread=_thread(protected=False))
 
@@ -740,3 +740,177 @@ def test_apply_needs_an_owner_or_editor_of_the_folders_project(
         assert response.json()["detail"]["code"] == "protected_cloud_apply_not_member"
         assert calls == []
     store.get_user_project_roles.assert_awaited_once_with(USER["id"], [folder_project])
+
+
+# --------------------------------------------------------------------------- #
+# The deprecated /api/agents alias
+# --------------------------------------------------------------------------- #
+
+
+def _staged_summary(monkeypatch):
+    summary = _Summary(
+        [_file("a.txt")],
+        {"epoch": 4, "staged_at": "2026-01-01T00:00:00Z", "counts": {"modified": 1}},
+    )
+    src = SimpleNamespace(summary=AsyncMock(return_value=summary))
+    monkeypatch.setattr(
+        ops,
+        "_thread_cloud_diff_source",
+        AsyncMock(return_value=({"id": "r"}, src, "MyProject")),
+    )
+
+
+def _file_content(monkeypatch):
+    content = SimpleNamespace(
+        path="a.txt",
+        status="modified",
+        old_content="x",
+        new_content="y",
+        old_binary=False,
+        new_binary=False,
+    )
+    src = SimpleNamespace(file=AsyncMock(return_value=content))
+    monkeypatch.setattr(
+        ops, "_thread_cloud_diff_source", AsyncMock(return_value=({}, src, None))
+    )
+
+
+def _unreadable_file(monkeypatch):
+    src = SimpleNamespace(
+        file=AsyncMock(return_value=None),
+        summary=AsyncMock(return_value=_Summary([_file("a.txt")])),
+    )
+    monkeypatch.setattr(
+        ops, "_thread_cloud_diff_source", AsyncMock(return_value=({}, src, None))
+    )
+
+
+def _restage_scheduled(monkeypatch):
+    from orchestrator.services.cloud_staging import stage as stage_module
+
+    monkeypatch.setattr(stage_module, "_resolve_workspace_ssh", lambda _m: ("h", 22))
+    monkeypatch.setattr(
+        ops, "_capture_cloud_stage_authority", lambda *_a: {"runtime_generation": "g"}
+    )
+    monkeypatch.setattr(ops, "_cloud_stage_task_key", lambda tid, _a: f"{tid}:key")
+
+
+def _restage_without_workspace(monkeypatch):
+    from orchestrator.services.cloud_staging import stage as stage_module
+
+    monkeypatch.setattr(stage_module, "_resolve_workspace_ssh", lambda _m: None)
+
+
+def _apply_partial(monkeypatch):
+    from orchestrator.services.cloud_staging import apply as apply_module
+
+    async def _partial(**_kwargs):
+        return {"written": 2, "errors": ["a.txt"]}
+
+    monkeypatch.setattr(apply_module, "apply_staged_diff", _partial)
+
+
+def _apply_written(monkeypatch):
+    from orchestrator.services.cloud_staging import apply as apply_module
+
+    async def _written(**kwargs):
+        return {"written": 1, "epoch": kwargs["epoch"]}
+
+    monkeypatch.setattr(apply_module, "apply_staged_diff", _written)
+
+
+def _reject_refused(monkeypatch):
+    from orchestrator.services.cloud_staging import apply as apply_module
+
+    async def _raise(**_kwargs):
+        raise apply_module.StagedApplyError(409, {"code": "epoch_mismatch"})
+
+    monkeypatch.setattr(apply_module, "reject_staged_diff", _raise)
+
+
+@pytest.mark.parametrize(
+    "setup,method,suffix,body",
+    [
+        (_staged_summary, "GET", "", None),
+        (None, "GET", "", None),
+        (_file_content, "GET", "/a.txt", None),
+        (_unreadable_file, "GET", "/a.txt", None),
+        (None, "GET", "/a.txt", None),
+        (_restage_scheduled, "POST", "/restage", None),
+        (_restage_without_workspace, "POST", "/restage", None),
+        (_apply_written, "POST", "/apply", {"epoch": 3}),
+        (_apply_partial, "POST", "/apply", {"epoch": 3}),
+        (None, "POST", "/apply", {"epoch": "soon"}),
+        (_reject_refused, "POST", "/reject", {"epoch": 3}),
+    ],
+)
+def test_the_deprecated_alias_answers_exactly_like_the_moved_route(
+    monkeypatch, setup, method, suffix, body
+):
+    """Same handler on both paths: same status, same body, same gate run and
+    the same scheduling side effect — the alias is not a second implementation.
+    """
+    if setup is not None:
+        setup(monkeypatch)
+
+    answers = []
+    for base in (BASE, ALIAS_BASE):
+        wired = _wire()
+        response = wired.client.request(method, f"{base}{suffix}", json=body)
+        answers.append(
+            (
+                response.status_code,
+                response.json(),
+                wired.calls.owner,
+                wired.registry.started,
+            )
+        )
+
+    moved, alias = answers
+    assert moved == alias
+    # The owner gate ran, so both paths reached the handler (not a router 404).
+    assert moved[2] == [THREAD_ID]
+
+
+def test_both_prefixes_keep_the_declared_route_order():
+    """The summary precedes ``{file_path:path}``, and the POST verbs keep their
+    positions, under the new prefix and under the alias alike."""
+    declared = [
+        (sorted(route.methods), route.path) for route in route_module.router.routes
+    ]
+    expected = [
+        (["GET"], "/cloud-diff"),
+        (["GET"], "/cloud-diff/{file_path:path}"),
+        (["POST"], "/cloud-diff/restage"),
+        (["POST"], "/cloud-diff/apply"),
+        (["POST"], "/cloud-diff/reject"),
+    ]
+
+    def under(prefix):
+        return [
+            (methods, path.removeprefix(prefix))
+            for methods, path in declared
+            if path.startswith(prefix)
+        ]
+
+    assert under("/api/persistent/threads/{thread_id}") == expected
+    assert under("/api/agents/threads/{thread_id}") == expected
+    assert len(declared) == 2 * len(expected)
+
+
+def test_the_alias_is_published_as_deprecated_and_the_moved_route_is_not():
+    paths = _wire().app.openapi()["paths"]
+    published = {
+        (method, path): operation.get("deprecated", False)
+        for path, operations in paths.items()
+        if "/cloud-diff" in path
+        for method, operation in operations.items()
+    }
+
+    assert len(published) == 2 * len(_SHAPES)
+    for (method, path), deprecated in published.items():
+        if path.startswith("/api/agents/"):
+            assert deprecated is True, (method, path)
+        else:
+            assert path.startswith("/api/persistent/threads/"), (method, path)
+            assert deprecated is False, (method, path)

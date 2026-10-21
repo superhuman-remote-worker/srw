@@ -180,7 +180,7 @@ def _patch_endpoint(
 
 
 # --------------------------------------------------------------------------- #
-# POST /api/agents/threads/{thread_id}/cloud-diff/apply
+# POST /api/persistent/threads/{thread_id}/cloud-diff/apply
 # --------------------------------------------------------------------------- #
 
 
@@ -470,7 +470,7 @@ class TestApplyEndpoint:
 
 
 # --------------------------------------------------------------------------- #
-# POST /api/agents/threads/{thread_id}/cloud-diff/reject
+# POST /api/persistent/threads/{thread_id}/cloud-diff/reject
 # --------------------------------------------------------------------------- #
 
 

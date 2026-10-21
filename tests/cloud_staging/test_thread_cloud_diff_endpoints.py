@@ -276,7 +276,7 @@ def _patch_endpoint(
 
 
 # --------------------------------------------------------------------------- #
-# GET /api/agents/threads/{thread_id}/cloud-diff  (summary)
+# GET /api/persistent/threads/{thread_id}/cloud-diff  (summary)
 # --------------------------------------------------------------------------- #
 
 
@@ -412,7 +412,7 @@ class TestCloudDiffSummary:
 
 
 # --------------------------------------------------------------------------- #
-# GET /api/agents/threads/{thread_id}/cloud-diff/{file_path:path}
+# GET /api/persistent/threads/{thread_id}/cloud-diff/{file_path:path}
 # --------------------------------------------------------------------------- #
 
 
@@ -549,7 +549,7 @@ class TestCloudDiffFile:
 
 
 # --------------------------------------------------------------------------- #
-# POST /api/agents/threads/{thread_id}/cloud-diff/restage
+# POST /api/persistent/threads/{thread_id}/cloud-diff/restage
 # --------------------------------------------------------------------------- #
 
 

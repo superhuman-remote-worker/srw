@@ -184,8 +184,14 @@ _RULES: tuple[_Rule, ...] = (
     _exact("/api/health", _ANY),
     _exact("/api/system/readiness", _ANY),
     # -- Admin-only routes outside /api/admin ------------------------------
+    # The fleet view (``/api/admin/agents…``, routers/agent_registration.py)
+    # is admin through this prefix.
     _prefix("/api/admin", _ADMIN),
     _exact(f"{_JOB}/assign/{{agent_id}}", _ADMIN),
+    # Its deprecated ``/api/agents`` aliases (one release), which must decide
+    # exactly as the moved routes do. ``DELETE /api/agents/{agent_id}`` is
+    # also the agent's internal-key deregistration; it stays after the
+    # aliases go.
     _exact("/api/agents", _ADMIN),
     _exact("/api/agents/{agent_id}", _ADMIN),
     _exact("/api/agents/{agent_id}/system-info", _ADMIN),
@@ -215,8 +221,12 @@ _RULES: tuple[_Rule, ...] = (
     _prefix("/api/sources", _KNOWLEDGE),
     _prefix("/api/graph", _KNOWLEDGE),
     # -- Chat (persistent threads) -----------------------------------------
+    # Includes the protected-cloud review, ``/api/persistent/threads/
+    # {thread_id}/cloud-diff…`` (routers/thread_cloud_diff.py).
     _prefix("/api/persistent", _CHAT),
     _prefix("/api/sessions", _CHAT),
+    # That review's deprecated alias under the agent prefix (one release):
+    # the same decision as the moved routes.
     _prefix(f"{_THREAD}/cloud-diff", _CHAT),
     _exact(f"{_THREAD}/rewind", _CHAT),
     _prefix("/api/voice", _CHAT),

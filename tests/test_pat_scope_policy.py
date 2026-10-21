@@ -44,7 +44,10 @@ from orchestrator.security.token_scopes import (
     require_scopes,
     tethers_session,
 )
-from tests.test_endpoint_inventory import _load_script
+from tests.test_endpoint_inventory import (
+    DEPRECATED_AGENT_PREFIX_ALIASES,
+    _load_script,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 API_KEYS_PAGE = (
@@ -270,6 +273,63 @@ class TestClassifyRoute:
     )
     def test_decision(self, method, path, expected):
         assert classify_route(method, path) == expected
+
+
+# Each route moved out of ``/api/agents`` and the PAT decision it had there.
+_MOVED_ROUTE_DECISIONS = [
+    ("GET", "/api/persistent/threads/{thread_id}/cloud-diff", "chat:read"),
+    (
+        "GET",
+        "/api/persistent/threads/{thread_id}/cloud-diff/{file_path:path}",
+        "chat:read",
+    ),
+    ("POST", "/api/persistent/threads/{thread_id}/cloud-diff/restage", "chat:write"),
+    ("POST", "/api/persistent/threads/{thread_id}/cloud-diff/apply", "chat:write"),
+    ("POST", "/api/persistent/threads/{thread_id}/cloud-diff/reject", "chat:write"),
+    ("GET", "/api/admin/agents", "admin"),
+    ("GET", "/api/admin/agents/{agent_id}", "admin"),
+    ("GET", "/api/admin/agents/{agent_id}/system-info", "admin"),
+    ("DELETE", "/api/admin/agents/{agent_id}", "admin"),
+]
+
+
+class TestMovedRoutesKeepTheirDecision:
+    """The protected-cloud review moved to ``/api/persistent`` and the fleet view
+    to ``/api/admin/agents``; neither move may change what a PAT can reach, and
+    each deprecated ``/api/agents`` alias must decide exactly as before."""
+
+    @pytest.mark.parametrize(("method", "moved", "decision"), _MOVED_ROUTE_DECISIONS)
+    def test_the_moved_route_and_its_alias_need_the_same_scope(
+        self, endpoints, method, moved, decision
+    ):
+        (alias,) = [
+            path
+            for (alias_method, path), target in DEPRECATED_AGENT_PREFIX_ALIASES.items()
+            if alias_method == method and target == moved
+        ]
+        mounted = {(e.method, e.path) for e in endpoints}
+        assert {(method, moved), (method, alias)} <= mounted
+
+        assert classify_route(method, moved) == decision
+        assert classify_route(method, alias) == decision
+        if method == "GET":
+            assert classify_route("HEAD", moved) == decision
+            assert classify_route("HEAD", alias) == decision
+
+    def test_every_alias_has_its_decision_pinned_here(self):
+        assert {(method, moved) for method, moved, _ in _MOVED_ROUTE_DECISIONS} == {
+            (method, moved)
+            for (method, _alias), moved in DEPRECATED_AGENT_PREFIX_ALIASES.items()
+        }
+
+    def test_the_agent_runtime_routes_beside_them_still_refuse_pats(self):
+        for method, path in [
+            ("POST", "/api/agents/threads/{thread_id}/cloud-stage"),
+            ("GET", "/api/agents/threads/{thread_id}/workspace"),
+            ("POST", "/api/agents/{agent_id}/heartbeat"),
+            ("POST", "/api/agents/register"),
+        ]:
+            assert classify_route(method, path) == REFUSED, (method, path)
 
 
 @pytest.mark.parametrize(

@@ -147,7 +147,7 @@ async def get_agent_statistics(
     ),
 ) -> dict[str, Any]:
     """Get agent workforce summary. **Admin only** (G5) — counts the
-    fleet by status, which is infra-level data tied to ``/api/agents``."""
+    fleet by status, which is infra-level data tied to ``/api/admin/agents``."""
     await dependencies.require_admin(request)
     return await usage_reporting.agent_statistics(dependencies=dependencies.reports)
 

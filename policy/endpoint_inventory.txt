@@ -20,6 +20,10 @@
 #   unscoped               — no gate detected; CI snapshot test will fail
 
 GET    /api/actions/pending                                                             pat=jobs:read       gated:require_approved_user
+GET    /api/admin/agents                                                                pat=admin           admin:_require_admin
+DELETE /api/admin/agents/{agent_id}                                                     pat=admin           internal:is_internal_call
+GET    /api/admin/agents/{agent_id}                                                     pat=admin           admin:_require_admin
+GET    /api/admin/agents/{agent_id}/system-info                                         pat=admin           admin:_require_admin
 GET    /api/admin/capacity                                                              pat=admin           admin:_require_admin
 POST   /api/admin/completion-commands/{command_id}/force-resolve                        pat=admin           admin:_require_admin
 POST   /api/admin/completion-commands/{command_id}/unpark                               pat=admin           admin:_require_admin
@@ -402,6 +406,11 @@ DELETE /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attac
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/authorize pat=chat:write      gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/renew pat=chat:write      gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/citations                                    pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/cloud-diff                                   pat=chat:read       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/cloud-diff/apply                             pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/cloud-diff/reject                            pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/cloud-diff/restage                           pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/cloud-diff/{file_path:path}                  pat=chat:read       gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}/config                                       pat=chat:write      gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/controls                                     pat=chat:write      gated:require_thread_owner
 DELETE /api/persistent/threads/{thread_id}/ide                                          pat=chat:write      gated:require_thread_owner
