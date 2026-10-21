@@ -191,3 +191,49 @@ async def test_a_virtual_session_records_the_cloud_folders_it_leaves_out(case):
             "title": "Session outbox",
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unavailable", "expected"),
+    [({}, True), ({"containers": False}, False), ({"container_granted": False}, False)],
+    ids=["container", "no-container-provisioner", "container-not-granted"],
+)
+async def test_the_new_session_form_predicts_the_container(unavailable, expected):
+    """The form's preview asks admission's own rule for the defaults it submits."""
+    deps = _defaults_deps(**unavailable)
+
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER, project_id=PROJECT, dependencies=deps
+        )
+        is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_new_session_form_predicts_virtual_without_cloud_connectors():
+    deps = _deps_with([_kb_row()])
+    deps.store.list_default_datasource_candidates = AsyncMock(return_value=[_kb_row()])
+
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER, project_id=PROJECT, dependencies=deps
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_project_predicts_no_container():
+    deps = _defaults_deps()
+    deps.authorize_thread_project_ids.side_effect = HTTPException(
+        status_code=403, detail="nope"
+    )
+
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER, project_id=PROJECT, dependencies=deps
+        )
+        is False
+    )

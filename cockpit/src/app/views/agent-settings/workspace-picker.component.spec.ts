@@ -254,6 +254,16 @@ describe('WorkspacePickerComponent', () => {
     expect(missing.c.summary()).toBe('agentSettings.workspacePicker.mode.container (agentSettings.workspacePicker.layer.installation)');
   });
 
+  it('labels a default its cloud connectors took up to a Container', () => {
+    const {c} = create({projectId: 'p-1', role: 'session'});
+    expect(c.defaultLabel()).toContain('agentSettings.workspacePicker.mode.virtual');
+    c.lastDefaultPreview.set({backend: 'sandbox', source: 'default', binding: null, template_name: 'container-full',
+      sources: {tier: 'cloud_connectors', template: 'builtin'}});
+    expect(c.defaultLabel()).toContain('agentSettings.workspacePicker.mode.container · container-full');
+    expect(c.defaultLabel()).toContain('agentSettings.workspacePicker.layer.cloud_connectors');
+    expect(c.summary()).toContain('container-full:1');
+  });
+
   it('customizes from the default preview when there is no Project', () => {
     const {c} = create();
     c.lastDefaultPreview.set({backend: 'virtual', source: 'default', binding: null, template_name: 'virtual'});

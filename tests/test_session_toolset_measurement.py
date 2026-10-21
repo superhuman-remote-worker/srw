@@ -50,6 +50,17 @@ def account_workspace_defaults(fake_db):
     fake_db.resolve_default_for_capability.return_value = None
 
 
+@pytest.fixture(autouse=True)
+def no_cloud_connectors():
+    """The admission rule a Virtual preview asks has its own tests below and
+    in test_thread_admission_cloud_container.py."""
+    with patch(
+        "orchestrator.services.thread_admission.cloud_folders_need_a_container",
+        AsyncMock(return_value=False),
+    ):
+        yield
+
+
 def _approved(user):
     """A stand-in with the REAL ``require_approved_user(request, db)`` arity.
 
@@ -1521,6 +1532,132 @@ async def test_a_recommendation_replaces_the_installation_default_binding(
         "sources": {"tier": "explicit", "template": "explicit"},
         "template_name": None,
     }
+
+
+def _virtual_default():
+    return (
+        {"backend": "virtual"},
+        {
+            "document": {"template": {"inline": {"backend": "virtual"}}},
+            "sources": {"tier": "installation", "template": "builtin"},
+            "template_name": None,
+            "project_revision": None,
+        },
+    )
+
+
+def _container_default():
+    return (
+        {"backend": "sandbox"},
+        {
+            "document": {
+                "template": {
+                    "ref": {
+                        "name": "container-full",
+                        "scope": {"kind": "Catalog", "name": "shared"},
+                    }
+                }
+            },
+            "sources": {"tier": "installation", "template": "builtin"},
+            "template_name": "container-full",
+            "project_revision": None,
+        },
+    )
+
+
+async def _preview_cloud_folders(user, db, request, *, need_container, **fields):
+    """A Virtual default; admission's rule answers ``need_container``."""
+    select = AsyncMock(
+        side_effect=lambda *_a, upgrade=None, **_kw: (
+            _container_default() if upgrade else _virtual_default()
+        )
+    )
+    need = AsyncMock(return_value=need_container)
+    with (
+        patch("orchestrator.security.auth.require_approved_user", _approved(user)),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
+        patch(
+            "orchestrator.services.grant_enforcement.resolve_runner_grants",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.services.manifest_workspace_selection."
+            "select_execution_workspace",
+            select,
+        ),
+        patch(
+            "orchestrator.services.thread_admission.cloud_folders_need_a_container",
+            need,
+        ),
+    ):
+        result = await _preview_tool_groups(
+            ToolGroupPreviewRequest(config_name="session_base", **fields), request
+        )
+    return result, select, need
+
+
+_PROJECT = "33333333-3333-4333-8333-333333333333"
+
+
+@pytest.mark.asyncio
+async def test_the_form_predicts_the_container_its_cloud_folders_get(
+    user_a, fake_db, fake_request
+):
+    """Admission gives a default Session with cloud connectors a Container
+    (owner 2026-10-21); the form must predict it, or it lists the connectors
+    for Virtual, leaves the cloud folder out and submits a Virtual Session."""
+    from shared.workspace_defaults import Upgrade
+
+    result, select, need = await _preview_cloud_folders(
+        user_a, fake_db, fake_request, need_container=True, project_id=_PROJECT
+    )
+
+    need.assert_awaited_once()
+    assert need.await_args.kwargs["project_id"] == _PROJECT
+    assert select.await_args.kwargs["upgrade"] == Upgrade(
+        current="virtual", requested="container"
+    )
+    assert result["workspace"]["backend"] == "sandbox"
+    assert result["workspace"]["source"] == "default"
+    assert result["workspace"]["sources"] == {
+        "tier": "cloud_connectors",
+        "template": "builtin",
+    }
+    assert result["workspace"]["template_name"] == "container-full"
+
+
+@pytest.mark.asyncio
+async def test_without_cloud_connectors_the_form_predicts_virtual(
+    user_a, fake_db, fake_request
+):
+    result, select, _ = await _preview_cloud_folders(
+        user_a, fake_db, fake_request, need_container=False, project_id=_PROJECT
+    )
+
+    assert select.await_count == 1
+    assert result["workspace"]["backend"] == "virtual"
+    assert result["workspace"]["sources"]["tier"] == "installation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"workspace": {"template": {"inline": {"backend": "virtual"}}}},
+        {"expert_type": "worker"},
+    ],
+    ids=["tier-chosen", "job-form"],
+)
+async def test_a_chosen_tier_or_a_job_keeps_the_prediction(
+    user_a, fake_db, fake_request, fields
+):
+    """Admission keeps a chosen tier, and the rule is a Session's."""
+    _, select, need = await _preview_cloud_folders(
+        user_a, fake_db, fake_request, need_container=True, **fields
+    )
+
+    need.assert_not_awaited()
+    assert select.await_count == 1
 
 
 class TestPreviewTakesAnInlineExpert:

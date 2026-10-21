@@ -4014,7 +4014,7 @@
       "label": "Workspace",
       "default": "Default: {{what}} ({{layer}})",
       "defaultUnknown": "Default (project or installation)",
-      "layer": {"project": "project default", "installation": "installation default"},
+      "layer": {"project": "project default", "installation": "installation default", "cloud_connectors": "needed for cloud folders"},
       "mode": {"none": "No workspace", "virtual": "Virtual", "container": "Container", "vm": "VM"},
       "group": {"shared": "Shared", "project": "This project", "mine": "Mine"},
       "none": "No workspace",

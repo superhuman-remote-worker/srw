@@ -126,9 +126,10 @@ where it is enforced; anything else is unsupported, with the reason.
 Container is the `sandbox` tier. The Virtual and None tiers get no cloud
 folder. A new Session whose own folders (its outbox, its project's folder, My
 cloud) would attach gets a Container instead of Virtual, when its tier comes
-from the defaults and the Container tier is available and allowed for you. A
-Session on Virtual by choice, or because no Container is allowed, names the
-folders it left out.
+from the defaults and the Container tier is available and allowed for you. The
+New Session form shows it as **Default: Container (needed for cloud
+folders)**. A Session on Virtual by choice, or because no Container is
+allowed, names the folders it left out.
 
 | Connector · level | Nextcloud | OpenCloud |
 | --- | --- | --- |

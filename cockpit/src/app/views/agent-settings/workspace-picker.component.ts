@@ -179,6 +179,12 @@ export class WorkspacePickerComponent {
   /** What "Default" resolves to: from the Project's defaults when a Project is chosen, otherwise from the last preview taken while Default was selected. */
   private readonly resolvedDefault = computed<{mode: Mode | null; template: string | null; layer: string}>(() => {
     const roleKey = this.role() === 'job' ? 'jobs' : 'sessions';
+    const p = this.lastDefaultPreview();
+    // The Session's cloud connectors took its default up to a Container (the
+    // server's rule); the Project's defaults don't know its connectors.
+    if (p?.sources?.tier === 'cloud_connectors') {
+      return {mode: modeOf(p.backend), template: p.template_name ?? null, layer: 'cloud_connectors'};
+    }
     const d = this.defaults();
     if (d) {
       const mode = d.effective[roleKey].mode as Mode;
@@ -188,7 +194,6 @@ export class WorkspacePickerComponent {
         layer: d.effective[roleKey].source === 'project' ? 'project' : 'installation',
       };
     }
-    const p = this.lastDefaultPreview();
     return {mode: modeOf(p?.backend), template: p?.template_name ?? null, layer: p?.sources?.tier === 'project' ? 'project' : 'installation'};
   });
 
@@ -204,9 +209,8 @@ export class WorkspacePickerComponent {
   /** A missing Project template, for the tier Default uses. */
   readonly problem = computed(() => {
     if (this.choice().kind !== 'default') return '';
-    const d = this.defaults();
-    const mode = d?.effective[this.role() === 'job' ? 'jobs' : 'sessions'].mode;
-    return (mode === 'container' || mode === 'vm' ? d?.template_problems[mode] : undefined) ?? '';
+    const {mode} = this.resolvedDefault();
+    return (mode === 'container' || mode === 'vm' ? this.defaults()?.template_problems[mode] : undefined) ?? '';
   });
 
   readonly summary = computed(() => {

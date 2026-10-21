@@ -42,6 +42,7 @@ from orchestrator.services import (
     stateless_input_admission as stateless_input_operations,
     stateless_workspace_scheduler,
     stateless_workspace_upgrade as stateless_workspace_upgrade_service,
+    thread_admission as thread_admission_service,
     workspace_suspension,
 )
 from shared.runtime.core import model_registry
@@ -84,6 +85,11 @@ def session_tool_view_dependencies(
         ),
         srw_image=functools.partial(
             manifest_experts.trusted_srw_image, resources.postgres_db
+        ),
+        cloud_folders_need_a_container=bound(
+            thread_admission_service.cloud_folders_need_a_container,
+            sessions_composition.thread_admission_dependencies,
+            resources,
         ),
     )
 

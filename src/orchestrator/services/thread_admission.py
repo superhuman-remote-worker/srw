@@ -784,6 +784,43 @@ async def _container_allowed(
     return True
 
 
+async def cloud_folders_need_a_container(
+    user: dict[str, Any],
+    *,
+    project_id: str | None,
+    dependencies: ThreadAdmissionDependencies,
+) -> bool:
+    """Whether a default Session in ``project_id`` gets a Container for its
+    cloud connectors.
+
+    The New Session form's prediction of the rule in
+    ``resolve_thread_creation_plan``: the form submits the connectors its
+    picker defaults on the tier it predicts, and those are the defaults.
+    """
+    request_body = ThreadCreateRequest(
+        project_id=project_id, use_datasource_defaults=True
+    )
+    try:
+        effective_project_ids = await dependencies.authorize_thread_project_ids(
+            user, thread_creation_project_ids(request_body, user)
+        )
+    except HTTPException:
+        # The create is refused anyway; the form names no tier for it.
+        return False
+    return bool(
+        await _cloud_rows_a_container_gets(
+            request_body,
+            user,
+            effective_project_ids=effective_project_ids,
+            dependencies=dependencies,
+        )
+    ) and await _container_allowed(
+        user,
+        effective_project_ids=effective_project_ids,
+        dependencies=dependencies,
+    )
+
+
 async def resolve_thread_creation_plan(
     request_body: ThreadCreateRequest,
     user: dict[str, Any],
@@ -2100,6 +2137,7 @@ __all__ = [
     "ThreadAdmissionStore",
     "ThreadCreationPlan",
     "build_session_config_override",
+    "cloud_folders_need_a_container",
     "commit_thread_creation",
     "create_thread",
     "list_threads",
