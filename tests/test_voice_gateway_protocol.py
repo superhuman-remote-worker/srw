@@ -796,3 +796,67 @@ async def test_closed_session_is_forgotten_after_retention(running):
     await until(lambda: sid not in gateway.sessions)
     response = await client.post(f"/v1/live/sessions/{sid}/hangup")
     assert response.status == 404
+
+
+def test_continuing_transcript_pieces_carry_their_space():
+    """Readers join a speaker's consecutive deltas as they are (the cockpit's
+    timeline, the job's transcript); a cascade emits whole pieces, e.g. one
+    caller turn that VAD split into two STT results (A1 found
+    "letzte Wochenach einer schicken")."""
+    from agent.subagents.live import Transcript
+    from voice_gateway.session import Session
+
+    session = Session(Line("fake", "connector", b"key"), [], None, {})
+    session.state = "active"
+    pieces = [
+        ("assistant", "Guten Tag."),
+        ("caller", "Können Sie mir die Rechnung von meinem Aufenthalt letzte Woche"),
+        ("caller", "noch einmal schicken?"),
+        ("assistant", "Der Check-out ist bis 11 Uhr möglich."),
+        ("assistant", "Möchten Sie später auschecken?"),
+        ("assistant", " Schon mit Leerzeichen."),
+        ("caller", ""),
+        ("caller", "Ja."),
+        ("caller", "Bitte prüfen Sie das."),
+        "delegate",
+        ("assistant", "Einen Moment, ich schaue nach."),
+        "usage",
+        ("assistant", "Sie ist da."),
+    ]
+    for piece in pieces:
+        if piece == "delegate":
+            session.delegate()
+        elif piece == "usage":
+            session.usage()
+        else:
+            session.transcript(*piece)
+    deltas = [
+        (event["type"].split(".")[1], event["delta"])
+        for _, event in session.history
+        if event["type"].endswith("_transcript.delta")
+    ]
+    assert [text for _, text in deltas] == [
+        "Guten Tag.",
+        "Können Sie mir die Rechnung von meinem Aufenthalt letzte Woche",
+        " noch einmal schicken?",
+        "Der Check-out ist bis 11 Uhr möglich.",
+        " Möchten Sie später auschecken?",
+        " Schon mit Leerzeichen.",
+        "",
+        "Ja.",
+        " Bitte prüfen Sie das.",
+        # A delegation (a journal row, a new response) starts a new stretch;
+        # a usage update does not.
+        "Einen Moment, ich schaue nach.",
+        " Sie ist da.",
+    ]
+    # The job's own transcript reads the turns back intact.
+    transcript = Transcript()
+    for kind, text in deltas:
+        transcript.add("caller" if kind == "input_transcript" else "assistant", text)
+    assert [t.text for t in transcript.turns][1:3] == [
+        "Können Sie mir die Rechnung von meinem Aufenthalt letzte Woche "
+        "noch einmal schicken?",
+        "Der Check-out ist bis 11 Uhr möglich. Möchten Sie später auschecken?"
+        " Schon mit Leerzeichen.",
+    ]

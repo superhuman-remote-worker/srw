@@ -66,6 +66,8 @@ class Session:
         self.rest_calls: list[tuple[str, dict]] = []
         self.delegations: set[str] = set()
         self.caller_since_delegation = False
+        # Speaker and text of the last transcript delta (see transcript()).
+        self._last_delta: tuple[str, str] | None = None
         self.webhook_responses: list[int] = []
         self.lock = asyncio.Lock()
         self.changed = asyncio.Event()
@@ -100,6 +102,10 @@ class Session:
             "event_id": "event_" + uuid.uuid4().hex,
             "session_id": self.id,
         }
+        if not event_type.endswith(("_transcript.delta", "usage.updated")):
+            # A delegation, an append or an error starts a new stretch in the
+            # driver's journal and a new response: no joining space after it.
+            self._last_delta = None
         self.prune()
         self.history.append((time.monotonic(), event))
         queues = (target,) if target is not None else tuple(self.subscribers)
@@ -131,6 +137,22 @@ class Session:
         end_ms: int | None = None,
     ) -> None:
         self.require_active()
+        # GPT-Live deltas carry their own spacing, and the driver's readers
+        # (the job's transcript, the cockpit's timeline) join a speaker's
+        # consecutive deltas as they are. An engine emits whole pieces (an
+        # STT result, a sentence), so a piece that directly continues the
+        # same speaker's run starts with the space between the two; after
+        # any other event (emit() forgets the run) it starts a new stretch.
+        last = self._last_delta
+        if (
+            last is not None
+            and last[0] == speaker
+            and last[1][-1:].strip()
+            and text[:1].strip()
+        ):
+            text = " " + text
+        if text:
+            self._last_delta = (speaker, text)
         offset = int(self.seconds * 1000)
         self.emit(
             f"session.{'input' if speaker == 'caller' else 'output'}_transcript.delta",
