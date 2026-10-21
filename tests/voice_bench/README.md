@@ -148,6 +148,41 @@ the driver changed in their containers (`docker diff`): the gateway and the
 driver run read-only, and the addon may only keep its astdb and control
 socket. The services' logs are saved as `srw-*.log` in the results.
 
+## One scripted call through SRW's live stack (A1)
+
+```bash
+scripts/voice-bench.sh addon up --line fake        # PBX + SRW's addon only
+# start the gateway with the printed source settings, then:
+scripts/voice-bench.sh call --script tests/voice_bench/calls/a1-de.yaml
+scripts/voice-bench.sh down
+```
+
+For the acceptance call (local_voice_gateway.md §5 A1) the gateway runs
+outside the bench, on the host: it needs the model servers on host loopback
+and must be reachable by the line's driver pod on k3d, while SRW's real live
+job (orchestrator, driver pod, back office) answers its webhook.
+
+- **`addon up`** starts the PBX and only the addon (`srw.py::prepare_addon`).
+  The addon registers the gateway's line (`--line`, the name in the gateway
+  config) as extension 2000, serves ARI on its bench address (`.50`) and
+  sends each call's audio to `ws://<bench gateway address>:18441/media`,
+  i.e. the host (`--media-host` for another address). It prints the
+  gateway's `source:` block (also `.run/srw/gateway/source.yaml`, with the
+  shared Asterisk secret beside it).
+- **`call`** places one call from a script (`call.py`, example
+  `calls/a1-de.yaml`): the number to dial (107 accepts a blind REFER to the
+  human extension 3000), the caller's lines at fixed seconds after the
+  answer (test-set ids or free text, rendered with the bench's Piper voice),
+  the hangup time, and `expect` windows with keywords the caller must hear
+  (`from: human` starts at the moment 3000 answered). Afterwards whisper
+  transcribes what the caller heard as a timeline; `call.json` holds the
+  timeline, the windows, the PBX's view of a transfer (REFER, its answer,
+  the NOTIFY, when the human answered) and `no_audio_written` for the
+  addon (`docker diff`).
+
+The script's times are fixed, so leave room for the back office: a line
+spoken while the voice still talks may barge in.
+
 ## Plugging in a real device (WP2)
 
 Run the profiles against another device (or a manually run addon) instead of

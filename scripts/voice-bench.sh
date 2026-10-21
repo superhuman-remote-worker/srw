@@ -6,6 +6,8 @@
 #   scripts/voice-bench.sh run --profile dtmf-info,refer-accept
 #   scripts/voice-bench.sh run --dut external --dut-peer 172.30.86.50   # a real device (WP2)
 #   scripts/voice-bench.sh list | models | audio | build | standin up|down | down
+#   scripts/voice-bench.sh addon up --line fake      # PBX + SRW's addon, gateway elsewhere (A1)
+#   scripts/voice-bench.sh call --script tests/voice_bench/calls/a1-de.yaml
 #
 # Needs Docker with Compose v2+ and Python 3.10+ with PyYAML (the repo venv).
 # Report: tests/voice_bench/results/<UTC time>/report.json; exit code 1 when

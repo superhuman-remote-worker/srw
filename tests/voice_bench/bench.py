@@ -2,6 +2,7 @@
 
     scripts/voice-bench.sh run [--profile a,b] [--skip-slow] [--dut standin|external|srw ...]
     scripts/voice-bench.sh list | models | audio | build | standin up|down | down
+    scripts/voice-bench.sh addon up|down [--line NAME] | call --script FILE   (A1)
 
 ``run`` downloads the pinned models, builds the images, renders the German
 WAVs, starts the bench PBX and runs each selected profile as one phone call.
@@ -23,6 +24,8 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 from tests.voice_bench import assets, render_audio, srw
 from tests.voice_bench.analysis import (
@@ -659,6 +662,66 @@ def cmd_standin(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_addon(args: argparse.Namespace) -> int:
+    """SRW's addon alone on the bench network, for a gateway that runs
+    elsewhere (A1: on the host, with SRW's live job on k3d behind it)."""
+    network = Network(args.subnet)
+    compose = Compose(network, srw=True)
+    if args.action == "down":
+        srw.down(compose)
+        return 0
+    ensure_images(Compose(network))
+    args.dut_peer = args.dut_peer or f"{network.addon}:5060"
+    _, _ = setup_pbx(args, fresh=False)
+    source = srw.prepare_addon(network, args.line, args.extension, args.media_host)
+    srw.addon_up(compose, args.extension, timeout=args.wait_registration or 60)
+    log(
+        f"addon registered line {args.line} as {args.extension} at {network.pbx}; "
+        f"human extension {HUMAN_EXTENSION}"
+    )
+    log("the gateway's source settings (also in .run/srw/gateway/source.yaml):")
+    print(yaml.safe_dump({"source": source}, sort_keys=False), end="", flush=True)
+    return 0
+
+
+def cmd_call(args: argparse.Namespace) -> int:
+    """One scripted call (call.py) through the running PBX."""
+    from tests.voice_bench import call
+
+    network = Network(args.subnet)
+    compose = Compose(network, srw=True)
+    if not pbx_running(compose):
+        log("the bench PBX is not running: start it with `addon up` (or `up`)")
+        return 2
+    try:
+        script = call.load_script(Path(args.script))
+    except (OSError, call.ScriptError) as exc:
+        log(f"bad call script: {exc}")
+        return 2
+    assets.fetch(MODELS_DIR, log=log)
+    render_audio.render(compose, log=log)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out = (
+        Path(args.results).resolve() if args.results else RESULTS_DIR / f"call-{stamp}"
+    )
+    report = call.run(compose, script, out, args.threads, log=log)
+    addon = compose.run("ps", "-q", "addon", check=False).stdout.strip()
+    if addon:
+        # A5: the addon wrote no audio during the call.
+        report["no_audio_written"] = srw.audio_check(compose, ("addon",))
+        if not report["no_audio_written"]["ok"]:
+            report["status"] = "fail"
+        (out / "call.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    for entry in report["timeline"]:
+        print(f"  {entry['from_s']:7.1f}  {entry['text']}")
+    for check in report["checks"]:
+        print(f"  {check['status']:<5} {check['name']}: {check['detail']}")
+    log(f"call {report['status'].upper()}; report: {out / 'call.json'}")
+    return 0 if report["status"] == "pass" else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="voice-bench", description=__doc__.split("\n")[0]
@@ -742,6 +805,28 @@ def main(argv: list[str] | None = None) -> int:
     standin.add_argument("action", choices=("up", "down"))
     device_options(standin)
     sub.add_parser("down", help="stop and remove the bench containers")
+    addon = sub.add_parser(
+        "addon",
+        help="SRW's Asterisk addon alone, for a gateway outside the bench (A1)",
+    )
+    addon.add_argument("action", choices=("up", "down"))
+    addon.add_argument("--line", default="bench", help="the gateway's line name")
+    addon.add_argument("--extension", default="2000")
+    addon.add_argument(
+        "--media-host",
+        default="",
+        help="where the addon sends call audio (default: this host's bench address)",
+    )
+    addon.add_argument("--wait-registration", type=float, default=60)
+    device_options(addon)
+    call_parser = sub.add_parser(
+        "call", help="one scripted call through the running PBX (call.py)"
+    )
+    call_parser.add_argument("--script", required=True, help="call script (YAML)")
+    call_parser.add_argument(
+        "--results", help="results directory (default: results/call-<UTC time>)"
+    )
+    call_parser.add_argument("--threads", type=int, default=8)
 
     args = parser.parse_args(argv)
     if args.command == "run" and args.dut_expect is None:
@@ -768,6 +853,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_standin(args)
     if args.command == "up":
         return cmd_up(args)
+    if args.command == "addon":
+        return cmd_addon(args)
+    if args.command == "call":
+        return cmd_call(args)
     if args.command == "down":
         compose.run(
             "--profile", "tools", "down", "--remove-orphans", check=False, capture=False

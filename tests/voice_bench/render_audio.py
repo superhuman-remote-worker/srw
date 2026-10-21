@@ -5,6 +5,8 @@ Outputs, under ``tests/voice_bench/.cache/audio`` (gitignored):
 - ``bench/{dut,human,caller}.16k.wav`` and ``.8k-alaw.wav``: the three bench
   parties (texts and speakers in ``testset/de/voices.yaml``)
 - ``testset/<id>.16k.wav`` and ``.8k-alaw.wav``: every ``utterances.yaml`` entry
+- ``call/<hash>.16k.wav`` and ``.8k-alaw.wav``: free text lines of a call
+  script (``call.py``), rendered on demand
 
 A manifest skips texts that are already rendered with the same voice, speaker
 and wording.
@@ -58,23 +60,37 @@ def _fingerprint(job: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def render(compose: Compose, force: bool = False, log=print) -> int:
-    """Render what is missing or changed; returns the number of files rendered."""
+def text_job(text: str, speaker: int) -> dict:
+    """A free text line (a call script's) as a render job under ``call/``;
+    the name follows from the wording and the speaker."""
+    digest = hashlib.sha256(f"{speaker}\n{text}".encode()).hexdigest()[:16]
+    return {"name": f"call/{digest}", "text": text, "speaker": int(speaker)}
+
+
+def render(
+    compose: Compose, force: bool = False, log=print, jobs: list[dict] | None = None
+) -> int:
+    """Render what is missing or changed (default: the bench parties and the
+    test set); returns the number of files rendered."""
     manifest_path = AUDIO_DIR / "manifest.json"
     manifest = {}
-    if manifest_path.exists() and not force:
+    if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     todo = []
-    for job in planned_jobs():
+    for job in planned_jobs() if jobs is None else jobs:
         fp = _fingerprint(job)
         outputs = [AUDIO_DIR / f"{job['name']}{ext}" for ext in FORMATS]
-        if manifest.get(job["name"]) == fp and all(p.exists() for p in outputs):
+        if (
+            not force
+            and manifest.get(job["name"]) == fp
+            and all(p.exists() for p in outputs)
+        ):
             continue
         todo.append((job, fp))
     if not todo:
         return 0
-    for sub in ("bench", "testset"):
-        (AUDIO_DIR / sub).mkdir(parents=True, exist_ok=True)
+    for job, _ in todo:
+        (AUDIO_DIR / job["name"]).parent.mkdir(parents=True, exist_ok=True)
     lines = [
         json.dumps(
             {

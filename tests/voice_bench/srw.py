@@ -100,22 +100,7 @@ def prepare(network: Network, transfer_target: str) -> None:
         ],
     }
     _write(SRW_DIR / "addon" / "values.yaml", yaml.safe_dump(values, sort_keys=False))
-    # The same renderer the Helm chart's init container will run (WP5).
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "voice_gateway.asterisk.render",
-            "--values",
-            str(SRW_DIR / "addon" / "values.yaml"),
-            "--out",
-            str(SRW_DIR / "addon" / "etc"),
-        ],
-        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    _render(SRW_DIR / "addon")
 
     gateway = {
         "listen": "127.0.0.1:18440",
@@ -157,6 +142,99 @@ def prepare(network: Network, transfer_target: str) -> None:
     }
     _write(SRW_DIR / "driver" / "driver.json", json.dumps(driver, indent=2))
     _write(DRIVER_LOG, "")
+
+
+MEDIA_PORT = 18441
+
+
+def prepare_addon(
+    network: Network, line: str, extension: str = "2000", media_host: str = ""
+) -> dict:
+    """Only the addon, for a gateway that runs elsewhere (A1: on the host,
+    beside the model servers and reachable from k3d).
+
+    The addon registers ``line`` as ``extension`` at the bench PBX, serves
+    ARI on its bench address and sends each call's audio to
+    ``ws://<media_host>:18441/media`` (default: the bench network's gateway
+    address, i.e. this host). Returns the gateway's ``source`` settings;
+    ``password_file`` is the shared Asterisk secret, written for the gateway.
+    """
+    if SRW_DIR.exists():
+        shutil.rmtree(SRW_DIR)
+    for part in ("addon", "gateway"):
+        (SRW_DIR / part).mkdir(parents=True, mode=0o700)
+    media_host = media_host or network.gateway
+    password = secrets.token_hex(16)
+    _write(SRW_DIR / "addon" / "asterisk-password", password)
+    _write(SRW_DIR / "addon" / f"line-{line}-password", load_secrets()["AI_PASSWORD"])
+    _write(SRW_DIR / "gateway" / "asterisk-password", password)
+    values = {
+        "sip": {"port": 5060},
+        "rtp": {"start": 10000, "end": 10099},
+        # The gateway is outside the addon's network namespace, so ARI
+        # listens on the addon's own bench address (never on all interfaces).
+        "ari": {
+            "bind": f"{network.addon}:8088",
+            "user": "srw",
+            "password_file": "asterisk-password",
+            "app": APP,
+        },
+        "gateway": {"media_uri": f"ws://{media_host}:{MEDIA_PORT}/media"},
+        "lines": [
+            {
+                "name": line,
+                "mode": "register",
+                "pbx": network.pbx,
+                "extension": extension,
+                "password_file": f"line-{line}-password",
+            }
+        ],
+    }
+    _write(SRW_DIR / "addon" / "values.yaml", yaml.safe_dump(values, sort_keys=False))
+    _render(SRW_DIR / "addon")
+    source = {
+        "kind": "asterisk",
+        "ari_url": f"http://{network.addon}:8088",
+        "ari_user": "srw",
+        "password_file": str(SRW_DIR / "gateway" / "asterisk-password"),
+        "app": APP,
+        "media_listen": f"{media_host}:{MEDIA_PORT}",
+    }
+    _write(
+        SRW_DIR / "gateway" / "source.yaml",
+        yaml.safe_dump({"source": source}, sort_keys=False),
+    )
+    return source
+
+
+def _render(addon_dir: Path) -> None:
+    """The same renderer the Helm chart's init container will run (WP5)."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "voice_gateway.asterisk.render",
+            "--values",
+            str(addon_dir / "values.yaml"),
+            "--out",
+            str(addon_dir / "etc"),
+        ],
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def addon_up(compose: Compose, extension: str = "2000", timeout: float = 60.0) -> None:
+    """Start only the addon and wait until its line registered at the PBX."""
+    compose.run("up", "-d", "--force-recreate", "--no-deps", "addon", timeout=180)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if f"{extension}/" in compose.asterisk("pjsip show contacts"):
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"the addon did not register as {extension}")
 
 
 def up(compose: Compose, timeout: float = 60.0) -> None:
@@ -221,13 +299,15 @@ ADDON_WRITES = (
 )
 
 
-def audio_check(compose: Compose) -> dict:
+def audio_check(compose: Compose, services: tuple[str, ...] = SERVICES) -> dict:
     """A5 for the bench: every file the addon, the gateway and the driver
     added to their containers (``docker diff``). The gateway and the driver
     run read-only; the addon may only keep its astdb and control socket. The
-    run directory (the driver's log, configs, secrets) holds no audio."""
+    run directory (the driver's log, configs, secrets) holds no audio.
+    ``services`` narrows it to the ones running here (only the addon when the
+    gateway runs on the host)."""
     report: dict = {"changed": {}, "unexpected": []}
-    for service in SERVICES:
+    for service in services:
         container = compose.run("ps", "-q", service, check=False).stdout.strip()
         if not container:
             report["changed"][service] = None

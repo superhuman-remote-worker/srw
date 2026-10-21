@@ -1,0 +1,36 @@
+# A1 (local_voice_gateway.md §5): one German call against the fictional
+# Hotel Beispielhof (testset/de/facts.md) through SRW's addon, gateway and
+# live job. Run with `scripts/voice-bench.sh call --script <this file>`
+# after `scripts/voice-bench.sh addon up --line <the gateway's line>`.
+#
+# The voice must greet with the expert's (German) greeting, answer the
+# check-out time from its facts, hand the invoice copy to the back office
+# and speak its answer, and get the caller transferred to reception, i.e.
+# the human extension 3000 (the line's transfer target is tel:3000).
+# Number 107 is the bench PBX's REFER-accepting profile. Times are seconds
+# after the call was answered, with room for the back office to answer.
+number: "107"
+hangup_after: 170
+lines:
+  - at: 14
+    utterance: a02-checkout       # Bis wann muss ich das Zimmer am Abreisetag räumen?
+  - at: 34
+    utterance: d03-invoice-copy   # Können Sie mir die Rechnung ... noch einmal schicken?
+  - at: 100
+    text: Verbinden Sie mich bitte mit der Rezeption.
+    speaker: 10
+expect:
+  - name: greeting
+    to: 14
+    keywords: ["beispielhof"]
+  - name: fact
+    from: 17
+    to: 34
+    keywords: ["11|elf"]
+  - name: back_office
+    from: 40
+    to: 100
+    keywords: ["rechnung"]
+  - name: human
+    from: human
+    keywords: ["mitarbeiter", "verbunden"]

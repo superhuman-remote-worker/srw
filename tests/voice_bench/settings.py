@@ -53,6 +53,11 @@ class Network:
         return str(net.network_address + index)
 
     @property
+    def gateway(self) -> str:
+        """The bridge's address on this host (Docker's default gateway)."""
+        return self.host(1)
+
+    @property
     def pbx(self) -> str:
         return self.host(10)
 
