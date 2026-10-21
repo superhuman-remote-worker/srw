@@ -240,3 +240,80 @@ class TestAddonOnly:
         assert source["media_listen"] == "172.30.89.7:18441"
         pjsip = (tmp_path / "srw" / "addon" / "etc" / "pjsip.conf").read_text()
         assert "2001" in pjsip
+
+
+class TestJudge:
+    def test_judge_gets_the_stretch_and_the_language(self):
+        import json
+        import threading
+        from email.parser import BytesParser
+        from email.policy import HTTP
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = {}
+
+        class Judge(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                message = BytesParser(policy=HTTP).parsebytes(
+                    b"Content-Type: "
+                    + self.headers["Content-Type"].encode()
+                    + b"\r\n\r\n"
+                    + body
+                )
+                for part in message.iter_parts():
+                    name = part.get_param("name", header="content-disposition")
+                    seen[name] = part.get_payload(decode=True)
+                seen["path"] = self.path
+                data = json.dumps({"text": " Der  Check-out ist bis 11 Uhr. "}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Judge)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/v1/"
+            text = call.judge_text(url, "qwen3-asr", b"RIFFwav")
+        finally:
+            server.shutdown()
+        assert text == "Der Check-out ist bis 11 Uhr."
+        assert seen["path"] == "/v1/audio/transcriptions"
+        assert seen["file"] == b"RIFFwav" and seen["language"] == b"de"
+        assert seen["model"] == b"qwen3-asr"
+
+
+class TestCannedBackOffice:
+    def test_delegations_match_what_the_caller_said(self, tmp_path):
+        from tests.voice_bench.srw_driver import Driver
+
+        (tmp_path / "key").write_text("k")
+        (tmp_path / "hook").write_text("whsec_a2V5")
+        driver = Driver(
+            {
+                "api_key_file": str(tmp_path / "key"),
+                "connectors": {"c": str(tmp_path / "hook")},
+                "events": str(tmp_path / "driver.jsonl"),
+                "answers": [
+                    {
+                        "keywords": ["rezeption|mensch"],
+                        "answer": "Ich verbinde.",
+                        "transfer": True,
+                    },
+                    {
+                        "keywords": ["rechnung"],
+                        "answer": "Die Rechnung kommt per E-Mail.",
+                    },
+                ],
+            }
+        )
+        assert driver.match("Können Sie mir die Rechnung schicken?") == (
+            1,
+            driver.answers[1],
+        )
+        assert driver.match("Verbinden Sie mich mit der Rezeption.")[0] == 0
+        assert driver.match("Wie ist das Wetter?") is None

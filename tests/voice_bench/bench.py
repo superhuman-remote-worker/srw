@@ -713,10 +713,11 @@ def cmd_call(args: argparse.Namespace) -> int:
     except (OSError, call.ScriptError) as exc:
         log(f"bad call script: {exc}")
         return 2
+    judge = (args.judge_url, args.judge_model) if args.judge_url else None
     if args.analyze:
         # Only the analysis, again, on an earlier call's results directory.
         out = Path(args.analyze).resolve()
-        report = call.analyze(compose, script, out, args.threads, log=log)
+        report = call.analyze(compose, script, out, args.threads, log=log, judge=judge)
     else:
         if not pbx_running(compose):
             log("the bench PBX is not running: start it with `addon up` (or `up`)")
@@ -729,7 +730,7 @@ def cmd_call(args: argparse.Namespace) -> int:
             if args.results
             else RESULTS_DIR / f"call-{stamp}"
         )
-        report = call.run(compose, script, out, args.threads, log=log)
+        report = call.run(compose, script, out, args.threads, log=log, judge=judge)
     addon = compose.run("ps", "-q", "addon", check=False).stdout.strip()
     if addon and not args.analyze:
         # A5: the addon wrote no audio during the call.
@@ -852,6 +853,12 @@ def main(argv: list[str] | None = None) -> int:
         "--results", help="results directory (default: results/call-<UTC time>)"
     )
     call_parser.add_argument("--threads", type=int, default=8)
+    call_parser.add_argument(
+        "--judge-url",
+        help="OpenAI-compatible transcription server for what the caller heard "
+        "(default: the bench's whisper.cpp small)",
+    )
+    call_parser.add_argument("--judge-model", default="judge")
     call_parser.add_argument(
         "--analyze",
         metavar="DIR",

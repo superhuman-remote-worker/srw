@@ -9,6 +9,9 @@ addon (``voice-bench.sh addon up``) with a gateway on the host and SRW's live
 job on k3d behind it. Afterwards whisper transcribes what the caller heard,
 as a timeline and per ``expect`` window, and the report adds the PBX's view
 of a transfer (REFER, its answer, the NOTIFY, the human answering).
+``--judge-url`` hands that transcription to an OpenAI-compatible server
+instead (WP4: whisper small could not understand the cascade's voice; the
+judge should be a stronger model than the STT stage under test uses).
 
 A script (YAML; times in seconds after the call was answered)::
 
@@ -40,6 +43,8 @@ import array
 import json
 import subprocess
 import time
+import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -323,8 +328,41 @@ def stretches(
     ]
 
 
+def judge_text(url: str, model: str, wav: bytes, language: str = "de") -> str:
+    """What an OpenAI-compatible ``/audio/transcriptions`` server hears."""
+    boundary = uuid.uuid4().hex
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{value}\r\n".encode()
+        for name, value in (
+            ("model", model),
+            ("language", language),
+            ("response_format", "json"),
+            ("temperature", "0"),
+        )
+    ]
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        'filename="heard.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode()
+        + wav
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+    request = urllib.request.Request(
+        url.rstrip("/") + "/audio/transcriptions",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:  # noqa: S310 - the operator's judge URL
+        body = json.loads(response.read())
+    return " ".join(str(body.get("text", "")).split())
+
+
 def heard_timeline(
-    compose: Compose, data: CallData, out: Path, threads: int
+    compose: Compose,
+    data: CallData,
+    out: Path,
+    threads: int,
+    judge: tuple[str, str] | None = None,
 ) -> list[dict]:
     """What the caller heard: each voiced stretch of its recording transcribed
     on its own (short clips keep whisper from looping over long silences),
@@ -352,7 +390,13 @@ def heard_timeline(
         name = f"{index:03d}.wav"
         write_wav(clips / name, rate, heard[int(start * rate) : int(end * rate)])
         names.append(name)
-    if names:
+    if names and judge is not None:
+        for name in names:
+            text = judge_text(judge[0], judge[1], (clips / name).read_bytes())
+            (clips / f"{name}.judge.json").write_text(
+                json.dumps({"text": text}, ensure_ascii=False), "utf-8"
+            )
+    elif names:
         args = ["--profile", "tools", "run", "--rm", "--no-deps", "whisper"]
         args += ["-m", "/models/ggml-small.bin", "-l", "de", "-t", str(threads)]
         args += ["-np", "-mc", "0", "-oj"]
@@ -364,7 +408,13 @@ def heard_timeline(
     timeline = []
     for name, (start, end) in zip(names, found):
         result = clips / f"{name}.json"
-        text = whisper_text(result) if result.exists() else ""
+        judged = clips / f"{name}.judge.json"
+        if judge is not None:
+            text = (
+                json.loads(judged.read_text("utf-8"))["text"] if judged.exists() else ""
+            )
+        else:
+            text = whisper_text(result) if result.exists() else ""
         timeline.append({"from_s": start, "to_s": end, "text": text})
     return timeline
 
@@ -454,7 +504,12 @@ def checks(script: CallScript, data: CallData, transfer: dict) -> list[Check]:
 
 
 def run(
-    compose: Compose, script: CallScript, out: Path, threads: int, log=print
+    compose: Compose,
+    script: CallScript,
+    out: Path,
+    threads: int,
+    log=print,
+    judge: tuple[str, str] | None = None,
 ) -> dict:
     """Place the call, then analyze it (``out/call.json``); returns the report."""
     # Imported here: bench.py imports this module for its CLI.
@@ -507,11 +562,16 @@ def run(
         fh.seek(offset)
         pbx_text = fh.read().decode("utf-8", errors="replace")
     (out / "pbx.log").write_text(pbx_text, encoding="utf-8")
-    return analyze(compose, script, out, threads, log=log)
+    return analyze(compose, script, out, threads, log=log, judge=judge)
 
 
 def analyze(
-    compose: Compose, script: CallScript, out: Path, threads: int, log=print
+    compose: Compose,
+    script: CallScript,
+    out: Path,
+    threads: int,
+    log=print,
+    judge: tuple[str, str] | None = None,
 ) -> dict:
     """Read a placed call's artifacts in ``out`` and write ``out/call.json``;
     also runs on an earlier results directory (``call --analyze DIR``)."""
@@ -542,7 +602,7 @@ def analyze(
     )
     data.windows = windows(script, data)
     log("transcribing what the caller heard")
-    heard = heard_timeline(compose, data, out, threads)
+    heard = heard_timeline(compose, data, out, threads, judge)
     t0 = data.t_confirmed("caller")
     report_windows = {}
     for name, w in data.windows.items():
@@ -566,6 +626,7 @@ def analyze(
         "lines": json.loads(lines_path.read_text("utf-8"))
         if lines_path.exists()
         else earlier.get("lines", []),
+        "judge": f"{judge[1]} at {judge[0]}" if judge else "whisper.cpp small",
         "timeline": heard,
         "windows": report_windows,
         "transfer": transfer,

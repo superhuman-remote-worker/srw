@@ -13,12 +13,15 @@ step's canned answer as ``commentary`` after ``--answer-delay`` seconds.
 seconds, B over it.
 
 Prints the transcript and per-turn timings (end of caller speech to first
-audio out, STT, LLM first token, TTS first audio), and writes to ``--out``
-(default ``.cache/voice-cascade-try/<UTC>/``, gitignored): ``heard.wav``
-(the voice through an 8 kHz G.711 leg), ``call.wav`` (stereo: caller left,
-voice right) and ``report.json``. ``--asr-check`` transcribes each voice
-utterance from ``heard.wav`` with the profile's STT and reports the word
-error rate: how well the German voice survives the phone.
+audio out, turn wait, STT, LLM first token, LLM to the TTS's first text,
+TTS first audio), and writes to ``--out`` (default
+``.cache/voice-cascade-try/<UTC>/``, gitignored): ``heard.wav`` (the voice
+through an 8 kHz G.711 leg), ``call.wav`` (stereo: caller left, voice
+right) and ``report.json``. ``--asr-check`` transcribes each voice
+utterance from ``heard.wav`` and reports the word error rate: how well the
+German voice survives the phone. It uses the profile's STT unless
+``--judge-url`` names another OpenAI-compatible transcription server (WP4:
+judge the voice with a model the STT stage does not use).
 """
 
 from __future__ import annotations
@@ -277,7 +280,9 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return previous[-1] / max(1, len(ref))
 
 
-async def asr_check(settings, heard: bytes, events: list[dict]) -> list[dict]:
+async def asr_check(
+    settings, heard: bytes, events: list[dict], judge: tuple[str, str] | None = None
+) -> list[dict]:
     said = [e for e in events if e["type"] == "session.output_transcript.delta"]
     results = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as http:
@@ -301,8 +306,9 @@ async def asr_check(settings, heard: bytes, events: list[dict]) -> list[dict]:
                 filename="voice.wav",
                 content_type="audio/wav",
             )
+            base_url, model = judge or (settings.stt.base_url, settings.stt.model)
             for key, value in (
-                ("model", settings.stt.model),
+                ("model", model),
                 ("language", settings.language),
                 ("response_format", "json"),
                 ("temperature", "0"),
@@ -310,11 +316,11 @@ async def asr_check(settings, heard: bytes, events: list[dict]) -> list[dict]:
                 form.add_field(key, value)
             headers = (
                 {"Authorization": f"Bearer {settings.stt.api_key}"}
-                if settings.stt.api_key
+                if settings.stt.api_key and judge is None
                 else {}
             )
             async with http.post(
-                settings.stt.base_url + "/audio/transcriptions",
+                base_url + "/audio/transcriptions",
                 data=form,
                 headers=headers,
             ) as response:
@@ -341,6 +347,10 @@ def main() -> None:
     parser.add_argument("--answer-delay", type=float, default=3.0)
     parser.add_argument("--barge-after", type=float, default=1.5)
     parser.add_argument("--asr-check", action="store_true")
+    parser.add_argument(
+        "--judge-url", help="OpenAI-compatible transcription server for --asr-check"
+    )
+    parser.add_argument("--judge-model", default="judge")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     settings = parse_settings(
@@ -377,15 +387,17 @@ def main() -> None:
     )
     print("engine = VAD end of speech to first audio, plus stage times")
     print(
-        f"{'step':24s} {'line':>6s} {'engine':>6s} {'stt':>6s} {'llm1st':>6s} {'tts1st':>6s} deleg"
+        f"{'step':24s} {'line':>6s} {'engine':>6s} {'turn':>6s} {'stt':>6s} "
+        f"{'llm1st':>6s} {'text1st':>7s} {'tts1st':>6s} deleg"
     )
     for row, timing in zip(
         rows, timings + [{}] * (len(rows) - len(timings)), strict=False
     ):
         print(
             f"{row['step']:24s} {row['line_first_audio_ms'] or '-':>6} "
-            f"{timing.get('first_audio_ms') or '-':>6} {timing.get('stt_ms') or '-':>6} "
-            f"{timing.get('llm_first_token_ms') or '-':>6} {timing.get('tts_first_audio_ms') or '-':>6} "
+            f"{timing.get('first_audio_ms') or '-':>6} {timing.get('turn_wait_ms') or '-':>6} "
+            f"{timing.get('stt_ms') or '-':>6} {timing.get('llm_first_token_ms') or '-':>6} "
+            f"{timing.get('llm_first_text_ms') or '-':>7} {timing.get('tts_first_audio_ms') or '-':>6} "
             f"{'yes' if timing.get('delegated') else ''}"
         )
     report = {
@@ -402,8 +414,15 @@ def main() -> None:
         ],
     }
     if args.asr_check:
-        report["asr_check"] = asyncio.run(asr_check(settings, heard, harness.events))
-        print("\nThe voice as STT hears it after G.711:")
+        judge = (args.judge_url, args.judge_model) if args.judge_url else None
+        report["asr_check"] = asyncio.run(
+            asr_check(settings, heard, harness.events, judge)
+        )
+        print(
+            "\nThe voice as "
+            + ("the judge" if judge else "STT")
+            + " hears it after G.711:"
+        )
         for item in report["asr_check"]:
             print(
                 f"  WER {item['wer']:.2f} | said: {item['said']}\n           | heard: {item['heard']}"

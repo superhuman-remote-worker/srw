@@ -8,6 +8,16 @@ WebSocket, sends the greeting the way the driver does, and on DTMF 9 asks
 for a transfer to the bench's human extension. Every step goes to a JSON
 lines log the bench reads per profile; no audio passes through here.
 
+With ``answers`` in the config it also plays a canned back office for a
+cascade profile (WP4, without k3d): each ``session.delegation.created`` is
+matched against what the caller said since the last delegation; the first
+entry whose keywords all appear answers with its ``answer`` as
+``commentary`` after ``answer_delay`` seconds, and an entry with
+``transfer: true`` then asks for the transfer to ``transfer_target``.
+``instructions`` and ``greeting`` replace the bench's accept instructions
+and greeting append. Only event kinds and the matched entry are logged,
+never what was said.
+
     python srw_driver.py --config driver.json   # inside the bench network
 """
 
@@ -41,6 +51,7 @@ class Driver:
         self.log_path = Path(config["events"])
         self.http: aiohttp.ClientSession | None = None
         self.tasks: set[asyncio.Task] = set()
+        self.answers: list[dict] = config.get("answers") or []
 
     def log(self, kind: str, **data) -> None:
         line = json.dumps({"t": time.time(), "kind": kind, **data})
@@ -67,10 +78,52 @@ class Driver:
             session_id=call.session_id,
             sip_headers=[{"name": n, "value": v} for n, v in call.sip_headers],
         )
-        task = asyncio.create_task(self.handle(call.session_id))
+        self.spawn(self.handle(call.session_id))
+        return web.json_response({"ok": True})
+
+    def spawn(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
-        return web.json_response({"ok": True})
+
+    def match(self, heard: str) -> tuple[int, dict] | None:
+        """The canned answer for what the caller said, by keywords."""
+        said = " ".join(heard.lower().split())
+        for index, entry in enumerate(self.answers):
+            if all(
+                any(k in said for k in group.lower().split("|"))
+                for group in entry.get("keywords", [])
+            ):
+                return index, entry
+        return None
+
+    async def back_office(self, ws, sid: str, delegation_id: str, heard: str) -> None:
+        found = self.match(heard)
+        self.log(
+            "delegation",
+            session_id=sid,
+            delegation_id=delegation_id,
+            answer=None if found is None else found[0],
+        )
+        if found is None:
+            return
+        index, entry = found
+        await asyncio.sleep(float(self.config.get("answer_delay", 4.0)))
+        await ws.send_json(
+            {
+                "type": "session.commentary.append",
+                "event_id": "evt_" + uuid.uuid4().hex,
+                "delegation_id": delegation_id,
+                "content": entry["answer"],
+            }
+        )
+        self.log("answered", session_id=sid, answer=index)
+        if entry.get("transfer"):
+            # Let the voice say the answer before the caller leaves.
+            await asyncio.sleep(float(self.config.get("transfer_delay", 4.0)))
+            target = self.config["transfer_target"]
+            status = await self.post(sid, "refer", {"target_uri": target})
+            self.log("referred", session_id=sid, status=status)
 
     async def post(self, sid: str, action: str, body: dict) -> int:
         url = f"{self.config['gateway']}/v1/live/sessions/{sid}/{action}"
@@ -94,7 +147,9 @@ class Driver:
                 "session": {
                     "type": "live",
                     "model": self.config.get("model", "echo"),
-                    "instructions": "Bench: repeat what the caller says.",
+                    "instructions": self.config.get(
+                        "instructions", "Bench: repeat what the caller says."
+                    ),
                     "audio": {"output": {"voice": "marin"}},
                     "delegation": {"type": "client"},
                 }
@@ -111,9 +166,12 @@ class Driver:
                 {
                     "type": "session.instructions.append",
                     "event_id": "evt_" + uuid.uuid4().hex,
-                    "content": "Guten Tag, hier ist der Testanschluss.",
+                    "content": self.config.get(
+                        "greeting", "Guten Tag, hier ist der Testanschluss."
+                    ),
                 }
             )
+            heard: list[str] = []
             async for message in ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
                     break
@@ -126,7 +184,15 @@ class Driver:
                     entry["reason"] = event.get("reason")
                 elif kind == "error":
                     entry["code"] = (event.get("error") or {}).get("code")
+                if kind == "session.input_transcript.delta":
+                    heard.append(event.get("delta") or "")
                 self.log("event", **entry)
+                if kind == "session.delegation.created" and self.answers:
+                    delegation_id = (event.get("delegation") or {}).get("id")
+                    self.spawn(
+                        self.back_office(ws, sid, delegation_id, " ".join(heard))
+                    )
+                    heard = []
                 if (
                     kind == "transport.dtmf.received"
                     and event.get("event") == self.config["transfer_digit"]
