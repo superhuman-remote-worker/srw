@@ -1165,6 +1165,14 @@ async def prepare_thread_folder_grants(
             if converted is not None:
                 thread = converted
                 metadata = thread_metadata_object(converted)
+        # A VM upgraded from Virtual: the folders its creation left out (a
+        # Pod gets them in its planner), and a re-added outbox's folder.
+        restored = await _restore_once(
+            thread, mount_rows=mount_rows, dependencies=dependencies
+        )
+        if restored is not None:
+            thread = restored
+            metadata = thread_metadata_object(restored)
         await prepare_folder_grants(
             thread,
             mount_rows=mount_rows,
@@ -1323,6 +1331,41 @@ async def _convert_once(
         logger.warning(
             "Thread %s: its cloud folders did not convert; the next delivery "
             "retries it",
+            thread.get("id"),
+            exc_info=True,
+        )
+        return None
+
+
+async def _restore_once(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    dependencies: AgentCloudMountDependencies,
+) -> dict[str, Any] | None:
+    """The folders a session upgraded from Virtual left out at creation,
+    restored before an in-workspace attach, with the folder of an outbox
+    among them made. Never fails the attach."""
+    from orchestrator.services.session_cloud_preparation import (
+        prepare_session_outbox,
+        restore_virtual_exclusions,
+    )
+
+    try:
+        restored = await restore_virtual_exclusions(
+            thread, mount_rows=mount_rows, store=dependencies.store
+        )
+        if restored is not None:
+            await prepare_session_outbox(
+                restored,
+                store=dependencies.store,
+                cloud_router=dependencies.cloud_router,
+            )
+        return restored
+    except Exception:
+        logger.warning(
+            "Thread %s: the cloud folders Virtual left out were not restored; "
+            "the next attach retries it",
             thread.get("id"),
             exc_info=True,
         )

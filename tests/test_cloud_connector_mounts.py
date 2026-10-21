@@ -1893,6 +1893,217 @@ async def test_an_old_session_converts_at_its_first_in_workspace_delivery(
 
 
 # --------------------------------------------------------------------------- #
+# What Virtual left out (owner 2026-10-21)
+# --------------------------------------------------------------------------- #
+
+
+def _left_out(cid, kind):
+    return {
+        "source_ref": cid,
+        "mount_kind": kind,
+        "reason": "mount_unsupported",
+        "detail": "virtual_workspace",
+        "title": kind,
+    }
+
+
+_OTHER_EXCLUSION = {
+    "source_ref": "sync-1",
+    "mount_kind": "project",
+    "reason": "mount_unsupported",
+    "detail": "sync_driver",
+}
+
+
+def _upgraded_thread(backend="sandbox", *, excluded=None, ids=("kb-1",)):
+    return _old_thread(
+        metadata={
+            "cloud_mount_rule": "connectors",
+            "datasource_ids": list(ids),
+            "config_override": {"workspace": {"backend": backend}},
+            "cloud_mount_status": {
+                "version": 1,
+                "fingerprint": None,
+                "runtime_incarnation": None,
+                "notice": None,
+                "mounts": {},
+                "excluded": (
+                    excluded
+                    if excluded is not None
+                    else [
+                        _left_out(FOLDER, "project"),
+                        _left_out(OUTBOX, "cloud_outbox"),
+                    ]
+                ),
+            },
+        }
+    )
+
+
+class StatusStore(Store):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.statuses: list[Any] = []
+
+    async def set_thread_cloud_mount_status(self, thread_id, status):
+        self.statuses.append(status)
+        thread = self.threads.setdefault(thread_id, {"id": thread_id, "metadata": {}})
+        metadata = dict(thread["metadata"])
+        if status is None:
+            metadata.pop("cloud_mount_status", None)
+        else:
+            metadata["cloud_mount_status"] = status
+        thread["metadata"] = metadata
+        return True
+
+
+@pytest.fixture
+def authorize_kwargs(monkeypatch):
+    calls: list[tuple[list[str], str | None, dict]] = []
+
+    async def fake(store, owner, owner_id, ids, project_ids, backend, **kwargs):
+        calls.append((list(ids), backend, kwargs))
+        return list(ids), {cid: 1 for cid in ids}
+
+    monkeypatch.setattr(
+        "orchestrator.services.datasource_policy.authorize_datasource_selection", fake
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["sandbox", "vm"])
+async def test_an_upgraded_session_gets_back_what_virtual_left_out(
+    denied, authorize_kwargs, backend
+):
+    thread = _upgraded_thread(
+        backend,
+        excluded=[
+            _left_out(FOLDER, "project"),
+            _left_out(OUTBOX, "cloud_outbox"),
+            _OTHER_EXCLUSION,
+        ],
+    )
+    store = StatusStore([_folder_row(), _outbox_row()], threads={THREAD: thread})
+    restored = await prep.restore_virtual_exclusions(thread, mount_rows=[], store=store)
+    assert restored["metadata"]["datasource_ids"] == ["kb-1", FOLDER, OUTBOX]
+    # Authorized again for the new tier, as a session's selection.
+    [(ids, tier, kwargs)] = authorize_kwargs
+    assert (ids, tier, kwargs["execution_kind"]) == (
+        [FOLDER, OUTBOX],
+        backend,
+        "session",
+    )
+    provenance = store.selections[0][2]["provenance"]
+    assert provenance["virtual_exclusions_restored"]["added"] == [FOLDER, OUTBOX]
+    # The record no longer names them; what else it names stays.
+    assert restored["metadata"]["cloud_mount_status"]["excluded"] == [_OTHER_EXCLUSION]
+    # Once.
+    assert (
+        await prep.restore_virtual_exclusions(restored, mount_rows=[], store=store)
+        is None
+    )
+    assert len(store.selections) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_session_still_on_virtual_restores_nothing(denied, authorize_kwargs):
+    thread = _upgraded_thread("virtual")
+    store = StatusStore([_folder_row(), _outbox_row()], threads={THREAD: thread})
+    assert (
+        await prep.restore_virtual_exclusions(thread, mount_rows=[], store=store)
+        is None
+    )
+    assert store.selections == [] and store.statuses == []
+
+
+@pytest.mark.asyncio
+async def test_a_folder_the_owner_lost_is_not_restored_and_the_record_goes(
+    denied, authorize_kwargs
+):
+    denied.add(OUTBOX)
+    thread = _upgraded_thread(ids=("kb-1", FOLDER))
+    store = StatusStore([_folder_row(), _outbox_row()], threads={THREAD: thread})
+    restored = await prep.restore_virtual_exclusions(thread, mount_rows=[], store=store)
+    # The folder is attached already, the outbox is refused: nothing added,
+    # and a record of no Pod naming nothing else is removed.
+    assert store.selections == [] and authorize_kwargs == []
+    assert "cloud_mount_status" not in restored["metadata"]
+    assert store.statuses == [None]
+
+
+@pytest.mark.asyncio
+async def test_what_no_longer_authorises_is_restored_at_a_later_pass(denied, authorize):
+    authorize.refuse["value"] = True
+    thread = _upgraded_thread()
+    store = StatusStore([_folder_row(), _outbox_row()], threads={THREAD: thread})
+    assert (
+        await prep.restore_virtual_exclusions(thread, mount_rows=[], store=store)
+        is None
+    )
+    assert store.selections == [] and store.statuses == []
+
+
+@pytest.mark.asyncio
+async def test_a_new_pod_restores_before_it_makes_the_outbox_folder(monkeypatch):
+    """The planner's preparation: the restore runs before the outbox step,
+    so an outbox that comes back gets its folder before the Pod mounts it."""
+    from orchestrator.application import workspace as app_workspace
+
+    order: list[str] = []
+    restored = {"id": THREAD, "metadata": {"datasource_ids": [OUTBOX]}}
+
+    async def convert(thread, **_kw):
+        order.append("convert")
+
+    async def restore(thread, **_kw):
+        order.append("restore")
+        return restored
+
+    async def outbox(thread, **_kw):
+        order.append(f"outbox:{thread['metadata']['datasource_ids']}")
+
+    async def noop(*_a, **_kw):
+        return None
+
+    prep_mod = app_workspace.session_cloud_preparation
+    monkeypatch.setattr(prep_mod, "convert_to_connector_rule", convert)
+    monkeypatch.setattr(prep_mod, "restore_virtual_exclusions", restore)
+    monkeypatch.setattr(prep_mod, "prepare_session_outbox", outbox)
+    monkeypatch.setattr(app_workspace.cloud_user_root, "prepare_session_root", noop)
+    monkeypatch.setattr(app_workspace.agent_cloud_mounts, "prepare_folder_grants", noop)
+    store = SimpleNamespace(get_thread=AsyncMock(return_value=restored))
+    resources = SimpleNamespace(
+        postgres_db=store, main_cloud_router=None, cloud_task_registry=None
+    )
+    await app_workspace._prepare_session_cloud(resources, _upgraded_thread(), [])
+    assert order == ["convert", "restore", f"outbox:{[OUTBOX]}"]
+
+
+@pytest.mark.asyncio
+async def test_a_vm_attach_restores_and_makes_the_outbox_folder(
+    denied, authorize_kwargs, monkeypatch
+):
+    made: list[list[str]] = []
+
+    async def outbox(thread, **_kw):
+        made.append(list(thread["metadata"]["datasource_ids"]))
+
+    monkeypatch.setattr(prep, "prepare_session_outbox", outbox)
+    thread = _upgraded_thread("vm")
+    thread["metadata"]["vm"] = {"status": "ready", "ssh_host": "10.0.0.9"}
+    store = StatusStore([_folder_row(), _outbox_row()], threads={THREAD: thread})
+    store.list_thread_mounts = AsyncMock(return_value=[])
+    await mounts.prepare_thread_folder_grants(THREAD, dependencies=_deps(store))
+    assert store.threads[THREAD]["metadata"]["datasource_ids"] == [
+        "kb-1",
+        FOLDER,
+        OUTBOX,
+    ]
+    assert made == [["kb-1", FOLDER, OUTBOX]]
+
+
+# --------------------------------------------------------------------------- #
 # The outbox folder
 # --------------------------------------------------------------------------- #
 

@@ -107,8 +107,9 @@ DETAIL_TEXT = {
         "session's workspace starts again"
     ),
     ("mount_unsupported", "virtual_workspace"): (
-        "this session's Virtual workspace can't hold cloud folders; a new "
-        "Session with a Container workspace gets it"
+        "this session's Virtual workspace can't hold cloud folders; a "
+        "Container workspace gets it, after an upgrade of this session or in "
+        "a new Session"
     ),
 }
 

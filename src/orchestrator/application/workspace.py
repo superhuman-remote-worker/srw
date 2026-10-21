@@ -308,7 +308,8 @@ async def _prepare_session_cloud(
 ) -> dict[str, Any]:
     """What a session's cloud folders need before its Pod is planned (main
     cloud slices 3, 4 and 6.1): the one-time conversion of a session created
-    before cloud connectors, then its outbox folder ensured and its share
+    before cloud connectors, and the folders an upgraded Virtual session's
+    creation left out; then its outbox folder ensured and its share
     retried, and its owner's root probed. The thread as it now is. Never
     raises."""
     store = resources.postgres_db
@@ -327,6 +328,21 @@ async def _prepare_session_cloud(
         )
         converted = None
     thread = converted or thread
+    # Upgraded from Virtual: the folders its creation left out, before the
+    # outbox step below makes a re-added outbox's folder.
+    try:
+        restored = await session_cloud_preparation.restore_virtual_exclusions(
+            thread, mount_rows=mount_rows, store=store
+        )
+    except Exception:
+        logger.warning(
+            "Session %s: the cloud folders Virtual left out were not restored; "
+            "the next Pod retries it",
+            thread.get("id"),
+            exc_info=True,
+        )
+        restored = None
+    thread = restored or thread
     await session_cloud_preparation.prepare_session_outbox(
         thread, store=store, cloud_router=resources.main_cloud_router
     )

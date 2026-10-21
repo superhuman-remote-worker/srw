@@ -129,7 +129,9 @@ cloud) would attach gets a Container instead of Virtual, when its tier comes
 from the defaults and the Container tier is available and allowed for you. The
 New Session form shows it as **Default: Container (needed for cloud
 folders)**. A Session on Virtual by choice, or because no Container is
-allowed, names the folders it left out.
+allowed, names the folders it left out. Upgrade it to a Container or a VM and
+its new workspace gets exactly those folders back, if you may still attach
+them.
 
 | Connector · level | Nextcloud | OpenCloud |
 | --- | --- | --- |
@@ -231,7 +233,7 @@ same.
 | the cloud no longer accepts your connection | `cloud_grant_revoked` | Reconnect it under **Settings → Connectors**. |
 | the session has more cloud folders than a workspace mounts | `too_many_mounts` | Detach some; the limit is `connectors.inPodPlane.maxMounts`. |
 | this deployment syncs files instead of mounting them; cloud folders aren't delivered here | `delivery_unsupported` | The deployment syncs instead of mounting; see [below](#known-limitation-sync-instead-of-mount). |
-| this workspace can't mount cloud folders; they aren't delivered here | `mount_unsupported` | The workspace refuses mounts (`cloud.rcloneMount.allowContainer: false`, or FUSE denied); see [below](#known-limitation-sync-instead-of-mount). On a Virtual Session (`virtual_workspace`): start a new Session with a Container workspace. |
+| this workspace can't mount cloud folders; they aren't delivered here | `mount_unsupported` | The workspace refuses mounts (`cloud.rcloneMount.allowContainer: false`, or FUSE denied); see [below](#known-limitation-sync-instead-of-mount). On a Virtual Session (`virtual_workspace`): upgrade it to a Container, or start a new Session with a Container workspace. |
 | it is mounted only when the session's workspace starts again | `mount_unsupported` (`needs_new_pod`, `plan_failed`, `next_start`) | The folder was attached while the workspace ran, or the workspace started without the mount service planning it. Its credential never goes into a running workspace: it mounts in the next one (start a new Session, or resume one whose workspace was released). |
 | it could not be prepared for this session | `unbuildable` | The cloud could not build this mount; start a new Session, and tell your operator if it persists. |
 
