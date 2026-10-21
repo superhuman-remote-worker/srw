@@ -730,9 +730,6 @@ async def frozen_protected_source(
     return source
 
 
-_CLOUD_CONNECTOR_TYPES = frozenset({"cloud_folder", "cloud_outbox"})
-
-
 async def _cloud_rows_a_container_gets(
     request_body: ThreadCreateRequest,
     user: dict[str, Any],
@@ -760,8 +757,10 @@ async def _cloud_rows_a_container_gets(
         return []
     if not ids:
         return []
+    from orchestrator.services.cloud_connector_mounts import cloud_mount_driver
+
     rows = await dependencies.store.resolve_datasources_for_thread(datasource_ids=ids)
-    return [row for row in rows or [] if row.get("type") in _CLOUD_CONNECTOR_TYPES]
+    return [row for row in rows or [] if cloud_mount_driver(row) is not None]
 
 
 async def _container_allowed(

@@ -468,7 +468,7 @@ VIRTUAL_WORKSPACE_DETAIL = "virtual_workspace"
 def virtual_workspace_exclusion(row: Mapping[str, Any]) -> dict[str, str]:
     """A cloud connector (a datasource row) a Virtual Session left out at
     creation, as an exclusion of its record (owner 2026-10-21)."""
-    if row.get("type") == "cloud_outbox":
+    if isinstance(cloud_mount_driver(row), CloudOutboxDriver):
         kind = "cloud_outbox"
     else:
         config = row.get("config")
