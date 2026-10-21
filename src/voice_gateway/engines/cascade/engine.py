@@ -238,7 +238,11 @@ class CascadeEngine:
         )
         params = transport_params()
         tts = SpeechTTS(
-            settings.tts, voice=voice, http=self._http, timings=self.timings
+            settings.tts,
+            voice=voice,
+            language=settings.language,
+            http=self._http,
+            timings=self.timings,
         )
         self.output = output = CallOutput(
             audio,
@@ -278,6 +282,11 @@ class CascadeEngine:
             ),
             _realtime_service_mode=False,
         )
+
+        @user.event_handler("on_user_turn_stopped")
+        async def _turn_stopped(aggregator, strategy, message):
+            self.timings.turn_released()
+
         assistant = HeardAssistant(
             context,
             params=LLMAssistantAggregatorParams(),

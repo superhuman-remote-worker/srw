@@ -31,6 +31,7 @@ from voice_gateway.config import Line  # noqa: E402
 from voice_gateway.engines.cascade import parse_settings  # noqa: E402
 from voice_gateway.engines.cascade.engine import CascadeEngine  # noqa: E402
 from voice_gateway.engines.cascade.fileport import FileAudioPort  # noqa: E402
+from voice_gateway.engines.cascade.services import SpokenTextAggregator  # noqa: E402
 from voice_gateway.engines.cascade.transport import heard_prefix  # noqa: E402
 from voice_gateway.session import Session  # noqa: E402
 
@@ -346,6 +347,90 @@ async def test_a_fact_is_answered_by_the_voice(call, fakes):
     assert request["stream"] is True and request["cache_prompt"] is True
     turn = call.engine.timings.turns[0]
     assert turn.stt_ms is not None and turn.first_audio_ms is not None
+    # Every stage of A4's breakdown is measured.
+    assert turn.turn_wait_ms is not None and turn.turn_wait_ms >= 0
+    assert turn.llm_first_token_ms is not None
+    assert turn.llm_first_text_ms is not None
+    assert turn.llm_first_text_ms >= turn.llm_first_token_ms
+    assert turn.tts_first_audio_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_a_long_first_sentence_starts_at_a_clause(call, fakes):
+    fakes.stt_texts = ["Haben Sie im März ein Zimmer frei?"]
+    fakes.llm_replies = [
+        "Vom 12. bis 14. März ist ein Doppelzimmer frei, es kostet 129 Euro "
+        "pro Nacht mit Frühstück. Soll ich es reservieren?"
+    ]
+    call.port.say(tone(1.0))
+    await call.until(lambda: len(fakes.tts_inputs) >= 3)
+    await call.quiet()
+    # The clause, then the sentence's rest, then whole sentences; the
+    # ordinals ("12.", "14.") end nothing.
+    assert fakes.tts_inputs == [
+        "Vom 12. bis 14. März ist ein Doppelzimmer frei,",
+        "es kostet 129 Euro pro Nacht mit Frühstück.",
+        "Soll ich es reservieren?",
+    ]
+    await call.until(lambda: len(call.transcripts("assistant")) >= 3)
+    said = " ".join(call.transcripts("assistant"))
+    assert "frei, es kostet" in " ".join(said.split())
+
+
+@pytest.mark.asyncio
+async def test_clause_chars_zero_waits_for_the_whole_sentence(fakes):
+    call = Call(
+        fakes,
+        fakes.base,
+        tts={
+            "base_url": fakes.base,
+            "model": "tts-model",
+            "voice": "speaker-1",
+            "sample_rate": 24_000,
+            "clause_chars": 0,
+        },
+    )
+    await call.accept()
+    try:
+        fakes.stt_texts = ["Haben Sie im März ein Zimmer frei?"]
+        fakes.llm_replies = ["Ja, vom 12. bis 14. März ist ein Doppelzimmer frei."]
+        call.port.say(tone(1.0))
+        await call.until(lambda: fakes.tts_inputs)
+        await call.quiet()
+        assert fakes.tts_inputs == [
+            "Ja, vom 12. bis 14. März ist ein Doppelzimmer frei."
+        ]
+    finally:
+        await call.close()
+
+
+async def _pieces(aggregator, text: str, step: int = 3) -> list[str]:
+    out = []
+    for at in range(0, len(text), step):
+        async for piece in aggregator.aggregate(text[at : at + step]):
+            out.append(piece.text)
+    tail = await aggregator.flush()
+    return out + ([tail.text] if tail and tail.text else [])
+
+
+@pytest.mark.asyncio
+async def test_only_a_reply_s_first_piece_is_cut_at_a_clause():
+    aggregator = SpokenTextAggregator(clause_chars=20, language="de")
+    reply = (
+        "Gerne, das geht. Die Sauna ist täglich von 16 bis 21 Uhr geöffnet, "
+        "für Hotelgäste kostenlos."
+    )
+    # "Gerne," is too short to cut; the first sentence is whole, so the
+    # second, long one is not cut either.
+    assert await _pieces(aggregator, reply) == [
+        "Gerne, das geht.",
+        "Die Sauna ist täglich von 16 bis 21 Uhr geöffnet, für Hotelgäste kostenlos.",
+    ]
+    # The next reply starts afresh.
+    assert await _pieces(
+        aggregator,
+        "Das Frühstück gibt es von 6:30 bis 10:30 Uhr, am Wochenende bis 11.",
+    ) == ["Das Frühstück gibt es von 6:30 bis 10:30 Uhr,", "am Wochenende bis 11."]
 
 
 @pytest.mark.asyncio

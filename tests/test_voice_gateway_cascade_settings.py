@@ -13,7 +13,9 @@ import pytest
 from voice_gateway.config import load_config
 from voice_gateway.engines import build_engines
 from voice_gateway.engines.cascade import cascade_kind, parse_settings
+from voice_gateway.engines.cascade.clauses import clause_end
 from voice_gateway.engines.cascade.prompt import exact_words, note, system_prompt
+from voice_gateway.engines.cascade.timings import Timings
 from voice_gateway.errors import ConfigError
 
 HAS_PIPECAT = importlib.util.find_spec("pipecat") is not None
@@ -45,6 +47,7 @@ class TestParseSettings:
         assert settings.llm.base_url == "http://127.0.0.1:18451/v1"
         assert settings.llm.api_key is None
         assert settings.tts.response_format == "pcm"
+        assert settings.tts.clause_chars == 40
 
     def test_key_files_are_read_and_never_shown(self, tmp_path):
         key = tmp_path / "llm.key"
@@ -105,6 +108,16 @@ class TestParseSettings:
                     }
                 },
                 "pcm or wav",
+            ),
+            (
+                {
+                    "tts": {
+                        "base_url": "http://x/v1",
+                        "model": "m",
+                        "clause_chars": -1,
+                    }
+                },
+                "clause_chars",
             ),
             ({"turn": {"vad_stop_secs": 0}}, "vad_stop_secs"),
             (
@@ -184,3 +197,72 @@ class TestPrompt:
         assert "do not answer it now" in note("thinking", "x")
         assert "follow it now" in note("instructions", "x")
         assert "in your own words" in note("commentary", "x")
+
+
+class TestClauses:
+    @pytest.mark.parametrize(
+        ("text", "end"),
+        [
+            # A comma, semicolon, colon or dash once enough is written.
+            ("Vom 12. bis 14. März ist ein Doppelzimmer frei, ", 47),
+            ("Das Frühstück gibt es täglich bis 10:30 Uhr; ", 44),
+            ("Für Ihren Hund gilt Folgendes: ", 30),
+            ("Die Sauna ist bis 21 Uhr geöffnet – ", 35),
+            # Too short, or not at a word's end yet.
+            ("Gerne, ", None),
+            ("Vom 12. bis 14. März ist ein Doppelzimmer frei,", None),
+            # A decimal comma or a time is no clause.
+            ("Der Strom kostet pro Kilowattstunde 0,45 ", None),
+            ("Das Frühstück beginnt jeden Morgen um 6:30 ", None),
+            # A conjunction once twice the length is written; cut before it.
+            (
+                "Das Doppelzimmer kostet 129 Euro pro Nacht mit Frühstück im Haus und ",
+                64,
+            ),
+            ("Das Zimmer ist frei und ", None),
+        ],
+    )
+    def test_where_a_first_sentence_may_start(self, text, end):
+        assert clause_end(text, 30) == end
+
+    def test_zero_turns_it_off(self):
+        assert clause_end("Vom 12. bis 14. März ist ein Doppelzimmer frei, ", 0) is None
+
+
+class TestTimings:
+    def test_a_turn_records_every_stage(self):
+        now = [100.0]
+        timings = Timings(clock=lambda: now[0])
+        timings.speech_ended(99.8)  # VAD reports the end 0.2 s later
+        timings.stt(310.4)
+        now[0] = 100.4
+        timings.turn_released()
+        timings.llm_started()
+        now[0] = 100.7
+        timings.llm_first_token()
+        now[0] = 100.9
+        timings.tts_requested()
+        timings.tts_first_audio(80)
+        now[0] = 101.0
+        timings.audio_out()
+        assert timings.turns[0].as_dict() == {
+            "turn_wait_ms": 600,
+            "stt_ms": 310,
+            "llm_first_token_ms": 300,
+            "llm_first_text_ms": 500,
+            "tts_first_audio_ms": 80,
+            "first_audio_ms": 1200,
+            "delegated": False,
+        }
+
+    def test_the_greeting_and_later_pieces_do_not_count(self):
+        now = [10.0]
+        timings = Timings(clock=lambda: now[0])
+        timings.tts_requested()  # the greeting, before any turn
+        timings.speech_ended(10.0)
+        timings.llm_started()
+        now[0] = 10.5
+        timings.tts_requested()
+        now[0] = 10.9
+        timings.tts_requested()  # the second sentence
+        assert timings.turns[0].llm_first_text_ms == 500

@@ -1,9 +1,12 @@
 """Per-turn timings of a cascade call; knowledge-base/knowledge/features/local_voice_gateway.md §5 (A4).
 
-One record per caller turn: when the caller stopped speaking, how long STT,
-the voice LLM's first token and the TTS's first audio took, and when the
-reply's first audio reached the call. Times only, never content, so the
-records may be logged.
+One record per caller turn: when the caller stopped speaking, how long the
+turn detector held the turn (``turn_wait_ms``: end of speech until the turn
+went to the LLM, which also waits for the transcript, so a slow STT shows up
+here too), how long STT, the voice LLM's first token, the first piece of
+text for the TTS (a sentence or a clause) and the TTS's first audio took,
+and when the reply's first audio reached the call. Times only, never
+content, so the records may be logged.
 """
 
 from __future__ import annotations
@@ -15,8 +18,11 @@ from dataclasses import asdict, dataclass
 @dataclass
 class TurnTiming:
     speech_end: float
+    turn_wait_ms: float | None = None
     stt_ms: float | None = None
     llm_first_token_ms: float | None = None
+    #: LLM request to the first text the TTS got (sentence or clause).
+    llm_first_text_ms: float | None = None
     tts_first_audio_ms: float | None = None
     #: End of the caller's speech to the reply's first audio at the call.
     first_audio_ms: float | None = None
@@ -35,6 +41,7 @@ class Timings:
         self.clock = clock
         self.turns: list[TurnTiming] = []
         self._llm_started: float | None = None
+        self._llm_request: float | None = None
 
     @property
     def current(self) -> TurnTiming | None:
@@ -57,8 +64,14 @@ class Timings:
         if self.current is not None:
             self.current.stt_ms = round(ms)
 
+    def turn_released(self) -> None:
+        """The turn detector handed the caller's turn to the LLM."""
+        turn = self.current
+        if turn is not None and turn.first_audio_ms is None:
+            turn.turn_wait_ms = round((self.clock() - turn.speech_end) * 1000)
+
     def llm_started(self) -> None:
-        self._llm_started = self.clock()
+        self._llm_started = self._llm_request = self.clock()
 
     def llm_first_token(self) -> None:
         turn = self.current
@@ -72,6 +85,21 @@ class Timings:
             and turn.first_audio_ms is None
         ):
             turn.llm_first_token_ms = round(ms)
+
+    def tts_requested(self) -> None:
+        """The TTS got a piece of text; the first one after the LLM started
+        counts (the greeting before any turn does not)."""
+        turn = self.current
+        if self._llm_request is None:
+            return
+        ms = (self.clock() - self._llm_request) * 1000
+        self._llm_request = None
+        if (
+            turn is not None
+            and turn.llm_first_text_ms is None
+            and turn.first_audio_ms is None
+        ):
+            turn.llm_first_text_ms = round(ms)
 
     def tts_first_audio(self, ms: float) -> None:
         turn = self.current

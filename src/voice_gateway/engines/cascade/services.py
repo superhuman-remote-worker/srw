@@ -5,16 +5,18 @@
 - ``VoiceLLM``: Pipecat's OpenAI chat service with the profile's
   ``extra_body`` (e.g. thinking off) and note-role mapping.
 - ``SpeechTTS``: one streamed ``/audio/speech`` request per sentence, PCM or
-  WAV at any rate, resampled to 16 kHz.
+  WAV at any rate, resampled to 16 kHz. ``SpokenTextAggregator`` cuts the
+  reply into those sentences; a long first sentence starts at a clause.
 
 Nothing here logs what was said; errors carry status codes only.
 """
 
 from __future__ import annotations
 
+import re
 import struct
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 
 import aiohttp
 from pipecat.audio.utils import create_stream_resampler
@@ -28,8 +30,14 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.settings import STTSettings, TTSSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.services.tts_service import TTSService
+from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
+from pipecat.utils.text.simple_text_aggregator import (
+    SimpleTextAggregator,
+    _LookaheadState,
+)
 from pipecat.utils.time import time_now_iso8601
 
+from voice_gateway.engines.cascade.clauses import clause_end
 from voice_gateway.engines.cascade.settings import LlmSettings, SttSettings, TtsSettings
 from voice_gateway.engines.cascade.timings import Timings
 from voice_gateway.interfaces import SAMPLE_RATE
@@ -272,6 +280,69 @@ class _WavStream:
         return b""
 
 
+#: A number before a period: in German mostly an ordinal ("am 12. März"),
+#: which Pipecat's sentence splitter takes for a sentence end.
+_NUMBER_END = re.compile(r"(?:^|\s)\d{1,4}$")
+#: Stands in for that period while the splitter looks (it is no sentence
+#: punctuation); the text goes out with the period back.
+_ORDINAL_DOT = "\u2024"
+
+
+def _spoken(aggregation: Aggregation) -> Aggregation:
+    return Aggregation(
+        text=aggregation.text.replace(_ORDINAL_DOT, "."), type=aggregation.type
+    )
+
+
+class SpokenTextAggregator(SimpleTextAggregator):
+    """Pipecat's sentence aggregator for a German phone voice.
+
+    - A number's period ("am 12. März", "Zimmer 12.") does not end a
+      sentence; a reply that ends there still goes out at its end.
+    - The first piece of a reply may end at a clause (``clauses.clause_end``)
+      once ``clause_chars`` are written, so a long sentence starts sooner.
+    """
+
+    def __init__(self, *, clause_chars: int, **kwargs):
+        super().__init__(aggregation_type=AggregationType.SENTENCE, **kwargs)
+        self._clause_chars = clause_chars
+        self._piece_out = False
+
+    async def aggregate(self, text: str) -> AsyncIterator[Aggregation]:
+        for char in text:
+            if char == "." and _NUMBER_END.search(self._text):
+                char = _ORDINAL_DOT
+            self._text += char
+            result = await self._check_sentence_with_lookahead(char)
+            if result is None and not self._piece_out:
+                result = self._clause()
+            if result is not None:
+                self._piece_out = True
+                yield _spoken(result)
+
+    def _clause(self) -> Aggregation | None:
+        if self._lookahead_state != _LookaheadState.IDLE:
+            return None  # a sentence end is still being decided
+        end = clause_end(self._text, self._clause_chars)
+        if end is None:
+            return None
+        piece, self._text = self._text[:end], self._text[end:].lstrip(" ")
+        return Aggregation(text=piece.strip(" "), type=AggregationType.SENTENCE)
+
+    async def flush(self) -> Aggregation | None:
+        self._piece_out = False
+        result = await super().flush()
+        return None if result is None else _spoken(result)
+
+    async def handle_interruption(self):
+        self._piece_out = False
+        await super().handle_interruption()
+
+    async def reset(self):
+        self._piece_out = False
+        await super().reset()
+
+
 class SpeechTTS(TTSService):
     """One streamed ``POST {base_url}/audio/speech`` per sentence."""
 
@@ -280,6 +351,7 @@ class SpeechTTS(TTSService):
         settings: TtsSettings,
         *,
         voice: str,
+        language: str,
         http: aiohttp.ClientSession,
         timings: Timings,
         **kwargs,
@@ -293,6 +365,9 @@ class SpeechTTS(TTSService):
             reuse_context_id_within_turn=False,
             settings=TTSSettings(model=settings.model, voice=voice, language=None),
             **kwargs,
+        )
+        self._text_aggregator = SpokenTextAggregator(
+            clause_chars=settings.clause_chars, language=language
         )
         self._stage = settings
         self._voice = voice
@@ -316,6 +391,7 @@ class SpeechTTS(TTSService):
         }
         if self._stage.speed is not None:
             body["speed"] = self._stage.speed
+        self._timings.tts_requested()
         started = time.monotonic()
         resampler = create_stream_resampler()
         wav = _WavStream() if self._stage.response_format == "wav" else None
