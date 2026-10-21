@@ -3,6 +3,7 @@
 #   python docker/voice-models/models.py fetch [--set cpu,gpu,judge]
 #   docker compose -f docker/voice-models/compose.yaml up -d                  # cascade-cpu
 #   docker compose -f docker/voice-models/compose.yaml --profile gpu up -d    # + cascade-gpu
+#   ... --profile gpu-rocm up -d llm speech-gpu tts-gpu-rocm                  # cascade-gpu-rocm
 # Details, licences and the SELinux/GPU notes: docker/voice-models/README.md.
 name: srw-voice-models
 
@@ -198,6 +199,37 @@ services:
     ports:
       - "127.0.0.1:${VOICE_TTS_GPU_PORT:-18454}:8000"
     depends_on: [tts-gpu-model]
+    restart: unless-stopped
+
+  # TTS on an AMD GPU with ROCm (`--profile gpu-rocm`, the cascade-gpu-rocm
+  # profile): Qwen3-TTS 0.6B Base on PyTorch, streamed, so the first audio
+  # leaves after 0.67 s of speech is made instead of the whole sentence.
+  # PyTorch and the model come from models.py fetch --set rocm.
+  tts-gpu-rocm:
+    profiles: [gpu-rocm]
+    image: srw-voice-qwen-tts:1
+    build:
+      context: .
+      dockerfile: Dockerfile.qwen-tts
+    devices:
+      - /dev/kfd:/dev/kfd
+      - "${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}:${VOICE_LLM_RENDER_NODE:-/dev/dri/renderD128}"
+    # The host's `render` group (getent group render), for /dev/kfd.
+    group_add:
+      - "${VOICE_RENDER_GID:-105}"
+    security_opt:
+      - label=disable
+    environment:
+      TTS_VOICE: "${VOICE_TTS_GPU_VOICE:-de-1}"
+      TTS_LANGUAGE: German
+    volumes:
+      - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/qwen-tts:/opt/qwen-tts:ro
+      - ./voices:/voices:ro,z
+    read_only: true
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:${VOICE_TTS_ROCM_PORT:-18456}:8000"
     restart: unless-stopped
 
   # --- the bench's judge (WP4), `--profile judge` ---------------------------

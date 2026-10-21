@@ -45,7 +45,7 @@ def test_gpu_servers_cannot_write_to_disk():
         assert service.get("read_only") is True, name
         for volume in service.get("volumes", []):
             assert volume.rsplit(":", 1)[-1].startswith("ro"), (name, volume)
-    for name in ("speech-gpu", "tts-gpu-model", "judge-model", "llm"):
+    for name in ("speech-gpu", "tts-gpu-model", "tts-gpu-rocm", "judge-model", "llm"):
         assert "/tmp" in services[name]["tmpfs"], name
 
 

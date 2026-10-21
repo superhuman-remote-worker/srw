@@ -35,3 +35,25 @@ cascade-gpu:
   # directory.
   # turn:
   #   vad_model_file: /models/vad/silero_vad-v6.2.3.onnx
+
+# The same with the TTS for AMD GPUs with ROCm (WP4): Qwen3-TTS 0.6B Base on
+# PyTorch, streamed (`--profile gpu-rocm up -d llm speech-gpu tts-gpu-rocm`).
+# On the RX 9070 XT its first audio comes after ~0.4 s instead of the
+# whole sentence (~1.3 s for a short one).
+cascade-gpu-rocm:
+  engine: cascade
+  language: de
+  stt:
+    base_url: http://127.0.0.1:18453/v1
+    model: whisper-large-v3-turbo
+  llm:
+    base_url: http://127.0.0.1:18451/v1
+    model: gemma-4-12b-it
+    temperature: 0.3
+    max_tokens: 300
+  tts:
+    base_url: http://127.0.0.1:18456/v1
+    model: qwen3-tts-0.6b
+    voice: de-1
+    response_format: pcm
+    sample_rate: 24000

@@ -12,9 +12,12 @@ offline server finds it). Standard library only.
 
 Sets: ``cpu`` (default) is the ``cascade-cpu`` profile with the voice LLM;
 ``gpu`` adds the ``cascade-gpu`` stages (``stt/`` whisper-large-v3-turbo for
-whisper.cpp, ``tts/`` Qwen3-TTS for llama.cpp; WP4); ``judge`` the bench's
-transcription judge (``judge/`` Qwen3-ASR, another model family than the STT
-it judges).
+whisper.cpp, ``tts/`` Qwen3-TTS for llama.cpp; WP4); ``rocm`` the streamed
+Qwen3-TTS for AMD GPUs (``qwen-tts/``: the 0.6B Base model, the PyTorch ROCm
+wheel, and ``runtime/``, the pinned Python packages of
+``qwen-tts-rocm.requirements.txt`` installed there by pip in a pinned
+Python image); ``judge`` the bench's transcription judge (``judge/``
+Qwen3-ASR, another model family than the STT it judges).
 """
 
 from __future__ import annotations
@@ -140,6 +143,50 @@ FILES += (
     ),
 )
 
+_QWEN_TTS_06 = (
+    "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/"
+    "5d83992436eae1d760afd27aff78a71d676296fc"
+)
+_QWEN_TTS_06_FILES = {
+    "config.json": "2e714c787c8edb98b05432685cddb634add2de4d4e645f653d68251ef72ba011",
+    "generation_config.json": "f1b90b4513f3b34c62851049e2492d7b4c5940daf1276f89c82b8ef04127f3aa",
+    "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+    "preprocessor_config.json": "efdde1022ea9d76928bf7a9cd53139138f5ba2e466e837f08f6105ab1af1c119",
+    "tokenizer_config.json": "dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670",
+    "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+    "model.safetensors": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+    "speech_tokenizer/config.json": "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167",
+    "speech_tokenizer/configuration.json": "6bc26d64eb5024b4d1dab5a52371958b429256d6c9d59787f1f5294a54e0cebd",
+    "speech_tokenizer/preprocessor_config.json": "fcb3805e597e786d4067706e602f6688524640f8d3396790e2e09b5942fcbdfb",
+    "speech_tokenizer/model.safetensors": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+}
+TORCH_ROCM_WHEEL = "torch-2.14.1+rocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl"
+
+FILES += tuple(
+    File(
+        f"qwen-tts/Qwen3-TTS-12Hz-0.6B-Base/{name}",
+        f"{_QWEN_TTS_06}/{name}",
+        digest,
+        "Apache-2.0 (Qwen/Qwen3-TTS-12Hz-0.6B-Base)",
+        "rocm",
+    )
+    for name, digest in _QWEN_TTS_06_FILES.items()
+) + (
+    File(
+        f"qwen-tts/wheels/{TORCH_ROCM_WHEEL}",
+        "https://download-r2.pytorch.org/whl/rocm7.2/torch-2.14.1%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "fc35e48fd83329f5d60ab925951d138edb5a6fce84323600703637fbc693541c",
+        "BSD-3-Clause and others (PyTorch 2.14.1, ROCm 7.2 build with ROCm libraries)",
+        "rocm",
+    ),
+)
+#: The Python image the server image builds on; pip runs in it, too.
+PYTHON_IMAGE = (
+    "python:3.12-slim"
+    "@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
+)
+ROCM_REQUIREMENTS = Path(__file__).resolve().parent / "qwen-tts-rocm.requirements.txt"
+
 SNAPSHOTS = (
     Snapshot(
         "Systran/faster-whisper-small",
@@ -260,6 +307,43 @@ def fetch_snapshot(root: Path, snap: Snapshot) -> None:
     (refs / "main").write_text(snap.revision)
 
 
+def install_rocm_runtime(root: Path) -> None:
+    """The Qwen3-TTS server's packages into ``qwen-tts/runtime``: torch from
+    the fetched wheel, the rest pinned, all without dependency resolution."""
+    runtime = root / "qwen-tts" / "runtime"
+    stamp = runtime / ".requirements.sha256"
+    wanted = sha256_of(ROCM_REQUIREMENTS) + " " + TORCH_ROCM_WHEEL
+    if stamp.exists() and stamp.read_text().strip() == wanted:
+        print("ok   qwen-tts/runtime")
+        return
+    print("get  qwen-tts/runtime (pip, a few minutes)")
+    runtime.mkdir(parents=True, exist_ok=True)
+    pip = "pip install -q --no-cache-dir --no-deps --target /runtime"
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-e",
+            "HOME=/tmp",
+            "-v",
+            f"{root / 'qwen-tts' / 'wheels'}:/wheels:ro,z",
+            "-v",
+            f"{ROCM_REQUIREMENTS}:/requirements.txt:ro,z",
+            "-v",
+            f"{runtime}:/runtime:z",
+            PYTHON_IMAGE,
+            "sh",
+            "-c",
+            f"{pip} /wheels/{TORCH_ROCM_WHEEL} && {pip} -r /requirements.txt",
+        ],
+        check=True,
+    )
+    stamp.write_text(wanted + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
@@ -276,12 +360,13 @@ def main() -> None:
     parser.add_argument(
         "--set",
         default="cpu",
-        help="comma-separated model sets: cpu (default), gpu, judge, or all",
+        help="comma-separated model sets: cpu (default), gpu, rocm, judge, or all",
     )
     args = parser.parse_args()
     root = args.dir.resolve()
-    sets = {"cpu", "gpu", "judge"} if args.set == "all" else set(args.set.split(","))
-    unknown = sets - {"cpu", "gpu", "judge"}
+    known = {"cpu", "gpu", "rocm", "judge"}
+    sets = known if args.set == "all" else set(args.set.split(","))
+    unknown = sets - known
     if unknown:
         sys.exit(f"unknown model set(s): {', '.join(sorted(unknown))}")
     files = [f for f in FILES if f.group in sets]
@@ -304,6 +389,8 @@ def main() -> None:
         fetch_file(root, item)
     for snap in snapshots:
         fetch_snapshot(root, snap)
+    if "rocm" in sets:
+        install_rocm_runtime(root)
     print(f"models in {root}")
 
 

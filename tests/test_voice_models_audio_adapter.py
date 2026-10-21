@@ -160,3 +160,26 @@ def test_nothing_touches_the_disk():
     source = ADAPTER.read_text(encoding="utf-8")
     assert "open(" not in source.replace("read_bytes()", "")
     assert "tempfile" not in source and "write_bytes" not in source
+
+
+def test_qwen_tts_server_helpers(tmp_path):
+    """The streamed Qwen3-TTS server's pieces that need no GPU."""
+    np = pytest.importorskip("numpy")
+    spec = importlib.util.spec_from_file_location(
+        "qwen_tts_server_under_test", ADAPTER.parent / "qwen_tts_server.py"
+    )
+    server = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(server)
+    assert server.pcm16(np.array([0.0, 0.5, -2.0], dtype=np.float32)) == struct.pack(
+        "<3h", 0, 16383, -32767
+    )
+    assert server.wav_header(24_000)[:4] == b"RIFF"
+    # A voice needs its clip and the clip's transcript (for the clone prompt).
+    (tmp_path / "de-1.wav").write_bytes(b"RIFF")
+    (tmp_path / "de-1.txt").write_text("Guten Tag.\n", encoding="utf-8")
+    (tmp_path / "lonely.wav").write_bytes(b"RIFF")
+    assert server.load_voices(tmp_path) == {
+        "de-1": (str(tmp_path / "de-1.wav"), "Guten Tag.")
+    }
+    source = (ADAPTER.parent / "qwen_tts_server.py").read_text(encoding="utf-8")
+    assert "open(" not in source and "write_bytes" not in source
