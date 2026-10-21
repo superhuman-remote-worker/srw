@@ -20,6 +20,19 @@ ROOT = Path(__file__).resolve().parents[1]
 ROLES = {
     "orchestrator": ("orchestrator", "3.11"),
     "vm-controller": ("vm_controller", "3.12"),
+    "voice-gateway": ("voice_gateway", "3.12"),
+}
+#: Distributions a role's resolution needs but its image never installs. Each
+#: ships only a source distribution, which a hash-checked install could only
+#: build with unpinned build tools (pip does not hash-check build
+#: dependencies). The resolver reads it from source, the generator leaves it
+#: out of the lock, the role installs its lock with --no-deps, and
+#: ``pip-check`` tolerates exactly these missing requirements.
+EXCLUDED: dict[str, dict[str, str]] = {
+    "voice-gateway": {
+        "docopt": "num2words' command-line script only; Pipecat imports the "
+        "num2words library, which never imports docopt",
+    },
 }
 COMMON_INPUTS = (
     "requirements/constraints.txt",
@@ -127,6 +140,58 @@ def check_platform(role: str) -> None:
         raise ValueError(f"{role}: requires Linux amd64 Python {ROLES[role][1]}")
 
 
+def strip_excluded(role: str, lock: Path) -> None:
+    """Leave the role's :data:`EXCLUDED` distributions out of its lock: their
+    pin with its hash and ``via`` lines, and the format option naming them."""
+    excluded = set(EXCLUDED.get(role, ()))
+    if not excluded:
+        return
+    out, skipping = [], False
+    for line in lock.read_text().splitlines():
+        if line.startswith((" ", "\t")):
+            if not skipping:
+                out.append(line)
+            continue
+        name = re.split(r"==|\s", line, maxsplit=1)[0].lower()
+        skipping = bool(line) and name in excluded
+        option = re.fullmatch(r"--no-binary[ =](\S+)", line)
+        if option and set(option[1].split(",")) <= excluded:
+            continue
+        if not skipping:
+            out.append(line)
+    lock.write_text("\n".join(out) + "\n")
+    left = excluded & set(pinned_versions(lock))
+    if left:
+        raise ValueError(f"{role}: excluded distributions still pinned: {left}")
+
+
+def pip_check(role: str) -> list[str]:
+    """``pip check`` of the installed role: the problems other than a
+    requirement on one of its :data:`EXCLUDED` distributions."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "check"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    excluded = set(EXCLUDED.get(role, ()))
+    problems = []
+    for line in result.stdout.splitlines():
+        missing = re.fullmatch(
+            r"\S+ \S+ requires (\S+), which is not installed\.", line
+        )
+        if line.startswith("No broken requirements") or (
+            missing and missing[1].lower() in excluded
+        ):
+            continue
+        problems.append(line)
+    if result.returncode not in (0, 1) or (result.returncode and not result.stdout):
+        problems.append(
+            result.stderr.strip() or f"pip check exited {result.returncode}"
+        )
+    return problems
+
+
 def compile_inside(role: str, upgrades: list[str]) -> None:
     check_platform(role)
     for name, version in pinned_versions(ROOT / "requirements/lock-tools.txt").items():
@@ -148,7 +213,8 @@ def compile_inside(role: str, upgrades: list[str]) -> None:
         "--no-emit-index-url",
         "--no-emit-trusted-host",
         "--index-url=https://pypi.org/simple",
-        "--pip-args=--only-binary=:all:",
+        "--pip-args=--only-binary=:all:"
+        + "".join(f" --no-binary={name}" for name in sorted(EXCLUDED.get(role, ()))),
         "--cache-dir=/tmp/pip-tools-cache",
         *upgrades,
     ]
@@ -157,6 +223,7 @@ def compile_inside(role: str, upgrades: list[str]) -> None:
         CUSTOM_COMPILE_COMMAND=f"python scripts/lock_dependencies.py compile {role}",
     )
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+    strip_excluded(role, ROOT / lock)
     pinned_versions(ROOT / lock)
     (ROOT / manifest).write_text(
         json.dumps(
@@ -223,6 +290,11 @@ def main() -> None:
     )
     verify.add_argument("role", choices=ROLES, nargs="?")
     verify.add_argument("--installed", action="store_true")
+    consistency = commands.add_parser(
+        "pip-check",
+        help="pip check of an installed role, tolerating only its excluded distributions",
+    )
+    consistency.add_argument("role", choices=ROLES)
     for command in ("compile", "_compile"):
         generate = commands.add_parser(command)
         generate.add_argument("role", choices=ROLES)
@@ -230,7 +302,13 @@ def main() -> None:
         generate.add_argument("--upgrade-package", action="append", default=[])
     args = parser.parse_args()
     try:
-        if args.command == "check":
+        if args.command == "pip-check":
+            problems = pip_check(args.role)
+            for line in problems:
+                print(line)
+            if problems:
+                raise ValueError(f"{args.role}: broken requirements")
+        elif args.command == "check":
             if args.installed and not args.role:
                 parser.error("--installed requires a role")
             for role in [args.role] if args.role else ROLES:

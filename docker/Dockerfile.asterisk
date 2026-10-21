@@ -132,6 +132,26 @@ RUN set -eux; \
 # Debian's /var/run is a symlink to /run; the runtime stage creates the
 # directory through it instead of copying a real /var/run over the link.
 RUN rm -rf /out/var/run
+# GPL-2.0 (Asterisk) and GPL-2.0-or-later (pjproject): the image carries the
+# licences and the exact, verified source tarballs it was built from (the
+# build configuration is this Dockerfile), so the source travels with every
+# copy of the binaries.
+RUN set -eux; \
+    doc=/out/usr/share/doc/srw-asterisk; \
+    mkdir -p "$doc/source"; \
+    cp /usr/src/asterisk/COPYING "$doc/COPYING.asterisk"; \
+    cp /usr/src/asterisk/LICENSE "$doc/LICENSE.asterisk"; \
+    tar -xjOf /usr/src/externals/pjproject-${PJPROJECT_VERSION}.tar.bz2 \
+        "pjproject-${PJPROJECT_VERSION}/COPYING" > "$doc/COPYING.pjproject"; \
+    cp /usr/src/asterisk-${ASTERISK_VERSION}.tar.gz /usr/src/asterisk-${ASTERISK_VERSION}.tar.gz.asc \
+        /usr/src/externals/pjproject-${PJPROJECT_VERSION}.tar.bz2 "$doc/source/"; \
+    printf '%s\n' \
+        "Asterisk ${ASTERISK_VERSION} (GPL-2.0-only) with its bundled pjproject ${PJPROJECT_VERSION}" \
+        "(GPL-2.0-or-later), built from the source tarballs in source/: the official" \
+        "Asterisk release (sha256 and the Asterisk Development Team's signature checked)" \
+        "and pjproject from Asterisk's third-party mirror (sha256 checked)." \
+        "Build configuration: docker/Dockerfile.asterisk in SRW's repository." \
+        > "$doc/README"
 
 FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 

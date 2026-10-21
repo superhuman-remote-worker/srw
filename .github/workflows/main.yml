@@ -1972,6 +1972,166 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-gpt-live-sip:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
 
+  # The voice gateway's pipeline tests need Pipecat, which only the gateway's
+  # own lock carries (not the combined test environment), and run without
+  # the repository's conftest (it imports the orchestrator). Installed the
+  # way the image installs it (hashes, wheels, --no-deps).
+  test-voice-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the gateway's locked environment
+        run: |
+          python scripts/lock_dependencies.py check voice-gateway
+          python -m venv .voice-venv
+          .voice-venv/bin/python -m pip install --require-hashes --no-deps --only-binary :all: \
+            -r requirements/locks/voice-gateway-py312.txt
+          .voice-venv/bin/python scripts/lock_dependencies.py check voice-gateway --installed
+          .voice-venv/bin/python scripts/lock_dependencies.py pip-check voice-gateway
+          .voice-venv/bin/python -m pip install pytest pytest-asyncio
+      - name: Run the voice gateway and pipeline tests
+        env:
+          PYTHONPATH: src
+        run: >-
+          .voice-venv/bin/python -m pytest --noconftest -q
+          tests/test_voice_gateway_cascade.py tests/test_voice_gateway_cascade_settings.py
+          tests/test_voice_gateway_config.py tests/test_voice_gateway_asterisk_render.py
+          tests/test_voice_gateway_asterisk_media.py tests/test_voice_gateway_asterisk_source.py
+
+  # SRW's voice gateway (local phone lines): its pipeline tests first, then
+  # the image; the release chart pins its digest.
+  build-voice-gateway:
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, test-voice-gateway, resolve-version]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      needs.test-voice-gateway.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: needs.resolve-version.result == 'success'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-voice-gateway
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.voice-gateway
+          platforms: linux/amd64
+          push: ${{ needs.resolve-version.result == 'success' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=voice-gateway
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-voice-gateway:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-voice-gateway:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
+  # SRW's Asterisk addon (srw-asterisk, GPL-2.0, its own process): Asterisk
+  # 22 LTS built from the signed release tarball with only the voice path's
+  # modules; the image carries its licences and source tarballs. The release
+  # chart pins its digest.
+  build-asterisk:
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: needs.resolve-version.result == 'success'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-asterisk
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.asterisk
+          platforms: linux/amd64
+          push: ${{ needs.resolve-version.result == 'success' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=asterisk
+          provenance: false
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-asterisk:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-asterisk:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
   # The in-pod plane (connector drivers D7): the privileged FUSE opener and
   # the unprivileged cloud mount supervisor, two targets of one Dockerfile.
   # Both Go modules are vetted and tested under the race detector with the
@@ -2089,7 +2249,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-fuse-opener, build-agent-vm-base, chart-test, chart-schema-negative]
+    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-voice-gateway, build-asterisk, build-fuse-opener, build-agent-vm-base, chart-test, chart-schema-negative]
     if: >-
       always() && !cancelled() &&
       github.ref == 'refs/heads/main' &&
@@ -2107,6 +2267,8 @@ jobs:
       needs.build-driver-mcp-front.result == 'success' &&
       needs.build-driver-git-swap.result == 'success' &&
       needs.build-driver-gpt-live-sip.result == 'success' &&
+      needs.build-voice-gateway.result == 'success' &&
+      needs.build-asterisk.result == 'success' &&
       needs.build-fuse-opener.result == 'success' &&
       needs.chart-test.result == 'success' &&
       needs.chart-schema-negative.result == 'success'
@@ -2162,6 +2324,10 @@ jobs:
             .connectors.drivers.gitSwap.image.digest = strenv(DRIVER_GIT_SWAP_DIGEST) |
             .connectors.drivers.gptLiveSip.image.tag = strenv(IMAGE_TAG) |
             .connectors.drivers.gptLiveSip.image.digest = strenv(DRIVER_GPT_LIVE_SIP_DIGEST) |
+            .voiceGateway.image.tag = strenv(IMAGE_TAG) |
+            .voiceGateway.image.digest = strenv(VOICE_GATEWAY_DIGEST) |
+            .asterisk.image.tag = strenv(IMAGE_TAG) |
+            .asterisk.image.digest = strenv(ASTERISK_DIGEST) |
             .connectors.inPodPlane.opener.image.tag = strenv(IMAGE_TAG) |
             .connectors.inPodPlane.opener.image.digest = strenv(FUSE_OPENER_DIGEST) |
             .connectors.inPodPlane.rclone.image.tag = strenv(IMAGE_TAG) |
