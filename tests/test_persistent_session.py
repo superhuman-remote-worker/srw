@@ -4467,6 +4467,44 @@ class TestCleanup:
         session.shell_manager.cleanup.assert_called_once_with(strict=True)
 
     @pytest.mark.asyncio
+    async def test_protected_cleanup_retries_a_resident_over_a_fresh_transport(self):
+        # The strict shell retirement kills every workspace-UID process, the
+        # transport's sftp-server among them. A retry over that transport
+        # failed with "Socket is closed" forever (dev, 10-19), so a resident
+        # failure resets the transport and keeps claim-resource admission.
+        session = _make_session(
+            protected_cloud_required=True,
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="sandbox",
+        )
+        backend = MagicMock()
+        backend.terminal_local_quiescence_protocol = "workspace_process_zero_v1"
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        overlay = MagicMock()
+        overlay.unmount.side_effect = [RuntimeError("overlay remained mounted"), None]
+        cloud = MagicMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        with pytest.raises(WorkspaceUnavailableError, match="residents remain active"):
+            await session.cleanup()
+
+        backend.disconnect.assert_called_once_with()
+        backend.retire.assert_not_called()
+        backend.retire_claim_resource_owner.assert_not_called()
+        cloud.aclose.assert_not_awaited()
+        assert session.overlay_mount_manager is overlay
+
+        await session.cleanup()
+
+        assert overlay.unmount.call_count == 2
+        cloud.aclose.assert_awaited_once_with(strict=True)
+        backend.retire.assert_called_once_with()
+        assert session.overlay_mount_manager is None
+
+    @pytest.mark.asyncio
     async def test_protected_cleanup_waits_for_busy_upperdir_to_quiesce(self):
         session = _make_session(
             protected_cloud_required=True,

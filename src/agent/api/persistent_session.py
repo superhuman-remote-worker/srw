@@ -4505,6 +4505,17 @@ class PersistentSession:
                         )
                     else:
                         logger.warning(f"Backend disconnect error: {e}")
+        elif backend_for_cleanup is not None and resident_cleanup_error is not None:
+            # The retry runs the resident teardown again over this backend.
+            # The protected shell retirement above kills every workspace-UID
+            # process, this transport's sftp-server among them, so reset the
+            # transport and let the retry reconnect with a fresh SFTP channel.
+            # Claim-resource admission stays open for the retry's scripts.
+            if hasattr(backend_for_cleanup, "disconnect"):
+                try:
+                    backend_for_cleanup.disconnect()
+                except Exception as e:
+                    logger.warning(f"Backend disconnect error: {e}")
 
         if (
             exact_pinned_terminal

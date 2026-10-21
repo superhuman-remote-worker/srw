@@ -190,6 +190,39 @@ def test_unmount_is_plain_and_leaves_upperdir():
     assert "rm -rf /home/agent-host/.overlay/work" not in u
 
 
+def test_strict_unmount_failure_reports_the_fusermount_error(tmp_path):
+    # An unprivileged fusermount3 refuses to unmount without /etc/mtab, which
+    # containerd doesn't add (dev, 10-19); the refusal belongs in the report.
+    stubs = {
+        "mountpoint": "exit 0",
+        "fusermount3": (
+            "echo 'fusermount3: failed to open /etc/mtab: "
+            "No such file or directory' >&2; exit 1"
+        ),
+        "fusermount": "exit 1",
+    }
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in stubs.items():
+        stub = bin_dir / name
+        stub.write_text(f"#!/bin/sh\n{body}\n")
+        stub.chmod(0o755)
+    script = _manager(FakeRemoteBackend())._unmount_script(strict=True)
+
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 6
+    assert "__SRW_OVERLAY_FAILED__ rc=6" in result.stdout
+    assert "failed to open /etc/mtab" in result.stdout
+
+
 def test_mount_script_quotes_paths_with_spaces():
     """Verify that paths with spaces are properly quoted in fuse-overlayfs -o option."""
     backend = FakeRemoteBackend()

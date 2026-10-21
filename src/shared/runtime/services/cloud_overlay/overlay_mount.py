@@ -539,16 +539,19 @@ echo "{_OVERLAY_OK}"
         identity = shlex.quote(self._identity_path)
         terminal_check = (
             f'''if mountpoint -q {merged}; then
-  echo "{_OVERLAY_FAILED} rc=6 (overlay remained mounted)"
+  echo "{_OVERLAY_FAILED} rc=6 (overlay remained mounted: ${{unmount_error:-no error output}})"
   exit 6
 fi'''
             if strict
             else ""
         )
+        # fusermount3's own message names the cause (an unprivileged unmount
+        # needs /etc/mtab, for one); keep it for the failure report.
         return f"""#!/usr/bin/env bash
 set +e
+unmount_error=""
 if mountpoint -q {merged}; then
-  fusermount3 -u {merged} 2>/dev/null || fusermount -u {merged} 2>/dev/null
+  unmount_error="$(fusermount3 -u {merged} 2>&1)" || fusermount -u {merged} 2>/dev/null
 fi
 if mountpoint -q {merged}; then
   fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
