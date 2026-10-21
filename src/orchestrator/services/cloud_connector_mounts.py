@@ -52,6 +52,7 @@ from orchestrator.services.connector_drivers.cloud_folder import (
     CloudFolderMount,
     CloudFolderUnavailable,
 )
+from orchestrator.services.cloud_mount_status import STATUS_KEY
 from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
 from shared.connectors.builtin import (
     CLOUD_FOLDER_SPEC,
@@ -457,6 +458,42 @@ def excluded_entry(
     if level:
         entry["level"] = level
     return entry
+
+
+#: ``mount_unsupported``'s detail for a Virtual Session: its workspace mounts
+#: no cloud folder, so its own were left out when it was created.
+VIRTUAL_WORKSPACE_DETAIL = "virtual_workspace"
+
+
+def virtual_workspace_exclusion(row: Mapping[str, Any]) -> dict[str, str]:
+    """A cloud connector (a datasource row) a Virtual Session left out at
+    creation, as an exclusion of its record (owner 2026-10-21)."""
+    if row.get("type") == "cloud_outbox":
+        kind = "cloud_outbox"
+    else:
+        config = row.get("config")
+        kind = config.get("folder_kind") if isinstance(config, Mapping) else None
+    return {
+        "source_ref": str(row.get("id") or ""),
+        "mount_kind": str(kind or "project"),
+        "reason": "mount_unsupported",
+        "detail": VIRTUAL_WORKSPACE_DETAIL,
+        "title": str(row.get("name") or ""),
+    }
+
+
+def virtual_workspace_exclusions(
+    metadata: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """What a Virtual Session's record says it left out at creation."""
+    status = metadata.get(STATUS_KEY) if isinstance(metadata, Mapping) else None
+    excluded = status.get("excluded") if isinstance(status, Mapping) else None
+    return [
+        dict(entry)
+        for entry in excluded or []
+        if isinstance(entry, Mapping)
+        and entry.get("detail") == VIRTUAL_WORKSPACE_DETAIL
+    ]
 
 
 # --------------------------------------------------------------------------- #

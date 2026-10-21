@@ -1133,6 +1133,24 @@ def test_the_prompt_says_a_withheld_folder_mounts_when_the_workspace_starts_agai
     assert plain["text"].startswith("this workspace can't mount")
 
 
+def test_the_prompt_says_a_virtual_session_needs_a_container_for_its_cloud():
+    """A Virtual Session's left-out folders (owner 2026-10-21): the agent
+    names them and the way to get them, never a workspace restart."""
+    from shared.runtime.services.cloud_mount.sidecar import excluded_row
+
+    row = excluded_row(
+        {
+            "reason": "mount_unsupported",
+            "detail": "virtual_workspace",
+            "title": "Session outbox",
+            "mount_kind": "cloud_outbox",
+        }
+    )
+    assert row["title"] == "Session outbox"
+    assert "Virtual workspace" in row["text"] and "Container" in row["text"]
+    assert "starts again" not in row["text"]
+
+
 def test_attached_live_after_an_edit_keeps_only_this_runtimes_folders():
     metadata = {
         **_planless_pod(),

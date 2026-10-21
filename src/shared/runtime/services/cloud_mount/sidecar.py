@@ -106,6 +106,10 @@ DETAIL_TEXT = {
         "it was attached while the workspace ran; it is mounted when the "
         "session's workspace starts again"
     ),
+    ("mount_unsupported", "virtual_workspace"): (
+        "this session's Virtual workspace can't hold cloud folders; a new "
+        "Session with a Container workspace gets it"
+    ),
 }
 
 #: What each kind of mounted folder is, for the agent's prompt.

@@ -55,6 +55,7 @@ from orchestrator.services import cloud_mount_status, connector_credential_lease
 from orchestrator.services.cloud_connector_mounts import (
     outbox_attached,
     uses_connector_rule,
+    virtual_workspace_exclusions,
 )
 from orchestrator.services.cloud_mount_sidecar import (
     PLAN_CONTEXT_KEY,
@@ -1153,15 +1154,24 @@ async def agent_get_thread_workspace_locked(
             # such as a default user home; that is the startup failure this
             # driver is meant to avoid.
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
+            # A Virtual Session mounts none: what its creation left out is
+            # named from its record (owner 2026-10-21).
+            cloud_folders_excluded = [
+                *cloud_folders_excluded,
+                *virtual_workspace_exclusions(metadata),
+            ]
         else:
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
             # The sync driver delivers no connector's cloud folder: each one
             # attached is named, for the agent and the session header,
             # rather than silently missing (main cloud, fix-up 3).
             if dependencies.cloud_sync_exclusions is not None:
-                cloud_folders_excluded = await dependencies.cloud_sync_exclusions(
-                    thread, mount_rows=mount_rows
-                )
+                cloud_folders_excluded = [
+                    *await dependencies.cloud_sync_exclusions(
+                        thread, mount_rows=mount_rows
+                    ),
+                    *virtual_workspace_exclusions(metadata),
+                ]
                 await cloud_mount_status.record_sync_exclusions(
                     postgres_db, thread_id, metadata, cloud_folders_excluded
                 )

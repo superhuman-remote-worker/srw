@@ -730,6 +730,61 @@ async def frozen_protected_source(
     return source
 
 
+_CLOUD_CONNECTOR_TYPES = frozenset({"cloud_folder", "cloud_outbox"})
+
+
+async def _cloud_rows_a_container_gets(
+    request_body: ThreadCreateRequest,
+    user: dict[str, Any],
+    *,
+    effective_project_ids: list[str],
+    dependencies: ThreadAdmissionDependencies,
+) -> list[dict[str, Any]]:
+    """The cloud connectors this request's selection holds on a Container.
+
+    A Virtual Session can't mount a cloud folder or the session outbox, so
+    it gets none of these (issues/virtual_sessions_get_no_cloud_connectors.md).
+    """
+    try:
+        ids = (
+            await _select_thread_datasources(
+                request_body,
+                user,
+                thread_backend="sandbox",
+                effective_project_ids=effective_project_ids,
+                dependencies=dependencies,
+            )
+        )[0]
+    except HTTPException:
+        # A refused selection is refused again, on the tier it really gets.
+        return []
+    if not ids:
+        return []
+    rows = await dependencies.store.resolve_datasources_for_thread(datasource_ids=ids)
+    return [row for row in rows or [] if row.get("type") in _CLOUD_CONNECTOR_TYPES]
+
+
+async def _container_allowed(
+    user: dict[str, Any],
+    *,
+    effective_project_ids: list[str],
+    dependencies: ThreadAdmissionDependencies,
+) -> bool:
+    """Whether this install runs containers and the owner may use one."""
+    provisioners = (dependencies.container_provisioner, dependencies.docker_provisioner)
+    if not any(getattr(p, "is_available", False) for p in provisioners):
+        return False
+    try:
+        await dependencies.enforce_session_create_grants(
+            {"workspace": {"backend": "sandbox"}},
+            user_id=str(user["id"]),
+            project_ids=effective_project_ids,
+        )
+    except HTTPException:
+        return False
+    return True
+
+
 async def resolve_thread_creation_plan(
     request_body: ThreadCreateRequest,
     user: dict[str, Any],
@@ -896,6 +951,50 @@ async def resolve_thread_creation_plan(
         config_override=config_override,
         account_defaults=account_defaults,
     )
+    # A Session whose own cloud folders would attach gets a Container when
+    # its tier came from the defaults (owner 2026-10-21): Virtual mounts none.
+    # Kept Virtual, it records what it left out, so nothing goes silently.
+    cloud_rows: list[dict[str, Any]] = []
+    if (
+        backend_from_override(
+            bind_execution_workspace(config_override, selected_workspace)
+        )
+        == "virtual"
+    ):
+        cloud_rows = await _cloud_rows_a_container_gets(
+            request_body,
+            user,
+            effective_project_ids=effective_project_ids,
+            dependencies=dependencies,
+        )
+    if (
+        cloud_rows
+        and workspace_selection is not None
+        and "workspace" not in request_body.model_fields_set
+        and await _container_allowed(
+            user,
+            effective_project_ids=effective_project_ids,
+            dependencies=dependencies,
+        )
+    ):
+        from shared.workspace_defaults import Upgrade
+
+        selected_workspace, workspace_selection = await select_execution_workspace(
+            dependencies.store,
+            user,
+            project_id=primary_project_id,
+            role="session",
+            workspace=None,
+            supplied=False,
+            config_override=config_override,
+            account_defaults=account_defaults,
+            upgrade=Upgrade(current="virtual", requested="container"),
+        )
+        workspace_selection["sources"] = {
+            **workspace_selection["sources"],
+            "tier": "cloud_connectors",
+        }
+        cloud_rows = []
     config_override = bind_execution_workspace(config_override, selected_workspace)
 
     # Resolve the complete create-time policy view.  This is also the source
@@ -1243,6 +1342,20 @@ async def resolve_thread_creation_plan(
     # it in the thread INSERT transaction together with the opening event,
     # even on the pinned lane, so no reconciler can observe a created review
     # thread before its exact delivery constraint exists.
+    left_out = [
+        row
+        for row in cloud_rows
+        if str(row.get("id")) not in set(selected_thread_datasource_ids)
+    ]
+    if left_out:
+        from orchestrator.services.cloud_connector_mounts import (
+            virtual_workspace_exclusion,
+        )
+        from orchestrator.services.cloud_mount_status import STATUS_KEY, sync_status
+
+        metadata_patch[STATUS_KEY] = sync_status(
+            [virtual_workspace_exclusion(row) for row in left_out]
+        )
     create_kwargs["initial_metadata"] = metadata_patch
 
     return ThreadCreationPlan(
