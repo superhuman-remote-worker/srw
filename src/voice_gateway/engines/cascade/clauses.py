@@ -7,16 +7,27 @@ once ``min_chars`` are written (the TTS reads the trailing comma as "more
 follows", so the voice does not drop its pitch there), or before a
 coordinating conjunction ("und", "oder", …) once half as many again are. Only
 the first piece of a reply is cut: the rest is synthesised while the first
-plays. No Pipecat here, so the main suite tests it.
+plays. ``sentences`` splits fixed text (the greeting) the same way, so a TTS
+that answers only once a request is synthesised starts with the first
+sentence. No Pipecat here, so the main suite tests it.
 """
 
 from __future__ import annotations
+
+import re
 
 #: Punctuation after which a clause ends (followed by a space).
 CLAUSE_MARKS = frozenset(",;:–—")
 #: Coordinating conjunctions a clause may start with (no comma before them
 #: in German); the cut goes before the word.
 CONJUNCTIONS = frozenset({"und", "oder", "aber", "sondern", "denn", "sowie"})
+#: Where a sentence may end: ., ! or ? before a space and a capital.
+_SENTENCE_END = re.compile(r"[.!?]\s+(?=[A-ZÄÖÜ„\"])")
+#: Words whose period ends no sentence: numbers ("am 12. März"), single
+#: letters ("z. B.") and common short forms.
+_ABBREVIATIONS = frozenset(
+    {"nr", "dr", "hr", "fr", "st", "str", "ca", "bzw", "usw", "inkl", "evtl", "ggf"}
+)
 
 
 def clause_end(text: str, min_chars: int) -> int | None:
@@ -39,3 +50,19 @@ def clause_end(text: str, min_chars: int) -> int | None:
     if word.lower() in CONJUNCTIONS and 2 * len(head.rstrip(",")) >= 3 * min_chars:
         return len(head)
     return None
+
+
+def sentences(text: str) -> list[str]:
+    """Fixed text in sentences, for one TTS request each."""
+    parts, start = [], 0
+    for match in _SENTENCE_END.finditer(text):
+        word = text[start : match.start()].rsplit(None, 1)[-1:] or [""]
+        word = word[0].lower()
+        if text[match.start()] == "." and (
+            word.isdigit() or len(word) == 1 or word in _ABBREVIATIONS
+        ):
+            continue
+        parts.append(text[start : match.start() + 1].strip())
+        start = match.end()
+    parts.append(text[start:].strip())
+    return [p for p in parts if p]

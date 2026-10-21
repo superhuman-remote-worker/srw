@@ -40,6 +40,10 @@ INSTRUCTIONS = (
     "Du bist die Telefonstimme vom Hotel Beispielhof.\n\n## Facts\nCheck-in ab 15 Uhr."
 )
 GREETING = 'Greet the caller now with exactly these words, then listen: "Guten Tag, hier ist das Hotel."'
+GREETING_2 = (
+    "Greet the caller now with exactly these words, then listen: "
+    '"Guten Tag, hier ist das Hotel am 12. März. Ich bin eine KI."'
+)
 
 
 def tone(
@@ -317,6 +321,32 @@ async def test_greeting_is_spoken_verbatim_without_the_llm(call, fakes):
     prewarm = fakes.prewarms[0]
     assert prewarm["max_tokens"] == 1 and prewarm["messages"][0]["role"] == "system"
     assert prewarm["tools"][0]["function"]["name"] == "delegate"
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_goes_to_the_tts_sentence_by_sentence(call, fakes):
+    await call.append("instructions", GREETING_2)
+    await call.until(lambda: len(fakes.tts_inputs) >= 2)
+    await call.quiet()
+    assert fakes.tts_inputs == [
+        "Guten Tag, hier ist das Hotel am 12. März.",
+        "Ich bin eine KI.",
+    ]
+    assert " ".join(" ".join(call.transcripts("assistant")).split()) == (
+        "Guten Tag, hier ist das Hotel am 12. März. Ich bin eine KI."
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_sentences_play_back_to_back(call, fakes):
+    # Each sentence has its own TTS context; one that is not closed at once
+    # held the next sentence back until Pipecat's 3 s context timeout.
+    await call.append("instructions", GREETING_2)
+    await call.until(lambda: len(fakes.tts_inputs) >= 2)
+    await asyncio.sleep(2.0 + 0.6)
+    spoken = sum(len(t) for t in fakes.tts_inputs) * fakes.ms_per_char
+    assert call.port.played_ms() >= 0.9 * spoken
+    assert len(call.port.voice_starts) == 1  # no silence between them
 
 
 @pytest.mark.asyncio

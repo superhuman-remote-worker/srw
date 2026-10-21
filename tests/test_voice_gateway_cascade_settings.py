@@ -13,7 +13,7 @@ import pytest
 from voice_gateway.config import load_config
 from voice_gateway.engines import build_engines
 from voice_gateway.engines.cascade import cascade_kind, parse_settings
-from voice_gateway.engines.cascade.clauses import clause_end
+from voice_gateway.engines.cascade.clauses import clause_end, sentences
 from voice_gateway.engines.cascade.prompt import (
     DELEGATE_DESCRIPTION,
     exact_words,
@@ -244,6 +244,22 @@ class TestClauses:
     )
     def test_where_a_first_sentence_may_start(self, text, end):
         assert clause_end(text, 30) == end
+
+    def test_fixed_text_splits_into_sentences(self):
+        greeting = (
+            "Guten Tag, hier ist die digitale Assistenz vom Hotel Beispielhof. "
+            "Ich bin eine KI. Wie kann ich Ihnen helfen?"
+        )
+        assert sentences(greeting) == [
+            "Guten Tag, hier ist die digitale Assistenz vom Hotel Beispielhof.",
+            "Ich bin eine KI.",
+            "Wie kann ich Ihnen helfen?",
+        ]
+        # Ordinals and short forms end no sentence.
+        assert sentences("Am 12. März ist z. B. Nr. 5 frei. Gut!") == [
+            "Am 12. März ist z. B. Nr. 5 frei.",
+            "Gut!",
+        ]
 
     def test_zero_turns_it_off(self):
         assert clause_end("Vom 12. bis 14. März ist ein Doppelzimmer frei, ", 0) is None

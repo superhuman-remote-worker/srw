@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     Frame,
     TranscriptionFrame,
     TTSAudioRawFrame,
+    TTSStoppedFrame,
 )
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.settings import STTSettings, TTSSettings
@@ -375,9 +376,29 @@ class SpeechTTS(TTSService):
         self._timings = timings
         #: Milliseconds of audio per TTS context, for "what was heard" maths.
         self.durations: dict[str, float] = {}
+        self._sentence_context: str | None = None
 
     def sentence_ms(self, context_id: str | None) -> float | None:
         return self.durations.get(context_id) if context_id else None
+
+    async def _push_tts_frames(self, src_frame, *args, **kwargs):
+        """One sentence's request, then its context is closed at once.
+
+        Each sentence has its own context, and Pipecat closes only the turn's
+        (an HTTP service's sentence contexts end when no audio came for
+        ``stop_frame_timeout_s``, 3 s, counted from the last chunk received,
+        not played). Without this a sentence shorter than 3 s was followed
+        by silence until then before the next one played.
+        """
+        self._sentence_context = None
+        await super()._push_tts_frames(src_frame, *args, **kwargs)
+        context_id, self._sentence_context = self._sentence_context, None
+        if context_id and self.audio_context_available(context_id):
+            if self._push_stop_frames:
+                await self.append_to_audio_context(
+                    context_id, TTSStoppedFrame(context_id=context_id)
+                )
+            await self.remove_audio_context(context_id)
 
     async def run_tts(
         self, text: str, context_id: str
@@ -391,6 +412,7 @@ class SpeechTTS(TTSService):
         }
         if self._stage.speed is not None:
             body["speed"] = self._stage.speed
+        self._sentence_context = context_id
         self._timings.tts_requested()
         started = time.monotonic()
         resampler = create_stream_resampler()

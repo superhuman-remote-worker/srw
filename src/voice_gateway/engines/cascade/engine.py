@@ -5,7 +5,8 @@ start, Smart Turn v3 stop) → voice LLM (delegate tool) → TTS → port →
 assistant context. How the protocol's appends map onto it:
 
 - ``instructions`` with quoted exact words (the greeting) are spoken as they
-  are; other instructions become a note the LLM acts on now.
+  are, sentence by sentence; other instructions become a note the LLM acts
+  on now.
 - ``commentary`` with an open delegation's id is that ``delegate`` call's
   result, which the LLM phrases for the caller; any other ``commentary`` is
   a note to say now in its own words.
@@ -49,6 +50,7 @@ from pipecat.turns.user_stop import (
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
+from voice_gateway.engines.cascade.clauses import sentences
 from voice_gateway.engines.cascade.prompt import (
     DELEGATE_TOOL,
     delegate_schema,
@@ -146,7 +148,10 @@ class CascadeEngine:
             await answer(content)
             return
         if kind == "instructions" and (words := exact_words(content)):
-            await self._queue(TTSSpeakFrame(words))
+            # One TTS request per sentence: a TTS that answers once a
+            # request is synthesised starts with the first sentence.
+            for sentence in sentences(words):
+                await self._queue(TTSSpeakFrame(sentence))
             return
         message = {"role": "developer", "content": note(kind, content)}
         await self._queue(
