@@ -27059,10 +27059,10 @@ class PostgresDB:
             "WHERE id = $2 "
             "  AND metadata->'vm'->>'provision_generation' = $3 "
             "  AND ($4::boolean = FALSE "
-            "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready') "
-            "  AND ($5::boolean = FALSE "
             "       OR (runtime_retirement_token IS NULL "
             "           AND status IS DISTINCT FROM 'ended')) "
+            "  AND ($5::boolean = FALSE "
+            "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready') "
             "  AND NOT EXISTS ("
             "      SELECT 1 FROM vm_workspace_recoveries recovery "
             "      WHERE recovery.owner_kind='thread' "
@@ -27076,8 +27076,8 @@ class PostgresDB:
                 json_module.dumps(vm_updates),
                 uuid_val,
                 expected_generation,
-                require_status_not_ready,
                 require_not_retiring,
+                require_status_not_ready,
             )
 
         return result == "UPDATE 1"
