@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -19,6 +20,10 @@ from voice_gateway.config import Config
 from voice_gateway.interfaces import CallSource, Engine
 from voice_gateway.scripted import ScriptedCallSource, ScriptedEngine
 from voice_gateway.session import ProtocolError, Session
+
+# One line per call event: session id, line, outcome. Never phone numbers,
+# instructions or anything the caller or the voice says.
+logger = logging.getLogger(__name__)
 
 
 def sign_webhook(key: bytes, webhook_id: str, timestamp: int, body: bytes) -> str:
@@ -169,6 +174,7 @@ class Gateway:
             record=self.config.test_control,
         )
         self.sessions[session.id] = session
+        logger.info("call %s ringing on line %s", session.id, line_name)
         self.spawn(self.ringing_deadline(session))
         self.spawn(self.deliver_webhook(session))
         self.spawn(self.usage_loop(session))
@@ -178,6 +184,12 @@ class Gateway:
     async def retire(self, session: Session) -> None:
         """Forget a closed call after a grace period; later requests get 404."""
         await session.closed.wait()
+        logger.info(
+            "call %s closed: %s after %.1f s",
+            session.id,
+            session.close_reason,
+            session.seconds,
+        )
         await asyncio.sleep(self.retention_s)
         self.sessions.pop(session.id, None)
 
@@ -242,6 +254,9 @@ class Gateway:
             except (aiohttp.ClientError, TimeoutError):
                 status = 0
             session.webhook_responses.append(status)
+            logger.info(
+                "call %s webhook answered %s", session.id, status or "no response"
+            )
             session.notify()
             if 200 <= status < 300 or (
                 status and status < 500 and status not in {408, 429}
@@ -258,7 +273,9 @@ class Gateway:
 
     async def control(self, request: web.Request) -> web.Response:
         session = self.session(request)
-        await session.control(request.match_info["action"], await object_body(request))
+        action = request.match_info["action"]
+        await session.control(action, await object_body(request))
+        logger.info("call %s %s", session.id, action)
         return web.Response(status=200)
 
     async def attach(self, request: web.Request) -> web.StreamResponse:
@@ -274,6 +291,7 @@ class Gateway:
             self.sockets.discard(ws)
             return ws
         replay, queue = session.subscribe()
+        logger.info("call %s attached (%d)", session.id, session.attach_count)
 
         async def write():
             try:
