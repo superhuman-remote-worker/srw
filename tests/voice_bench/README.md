@@ -175,13 +175,18 @@ job (orchestrator, driver pod, back office) answers its webhook.
   answer (test-set ids or free text, rendered with the bench's Piper voice),
   the hangup time, and `expect` windows with keywords the caller must hear
   (`from: human` starts at the moment 3000 answered). Afterwards whisper
-  transcribes what the caller heard as a timeline; `call.json` holds the
-  timeline, the windows, the PBX's view of a transfer (REFER, its answer,
-  the NOTIFY, when the human answered) and `no_audio_written` for the
-  addon (`docker diff`).
+  transcribes what the caller heard, each voiced stretch of the recording
+  on its own (one long clip makes whisper loop over the silences and blur
+  the times); a window's text is the stretches that start inside it.
+  `call.json` holds that timeline, the windows, the PBX's view of a
+  transfer (REFER, its answer, the NOTIFY, when the human answered) and
+  `no_audio_written` for the addon (`docker diff`). `call --analyze DIR`
+  repeats only the analysis on an earlier call's results.
 
 The script's times are fixed, so leave room for the back office: a line
-spoken while the voice still talks may barge in.
+spoken while the voice still talks may barge in. whisper (small) is a weak
+judge of the cascade's Piper voice after G.711: compare a failed keyword
+with SRW's own transcript (the job's live session) before blaming the call.
 
 ## Plugging in a real device (WP2)
 

@@ -690,23 +690,30 @@ def cmd_call(args: argparse.Namespace) -> int:
 
     network = Network(args.subnet)
     compose = Compose(network, srw=True)
-    if not pbx_running(compose):
-        log("the bench PBX is not running: start it with `addon up` (or `up`)")
-        return 2
     try:
         script = call.load_script(Path(args.script))
     except (OSError, call.ScriptError) as exc:
         log(f"bad call script: {exc}")
         return 2
-    assets.fetch(MODELS_DIR, log=log)
-    render_audio.render(compose, log=log)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    out = (
-        Path(args.results).resolve() if args.results else RESULTS_DIR / f"call-{stamp}"
-    )
-    report = call.run(compose, script, out, args.threads, log=log)
+    if args.analyze:
+        # Only the analysis, again, on an earlier call's results directory.
+        out = Path(args.analyze).resolve()
+        report = call.analyze(compose, script, out, args.threads, log=log)
+    else:
+        if not pbx_running(compose):
+            log("the bench PBX is not running: start it with `addon up` (or `up`)")
+            return 2
+        assets.fetch(MODELS_DIR, log=log)
+        render_audio.render(compose, log=log)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out = (
+            Path(args.results).resolve()
+            if args.results
+            else RESULTS_DIR / f"call-{stamp}"
+        )
+        report = call.run(compose, script, out, args.threads, log=log)
     addon = compose.run("ps", "-q", "addon", check=False).stdout.strip()
-    if addon:
+    if addon and not args.analyze:
         # A5: the addon wrote no audio during the call.
         report["no_audio_written"] = srw.audio_check(compose, ("addon",))
         if not report["no_audio_written"]["ok"]:
@@ -827,6 +834,11 @@ def main(argv: list[str] | None = None) -> int:
         "--results", help="results directory (default: results/call-<UTC time>)"
     )
     call_parser.add_argument("--threads", type=int, default=8)
+    call_parser.add_argument(
+        "--analyze",
+        metavar="DIR",
+        help="only analyze an earlier call's results directory again",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "run" and args.dut_expect is None:

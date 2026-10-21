@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import array
-import json
 from pathlib import Path
 
 import pytest
@@ -128,7 +127,6 @@ class TestWindowsAndTransfer:
     def test_windows_anchor_on_answer_and_human(self):
         script = call.parse_script(_script())
         placed = call.windows(script, _data(human_t=130.0))
-        assert placed["heard"].start is None and placed["heard"].end is None
         assert (placed["greeting"].start, placed["greeting"].end) == (100.0, 105.0)
         assert placed["human"].start == 130.5 and placed["human"].end is None
         # No human answered: no window, and the check fails.
@@ -138,22 +136,37 @@ class TestWindowsAndTransfer:
         found = {c.name: c for c in call.checks(script, unanswered, {"refer_to": None})}
         assert found["heard_human"].ok is False
 
-    def test_timeline_from_whisper_offsets(self, tmp_path):
-        out = tmp_path / "heard.wav.json"
-        out.write_text(
-            json.dumps(
-                {
-                    "transcription": [
-                        {"offsets": {"from": 2500, "to": 6100}, "text": " Guten Tag."},
-                        {"offsets": {"from": 7000, "to": 7100}, "text": " "},
-                    ]
-                }
-            )
+    def test_stretches_split_on_pauses(self):
+        rate = 1000  # 20 samples per 20 ms frame
+        loud, quiet = [3000] * 20, [0] * 20
+        frames = (
+            [quiet] * 10  # 0.0-0.2 s silence
+            + [loud] * 25  # 0.2-0.7 s speech
+            + [quiet] * 10  # a 0.2 s pause inside the utterance
+            + [loud] * 25  # 0.9-1.4 s
+            + [quiet] * 50  # 1 s of silence ends the stretch
+            + [loud] * 5  # 0.1 s click: too short
+            + [quiet] * 50
+            + [loud] * 30  # 3.5-4.1 s
         )
-        assert call.timeline(out, 0.0) == [
-            {"from_s": 2.5, "to_s": 6.1, "text": "Guten Tag."}
+        samples = array.array("h", [x for frame in frames for x in frame])
+        assert call.stretches(samples, rate, pad_s=0.0) == [(0.2, 1.4), (3.5, 4.1)]
+        # Padding stays inside the recording.
+        assert call.stretches(samples, rate, pad_s=0.5)[0] == (0.0, 1.9)
+        assert call.stretches(samples, rate, pad_s=0.5)[-1] == (3.0, 4.1)
+
+    def test_window_text_joins_stretches_that_start_inside(self):
+        timeline = [
+            {"from_s": 1.6, "to_s": 2.8, "text": "Guten Tag!"},
+            {"from_s": 3.1, "to_s": 6.0, "text": "Hier ist die Assistenz."},
+            {"from_s": 19.4, "to_s": 22.7, "text": ""},
+            {"from_s": 109.6, "to_s": 110.9, "text": "Guten Abend!"},
         ]
-        assert call.timeline(tmp_path / "missing.json", 0.0) == []
+        assert call.window_text(timeline, 0.0, 14.0) == (
+            "Guten Tag! Hier ist die Assistenz."
+        )
+        assert call.window_text(timeline, 17.0, 34.0) == ""
+        assert call.window_text(timeline, 109.5, None) == "Guten Abend!"
 
     def test_transfer_view_and_check(self):
         def msg(t, direction, start, headers, body=""):

@@ -52,6 +52,7 @@ from tests.voice_bench.analysis import (
     missing_keywords,
     parse_asterisk_sip_log,
     read_wav,
+    whisper_text,
     write_wav,
 )
 from tests.voice_bench.profiles import (
@@ -272,9 +273,9 @@ def scenarios(script: CallScript, pbx: str) -> dict[str, dict]:
 
 
 def windows(script: CallScript, data: CallData) -> dict[str, Window]:
-    """The whole call plus one window per ``expect`` entry."""
+    """One window per ``expect`` entry, in wall-clock time."""
     t0 = data.t_confirmed("caller")
-    out = {"heard": Window("caller", None, None, [], "everything the caller heard")}
+    out: dict[str, Window] = {}
     if t0 is None:
         return out
     t_human = data.t_confirmed("human")
@@ -290,25 +291,93 @@ def windows(script: CallScript, data: CallData) -> dict[str, Window]:
     return out
 
 
-def timeline(whisper_json: Path, offset_s: float) -> list[dict]:
-    """whisper.cpp segments as seconds after the call was answered."""
-    if not whisper_json.exists():
-        return []
-    data = json.loads(whisper_json.read_text(encoding="utf-8"))
-    out = []
-    for seg in data.get("transcription", []):
-        text = seg.get("text", "").strip()
-        offsets = seg.get("offsets") or {}
-        if not text:
+def stretches(
+    samples: array.array,
+    rate: int,
+    *,
+    level: int = 500,
+    gap_s: float = 0.5,
+    min_s: float = 0.3,
+    pad_s: float = 0.15,
+) -> list[tuple[float, float]]:
+    """Voiced stretches (start, end in seconds) of a recording: 20 ms frames
+    above ``level``, joined across pauses shorter than ``gap_s``."""
+    step = rate // 50
+    voiced = [
+        max(map(abs, samples[i : i + step]), default=0) > level
+        for i in range(0, len(samples), step)
+    ]
+    found: list[list[int]] = []
+    for index, on in enumerate(voiced):
+        if not on:
             continue
-        out.append(
-            {
-                "from_s": round(offset_s + offsets.get("from", 0) / 1000, 2),
-                "to_s": round(offset_s + offsets.get("to", 0) / 1000, 2),
-                "text": text,
-            }
-        )
-    return out
+        if found and index - found[-1][1] <= gap_s * 50:
+            found[-1][1] = index + 1
+        else:
+            found.append([index, index + 1])
+    total = len(samples) / rate
+    return [
+        (round(max(0.0, a / 50 - pad_s), 2), round(min(total, b / 50 + pad_s), 2))
+        for a, b in found
+        if (b - a) / 50 >= min_s
+    ]
+
+
+def heard_timeline(
+    compose: Compose, data: CallData, out: Path, threads: int
+) -> list[dict]:
+    """What the caller heard: each voiced stretch of its recording transcribed
+    on its own (short clips keep whisper from looping over long silences),
+    in seconds after the answer."""
+    summary = data.summary.get("caller") or {}
+    t0 = data.t_confirmed("caller")
+    recording = out / "caller.wav"
+    if t0 is None or not recording.exists() or not summary.get("recording_seconds"):
+        return []
+    # pjsua records only while the call's media runs, so the file ends when
+    # the call ends.
+    rec_end = data.t_disconnected("caller") or summary["t_exit"]
+    rec_t0 = rec_end - summary["recording_seconds"]
+    rate, samples = read_wav(recording)
+    skip = max(0, int((t0 - rec_t0) * rate))
+    heard = samples[skip:]
+    clips = out / "heard"
+    if clips.exists():
+        for old in clips.iterdir():
+            old.unlink()
+    clips.mkdir(exist_ok=True)
+    found = stretches(heard, rate)
+    names = []
+    for index, (start, end) in enumerate(found):
+        name = f"{index:03d}.wav"
+        write_wav(clips / name, rate, heard[int(start * rate) : int(end * rate)])
+        names.append(name)
+    if names:
+        args = ["--profile", "tools", "run", "--rm", "--no-deps", "whisper"]
+        args += ["-m", "/models/ggml-small.bin", "-l", "de", "-t", str(threads)]
+        args += ["-np", "-mc", "0", "-oj"]
+        for name in names:
+            args += ["-f", f"/work/{name}"]
+        proc = compose.run(*args, work_dir=clips, check=False, timeout=900)
+        if proc.returncode != 0:
+            (out / "whisper.log").write_text(proc.stdout + proc.stderr, "utf-8")
+    timeline = []
+    for name, (start, end) in zip(names, found):
+        result = clips / f"{name}.json"
+        text = whisper_text(result) if result.exists() else ""
+        timeline.append({"from_s": start, "to_s": end, "text": text})
+    return timeline
+
+
+def window_text(timeline: list[dict], start_s: float, end_s: float | None) -> str:
+    """The stretches that start inside a window, joined."""
+    return " ".join(
+        entry["text"]
+        for entry in timeline
+        if entry["text"]
+        and entry["from_s"] >= start_s
+        and (end_s is None or entry["from_s"] < end_s)
+    )
 
 
 def transfer_view(data: CallData) -> dict:
@@ -387,9 +456,9 @@ def checks(script: CallScript, data: CallData, transfer: dict) -> list[Check]:
 def run(
     compose: Compose, script: CallScript, out: Path, threads: int, log=print
 ) -> dict:
-    """Place the call and write ``out/call.json``; returns the report."""
+    """Place the call, then analyze it (``out/call.json``); returns the report."""
     # Imported here: bench.py imports this module for its CLI.
-    from tests.voice_bench.bench import registered, transcribe, wait_for
+    from tests.voice_bench.bench import registered, wait_for
 
     network = compose.network
     out.mkdir(parents=True, exist_ok=True)
@@ -399,6 +468,7 @@ def run(
         if rendered:
             log(f"rendered {rendered} call line(s)")
     placed = write_caller_audio(script, out / CALLER_AUDIO)
+    (out / "lines.json").write_text(json.dumps(placed, ensure_ascii=False), "utf-8")
     for role, scenario in scenarios(script, network.pbx).items():
         scenario["out_dir"] = "/bench/out"
         (out / f"{role}.json").write_text(json.dumps(scenario, indent=2), "utf-8")
@@ -437,13 +507,23 @@ def run(
         fh.seek(offset)
         pbx_text = fh.read().decode("utf-8", errors="replace")
     (out / "pbx.log").write_text(pbx_text, encoding="utf-8")
+    return analyze(compose, script, out, threads, log=log)
 
+
+def analyze(
+    compose: Compose, script: CallScript, out: Path, threads: int, log=print
+) -> dict:
+    """Read a placed call's artifacts in ``out`` and write ``out/call.json``;
+    also runs on an earlier results directory (``call --analyze DIR``)."""
+    network = compose.network
     roles = ("caller", "human")
     events = {role: load_events(out / f"{role}.events.jsonl") for role in roles}
     summary = {}
     for role in roles:
         path = out / f"{role}.summary.json"
         summary[role] = json.loads(path.read_text("utf-8")) if path.exists() else {}
+    pbx_path = out / "pbx.log"
+    pbx_text = pbx_path.read_text("utf-8") if pbx_path.exists() else ""
     data = CallData(
         profile=Profile(
             name="call",
@@ -462,34 +542,42 @@ def run(
     )
     data.windows = windows(script, data)
     log("transcribing what the caller heard")
-    transcribe(compose, data, threads)
+    heard = heard_timeline(compose, data, out, threads)
     t0 = data.t_confirmed("caller")
+    report_windows = {}
+    for name, w in data.windows.items():
+        start = round(w.start - t0, 2)
+        end = None if w.end is None else round(w.end - t0, 2)
+        data.transcripts[name] = window_text(heard, start, end)
+        report_windows[name] = {
+            "from_s": start,
+            "to_s": end,
+            "keywords": w.keywords,
+            "transcript": data.transcripts[name],
+        }
     transfer = transfer_view(data)
+    lines_path = out / "lines.json"
+    report_path = out / "call.json"
+    # A second analysis keeps what only the call itself could record.
+    earlier = json.loads(report_path.read_text("utf-8")) if report_path.exists() else {}
     report = {
         "number": script.number,
         "hangup_after_s": script.hangup_after,
-        "lines": placed,
-        # The "heard" window starts at the answer, so whisper's offsets are
-        # already seconds after it.
-        "timeline": timeline(out / "heard.wav.json", 0.0),
-        "windows": {
-            name: {
-                "from_s": None
-                if w.start is None or t0 is None
-                else round(w.start - t0, 2),
-                "to_s": None if w.end is None or t0 is None else round(w.end - t0, 2),
-                "keywords": w.keywords,
-                "transcript": data.transcripts.get(name, ""),
-                "audio": data.audio.get(name),
-            }
-            for name, w in data.windows.items()
-        },
+        "lines": json.loads(lines_path.read_text("utf-8"))
+        if lines_path.exists()
+        else earlier.get("lines", []),
+        "timeline": heard,
+        "windows": report_windows,
         "transfer": transfer,
     }
+    if "no_audio_written" in earlier:
+        report["no_audio_written"] = earlier["no_audio_written"]
     found = checks(script, data, transfer)
     report["checks"] = [c.as_dict() for c in found]
     report["status"] = "fail" if any(c.ok is False for c in found) else "pass"
-    (out / "call.json").write_text(
+    if not report.get("no_audio_written", {"ok": True})["ok"]:
+        report["status"] = "fail"
+    report_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return report
