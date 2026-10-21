@@ -1,0 +1,29 @@
+# Voices for the WP0 bench, rendered by Piper's de_DE-mls-medium voice
+# (multi-speaker; ids are indices into its speaker_id_map).
+#
+# bench: the three parties of every bench call. Each WAV loops for the whole
+#   call; the runner looks for `keywords` in the transcript of what the other
+#   side recorded (all must appear; matching ignores case, spaces and
+#   punctuation). Texts and speakers were picked because whisper.cpp (small)
+#   transcribes them reliably after a G.711 round trip; the mls voice garbles
+#   some sentences (anything starting with "Hallo", most questions).
+# testset_speakers: utterances.yaml entries are rendered round-robin with
+#   these speakers so the set is not one voice.
+
+voice: de_DE-mls-medium
+
+bench:
+  dut:
+    speaker: 30
+    text: Guten Tag, hier ist der digitale Assistent vom Hotel Beispielhof.
+    keywords: ["digital", "assistent"]
+  human:
+    speaker: 10
+    text: Guten Abend, Sie sind jetzt mit einem Mitarbeiter verbunden.
+    keywords: ["mitarbeiter", "verbunden"]
+  caller:
+    speaker: 6
+    text: Guten Tag, ich möchte ein Doppelzimmer für nächsten Freitag reservieren.
+    keywords: ["doppelzimmer", "freitag"]
+
+testset_speakers: [30, 10, 40, 0]

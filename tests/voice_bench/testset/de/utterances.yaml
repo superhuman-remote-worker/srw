@@ -1,0 +1,141 @@
+# "Answer or delegate" set for the voice LLM (WP3/WP4), German, against the
+# FICTIONAL facts sheet facts.md (Hotel Beispielhof).
+#
+# expect:
+#   answer    the facts sheet holds the answer; the voice layer replies itself
+#   delegate  needs the back office (availability, bookings, invoices, ...)
+#   transfer  the caller wants a human; connect to the reception
+#   message   the caller leaves a message for someone
+# keywords: for "answer", words or numbers the reply must contain; for the
+#   other kinds, what the delegation request or the message must carry.
+#   Matching ignores case, spaces and punctuation; "a|b" accepts either.
+#
+# Audio: scripts/voice-bench.sh audio renders every text with Piper's
+# de_DE-mls-medium voice (speaker pool in voices.yaml) as 16 kHz PCM and
+# 8 kHz G.711 A-law into tests/voice_bench/.cache/audio/testset/ (gitignored).
+
+utterances:
+  - id: a01-checkin
+    text: Ab wann kann ich am Anreisetag einchecken?
+    expect: answer
+    keywords: ["15|fünfzehn"]
+  - id: a02-checkout
+    text: Bis wann muss ich das Zimmer am Abreisetag räumen?
+    expect: answer
+    keywords: ["11|elf"]
+  - id: a03-breakfast-times
+    text: Von wann bis wann gibt es Frühstück?
+    expect: answer
+    keywords: ["6:30|sechs uhr dreißig|halb sieben", "10:30|zehn uhr dreißig|halb elf"]
+  - id: a04-parking
+    text: Kann ich bei Ihnen parken, und was kostet das?
+    expect: answer
+    keywords: ["10|zehn", "euro"]
+  - id: a05-dogs
+    text: Darf ich meinen Hund mitbringen?
+    expect: answer
+    keywords: ["15|fünfzehn", "restaurant"]
+  - id: a06-wifi
+    text: Gibt es bei Ihnen WLAN, und kostet das etwas?
+    expect: answer
+    keywords: ["kostenlos|gratis|frei"]
+  - id: a07-double-room-price
+    text: Was kostet ein Doppelzimmer pro Nacht?
+    expect: answer
+    keywords: ["129|hundertneunundzwanzig"]
+  - id: a08-restaurant-monday
+    text: Hat Ihr Restaurant am Montagabend geöffnet?
+    expect: answer
+    keywords: ["geschlossen|nicht geöffnet|zu"]
+  - id: a09-sauna
+    text: Wann ist die Sauna geöffnet?
+    expect: answer
+    keywords: ["16|sechzehn", "21|einundzwanzig"]
+  - id: a10-station
+    text: Wie weit ist es vom Bahnhof zu Ihnen?
+    expect: answer
+    keywords: ["10|zehn", "minuten"]
+  - id: a11-cancellation
+    text: Bis wann kann ich kostenlos stornieren?
+    expect: answer
+    keywords: ["48|achtundvierzig", "stunden"]
+  - id: a12-ev-charging
+    text: Kann ich bei Ihnen mein Elektroauto laden?
+    expect: answer
+    keywords: ["45|fünfundvierzig|ladepl"]
+  - id: a13-children
+    text: Was kostet es, wenn unser vierjähriger Sohn bei uns im Zimmer schläft?
+    expect: answer
+    keywords: ["kostenlos|gratis|nichts"]
+  - id: d01-availability
+    text: Haben Sie vom zwölften bis vierzehnten März noch ein Doppelzimmer frei?
+    expect: delegate
+    keywords: ["doppelzimmer", "märz"]
+  - id: d02-booking-change
+    text: Ich habe für Freitag gebucht und möchte eine Nacht verlängern.
+    expect: delegate
+    keywords: ["freitag", "verlänger|nacht"]
+  - id: d03-invoice-copy
+    text: Können Sie mir die Rechnung von meinem Aufenthalt letzte Woche noch einmal schicken?
+    expect: delegate
+    keywords: ["rechnung"]
+  - id: d04-lost-item
+    text: Ich glaube, ich habe mein Ladekabel in Zimmer zwölf vergessen.
+    expect: delegate
+    keywords: ["ladekabel", "zwölf|12"]
+  - id: d05-late-checkout
+    text: Kann ich morgen ausnahmsweise erst um zwei Uhr auschecken?
+    expect: delegate
+    keywords: ["check|auscheck", "14|zwei"]
+  - id: d06-group
+    text: Wir sind ein Verein und bräuchten im Juni zwölf Zimmer für zwei Nächte.
+    expect: delegate
+    keywords: ["juni", "zwölf|12"]
+  - id: d07-table
+    text: Ich möchte für Samstagabend einen Tisch für sechs Personen reservieren.
+    expect: delegate
+    keywords: ["samstag", "sechs|6"]
+  - id: d08-cancel-booking
+    text: Ich muss meine Buchung für nächste Woche leider stornieren.
+    expect: delegate
+    keywords: ["storn"]
+  - id: d09-shuttle
+    text: Können Sie mich am Donnerstag um 18 Uhr vom Bahnhof abholen?
+    expect: delegate
+    keywords: ["donnerstag", "18|achtzehn", "bahnhof"]
+  - id: t01-human
+    text: Ich möchte bitte mit einem Menschen sprechen.
+    expect: transfer
+    keywords: []
+  - id: t02-manager
+    text: Verbinden Sie mich bitte mit Frau Muster von der Hotelleitung.
+    expect: transfer
+    keywords: ["muster"]
+  - id: t03-complaint
+    text: Ich möchte mich über mein Zimmer beschweren, und zwar bei jemandem persönlich.
+    expect: transfer
+    keywords: ["beschwer"]
+  - id: t04-reception
+    text: Ist gerade jemand an der Rezeption? Dann stellen Sie mich bitte durch.
+    expect: transfer
+    keywords: []
+  - id: m01-callback
+    text: Bitte richten Sie Herrn Beispiel aus, er soll mich zurückrufen, mein Name ist Jana Probe.
+    expect: message
+    keywords: ["beispiel", "probe", "rückruf|zurückrufen"]
+  - id: m02-arrival-late
+    text: Sagen Sie bitte der Rezeption, dass wir heute erst gegen dreiundzwanzig Uhr ankommen.
+    expect: message
+    keywords: ["23|dreiundzwanzig"]
+  - id: m03-allergy
+    text: Richten Sie bitte der Küche aus, dass meine Frau keine Nüsse verträgt.
+    expect: message
+    keywords: ["nüsse|nuss"]
+  - id: m04-for-manager
+    text: Ich hätte gern eine Nachricht für Frau Muster, es geht um unsere Firmenfeier.
+    expect: message
+    keywords: ["muster", "firmenfeier|feier"]
+  - id: m05-number
+    text: Notieren Sie bitte meine Rückrufnummer, null eins fünf null, eins zwei drei, vier fünf sechs.
+    expect: message
+    keywords: ["0150|null eins fünf null", "123|eins zwei drei", "456|vier fünf sechs"]
