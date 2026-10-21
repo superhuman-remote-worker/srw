@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from voice_gateway.config import ConfigError, load_config
 from voice_gateway.server import sign_webhook
 
 PYTHON = sys.executable
+SRC = str(Path(__file__).resolve().parents[1] / "src")
 
 
 @pytest.fixture
@@ -127,10 +129,13 @@ def test_bad_yaml_does_not_echo_contents(config_file):
 def test_cli_invalid_config_has_clear_error(config_file):
     path, _ = config_file
     path.write_text("null")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC, env.get("PYTHONPATH")]))
     result = subprocess.run(
         [PYTHON, "-m", "voice_gateway", "--config", str(path)],
         capture_output=True,
         text=True,
+        env=env,
     )
     assert result.returncode == 2
     assert "config must be a mapping" in result.stderr
