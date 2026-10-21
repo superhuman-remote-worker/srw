@@ -12,9 +12,17 @@ from __future__ import annotations
 from voice_gateway.engines.cascade.settings import LANGUAGE_NAMES
 
 DELEGATE_TOOL = "delegate"
-#: The holding sentences the rules prescribe (German); the engine keeps their
-#: audio ready, so they play at once.
-HOLDING_PHRASES = ("Einen Moment, ich schaue nach.", "Einen Moment, ich frage nach.")
+#: The holding sentences the rules prescribe, per language (checking, asking
+#: for a person); the engine keeps their audio ready, so they play at once.
+HOLDING_PHRASES = {
+    "de": ("Einen Moment, ich schaue nach.", "Einen Moment, ich frage nach."),
+    "en": ("One moment, I'll check.", "One moment, I'll ask."),
+}
+#: What the voice must not say before the answer is back, per language.
+_HANDOVER_WORDS = {
+    "de": '"Ich verbinde Sie", "Ich leite das weiter"',
+    "en": '"I\'ll put you through", "I\'ll pass that on"',
+}
 
 ENGINE_RULES = """# How this call works
 You are the voice on a live phone call. Everything you write is spoken by a \
@@ -34,8 +42,8 @@ With that call, say at most one short sentence, and only that you are \
 checking or asking: "{holding[0]}", or when the caller \
 wants a person, "{holding[1]}" Never add a second holding \
 sentence. Until the answer is back, never say that you connect, put \
-through, forward or pass on anything ("Ich verbinde Sie", "Ich leite das \
-weiter"): whether that happens is decided by the answer. Never say that \
+through, forward or pass on anything ({handover}): whether that \
+happens is decided by the answer. Never say that \
 you check or ask without calling `{tool}`.
 The answer comes back later, as the result of that tool call or as a \
 system note. Then tell the caller what it says in your own words, as your \
@@ -67,7 +75,10 @@ _CLOSE_QUOTES = '"“”»'
 
 def system_prompt(instructions: str, language: str, extra: str = "") -> str:
     rules = ENGINE_RULES.format(
-        language=LANGUAGE_NAMES[language], tool=DELEGATE_TOOL, holding=HOLDING_PHRASES
+        language=LANGUAGE_NAMES[language],
+        tool=DELEGATE_TOOL,
+        holding=HOLDING_PHRASES[language],
+        handover=_HANDOVER_WORDS[language],
     )
     parts = [rules.strip(), extra.strip(), instructions.strip()]
     return "\n\n".join(p for p in parts if p)

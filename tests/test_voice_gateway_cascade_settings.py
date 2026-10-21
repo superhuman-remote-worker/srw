@@ -213,10 +213,18 @@ class TestPrompt:
         assert "at most one short sentence" in prompt
         assert "Never add a second holding sentence" in prompt
         assert "Until the answer is back, never say that you connect" in prompt
+        assert '"Einen Moment, ich schaue nach."' in prompt
         assert "Ich verbinde Sie" in prompt and "never your own reasoning" in prompt
         assert "without saying who answered" in prompt
         assert "Do not start with a holding sentence again" in prompt
         assert "never that you connect or forward" in DELEGATE_DESCRIPTION
+
+    def test_an_english_line_gets_english_holding_sentences(self):
+        prompt = system_prompt("Persona", "en")
+        assert "spoken English" in prompt
+        assert '"One moment, I\'ll check."' in prompt
+        assert "I'll put you through" in prompt
+        assert "Einen Moment" not in prompt and "verbinde" not in prompt
 
 
 class TestClauses:

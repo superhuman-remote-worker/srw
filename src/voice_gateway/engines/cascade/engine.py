@@ -337,8 +337,8 @@ class CascadeEngine:
         if self._tts is None:
             return
         phrases = [self.settings.filler] if self.settings.filler else []
-        if self.settings.language == "de":
-            phrases += [p for p in HOLDING_PHRASES if p not in phrases]
+        holding = HOLDING_PHRASES.get(self.settings.language, ())
+        phrases += [p for p in holding if p not in phrases]
         if not self._tts.uncached(phrases):
             return
         try:
