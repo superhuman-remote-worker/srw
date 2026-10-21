@@ -30,6 +30,7 @@ RUN set -eux; \
 
 COPY piper_server.py /usr/local/lib/piper_server.py
 USER 65532:65532
-ENV PIPER_WORK=/tmp/piper PORT=8000
+# A tmpfs: piper_server.py keeps each utterance there only while reading it.
+ENV PIPER_WORK=/dev/shm/piper PORT=8000
 EXPOSE 8000
 ENTRYPOINT ["python3", "/usr/local/lib/piper_server.py"]

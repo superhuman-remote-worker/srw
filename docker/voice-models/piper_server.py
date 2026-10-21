@@ -23,7 +23,10 @@ from pathlib import Path
 
 MODEL = os.environ.get("PIPER_MODEL", "/models/de_DE-mls-medium.onnx")
 SPEAKER = os.environ.get("PIPER_SPEAKER", "0")
-WORK = Path(os.environ.get("PIPER_WORK", "/tmp/piper"))
+# Piper writes each utterance to a file, read back and deleted at once. It
+# stays in memory: /dev/shm is a tmpfs in every container (A5: no audio on
+# disk); /tmp would put the caller-facing speech on the container's disk.
+WORK = Path(os.environ.get("PIPER_WORK", "/dev/shm/piper"))
 
 
 class Piper:

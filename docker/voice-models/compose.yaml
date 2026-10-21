@@ -26,6 +26,10 @@ services:
       WHISPER__TTL: "-1"
     volumes:
       - ${VOICE_MODELS_DIR:-../../.cache/voice-models}/hf:/hf:z
+    # Uploads larger than 1 MB (about 30 s of a caller's speech) spill to
+    # /tmp; keep that in memory (no audio on disk).
+    tmpfs:
+      - /tmp
     ports:
       - "127.0.0.1:${VOICE_SPEECH_PORT:-18450}:8000"
     restart: unless-stopped
