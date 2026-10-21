@@ -3,6 +3,7 @@
 import base64
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from shared.runtime.live.webhook import verify_webhook
 from voice_gateway.config import ConfigError, load_config
 from voice_gateway.server import sign_webhook
 
-PYTHON = "/home/ghost/Repositories/Superhuman-Remote-Worker/.venv/bin/python"
+PYTHON = sys.executable
 
 
 @pytest.fixture
