@@ -30,7 +30,9 @@ from tests.voice_bench.profiles import (
     PROFILES,
     CallData,
     check_dtmf_info,
+    check_refer_refuse,
     check_reinvite,
+    gateway_checks,
 )
 
 BENCH = Path(__file__).resolve().parent
@@ -271,6 +273,78 @@ class TestProfileChecks:
             and checks["media_reanchored"]
             and checks["reinvites_accepted"]
         )
+
+
+class TestSrwChecks:
+    """``--dut srw``: SRW's side of the call comes from the driver's log."""
+
+    DRIVER = [
+        {
+            "kind": "webhook",
+            "connector": "bench-register",
+            "session_id": "s",
+            "sip_headers": [
+                {"name": "From", "value": "<sip:1000@pbx>"},
+                {"name": "To", "value": "<sip:2000@addon>"},
+            ],
+        },
+        {"kind": "accepted", "session_id": "s", "status": 200},
+        {"kind": "event", "session_id": "s", "event": "session.started"},
+        {"kind": "referred", "session_id": "s", "status": 200},
+        {
+            "kind": "event",
+            "session_id": "s",
+            "event": "session.closed",
+            "reason": "remote_hangup",
+        },
+    ]
+
+    def _srw(self, profile, msgs, driver, human=None):
+        data = _calldata(profile, msgs)
+        data.standin, data.dut_mode, data.driver = False, "srw", driver
+        data.events["human"] = human or []
+        return data
+
+    def test_gateway_checks_read_the_driver_log(self):
+        checks = gateway_checks(self._srw("register", [], self.DRIVER))
+        assert [c.ok for c in checks] == [True, True, True]
+        peer = gateway_checks(self._srw("peer", [], self.DRIVER))
+        assert peer[0].ok is False  # the peer call belongs to the peer line
+        closed = [e for e in self.DRIVER if e.get("event") != "session.closed"]
+        assert gateway_checks(self._srw("register", [], closed))[2].ok is False
+
+    def test_refused_refer_expects_srw_to_dial_the_target(self):
+        call = [("Call-ID", "c"), ("To", "<sip:2000@x>;tag=a")]
+        refer = _msg(
+            6.6,
+            "tx",
+            "REFER sip:pbx SIP/2.0",
+            [*call, ("CSeq", "3 REFER"), ("Refer-To", "<sip:3000@pbx>")],
+        )
+        refused = _msg(6.61, "rx", "SIP/2.0 603 Decline", [*call, ("CSeq", "3 REFER")])
+        dial = [("Call-ID", "d"), ("To", "<sip:3000@pbx>")]
+        msgs = [refer, refused]
+        for cseq, status in ((1, "401 Unauthorized"), (2, "200 OK")):
+            head = [*dial, ("CSeq", f"{cseq} INVITE")]
+            msgs.append(
+                _msg(6.62 + cseq / 100, "tx", "INVITE sip:3000@pbx SIP/2.0", head)
+            )
+            msgs.append(_msg(6.63 + cseq / 100, "rx", f"SIP/2.0 {status}", head))
+        human = [{"type": "call_state", "state": "CONFIRMED", "t": 6.7}]
+        checks = {
+            c.name: c.ok
+            for c in check_refer_refuse(
+                self._srw("refer-refuse", msgs, self.DRIVER, human)
+            )
+        }
+        assert checks["refer_refused"] and checks["call_stays_up"]
+        assert checks["driver_referred"] and checks["fallback_dialled"]
+        assert checks["human_answered"] and "human_not_called" not in checks
+        # The stand-in keeps the WP0 expectation: nobody calls the human.
+        standin = {
+            c.name for c in check_refer_refuse(_calldata("refer-refuse", msgs[:2]))
+        }
+        assert "human_not_called" in standin and "fallback_dialled" not in standin
 
 
 class TestBenchConfigConsistency:

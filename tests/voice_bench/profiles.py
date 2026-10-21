@@ -59,6 +59,10 @@ class CallData:
     keywords: dict[str, list[str]]  # role -> keywords of that party's own WAV
     heard_from_dut: list[str]  # what the caller must hear from the DUT
     contacts_before: str = ""
+    # standin | external | srw (SRW's addon + gateway; ``driver`` is the
+    # harness's log of what SRW's side saw through the gateway's API)
+    dut_mode: str = "standin"
+    driver: list[dict] = field(default_factory=list)
     windows: dict[str, Window] = field(default_factory=dict)
     transcripts: dict[str, str] = field(default_factory=dict)
     audio: dict[str, dict] = field(default_factory=dict)  # window -> level stats
@@ -79,6 +83,13 @@ class CallData:
     def t_disconnected(self, role: str) -> float | None:
         event = self.first_event(role, "call_state", state="DISCONNECTED")
         return event["t"] if event else None
+
+    def driver_seen(self, kind: str, **match) -> list[dict]:
+        return [
+            e
+            for e in self.driver
+            if e.get("kind") == kind and all(e.get(k) == v for k, v in match.items())
+        ]
 
 
 @dataclass
@@ -150,11 +161,63 @@ def common_checks(data: CallData) -> list[Check]:
         checks.append(_audio_check(data, "caller_full", "caller_hears_dut"))
     if data.standin:
         checks.append(_audio_check(data, "dut_full", "dut_hears_caller"))
+    elif data.dut_mode == "srw":
+        checks.append(
+            Check(
+                "dut_hears_caller",
+                None,
+                "SRW keeps no audio; the caller hearing its own words proves it",
+            )
+        )
+        checks += gateway_checks(data)
     else:
         checks.append(
             Check("dut_hears_caller", None, "external device: check its own transcript")
         )
     return checks
+
+
+def gateway_checks(data: CallData) -> list[Check]:
+    """SRW's side of the call, from the driver harness's log (``--dut srw``)."""
+    connector = "bench-peer" if not data.profile.dut_registers else "bench-register"
+    hooks = data.driver_seen("webhook")
+    names = {h["name"] for hook in hooks for h in hook.get("sip_headers", [])}
+    accepted = data.driver_seen("accepted", status=200)
+    started = data.driver_seen("event", event="session.started")
+    closed = data.driver_seen("event", event="session.closed")
+    reasons = [e.get("reason") for e in closed]
+    data.observed["gateway"] = {
+        "webhooks": [h["connector"] for h in hooks],
+        "headers": sorted(names),
+        "closed": reasons,
+    }
+    return [
+        Check(
+            "gateway_webhook",
+            len(hooks) == 1
+            and hooks[0]["connector"] == connector
+            and {"From", "To"} <= names,
+            f"{len(hooks)} signed webhook(s) for {[h['connector'] for h in hooks]}, "
+            f"headers {sorted(names)}",
+        ),
+        Check(
+            "gateway_session",
+            len(accepted) == 1 and len(started) == 1,
+            f"accepted {len(accepted)}, session.started {len(started)}",
+        ),
+        Check(
+            "gateway_closed",
+            reasons == ["remote_hangup"],
+            f"session.closed reasons {reasons}",
+        ),
+    ]
+
+
+def _driver_digits(data: CallData) -> str:
+    return "".join(
+        e.get("digit") or ""
+        for e in data.driver_seen("event", event="transport.dtmf.received")
+    )
 
 
 def default_windows(data: CallData) -> dict[str, Window]:
@@ -306,6 +369,16 @@ def check_dtmf_info(data: CallData) -> list[Check]:
                 f"DUT saw {digits!r} via {methods}",
             )
         )
+    elif data.dut_mode == "srw":
+        digits = _driver_digits(data)
+        data.observed["dtmf_seen"] = digits
+        checks.append(
+            Check(
+                "dut_saw_digits",
+                digits == DTMF_DIGITS,
+                f"transport.dtmf.received at SRW's driver: {digits!r}",
+            )
+        )
     else:
         checks.append(
             Check("dut_saw_digits", None, "external device: check its own DTMF log")
@@ -334,6 +407,16 @@ def check_dtmf_rfc4733(data: CallData) -> list[Check]:
                 "dut_saw_digits",
                 digits == DTMF_DIGITS and methods == ["rfc4733"],
                 f"DUT saw {digits!r} via {methods}",
+            )
+        )
+    elif data.dut_mode == "srw":
+        digits = _driver_digits(data)
+        data.observed["dtmf_seen"] = digits
+        checks.append(
+            Check(
+                "dut_saw_digits",
+                digits == DTMF_DIGITS,
+                f"transport.dtmf.received at SRW's driver: {digits!r}",
             )
         )
     else:
@@ -614,12 +697,50 @@ def check_refer_accept(data: CallData) -> list[Check]:
     ]
     if data.standin:
         checks.append(_audio_check(data, "dut_full", "dut_hears_caller"))
+    if data.dut_mode == "srw":
+        checks.append(_driver_referred(data))
     return checks
+
+
+def _driver_referred(data: CallData) -> Check:
+    referred = data.driver_seen("referred")
+    return Check(
+        "driver_referred",
+        [e.get("status") for e in referred] == [200],
+        f"refer requests from SRW's driver answered {[e.get('status') for e in referred]}",
+    )
+
+
+def _fallback_invites(data: CallData) -> list[SipMessage]:
+    """The device's own INVITEs to the human extension (a new dialog; the
+    first is usually challenged, the retry carries credentials)."""
+    return [
+        m
+        for m in data.dut_msgs
+        if m.is_request
+        and m.method == "INVITE"
+        and m.direction == "tx"
+        and not m.has_to_tag
+        and f"sip:{HUMAN_EXTENSION}@" in m.start
+    ]
 
 
 def windows_refer_refuse(data: CallData) -> dict[str, Window]:
     windows = default_windows(data)
     refer = _refer(data)
+    t_human = data.t_confirmed("human")
+    if data.dut_mode == "srw" and t_human:
+        # SRW dials the target itself once the PBX refuses (§4.2 step 7).
+        windows["caller_after_fallback"] = Window(
+            "caller",
+            t_human + 0.5,
+            None,
+            data.keywords["human"],
+            "caller hears the human after the fallback transfer",
+        )
+        windows["human_full"] = Window(
+            "human", None, None, data.keywords["caller"], "human hears the caller"
+        )
     if refer:
         refusal = [
             m for m in response_to(data.dut_msgs, refer) if m.status and m.status >= 300
@@ -669,17 +790,72 @@ def check_refer_refuse(data: CallData) -> list[Check]:
             not early_bye,
             f"BYE before the caller's hangup: {len(early_bye)}",
         ),
+    ]
+    if data.dut_mode != "srw":
+        checks += [
+            Check(
+                "human_not_called",
+                not human_called,
+                "human extension rang" if human_called else "human untouched",
+            ),
+            _audio_check(
+                data, "caller_after_refusal", "caller_hears_dut_after_refusal"
+            ),
+        ]
+        return checks
+    # SRW falls back to dialling the target through its own line and bridging
+    # it with the caller, who never leaves (local_voice_gateway.md §4.2).
+    statuses = [final_status(data.dut_msgs, m) for m in _fallback_invites(data)]
+    t_human = data.t_confirmed("human")
+    data.observed["fallback_invites"] = statuses
+    checks += [
+        _driver_referred(data),
         Check(
-            "human_not_called",
-            not human_called,
-            "human extension rang" if human_called else "human untouched",
+            "fallback_dialled",
+            200 in statuses,
+            f"INVITEs from the device to {HUMAN_EXTENSION} answered {statuses}",
         ),
-        _audio_check(data, "caller_after_refusal", "caller_hears_dut_after_refusal"),
+        Check(
+            "human_answered",
+            t_human is not None,
+            "human extension confirmed the call" if t_human else "no call",
+        ),
+        _audio_check(
+            data, "caller_after_fallback", "caller_hears_human_after_fallback"
+        ),
+        _audio_check(data, "human_full", "human_hears_caller"),
     ]
     return checks
 
 
+def _webhook_headers(data: CallData, name: str) -> list[str]:
+    return [
+        h["value"]
+        for hook in data.driver_seen("webhook")
+        for h in hook.get("sip_headers", [])
+        if h["name"].lower() == name.lower()
+    ]
+
+
 def _diversion_checks(data: CallData, expect: bool, number: str) -> list[Check]:
+    checks = _diversion_sip_checks(data, expect, number)
+    if data.dut_mode == "srw":
+        diversion = _webhook_headers(data, "Diversion")
+        history = _webhook_headers(data, "History-Info")
+        found = any(number in d for d in diversion) and any(
+            number in h for h in history
+        )
+        checks.append(
+            Check(
+                "webhook_carries_diversion" if expect else "webhook_without_diversion",
+                found if expect else not (diversion or history),
+                f"webhook sip_headers: Diversion {diversion}, History-Info {history}",
+            )
+        )
+    return checks
+
+
+def _diversion_sip_checks(data: CallData, expect: bool, number: str) -> list[Check]:
     invite = initial_invite(data.dut_msgs)
     diversion = invite.header("Diversion") if invite else []
     history = invite.header("History-Info") if invite else []

@@ -1,0 +1,52 @@
+# WP2 device under test (scripts/voice-bench.sh run --dut srw): SRW's
+# Asterisk addon with its rendered config, the voice gateway with the
+# Asterisk source and the echo engine, and a harness in SRW's driver role.
+# The gateway and the harness share the addon's network namespace, so ARI,
+# the media WebSocket and the webhook stay on loopback, as in one pod.
+services:
+  addon:
+    image: srw-asterisk:22.11.0
+    # The rendered files are 0640 and owned by the user running the bench.
+    group_add:
+      - "${VOICE_BENCH_GID:-1000}"
+    volumes:
+      - ${VOICE_BENCH_SRW:-./.run/srw}/addon/etc:/etc/asterisk:ro
+    networks:
+      bench:
+        ipv4_address: ${VOICE_BENCH_ADDON_IP:-172.30.86.50}
+    depends_on:
+      pbx:
+        condition: service_healthy
+
+  gateway:
+    image: srw-voice-bench-gateway:py3.12
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    user: "${VOICE_BENCH_UID:-1000}:${VOICE_BENCH_GID:-1000}"
+    network_mode: service:addon
+    # Nothing in the gateway may write a file (no audio on disk).
+    read_only: true
+    command: ["python", "-m", "voice_gateway", "--config", "/bench/gateway/gateway.yaml"]
+    volumes:
+      - ${VOICE_BENCH_SRC:-../../src}:/app/src:ro
+      - ${VOICE_BENCH_SRW:-./.run/srw}/gateway:/bench/gateway:ro
+    stop_grace_period: 10s
+    depends_on:
+      addon:
+        condition: service_healthy
+
+  driver:
+    image: srw-voice-bench-gateway:py3.12
+    user: "${VOICE_BENCH_UID:-1000}:${VOICE_BENCH_GID:-1000}"
+    network_mode: service:addon
+    read_only: true
+    command: ["python", "/bench/srw_driver.py", "--config", "/bench/driver/driver.json"]
+    volumes:
+      - ${VOICE_BENCH_SRC:-../../src}:/app/src:ro
+      - ./srw_driver.py:/bench/srw_driver.py:ro
+      - ${VOICE_BENCH_SRW:-./.run/srw}/driver:/bench/driver
+    stop_grace_period: 5s
+    depends_on:
+      addon:
+        condition: service_healthy

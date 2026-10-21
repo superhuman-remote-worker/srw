@@ -15,6 +15,7 @@ CACHE_DIR = BENCH_DIR / ".cache"
 MODELS_DIR = CACHE_DIR / "models"
 AUDIO_DIR = CACHE_DIR / "audio"
 RUN_DIR = BENCH_DIR / ".run"
+SRW_DIR = RUN_DIR / "srw"
 RESULTS_DIR = BENCH_DIR / "results"
 ENV_FILE = BENCH_DIR / ".env"
 TESTSET_DIR = BENCH_DIR / "testset" / "de"
@@ -67,6 +68,11 @@ class Network:
     def caller(self) -> str:
         return self.host(40)
 
+    @property
+    def addon(self) -> str:
+        """SRW's Asterisk addon in ``--dut srw`` mode (WP2)."""
+        return self.host(50)
+
 
 @dataclass
 class ExternalDut:
@@ -80,6 +86,7 @@ class ExternalDut:
 class Compose:
     network: Network = field(default_factory=Network)
     external: ExternalDut | None = None
+    srw: bool = False  # add SRW's addon, gateway and driver (compose.srw.yaml)
 
     def env(
         self, out_dir: Path | None = None, work_dir: Path | None = None
@@ -100,6 +107,9 @@ class Compose:
                 "VOICE_BENCH_DUT_IP": self.network.dut,
                 "VOICE_BENCH_HUMAN_IP": self.network.human,
                 "VOICE_BENCH_CALLER_IP": self.network.caller,
+                "VOICE_BENCH_ADDON_IP": self.network.addon,
+                "VOICE_BENCH_SRW": str(SRW_DIR),
+                "VOICE_BENCH_SRC": str(REPO_ROOT / "src"),
             }
         )
         if self.external:
@@ -110,6 +120,8 @@ class Compose:
         args = ["-f", str(BENCH_DIR / "compose.yaml")]
         if self.external:
             args += ["-f", str(BENCH_DIR / "compose.external.yaml")]
+        if self.srw:
+            args += ["-f", str(BENCH_DIR / "compose.srw.yaml")]
         return args
 
     def run(
@@ -132,6 +144,8 @@ class Compose:
             timeout=timeout,
         )
 
-    def asterisk(self, command: str) -> str:
-        result = self.run("exec", "-T", "pbx", "asterisk", "-rx", command, check=False)
+    def asterisk(self, command: str, service: str = "pbx") -> str:
+        result = self.run(
+            "exec", "-T", service, "asterisk", "-rx", command, check=False
+        )
         return result.stdout

@@ -1,6 +1,6 @@
 """WP0 phone test bench runner (entry point: scripts/voice-bench.sh).
 
-    scripts/voice-bench.sh run [--profile a,b] [--skip-slow] [--dut standin|external ...]
+    scripts/voice-bench.sh run [--profile a,b] [--skip-slow] [--dut standin|external|srw ...]
     scripts/voice-bench.sh list | models | audio | build | standin up|down | down
 
 ``run`` downloads the pinned models, builds the images, renders the German
@@ -24,7 +24,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tests.voice_bench import assets, render_audio
+from tests.voice_bench import assets, render_audio, srw
 from tests.voice_bench.analysis import (
     load_events,
     messages_from_events,
@@ -165,7 +165,7 @@ def setup_pbx(args: argparse.Namespace, fresh: bool) -> tuple[Compose, tuple[str
     external = None
     if getattr(args, "external_address", None):
         external = ExternalDut(args.external_address, args.sip_port)
-    compose = Compose(network, external)
+    compose = Compose(network, external, srw=getattr(args, "dut", None) == "srw")
     render_pbx_config(network, external, peer)
     start_pbx(compose, fresh=fresh or not pbx_running(compose))
     return compose, peer
@@ -391,10 +391,11 @@ def run_profile(
     compose: Compose,
     profile: Profile,
     out: Path,
-    standin: bool,
+    mode: str,
     heard_from_dut: list[str],
     threads: int,
 ) -> dict:
+    standin = mode == "standin"
     started_at = time.time()
     result = {
         "name": profile.name,
@@ -406,7 +407,13 @@ def run_profile(
     }
     try:
         out.mkdir(parents=True, exist_ok=True)
+        offset = srw.driver_offset() if mode == "srw" else 0
         pbx_text = run_call(compose, profile, out, standin)
+        driver = srw.driver_events(offset) if mode == "srw" else []
+        if driver:
+            (out / "driver.events.jsonl").write_text(
+                "".join(json.dumps(e) + "\n" for e in driver), encoding="utf-8"
+            )
         roles = ("caller", "dut", "human") if standin else ("caller", "human")
         events = {role: load_events(out / f"{role}.events.jsonl") for role in roles}
         summary = {}
@@ -431,6 +438,8 @@ def run_profile(
             keywords={role: spec["keywords"] for role, spec in voices.items()},
             heard_from_dut=heard_from_dut,
             contacts_before=(out / "contacts_before.txt").read_text(encoding="utf-8"),
+            dut_mode=mode,
+            driver=driver,
         )
         place_windows(data)
         transcribe(compose, data, threads)
@@ -472,6 +481,11 @@ def parse_host_port(value: str, default_port: int = 5060) -> tuple[str, int]:
 
 def cmd_run(args: argparse.Namespace) -> int:
     standin = args.dut == "standin"
+    if args.dut == "srw":
+        # SRW's own addon on the bench network (srw.py): registers as 2000,
+        # takes the peer profile at its own address.
+        args.dut_peer = args.dut_peer or f"{Network(args.subnet).addon}:5060"
+        args.wait_registration = args.wait_registration or 60
     if not standin and not args.dut_peer:
         log(
             "--dut external needs --dut-peer HOST[:PORT] (where the peer profile sends its INVITE)"
@@ -504,8 +518,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if rendered:
         log(f"rendered {rendered} WAV set(s)")
     # The stand-in run always starts from a clean PBX; an external device's
-    # registration lives in the running PBX, so external runs reuse it.
-    compose, peer = setup_pbx(args, fresh=standin)
+    # registration lives in the running PBX, so external runs reuse it. SRW's
+    # stack starts fresh with it.
+    compose, peer = setup_pbx(args, fresh=args.dut != "external")
+    if args.dut == "srw":
+        log("starting SRW's Asterisk addon, voice gateway and driver harness")
+        srw.prepare(compose.network, f"sip:{HUMAN_EXTENSION}@{compose.network.pbx}")
+        srw.up(compose, timeout=args.wait_registration)
     if not standin:
         print_device_hints(compose, args)
         if args.wait_registration:
@@ -514,7 +533,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 args.wait_registration,
                 "extension 2000 to register",
             )
-    keep_up = args.keep_up or not standin
+    keep_up = args.keep_up or args.dut == "external"
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     results_dir = Path(args.results).resolve() if args.results else RESULTS_DIR / stamp
@@ -541,7 +560,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 + (" (slow)" if profile.slow else "")
             )
             result = run_profile(
-                compose, profile, results_dir / name, standin, heard, args.threads
+                compose, profile, results_dir / name, args.dut, heard, args.threads
             )
             report["profiles"].append(result)
             failed = [
@@ -555,7 +574,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             (results_dir / "report.json").write_text(
                 json.dumps(report, indent=2, ensure_ascii=False), "utf-8"
             )
+        if args.dut == "srw":
+            # A5: nothing in the addon, the gateway or the driver wrote audio.
+            report["no_audio_written"] = srw.audio_check(compose)
+            log(
+                "no audio written by addon/gateway/driver: "
+                + ("yes" if report["no_audio_written"]["ok"] else "NO")
+            )
+            if not report["no_audio_written"]["ok"]:
+                exit_code = 1
     finally:
+        if args.dut == "srw":
+            srw.logs(compose, results_dir)
+            if not keep_up:
+                srw.down(compose)
         if not keep_up:
             compose.run("down", "--remove-orphans", check=False, timeout=120)
     statuses = [p["status"] for p in report["profiles"]]
@@ -643,12 +675,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="leave out slow profiles (session-timer)",
     )
-    run.add_argument("--dut", choices=("standin", "external"), default="standin")
+    run.add_argument(
+        "--dut",
+        choices=("standin", "external", "srw"),
+        default="standin",
+        help="standin (pjsua), external (a device you run) or srw (SRW's own "
+        "Asterisk addon, voice gateway and echo engine; WP2)",
+    )
     run.add_argument(
         "--dut-expect",
         default=None,
         help="what the caller must hear from the DUT: standin (default with the stand-in), "
-        "echo (default for external: the caller's own words) or comma-separated keywords",
+        "echo (default for external and srw: the caller's own words) or comma-separated keywords",
     )
 
     def device_options(p: argparse.ArgumentParser) -> None:
@@ -686,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--keep-up",
         action="store_true",
-        help="leave the PBX running afterwards (always the case with --dut external)",
+        help="leave the PBX (and SRW's stack) running afterwards (always with --dut external)",
     )
     up = sub.add_parser("up", help="start the bench PBX for an external device")
     device_options(up)

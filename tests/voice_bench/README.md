@@ -30,6 +30,7 @@ virtual environment has it; `SRW_PYTHON` picks another interpreter).
 scripts/voice-bench.sh run                    # every profile against the stand-in
 scripts/voice-bench.sh run --skip-slow        # without session-timer
 scripts/voice-bench.sh run --profile dtmf-info,refer-accept
+scripts/voice-bench.sh run --dut srw          # SRW's addon + gateway + echo engine (WP2)
 scripts/voice-bench.sh list                   # profiles and what they imitate
 ```
 
@@ -86,6 +87,7 @@ recording contains the caller's keywords (stand-in only).
 | Caller, stand-in device, human | `srw-voice-bench-ua:pjsua-2.17`: pjsua (pjproject 2.17, GPL-2.0, test container only) driven by `ua/ua_agent.py` | pjproject tarball from Asterisk's third-party mirror (sha256) |
 | Transcription | `srw-voice-bench-whisper:1.9.5`: whisper.cpp v1.9.5 (MIT), CPU, model `ggml-small.bin` (multilingual) | GitHub release tag archive (sha256); model from huggingface.co/ggerganov/whisper.cpp at a pinned commit (sha256) |
 | Test voices | `srw-voice-bench-piper:2023.11.14-2`: Piper (MIT) + sox; voice `de_DE-mls-medium` | GitHub release (sha256); voice from huggingface.co/rhasspy/piper-voices at a pinned commit (sha256) |
+| SRW gateway and driver (`--dut srw`) | `srw-voice-bench-gateway:py3.12`: python:3.12-slim (digest-pinned) with aiohttp and PyYAML; the code is mounted from the repository | PyPI wheels, hashes from `requirements/locks/vm-controller-py312.txt` |
 
 **Why pjsua.** It is pjproject's reference user agent: unattended
 auto-answer, looping WAV playback, recording of the far end, RFC 4733 and SIP
@@ -104,9 +106,52 @@ sentences (questions, anything starting with "Hallo"), so the three bench
 lines in `testset/de/voices.yaml` were picked because whisper transcribes
 them reliably after a G.711 round trip.
 
+## SRW's own stack as the device (WP2)
+
+```bash
+scripts/voice-bench.sh run --dut srw                 # all 11 profiles
+scripts/voice-bench.sh run --dut srw --skip-slow     # without session-timer
+```
+
+Runs every profile against SRW's local voice path instead of the stand-in
+(`srw.py`, `compose.srw.yaml`):
+
+- **addon** (`.50` on the bench network): `srw-asterisk` with the
+  `/etc/asterisk` that `python -m voice_gateway.asterisk.render` writes from
+  bench line values: line `bench` registers as extension 2000, line
+  `bench-peer` takes the peer profile's INVITE at the addon's address.
+- **gateway**: `python -m voice_gateway` with `source: {kind: asterisk}` and
+  the `echo` profile, so the caller hears its own words back.
+- **driver**: `srw_driver.py` in SRW's role: it receives the gateway's signed
+  webhook (verified with the orchestrator's own code), accepts with `echo`,
+  attaches, sends a greeting append like the gpt-live-sip driver, and on
+  DTMF 9 asks the gateway to transfer to `sip:3000@<PBX>`.
+
+The gateway and the driver share the addon's network namespace, so ARI, the
+media WebSocket and the webhook stay on loopback. They run from the
+repository (mounted read-only) in a test-only Python image
+(`docker/Dockerfile.gateway`, hash-pinned aiohttp and PyYAML). All secrets
+are fresh throwaway values under `.run/srw/`.
+
+On top of the external-device checks, the runner reads the driver's log
+(`driver.events.jsonl` per profile) and asserts one signed webhook for the
+right line with From/To (and Diversion/History-Info for `diversion-on`, none
+for `diversion-off`), accept + `session.started`, `session.closed` with
+`remote_hangup`, the DTMF digits SRW received (`2580#` for both DTMF
+profiles), and the transfer request. `refer-refuse` asserts SRW's fallback
+instead of the stand-in's behaviour: after the 603 the addon dials 3000
+itself through its line, the human answers, and the caller, who never left,
+hears the human (the bench PBX lets extension 2000 call 3000, as any PBX
+lets an internal phone call the reception). After the last profile,
+`no_audio_written` in the report lists every file the addon, the gateway and
+the driver changed in their containers (`docker diff`): the gateway and the
+driver run read-only, and the addon may only keep its astdb and control
+socket. The services' logs are saved as `srw-*.log` in the results.
+
 ## Plugging in a real device (WP2)
 
-Run the profiles against WP2's Asterisk addon instead of the stand-in:
+Run the profiles against another device (or a manually run addon) instead of
+the stand-in:
 
 ```bash
 scripts/voice-bench.sh up --dut-peer <device-ip>[:port]       # start the PBX, print the settings
