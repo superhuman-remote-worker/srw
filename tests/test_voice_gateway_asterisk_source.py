@@ -76,6 +76,7 @@ class FakeAsterisk:
         self.media_mode = "connect"
         self.transfer = ("SUCCESS", "0")
         self.dial = "answer"
+        self.continue_status: int | None = None
         self.tasks: set[asyncio.Task] = set()
         self.http: aiohttp.ClientSession | None = None
         self.app = web.Application()
@@ -158,7 +159,15 @@ class FakeAsterisk:
                 self.spawn(self.emit("ChannelDestroyed", params["channelId"], cause=3))
             return web.json_response({"id": params["channelId"]})
         if request.method == "POST" and parts[-1] == "continue":
-            self.spawn(self.run_transfer(parts[1]))
+            if self.continue_status is not None:
+                return web.json_response(
+                    {"message": "Channel not found"}, status=self.continue_status
+                )
+            if params.get("context") == "srw-handover":
+                # The caller leaves the app; Bridge() takes the dial leg out.
+                self.spawn(self.emit("StasisEnd", parts[1]))
+            else:
+                self.spawn(self.run_transfer(parts[1]))
         elif request.method == "POST" and len(parts) == 2 and "endpoint" in params:
             self.spawn(self.originate(parts[1], params["appArgs"]))
         elif request.method == "DELETE" and parts[0] == "channels":
@@ -435,7 +444,7 @@ async def test_refused_refer_dials_the_target_and_bridges_the_caller(stack):
     adds = [
         q["channel"] for m, p, q in fake.calls if p == f"/bridges/{bridge}/addChannel"
     ]
-    assert adds == ["caller-1", media, "caller-1", dial]
+    assert adds == ["caller-1", media, "caller-1"]
     assert fake.made(
         "POST",
         f"/channels/{dial}",
@@ -444,13 +453,51 @@ async def test_refused_refer_dials_the_target_and_bridges_the_caller(stack):
         appArgs="SRW_DIAL",
         callerId="1000",
     )
-    # ... and once it answered, caller and target share the bridge.
-    assert fake.made("POST", f"/bridges/{bridge}/removeChannel", channel=media)
+    # ... and once it answered, the caller leaves the app for the hand-over
+    # context, whose Bridge() joins it with the target outside Stasis.
+    assert fake.made(
+        "POST", "/channels/caller-1/variable", variable="SRW_HANDOVER_TO", value=dial
+    )
     assert fake.made("DELETE", f"/channels/{media}")
+    assert fake.made("POST", "/channels/caller-1/continue", context="srw-handover")
+    assert fake.made("DELETE", f"/bridges/{bridge}")
     assert not fake.made("DELETE", "/channels/caller-1")
-    # The target hanging up ends the caller's call too.
+    assert not fake.made("DELETE", f"/channels/{dial}")
+    # The source let go: the two parties' later events are none of its
+    # business, and stopping the gateway leaves them talking.
+    await until(lambda: not gateway.source.calls and not gateway.source.channels)
     await fake.emit("ChannelDestroyed", dial, cause=16)
-    await until(lambda: fake.made("DELETE", "/channels/caller-1"))
+    await gateway.source.stop()
+    assert not fake.made("DELETE", "/channels/caller-1")
+    assert not fake.made("DELETE", f"/channels/{dial}")
+
+
+@pytest.mark.asyncio
+async def test_a_hand_over_that_fails_ends_the_call(stack):
+    """The caller hung up just as the target answered (continue: 404): the
+    source hangs up what is left instead of leaving the target ringing on."""
+    gateway, client, fake, deliveries = await stack()
+    fake.transfer = ("FAILURE", "603")
+    session = await answered(client, fake, deliveries, gateway)
+    dial = f"{session.id}-dial"
+    fake.continue_status = None
+    # The transfer runs normally; only the hand-over's continue fails.
+    original = fake.originate
+
+    async def originate(channel, args):
+        fake.continue_status = 404
+        await original(channel, args)
+
+    fake.originate = originate
+    response = await client.post(
+        f"/v1/live/sessions/{session.id}/refer",
+        json={"target_uri": "sip:3000@pbx.test"},
+    )
+    assert response.status == 200
+    await until(lambda: session.state == "closed")
+    assert session.close_reason == "connection_lost"
+    await until(lambda: fake.made("DELETE", f"/channels/{dial}"))
+    assert fake.made("DELETE", "/channels/caller-1")
     await until(lambda: not gateway.source.calls)
 
 

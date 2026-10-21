@@ -9,6 +9,7 @@ the transcripts of their recordings.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -738,6 +739,15 @@ def windows_refer_refuse(data: CallData) -> dict[str, Window]:
             data.keywords["human"],
             "caller hears the human after the fallback transfer",
         )
+        restart = _gateway_restart(data)
+        if restart.get("finished"):
+            windows["caller_after_restart"] = Window(
+                "caller",
+                restart["finished"] + 0.5,
+                None,
+                data.keywords["human"],
+                "caller still hears the human after the gateway restarted",
+            )
         windows["human_full"] = Window(
             "human", None, None, data.keywords["caller"], "human hears the caller"
         )
@@ -754,6 +764,45 @@ def windows_refer_refuse(data: CallData) -> dict[str, Window]:
             "caller still hears the DUT after the refusal",
         )
     return windows
+
+
+def _gateway_restart(data: CallData) -> dict:
+    """What the bench's gateway restart did during this call (``--dut srw``)."""
+    path = data.out / "gateway_restart.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _restart_checks(data: CallData, t_human: float | None) -> list[Check]:
+    """A handed-over call lives in the addon's dialplan, outside the
+    gateway's app: restarting the gateway (a rollout) must not drop it."""
+    restart = _gateway_restart(data)
+    if not restart:
+        return []
+    t_disc = data.t_disconnected("caller")
+    t_conf = data.t_confirmed("caller")
+    scheduled = t_conf + data.profile.hangup_after if t_conf else None
+    ok = (
+        restart.get("ok")
+        and t_human is not None
+        and restart["started"] > t_human
+        and t_disc is not None
+        and t_disc > restart["finished"]
+        and scheduled is not None
+        and t_disc >= scheduled - 1.0
+    )
+    detail = (
+        restart.get("error")
+        or f"restart {restart['started'] - t_human:.1f}-{restart['finished'] - t_human:.1f} s "
+        f"after the human answered; caller hung up "
+        f"{(t_disc or 0) - (t_conf or 0):.1f} s into the call "
+        f"(scheduled {data.profile.hangup_after:.0f} s)"
+        if t_human
+        else "the human never answered"
+    )
+    return [
+        Check("handed_over_call_survives_gateway_restart", bool(ok), detail),
+        _audio_check(data, "caller_after_restart", "caller_hears_human_after_restart"),
+    ]
 
 
 def check_refer_refuse(data: CallData) -> list[Check]:
@@ -825,6 +874,7 @@ def check_refer_refuse(data: CallData) -> list[Check]:
         ),
         _audio_check(data, "human_full", "human_hears_caller"),
     ]
+    checks += _restart_checks(data, t_human)
     return checks
 
 

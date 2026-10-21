@@ -11,9 +11,12 @@ source keeps it ringing and announces it through ``Gateway.incoming_call``.
 - refer: the caller leaves Stasis for the transfer context, whose Transfer()
   sends a blind REFER and returns with the result. If the PBX refuses, the
   source dials the target through the same line while the caller stays with
-  the voice, then bridges caller and target itself. (ARI's own redirect
-  sends the REFER too, but reports no outcome and reads frames from a
-  bridged channel's control thread.)
+  the voice; once the target answers, the caller leaves the app for the
+  hand-over context, whose Bridge() joins it with the target outside
+  Stasis, and the source forgets the call: a gateway restart or rollout
+  never drops a handed-over call. (ARI's own redirect sends the REFER too,
+  but reports no outcome and reads frames from a bridged channel's control
+  thread.)
 - DTMF arrives as ChannelDtmfReceived whichever way the PBX sent it.
 
 Logs carry session ids, lines and outcomes; never numbers or SIP headers.
@@ -40,6 +43,8 @@ from voice_gateway.asterisk import (
     DEFAULT_MEDIA_CONNECTION,
     DIAL_ARG,
     ENDPOINT_PREFIX,
+    HANDOVER_CONTEXT,
+    HANDOVER_VAR,
     PBX_VAR,
     REFER_TO_VAR,
     TRANSFER_CONTEXT,
@@ -140,7 +145,8 @@ class Call:
         self.pbx: str | None = None
         self.media = self.bridge = self.dial = None
         self.port: MediaPort | None = None
-        # ringing -> answered <-> transferring -> handed_over | ended
+        # ringing -> answered <-> transferring; answered -> handed_over (the
+        # dialplan bridges caller and target; the source lets go) | ended
         self.state = "ringing"
         # The gateway is ending the call, so losing its channels is expected.
         self.ending = False
@@ -368,16 +374,12 @@ class AsteriskCallSource:
             if channel == call.caller and args[1:2] == ["transfer"]:
                 await self.transfer_result(call, args[2:])
             elif channel == call.dial:
-                await self.hand_over(call)
+                return await self.hand_over(call)
         elif kind == "ChannelDestroyed":
             if channel == call.caller:
                 if not call.ending:
                     logger.info("call %s: caller hung up", call.sid)
                 await self.end(call, "remote_hangup", caller=False)
-                return True
-            if channel == call.dial and call.state == "handed_over":
-                logger.info("call %s: transfer target hung up", call.sid)
-                await self.end(call, None, caller=True)
                 return True
             if channel == call.dial:
                 logger.info("call %s: transfer target not reached", call.sid)
@@ -511,25 +513,44 @@ class AsteriskCallSource:
             self.channels.pop(call.dial, None)
             call.dial = None
 
-    async def hand_over(self, call: Call) -> None:
-        """The target answered the fallback dial: bridge it with the caller
-        and end the voice session; the caller never left."""
+    async def hand_over(self, call: Call) -> bool:
+        """The target answered the fallback dial: end the voice and hand the
+        caller to the target outside the app; True once the source let go.
+
+        The caller leaves Stasis for the hand-over context, whose Bridge()
+        pulls the answered dial leg out of the app and joins the two; the
+        bridge is Asterisk's own, so stopping or restarting the gateway
+        leaves the call alone. The source forgets the call's channels."""
         session = call.session
         async with session.lock:
             if call.state != "answered" or call.ending or session.state != "active":
                 await self.hang_up(call.dial)
-                return
+                return False
             call.state = "handed_over"
             try:
-                await self.ari.add_to_bridge(call.bridge, call.dial)
-                await self.ari.remove_from_bridge(call.bridge, call.media)
+                await self.ari.set_variable(call.caller, HANDOVER_VAR, call.dial)
                 await self.hang_up(call.media)
+                await self.ari.continue_in_dialplan(call.caller, HANDOVER_CONTEXT)
             except _FAILURES:
-                logger.warning("call %s: hand-over incomplete", call.sid)
+                # The caller may still sit in the voice's bridge (or has hung
+                # up meanwhile): end the call rather than leave either leg.
+                logger.warning("call %s: hand-over failed", call.sid)
+                call.ending, call.state = True, "ended"
+                await self.release(call, caller=True)
+                await session.close("connection_lost")
+                return True
             if call.port is not None:
                 await call.port.close()
+            try:
+                await self.ari.destroy_bridge(call.bridge)
+            except _FAILURES:
+                pass
+            for channel in (call.caller, call.media, call.dial):
+                self.channels.pop(channel, None)
+            call.ending = True
             logger.info("call %s: caller handed to the transfer target", call.sid)
             await session.close("remote_hangup")
+            return True
 
     # -- teardown ------------------------------------------------------------------------
 

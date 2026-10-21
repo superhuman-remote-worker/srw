@@ -17,6 +17,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -251,6 +252,63 @@ def up(compose: Compose, timeout: float = 60.0) -> None:
     raise TimeoutError(
         "the gateway did not register its ARI app, or 2000 did not register"
     )
+
+
+#: Where the gateway-restart probe records what it did, per profile.
+RESTART_FILE = "gateway_restart.json"
+
+
+def _human_answered(out: Path) -> float | None:
+    path = out / "human.events.jsonl"
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue  # a line pjsua's controller is still writing
+        if event.get("type") == "call_state" and event.get("state") == "CONFIRMED":
+            return event.get("t")
+    return None
+
+
+def restart_gateway_when_answered(
+    compose: Compose, out: Path, timeout: float = 30.0, settle_s: float = 1.0
+) -> threading.Thread:
+    """Restart the gateway once the fallback transfer's target answered.
+
+    The handed-over call (caller and human, bridged by the addon's dialplan
+    outside the gateway's app) must outlive a gateway rollout. Writes
+    ``gateway_restart.json`` (host times, which the parties' event logs
+    share) for the profile's checks; waits for the app to be back."""
+
+    def run() -> None:
+        record: dict = {"ok": False}
+        try:
+            deadline = time.time() + timeout
+            while (answered := _human_answered(out)) is None:
+                if time.time() > deadline:
+                    raise TimeoutError("the human never answered")
+                time.sleep(0.1)
+            record["human_answered"] = answered
+            time.sleep(settle_s)
+            record["started"] = time.time()
+            compose.run("restart", "-t", "10", "gateway", timeout=60)
+            record["finished"] = time.time()
+            deadline = time.time() + timeout
+            while APP not in compose.asterisk("ari show apps", service="addon"):
+                if time.time() > deadline:
+                    raise TimeoutError("the gateway did not reconnect its ARI app")
+                time.sleep(0.25)
+            record["app_back"] = time.time()
+            record["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - recorded for the checks
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        (out / RESTART_FILE).write_text(json.dumps(record), encoding="utf-8")
+
+    thread = threading.Thread(target=run, name="gateway-restart", daemon=True)
+    thread.start()
+    return thread
 
 
 def logs(compose: Compose, out: Path) -> None:

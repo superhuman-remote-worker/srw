@@ -31,6 +31,8 @@ from voice_gateway.asterisk import (
     DEFAULT_APP,
     DEFAULT_MEDIA_CONNECTION,
     ENDPOINT_PREFIX,
+    HANDOVER_CONTEXT,
+    HANDOVER_VAR,
     LINE_VAR,
     PBX_VAR,
     REFER_TO_VAR,
@@ -527,6 +529,14 @@ def extensions_conf(v: AddonValues) -> str:
         f"exten => s,1,Transfer(PJSIP/${{{REFER_TO_VAR}}})\n"
         f" same => n,Stasis({v.app},${{{LINE_VAR}}},transfer,${{TRANSFERSTATUS}},"
         "${TRANSFERSTATUSPROTOCOL})\n"
+        " same => n,Hangup()\n"
+    )
+    parts.append(
+        f"[{HANDOVER_CONTEXT}]\n"
+        "; The fallback transfer's target answered: the caller leaves the\n"
+        "; gateway's app and bridges to it here (x: the target's leg ends with\n"
+        "; the bridge), so a gateway restart never drops the two parties.\n"
+        f"exten => s,1,Bridge(${{{HANDOVER_VAR}}},x)\n"
         " same => n,Hangup()\n"
     )
     return "\n".join(parts)

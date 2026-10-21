@@ -276,8 +276,17 @@ def started(out: Path, role: str) -> bool:
     )
 
 
-def run_call(compose: Compose, profile: Profile, out: Path, standin: bool) -> str:
-    """Place the profile's call; returns the PBX log written during it."""
+def run_call(
+    compose: Compose,
+    profile: Profile,
+    out: Path,
+    standin: bool,
+    during=None,
+) -> str:
+    """Place the profile's call; returns the PBX log written during it.
+
+    ``during(out)`` starts a thread that acts on the call while it runs (the
+    gateway restart of ``refer-refuse`` with ``--dut srw``)."""
     network = compose.network
     for role, scenario in scenarios(profile, network, standin).items():
         scenario["out_dir"] = "/bench/out"
@@ -309,6 +318,7 @@ def run_call(compose: Compose, profile: Profile, out: Path, standin: bool) -> st
         "up", "-d", "--force-recreate", "--no-deps", "caller", out_dir=out, timeout=60
     )
     container = compose.run("ps", "-q", "caller", out_dir=out).stdout.strip()
+    acting = during(out) if during is not None else None
     try:
         subprocess.run(
             ["docker", "wait", container],
@@ -317,6 +327,8 @@ def run_call(compose: Compose, profile: Profile, out: Path, standin: bool) -> st
             timeout=profile.hangup_after + 60,
             check=False,
         )
+        if acting is not None:
+            acting.join(timeout=60)
     finally:
         compose.run(
             "stop", "-t", "15", "caller", *parties, out_dir=out, check=False, timeout=60
@@ -411,7 +423,13 @@ def run_profile(
     try:
         out.mkdir(parents=True, exist_ok=True)
         offset = srw.driver_offset() if mode == "srw" else 0
-        pbx_text = run_call(compose, profile, out, standin)
+        during = None
+        if mode == "srw" and profile.name == "refer-refuse":
+            # The handed-over call must outlive a gateway rollout (WP5).
+            def during(out_dir):
+                return srw.restart_gateway_when_answered(compose, out_dir)
+
+        pbx_text = run_call(compose, profile, out, standin, during)
         driver = srw.driver_events(offset) if mode == "srw" else []
         if driver:
             (out / "driver.events.jsonl").write_text(

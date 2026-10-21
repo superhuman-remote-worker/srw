@@ -18,7 +18,12 @@ TRANSFER_CONTEXT = "srw-transfer"
 #: Stasis argument of the fallback transfer's dial leg; upper case, so it
 #: can never be a line name.
 DIAL_ARG = "SRW_DIAL"
+#: Dialplan context a handed-over caller runs: ``Bridge()`` with the answered
+#: dial leg (named by :data:`HANDOVER_VAR`), outside the gateway's app, so a
+#: gateway restart or rollout never drops the two parties.
+HANDOVER_CONTEXT = "srw-handover"
 #: Channel variables the source sets or reads.
 REFER_TO_VAR = "SRW_REFER_TO"
+HANDOVER_VAR = "SRW_HANDOVER_TO"
 LINE_VAR = "SRW_LINE"
 PBX_VAR = "SRW_PBX"
