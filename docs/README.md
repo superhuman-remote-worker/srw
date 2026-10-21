@@ -36,6 +36,8 @@ the site; edit it on GitHub and the site follows.
   register and use a bind-time driver image.
 - [Cloud folders](cloud-folders.md) — the main cloud's project folders, My
   cloud, outboxes and job copies.
+- [Local phone lines](voice-gateway.md) — answer calls on your own phone
+  system with SRW's voice gateway and Asterisk addon.
 - [Build your own workspace image](workspace-images.md) — add your tools and
   run jobs and sessions on them.
 - [SSH access](../ssh-access.md) — connect a terminal or IDE to a live session

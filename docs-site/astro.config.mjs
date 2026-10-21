@@ -79,6 +79,7 @@ export default defineConfig({
 						'k3s-host-preparation',
 						'connector-drivers',
 						'cloud-folders',
+						'voice-gateway',
 						'workspace-images',
 						{
 							label: 'SSH access',
