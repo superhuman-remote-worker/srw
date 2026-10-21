@@ -48,7 +48,7 @@ ACCEPT = {
 }
 HEADERS = {
     "From": ['"Anrufer" <sip:1000@pbx.test>;tag=a1'],
-    "To": ["<sip:2000@addon.test>"],
+    "To": ["<sip:2000@addon.test;line=abcdefg>"],
     "Diversion": ["<sip:200@pbx.test>;reason=unconditional"],
 }
 
@@ -285,6 +285,8 @@ async def test_incoming_call_rings_and_announces_headers(stack):
     names = [name for name, _ in deliveries[0].sip_headers]
     assert names == ["From", "To", "Diversion"]
     assert deliveries[0].sip_header("From") == HEADERS["From"][0]
+    # The registration's line token stays in the addon.
+    assert deliveries[0].sip_header("To") == "<sip:2000@addon.test>"
     assert session.state == "ringing"
 
 

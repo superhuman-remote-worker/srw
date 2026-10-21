@@ -80,6 +80,10 @@ SIP_HEADERS = (
     ("Diversion", 8),
     ("History-Info", 8),
 )
+#: Asterisk's ``;line=`` token in a registered line's Contact. The PBX echoes
+#: it in To and History-Info; it identifies an INVITE as that line's, so it
+#: stays in the addon instead of reaching the orchestrator's call records.
+_LINE_PARAM = re.compile(r";line=[^;>?,\s]*", re.IGNORECASE)
 _SIP_URI = re.compile(r"sips?:[A-Za-z0-9\-_.~*%+;=:@\[\]]{1,200}")
 _TEL_URI = re.compile(r"tel:(\+?[0-9*#][0-9*#\-. ]{0,40})")
 _FAILURES = (AriError, aiohttp.ClientError, TimeoutError)
@@ -179,7 +183,7 @@ async def read_headers(ari: AriClient, channel: str) -> list[dict]:
             value = await ari.variable(channel, f"PJSIP_HEADER(read,{name},{index})")
             if value is None:
                 break
-            headers.append({"name": name, "value": value})
+            headers.append({"name": name, "value": _LINE_PARAM.sub("", value)})
     return headers
 
 
