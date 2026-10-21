@@ -1,8 +1,14 @@
-{{- if .Values.llm.seed.enabled }}
+{{- $voice := include "srw.voiceCatalogSeeded" . }}
+{{- if or .Values.llm.seed.enabled $voice }}
+{{- $seed := .Values.llm.seed.enabled }}
 {{- /*
 Payload for `python -m orchestrator.seed.llm_config`. Stays plaintext-free:
 API keys are referenced via `apiKeyEnv` and injected into the seed Job pod
 via envFrom on the referenced Secrets.
+
+With voiceGateway.catalog.seed, the voice gateway's endpoint and one
+live_voice row per profile join systemEndpoints (the only entries when
+llm.seed.enabled is false).
 
 The seeder is insert-only — re-applying an unchanged payload on `helm upgrade`
 is a no-op, and admin-UI edits to `system_api_keys` / `llm_endpoints`
@@ -23,7 +29,7 @@ metadata:
 data:
   llm.yaml: |
     systemApiKeys:
-      {{- range $provider, $ref := .Values.llm.seed.systemApiKeys }}
+      {{- range $provider, $ref := (ternary .Values.llm.seed.systemApiKeys dict $seed) }}
       - provider: {{ $provider | quote }}
         apiKeyEnv: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
         {{- with $ref.label }}
@@ -34,7 +40,7 @@ data:
         {{- end }}
       {{- end }}
     systemEndpoints:
-      {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
+      {{- range $i, $ep := (ternary .Values.llm.seed.systemEndpoints list $seed) }}
       - label: {{ required "llm.seed.systemEndpoints[].label is required" $ep.label | quote }}
         baseUrl: {{ required "llm.seed.systemEndpoints[].baseUrl is required" $ep.baseUrl | quote }}
         {{- /* apiKeyRef (any mode) or an inline apiKey (dev mode, see
@@ -85,8 +91,30 @@ data:
             enabled: {{ default true .enabled }}
           {{- end }}
       {{- end }}
+      {{- if $voice }}
+      {{- $catalog := .Values.voiceGateway.catalog }}
+      # SRW's voice gateway: one live_voice row per profile (voiceGateway).
+      - label: {{ required "voiceGateway.catalog.endpointLabel is required" $catalog.endpointLabel | quote }}
+        baseUrl: {{ include "srw.voiceGatewayBaseUrl" . | quote }}
+        apiKeyEnv: "SEED_VOICE_GATEWAY_API_KEY"
+        models:
+          {{- range $profile, $_ := .Values.voiceGateway.profiles }}
+          {{- $model := index ($catalog.models | default dict) $profile | default dict }}
+          - id: {{ $profile | quote }}
+            displayName: {{ $model.displayName | default (printf "%s (voice gateway)" $profile) | quote }}
+            capabilities:
+              - "live_voice"
+            params:
+              adapter: "openai-live"
+              rate_usd_per_minute: {{ $model.ratePerMinuteUsd | default 0 }}
+              {{- with $model.voice }}
+              voice: {{ . | quote }}
+              {{- end }}
+            enabled: true
+          {{- end }}
+      {{- end }}
     systemModels:
-      {{- range .Values.llm.seed.systemModels }}
+      {{- range (ternary .Values.llm.seed.systemModels list $seed) }}
       - provider: {{ required "llm.seed.systemModels[].provider is required" .provider | quote }}
         id: {{ required "llm.seed.systemModels[].id is required" .id | quote }}
         displayName: {{ default .id .displayName | quote }}
@@ -133,7 +161,7 @@ data:
     */}}
     {{- $validKinds := list "auxiliary" "browser" "chat" "citation" "embedding" "fetch" "live_voice" "rerank" "search" "search_fallback" "tts" "vision" "whisper" }}
     defaults:
-      {{- range $kind, $decl := .Values.llm.seed.defaults }}
+      {{- range $kind, $decl := (ternary .Values.llm.seed.defaults dict $seed) }}
       {{- if not (has $kind $validKinds) }}
       {{- fail (printf "llm.seed.defaults: unknown kind %q (valid: %s)" $kind (join ", " $validKinds)) }}
       {{- end }}

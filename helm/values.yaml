@@ -480,7 +480,8 @@ connectors:
     # session over, holds the session's sideband, journals it and serves the
     # job's voice subagent. Needs servicePods.enabled and a live_voice
     # catalog model (llm.seed: an OpenAI endpoint plus a gpt-live-1 row with
-    # capabilities [live_voice]). CI stamps tag and digest.
+    # capabilities [live_voice], or a profile of SRW's own voice gateway on
+    # the customer's phone system: voiceGateway). CI stamps tag and digest.
     gptLiveSip:
       enabled: false
       image:
@@ -1075,7 +1076,9 @@ agent:
     #         port: 8000
     extraEgress: []
   # -- Agent pool sizing (AgentProvisioner) — this is the agent COUNT, not DB
-  # connections (see dbPool below).
+  # connections (see dbPool below). An install with phone lines needs a warm
+  # agent per line that may ring at once (buffer and minAgents; see
+  # voiceGateway): a live job waits for an agent like any job.
   pool:
     maxAgents: "10"
     minAgents: "2"
@@ -3794,6 +3797,202 @@ codexProxy:
     limits:
       memory: "2Gi"
       cpu: "1000m"
+
+# =============================================================================
+# Local phone lines: the voice gateway and the Asterisk addon
+# =============================================================================
+# Phone calls on the customer's own phone system (PBX), answered by SRW's own
+# engine instead of OpenAI's GPT-Live (docs/voice-gateway.md). Both off by
+# default. The path of one call:
+#
+#   PBX --SIP/RTP--> asterisk --ARI + audio--> voiceGateway --webhook--> orchestrator
+#                                               ^                        (automation -> live job)
+#                    phone-line driver pod -----+ (accept, transfer, hang up, events)
+#
+# * A phone line is a connector of srw.gpt-live-sip/v1
+#   (connectors.drivers.gptLiveSip, needs connectors.servicePods) whose model
+#   is one of the gateway's profiles: the gateway is that model's live_voice
+#   endpoint, seeded by llm.seed (voiceGateway.catalog).
+# * Each line here names that connector and its webhook secret (the same
+#   whsec_ value the connector holds); the phone system sees an extension
+#   (mode register) or sends calls to Asterisk's address (mode peer).
+# * The driver pod reaches the gateway's in-cluster Service: the Service
+#   admits srw.gpt-live-sip/v1's pods (annotation srw.io/driver-egress) and
+#   the pod's egress is pinned to the gateway's pods, whatever the line's
+#   project network tier.
+# * Back office: every call is a live job that needs an agent at once. Size
+#   agent.pool so a warm agent waits per line that may ring at the same time
+#   (agent.pool.buffer and minAgents of at least the number of lines, with
+#   maxAgents above them plus what jobs and chat use): reservedJobSlots does
+#   not hold a slot for a new job, and a chat session can take a warm agent.
+#   Without one, the caller hears the line's no-job fallback until an agent
+#   starts.
+# * Model servers (STT, voice LLM, TTS) are not part of the chart: a profile
+#   names OpenAI-compatible URLs, like any catalog endpoint.
+voiceGateway:
+  enabled: false
+  # -- SRW's voice gateway image (docker/Dockerfile.voice-gateway); also
+  # renders Asterisk's config. CI stamps tag and digest.
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-voice-gateway
+    tag: latest
+    digest: ""
+    pullPolicy: IfNotPresent
+  # -- A Secret with `api-key` (the gateway's Bearer key, which the seeded
+  # live_voice endpoint carries) and `asterisk-password` (ARI and the audio
+  # connection). Empty: the chart generates both once and keeps them
+  # (resource-policy keep). Name one to manage them in Vault/ESO.
+  existingSecret: ""
+  # -- The phone lines (local_voice_gateway.md §4.4). Per line:
+  #   name           lowercase letters, digits, dashes (at most 31)
+  #   mode           register (an extension on the PBX) or peer (the PBX sends
+  #                  calls to Asterisk's address; no registration)
+  #   pbx            the phone system's host[:port]
+  #   transport      udp (default) or tcp
+  #   extension      the extension the line registers as (register), or the
+  #                  user it calls the PBX as (peer, for transfers)
+  #   username       digest user, when the PBX's auth ID differs
+  #   passwordSecret {name, key}: the extension's SIP password (register)
+  #   connectorId    the SRW phone-line connector this line's calls go to
+  #   webhookSecret  {name, key}: that connector's webhook secret (whsec_...)
+  #   match          peer: addresses the PBX calls from (default: pbx)
+  #   domain, codecs, dtmfMode: per line, rarely needed
+  # Example:
+  #   - name: reception
+  #     mode: register
+  #     pbx: 192.0.2.10
+  #     extension: "2000"
+  #     passwordSecret: {name: srw-voice-lines, key: reception-sip-password}
+  #     connectorId: 00000000-0000-0000-0000-000000000001
+  #     webhookSecret: {name: srw-voice-lines, key: reception-webhook-secret}
+  lines: []
+  # -- The engines a line's catalog model can name, passed to the gateway as
+  # they are (keys as the gateway reads them; src/voice_gateway). Each
+  # profile is one live_voice catalog row (its name is the model id). The
+  # cascade engine names OpenAI-compatible STT, LLM and TTS stages; the image
+  # carries Silero VAD v6.2.3 at /opt/srw-voice/models/silero_vad-v6.2.3.onnx.
+  # A stage's key is a file: mount it with profileSecrets.
+  #   cascade-cpu:
+  #     engine: cascade
+  #     language: de
+  #     stt: {base_url: "http://stt.voice.svc:8000/v1", model: Systran/faster-whisper-small}
+  #     llm: {base_url: "http://llm.voice.svc:8080/v1", model: gemma-4-12b-it}
+  #     tts: {base_url: "http://tts.voice.svc:8000/v1", model: de_DE-mls-medium, voice: "10"}
+  #     turn: {vad_model_file: /opt/srw-voice/models/silero_vad-v6.2.3.onnx}
+  #   echo:
+  #     engine: echo        # plays the caller back: a line test without models
+  profiles: {}
+  # -- Secret keys mounted as files for profiles (a hosted stage's API key):
+  # each {name, secretName, key} lands at /run/srw-voice/profiles/<name>,
+  # which the profile names as its api_key_file.
+  profileSecrets: []
+  # -- An Asterisk of your own instead of the addon (asterisk.enabled false):
+  # its ARI base URL. It needs the asterisk.ari user and app, the
+  # `asterisk-password`, and its media connection pointed at this release's
+  # <release>-voice-gateway-media Service.
+  ari:
+    url: ""
+  # -- Seconds accept waits for a call's audio to start before it fails.
+  mediaTimeoutSeconds: 5
+  # -- Seconds the target rings when the PBX refused a transfer and Asterisk
+  # dials the target itself.
+  dialTimeoutSeconds: 30
+  # -- Extra sources (CIDRs) the media listener admits besides the Asterisk
+  # pods: a hostNetwork Asterisk the gateway does not run beside (its node's
+  # address on the pod network), or an Asterisk of your own.
+  mediaSourceCidrs: []
+  # -- The gateway's live_voice catalog rows, seeded by llm.seed's Job (also
+  # when llm.seed.enabled is false: then only these): one endpoint at the
+  # gateway's Service with its API key, one row per profile (model id = the
+  # profile's name, capabilities [live_voice]). Insert-only like the rest of
+  # the seed: rows an admin changed stay as they are, and a profile whose name
+  # another provider's row already holds is skipped.
+  catalog:
+    seed: true
+    endpointLabel: "SRW voice gateway"
+    # -- Per profile (optional): displayName, ratePerMinuteUsd (what a call
+    # minute costs on the usage ledger; default 0, a local engine) and voice
+    # (the voice an expert that names none gets).
+    models: {}
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  # -- A rollout ends the calls in progress (handed-over calls survive): the
+  # old gateway gets this long to close them.
+  terminationGracePeriodSeconds: 30
+  nodeSelector: {}
+  tolerations: []
+  # -- Default: beside Asterisk when it runs on hostNetwork.
+  affinity: {}
+
+# -- SRW's Asterisk addon (srw-asterisk: Asterisk 22 LTS, GPL-2.0, its own
+# process and image): registers each voiceGateway line at the phone system
+# and hands its calls to the gateway. Needs voiceGateway.enabled.
+asterisk:
+  enabled: false
+  # -- docker/Dockerfile.asterisk. CI stamps tag and digest.
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-asterisk
+    tag: latest
+    digest: ""
+    pullPolicy: IfNotPresent
+  # -- How the phone system reaches Asterisk (SIP and RTP):
+  #   hostNetwork   on a pinned node's own addresses (nodeSelector is required):
+  #                 the usual answer for VoIP on Kubernetes. NetworkPolicy does
+  #                 not reach a hostNetwork pod: ARI (ari.port) listens on the
+  #                 node's address, guarded by its password only, so keep it
+  #                 off the LAN with the node's firewall.
+  #   loadBalancer  at one LoadBalancer IP (MetalLB or a cloud LB):
+  #                 externalAddress is that IP; Asterisk advertises it to
+  #                 everything outside localNets (plus the cluster ranges).
+  network:
+    mode: hostNetwork
+    # -- The address the phone system reaches Asterisk at, when it is not the
+    # node's own (NAT, or the LoadBalancer IP). Needs localNets on hostNetwork.
+    externalAddress: ""
+    # -- Networks Asterisk reaches without that address translation.
+    localNets: []
+    # -- Who may send SIP and RTP (CIDRs, e.g. the PBX's address): the
+    # LoadBalancer's source ranges and Asterisk's ingress policy. Empty: any.
+    allowedSources: []
+    loadBalancer:
+      ip: ""
+      class: ""
+      annotations: {}
+  sip:
+    port: 5060
+  # -- Two ports per concurrent call (10000-10099: 50 calls).
+  rtp:
+    start: 10000
+    end: 10099
+  # -- Offered to the phone system, in this order; Asterisk converts each to
+  # 16 kHz audio for the gateway.
+  codecs: [alaw, ulaw, g722]
+  # -- auto: RFC 4733 when offered, else in-band, SIP INFO always. auto_info
+  # (no in-band) when the caller's speech could read as digits.
+  dtmfMode: auto
+  ari:
+    port: 8088
+    user: srw
+    app: srw-voice
+  # -- The websocket_client.conf entry for each call's audio.
+  mediaConnection: srw-gateway
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  terminationGracePeriodSeconds: 30
+  # -- hostNetwork: the node whose address the phone system reaches.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # =============================================================================
 # Test-only Infrastructure

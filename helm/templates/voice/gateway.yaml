@@ -1,0 +1,240 @@
+{{- /*
+SRW's voice gateway (local_voice_gateway.md §4): a GPT-Live-compatible
+endpoint the phone-line driver (srw.gpt-live-sip/v1) accepts calls at. It
+takes calls from Asterisk over ARI, gets each call's audio on its media
+listener, and talks through the profile a line's catalog model names.
+
+* One replica, recreated on change: calls live in its memory. A rollout ends
+  the calls in progress (handed-over calls survive: Asterisk bridges them);
+  roll out between calls.
+* Its API Service is the seeded live_voice endpoint and admits the phone-line
+  driver's pods (srw.io/driver-egress): the driver pod's egress is pinned to
+  this Service's pods, and this policy admits only those pods and the
+  orchestrator (Admin -> Models tests and imports the endpoint).
+* The media listener admits Asterisk only.
+* Secrets are files from Secrets; the ConfigMap holds none.
+*/ -}}
+{{- if .Values.voiceGateway.enabled }}
+{{- include "srw.voiceValidate" . }}
+{{- $gateway := .Values.voiceGateway }}
+{{- $name := include "srw.voiceGatewayName" . }}
+{{- $hostNetwork := and .Values.asterisk.enabled (eq .Values.asterisk.network.mode "hostNetwork") }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+data:
+  gateway.yaml: |
+    {{- include "srw.voiceGatewayConfig" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+spec:
+  replicas: 1
+  # Calls live in the gateway's memory, and two gateways on one ARI app
+  # would split its events: the old one stops before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "voice-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "voice-gateway") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "srw.voiceGatewayConfig" . | sha256sum }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ $gateway.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $gateway.affinity }}
+      affinity:
+        {{- toYaml $gateway.affinity | nindent 8 }}
+      {{- else if $hostNetwork }}
+      # Beside Asterisk on its pinned node: the media connection stays on
+      # the node, where the pod's policy admits the node's own traffic.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 18 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "srw.imageRef" (dict "image" $gateway.image) | quote }}
+          imagePullPolicy: {{ $gateway.image.pullPolicy }}
+          args: ["--config", "/etc/srw-voice/gateway.yaml"]
+          ports:
+            - name: api
+              containerPort: 18440
+              protocol: TCP
+            - name: media
+              containerPort: 18441
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: api
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml $gateway.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/srw-voice
+              readOnly: true
+            - name: secrets
+              mountPath: /run/srw-voice
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: secrets
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ include "srw.voiceSecretName" . }}
+                  items:
+                    - key: api-key
+                      path: api-key
+                    - key: asterisk-password
+                      path: asterisk-password
+              {{- range $gateway.lines }}
+              - secret:
+                  name: {{ .webhookSecret.name }}
+                  items:
+                    - key: {{ .webhookSecret.key }}
+                      path: {{ printf "lines/%s/webhook-secret" .name }}
+              {{- end }}
+              {{- range $gateway.profileSecrets }}
+              - secret:
+                  name: {{ .secretName }}
+                  items:
+                    - key: {{ .key }}
+                      path: {{ printf "profiles/%s" .name }}
+              {{- end }}
+        # Numba's cache and nothing else; in memory, so no call leaves a
+        # trace on the node's disk.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+  annotations:
+    # The phone-line driver's pods may reach this Service (connector drivers
+    # "Reachability"): their egress is pinned to its pods by selector.
+    srw.io/driver-egress: srw.gpt-live-sip/v1
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 18440
+      targetPort: 18440
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.voiceGatewayMediaName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: media
+      port: 18441
+      targetPort: 18441
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "voice-gateway") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "voice-gateway") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # The protocol API: the phone-line driver's pods and the orchestrator.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "srw.connectorsNamespace" . | quote }}
+          podSelector:
+            matchLabels:
+              srw.io/driver: {{ include "srw.voiceDriverLabel" . }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 18440
+    # Each call's audio: Asterisk only. A hostNetwork Asterisk connects from
+    # its node, which the CNI admits for pods on that node (the gateway is
+    # scheduled there); mediaSourceCidrs adds other sources.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 14 }}
+        {{- range $gateway.mediaSourceCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 18441
+{{- end }}

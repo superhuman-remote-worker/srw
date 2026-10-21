@@ -347,13 +347,12 @@ def driver_events(offset: int, settle_s: float = 3.0) -> list[dict]:
 
 
 #: What the addon may change in its container: Asterisk's key-value store
-#: and its control socket. Everything else would be a finding.
-ADDON_WRITES = (
-    "/var/lib/asterisk/astdb.sqlite3",
-    "/run/asterisk/asterisk.ctl",
-    "/run/asterisk/asterisk.pid",
-    "/var/run/asterisk/asterisk.ctl",
-    "/var/run/asterisk/asterisk.pid",
+#: and its control socket, both in its run directory. Everything else would
+#: be a finding.
+ADDON_WRITES = tuple(
+    f"{run}/asterisk/{name}"
+    for run in ("/run", "/var/run")
+    for name in ("astdb.sqlite3", "asterisk.ctl", "asterisk.pid")
 )
 
 

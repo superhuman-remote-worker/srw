@@ -552,7 +552,10 @@ def render(v: AddonValues) -> dict[str, str]:
             astetcdir="/etc/asterisk",
             astmoddir="/usr/lib/asterisk/modules",
             astvarlibdir="/var/lib/asterisk",
-            astdbdir="/var/lib/asterisk",
+            # The key-value store is runtime state: beside the control socket,
+            # so /var/lib/asterisk (the XML documentation Stasis needs at
+            # start) stays the image's and a pod's root can be read-only.
+            astdbdir="/var/run/asterisk",
             astkeydir="/var/lib/asterisk",
             astdatadir="/var/lib/asterisk",
             astagidir="/var/lib/asterisk/agi-bin",
