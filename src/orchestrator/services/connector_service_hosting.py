@@ -78,9 +78,11 @@ from orchestrator.services.connector_driver_identities import (
 )
 from orchestrator.services.connector_drivers.base import SupportsServiceConnector
 from orchestrator.services.connector_egress import (
+    SERVICE_EGRESS_ANNOTATION,
     EgressPins,
     EgressPolicy,
     EgressRefused,
+    ServicePeer,
     expand_rule,
     pin_egress,
     private_addresses_allowed,
@@ -418,6 +420,37 @@ class ServicePodRuntime:
                 f"the Service {namespace}/{name} has no ClusterIP"
             )
         return str(address)
+
+    async def read_service(self, name: str, namespace: str) -> dict[str, Any] | None:
+        """A Service's annotations, ClusterIP, selector and ports, or
+        ``None`` when it does not exist."""
+        try:
+            service = await run_bounded_k8s_call(
+                self.core_api.read_namespaced_service, name=name, namespace=namespace
+            )
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise ServiceRuntimeError(
+                f"reading the Service {namespace}/{name} failed"
+            ) from None
+        metadata, spec = _field(service, "metadata"), _field(service, "spec")
+        ports = []
+        for port in _field(spec, "ports") or ():
+            number = _field(port, "port")
+            ports.append(
+                {
+                    "port": number,
+                    "targetPort": _field(port, "targetPort") or number,
+                    "protocol": str(_field(port, "protocol") or "TCP"),
+                }
+            )
+        return {
+            "annotations": dict(_field(metadata, "annotations") or {}),
+            "clusterIP": _field(spec, "clusterIP"),
+            "selector": dict(_field(spec, "selector") or {}),
+            "ports": ports,
+        }
 
     async def observe(self, identity: ServicePodIdentity) -> PodState:
         try:
@@ -871,6 +904,10 @@ def egress_withdrawn(
         return "its declared egress changed"
     if policy is not None:
         for item in recorded.get("hosts") or ():
+            if item.get("service"):
+                # An opted-in Service: its policy admits the Service's pods by
+                # selector; its ClusterIP is in the cluster range on purpose.
+                continue
             for address in item.get("addresses") or ():
                 try:
                     network = ipaddress.ip_network(str(address), strict=False)
@@ -1605,6 +1642,10 @@ class ServiceHostingReconciler:
         self, spec: DriverSpec, config: Mapping[str, Any], *, private_allowed: bool
     ) -> EgressPins:
         """Resolve and check the spec's egress for one connector's config."""
+
+        async def service_peer(namespace: str, name: str) -> ServicePeer | None:
+            return await self._service_peer(spec.name, namespace, name)
+
         return await pin_egress(
             spec.egress,
             config,
@@ -1612,6 +1653,48 @@ class ServiceHostingReconciler:
             needs_dns=spec.needs_dns,
             resolver=self.resolver,
             now=self.clock,
+            service_peer=service_peer,
+        )
+
+    async def _service_peer(
+        self, driver: str, namespace: str, name: str
+    ) -> ServicePeer | None:
+        """The release namespace's Service ``name`` when it admits ``driver``'s
+        pods (its :data:`SERVICE_EGRESS_ANNOTATION` names the driver).
+
+        ``None`` for another namespace or no such Service: the name then
+        resolves like any other host, to a cluster address that is refused.
+        A Service that exists but does not admit the driver is refused with
+        the annotation it lacks."""
+        if namespace != self.settings.release_namespace:
+            return None
+        try:
+            service = await self.runtime.read_service(name, namespace)
+        except ServiceRuntimeError as exc:
+            raise EgressRefused(str(exc)) from None
+        if service is None:
+            return None
+        admitted = {
+            item.strip()
+            for item in str(
+                service["annotations"].get(SERVICE_EGRESS_ANNOTATION) or ""
+            ).split(",")
+        }
+        if driver not in admitted:
+            raise EgressRefused(
+                f"the Service {namespace}/{name} does not admit {driver}'s pods "
+                f"(its {SERVICE_EGRESS_ANNOTATION} annotation does not name it)"
+            )
+        ports = [port for port in service["ports"] if isinstance(port.get("port"), int)]
+        return ServicePeer(
+            namespace=namespace,
+            name=name,
+            address=str(service.get("clusterIP") or ""),
+            selector=tuple(sorted(service["selector"].items())),
+            ports=tuple((port["port"], port["targetPort"]) for port in ports),
+            protocols=tuple(
+                (port["port"], str(port["protocol"]).lower()) for port in ports
+            ),
         )
 
     async def _observe(self, row: Mapping[str, Any], report: ReconcileReport) -> bool:

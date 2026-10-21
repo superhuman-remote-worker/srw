@@ -16,9 +16,11 @@ from orchestrator.services.connector_egress import (
     DNS_PEER,
     EgressPolicy,
     EgressRefused,
+    ServicePeer,
     expand_rule,
     pin_egress,
     refusal,
+    service_host,
 )
 from shared.connectors.contract import EgressRule
 
@@ -398,3 +400,180 @@ async def test_a_host_with_many_addresses_is_flagged():
     )
     assert pins.hosts[0].many_addresses is True
     assert pins.record()["hosts"][0]["many_addresses"] is True
+
+
+# =============================================================================
+# In-cluster Services that admit a driver (the voice gateway for the phone line)
+# =============================================================================
+
+GATEWAY = ServicePeer(
+    namespace="srw",
+    name="srw-voice-gateway",
+    address="10.43.7.7",
+    selector=(("app.kubernetes.io/component", "voice-gateway"),),
+    ports=((18440, 18440), (8080, "http")),
+    protocols=((18440, "tcp"), (8080, "tcp")),
+)
+ENGINE = (EgressRule("${config.api_host}", ("${config.api_port}",)),)
+
+
+def peers(found: dict[tuple[str, str], ServicePeer | None]):
+    asked: list[tuple[str, str]] = []
+
+    async def lookup(namespace: str, name: str):
+        asked.append((namespace, name))
+        return found.get((namespace, name))
+
+    lookup.asked = asked  # type: ignore[attr-defined]
+    return lookup
+
+
+@pytest.mark.parametrize(
+    "host, named",
+    [
+        ("srw-voice-gateway.srw.svc", ("srw", "srw-voice-gateway")),
+        ("srw-voice-gateway.srw.svc.cluster.local", ("srw", "srw-voice-gateway")),
+        ("srw-voice-gateway.srw", None),
+        ("api.openai.com", None),
+        ("svc.example.com", None),
+    ],
+)
+def test_service_host_names_namespace_and_service(host, named):
+    assert service_host(host) == named
+
+
+@pytest.mark.asyncio
+async def test_an_admitting_service_is_reached_by_selector_not_by_address():
+    """Its ClusterIP lies in the refused cluster range: the pin keeps it for
+    hostAliases only, and the policy admits the Service's pods on the target
+    port, which is what NetworkPolicy sees after the address translation."""
+    lookup = peers({("srw", "srw-voice-gateway"): GATEWAY})
+    pins = await pin_egress(
+        ENGINE,
+        {"api_host": "srw-voice-gateway.srw.svc", "api_port": 18440},
+        policy=PUBLIC,
+        resolver=resolver({}),
+        service_peer=lookup,
+    )
+    assert lookup.asked == [("srw", "srw-voice-gateway")]
+    assert pins.network_policy_egress() == [
+        {
+            "to": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"kubernetes.io/metadata.name": "srw"}
+                    },
+                    "podSelector": {
+                        "matchLabels": {"app.kubernetes.io/component": "voice-gateway"}
+                    },
+                }
+            ],
+            "ports": [{"protocol": "TCP", "port": 18440}],
+        }
+    ]
+    assert pins.host_aliases() == [
+        {"ip": "10.43.7.7", "hostnames": ["srw-voice-gateway.srw.svc"]}
+    ]
+    (recorded,) = pins.record()["hosts"]
+    assert recorded["addresses"] == ["10.43.7.7"]
+    assert recorded["service"] == {
+        "namespace": "srw",
+        "name": "srw-voice-gateway",
+        "selector": {"app.kubernetes.io/component": "voice-gateway"},
+        "target_ports": [18440],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_named_target_port_is_matched_by_name():
+    pins = await pin_egress(
+        ENGINE,
+        {"api_host": "srw-voice-gateway.srw.svc", "api_port": 8080},
+        policy=PUBLIC,
+        resolver=resolver({}),
+        service_peer=peers({("srw", "srw-voice-gateway"): GATEWAY}),
+    )
+    assert pins.network_policy_egress()[0]["ports"] == [
+        {"protocol": "TCP", "port": "http"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_without_an_admitting_service_the_cluster_stays_refused():
+    """No lookup, or no such Service: the name resolves like any other host
+    and its cluster address is refused, as before."""
+    config = {"api_host": "srw-voice-gateway.srw.svc", "api_port": 18440}
+    answers = resolver({"srw-voice-gateway.srw.svc": ["10.43.7.7"]})
+    for lookup in (None, peers({})):
+        with pytest.raises(EgressRefused, match="cluster's pod or service range"):
+            await pin_egress(
+                ENGINE, config, policy=HOME, resolver=answers, service_peer=lookup
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "port, peer, fragment",
+    [
+        (18441, GATEWAY, "has no port 18441"),
+        (
+            18440,
+            ServicePeer("srw", "srw-voice-gateway", "10.43.7.7", (), ((18440, 18440),)),
+            "selects no pods",
+        ),
+        (
+            18440,
+            ServicePeer(
+                "srw",
+                "srw-voice-gateway",
+                "10.43.7.7",
+                (("app", "x"),),
+                ((18440, 18440),),
+                ((18440, "udp"),),
+            ),
+            "is not tcp",
+        ),
+        (
+            18440,
+            ServicePeer(
+                "srw",
+                "srw-voice-gateway",
+                "fd00::7",
+                (("app", "x"),),
+                ((18440, 18440),),
+            ),
+            "IPv4 only",
+        ),
+        (
+            18440,
+            ServicePeer(
+                "srw", "srw-voice-gateway", "None", (("app", "x"),), ((18440, 18440),)
+            ),
+            "no ClusterIP",
+        ),
+    ],
+)
+async def test_an_admitting_service_must_serve_the_declared_port(port, peer, fragment):
+    with pytest.raises(EgressRefused, match=fragment):
+        await pin_egress(
+            ENGINE,
+            {"api_host": "srw-voice-gateway.srw.svc", "api_port": port},
+            policy=PUBLIC,
+            resolver=resolver({}),
+            service_peer=peers({("srw", "srw-voice-gateway"): peer}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_refusing_service_says_so():
+    async def lookup(namespace: str, name: str):
+        raise EgressRefused("the Service srw/x does not admit this driver")
+
+    with pytest.raises(EgressRefused, match="does not admit"):
+        await pin_egress(
+            ENGINE,
+            {"api_host": "x.srw.svc", "api_port": 18440},
+            policy=PUBLIC,
+            resolver=resolver({}),
+            service_peer=lookup,
+        )
