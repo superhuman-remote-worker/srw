@@ -88,6 +88,9 @@ class TtsSettings(Stage):
     #: A reply's first sentence may start at a clause (comma, "und", …) once
     #: this many characters are written; 0 waits for whole sentences.
     clause_chars: int = 30
+    #: Keep the audio of short recurring texts (filler, greeting, holding
+    #: phrases) in memory and replay it; for a TTS that is slow to start.
+    cache_phrases: bool = True
 
 
 @dataclass(frozen=True)
@@ -281,7 +284,15 @@ def _tts(raw, label: str, base: Path | None) -> TtsSettings:
     stage = _stage(
         raw,
         label,
-        {"voice", "voices", "response_format", "sample_rate", "speed", "clause_chars"},
+        {
+            "voice",
+            "voices",
+            "response_format",
+            "sample_rate",
+            "speed",
+            "clause_chars",
+            "cache_phrases",
+        },
         base,
     )
     voice = raw.get("voice", "")
@@ -305,6 +316,7 @@ def _tts(raw, label: str, base: Path | None) -> TtsSettings:
         sample_rate=_integer(raw, "sample_rate", label, 24_000, 8_000, 48_000),
         speed=None if speed is None else _number(raw, "speed", label, 1.0, 0.5, 2.0),
         clause_chars=_integer(raw, "clause_chars", label, 30, 0, 500),
+        cache_phrases=_boolean(raw, "cache_phrases", label, True),
     )
 
 

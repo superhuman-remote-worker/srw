@@ -12,6 +12,9 @@ from __future__ import annotations
 from voice_gateway.engines.cascade.settings import LANGUAGE_NAMES
 
 DELEGATE_TOOL = "delegate"
+#: The holding sentences the rules prescribe (German); the engine keeps their
+#: audio ready, so they play at once.
+HOLDING_PHRASES = ("Einen Moment, ich schaue nach.", "Einen Moment, ich frage nach.")
 
 ENGINE_RULES = """# How this call works
 You are the voice on a live phone call. Everything you write is spoken by a \
@@ -28,8 +31,8 @@ Whenever the caller needs any of that, or data the facts do not hold, call \
 call it right away with that message; ask for a missing name or number only \
 after.
 With that call, say at most one short sentence, and only that you are \
-checking or asking: "Einen Moment, ich schaue nach.", or when the caller \
-wants a person, "Einen Moment, ich frage nach." Never add a second holding \
+checking or asking: "{holding[0]}", or when the caller \
+wants a person, "{holding[1]}" Never add a second holding \
 sentence. Until the answer is back, never say that you connect, put \
 through, forward or pass on anything ("Ich verbinde Sie", "Ich leite das \
 weiter"): whether that happens is decided by the answer. Never say that \
@@ -63,7 +66,9 @@ _CLOSE_QUOTES = '"“”»'
 
 
 def system_prompt(instructions: str, language: str, extra: str = "") -> str:
-    rules = ENGINE_RULES.format(language=LANGUAGE_NAMES[language], tool=DELEGATE_TOOL)
+    rules = ENGINE_RULES.format(
+        language=LANGUAGE_NAMES[language], tool=DELEGATE_TOOL, holding=HOLDING_PHRASES
+    )
     parts = [rules.strip(), extra.strip(), instructions.strip()]
     return "\n\n".join(p for p in parts if p)
 

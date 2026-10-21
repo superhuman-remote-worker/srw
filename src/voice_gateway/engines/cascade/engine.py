@@ -53,6 +53,7 @@ from pipecat.workers.runner import WorkerRunner
 from voice_gateway.engines.cascade.clauses import sentences
 from voice_gateway.engines.cascade.prompt import (
     DELEGATE_TOOL,
+    HOLDING_PHRASES,
     delegate_schema,
     exact_words,
     note,
@@ -118,6 +119,9 @@ class CascadeEngine:
         self._audioless = False
         self._stopped = False
         self._prewarm: asyncio.Task | None = None
+        self._tts: SpeechTTS | None = None
+        #: Set once the voice first played audio (the greeting).
+        self._greeted = asyncio.Event()
         self.output: CallOutput | None = None
         self.context: LLMContext | None = None
 
@@ -209,7 +213,7 @@ class CascadeEngine:
                 self._ready.set()
                 if self.settings.llm.prewarm:
                     prefix = LLMContext(tools=self.context.tools)
-                    self._prewarm = asyncio.create_task(self._llm.prewarm(prefix))
+                    self._prewarm = asyncio.create_task(self._prewarm_all(prefix))
 
             await self._runner.run()
         except asyncio.CancelledError:
@@ -242,7 +246,7 @@ class CascadeEngine:
             timeout=aiohttp.ClientTimeout(total=60, sock_connect=5, sock_read=20)
         )
         params = transport_params()
-        tts = SpeechTTS(
+        self._tts = tts = SpeechTTS(
             settings.tts,
             voice=voice,
             language=settings.language,
@@ -254,7 +258,7 @@ class CascadeEngine:
             params,
             lead_ms=settings.playout_lead_ms,
             on_sentence=lambda text: self._say("assistant", text),
-            on_first_audio=self.timings.audio_out,
+            on_first_audio=self._audio_out,
             sentence_ms=tts.sentence_ms,
         )
         stt = TranscriptionSTT(
@@ -306,6 +310,32 @@ class CascadeEngine:
         return Pipeline(
             [CallInput(audio, params), stt, caller, user, llm, tts, output, assistant]
         )
+
+    async def _prewarm_all(self, prefix: LLMContext) -> None:
+        """The LLM's fixed prefix, then, once the greeting has been played
+        (a TTS server with one slot would make it wait), the audio of the
+        filler and the holding phrases that are not cached yet."""
+        await self._llm.prewarm(prefix)
+        if self._tts is None:
+            return
+        phrases = [self.settings.filler] if self.settings.filler else []
+        if self.settings.language == "de":
+            phrases += [p for p in HOLDING_PHRASES if p not in phrases]
+        if not self._tts.uncached(phrases):
+            return
+        try:
+            await asyncio.wait_for(self._greeted.wait(), timeout=5)
+        except TimeoutError:
+            pass
+        for _ in range(150):  # the greeting's rest, at most 15 s
+            if self.output is None or not self.output.audible():
+                break
+            await asyncio.sleep(0.1)
+        await self._tts.prewarm(phrases)
+
+    def _audio_out(self) -> None:
+        self._greeted.set()
+        self.timings.audio_out()
 
     async def _queue(self, frame: Frame) -> None:
         if self._ready.is_set() and self._worker is not None:

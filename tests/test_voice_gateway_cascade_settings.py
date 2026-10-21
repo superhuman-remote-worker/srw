@@ -53,6 +53,7 @@ class TestParseSettings:
         assert settings.llm.api_key is None
         assert settings.tts.response_format == "pcm"
         assert settings.tts.clause_chars == 30
+        assert settings.tts.cache_phrases is True
 
     def test_key_files_are_read_and_never_shown(self, tmp_path):
         key = tmp_path / "llm.key"

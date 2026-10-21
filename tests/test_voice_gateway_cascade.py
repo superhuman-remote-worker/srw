@@ -31,7 +31,10 @@ from voice_gateway.config import Line  # noqa: E402
 from voice_gateway.engines.cascade import parse_settings  # noqa: E402
 from voice_gateway.engines.cascade.engine import CascadeEngine  # noqa: E402
 from voice_gateway.engines.cascade.fileport import FileAudioPort  # noqa: E402
-from voice_gateway.engines.cascade.services import SpokenTextAggregator  # noqa: E402
+from voice_gateway.engines.cascade.services import (  # noqa: E402
+    PHRASES,
+    SpokenTextAggregator,
+)
 from voice_gateway.engines.cascade.transport import heard_prefix  # noqa: E402
 from voice_gateway.session import Session  # noqa: E402
 
@@ -40,6 +43,7 @@ INSTRUCTIONS = (
     "Du bist die Telefonstimme vom Hotel Beispielhof.\n\n## Facts\nCheck-in ab 15 Uhr."
 )
 GREETING = 'Greet the caller now with exactly these words, then listen: "Guten Tag, hier ist das Hotel."'
+FILLER = "Einen Moment, ich schaue nach."
 GREETING_2 = (
     "Greet the caller now with exactly these words, then listen: "
     '"Guten Tag, hier ist das Hotel am 12. März. Ich bin eine KI."'
@@ -76,6 +80,9 @@ class Fakes:
         self.prewarms: list[dict] = []
         self.llm_replies: list = []  # each: str (text) or ("delegate", request[, text])
         self.tts_inputs: list[str] = []
+        #: Requests for the filler (prewarmed into the phrase cache at the
+        #: call's start), kept out of ``tts_inputs``.
+        self.filler_requests = 0
         self.ms_per_char = 40
 
     async def transcriptions(self, request: web.Request) -> web.Response:
@@ -142,7 +149,10 @@ class Fakes:
     async def speech(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         assert body["model"] == "tts-model" and body["voice"] == "speaker-1"
-        self.tts_inputs.append(body["input"])
+        if body["input"] in (FILLER, "Einen Moment, ich frage nach."):
+            self.filler_requests += 1
+        else:
+            self.tts_inputs.append(body["input"])
         pcm = tone(len(body["input"]) * self.ms_per_char / 1000, rate=24_000, freq=330)
         response = web.StreamResponse(headers={"Content-Type": "audio/pcm"})
         await response.prepare(request)
@@ -292,6 +302,7 @@ class Call:
 
 @pytest_asyncio.fixture
 async def fakes():
+    PHRASES.clear()  # process-wide; each test's fake voice differs
     fakes = Fakes()
     fakes.base = await fakes.start()
     yield fakes
@@ -492,6 +503,23 @@ async def test_delegation_follows_the_transcript_then_filler_then_phrased_answer
     tool = [m for m in answer_request if m["role"] == "tool"]
     assert tool and "129 Euro" in tool[-1]["content"]
     assert call.engine.timings.turns[0].delegated
+
+
+@pytest.mark.asyncio
+async def test_the_filler_is_synthesised_once_and_replayed(call, fakes):
+    # Prewarmed while the call starts, then played from memory: a slow TTS
+    # does not keep the caller waiting for "Einen Moment, ich schaue nach."
+    await call.until(lambda: fakes.filler_requests == 2)  # both holding lines
+    fakes.stt_texts = ["Können Sie meine Rechnung schicken?"]
+    fakes.llm_replies = [("delegate", "Rechnung schicken")]
+    call.port.say(tone(1.0))
+    await call.until(lambda: call.transcripts("assistant"))
+    await call.quiet()
+    assert call.transcripts("assistant") == [FILLER]
+    assert fakes.filler_requests == 2
+    assert call.port.played_ms() >= 0.8 * len(FILLER) * fakes.ms_per_char
+    turn = call.engine.timings.turns[0]
+    assert turn.tts_first_audio_ms == 0
 
 
 @pytest.mark.asyncio

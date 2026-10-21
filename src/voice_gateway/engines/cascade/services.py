@@ -7,6 +7,8 @@
 - ``SpeechTTS``: one streamed ``/audio/speech`` request per sentence, PCM or
   WAV at any rate, resampled to 16 kHz. ``SpokenTextAggregator`` cuts the
   reply into those sentences; a long first sentence starts at a clause.
+  Short texts that recur (the filler, the greeting, the holding phrases the
+  rules prescribe) are kept in ``PHRASES``, in memory, and replayed at once.
 
 Nothing here logs what was said; errors carry status codes only.
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 import re
 import struct
 import time
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator
 
 import aiohttp
@@ -344,6 +347,59 @@ class SpokenTextAggregator(SimpleTextAggregator):
         await super().reset()
 
 
+class PhraseCache:
+    """Synthesised audio of short texts, shared by the process's calls.
+
+    A TTS that answers only once a request is synthesised (Qwen3-TTS on
+    llama.cpp takes about a second for "Einen Moment, ich schaue nach.")
+    makes the caller wait for every piece; the filler, the greeting and the
+    holding phrases the rules prescribe recur in every call, so the second
+    time they play at once. The voice's own speech, in memory only (A5), and
+    never the caller's.
+    """
+
+    def __init__(self, max_entries: int = 64, max_chars: int = 80):
+        self.max_entries = max_entries
+        self.max_chars = max_chars
+        self._entries: OrderedDict[tuple, bytes] = OrderedDict()
+
+    def key(self, stage: TtsSettings, voice: str, text: str) -> tuple | None:
+        if not stage.cache_phrases or len(text) > self.max_chars:
+            return None
+        extra = tuple(sorted((k, repr(v)) for k, v in stage.extra_body.items()))
+        # The LLM's "Einen Moment, ich schaue nach.\n" is the filler too.
+        return (
+            stage.base_url,
+            stage.model,
+            voice,
+            stage.speed,
+            extra,
+            " ".join(text.split()),
+        )
+
+    def get(self, key: tuple | None) -> bytes | None:
+        if key is None or key not in self._entries:
+            return None
+        self._entries.move_to_end(key)
+        return self._entries[key]
+
+    def put(self, key: tuple | None, pcm: bytes) -> None:
+        if key is None or not pcm:
+            return
+        self._entries[key] = pcm
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+PHRASES = PhraseCache()
+#: Replayed audio goes out in 100 ms frames, like a streamed answer.
+_REPLAY_BYTES = SAMPLE_RATE * 2 // 10
+
+
 class SpeechTTS(TTSService):
     """One streamed ``POST {base_url}/audio/speech`` per sentence."""
 
@@ -403,23 +459,30 @@ class SpeechTTS(TTSService):
     async def run_tts(
         self, text: str, context_id: str
     ) -> AsyncGenerator[Frame | None, None]:
-        body = {
-            "model": self._stage.model,
-            "input": text,
-            "voice": self._voice,
-            "response_format": self._stage.response_format,
-            **self._stage.extra_body,
-        }
-        if self._stage.speed is not None:
-            body["speed"] = self._stage.speed
+        body = self._body(text)
         self._sentence_context = context_id
         self._timings.tts_requested()
+        key = PHRASES.key(self._stage, self._voice, text)
+        cached = PHRASES.get(key)
+        if cached is not None:
+            self._timings.tts_first_audio(0)
+            await self.stop_ttfb_metrics()
+            for at in range(0, len(cached), _REPLAY_BYTES):
+                yield TTSAudioRawFrame(
+                    cached[at : at + _REPLAY_BYTES],
+                    SAMPLE_RATE,
+                    1,
+                    context_id=context_id,
+                )
+            self.durations[context_id] = len(cached) / (SAMPLE_RATE * 2 / 1000)
+            return
         started = time.monotonic()
         resampler = create_stream_resampler()
         wav = _WavStream() if self._stage.response_format == "wav" else None
         rate = self._stage.sample_rate
         carry = b""
         produced = 0
+        kept = bytearray() if key is not None else None
         try:
             async with self._http.post(
                 self._stage.base_url + "/audio/speech",
@@ -447,12 +510,71 @@ class SpeechTTS(TTSService):
                         )
                         await self.stop_ttfb_metrics()
                     produced += len(pcm)
+                    if kept is not None:
+                        kept += pcm
                     yield TTSAudioRawFrame(pcm, SAMPLE_RATE, 1, context_id=context_id)
                 tail = await resampler.flush()
                 if tail:
                     produced += len(tail)
+                    if kept is not None:
+                        kept += tail
                     yield TTSAudioRawFrame(tail, SAMPLE_RATE, 1, context_id=context_id)
+                # Only a whole answer (a barge-in cancels this generator first).
+                if kept is not None:
+                    PHRASES.put(key, bytes(kept))
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             yield ErrorFrame(error=f"TTS request failed: {type(exc).__name__}")
         finally:
             self.durations[context_id] = produced / (SAMPLE_RATE * 2 / 1000)
+
+    def uncached(self, texts) -> list[str]:
+        """The texts the phrase cache would keep and does not have yet."""
+        out = []
+        for text in texts:
+            key = PHRASES.key(self._stage, self._voice, text)
+            if key is not None and PHRASES.get(key) is None:
+                out.append(text)
+        return out
+
+    async def prewarm(self, texts) -> None:
+        """Synthesise phrases into the cache without playing them."""
+        for text in texts:
+            key = PHRASES.key(self._stage, self._voice, text)
+            if key is None or PHRASES.get(key) is not None:
+                continue
+            resampler = create_stream_resampler()
+            wav = _WavStream() if self._stage.response_format == "wav" else None
+            rate, carry, kept = self._stage.sample_rate, b"", bytearray()
+            try:
+                async with self._http.post(
+                    self._stage.base_url + "/audio/speech",
+                    json=self._body(text),
+                    headers=_headers(self._stage.api_key),
+                ) as response:
+                    if response.status != 200:
+                        continue
+                    async for chunk in response.content.iter_chunked(4096):
+                        if wav is not None:
+                            chunk = wav.feed(chunk)
+                            rate = wav.rate or rate
+                        chunk = carry + chunk
+                        usable = len(chunk) - len(chunk) % 2
+                        chunk, carry = chunk[:usable], chunk[usable:]
+                        if chunk:
+                            kept += await resampler.resample(chunk, rate, SAMPLE_RATE)
+                    kept += await resampler.flush()
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                continue  # a cold phrase only costs latency
+            PHRASES.put(key, bytes(kept))
+
+    def _body(self, text: str) -> dict:
+        body = {
+            "model": self._stage.model,
+            "input": text,
+            "voice": self._voice,
+            "response_format": self._stage.response_format,
+            **self._stage.extra_body,
+        }
+        if self._stage.speed is not None:
+            body["speed"] = self._stage.speed
+        return body
