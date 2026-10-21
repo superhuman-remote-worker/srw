@@ -52,7 +52,7 @@ class TestParseSettings:
         assert settings.llm.base_url == "http://127.0.0.1:18451/v1"
         assert settings.llm.api_key is None
         assert settings.tts.response_format == "pcm"
-        assert settings.tts.clause_chars == 40
+        assert settings.tts.clause_chars == 30
 
     def test_key_files_are_read_and_never_shown(self, tmp_path):
         key = tmp_path / "llm.key"
@@ -232,12 +232,13 @@ class TestClauses:
             # A decimal comma or a time is no clause.
             ("Der Strom kostet pro Kilowattstunde 0,45 ", None),
             ("Das Frühstück beginnt jeden Morgen um 6:30 ", None),
-            # A conjunction once twice the length is written; cut before it.
+            # A conjunction once half as much again is written; cut before it.
             (
                 "Das Doppelzimmer kostet 129 Euro pro Nacht mit Frühstück im Haus und ",
                 64,
             ),
             ("Das Zimmer ist frei und ", None),
+            ("Ihre Buchung wurde um eine Nacht bis Samstag verlängert und ", 55),
         ],
     )
     def test_where_a_first_sentence_may_start(self, text, end):

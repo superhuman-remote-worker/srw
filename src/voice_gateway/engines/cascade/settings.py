@@ -87,7 +87,7 @@ class TtsSettings(Stage):
     speed: float | None = None
     #: A reply's first sentence may start at a clause (comma, "und", …) once
     #: this many characters are written; 0 waits for whole sentences.
-    clause_chars: int = 40
+    clause_chars: int = 30
 
 
 @dataclass(frozen=True)
@@ -304,7 +304,7 @@ def _tts(raw, label: str, base: Path | None) -> TtsSettings:
         response_format=response_format,
         sample_rate=_integer(raw, "sample_rate", label, 24_000, 8_000, 48_000),
         speed=None if speed is None else _number(raw, "speed", label, 1.0, 0.5, 2.0),
-        clause_chars=_integer(raw, "clause_chars", label, 40, 0, 500),
+        clause_chars=_integer(raw, "clause_chars", label, 30, 0, 500),
     )
 
 

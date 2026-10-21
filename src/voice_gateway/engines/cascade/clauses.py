@@ -5,7 +5,7 @@ caller waiting until the LLM has written all of it. ``clause_end`` finds an
 earlier place to start speaking: after a comma, semicolon, colon or dash
 once ``min_chars`` are written (the TTS reads the trailing comma as "more
 follows", so the voice does not drop its pitch there), or before a
-coordinating conjunction ("und", "oder", …) once twice that many are. Only
+coordinating conjunction ("und", "oder", …) once half as many again are. Only
 the first piece of a reply is cut: the rest is synthesised while the first
 plays. No Pipecat here, so the main suite tests it.
 """
@@ -36,6 +36,6 @@ def clause_end(text: str, min_chars: int) -> int | None:
         return len(body)
     # "…, und" / "… Zimmer und": cut before the conjunction.
     head, _, word = body.rpartition(" ")
-    if word.lower() in CONJUNCTIONS and len(head.rstrip(",")) >= 2 * min_chars:
+    if word.lower() in CONJUNCTIONS and 2 * len(head.rstrip(",")) >= 3 * min_chars:
         return len(head)
     return None
