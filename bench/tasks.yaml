@@ -413,3 +413,293 @@ tasks:
       install fails for network reasons, record the exact error under
       `## Result` and stop.
     required_deliverables: [output/install-report.md]
+
+  # ── Cross-harness set (2026-10-21) ─────────────────────────────────────
+  # Added for the SRW-vs-Claude-Code comparison: topics the set above does
+  # not cover (SQL, log analysis, JavaScript, a multi-file package, data
+  # cleaning, German business prose). Inputs inline, outcomes checkable.
+
+  - id: M3-sqlite-analytics
+    family: data
+    config_name: engineer
+    description: |
+      Load the two tables below into a SQLite database `output/shop.db`
+      (tables `customers` and `orders`, columns as in the headers), then
+      answer the questions with SQL. Save every query you used, one per
+      question and labelled with a comment, in `output/queries.sql`, and the
+      answers in `output/answers.json` with exactly these keys:
+
+      - `revenue_completed_eur`: total `amount_eur` of orders with status
+        `completed`, rounded to 2 decimals (a number).
+      - `top_country`: the customer country with the highest completed
+        revenue (a string).
+      - `repeat_customers`: how many customers have at least two completed
+        orders (an integer).
+      - `avg_order_value_q3_2026`: the average `amount_eur` of completed
+        orders dated 2026-07-01 through 2026-09-30 inclusive, rounded to 2
+        decimals (a number).
+      - `customers_without_orders`: names of customers with no orders of any
+        status, sorted alphabetically (a list of strings).
+
+      customers.csv:
+      ```
+      id,name,country,signup_date
+      1,Alder GmbH,DE,2025-11-02
+      2,Birch SARL,FR,2026-01-15
+      3,Cedar BV,NL,2026-02-20
+      4,Dogwood AG,CH,2026-03-05
+      5,Elm Oy,FI,2026-04-11
+      6,Fir Kft,HU,2026-05-30
+      7,Ginkgo GmbH,DE,2026-06-18
+      8,Hazel SRL,IT,2026-07-07
+      ```
+
+      orders.csv:
+      ```
+      order_id,customer_id,order_date,amount_eur,status
+      1001,1,2026-06-28,1200.00,completed
+      1002,2,2026-07-02,349.90,completed
+      1003,1,2026-07-05,89.50,refunded
+      1004,3,2026-07-09,2400.00,completed
+      1005,2,2026-07-15,129.99,completed
+      1006,5,2026-07-21,560.00,cancelled
+      1007,7,2026-08-01,780.25,completed
+      1008,1,2026-08-03,1500.00,completed
+      1009,3,2026-08-14,99.00,completed
+      1010,7,2026-08-29,310.75,completed
+      1011,2,2026-09-02,45.00,pending
+      1012,4,2026-09-12,1999.99,completed
+      1013,1,2026-09-30,250.00,completed
+      1014,3,2026-10-01,640.00,completed
+      1015,7,2026-10-03,95.40,refunded
+      ```
+    required_deliverables: [output/shop.db, output/queries.sql, output/answers.json]
+
+  - id: O2-access-log-summary
+    family: ops
+    config_name: engineer
+    description: |
+      Summarise the web-server access log below. Each line ends with the
+      response time in milliseconds. Write `output/log-summary.json` with
+      exactly these keys:
+
+      - `total_requests` (integer)
+      - `unique_ips` (integer)
+      - `status_counts`: object mapping each status code, as a string, to
+        its count
+      - `top_paths`: the three most requested paths with the query string
+        removed, as `[path, count]` pairs, highest count first, ties broken
+        by path ascending
+      - `error_rate_pct`: share of responses with a 5xx status, in percent,
+        rounded to 1 decimal
+      - `p95_latency_ms`: nearest-rank 95th percentile of the response
+        times — sort ascending and take the value at 1-based position
+        ceil(0.95 × n)
+      - `slowest_path`: the path (query string removed) of the slowest
+        request; if several tie, the earliest in the log
+
+      Also write `output/log-summary.md`: three or four sentences an on-call
+      engineer would want to read, quoting the numbers. Keep the script you
+      used in `output/`.
+
+      ```
+      203.0.113.7 - - [21/Oct/2026:10:00:01 +0000] "GET /api/items?page=1 HTTP/1.1" 200 5120 42
+      198.51.100.23 - - [21/Oct/2026:10:00:02 +0000] "GET /api/items?page=2 HTTP/1.1" 200 4980 38
+      203.0.113.7 - - [21/Oct/2026:10:00:04 +0000] "POST /api/orders HTTP/1.1" 201 312 120
+      192.0.2.55 - - [21/Oct/2026:10:00:05 +0000] "GET /health HTTP/1.1" 200 15 2
+      198.51.100.23 - - [21/Oct/2026:10:00:07 +0000] "GET /api/items/42 HTTP/1.1" 200 860 25
+      203.0.113.9 - - [21/Oct/2026:10:00:08 +0000] "GET /api/items?page=1 HTTP/1.1" 200 5120 47
+      192.0.2.55 - - [21/Oct/2026:10:00:10 +0000] "GET /health HTTP/1.1" 200 15 3
+      203.0.113.7 - - [21/Oct/2026:10:00:11 +0000] "POST /api/orders HTTP/1.1" 500 98 1830
+      198.51.100.40 - - [21/Oct/2026:10:00:12 +0000] "GET /api/items/7 HTTP/1.1" 404 120 11
+      203.0.113.9 - - [21/Oct/2026:10:00:14 +0000] "GET /api/search?q=bolt HTTP/1.1" 200 2200 310
+      198.51.100.23 - - [21/Oct/2026:10:00:15 +0000] "GET /api/items?page=3 HTTP/1.1" 200 4870 41
+      192.0.2.55 - - [21/Oct/2026:10:00:16 +0000] "GET /health HTTP/1.1" 200 15 2
+      203.0.113.7 - - [21/Oct/2026:10:00:18 +0000] "POST /api/orders HTTP/1.1" 502 0 3000
+      198.51.100.40 - - [21/Oct/2026:10:00:19 +0000] "GET /api/search?q=nut HTTP/1.1" 200 1980 290
+      203.0.113.9 - - [21/Oct/2026:10:00:21 +0000] "GET /api/items/42 HTTP/1.1" 200 860 22
+      198.51.100.23 - - [21/Oct/2026:10:00:22 +0000] "DELETE /api/orders/17 HTTP/1.1" 204 0 64
+      192.0.2.55 - - [21/Oct/2026:10:00:23 +0000] "GET /health HTTP/1.1" 200 15 2
+      203.0.113.7 - - [21/Oct/2026:10:00:25 +0000] "POST /api/orders HTTP/1.1" 201 315 133
+      198.51.100.40 - - [21/Oct/2026:10:00:26 +0000] "GET /api/items?page=1 HTTP/1.1" 200 5120 45
+      203.0.113.9 - - [21/Oct/2026:10:00:27 +0000] "GET /api/search?q=bolt HTTP/1.1" 200 2200 3000
+      198.51.100.23 - - [21/Oct/2026:10:00:29 +0000] "GET /api/items/9 HTTP/1.1" 200 840 24
+      192.0.2.55 - - [21/Oct/2026:10:00:30 +0000] "GET /health HTTP/1.1" 503 0 1
+      203.0.113.7 - - [21/Oct/2026:10:00:31 +0000] "GET /api/items?page=2 HTTP/1.1" 200 4980 39
+      198.51.100.40 - - [21/Oct/2026:10:00:33 +0000] "POST /api/orders HTTP/1.1" 201 309 118
+      203.0.113.9 - - [21/Oct/2026:10:00:34 +0000] "GET /api/items/42 HTTP/1.1" 304 0 9
+      198.51.100.23 - - [21/Oct/2026:10:00:36 +0000] "GET /api/search?q=washer HTTP/1.1" 200 2050 305
+      192.0.2.55 - - [21/Oct/2026:10:00:37 +0000] "GET /health HTTP/1.1" 200 15 2
+      203.0.113.7 - - [21/Oct/2026:10:00:38 +0000] "GET /api/items?page=4 HTTP/1.1" 200 4720 40
+      198.51.100.40 - - [21/Oct/2026:10:00:40 +0000] "GET /api/items/42 HTTP/1.1" 200 860 23
+      203.0.113.9 - - [21/Oct/2026:10:00:41 +0000] "POST /api/orders HTTP/1.1" 500 98 1790
+      ```
+    required_deliverables: [output/log-summary.json, output/log-summary.md]
+
+  # Known flaw (pinned text, so not edited): on Node 22 `node --test code/`
+  # resolves the directory as a module and fails; agents fall back to a glob.
+  # A D6b should name `node --test "code/**/*.test.js"`.
+  - id: D6-semver-js
+    family: dev
+    config_name: engineer
+    description: |
+      Write a small dependency-free Node.js module `code/semver.js`
+      (CommonJS, `module.exports = { compare, satisfies }`) and its tests.
+
+      - `compare(a, b)` returns -1, 0 or 1 by Semantic Versioning 2.0.0
+        precedence. Versions are `MAJOR.MINOR.PATCH` with an optional
+        `-prerelease` of dot-separated identifiers (no build metadata).
+        Numeric identifiers compare numerically, alphanumeric ones in ASCII
+        order, numeric ones sort before alphanumeric ones, a shorter set of
+        identifiers sorts first when all earlier ones are equal, and a
+        version with a prerelease sorts before the same version without one
+        (`1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-beta < 1.0.0-beta.2 <
+        1.0.0-beta.11 < 1.0.0-rc.1 < 1.0.0`).
+      - `satisfies(version, range)` supports exactly four range forms:
+        `1.2.3` (equal), `>=1.2.3`, `~1.2.3` (>=1.2.3 <1.3.0) and `^1.2.3`
+        (>=1.2.3 <2.0.0; when MAJOR is 0 the next MINOR is the bound,
+        `^0.2.3` = >=0.2.3 <0.3.0; when MAJOR and MINOR are 0 the next PATCH
+        is, `^0.0.3` = >=0.0.3 <0.0.4). A version with a prerelease satisfies
+        only an exact range equal to it.
+      - Malformed versions or ranges throw a `TypeError`.
+
+      Write `code/semver.test.js` with the built-in `node:test` runner
+      covering both functions, run `node --test code/` from the workspace
+      root, and save its complete output to `output/test-run.txt`.
+    required_deliverables: [code/semver.js, code/semver.test.js, output/test-run.txt]
+
+  - id: D7-cart-package
+    family: dev
+    config_name: engineer
+    description: |
+      Create the small Python package below under `code/shop/`. It has
+      three real bugs. Fix them, add one feature, and test it.
+
+      1. Write pytest tests under `code/tests/` that expose each bug
+         (each must fail against the code as given), document each bug in a
+         comment above its test, then fix the bugs.
+      2. Feature: a cart line with quantity 10 or more is charged 95% of its
+         line amount, rounded half-up to whole cents, and `subtotal()`
+         returns the sum after that rule. Test it.
+      3. `python -m pytest code -v`, run from the workspace root, must pass;
+         save its complete output to `output/test-run.txt`.
+
+      `code/shop/__init__.py`:
+      ```python
+      from .cart import Cart
+      from .discounts import apply_discounts
+
+      __all__ = ["Cart", "apply_discounts"]
+      ```
+
+      `code/shop/money.py`:
+      ```python
+      from decimal import ROUND_HALF_UP, Decimal
+
+
+      def to_cents(amount):
+          """Euros as str/int/Decimal -> integer cents, rounded half-up."""
+          return int((Decimal(str(amount)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+      ```
+
+      `code/shop/cart.py`:
+      ```python
+      from .discounts import apply_discounts
+      from .money import to_cents
+
+
+      class Cart:
+          def __init__(self):
+              self.lines = {}  # sku -> [unit_cents, qty]
+
+          def add(self, sku, unit_price, qty=1):
+              """Add qty units of sku; adding an existing sku increases its quantity."""
+              if qty <= 0:
+                  raise ValueError("qty must be positive")
+              cents = to_cents(unit_price)
+              if sku in self.lines:
+                  self.lines[sku][1] = qty
+              else:
+                  self.lines[sku] = [cents, qty]
+
+          def subtotal(self):
+              return sum(unit * qty for unit, qty in self.lines.values())
+
+          def total(self, codes=()):
+              return apply_discounts(self.subtotal(), list(codes))
+      ```
+
+      `code/shop/discounts.py`:
+      ```python
+      def apply_discounts(subtotal_cents, codes):
+          """Apply discount codes to a subtotal in cents.
+
+          Percentage codes (PCTnn, nn percent off) apply first, each to the
+          running total, rounding the discount down to whole cents; flat
+          codes (FLATnnn, nnn cents off) apply after all percentage codes.
+          The result is never below zero.
+          """
+          total = subtotal_cents
+          for code in codes:
+              if code.startswith("PCT"):
+                  total = total - total * int(code[3:]) // 100
+              elif code.startswith("FLAT"):
+                  total = total - int(code[4:])
+          return total
+      ```
+    required_deliverables: [code/shop/cart.py, code/shop/discounts.py, output/test-run.txt]
+
+  - id: M4-contacts-cleanup
+    family: data
+    config_name: engineer
+    description: |
+      Clean the contact export below into `output/contacts.json` — a JSON
+      list of objects with keys `name`, `email`, `phone`, `updated`, sorted
+      by `email` ascending — following exactly these rules:
+
+      1. Trim surrounding whitespace from every field.
+      2. `name`: each word with its first letter upper-case and the rest
+         lower-case, words separated by single spaces.
+      3. `email`: lower-case. A row whose email does not contain exactly one
+         `@` is rejected: list it in `output/rejected.csv` with header
+         `email,reason` and reason `invalid_email`.
+      4. `phone`: remove spaces, `-`, `/`, `(` and `)`. Then a leading `00`
+         becomes `+`; otherwise a single leading `0` becomes `+49`; a
+         leading `+` stays. An empty phone becomes `null`.
+      5. Rows with the same (normalised) email are duplicates: keep only
+         the one with the latest `updated` date.
+
+      Keep the script you used in `output/`.
+
+      ```
+      name,email,phone,updated
+        anna schmidt ,Anna.Schmidt@Example.com,0171 2345678,2026-03-01
+      Bernd Müller,bernd.mueller@example.com,+49 160 9876543,2026-02-11
+      anna SCHMIDT,anna.schmidt@example.com , (0171) 234 5679,2026-05-20
+      Carla Rossi,carla.rossi@example.it,0049-151-1112223,2026-01-30
+      dieter weber,dieter.weber(at)example.com,0176/5556667,2026-04-02
+      Eva Klein,eva.klein@example.com,,2026-06-15
+      bernd müller,BERND.MUELLER@example.com,0160 9876543,2026-01-05
+      Frank Ott,frank.ott@example.com,+43 664 1234567,2026-02-28
+      ```
+    required_deliverables: [output/contacts.json, output/rejected.csv]
+
+  - id: M5-german-guest-email
+    family: writing
+    config_name: engineer
+    description: |
+      Schreibe eine E-Mail an eine Hotelgaestin und speichere sie als
+      `output/email.md`. Erste Zeile: `Betreff: ...`. Danach die E-Mail in
+      der Sie-Form, hoechstens 220 Woerter, freundlich und konkret, mit der
+      Grussformel "Ihr Team vom Hotel Lindenhof" am Ende.
+
+      Fakten (alle muessen vorkommen, nichts dazuerfinden):
+      - Gaestin: Frau Petra Schneider, Buchungsnummer HR-48213.
+      - Sie hat gebeten, ihren Aufenthalt vom 12. bis 15. Maerz 2027 zu
+        verschieben. Das klappt: neuer Zeitraum 19. bis 22. Maerz 2027.
+      - Die gebuchte Kategorie "Doppelzimmer Komfort" ist dann ausgebucht;
+        sie erhaelt ohne Aufpreis ein "Doppelzimmer Superior".
+      - Der Zugang zum Spa-Bereich bleibt inklusive.
+      - Kostenlose Stornierung ist bis 5. Maerz 2027, 18:00 Uhr moeglich.
+      - Rueckfragen: Telefon 06221 555 210 oder Antwort auf diese E-Mail.
+    required_deliverables: [output/email.md]
