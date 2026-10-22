@@ -141,8 +141,9 @@ no LLM judge.
 
 **What the caller heard** is judged by Qwen3-ASR 0.6B (another model family
 than the whisper STT it judges). With the GPU full of a profile's servers it
-runs on the CPU (`judge-cpu.yaml`, about 1 s per stretch); the run records the
-judge it used.
+runs on the CPU (`judge-cpu.yaml`, about 1 s per stretch; its llama.cpp
+process grows to about 5 GB, so `judge down` after a run); the run records
+the judge it used.
 
 ## The corpus
 
