@@ -235,7 +235,7 @@ often disagree.
 | condition | chain |
 |---|---|
 | `clean` | none: the STT's ceiling |
-| `g711a`, `g711u` | 8 kHz G.711 A-law / µ-law (numpy, bit-exact with the ITU reference tables) |
+| `g711a`, `g711u` | 8 kHz G.711 A-law / µ-law (numpy; every 16-bit sample encodes and decodes as the classic reference code and Python's `audioop` do) |
 | `g722` | G.722 through ffmpeg (HD voice) |
 | `mobile` | band 300–3400 Hz, AMR-NB 7.95 kbit/s (ffmpeg, libopencore), then A-law into the PBX |
 | `loss-3`, `loss-8` | A-law, then 3 % / 8 % of the 20 ms packets lost (Gilbert-Elliott bursts of 1.5 / 3), gaps silent |
