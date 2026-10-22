@@ -263,6 +263,19 @@ JSON, and the PBX log slice.
 The bench PBX records nothing; only the test parties record, and only
 synthetic speech.
 
+## End-to-end test set (`evalset/`)
+
+`scripts/voice-eval.sh` measures the whole voice system against a German
+caller corpus rendered from text (six designed Qwen3-TTS voices plus Piper,
+twelve phone conditions, names, numbers, dates, pauses, backchannels,
+barge-in) and 20 multi-turn scenarios with expected outcomes, at three
+levels: STT per clip, the cascade harness, and calls through this bench's
+PBX and SRW's addon (compose project `srw-voice-eval`, subnet
+`172.30.98.0/24`) with `srw_driver.py` as the canned back office. Results go
+to `results/eval-*/` with a Markdown summary and a diff against the stored
+baseline per profile. Details, formats and licences:
+[`evalset/README.md`](evalset/README.md).
+
 ## German test set (`testset/de/`)
 
 - `facts.md`: a **fictional** facts sheet (Hotel Beispielhof) for the voice
