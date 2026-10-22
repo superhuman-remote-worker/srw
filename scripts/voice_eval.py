@@ -776,15 +776,18 @@ async def file_scenario(args, evalset, settings, scenario, judge, out: Path) -> 
 
 
 def score_scenarios(
-    evalset, runs: list[dict], judge_llm=None
+    evalset, runs: list[dict], judge_llm=None, today: dt.date | None = None
 ) -> tuple[list[dict], dict]:
+    """Verdicts for every observed turn and the totals; ``today`` resolves
+    relative dates (the day of the run)."""
     import voice_cascade_eval as cascade_eval
 
-    today = dt.date.today()
+    today = today or dt.date.today()
     results = []
     timings, intel, phantoms = [], [], 0
     for run in runs:
         scenario = evalset.scenarios[run["scenario"]]
+        verdicts = []
         for index, obs in enumerate(run["observed"]):
             turn = scenario.turns[index]
             verdict = S.score_turn(
@@ -796,7 +799,8 @@ def score_scenarios(
                 judge=judge_llm,
             )
             results.append({"scenario": scenario.id, "turn": index, "verdict": verdict})
-            run.setdefault("verdicts", []).append(verdict)
+            verdicts.append(verdict)
+        run["verdicts"] = verdicts
         timings += run.get("timings") or []
         intel += run.get("intelligibility") or []
         phantoms += len(run.get("phantoms") or [])
@@ -1417,8 +1421,64 @@ def finish(out: Path, args) -> int:
     return 0
 
 
+def rescore(out: Path, args) -> None:
+    """Score a run's stored observations again with the current test set and
+    matchers, without a call: STT values against the stored transcripts,
+    scenario turns against the stored observations, relative dates against
+    the day of the run. Word error rates, timings and judge results stay."""
+    from tests.voice_bench.evalset import values as V
+
+    evalset = spec.load()
+    meta = Rep.load_json(out / "run.json") or {}
+    today = dt.date.fromisoformat(meta["today"]) if meta.get("today") else None
+    data = Rep.load_json(out / "stt.json")
+    if data is not None:
+        utterances = dict(evalset.corpus.utterances)
+        for rec in evalset.human:
+            utterances[rec.id] = spec.Utterance(
+                rec.id, rec.category, rec.text, values=rec.values
+            )
+        for item in data["items"]:
+            utt = utterances.get(item["id"])
+            if utt is None:
+                continue
+            checks = []
+            for value in utt.values:
+                found = V.match(value, item["heard"], today)
+                checks.append(
+                    {
+                        "value": value.label(),
+                        "kind": value.kind,
+                        "category": value.category,
+                        "ok": found.ok,
+                        "how": found.how,
+                    }
+                )
+            item["values"] = checks
+        data["summary"] = S.aggregate_stt(data["items"])
+        (out / "stt.json").write_text(
+            json.dumps(data, indent=1, ensure_ascii=False), "utf-8"
+        )
+    judge = None if args.no_llm_judge else llm_judge(args, load_settings(args)[0])
+    for level in ("file", "call"):
+        data = Rep.load_json(out / f"{level}.json")
+        if data is None:
+            continue
+        keep = {k: v for k, v in data["summary"].items() if k in ("no_audio_written",)}
+        runs = [r for r in data["scenarios"] if r["scenario"] in evalset.scenarios]
+        _, summary = score_scenarios(evalset, runs, judge, today)
+        data["summary"] = {**summary, **keep}
+        (out / f"{level}.json").write_text(
+            json.dumps(data, indent=1, ensure_ascii=False, default=str), "utf-8"
+        )
+    log(f"rescored {out}")
+
+
 def cmd_report(args) -> int:
-    return finish(Path(args.run).resolve(), args)
+    out = Path(args.run).resolve()
+    if args.rescore:
+        rescore(out, args)
+    return finish(out, args)
 
 
 def cmd_diff(args) -> int:
@@ -1601,6 +1661,20 @@ def main() -> int:
     )
     report.add_argument("run")
     report.add_argument("--baseline")
+    report.add_argument(
+        "--rescore",
+        action="store_true",
+        help="score the stored observations again with the current matchers (no calls)",
+    )
+    report.add_argument(
+        "--profile-file",
+        type=Path,
+        default=REPO_ROOT / "docker" / "voice-models" / "cascade-gpu.yaml",
+    )
+    report.add_argument("--profile", default="cascade-gpu-rocm")
+    report.add_argument("--llm-judge-url")
+    report.add_argument("--llm-judge-model")
+    report.add_argument("--no-llm-judge", action="store_true")
     diff = sub.add_parser("diff", help="a run against the stored baseline")
     diff.add_argument("run")
     diff.add_argument("--baseline")

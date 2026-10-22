@@ -389,6 +389,11 @@ class TestValues:
         assert not V.match(
             Value("email", "jana.probe@beispiel.example"), "Jana Probe bei Beispiel"
         ).ok
+        jana = Value("email", "jana.probe@beispiel.example")
+        assert V.match(jana, "ist jana.probe-at-Beispiel.example.").ok
+        assert not V.match(jana, "ist jana.probeartbeispiel.example").ok
+        info = Value("email", "info@musterfirma-bau.example")
+        assert V.match(info, "info-at-musterfirma-bau.example").ok
         address = Value("address", "Lindenallee 23, 99999 Beispielstadt")
         assert V.match(
             address, "an die Linden-Allee 23 in neun neun neun neun neun Beispielstadt"

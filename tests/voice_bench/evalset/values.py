@@ -431,9 +431,16 @@ _SPOKEN_SYMBOLS = {
 def spoken_email(text: str) -> str:
     """The text as an address would be typed: spoken symbols as characters,
     number words as digits, no spaces ("jana punkt probe at beispiel punkt
-    example", "reisen unterstrich zwanzig sechsundzwanzig")."""
+    example", "reisen unterstrich zwanzig sechsundzwanzig"); the hyphens STT
+    puts around a spoken symbol ("probe-at-Beispiel") go."""
+    words = re.findall(r"[a-zäöüß0-9]+|[@._\-]", (text or "").lower())
     out = []
-    for word in re.findall(r"[a-zäöüß0-9]+|[@._\-]", (text or "").lower()):
+    for index, word in enumerate(words):
+        if word == "-" and any(
+            0 <= j < len(words) and words[j] in _SPOKEN_SYMBOLS
+            for j in (index - 1, index + 1)
+        ):
+            continue
         if word in _SPOKEN_SYMBOLS:
             out.append(_SPOKEN_SYMBOLS[word])
         elif (number := cardinal(word)) is not None and word not in ("ein", "eine"):
