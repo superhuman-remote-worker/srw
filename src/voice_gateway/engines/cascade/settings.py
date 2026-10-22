@@ -103,8 +103,9 @@ class TurnSettings:
     vad_model_file: str | None = None
     #: Smart Turn v3 decides the end of a turn; without it, a fixed silence.
     smart_turn: bool = True
-    #: Longest silence Smart Turn waits for when it reads a turn as unfinished.
-    smart_turn_stop_secs: float = 3.0
+    #: Longest silence Smart Turn waits for when it reads a turn as unfinished
+    #: (owner 2026-10-22: 2 s; Pipecat's 3 s left callers waiting).
+    smart_turn_stop_secs: float = 2.0
     #: The silence that ends a turn when ``smart_turn`` is off.
     speech_timeout_secs: float = 0.6
 
@@ -336,7 +337,7 @@ def _turn(raw, label: str, base: Path | None) -> TurnSettings:
         vad_model_file=model_file,
         smart_turn=_boolean(raw, "smart_turn", label, True),
         smart_turn_stop_secs=_number(
-            raw, "smart_turn_stop_secs", label, 3.0, 0.3, 10.0
+            raw, "smart_turn_stop_secs", label, 2.0, 0.3, 10.0
         ),
         speech_timeout_secs=_number(raw, "speech_timeout_secs", label, 0.6, 0.1, 5.0),
     )
