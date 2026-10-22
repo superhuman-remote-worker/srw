@@ -26,8 +26,12 @@ USER 65532:65532
 # HOME is the tmpfs: MIOpen keeps its kernel database there (no audio).
 # MIOpen's exhaustive kernel search made the first sentences take ten times
 # longer than they last on an RX 9070 XT; the fast find mode does not.
+# With ROCm's profiler-tool registration on, the runtime's event thread
+# (AsyncEventsLoop) never sleeps: one CPU core at 100 % while idle, from the
+# first tensor on (ROCm 7.2, RX 9070 XT). Nothing here uses those tools.
 ENV PORT=8000 VOICES_DIR=/voices HOME=/tmp HF_HUB_OFFLINE=1 \
-    MIOPEN_FIND_MODE=FAST PYTHONDONTWRITEBYTECODE=1 \
+    MIOPEN_FIND_MODE=FAST HSA_TOOLS_DISABLE_REGISTER=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/opt/qwen-tts/runtime:/usr/local/lib/qwen_tts_stubs \
     MODEL_DIR=/opt/qwen-tts/Qwen3-TTS-12Hz-0.6B-Base
 EXPOSE 8000
