@@ -22,6 +22,13 @@ and greeting append. Only event kinds and the matched entry are logged,
 never what was said, unless ``log_transcripts`` asks for the transcripts
 with their times (bench timelines of synthetic test speech).
 
+For the test set's call level (``scripts/voice-eval.sh run --levels call``),
+entries may carry their own ``delay``; ``answer_once`` uses each entry for
+one delegation only; ``default_answer`` answers a delegation no entry
+matches; and ``log_content`` also logs the transcripts and each delegation's
+request (what the caller said since the last one, as SRW's driver forwards
+it), the synthetic test caller's words only.
+
     python srw_driver.py --config driver.json   # inside the bench network
 """
 
@@ -44,6 +51,29 @@ from shared.runtime.live.webhook import (
 )
 
 
+def match_answer(
+    answers: list[dict],
+    heard: str,
+    used: set[int] | None = None,
+    default: str | None = None,
+) -> tuple[int, dict] | None:
+    """The first entry whose keyword groups all appear in what the caller
+    said (``a|b`` for either; no keywords match anything); entries in
+    ``used`` are skipped; ``default`` (index -1) when none matches."""
+    said = " ".join(heard.lower().split())
+    for index, entry in enumerate(answers):
+        if used is not None and index in used:
+            continue
+        if all(
+            any(k in said for k in group.lower().split("|"))
+            for group in entry.get("keywords", [])
+        ):
+            return index, entry
+    if default:
+        return -1, {"answer": default}
+    return None
+
+
 class Driver:
     def __init__(self, config: dict):
         self.config = config
@@ -56,6 +86,7 @@ class Driver:
         self.http: aiohttp.ClientSession | None = None
         self.tasks: set[asyncio.Task] = set()
         self.answers: list[dict] = config.get("answers") or []
+        self.used: set[int] = set()
 
     def log(self, kind: str, **data) -> None:
         line = json.dumps({"t": time.time(), "kind": kind, **data})
@@ -92,27 +123,30 @@ class Driver:
 
     def match(self, heard: str) -> tuple[int, dict] | None:
         """The canned answer for what the caller said, by keywords."""
-        said = " ".join(heard.lower().split())
-        for index, entry in enumerate(self.answers):
-            if all(
-                any(k in said for k in group.lower().split("|"))
-                for group in entry.get("keywords", [])
-            ):
-                return index, entry
-        return None
+        found = match_answer(
+            self.answers,
+            heard,
+            self.used if self.config.get("answer_once") else None,
+            self.config.get("default_answer"),
+        )
+        if found is not None and found[0] >= 0:
+            self.used.add(found[0])
+        return found
 
     async def back_office(self, ws, sid: str, delegation_id: str, heard: str) -> None:
         found = self.match(heard)
+        extra = {"request": heard} if self.config.get("log_content") else {}
         self.log(
             "delegation",
             session_id=sid,
             delegation_id=delegation_id,
             answer=None if found is None else found[0],
+            **extra,
         )
         if found is None:
             return
         index, entry = found
-        answer_delay = float(self.config.get("answer_delay", 4.0))
+        answer_delay = float(entry.get("delay", self.config.get("answer_delay", 4.0)))
         status = self.config.get("status")
         waited = 0.0
         if status:
@@ -204,10 +238,10 @@ class Driver:
                     entry["code"] = (event.get("error") or {}).get("code")
                 if kind == "session.input_transcript.delta":
                     heard.append(event.get("delta") or "")
-                if self.config.get("log_transcripts") and kind.endswith(
-                    "_transcript.delta"
-                ):
-                    entry["text"] = event.get("delta")
+                if (
+                    self.config.get("log_transcripts") or self.config.get("log_content")
+                ) and kind.endswith("_transcript.delta"):
+                    entry["text"] = event.get("delta") or ""
                     entry["start_ms"] = event.get("start_ms")
                 self.log("event", **entry)
                 if kind == "session.delegation.created" and self.answers:

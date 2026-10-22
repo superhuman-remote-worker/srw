@@ -17,12 +17,15 @@ A script (YAML; times in seconds after the call was answered)::
 
     number: "107"                 # bench number; 107 accepts a blind REFER
     hangup_after: 170
+    background: /path/room.wav    # optional: a 16 kHz WAV looped under the call
     lines:
       - at: 13
         utterance: a02-checkout   # an id from testset/de/utterances.yaml
       - at: 100
         text: Verbinden Sie mich bitte mit der Rezeption.
         speaker: 10               # Piper de_DE-mls-medium speaker (default 10)
+      - at: 120
+        audio: /path/to/line.wav  # a rendered 16 kHz mono WAV (the test set's)
     expect:                       # what the caller must hear
       - name: greeting
         to: 13
@@ -86,10 +89,11 @@ class Line:
     utterance: str | None = None
     text: str | None = None
     speaker: int = DEFAULT_SPEAKER
+    audio: str | None = None
 
     @property
     def label(self) -> str:
-        return self.utterance or (self.text or "")[:40]
+        return self.utterance or (self.text or "")[:40] or Path(self.audio or "").name
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,9 @@ class CallScript:
     lines: list[Line]
     expect: list[Expect] = field(default_factory=list)
     caller_ext: str = "1000"
+    #: A 16 kHz WAV looped under the whole call instead of silence (the
+    #: caller's room between the lines; the test set's noisy conditions).
+    background: str | None = None
 
 
 def _seconds(value, label: str) -> float:
@@ -118,7 +125,14 @@ def _seconds(value, label: str) -> float:
 def parse_script(raw: dict) -> CallScript:
     if not isinstance(raw, dict):
         raise ScriptError("a call script is a mapping")
-    unknown = set(raw) - {"number", "hangup_after", "lines", "expect", "caller_ext"}
+    unknown = set(raw) - {
+        "number",
+        "hangup_after",
+        "lines",
+        "expect",
+        "caller_ext",
+        "background",
+    }
     if unknown:
         raise ScriptError(f"unknown script fields: {', '.join(sorted(unknown))}")
     number = str(raw.get("number", ""))
@@ -133,10 +147,11 @@ def parse_script(raw: dict) -> CallScript:
             "utterance",
             "text",
             "speaker",
+            "audio",
         }:
-            raise ScriptError(f"{label} takes at, utterance or text, speaker")
-        if bool(item.get("utterance")) == bool(item.get("text")):
-            raise ScriptError(f"{label} needs either utterance or text")
+            raise ScriptError(f"{label} takes at, utterance, text or audio, speaker")
+        if sum(bool(item.get(k)) for k in ("utterance", "text", "audio")) != 1:
+            raise ScriptError(f"{label} needs either utterance, text or audio")
         speaker = item.get("speaker", DEFAULT_SPEAKER)
         if type(speaker) is not int or speaker < 0:
             raise ScriptError(f"{label}.speaker must be a speaker id")
@@ -146,6 +161,7 @@ def parse_script(raw: dict) -> CallScript:
                 utterance=item.get("utterance"),
                 text=item.get("text"),
                 speaker=speaker,
+                audio=str(item["audio"]) if item.get("audio") else None,
             )
         )
     if not lines:
@@ -180,6 +196,7 @@ def parse_script(raw: dict) -> CallScript:
         lines=lines,
         expect=expects,
         caller_ext=str(raw.get("caller_ext", "1000")),
+        background=str(raw["background"]) if raw.get("background") else None,
     )
 
 
@@ -197,6 +214,8 @@ def render_jobs(script: CallScript) -> list[dict]:
 
 
 def line_audio(line: Line) -> Path:
+    if line.audio:
+        return Path(line.audio)
     if line.utterance:
         return AUDIO_DIR / "testset" / f"{line.utterance}.16k.wav"
     return (
@@ -205,10 +224,19 @@ def line_audio(line: Line) -> Path:
 
 
 def compose_audio(
-    clips: list[tuple[float, array.array]], total_s: float, rate: int = RATE
+    clips: list[tuple[float, array.array]],
+    total_s: float,
+    rate: int = RATE,
+    background: array.array | None = None,
 ) -> array.array:
-    """One track with every clip at its start time, silence elsewhere."""
-    out = array.array("h", bytes(2 * int(total_s * rate)))
+    """One track with every clip at its start time, silence (or the looped
+    ``background``) elsewhere."""
+    size = int(total_s * rate)
+    if background:
+        loops = -(-size // len(background))
+        out = (background * loops)[:size]
+    else:
+        out = array.array("h", bytes(2 * size))
     end_of_last = 0
     for at, samples in clips:
         first = int(at * rate)
@@ -239,10 +267,16 @@ def write_caller_audio(script: CallScript, dst: Path) -> list[dict]:
             {
                 "at_s": line.at,
                 "seconds": round(len(samples) / rate, 2),
-                "line": line.utterance or line.text,
+                "line": line.utterance or line.text or line.audio,
             }
         )
-    write_wav(dst, RATE, compose_audio(clips, script.hangup_after + TAIL_S))
+    background = None
+    if script.background:
+        rate, background = read_wav(Path(script.background))
+        if rate != RATE:
+            raise ScriptError(f"the background is {rate} Hz, expected {RATE}")
+    total = script.hangup_after + TAIL_S
+    write_wav(dst, RATE, compose_audio(clips, total, background=background))
     return placed
 
 
