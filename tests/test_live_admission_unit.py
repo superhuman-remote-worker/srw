@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -40,6 +41,7 @@ from orchestrator.services.live.admission import (
     refuse_session_contradictions,
 )
 from orchestrator.services.live.instructions import (
+    CALL_TIME_CHARS,
     DEFAULT_FALLBACK,
     DEFAULT_VOICE,
     LIVE_VOICE_RULES,
@@ -48,11 +50,14 @@ from orchestrator.services.live.instructions import (
     LiveVoice,
     LiveVoiceError,
     build_live_voice,
+    call_time_section,
     catalog_voice,
     find_live_entry,
     greeting_instruction,
+    live_timezone,
     live_voice_of,
     session_instructions,
+    with_call_time,
     with_default_voice,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError, pod_endpoint
@@ -115,8 +120,10 @@ class TestSessionInstructions:
             logging.WARNING, logger="orchestrator.services.live.instructions"
         ):
             text = session_instructions(persona, "F" * MAX_INSTRUCTION_CHARS, entry="v")
-        assert len(text) == MAX_INSTRUCTION_CHARS
+        # Room stays for the date section the handoff adds.
+        assert len(text) == MAX_INSTRUCTION_CHARS - CALL_TIME_CHARS
         assert text.endswith(LIVE_VOICE_RULES)
+        assert len(with_call_time(text)) <= MAX_INSTRUCTION_CHARS
         assert any("Truncating the facts" in r.getMessage() for r in caplog.records)
 
     def test_facts_within_the_budget_are_kept_whole(self, caplog):
@@ -128,6 +135,66 @@ class TestSessionInstructions:
     def test_a_persona_over_the_budget_is_refused(self):
         with pytest.raises(LiveVoiceError, match="instruction budget"):
             session_instructions("P" * MAX_INSTRUCTION_CHARS, "")
+
+
+#: A Thursday afternoon in Berlin (CEST, UTC+2), the week before the clocks
+#: go back.
+CALL_START = datetime(2026, 10, 22, 12, 15, tzinfo=timezone.utc)
+
+
+class TestCallTime:
+    def test_the_start_in_berlin_and_the_next_two_weeks_by_weekday(self, monkeypatch):
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        text = with_call_time("RULES", CALL_START)
+        assert text == (
+            "RULES\n\n## Date and time\n"
+            "The call started on Thursday, 22 October 2026, at 14:15 "
+            "(time zone Europe/Berlin).\n"
+            "The next two weeks: Friday 23 October; Saturday 24 October; "
+            "Sunday 25 October; Monday 26 October; Tuesday 27 October; "
+            "Wednesday 28 October; Thursday 29 October; Friday 30 October; "
+            "Saturday 31 October; Sunday 1 November; Monday 2 November; "
+            "Tuesday 3 November; Wednesday 4 November; Thursday 5 November."
+        )
+
+    def test_the_deployment_names_the_time_zone(self, monkeypatch):
+        monkeypatch.setenv("LIVE_TIMEZONE", "America/New_York")
+        text = with_call_time("", CALL_START)
+        assert (
+            "on Thursday, 22 October 2026, at 08:15 (time zone America/New_York)"
+            in text
+        )
+        monkeypatch.setenv("LIVE_TIMEZONE", "UTC")
+        assert "at 12:15 (time zone UTC)" in with_call_time("", CALL_START)
+
+    def test_a_late_call_is_already_the_next_day_locally(self, monkeypatch):
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        late = datetime(2026, 12, 31, 23, 30, tzinfo=timezone.utc)
+        text = with_call_time("", late)
+        assert "on Friday, 1 January 2027, at 00:30 (time zone Europe/Berlin)" in text
+        assert "The next two weeks: Saturday 2 January;" in text
+
+    def test_an_unknown_time_zone_falls_back_to_berlin_with_a_warning(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("LIVE_TIMEZONE", "Mars/Olympus")
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.live.instructions"
+        ):
+            assert live_timezone().key == "Europe/Berlin"
+        assert any("LIVE_TIMEZONE" in r.getMessage() for r in caplog.records)
+
+    def test_the_section_fits_its_reserve(self, monkeypatch):
+        # The longest weekday and month names, in every month of a year.
+        for month in range(1, 13):
+            start = datetime(2026, month, 28, 23, 59, tzinfo=timezone.utc)
+            assert len(call_time_section(start)) + 2 <= CALL_TIME_CHARS
+
+    def test_without_a_time_it_is_now(self, monkeypatch):
+        monkeypatch.setenv("LIVE_TIMEZONE", "UTC")
+        text = with_call_time("")
+        today = datetime.now(timezone.utc)
+        assert f"{today.day} " in text and str(today.year) in text
 
 
 class TestGreeting:
@@ -782,14 +849,18 @@ def _admission_for(
 
 
 class TestHandoffBody:
-    def test_defaults(self):
-        body = handoff_body(_admission_for(), JOB)
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        body = handoff_body(_admission_for(), JOB, now=CALL_START)
         assert body == {
             "session_id": SESSION,
             "provider_session_id": "rtc_1",
             "job_id": JOB,
             "model": "gpt-live-1",
-            "accept": {"instructions": "INSTRUCTIONS", "voice": "cedar"},
+            "accept": {
+                "instructions": with_call_time("INSTRUCTIONS", CALL_START),
+                "voice": "cedar",
+            },
             "greeting_instruction": "GREET",
             "texts": {"fallback": "FALLBACK"},
             "limits": {"max_duration_s": 900, "no_job_fallback_s": 8},
@@ -810,6 +881,13 @@ class TestHandoffBody:
         body = handoff_body(_admission_for(connector), JOB)
         assert body["model"] == ""
         assert body["limits"] == {"max_duration_s": 900, "no_job_fallback_s": 8}
+
+    def test_the_instructions_end_with_the_handoff_s_date(self):
+        # The voice's facts and rules stay first: the date changes per call.
+        body = handoff_body(_admission_for(), JOB)
+        instructions = body["accept"]["instructions"]
+        assert instructions.startswith("INSTRUCTIONS\n\n## Date and time\n")
+        assert "The next two weeks: " in instructions
 
 
 def _sessions(transition_result=(True, {"status": "active"})) -> SimpleNamespace:

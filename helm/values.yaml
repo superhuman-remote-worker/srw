@@ -488,6 +488,11 @@ connectors:
         repository: ghcr.io/superhuman-remote-worker/srw-driver-gpt-live-sip
         tag: latest
         digest: ""
+      # -- The phone lines' local time zone (an IANA name such as
+      # Europe/Vienna, America/New_York or UTC): the voice is told the call's
+      # date, weekday and time in it, and the next two weeks' dates, so it
+      # works out "next Monday" without asking the back office.
+      timezone: Europe/Berlin
     # -- SRW's connector driver certificate authority (C3): signs each TLS
     # driver pod's certificate; workspaces trust it for the driver's URL
     # only. Generated once at install and kept (resource-policy keep) when

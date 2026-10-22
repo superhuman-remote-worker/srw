@@ -24,6 +24,7 @@ import copy
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
@@ -33,6 +34,7 @@ from orchestrator.services.live.instructions import (
     LiveVoiceError,
     catalog_voice,
     live_voice_of,
+    with_call_time,
     with_default_voice,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError
@@ -247,7 +249,11 @@ async def prepare_live_session(
     )
 
 
-def handoff_body(admission: LiveAdmission, job_id: str) -> dict[str, Any]:
+def handoff_body(
+    admission: LiveAdmission, job_id: str, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """What the line's pod accepts the session with; the instructions end
+    with the call's date and time (``now``, the handoff by default)."""
     config = admission.connector.get("config") or {}
     voice = admission.voice
     return {
@@ -255,7 +261,10 @@ def handoff_body(admission: LiveAdmission, job_id: str) -> dict[str, Any]:
         "provider_session_id": admission.session["provider_session_id"],
         "job_id": str(job_id),
         "model": str(config.get("model") or ""),
-        "accept": {"instructions": voice.instructions, "voice": voice.voice},
+        "accept": {
+            "instructions": with_call_time(voice.instructions, now),
+            "voice": voice.voice,
+        },
         "greeting_instruction": voice.greeting_instruction,
         "texts": {"fallback": voice.fallback},
         "limits": {

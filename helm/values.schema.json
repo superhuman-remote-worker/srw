@@ -1739,7 +1739,8 @@
                     "tag": {"type": "string"},
                     "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
                   }
-                }
+                },
+                "timezone": {"type": "string", "pattern": "^[A-Za-z0-9_+./-]{1,64}$"}
               }
             },
             "ca": {

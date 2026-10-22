@@ -2124,6 +2124,9 @@ spec:
             # A digest pins it (tag@digest; CI stamps it), a tag alone follows.
             - name: CONNECTOR_GPT_LIVE_SIP_IMAGE
               value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            # The time zone the voice is told the call's date and time in.
+            - name: LIVE_TIMEZONE
+              value: {{ .timezone | default "Europe/Berlin" | quote }}
             {{- end }}
             {{- end }}
             # The git swap driver (connector drivers C3): what a token

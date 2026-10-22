@@ -822,3 +822,18 @@ def test_the_retired_stdio_switch_off_still_renders(setting):
         and "MCP_DATASOURCES_ENABLED" in (doc.get("data") or {})
     )
     assert "MCP_STDIO_ENABLED" not in configmap["data"]
+
+
+def test_the_phone_line_driver_tells_the_voice_its_time_zone():
+    line = (
+        "connectors.drivers.gptLiveSip.enabled=true",
+        "connectors.drivers.gptLiveSip.image.repository=example.test/gpt-live-sip",
+    )
+    assert orchestrator_env(render(EXCHANGE, ON, *line))["LIVE_TIMEZONE"] == (
+        "Europe/Berlin"
+    )
+    zone = "connectors.drivers.gptLiveSip.timezone=America/New_York"
+    env = orchestrator_env(render(EXCHANGE, ON, *line, zone))
+    assert env["LIVE_TIMEZONE"] == "America/New_York"
+    # Without a phone-line driver there is no voice to tell.
+    assert "LIVE_TIMEZONE" not in orchestrator_env(render())
