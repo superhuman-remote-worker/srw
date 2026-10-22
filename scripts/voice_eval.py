@@ -1195,8 +1195,12 @@ def observe_call(
         if human_at is None or s["from_s"] < human_at
     ]
     starts = [a for a, _, _ in stretches]
+    # The last turn's window ends with the call: the last event either side
+    # saw. (Unbounded, a back-office answer the voice never said counted as
+    # a silence of 10**9 ms.)
+    call_end = max(ms(e["t"]) for e in [*driver, *caller_events] if "t" in e) + 1
     reply_his = S.reply_windows(
-        [t for t, *_ in lines], [round(t * 1000) for t in times], 10**9
+        [t for t, *_ in lines], [round(t * 1000) for t in times], call_end
     )
     observed = []
     for i, (turn, pcm, lead, tail) in enumerate(lines):
