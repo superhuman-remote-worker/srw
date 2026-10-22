@@ -191,7 +191,7 @@ allows commercial use; the full table with versions is in
 | Component | License |
 |---|---|
 | llama.cpp, whisper.cpp, Piper, Speaches, faster-qwen3-tts | MIT |
-| Gemma 4 12B, Qwen3-TTS 0.6B/1.7B Base, Qwen3-ASR 0.6B (bench judge only) | Apache-2.0 |
+| Gemma 4 12B, Qwen3-TTS 0.6B/1.7B Base, Qwen3-ASR 0.6B (bench judge only), Qwen3-TTS 1.7B VoiceDesign (test-set caller voices only) | Apache-2.0 |
 | whisper-large-v3-turbo, faster-whisper small, Piper `de_DE-mls-medium` | MIT |
 | PyTorch (ROCm wheel, bundling the ROCm libraries), Transformers, Accelerate, qwen-tts-hf | BSD-3-Clause / Apache-2.0 |
 | soxr (LGPL-2.1-or-later), certifi and tqdm (MPL-2.0) in the ROCm TTS runtime | weak copyleft, used unmodified |
@@ -199,6 +199,10 @@ allows commercial use; the full table with versions is in
 The bundled voice sample `docker/voice-models/voices/de-1.wav` was generated
 by Qwen3-TTS (Apache-2.0) without a reference recording; it is no real
 person's voice.
+The voice test set (`tests/voice_bench/evalset/`) commits no audio: its
+caller voices are designed from text descriptions by Qwen3-TTS VoiceDesign,
+its background noise is generated, and both are rendered into a gitignored
+cache; its licences are listed in that folder's README.
 
 ---
 

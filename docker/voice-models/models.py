@@ -1,6 +1,6 @@
 """Fetch the pinned models of the cascade test profiles; local_voice_gateway.md §6.2.
 
-    python docker/voice-models/models.py fetch [--set cpu,gpu,judge] [--dir DIR] [--with-medium-stt]
+    python docker/voice-models/models.py fetch [--set cpu,gpu,judge,design] [--dir DIR] [--with-medium-stt]
     python docker/voice-models/models.py check [--set ...] [--dir DIR]
 
 Every file comes from its official repository at a fixed revision and must
@@ -17,7 +17,10 @@ Qwen3-TTS for AMD GPUs (``qwen-tts/``: the 0.6B Base model, the PyTorch ROCm
 wheel, and ``runtime/``, the pinned Python packages of
 ``qwen-tts-rocm.requirements.txt`` installed there by pip in a pinned
 Python image); ``judge`` the bench's transcription judge (``judge/``
-Qwen3-ASR, another model family than the STT it judges).
+Qwen3-ASR, another model family than the STT it judges); ``design`` the
+test set's caller voices (``qwen-tts/`` Qwen3-TTS 1.7B VoiceDesign, which
+makes a voice from a description; tests/voice_bench/evalset/README.md; it
+runs on the CPU with ``rocm``'s runtime).
 """
 
 from __future__ import annotations
@@ -161,6 +164,15 @@ _QWEN_TTS_06_FILES = {
     "speech_tokenizer/model.safetensors": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
 }
 TORCH_ROCM_WHEEL = "torch-2.14.1+rocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl"
+_QWEN_DESIGN = (
+    "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/"
+    "5ecdb67327fd37bb2e042aab12ff7391903235d3"
+)
+_QWEN_DESIGN_FILES = {
+    **_QWEN_TTS_06_FILES,
+    "config.json": "aecd2cc4c1fe9edef1cb7ca7c401685a43879ad43f3f9e883f1c6760b61731e0",
+    "model.safetensors": "391e8db219f292c515297cdceeb43e4eae67cdde35fa57e79a6a8a532fca0522",
+}
 
 FILES += tuple(
     File(
@@ -179,6 +191,16 @@ FILES += tuple(
         "BSD-3-Clause and others (PyTorch 2.14.1, ROCm 7.2 build with ROCm libraries)",
         "rocm",
     ),
+)
+FILES += tuple(
+    File(
+        f"qwen-tts/Qwen3-TTS-12Hz-1.7B-VoiceDesign/{name}",
+        f"{_QWEN_DESIGN}/{name}",
+        digest,
+        "Apache-2.0 (Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign)",
+        "design",
+    )
+    for name, digest in _QWEN_DESIGN_FILES.items()
 )
 #: The Python image the server image builds on; pip runs in it, too.
 PYTHON_IMAGE = (
@@ -360,11 +382,11 @@ def main() -> None:
     parser.add_argument(
         "--set",
         default="cpu",
-        help="comma-separated model sets: cpu (default), gpu, rocm, judge, or all",
+        help="comma-separated model sets: cpu (default), gpu, rocm, judge, design, or all",
     )
     args = parser.parse_args()
     root = args.dir.resolve()
-    known = {"cpu", "gpu", "rocm", "judge"}
+    known = {"cpu", "gpu", "rocm", "judge", "design"}
     sets = known if args.set == "all" else set(args.set.split(","))
     unknown = sets - known
     if unknown:

@@ -35,6 +35,7 @@ understand of the voice; it is another model family than the STT it judges.
 | qwen-tts-hf 0.1.1.post1 (Qwen3-TTS's package for Transformers 5) | Apache-2.0 | — |
 | Transformers 5.15.1, Accelerate 1.12.0 and the other pinned packages of `qwen-tts-rocm.requirements.txt` | Apache-2.0, BSD, MIT, ISC; weak copyleft, used unmodified: soxr (LGPL-2.1+), certifi and tqdm (MPL-2.0) | — |
 | Qwen3-ASR 0.6B (GGUF by ggml-org), judge only | — | Apache-2.0 |
+| Qwen3-TTS 12Hz 1.7B VoiceDesign, the voice test set's caller voices only (`--set design`, CPU) | — | Apache-2.0 |
 | `audio_adapter.py`, `piper_server.py`, `qwen_tts_server.py`, `qwen_tts_stubs/` (here) | this repository | — |
 | Silero VAD v6.2.3 | MIT | MIT |
 | Smart Turn v3.2 (in Pipecat 1.12.0, BSD-2) | BSD-2 | BSD-2 |
@@ -55,6 +56,9 @@ python docker/voice-models/models.py fetch --set gpu,rocm     # cascade-gpu-rocm
 #    + the 0.6B model, the 6.2 GB PyTorch ROCm wheel, and qwen-tts/runtime
 #    (~15 GB), where pip in a pinned Python image installs the wheel and
 #    the pinned packages; the server image itself stays small.
+python docker/voice-models/models.py fetch --set rocm,design   # the voice test set's
+#    caller voices (tests/voice_bench/evalset/): + 3.8 GB VoiceDesign model,
+#    rendered on the CPU with the rocm runtime.
 
 # 2a. cascade-cpu on 127.0.0.1:18450 (STT), :18451 (LLM), :18452 (TTS).
 VOICE_LLM_RENDER_NODE=/dev/dri/renderD129 \
