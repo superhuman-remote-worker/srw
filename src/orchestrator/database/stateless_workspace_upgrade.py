@@ -15,8 +15,10 @@ container Session awaiting its first create:
 The runtime generation is never rotated, which keeps the 0198 generation
 trigger quiet; Task 1's probe pins that the 0198/0223 guard admits the rest.
 A row with earlier container history, physical keys, VM evidence or a stop
-marker is refused rather than repaired: those belong to End/Resume. A guard
-that still refuses the UPDATE becomes the same typed refusal, never a 500.
+marker is refused rather than repaired: those belong to End/Resume. The one
+record taken over is End's stamp on a resumed lite row, which migration 0558
+lets both guards read as empty for this UPDATE. A guard that still refuses the
+UPDATE becomes the same typed refusal, never a 500.
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ UPGRADE_NOT_POSSIBLE = (
     "This Session's workspace can't be upgraded in place. "
     "Start a new Session with a container workspace."
 )
+
+#: What End's settlement leaves on every lite row it settles; Resume keeps it.
+_END_STAMP = {"volume_reclaimed": False}
 
 _HISTORY_SQL = """
 SELECT EXISTS (
@@ -82,8 +87,9 @@ def stateless_upgrade_refusal(metadata: Any) -> str | None:
     """Why a lite row can't take the upgrade, from its metadata alone, or None.
 
     ``/connection`` offers the container only where this passes. Any
-    ``workspace_container`` content refuses: the lifecycle guards treat a
-    non-empty record without a provisioner as authority to retire.
+    ``workspace_container`` content but End's exact stamp refuses: the
+    lifecycle guards treat a non-empty record without a provisioner as
+    authority to retire, and only that stamp is read as empty (0558).
     """
     metadata = metadata_object(metadata)
     config_override = metadata.get("config_override")
@@ -101,7 +107,11 @@ def stateless_upgrade_refusal(metadata: Any) -> str | None:
         "_stateless_workspace_retirement_settled" in metadata
     ):
         return "session_ending"
-    if metadata.get("workspace_container") not in (None, {}):
+    workspace_context = metadata.get("workspace_container")
+    if workspace_context not in (None, {}) and not (
+        workspace_context == _END_STAMP
+        and workspace_context["volume_reclaimed"] is False
+    ):
         return "workspace_context_present"
     return None
 

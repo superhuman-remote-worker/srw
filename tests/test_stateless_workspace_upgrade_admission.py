@@ -221,10 +221,30 @@ async def test_prepare_refuses_a_vm_target_it_is_not_given(tracking, record):
         (_thread(backend="sandbox"), True, _provisioner(), []),
         (_thread(lane="pinned"), True, _provisioner(), []),
         (_thread(), True, _provisioner(in_cluster=False), []),
+        # A resumed Session keeps End's stamp; the guards read it as empty for
+        # the upgrade (0558), so it is offered.
+        (
+            _thread(workspace_container={"volume_reclaimed": False}),
+            True,
+            _provisioner(),
+            ["container"],
+        ),
         # What the transition refuses is never offered (E4-era bug: a resumed
         # Session was offered the container, then refused).
         (
-            _thread(workspace_container={"volume_reclaimed": False}),
+            _thread(workspace_container={"volume_reclaimed": True}),
+            True,
+            _provisioner(),
+            [],
+        ),
+        (
+            _thread(workspace_container={"volume_reclaimed": 0}),
+            True,
+            _provisioner(),
+            [],
+        ),
+        (
+            _thread(workspace_container={"volume_reclaimed": False, "repo_name": "r"}),
             True,
             _provisioner(),
             [],

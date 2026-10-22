@@ -3763,6 +3763,13 @@ BEGIN
     THEN
         old_workspace := '{}'::JSONB;
     END IF;
+    IF source_kind = 'thread' AND TG_OP = 'UPDATE'
+       AND public.stateless_lite_upgrade_replaces_end_stamp(
+           to_jsonb(OLD), to_jsonb(NEW)
+       )
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
     IF TG_OP = 'DELETE' AND source_kind = 'thread'
        AND public.stateless_virtual_permanent_delete_is_authority_free(
            source_id, old_state
@@ -16198,6 +16205,15 @@ BEGIN
             MESSAGE = 'Stateless workspace projection must match the thread runtime generation';
     END IF;
 
+    -- A resumed lite Session's upgrade replaces End's stamp (0558).
+    IF source_kind = 'thread' AND TG_OP = 'UPDATE'
+       AND public.stateless_lite_upgrade_replaces_end_stamp(
+           to_jsonb(OLD), to_jsonb(NEW)
+       )
+    THEN
+        old_state := jsonb_set(old_state, '{workspace_container}', '{}'::JSONB);
+    END IF;
+
     FOREACH scope_name IN ARRAY ARRAY['workspace_container', 'ide'] LOOP
         IF scope_name = 'ide' AND source_kind <> 'job' THEN
             CONTINUE;
@@ -20285,6 +20301,72 @@ BEGIN
     NEW.admitted_xact_id := pg_current_xact_id();
     RETURN NEW;
 END;
+$$;
+
+
+--
+-- Name: stateless_lite_upgrade_replaces_end_stamp(jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_lite_upgrade_replaces_end_stamp(old_row jsonb, new_row jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT COALESCE(
+        old_row->>'execution_lane' = 'stateless'
+        AND new_row->>'execution_lane' = 'stateless'
+        AND old_row->>'status' IN ('created', 'active', 'awaiting_user')
+        AND new_row->>'status' = old_row->>'status'
+        AND new_row->>'runtime_generation' = old_row->>'runtime_generation'
+        AND old_row->'runtime_retirement_token' = 'null'::JSONB
+        AND new_row->'runtime_retirement_token' = 'null'::JSONB
+        AND old_row #> '{metadata,workspace_container}'
+            = '{"volume_reclaimed": false}'::JSONB
+        AND old_row #>> '{metadata,config_override,workspace,backend}'
+            IN ('virtual', 'none')
+        AND new_row #>> '{metadata,config_override,workspace,backend}'
+            = 'sandbox'
+        AND jsonb_typeof(new_row #> '{metadata,workspace_container}') = 'object'
+        AND (new_row #> '{metadata,workspace_container}') - ARRAY[
+                'status',
+                'provisioner',
+                '_runtime_creation',
+                'upgrade_config',
+                'upgrade_sources',
+                'seed_from'
+            ] = '{}'::JSONB
+        AND new_row #> '{metadata,workspace_container,status}'
+            = '"pending"'::JSONB
+        AND new_row #> '{metadata,workspace_container,provisioner}'
+            = '"k8s"'::JSONB
+        AND new_row #> '{metadata,workspace_container,_runtime_creation}'
+            = jsonb_build_object(
+                'generation', new_row->'runtime_generation',
+                'mode', 'create',
+                'attempted', FALSE,
+                'replaces_uid', NULL
+            )
+        AND jsonb_typeof(new_row #> '{metadata,workspace_container,seed_from}')
+            = 'object'
+        AND COALESCE(old_row #> '{metadata,vm}', 'null'::JSONB)
+            IN ('null'::JSONB, '{}'::JSONB)
+        AND COALESCE(new_row #> '{metadata,vm}', 'null'::JSONB)
+            IN ('null'::JSONB, '{}'::JSONB)
+        AND NOT (old_row->'metadata') ?| ARRAY[
+            '_stateless_workspace_retirement_pending',
+            '_stateless_workspace_retirement_settled',
+            '_stateless_claim_retirement',
+            '_stateless_claim_losses',
+            '_stateless_claim_loss_hold'
+        ]
+        AND NOT (new_row->'metadata') ?| ARRAY[
+            '_stateless_workspace_retirement_pending',
+            '_stateless_workspace_retirement_settled',
+            '_stateless_claim_retirement',
+            '_stateless_claim_losses',
+            '_stateless_claim_loss_hold'
+        ],
+        FALSE
+    );
 $$;
 
 

@@ -11,6 +11,7 @@ import json
 import os
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 
 from orchestrator.services.manifest_workspace_selection import (
@@ -77,24 +78,8 @@ async def lite_session(database, actor, *, backend="virtual", bind=True):
     return thread_id
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "shape", ["virtual_bound", "virtual_unbound", "none", "empty_container"]
-)
-async def test_the_guards_admit_the_upgrade_envelope(database, actor, shape):
-    """Probe B (spec "One transition"): with the runtime generation kept, the
-    0198/0223 guards (as patched by 0332) admit the container envelope."""
-    backend = "none" if shape == "none" else "virtual"
-    thread_id = await lite_session(
-        database, actor, backend=backend, bind=shape == "virtual_bound"
-    )
-    if shape == "empty_container":
-        await database.execute(
-            "UPDATE threads SET metadata = jsonb_set(metadata, "
-            "'{workspace_container}', '{}'::jsonb) WHERE id = $1::uuid",
-            thread_id,
-        )
-    row = await database.get_thread(thread_id)
+def upgrade_envelope(row, backend):
+    """The metadata the transition writes, built by hand for the guard probes."""
     generation = str(row["runtime_generation"])
     next_metadata = metadata(row)
     binding = next_metadata.pop("_workspace_binding", None)
@@ -112,20 +97,90 @@ async def test_the_guards_admit_the_upgrade_envelope(database, actor, shape):
         "upgrade_sources": None,
         "seed_from": {
             "backend": backend,
-            "prefix": f"threads/{thread_id}/",
+            "prefix": f"threads/{row['id']}/",
             "binding": binding,
         },
     }
+    return next_metadata
+
+
+async def set_workspace_record(database, thread_id, record):
+    await database.execute(
+        "UPDATE threads SET metadata = jsonb_set(metadata, "
+        "'{workspace_container}', $2::jsonb) WHERE id = $1::uuid",
+        thread_id,
+        json.dumps(record),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape",
+    ["virtual_bound", "virtual_unbound", "none", "empty_container", "end_stamp"],
+)
+async def test_the_guards_admit_the_upgrade_envelope(database, actor, shape):
+    """Probe B (spec "One transition"): with the runtime generation kept, the
+    0198/0223 guards (as patched by 0332 and 0558) admit the container
+    envelope, also over the stamp End leaves on a resumed lite row."""
+    backend = "none" if shape == "none" else "virtual"
+    thread_id = await lite_session(
+        database, actor, backend=backend, bind=shape == "virtual_bound"
+    )
+    if shape == "empty_container":
+        await set_workspace_record(database, thread_id, {})
+    if shape == "end_stamp":
+        await set_workspace_record(database, thread_id, {"volume_reclaimed": False})
+    row = await database.get_thread(thread_id)
+    generation = str(row["runtime_generation"])
 
     await database.execute(
         "UPDATE threads SET metadata = $2::jsonb WHERE id = $1::uuid",
         thread_id,
-        json.dumps(next_metadata),
+        json.dumps(upgrade_envelope(row, backend)),
     )
 
     after = await database.get_thread(thread_id)
     assert str(after["runtime_generation"]) == generation
     assert stateless_workspace_check(after) == ("sandbox", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["reclaimed_stamp", "stamp_beside_a_key", "extra_new_key", "status", "cleared"],
+)
+async def test_the_guards_take_over_only_the_exact_stamp_in_the_upgrade(
+    database, actor, change
+):
+    """0558 reads End's stamp as empty for the upgrade's own UPDATE only."""
+    thread_id = await lite_session(database, actor)
+    await set_workspace_record(
+        database,
+        thread_id,
+        {
+            "reclaimed_stamp": {"volume_reclaimed": True},
+            "stamp_beside_a_key": {"volume_reclaimed": False, "repo_name": "r"},
+        }.get(change, {"volume_reclaimed": False}),
+    )
+    before = await database.get_thread(thread_id)
+    next_metadata = upgrade_envelope(before, "virtual")
+    status = before["status"]
+    if change == "extra_new_key":
+        next_metadata["workspace_container"]["pod_name"] = "p"
+    if change == "status":
+        status = "active"
+    if change == "cleared":
+        next_metadata = {**metadata(before), "workspace_container": {}}
+
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await database.execute(
+            "UPDATE threads SET metadata = $2::jsonb, status = $3 WHERE id = $1::uuid",
+            thread_id,
+            json.dumps(next_metadata),
+            status,
+        )
+
+    assert await database.get_thread(thread_id) == before
 
 
 from orchestrator.database.stateless_workspace_upgrade import (  # noqa: E402
@@ -219,7 +274,8 @@ async def test_a_none_session_records_a_none_source(database, actor):
         "vm_context",
         "stop_marker",
         "foreign_container_keys",
-        "resumed_before_the_fix",
+        "reclaimed_stamp",
+        "stamp_beside_a_key",
         "stale_generation",
     ],
 )
@@ -242,10 +298,14 @@ async def test_transition_refuses_rows_it_cannot_upgrade(database, actor, change
                 "jsonb_set(metadata, '{workspace_container}', "
                 '\'{"repo_name": "thread-x"}\'::jsonb)'
             ),
-            # Ended and Resumed before End stopped stamping lite rows.
-            "resumed_before_the_fix": (
+            # Only End's exact stamp is taken over.
+            "reclaimed_stamp": (
                 "jsonb_set(metadata, '{workspace_container}', "
-                "'{\"volume_reclaimed\": false}'::jsonb)"
+                "'{\"volume_reclaimed\": true}'::jsonb)"
+            ),
+            "stamp_beside_a_key": (
+                "jsonb_set(metadata, '{workspace_container}', "
+                '\'{"volume_reclaimed": false, "repo_name": "r"}\'::jsonb)'
             ),
         }[change]
         overrides["metadata"] = await database.fetchval(
@@ -270,6 +330,9 @@ from shared.run_queue import (  # noqa: E402
     claim_unit,
     complete_unit,
     record_input_seq,
+)
+from tests.test_virtual_permanent_end_real_postgres import (  # noqa: E402
+    _soft_ended_virtual as soft_ended_virtual,
 )
 
 UPGRADE_RECORD = {"upgrade_config": UPGRADE_CONFIG, "upgrade_sources": UPGRADE_SOURCES}
@@ -372,6 +435,32 @@ async def test_input_after_the_transition_keeps_a_valid_container_row(database, 
         "sandbox",
         None,
     )
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_virtual_session_takes_the_upgrade(
+    database, actor, monkeypatch
+):
+    """End stamps the lite row and Resume keeps the stamp; the upgrade
+    replaces it (dev 10-19, Session fa2a9885: four refusals)."""
+    thread_id, *_ = await soft_ended_virtual(database, actor, monkeypatch)
+    assert await database.resume_thread(thread_id) is True
+    resumed = await database.get_thread(thread_id)
+    assert metadata(resumed)["workspace_container"] == {"volume_reclaimed": False}
+    binding = metadata(resumed)["_workspace_binding"]
+
+    await admit_upgrade(database, actor, thread_id)
+
+    after = await database.get_thread(thread_id)
+    workspace = metadata(after)["workspace_container"]
+    assert after["runtime_generation"] == resumed["runtime_generation"]
+    assert workspace["status"] == "pending"
+    assert workspace["seed_from"] == {
+        "backend": "virtual",
+        "prefix": f"threads/{thread_id}/",
+        "binding": binding,
+    }
+    assert stateless_workspace_check(after) == ("sandbox", None)
 
 
 @pytest.mark.asyncio
