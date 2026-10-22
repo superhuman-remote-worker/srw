@@ -119,6 +119,8 @@ logger = logging.getLogger(__name__)
 SETTLE_SECS = 0.3
 #: How often the engine looks at the line.
 WATCH_SECS = 0.1
+#: A holding sentence said this recently covers a new request too.
+HELD_RECENTLY_SECS = 10.0
 
 
 @dataclass
@@ -178,6 +180,8 @@ class CascadeEngine:
         self._longer_said = False
         self._last_hold: str | None = None
         self._random = random.Random()
+        #: When the voice last started a sentence, and the sentence.
+        self._last_said: tuple[float, str] | None = None
         self._llm: VoiceLLM | None = None
         self._audioless = False
         self._stopped = False
@@ -437,14 +441,11 @@ class CascadeEngine:
         self._touch()
         pending = _Delegation(params.result_callback, params.tool_call_id)
         # An addition to an open request: the caller has heard a holding
-        # sentence for that one already.
-        addition = bool(self._pending)
+        # sentence for that one already, or has just heard one (a reply the
+        # caller cut before its call went out).
+        heard = bool(self._pending) or self._held_recently()
         self._pending[delegation_id] = pending
-        if (
-            self.settings.filler
-            and not addition
-            and not (self._llm and self._llm.spoke)
-        ):
+        if self.settings.filler and not heard and not (self._llm and self._llm.spoke):
             pending.filler = self.settings.filler
             await params.llm.push_frame(
                 TTSSpeakFrame(self.settings.filler, append_to_context=False)
@@ -600,8 +601,28 @@ class CascadeEngine:
         self._holds = 0
         self._longer_said = False
 
+    def _held_recently(self) -> bool:
+        """Whether the voice's last sentence, started a moment ago, was a
+        holding sentence (the filler or one the rules prescribe)."""
+        if self._last_said is None:
+            return False
+        at, text = self._last_said
+        if time.monotonic() - at > HELD_RECENTLY_SECS:
+            return False
+        holding = (
+            self.settings.filler,
+            *HOLDING_PHRASES.get(self.settings.language, ()),
+        )
+        return _plain(text) in {_plain(p) for p in holding if p}
+
     def _say(self, speaker: str, text: str) -> None:
+        if speaker == "assistant":
+            self._last_said = (time.monotonic(), text)
         try:
             self._session.transcript(speaker, text)
         except ProtocolError:
             pass  # the call ended while the pipeline drained
+
+
+def _plain(text: str) -> str:
+    return " ".join(text.lower().replace(",", " ").replace(".", " ").split())

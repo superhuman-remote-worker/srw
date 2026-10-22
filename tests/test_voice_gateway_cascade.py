@@ -956,3 +956,19 @@ async def test_a_sentence_the_tts_still_synthesises_keeps_the_line_busy():
     assert output.speaking() and not output.audible()
     # A TTS that never answers does not keep the line busy for good.
     assert not output.speaking(now=time.monotonic() + 16)
+
+
+@pytest.mark.asyncio
+async def test_no_second_holding_sentence_right_after_one(call, fakes):
+    # Bench: the LLM said "Einen Moment, ich schaue nach.", the caller went
+    # on before its call went out, and the call with the rest of the request
+    # came seconds later: the filler then made it two holding sentences.
+    fakes.stt_texts = ["Ein Zimmer für fünf Personen", "bis Mittwoch, bitte."]
+    fakes.llm_replies = [FILLER, ("delegate", "Fünf Personen bis Mittwoch")]
+    call.port.say(tone(1.0))
+    await call.until(lambda: call.transcripts("assistant"))
+    await call.quiet()
+    call.port.say(tone(1.0))
+    await call.until(lambda: len(delegation_ids(call)) == 1)
+    await call.quiet()
+    assert [t.strip() for t in call.transcripts("assistant")] == [FILLER]
