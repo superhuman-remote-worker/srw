@@ -10,7 +10,9 @@
   ``min_speech_secs`` or a transcript that survived the filter does, and
   that turn start is the interruption that flushes the port.
 - ``HeardAssistant`` adds the part of a cut sentence the caller heard to the
-  context, so the LLM's memory matches what was said on the line.
+  context, so the LLM's memory matches what was said on the line, and
+  delivers a back-office answer as news when the voice has spoken since its
+  request.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.aggregators.llm_context import LLMSpecificMessage
 from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.turns.types import ProcessFrameResult
@@ -171,6 +174,35 @@ class HeardAssistant(LLMAssistantAggregator):
     def __init__(self, *args, heard_tail: Callable[[], str | None], **kwargs):
         super().__init__(*args, **kwargs)
         self._heard_tail = heard_tail
+
+    def _is_deferred(self, in_progress_frame) -> bool:
+        """Pipecat settles an async call's result in place of its
+        placeholder unless a user or developer message follows it. When the
+        voice has spoken since (an earlier piece's answer, a status line from
+        the back office), the result in place reads as one the voice already
+        answered, and the LLM said nothing more (bench, 2026-10-22): then it
+        goes in as news, after what was said."""
+        if super()._is_deferred(in_progress_frame):
+            return True
+        tool_call_id = in_progress_frame.tool_call_id
+        after = False
+        for message in self._context.messages:
+            if isinstance(message, LLMSpecificMessage):
+                continue
+            if not after:
+                after = (
+                    message.get("role") == "tool"
+                    and message.get("tool_call_id") == tool_call_id
+                )
+                continue
+            content = message.get("content")
+            if (
+                message.get("role") == "assistant"
+                and isinstance(content, str)
+                and content.strip()
+            ):
+                return True
+        return False
 
     async def _handle_interruptions(self, frame: InterruptionFrame):
         tail = self._heard_tail()

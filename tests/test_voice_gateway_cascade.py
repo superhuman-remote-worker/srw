@@ -792,6 +792,18 @@ async def test_an_answer_with_an_addition_still_open_is_marked_incomplete(call, 
     last = fakes.llm_requests[3]["messages"]
     assert "zwei Zimmer frei" in contents(last)
     assert contents(last).count(ADDITION_OPEN) == 1  # only the first answer
+    # The second answer comes after what the voice said to the first: in
+    # place of its placeholder it read as already answered.
+    said = next(
+        i
+        for i, m in enumerate(last)
+        if m["role"] == "assistant"
+        and "brauchen Sie zwei Zimmer" in str(m.get("content"))
+    )
+    news = next(
+        i for i, m in enumerate(last) if "zwei Zimmer frei" in str(m.get("content"))
+    )
+    assert news > said and last[news]["role"] == "system"
     assert "Mittwoch sind zwei Zimmer frei" in "".join(call.transcripts("assistant"))
     assert call.engine._pending == {}
 
