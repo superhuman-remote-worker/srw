@@ -17,8 +17,16 @@ todos:
       - result "question": answer it at once with message_agent(handle,
         message=<what the voice should tell the caller>,
         reply_to=<question.delegation_id>). Look things up or act first if the
-        answer needs it; answer before answer_by, with a short holding message
-        first if you need longer.
+        answer needs it; answer before answer_by. When that takes more than a
+        few seconds, first give the voice one short line to say meanwhile, in
+        the caller's language and without reply_to, e.g. message_agent(handle,
+        message='Say exactly: "Ich schaue gerade im Buchungssystem nach."'),
+        before or together with the lookup.
+      - Questions can arrive in pieces: a caller who pauses is cut off, and
+        the rest comes as the next question, which may complete or correct
+        the one before. Answer the latest with everything known so far; an
+        earlier question it covers needs a brief answer or none (answering
+        the latest settles it).
       - result "timeout": the session is still running; wait again.
       - result "ready": the session has ended; this phase ends with it.
 
