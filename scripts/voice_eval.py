@@ -145,13 +145,28 @@ def gpu_memory() -> str | None:
     return None
 
 
+def repo_relative(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def judge_label(args) -> str | None:
+    """What judged the caller's line: ``--judge-label`` or model and URL."""
+    if not getattr(args, "judge_url", None):
+        return None
+    label = getattr(args, "judge_label", None) or args.judge_model
+    return f"{label} at {args.judge_url}"
+
+
 def write_meta(out: Path, args, settings, levels: list[str]) -> dict:
     path = out / "run.json"
     meta = json.loads(path.read_text("utf-8")) if path.exists() else {}
     meta.update(
         {
             "profile": args.profile,
-            "profile_file": str(Path(args.profile_file)),
+            "profile_file": repo_relative(Path(args.profile_file)),
             "started": meta.get("started")
             or dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "git": git_state(),
@@ -161,9 +176,7 @@ def write_meta(out: Path, args, settings, levels: list[str]) -> dict:
                 "llm": f"{settings.llm.model} at {settings.llm.base_url}",
                 "tts": f"{settings.tts.model} voice {settings.tts.voice} at {settings.tts.base_url}",
             },
-            "judge": f"{args.judge_model} at {args.judge_url}"
-            if getattr(args, "judge_url", None)
-            else None,
+            "judge": judge_label(args),
             "gpu": gpu_memory(),
         }
     )
@@ -699,6 +712,7 @@ def observe_file(harness, scenario) -> list[dict]:
             "relay": relay,
             "delegations": delegations,
             "voice_starts": [s for s in starts if lo <= s < rhi],
+            "voice_sentences": [at for at, _ in voice],
             "flushes": [at for at, cut in harness.flushes if cut and lo <= at < hi],
             "first_audio_ms": (after[0] - end) if after else None,
             "transfer_requested": any(lo <= t < hi for t in harness.transfers),
@@ -835,7 +849,7 @@ async def file_level(args, evalset, settings, out: Path) -> dict:
     for scenario in pick_scenarios(evalset, args):
         log(f"file level: {scenario.id} ({scenario.title})")
         run = await file_scenario(args, evalset, settings, scenario, judge, out)
-        run["judge"] = f"{args.judge_model} at {args.judge_url}" if judge else None
+        run["judge"] = judge_label(args)
         runs.append(run)
     results, summary = score_scenarios(evalset, runs, llm_judge(args, settings))
     (out / "file.json").write_text(
@@ -1228,6 +1242,7 @@ def observe_call(
             ),
             "delegations": dels,
             "voice_starts": [s for s in starts if lo <= s < rhi],
+            "voice_sentences": [at for at, _ in voice],
             "flushes": None,
             "voice_was_talking": any(a <= lo < b for a, b, _ in stretches),
             "first_audio_ms": (after[0] - end) if after else None,
@@ -1353,7 +1368,7 @@ def call_level(args, evalset, raw_profile, out: Path) -> dict:
                     "timings": timings,
                     "phantoms": phantoms,
                     "intelligibility": call_intelligibility(observed),
-                    "judge": report.get("judge"),
+                    "judge": judge_label(args) or report.get("judge"),
                 }
             )
         audio = srw.audio_check(bench.compose, ("addon",))
@@ -1466,12 +1481,63 @@ def rescore(out: Path, args) -> None:
             continue
         keep = {k: v for k, v in data["summary"].items() if k in ("no_audio_written",)}
         runs = [r for r in data["scenarios"] if r["scenario"] in evalset.scenarios]
+        for run in runs:
+            if level == "call":
+                reobserve_call(out, evalset.scenarios[run["scenario"]], run)
+            else:
+                add_voice_sentences(run)
         _, summary = score_scenarios(evalset, runs, judge, today)
         data["summary"] = {**summary, **keep}
         (out / f"{level}.json").write_text(
             json.dumps(data, indent=1, ensure_ascii=False, default=str), "utf-8"
         )
     log(f"rescored {out}")
+
+
+def add_voice_sentences(run: dict) -> None:
+    """File level: when the voice's sentences began, from the stored events
+    (runs from before observations recorded them)."""
+    said = [
+        e["clock_ms"]
+        for e in run.get("events", [])
+        if e["type"] == "session.output_transcript.delta"
+    ]
+    observed = run["observed"]
+    for i, obs in enumerate(observed):
+        if "voice_sentences" in obs:
+            continue
+        lo = obs["caller_start_ms"] - 300
+        hi = (
+            observed[i + 1]["caller_start_ms"] - 300 if i + 1 < len(observed) else 10**9
+        )
+        obs["voice_sentences"] = [at for at in said if lo <= at < hi]
+
+
+def reobserve_call(out: Path, scenario, run: dict) -> None:
+    """Call level: observe a stored call again from its saved artifacts (the
+    driver's log, the bench's report, the gateway's log, the played lines)."""
+    sdir = out / "call" / scenario.id
+    report = Rep.load_json(sdir / "call.json")
+    if report is None or not (sdir / "driver.jsonl").exists():
+        return
+    lines = []
+    for turn in scenario.turns:
+        pcm, _ = R.read_pcm(sdir / "lines" / f"{turn.label}.wav")
+        lead = 0 if turn.silence else int(R.LEAD_S * 1000)
+        tail = 0 if turn.silence else int(R.TAIL_S * 1000)
+        lines.append((turn, pcm.tobytes(), lead, tail))
+    gateway = out / "call" / "gateway.log"
+    log_text = gateway.read_text("utf-8") if gateway.exists() else ""
+    observed, timings, phantoms = observe_call(
+        scenario, run["schedule_s"], lines, sdir, report, log_text
+    )
+    if observed:
+        run.update(
+            observed=observed,
+            timings=timings,
+            phantoms=phantoms,
+            intelligibility=call_intelligibility(observed),
+        )
 
 
 def cmd_report(args) -> int:
@@ -1595,6 +1661,10 @@ def main() -> int:
             help="OpenAI-compatible transcription server for what the caller heard",
         )
         p.add_argument("--judge-model", default="judge")
+        p.add_argument(
+            "--judge-label",
+            help='what the judge is, for the report (e.g. "Qwen3-ASR 0.6B on the CPU")',
+        )
         p.add_argument(
             "--llm-judge-url",
             help="LLM for meaning checks (default: the profile's LLM)",

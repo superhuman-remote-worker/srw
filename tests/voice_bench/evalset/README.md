@@ -32,7 +32,8 @@ python docker/voice-models/models.py fetch --set rocm,design,judge   # once: the
 scripts/voice-eval.sh judge up               # Qwen3-ASR judge on the CPU, 127.0.0.1:18495
 scripts/voice-eval.sh render --judge-url http://127.0.0.1:18495/v1   # voices, pieces, clips (cached)
 scripts/voice-eval.sh run --profile-file docker/voice-models/cascade-gpu.yaml \
-    --profile cascade-gpu-rocm --levels stt,file,call --judge-url http://127.0.0.1:18495/v1
+    --profile cascade-gpu-rocm --levels stt,file,call \
+    --judge-url http://127.0.0.1:18495/v1 --judge-label "Qwen3-ASR 0.6B on the CPU"
 scripts/voice-eval.sh judge down
 ```
 
@@ -44,7 +45,10 @@ when `baselines/<profile>.json` exists, `diff.md`. `file/<scenario>/call.wav`
 is the stereo recording of each harness call (caller left, voice right); the
 call level keeps the bench's recordings per scenario. Options: `--levels`
 (default `stt,file`), `--scenarios s03,s11` (ids or prefixes), `--conditions`,
-`--categories`, `--limit` (STT level), `--out`, `--keep-up` (call level).
+`--categories`, `--voices`, `--limit` (STT level), `--out`, `--keep-up` (call
+level), `--judge-label`. `report RUN --rescore` scores a stored run again with
+the current matchers and expectations without placing a call (relative dates
+against the day of the run).
 
 Other commands:
 
@@ -107,10 +111,10 @@ stopped within 2 s.
 |---|---|
 | decision | answered (voice spoke, no delegation), delegated, or quiet; `transfer` and `message` count as right when delegated (the back office transfers and takes messages); `ignore` turns (backchannels, silence) are right when no caller transcript, flush or delegation came of them |
 | values | each expected value in the voice's reply (`in: reply`), the delegated request (`request`: the caller's words since the last delegation, as SRW's driver forwards them, or the voice LLM's own tool argument at file level), STT (`stt`) or `either`; `absent` values must not appear |
-| caller cut off | the voice started while the caller was still talking (a turn with a pause mid-sentence) |
+| caller cut off | the voice began audio or a sentence (a holding sentence included) while the caller was still talking, e.g. in a pause mid-sentence; only when the voice was silent as the caller began |
 | delegated early | a delegation went out before the caller finished (the §9.9 "Mittwoch" bug) |
 | turn missed | no audio and no delegation within 8 s of the caller's last word |
-| backchannel taken | "mhm" over the voice produced a transcript, a flush or a delegation |
+| backchannel taken | "mhm" over the voice produced a transcript, a flush or a delegation; a line meant for over the voice that met silence (the call level's fixed schedule against a slow reply) is reported as "not over the voice" and not scored |
 | barge-in | a real interruption flushed the voice within 2 s (file) or the voice stopped within 2 s (call) |
 | false barge-in | a flush that cut the voice outside a barge-in turn (file level) |
 | phantom transcripts | caller transcripts with no caller speech near them (noise taken as words) |

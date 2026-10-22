@@ -77,8 +77,8 @@ def _fmt(value, digits: int = 2) -> str:
     if value is None:
         return "–"
     if isinstance(value, float):
-        if value.is_integer() and abs(value) >= 2:
-            return str(int(value))
+        if (value.is_integer() and abs(value) >= 2) or abs(value) >= 100:
+            return f"{value:.0f}"
         return f"{value:.{digits}f}"
     return str(value)
 
@@ -295,7 +295,9 @@ def markdown(summary: dict) -> str:
             f"backchannel taken {taking.get('backchannel_taken', 0)}/{taking.get('backchannel_turns', 0)}, "
             f"barge-in honoured {taking.get('barge_in_ok', 0)}/{taking.get('barge_in_turns', 0)}, "
             f"false barge-in {taking.get('false_barge_in', 0) if level == 'file' else 'not observable'}, "
-            f"caller transcripts without speech {data.get('phantom_transcripts', 0)}.",
+            f"caller transcripts without speech {data.get('phantom_transcripts', 0)}; "
+            f"lines meant for over the voice that came while it was silent (not scored) "
+            f"{taking.get('not_over_voice', 0)}.",
             "",
         ]
         timings = data.get("timings") or {}

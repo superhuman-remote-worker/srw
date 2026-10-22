@@ -578,6 +578,8 @@ class TestScoring:
         assert S.score_turn(scenario.turns[0], late)["missed"]
         early = {**obs, "voice_starts": [2000, 4200]}
         assert S.score_turn(scenario.turns[0], early)["cut_off"]
+        holding = {**obs, "voice_sentences": [2100]}
+        assert S.score_turn(scenario.turns[0], holding)["cut_off"]
 
     def test_delegated_turn_values_in_the_request(self):
         scenario = _turn(
@@ -639,6 +641,23 @@ class TestScoring:
             ]
             is False
         )
+
+    def test_lines_meant_for_over_the_voice_need_the_voice(self):
+        back = _turn(when="during_voice", expect={"outcome": "ignore"}).turns[0]
+        silent = {
+            "caller_start_ms": 0,
+            "caller_end_ms": 600,
+            "stt_events": [900],
+            "voice_was_talking": False,
+        }
+        verdict = S.score_turn(back, silent)
+        assert verdict["not_over_voice"] and verdict["outcome_ok"]
+        assert "backchannel_taken" not in verdict
+        barge = _turn(
+            when="during_voice", expect={"outcome": "answer", "barge_in": True}
+        ).turns[0]
+        verdict = S.score_turn(barge, {**silent, "caller_end_ms": 2000, "flushes": []})
+        assert "barge_in_ok" not in verdict and verdict["not_over_voice"]
 
     def test_false_barge_in_and_absent_values(self):
         turn = _turn(
@@ -726,6 +745,19 @@ class TestScoring:
         assert summary["overall"]["turns_ok"] == 1
         assert summary["decisions"]["answer"]["rate"] == 1.0
         assert summary["by_category"]["facts"]["decision_rate"] == 1.0
+        failed = S.score_turn(scenario.turns[0], {"reply": "y"})
+        none_ok = S.aggregate_turns(
+            [{"scenario": scenario.id, "turn": 0, "verdict": failed}],
+            {scenario.id: scenario},
+        )
+        assert none_ok["by_category"]["keywords"] == {
+            "turns": 0,
+            "turns_ok": 0,
+            "values": 1,
+            "values_ok": 0,
+            "exact_rate": 0.0,
+        }
+        assert Rep.weak_spots({"file": none_ok})
         items = [
             {
                 "category": "names",
@@ -874,6 +906,28 @@ class TestRunner:
             "x INFO call live_1 cascade turns: [{'stt_ms': 300, 'delegated': False}]",
             "live_1",
         ) == [{"stt_ms": 300, "delegated": False}]
+
+    def test_rescore_rematches_stored_stt_items(self, tmp_path):
+        import argparse
+        import json
+
+        runner = _runner()
+        (tmp_path / "run.json").write_text('{"profile": "p", "today": "2026-10-22"}')
+        item = {
+            "id": "eml-01",
+            "category": "emails",
+            "voice": "v",
+            "condition": "g711a",
+            "styles": ["plain"],
+            "wer": 0.4,
+            "heard": "Meine E-Mail-Adresse ist jana.probe-at-Beispiel.example.",
+            "values": [{"kind": "email", "ok": False}],
+        }
+        (tmp_path / "stt.json").write_text(json.dumps({"items": [item]}))
+        runner.rescore(tmp_path, argparse.Namespace(no_llm_judge=True))
+        data = json.loads((tmp_path / "stt.json").read_text())
+        assert data["items"][0]["values"][0]["ok"] is True
+        assert data["summary"]["by_value_kind"]["email"]["rate"] == 1.0
 
 
 class TestBenchHooks:

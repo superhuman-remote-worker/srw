@@ -264,7 +264,8 @@ def score_turn(
     ``reply`` (the voice's words in the window), ``holding`` (its words before
     the back office answered), ``relay`` (after), ``delegations``
     (``at_ms``, ``request``, ``request_llm``, ``answered_at_ms``),
-    ``voice_starts``, ``flushes``, ``voice_was_talking``, ``first_audio_ms``.
+    ``voice_starts``, ``voice_sentences`` (when the voice began each
+    sentence), ``flushes``, ``voice_was_talking``, ``first_audio_ms``.
     """
     expect = turn.expect
     got = got_outcome(obs)
@@ -275,8 +276,20 @@ def score_turn(
     stt_events = obs.get("stt_events", [])
     verdict: dict = {"outcome_got": got}
 
+    # A line meant to be said over the voice that came while the voice was
+    # silent (the call level's fixed schedule met a slow reply) tests
+    # nothing about backchannels or barge-in: it is not scored as such.
+    over_voice = (
+        turn.when != "during_voice" or obs.get("voice_was_talking") is not False
+    )
+    if not over_voice:
+        verdict["not_over_voice"] = True
+
     # -- the decision
-    if expect.outcome == "ignore":
+    if not over_voice and (expect.outcome == "ignore" or expect.barge_in):
+        verdict["outcome_got"] = "not over the voice"
+        verdict["outcome_ok"] = True
+    elif expect.outcome == "ignore":
         taken = bool(stt_events) or bool(delegations) or bool(flushes)
         if turn.silence:
             # Only the line: any transcript or reply is a phantom turn.
@@ -307,10 +320,17 @@ def score_turn(
     # -- turn taking
     starts = obs.get("voice_starts") or []
     if start is not None and end is not None:
-        # The voice began a new utterance while the caller was still talking.
-        cut = [s for s in starts if start + 300 < s < end - 200]
+        # The voice began a new utterance (audio, or a sentence it started
+        # to say) while the caller was still talking.
+        spoken = starts + (obs.get("voice_sentences") or [])
+        cut = [s for s in spoken if start + 300 < s < end - 200]
+        # Only when the voice was silent as the caller began: a caller who
+        # starts over the voice is not cut off by it.
         verdict["cut_off"] = (
-            bool(cut) and turn.when != "during_voice" and expect.outcome != "ignore"
+            bool(cut)
+            and turn.when != "during_voice"
+            and expect.outcome != "ignore"
+            and obs.get("voice_was_talking") is not True
         )
         verdict["delegated_early"] = any(
             d.get("at_ms") is not None and d["at_ms"] < end - 200 for d in delegations
@@ -320,7 +340,7 @@ def score_turn(
                 d["at_ms"] for d in delegations if d.get("at_ms") is not None
             ]
             verdict["missed"] = not any(r <= end + MISSED_AFTER_MS for r in reacted)
-        if expect.barge_in:
+        if expect.barge_in and over_voice:
             if flushes is not None:
                 verdict["barge_in_ok"] = any(
                     start <= f <= start + BARGE_IN_WITHIN_MS for f in flushes
@@ -463,6 +483,8 @@ def aggregate_turns(results: list[dict], scenarios: dict[str, Scenario]) -> dict
                 taking[flag] += 1
                 sc[flag] += 1
                 failures[scenario.id].append(f"{turn.label} {flag.replace('_', ' ')}")
+        if verdict.get("not_over_voice"):
+            taking["not_over_voice"] += 1
         if "backchannel_taken" in verdict:
             taking["backchannel_turns"] += 1
             taking["backchannel_taken"] += bool(verdict["backchannel_taken"])
@@ -483,18 +505,10 @@ def aggregate_turns(results: list[dict], scenarios: dict[str, Scenario]) -> dict
             waits.append(verdict["wait_silence_ms"])
 
     def cat_row(c: Counter) -> dict:
-        row = {
-            k: c[k]
-            for k in (
-                "turns",
-                "turns_ok",
-                "decisions",
-                "decisions_ok",
-                "values",
-                "values_ok",
-            )
-            if c[k] or k == "turns"
-        }
+        row = {"turns": c["turns"], "turns_ok": c["turns_ok"]}
+        for key in ("decisions", "values"):
+            if c[key]:
+                row[key], row[f"{key}_ok"] = c[key], c[f"{key}_ok"]
         if c["decisions"]:
             row["decision_rate"] = _rate(c["decisions_ok"], c["decisions"])
         if c["values"]:
