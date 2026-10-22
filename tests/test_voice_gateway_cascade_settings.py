@@ -15,11 +15,14 @@ from voice_gateway.engines import build_engines
 from voice_gateway.engines.cascade import cascade_kind, parse_settings
 from voice_gateway.engines.cascade.clauses import clause_end, sentences
 from voice_gateway.engines.cascade.prompt import (
+    ADDITION_OPEN,
+    COVERED,
     DELEGATE_DESCRIPTION,
     exact_words,
     note,
     system_prompt,
 )
+from voice_gateway.engines.cascade.settings import HOLD_LONGER, HOLD_PHRASES
 from voice_gateway.engines.cascade.timings import Timings
 from voice_gateway.errors import ConfigError
 
@@ -55,6 +58,34 @@ class TestParseSettings:
         assert settings.tts.response_format == "pcm"
         assert settings.tts.clause_chars == 30
         assert settings.tts.cache_phrases is True
+        # Owner 2026-10-22: bridge a back office that takes long.
+        assert settings.hold_after_secs == 5.0
+        assert settings.hold_max == 2
+        assert settings.hold_phrases == HOLD_PHRASES["de"]
+        assert settings.hold_longer == HOLD_LONGER["de"]
+
+    def test_hold_sentences_follow_the_language_and_the_profile(self):
+        english = parse_settings("p", profile(language="en"))
+        assert english.hold_phrases == HOLD_PHRASES["en"]
+        assert "I should have your answer in just a moment." in english.hold_phrases
+        assert english.hold_longer == HOLD_LONGER["en"]
+        own = parse_settings(
+            "p",
+            profile(
+                hold_after_secs=8,
+                hold_max=1,
+                hold_phrases=[" Gleich geht's weiter. ", "Noch einen Augenblick."],
+                hold_longer="",
+            ),
+        )
+        assert own.hold_after_secs == 8.0 and own.hold_max == 1
+        assert own.hold_phrases == ("Gleich geht's weiter.", "Noch einen Augenblick.")
+        assert own.hold_longer == ""
+        assert parse_settings("p", profile(hold_after_secs=0)).hold_after_secs == 0
+        # Every default is short enough for the phrase cache.
+        for language in HOLD_PHRASES:
+            for phrase in (*HOLD_PHRASES[language], HOLD_LONGER[language]):
+                assert len(phrase) <= 80
 
     def test_key_files_are_read_and_never_shown(self, tmp_path):
         key = tmp_path / "llm.key"
@@ -133,6 +164,13 @@ class TestParseSettings:
             ),
             ({"barge_in": {"backchannels": "ja"}}, "backchannels"),
             ({"language": "fr"}, "language"),
+            ({"hold_after_secs": -1}, "hold_after_secs"),
+            ({"hold_after_secs": 61}, "hold_after_secs"),
+            ({"hold_max": 1.5}, "hold_max"),
+            ({"hold_phrases": "Moment."}, "hold_phrases must be a list"),
+            ({"hold_phrases": ["Moment.", "  "]}, "empty sentence"),
+            ({"hold_phrases": ["x" * 81]}, "at most 80 characters"),
+            ({"hold_longer": 5}, "hold_longer must be a string"),
             ({"colour": "blue"}, "unknown fields: colour"),
             (
                 {"stt": {"base_url": "http://x/v1", "model": "m", "beam": 5}},
@@ -213,12 +251,24 @@ class TestPrompt:
         assert "Never mention the back office" in prompt
         assert "at most one short sentence" in prompt
         assert "Never add a second holding sentence" in prompt
-        assert "Until the answer is back, never say that you connect" in prompt
+        assert "Until the answer is back, never guess it, and never say" in prompt
         assert '"Einen Moment, ich schaue nach."' in prompt
         assert "Ich verbinde Sie" in prompt and "never your own reasoning" in prompt
         assert "without saying who answered" in prompt
         assert "Do not start with a holding sentence again" in prompt
         assert "never that you connect or forward" in DELEGATE_DESCRIPTION
+
+    def test_late_words_go_to_the_back_office_as_an_addition(self):
+        # Owner 2026-10-22: a caller cut off at a pause ("Montag bis …
+        # Mittwoch") hands on the rest at once, without a new holding line.
+        prompt = " ".join(system_prompt("Persona", "de").split())
+        assert "call `delegate` again at once with the addition" in prompt
+        assert "and say nothing with it" in prompt
+        assert "in pieces is fine" in prompt
+        assert "say only what it already settles" in prompt
+        assert "call it again at once with the addition" in DELEGATE_DESCRIPTION
+        assert "do not present this answer as final" in ADDITION_OPEN
+        assert "next request" in COVERED
 
     def test_an_english_line_gets_english_holding_sentences(self):
         prompt = system_prompt("Persona", "en")

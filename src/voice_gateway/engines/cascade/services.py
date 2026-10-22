@@ -19,7 +19,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 
 import aiohttp
 from pipecat.audio.utils import create_stream_resampler
@@ -162,11 +162,31 @@ def strip_markup(text: str) -> tuple[str, str]:
     return text[: held.start()], text[held.start() :]
 
 
+#: Markup written since the reply's last speakable text after which the
+#: reply counts as a loop and is cut off (Gemma 4 sometimes repeats empty
+#: thought markers up to ``max_tokens`` when it would rather think, which
+#: keeps the LLM busy for seconds and the caller in silence).
+MARKUP_LOOP_CHARS = 200
+
+
+class _MarkupLoop(Exception):
+    """A reply that only repeats special-token markup."""
+
+
 class VoiceLLM(OpenAILLMService):
-    """Streaming chat completions with the delegate tool, thinking off."""
+    """Streaming chat completions with the delegate tool, thinking off.
+
+    ``prepare`` sees the context before each request; returning False skips
+    the request (the engine's bookkeeping, see ``engine.CascadeEngine``)."""
 
     def __init__(
-        self, settings: LlmSettings, *, system: str, timings: Timings, **kwargs
+        self,
+        settings: LlmSettings,
+        *,
+        system: str,
+        timings: Timings,
+        prepare: Callable[[object], bool] | None = None,
+        **kwargs,
     ):
         super().__init__(
             api_key=settings.api_key or "none",
@@ -181,10 +201,14 @@ class VoiceLLM(OpenAILLMService):
         )
         self._stage = settings
         self._timings = timings
+        self._prepare = prepare
         self._first_token = False
         #: Whether the response in flight said anything before a tool call.
         self.spoke = False
+        #: Whether a request is in flight.
+        self.generating = False
         self._held = ""
+        self._markup = 0
 
     async def prewarm(self, context) -> None:
         """One 1-token completion over the call's fixed prefix; the server's
@@ -218,8 +242,17 @@ class VoiceLLM(OpenAILLMService):
         self.spoke = False
         self._first_token = False
         self._held = ""  # a lone "<" at a reply's end is no speech either
+        self._markup = 0
+        if self._prepare is not None and not self._prepare(context):
+            return
+        self.generating = True
         self._timings.llm_started()
-        await super()._process_context(context)
+        try:
+            await super()._process_context(context)
+        except _MarkupLoop:
+            pass  # what was speakable went out already
+        finally:
+            self.generating = False
 
     def _token(self):
         if not self._first_token:
@@ -228,7 +261,13 @@ class VoiceLLM(OpenAILLMService):
 
     async def _push_llm_text(self, text: str):
         self._token()
-        text, self._held = strip_markup(self._held + text)
+        raw = self._held + text
+        text, self._held = strip_markup(raw)
+        self._markup += len(raw) - len(text) - len(self._held)
+        if text.strip():
+            self._markup = 0
+        elif self._markup > MARKUP_LOOP_CHARS:
+            raise _MarkupLoop
         if not text:
             return
         if text.strip():
@@ -243,12 +282,30 @@ class VoiceLLM(OpenAILLMService):
 def note_messages(messages: list, role: str) -> list:
     """Map "developer" notes (Pipecat's and ours) to the profile's note role
     and merge user messages that would end up next to each other; the system
-    prompt at the front is never touched, so its cached prefix holds."""
+    prompt at the front is never touched, so its cached prefix holds.
+
+    What the voice said with a tool call (its holding sentence, or the
+    filler in its place) and the call become one assistant message, the
+    shape chat models are trained on. Pipecat keeps them as two; Gemma 4
+    then loops on empty thought markers, or repeats the holding sentence
+    without calling the tool, when the caller speaks while the call runs."""
     out: list = []
     for index, message in enumerate(messages):
         if message.get("role") == "developer" and role != "developer":
             message = {**message, "role": role}
         previous = out[-1] if out else None
+        if (
+            previous is not None
+            and message.get("role") == "assistant"
+            and message.get("tool_calls")
+            and not message.get("content")
+            and previous.get("role") == "assistant"
+            and not previous.get("tool_calls")
+            and isinstance(previous.get("content"), str)
+            and previous["content"].strip()
+        ):
+            out[-1] = {**message, "content": previous["content"]}
+            continue
         if (
             index > 0
             and previous is not None

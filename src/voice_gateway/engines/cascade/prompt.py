@@ -41,15 +41,22 @@ after.
 With that call, say at most one short sentence, and only that you are \
 checking or asking: "{holding[0]}", or when the caller \
 wants a person, "{holding[1]}" Never add a second holding \
-sentence. Until the answer is back, never say that you connect, put \
-through, forward or pass on anything ({handover}): whether that \
-happens is decided by the answer. Never say that \
+sentence. Until the answer is back, never guess it, and never say that \
+you connect, put through, forward or pass on anything ({handover}): \
+whether that happens is decided by the answer. Never say that \
 you check or ask without calling `{tool}`.
+When the caller adds to, completes or corrects a request you have already \
+handed on, call `{tool}` again at once with the addition, and say nothing \
+with it: the caller has already heard that you are checking. Handing a \
+request on in pieces is fine; the back office puts them together.
 The answer comes back later, as the result of that tool call or as a \
 system note. Then tell the caller what it says in your own words, as your \
 own answer, without saying who answered; if it says the caller is being \
 put through, say that. Do not start with a holding sentence again: the \
-caller has already heard one.
+caller has already heard one. An answer to an earlier part may come back \
+while an addition is still being checked: then say only what it already \
+settles, or nothing yet, never ask again for what the caller already said, \
+and wait for the rest.
 
 # What the caller never hears
 Never mention the back office, a tool, a system or a note to the caller, \
@@ -62,8 +69,18 @@ DELEGATE_DESCRIPTION = (
     "you do not have (availability, bookings, invoices, records), an action, "
     "a transfer to a person, or a message to pass on. The answer arrives later "
     "as this call's result. With the call, say at most one short sentence "
-    "that you are checking; never that you connect or forward the caller."
+    "that you are checking; never that you connect or forward the caller. "
+    "When the caller adds to or corrects a request already handed on, call it "
+    "again at once with the addition and say nothing with it."
 )
+#: Added to an answer while the caller's later addition to the request is
+#: still with the back office: the answer may be incomplete.
+ADDITION_OPEN = (
+    "(The caller added to this request afterwards. That part is still being "
+    "checked and its answer follows: do not present this answer as final.)"
+)
+#: The result of a request that the answer to a later addition covers.
+COVERED = "Answered together with the caller's next request: see that result."
 REQUEST_DESCRIPTION = (
     "The caller's request in one sentence, in the caller's language, with "
     "every detail the caller gave (dates, names, numbers)."

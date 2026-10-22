@@ -78,6 +78,7 @@ class CallerTranscripts(FrameProcessor):
         voice_audible: Callable[[], bool],
         emit: Callable[[str], None],
         timings: Timings,
+        on_speech: Callable[[bool], None] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -85,6 +86,7 @@ class CallerTranscripts(FrameProcessor):
         self._voice_audible = voice_audible
         self._emit = emit
         self._timings = timings
+        self._on_speech = on_speech or (lambda speaking: None)
         self._over_voice = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -95,10 +97,12 @@ class CallerTranscripts(FrameProcessor):
             and direction == FrameDirection.UPSTREAM
         ):
             self._over_voice = self._voice_audible()
+            self._on_speech(True)
         elif (
             isinstance(frame, VADUserStoppedSpeakingFrame)
             and direction == FrameDirection.UPSTREAM
         ):
+            self._on_speech(False)
             self._timings.speech_ended(time.monotonic() - frame.stop_secs)
         elif (
             isinstance(frame, TranscriptionFrame)

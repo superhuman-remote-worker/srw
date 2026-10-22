@@ -137,6 +137,33 @@ In the phone-line connector, set the **greeting delay** (`greeting_delay_ms`) to
 0: the gateway speaks the greeting as soon as it gets it, while GPT-Live needs
 the default wait.
 
+### Date, time and waiting for the back office
+
+The voice is told the call's date, weekday and local time, and the dates of the
+next two weeks, so it works out "next Monday" by itself. The time zone is
+`connectors.drivers.gptLiveSip.timezone` (an IANA name, default
+`Europe/Berlin`); it applies to GPT-Live lines too.
+
+A cascade profile bridges a back office that takes long. While the voice waits
+for an answer and neither side has spoken for `hold_after_secs` (default 5;
+0 turns it off), it says one short sentence from `hold_phrases`, never the same
+one twice in a row, at most `hold_max` times (default 2) per wait, then
+`hold_longer` once. The defaults follow the profile's `language`:
+
+```yaml
+cascade-gpu:
+  engine: cascade
+  language: de
+  hold_after_secs: 5
+  hold_max: 2
+  hold_phrases: ["Einen kleinen Moment noch, bitte.", "Ich bin gleich so weit."]
+  hold_longer: "Es dauert leider etwas länger, bitte bleiben Sie dran."
+```
+
+Each sentence is at most 80 characters, so its audio is kept after the first
+call. Anything else the voice says on its own (the greeting, a line the back
+office sends it) waits until the caller has finished and the voice is silent.
+
 ## Check a line
 
 ```bash

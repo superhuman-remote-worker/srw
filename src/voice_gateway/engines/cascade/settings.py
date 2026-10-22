@@ -44,6 +44,29 @@ GERMAN_BACKCHANNELS = (
 )
 GERMAN_FILLER = "Einen Moment, ich schaue nach."
 LANGUAGE_NAMES = {"de": "German", "en": "English"}
+#: What the voice says while the back office takes long, per language
+#: (``hold_phrases``): short, so the phrase cache keeps their audio.
+HOLD_PHRASES = {
+    "de": (
+        "Einen kleinen Moment noch, bitte.",
+        "Ich bin gleich so weit.",
+        "Ich habe gleich eine Antwort für Sie.",
+        "Danke für Ihre Geduld, nur noch einen Moment.",
+    ),
+    "en": (
+        "Just a moment longer, please.",
+        "I'm almost there.",
+        "I should have your answer in just a moment.",
+        "Thanks for your patience, just a moment more.",
+    ),
+}
+#: Said once after ``hold_max`` of them (``hold_longer``).
+HOLD_LONGER = {
+    "de": "Es dauert leider etwas länger, bitte bleiben Sie dran.",
+    "en": "This is taking a little longer, please stay on the line.",
+}
+#: The phrase cache's limit (``services.PhraseCache``).
+HOLD_MAX_CHARS = 80
 
 
 @dataclass(frozen=True)
@@ -135,6 +158,15 @@ class CascadeSettings:
     playout_lead_ms: int = 200
     #: Extra lines appended to the engine's prompt (deployment wording).
     prompt: str = ""
+    #: While the back office has a request and neither side has spoken for
+    #: this long, the voice says one of ``hold_phrases`` (never the same one
+    #: twice in a row); 0 never.
+    hold_after_secs: float = 5.0
+    #: At most this many of them per wait, then ``hold_longer`` once.
+    hold_max: int = 2
+    hold_phrases: tuple[str, ...] = HOLD_PHRASES["de"]
+    #: Empty: none.
+    hold_longer: str = HOLD_LONGER["de"]
 
 
 def _mapping(raw, label: str, allowed: set[str]) -> dict:
@@ -359,6 +391,26 @@ def _barge_in(raw, label: str, language: str) -> BargeInSettings:
     )
 
 
+def _phrase(value, label: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be a string")
+    if len(value.strip()) > HOLD_MAX_CHARS:
+        raise ConfigError(f"{label} must be at most {HOLD_MAX_CHARS} characters")
+    return value.strip()
+
+
+def _hold_phrases(raw: dict, label: str, language: str) -> tuple[str, ...]:
+    value = raw.get("hold_phrases")
+    if value is None:
+        return HOLD_PHRASES[language]
+    if not isinstance(value, list):
+        raise ConfigError(f"{label}.hold_phrases must be a list of sentences")
+    phrases = tuple(_phrase(p, f"{label}.hold_phrases[]") for p in value)
+    if not all(phrases):
+        raise ConfigError(f"{label}.hold_phrases must not hold an empty sentence")
+    return phrases
+
+
 _PROFILE_KEYS = {
     "stt",
     "llm",
@@ -369,6 +421,10 @@ _PROFILE_KEYS = {
     "barge_in",
     "playout_lead_ms",
     "prompt",
+    "hold_after_secs",
+    "hold_max",
+    "hold_phrases",
+    "hold_longer",
 }
 
 
@@ -403,4 +459,10 @@ def parse_settings(name: str, raw: dict, base: Path | None = None) -> CascadeSet
         barge_in=_barge_in(raw.get("barge_in", {}), f"{label}.barge_in", language),
         playout_lead_ms=_integer(raw, "playout_lead_ms", label, 200, 40, 2000),
         prompt=prompt.strip(),
+        hold_after_secs=_number(raw, "hold_after_secs", label, 5.0, 0.0, 60.0),
+        hold_max=_integer(raw, "hold_max", label, 2, 0, 10),
+        hold_phrases=_hold_phrases(raw, label, language),
+        hold_longer=_phrase(
+            raw.get("hold_longer", HOLD_LONGER[language]), f"{label}.hold_longer"
+        ),
     )

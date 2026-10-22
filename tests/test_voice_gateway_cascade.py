@@ -31,10 +31,16 @@ from voice_gateway.config import Line  # noqa: E402
 from voice_gateway.engines.cascade import parse_settings  # noqa: E402
 from voice_gateway.engines.cascade.engine import CascadeEngine  # noqa: E402
 from voice_gateway.engines.cascade.fileport import FileAudioPort  # noqa: E402
+from voice_gateway.engines.cascade.prompt import ADDITION_OPEN, COVERED  # noqa: E402
 from voice_gateway.engines.cascade.services import (  # noqa: E402
     PHRASES,
     SpokenTextAggregator,
+    note_messages,
     strip_markup,
+)
+from voice_gateway.engines.cascade.settings import (  # noqa: E402
+    HOLD_LONGER,
+    HOLD_PHRASES,
 )
 from voice_gateway.engines.cascade.transport import heard_prefix  # noqa: E402
 from voice_gateway.session import Session  # noqa: E402
@@ -81,9 +87,14 @@ class Fakes:
         self.prewarms: list[dict] = []
         self.llm_replies: list = []  # each: str (text) or ("delegate", request[, text])
         self.tts_inputs: list[str] = []
+        #: Seconds between the streamed words of a reply.
+        self.word_delay = 0.0
         #: Requests for the filler (prewarmed into the phrase cache at the
         #: call's start), kept out of ``tts_inputs``.
         self.filler_requests = 0
+        #: Requests for the hold sentences (prewarmed at the first
+        #: delegation), kept out of ``tts_inputs`` too.
+        self.hold_requests = 0
         self.ms_per_char = 40
 
     async def transcriptions(self, request: web.Request) -> web.Response:
@@ -143,6 +154,8 @@ class Fakes:
         else:
             for word in reply.split(" "):
                 await send({"role": "assistant", "content": word + " "})
+                if self.word_delay:
+                    await asyncio.sleep(self.word_delay)
             await send({}, "stop")
         await response.write(b"data: [DONE]\n\n")
         return response
@@ -152,6 +165,8 @@ class Fakes:
         assert body["model"] == "tts-model" and body["voice"] == "speaker-1"
         if body["input"] in (FILLER, "Einen Moment, ich frage nach."):
             self.filler_requests += 1
+        elif body["input"] in (*HOLD_PHRASES["de"], HOLD_LONGER["de"]):
+            self.hold_requests += 1
         else:
             self.tts_inputs.append(body["input"])
         pcm = tone(len(body["input"]) * self.ms_per_char / 1000, rate=24_000, freq=330)
@@ -531,16 +546,17 @@ async def test_delegation_follows_the_transcript_then_filler_then_phrased_answer
     tool = [m for m in answer_request if m["role"] == "tool"]
     assert tool and "129 Euro" in tool[-1]["content"]
     assert call.engine.timings.turns[0].delegated
-    # The filler stands in front of the call, as if the LLM had said it, and
-    # nothing after the result asks for another holding sentence.
+    # The filler stands with the call, as if the LLM had said it (one
+    # assistant message), and nothing after the result asks for another
+    # holding sentence.
     roles = [(m["role"], bool(m.get("tool_calls"))) for m in answer_request]
     filler = next(
         i
         for i, m in enumerate(answer_request)
         if m["role"] == "assistant" and m.get("content") == FILLER
     )
-    assert roles[filler + 1 : filler + 3] == [("assistant", True), ("tool", False)]
-    assert filler + 3 == len(answer_request)
+    assert answer_request[filler]["tool_calls"][0]["function"]["name"] == "delegate"
+    assert roles[filler + 1 :] == [("tool", False)]
 
 
 @pytest.mark.asyncio
@@ -658,3 +674,226 @@ async def test_a_hangup_while_the_pipeline_starts_ends_promptly(fakes):
     await call.close()
     assert asyncio.get_running_loop().time() - started < 2
     assert call.engine._task.done()
+
+
+# =============================================================================
+# Several open requests, the line, and a long wait (owner's call 2026-10-22)
+# =============================================================================
+
+
+def delegation_ids(call) -> list[str]:
+    return [
+        e["delegation"]["id"]
+        for e in call.events
+        if e["type"] == "session.delegation.created"
+    ]
+
+
+def contents(messages) -> str:
+    return "\n".join(
+        m["content"] for m in messages if isinstance(m.get("content"), str)
+    )
+
+
+async def _cut_off_then_completed(call, fakes):
+    """The caller pauses, is cut off, and completes the request after the
+    delegation went out; the voice hands on the rest."""
+    fakes.stt_texts = [
+        "Fünf Personen, drei Tage ab Montag, Montag bis",
+        "Mittwoch, wahrscheinlich.",
+    ]
+    fakes.llm_replies = [
+        ("delegate", "Fünf Personen ab Montag"),
+        ("delegate", "Abreise Mittwoch"),
+    ]
+    call.port.say(tone(1.0))
+    await call.until(lambda: len(delegation_ids(call)) == 1)
+    await call.quiet()
+    call.port.say(tone(1.0))
+    await call.until(lambda: len(delegation_ids(call)) == 2)
+    await call.quiet()
+    return delegation_ids(call)
+
+
+def test_the_holding_sentence_and_its_call_are_one_message():
+    # Two assistant messages in a row (Pipecat's shape) made Gemma 4 loop on
+    # empty thought markers when the caller spoke while the call ran.
+    call = {"id": "c1", "type": "function", "function": {"name": "delegate"}}
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "Montag bis"},
+        {"role": "assistant", "content": FILLER},
+        {"role": "assistant", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "c1", "content": "running"},
+        {"role": "user", "content": "Mittwoch."},
+    ]
+    out = note_messages(messages, "system")
+    assert out[2] == {"role": "assistant", "content": FILLER, "tool_calls": [call]}
+    assert [m["role"] for m in out] == ["system", "user", "assistant", "tool", "user"]
+    # A reply without a call stays as it is.
+    plain = [messages[0], messages[1], {"role": "assistant", "content": "Gern."}]
+    assert note_messages(plain, "system") == plain
+
+
+@pytest.mark.asyncio
+async def test_a_late_addition_is_handed_on_without_a_second_holding_sentence(
+    call, fakes
+):
+    first, second = await _cut_off_then_completed(call, fakes)
+    assert first != second
+    # One holding sentence for both requests.
+    assert call.transcripts("assistant") == [FILLER]
+    assert call.transcripts("caller") == [
+        "Fünf Personen, drei Tage ab Montag, Montag bis",
+        "Mittwoch, wahrscheinlich.",
+    ]
+    # The LLM saw the filler with its call when the caller went on.
+    request = fakes.llm_requests[1]["messages"]
+    with_call = [m for m in request if m.get("tool_calls")]
+    assert with_call[0]["content"] == FILLER
+    assert request[-1] == {"role": "user", "content": "Mittwoch, wahrscheinlich."}
+    assert set(call.engine._pending) == {first, second}
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_an_addition_still_open_is_marked_incomplete(call, fakes):
+    first, second = await _cut_off_then_completed(call, fakes)
+    fakes.llm_replies = [
+        "Für fünf Personen brauchen Sie zwei Zimmer.",
+        "Von Montag bis Mittwoch sind zwei Zimmer frei.",
+    ]
+    await call.append("commentary", "Fünf Personen brauchen zwei Zimmer.", first)
+    await call.until(lambda: len(fakes.llm_requests) == 3)
+    await call.quiet()
+    assert ADDITION_OPEN in contents(fakes.llm_requests[2]["messages"])
+    await call.append("commentary", "Mo bis Mi: zwei Zimmer frei.", second)
+    await call.until(lambda: len(fakes.llm_requests) == 4)
+    await call.quiet()
+    last = fakes.llm_requests[3]["messages"]
+    assert "zwei Zimmer frei" in contents(last)
+    assert contents(last).count(ADDITION_OPEN) == 1  # only the first answer
+    assert "Mittwoch sind zwei Zimmer frei" in "".join(call.transcripts("assistant"))
+    assert call.engine._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_the_addition_settles_the_earlier_request(call, fakes):
+    first, second = await _cut_off_then_completed(call, fakes)
+    fakes.llm_replies = ["Von Montag bis Mittwoch sind zwei Zimmer frei."]
+    await call.append("commentary", "Mo bis Mi: zwei Zimmer frei.", second)
+    await call.until(lambda: len(fakes.llm_requests) == 3)
+    await call.quiet()
+    # One reply for both: the earlier request is settled quietly with it.
+    assert len(fakes.llm_requests) == 3
+    messages = contents(fakes.llm_requests[2]["messages"])
+    assert COVERED in messages and "zwei Zimmer frei" in messages
+    assert ADDITION_OPEN not in messages
+    assert call.engine._pending == {}
+    # A late answer to the earlier one is still said, as a note.
+    fakes.llm_replies = ["Und das Frühstück ist inbegriffen."]
+    await call.append("commentary", "Frühstück inklusive.", first)
+    await call.until(lambda: len(fakes.llm_requests) == 4)
+    assert "tell the caller this now" in contents(fakes.llm_requests[3]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_a_backchannel_while_waiting_gets_no_reply(call, fakes):
+    # The LLM tended to invent the open answer for a bare "Okay.".
+    fakes.stt_texts = ["Können Sie meine Rechnung schicken?", "Okay.", "Hallo?"]
+    fakes.llm_replies = [("delegate", "Rechnung schicken"), "Ich schaue noch nach."]
+    call.port.say(tone(1.0))
+    await call.until(lambda: len(delegation_ids(call)) == 1)
+    await call.quiet()
+    call.port.say(tone(0.8))
+    await call.until(lambda: "Okay." in call.transcripts("caller"))
+    await call.quiet(1.0)
+    assert len(fakes.llm_requests) == 1
+    call.port.say(tone(0.8))  # not a backchannel: answered
+    await call.until(lambda: len(fakes.llm_requests) == 2)
+    await call.until(
+        lambda: "Ich schaue noch nach."
+        in " ".join(call.transcripts("assistant")).replace("  ", " ")
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_markup_loop_is_cut_off(call, fakes):
+    fakes.word_delay = 0.02
+    fakes.stt_texts = ["Danke."]
+    fakes.llm_replies = [" ".join(["<|channel>thought<channel|>"] * 100)]
+    call.port.say(tone(1.0))
+    await call.until(lambda: fakes.llm_requests)
+    started = asyncio.get_running_loop().time()
+    await call.until(lambda: not call.engine._llm.generating, timeout=5)
+    # 100 markers take 2 s to stream; the engine stops reading after ~8.
+    assert asyncio.get_running_loop().time() - started < 1.0
+    await call.quiet()
+    assert call.transcripts("assistant") == [] and fakes.tts_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_the_voice_does_not_speak_into_the_caller(call, fakes):
+    # A status line from the back office while the caller talks waits until
+    # the caller's turn and the voice's reply to it are over.
+    fakes.stt_texts = ["Ich hätte gern ein Zimmer für nächste Woche."]
+    fakes.llm_replies = ["Gern."]
+    call.port.say(tone(2.0))
+    await asyncio.sleep(0.8)
+    await call.append(
+        "instructions",
+        'Say exactly: "Ich schaue gerade im Buchungssystem nach."',
+    )
+    await call.until(lambda: len(call.transcripts("assistant")) >= 2, timeout=15)
+    await call.quiet()
+    said = [t.strip() for t in call.transcripts("assistant")]
+    assert said == ["Gern.", "Ich schaue gerade im Buchungssystem nach."]
+    # Nothing played while the caller's clip ran.
+    assert call.port.voice_starts and call.port.voice_starts[0] > call.port.clip_ends[0]
+
+
+@pytest.mark.asyncio
+async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
+    call = Call(fakes, fakes.base, hold_after_secs=0.6, hold_max=2)
+    await call.accept()
+    try:
+        fakes.stt_texts = ["Ist am Freitag ein Doppelzimmer frei?"]
+        fakes.llm_replies = [("delegate", "Doppelzimmer Freitag")]
+        call.port.say(tone(1.0))
+        await call.until(lambda: len(delegation_ids(call)) == 1)
+        await call.until(lambda: len(call.transcripts("assistant")) >= 4, timeout=15)
+        await asyncio.sleep(2.5)  # nothing after the "longer" sentence
+        await call.quiet()
+        said = [t.strip() for t in call.transcripts("assistant")]
+        assert said[0] == FILLER
+        holds = said[1:3]
+        assert all(h in HOLD_PHRASES["de"] for h in holds)
+        assert holds[0] != holds[1]
+        assert said[3:] == [HOLD_LONGER["de"]]
+        # Never into each other: a pause of at least hold_after_secs each.
+        starts = call.port.voice_starts
+        assert len(starts) == 4
+        # The answer ends the wait; the next wait starts afresh.
+        fakes.llm_replies = ["Ja, am Freitag ist ein Doppelzimmer frei."]
+        await call.append("commentary", "Freitag frei.", delegation_ids(call)[0])
+        await call.until(lambda: len(call.transcripts("assistant")) == 5)
+        await asyncio.sleep(1.5)
+        assert len(call.transcripts("assistant")) == 5
+        assert call.engine._holds == 0 and not call.engine._longer_said
+    finally:
+        await call.close()
+
+
+@pytest.mark.asyncio
+async def test_hold_after_zero_never_bridges(fakes):
+    call = Call(fakes, fakes.base, hold_after_secs=0)
+    await call.accept()
+    try:
+        fakes.stt_texts = ["Ist am Freitag ein Doppelzimmer frei?"]
+        fakes.llm_replies = [("delegate", "Doppelzimmer Freitag")]
+        call.port.say(tone(1.0))
+        await call.until(lambda: len(delegation_ids(call)) == 1)
+        await asyncio.sleep(3.0)
+        assert [t.strip() for t in call.transcripts("assistant")] == [FILLER]
+        assert fakes.hold_requests == 0
+    finally:
+        await call.close()
