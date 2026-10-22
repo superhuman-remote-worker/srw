@@ -178,7 +178,6 @@ class CascadeEngine:
         self._longer_said = False
         self._last_hold: str | None = None
         self._random = random.Random()
-        self._hold_prewarm: asyncio.Task | None = None
         self._llm: VoiceLLM | None = None
         self._audioless = False
         self._stopped = False
@@ -236,8 +235,6 @@ class CascadeEngine:
             self._prewarm.cancel()
         if self._watch is not None:
             self._watch.cancel()
-        if self._hold_prewarm is not None:
-            self._hold_prewarm.cancel()
         if self._runner is not None:
             await self._runner.cancel()
         elif self._task is not None:
@@ -452,14 +449,6 @@ class CascadeEngine:
             await params.llm.push_frame(
                 TTSSpeakFrame(self.settings.filler, append_to_context=False)
             )
-        if self._hold_prewarm is None and self.settings.hold_after_secs and self._tts:
-            # The hold sentences are needed seconds from now at the earliest,
-            # while the TTS has nothing else to do: not after the greeting,
-            # where they would hold up the caller's first answer.
-            hold = [*self.settings.hold_phrases, self.settings.hold_longer]
-            self._hold_prewarm = asyncio.create_task(
-                self._tts.prewarm([p for p in hold if p])
-            )
         logger.info("call %s delegated", self._session.id)
 
     async def _answered(self, delegation_id: str, content: str) -> None:
@@ -544,7 +533,7 @@ class CascadeEngine:
             self._caller_speaking
             or self._turn_open
             or bool(self._llm and self._llm.generating)
-            or bool(self.output and self.output.audible())
+            or bool(self.output and self.output.speaking())
         )
 
     def _line_free(self) -> bool:
@@ -566,22 +555,32 @@ class CascadeEngine:
 
     async def _watch_line(self) -> None:
         """Release held speech when the line is free; bridge a long wait."""
-        while not self._stopped:
-            await asyncio.sleep(WATCH_SECS)
-            if not self._line_free():
-                continue
-            if self._held:
-                await self._release(self._held.popleft())
-                continue
-            after = self.settings.hold_after_secs
-            if not self._pending:
-                self._hold_reset()
-            elif after and time.monotonic() - self._last_busy >= after:
-                phrase = self._hold_phrase()
-                if phrase:
-                    await self._release(
-                        [TTSSpeakFrame(phrase, append_to_context=False)]
-                    )
+        try:
+            while not self._stopped:
+                await asyncio.sleep(WATCH_SECS)
+                await self._look_at_the_line()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the call goes on without it
+            logger.warning(
+                "call %s: the line watch stopped (%s)",
+                self._session.id,
+                type(exc).__name__,
+            )
+
+    async def _look_at_the_line(self) -> None:
+        if not self._line_free():
+            return
+        if self._held:
+            await self._release(self._held.popleft())
+            return
+        after = self.settings.hold_after_secs
+        if not self._pending:
+            self._hold_reset()
+        elif after and time.monotonic() - self._last_busy >= after:
+            phrase = self._hold_phrase()
+            if phrase:
+                await self._release([TTSSpeakFrame(phrase, append_to_context=False)])
 
     def _hold_phrase(self) -> str | None:
         """The next hold sentence of this wait, if any is left."""

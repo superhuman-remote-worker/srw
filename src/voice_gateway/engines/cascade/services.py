@@ -15,6 +15,7 @@ Nothing here logs what was said; errors carry status codes only.
 
 from __future__ import annotations
 
+import json
 import re
 import struct
 import time
@@ -30,6 +31,7 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
+from pipecat.processors.aggregators import async_tool_messages
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.settings import STTSettings, TTSSettings
 from pipecat.services.stt_service import SegmentedSTTService
@@ -42,6 +44,7 @@ from pipecat.utils.text.simple_text_aggregator import (
 from pipecat.utils.time import time_now_iso8601
 
 from voice_gateway.engines.cascade.clauses import clause_end
+from voice_gateway.engines.cascade.prompt import HANDED_ON
 from voice_gateway.engines.cascade.settings import LlmSettings, SttSettings, TtsSettings
 from voice_gateway.engines.cascade.timings import Timings
 from voice_gateway.interfaces import SAMPLE_RATE
@@ -288,11 +291,14 @@ def note_messages(messages: list, role: str) -> list:
     filler in its place) and the call become one assistant message, the
     shape chat models are trained on. Pipecat keeps them as two; Gemma 4
     then loops on empty thought markers, or repeats the holding sentence
-    without calling the tool, when the caller speaks while the call runs."""
+    without calling the tool, when the caller speaks while the call runs.
+    A call still running says it was handed on and that an addition goes
+    out as a new call (``prompt.HANDED_ON``)."""
     out: list = []
     for index, message in enumerate(messages):
         if message.get("role") == "developer" and role != "developer":
             message = {**message, "role": role}
+        message = _handed_on(message)
         previous = out[-1] if out else None
         if (
             previous is not None
@@ -322,6 +328,19 @@ def note_messages(messages: list, role: str) -> list:
             continue
         out.append(message)
     return out
+
+
+def _handed_on(message: dict) -> dict:
+    """Pipecat's placeholder of a running async call, with SRW's wording."""
+    content = message.get("content")
+    if message.get("role") != "tool" or not isinstance(content, str):
+        return message
+    payload = async_tool_messages.parse_message(message)
+    if payload is None or payload.kind != "started":
+        return message
+    body = json.loads(content)
+    body["description"] = HANDED_ON
+    return {**message, "content": json.dumps(body)}
 
 
 class _WavStream:

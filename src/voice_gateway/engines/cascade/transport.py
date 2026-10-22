@@ -12,9 +12,10 @@ part of the current sentence the caller heard is offered to the context.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pipecat.frames.frames import (
     AggregatedTextFrame,
@@ -35,6 +36,9 @@ from voice_gateway.interfaces import SAMPLE_RATE, AudioPort
 BYTES_PER_MS = SAMPLE_RATE * 2 // 1000
 #: Speaking rate used when a sentence's length is not known yet.
 _MS_PER_CHAR = 65.0
+#: How long a sentence counts as on its way to the line before its audio
+#: starts (a TTS that never answers must not keep the line busy forever).
+_ANNOUNCED_SECS = 15.0
 
 
 def transport_params() -> TransportParams:
@@ -91,6 +95,7 @@ class _Sentence:
     text: str
     context_id: str | None
     start_ms: float = 0.0
+    announced_at: float = field(default_factory=time.monotonic)
 
 
 class CallOutput(BaseOutputTransport):
@@ -128,6 +133,14 @@ class CallOutput(BaseOutputTransport):
 
     def audible(self) -> bool:
         return self.pending_ms() > 0
+
+    def speaking(self, now: float | None = None) -> bool:
+        """Audible, or a sentence is on its way: announced, its audio still
+        being synthesised (a busy TTS can take seconds)."""
+        if self.audible() or self._open is not None:
+            return True
+        now = time.monotonic() if now is None else now
+        return any(now - s.announced_at < _ANNOUNCED_SECS for s in self._announced)
 
     def take_heard_tail(self) -> str | None:
         """What the caller heard of the sentence a barge-in cut, once."""

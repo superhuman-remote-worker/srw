@@ -31,7 +31,13 @@ from voice_gateway.config import Line  # noqa: E402
 from voice_gateway.engines.cascade import parse_settings  # noqa: E402
 from voice_gateway.engines.cascade.engine import CascadeEngine  # noqa: E402
 from voice_gateway.engines.cascade.fileport import FileAudioPort  # noqa: E402
-from voice_gateway.engines.cascade.prompt import ADDITION_OPEN, COVERED  # noqa: E402
+from pipecat.processors.aggregators import async_tool_messages  # noqa: E402
+
+from voice_gateway.engines.cascade.prompt import (  # noqa: E402
+    ADDITION_OPEN,
+    COVERED,
+    HANDED_ON,
+)
 from voice_gateway.engines.cascade.services import (  # noqa: E402
     PHRASES,
     SpokenTextAggregator,
@@ -735,6 +741,20 @@ def test_the_holding_sentence_and_its_call_are_one_message():
     assert note_messages(plain, "system") == plain
 
 
+def test_a_running_call_says_an_addition_is_a_new_call():
+    # Pipecat's "Do not call it again" made Gemma 4 answer a caller's
+    # addition with another holding sentence instead of handing it on.
+    started = async_tool_messages.build_started_message("c1")
+    final = async_tool_messages.build_final_result_message("c1", '"frei"')
+    (tool, done) = note_messages([started, final], "system")
+    assert json.loads(tool["content"])["description"] == HANDED_ON
+    assert async_tool_messages.parse_message(tool).kind == "started"
+    assert tool["tool_call_id"] == "c1"
+    assert done["content"] == final["content"] and done["role"] == "system"
+    plain = {"role": "tool", "tool_call_id": "c2", "content": "129 Euro"}
+    assert note_messages([plain], "system") == [plain]
+
+
 @pytest.mark.asyncio
 async def test_a_late_addition_is_handed_on_without_a_second_holding_sentence(
     call, fakes
@@ -897,3 +917,30 @@ async def test_hold_after_zero_never_bridges(fakes):
         assert fakes.hold_requests == 0
     finally:
         await call.close()
+
+
+@pytest.mark.asyncio
+async def test_a_sentence_the_tts_still_synthesises_keeps_the_line_busy():
+    # With a busy TTS a sentence took 7 s to start on the bench; counting
+    # only audible audio, a hold sentence went out in that gap.
+    import time
+
+    from pipecat.frames.frames import AggregatedTextFrame
+
+    from voice_gateway.engines.cascade.transport import CallOutput, transport_params
+
+    output = CallOutput(
+        FileAudioPort(),
+        transport_params(),
+        lead_ms=200,
+        on_sentence=lambda text: None,
+        on_first_audio=lambda: None,
+        sentence_ms=lambda context_id: None,
+    )
+    assert not output.speaking()
+    frame = AggregatedTextFrame("Das Doppelzimmer ist frei.", "sentence", "ctx-1")
+    frame.will_be_spoken = True
+    await output.write_transport_frame(frame)
+    assert output.speaking() and not output.audible()
+    # A TTS that never answers does not keep the line busy for good.
+    assert not output.speaking(now=time.monotonic() + 16)

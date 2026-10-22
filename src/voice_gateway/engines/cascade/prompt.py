@@ -81,6 +81,13 @@ ADDITION_OPEN = (
 )
 #: The result of a request that the answer to a later addition covers.
 COVERED = "Answered together with the caller's next request: see that result."
+#: What a request still with the back office tells the LLM (in place of
+#: Pipecat's "Do not call it again", after which Gemma 4 answered a caller's
+#: addition with another holding sentence instead of handing it on).
+HANDED_ON = (
+    "Handed on; the answer follows later. If the caller adds to or corrects "
+    "this request, hand that on with a new call."
+)
 REQUEST_DESCRIPTION = (
     "The caller's request in one sentence, in the caller's language, with "
     "every detail the caller gave (dates, names, numbers)."
