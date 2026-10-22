@@ -317,3 +317,39 @@ class TestCannedBackOffice:
         )
         assert driver.match("Verbinden Sie mich mit der Rezeption.")[0] == 0
         assert driver.match("Wie ist das Wetter?") is None
+
+    def test_a_status_line_goes_before_a_slow_answer(self, tmp_path):
+        import asyncio
+
+        from tests.voice_bench.srw_driver import Driver
+        from voice_gateway.engines.cascade.prompt import exact_words
+
+        (tmp_path / "key").write_text("k")
+        (tmp_path / "hook").write_text("whsec_a2V5")
+        driver = Driver(
+            {
+                "api_key_file": str(tmp_path / "key"),
+                "connectors": {"c": str(tmp_path / "hook")},
+                "events": str(tmp_path / "driver.jsonl"),
+                "answer_delay": 0.05,
+                "status": "Ich schaue gerade im Buchungssystem nach.",
+                "status_delay": 0.01,
+                "answers": [{"keywords": ["zimmer"], "answer": "Ja, frei."}],
+            }
+        )
+
+        class Socket:
+            sent: list[dict] = []
+
+            async def send_json(self, body):
+                self.sent.append(body)
+
+        socket = Socket()
+        asyncio.run(driver.back_office(socket, "s", "item_1", "Ein Zimmer frei?"))
+        status, answer = socket.sent
+        assert status["type"] == "session.instructions.append"
+        assert exact_words(status["content"]) == (
+            "Ich schaue gerade im Buchungssystem nach."
+        )
+        assert answer["type"] == "session.commentary.append"
+        assert answer["delegation_id"] == "item_1" and answer["content"] == "Ja, frei."

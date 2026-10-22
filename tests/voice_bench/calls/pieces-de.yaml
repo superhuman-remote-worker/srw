@@ -1,0 +1,22 @@
+# A caller who pauses mid-request (local_voice_gateway.md §9.9, the owner's
+# test call): the caller is cut off after "von Montag", and the rest ("bis
+# Mittwoch") comes as an addition, which the voice should hand on at once
+# without a second holding sentence. Run like wait-de.yaml; `srw_driver.py`
+# answers each piece by its keywords (both pieces, or only the latest). The
+# bench's Piper voice garbles both lines (STT heard other words); render them
+# in a clearer synthetic voice over their cached .16k.wav files to test the
+# voice's behaviour.
+number: "107"
+hangup_after: 55
+lines:
+  - at: 12
+    text: Ich bräuchte ein Zimmer für fünf Personen, von Montag
+  - at: 21
+    text: bis Mittwoch, wahrscheinlich.
+expect:
+  - name: greeting
+    to: 12
+    keywords: ["beispielhof"]
+  - name: answer
+    from: 24
+    keywords: ["mittwoch|28"]

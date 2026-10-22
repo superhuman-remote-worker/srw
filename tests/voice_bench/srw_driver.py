@@ -14,9 +14,13 @@ matched against what the caller said since the last delegation; the first
 entry whose keywords all appear answers with its ``answer`` as
 ``commentary`` after ``answer_delay`` seconds, and an entry with
 ``transfer: true`` then asks for the transfer to ``transfer_target``.
+With ``status`` it first sends that line as an ``instructions`` append to
+say word for word, ``status_delay`` seconds after the delegation (a back
+office that says what it is doing before a slow lookup).
 ``instructions`` and ``greeting`` replace the bench's accept instructions
 and greeting append. Only event kinds and the matched entry are logged,
-never what was said.
+never what was said, unless ``log_transcripts`` asks for the transcripts
+with their times (bench timelines of synthetic test speech).
 
     python srw_driver.py --config driver.json   # inside the bench network
 """
@@ -108,7 +112,21 @@ class Driver:
         if found is None:
             return
         index, entry = found
-        await asyncio.sleep(float(self.config.get("answer_delay", 4.0)))
+        answer_delay = float(self.config.get("answer_delay", 4.0))
+        status = self.config.get("status")
+        waited = 0.0
+        if status:
+            waited = min(float(self.config.get("status_delay", 2.0)), answer_delay)
+            await asyncio.sleep(waited)
+            await ws.send_json(
+                {
+                    "type": "session.instructions.append",
+                    "event_id": "evt_" + uuid.uuid4().hex,
+                    "content": f'Say exactly: "{status}"',
+                }
+            )
+            self.log("status", session_id=sid)
+        await asyncio.sleep(answer_delay - waited)
         await ws.send_json(
             {
                 "type": "session.commentary.append",
@@ -186,6 +204,11 @@ class Driver:
                     entry["code"] = (event.get("error") or {}).get("code")
                 if kind == "session.input_transcript.delta":
                     heard.append(event.get("delta") or "")
+                if self.config.get("log_transcripts") and kind.endswith(
+                    "_transcript.delta"
+                ):
+                    entry["text"] = event.get("delta")
+                    entry["start_ms"] = event.get("start_ms")
                 self.log("event", **entry)
                 if kind == "session.delegation.created" and self.answers:
                     delegation_id = (event.get("delegation") or {}).get("id")
