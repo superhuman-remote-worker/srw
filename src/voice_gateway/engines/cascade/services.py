@@ -128,21 +128,35 @@ class TranscriptionSTT(SegmentedSTTService):
         yield TranscriptionFrame(text, "", time_now_iso8601())
 
 
+#: Digits and number words. A phone number or a postcode says "fünf fünf
+#: fünf", so a phrase of only these counts as a loop from this many repeats.
+NUMBER_LOOP = 6
+_NUMBER_WORDS = frozenset(
+    "null eins ein zwei zwo drei vier fünf sechs sieben acht neun "
+    "zero oh one two three four five six seven eight nine".split()
+)
+
+
+def _number(word: str) -> bool:
+    return word.isdigit() or word in _NUMBER_WORDS
+
+
 def cut_loop(text: str, longest: int = 6) -> str:
     """Whisper sometimes repeats a word or phrase until the segment ends
     ("das das das …"); keep the text up to the first repeat of a phrase
-    said three times in a row."""
+    said three times in a row (digits and number words: ``NUMBER_LOOP``
+    times, the test set's phone numbers lost their "fünf fünf fünf")."""
     words = text.split()
-    key = [w.lower().strip(",.!?") for w in words]
+    key = [w.lower().strip(",.!?;:") for w in words]
     for start in range(len(words)):
         for size in range(1, longest + 1):
-            end = start + 3 * size
-            if end > len(words):
-                break
-            if (
-                key[start : start + size]
-                == key[start + size : start + 2 * size]
-                == key[start + 2 * size : end]
+            phrase = key[start : start + size]
+            times = NUMBER_LOOP if all(map(_number, phrase)) else 3
+            if start + times * size > len(words):
+                continue
+            if all(
+                key[start + n * size : start + (n + 1) * size] == phrase
+                for n in range(1, times)
             ):
                 return " ".join(words[: start + size])
     return text

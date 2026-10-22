@@ -41,6 +41,7 @@ from voice_gateway.engines.cascade.prompt import (  # noqa: E402
 from voice_gateway.engines.cascade.services import (  # noqa: E402
     PHRASES,
     SpokenTextAggregator,
+    cut_loop,
     note_messages,
     strip_markup,
 )
@@ -481,6 +482,21 @@ def test_gemma_markup_never_reaches_the_tts():
         "",
     )
     assert strip_markup("Zimmer 3 < 4") == ("Zimmer 3 < 4", "")
+
+
+def test_a_whisper_loop_is_cut_but_repeated_digits_stay():
+    assert cut_loop("Ich möchte das das das das das das") == "Ich möchte das"
+    assert cut_loop("Danke schön danke schön danke schön") == "Danke schön"
+    # The test set: a phone number or a postcode says the same digit thrice.
+    for said in (
+        "Meine Nummer ist null eins fünf zwei, fünf fünf fünf zwei acht",
+        "Die Postleitzahl ist 5 5 5 1 8.",
+        "null null null eins",
+        "zwei eins zwei eins zwei eins",
+    ):
+        assert cut_loop(said) == said
+    assert cut_loop("null " * 9 + "eins") == "null"
+    assert cut_loop("5 5 5 5 5 5 5") == "5"
 
 
 @pytest.mark.asyncio
