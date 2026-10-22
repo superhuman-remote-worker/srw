@@ -1,0 +1,32 @@
+id: s02-availability-booking
+title: Availability with a relative date, then a booking on a name
+why: >-
+  A delegated question, the back office's answer relayed, then a follow-up
+  that must reach the back office with the caller's name (C1: follow-up
+  delegations).
+categories: [back_office, dates_times, names]
+voice: m-middle
+condition: g711a
+turns:
+  - say: Haben Sie nächste Woche von Montag bis Mittwoch ein Doppelzimmer für zwei Personen frei?
+    expect:
+      outcome: delegate
+      values:
+        - {keyword: "nächste woche", in: request}
+        - {keyword: montag, in: request}
+        - {keyword: mittwoch, in: request}
+        - {keyword: doppelzimmer, in: request}
+        - {keyword: "129|hundertneunundzwanzig", in: reply}
+    back_office:
+      match: ["zimmer|montag|mittwoch"]
+      answer: Von Montag bis Mittwoch ist ein Doppelzimmer frei, 129 Euro pro Nacht mit Frühstück.
+      after: 6
+  - say: Gut, dann buchen Sie das bitte auf den Namen Vöhringer.
+    expect:
+      outcome: delegate
+      values:
+        - {name: Vöhringer, in: request}
+        - {keyword: "gebucht|bestätig|reserviert", in: reply}
+    back_office:
+      answer: Das Doppelzimmer ist auf den Namen Vöhringer gebucht, die Bestätigung kommt per E-Mail.
+      after: 5

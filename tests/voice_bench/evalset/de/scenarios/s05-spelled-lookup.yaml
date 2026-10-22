@@ -1,0 +1,16 @@
+id: s05-spelled-lookup
+title: A booking lookup on a rare, spelled name over a mobile line
+why: A rare name spelled letter by letter must reach the back office intact.
+categories: [back_office, names]
+voice: m-young-fast
+condition: mobile
+turns:
+  - say: Ich wollte meine Buchung prüfen, die läuft auf Przybilla, P, R, Z, Y, B, I, L, L, A.
+    expect:
+      outcome: delegate
+      values:
+        - {name: Przybilla, in: request}
+        - {keyword: freitag, in: reply}
+    back_office:
+      answer: Die Buchung auf Przybilla ist bestätigt, Anreise am Freitag, zwei Nächte.
+      after: 5

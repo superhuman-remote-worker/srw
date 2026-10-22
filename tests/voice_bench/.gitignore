@@ -3,3 +3,5 @@
 /.cache/
 /results/
 /.env
+# Real human recordings for the test set (evalset/README.md); never commit.
+/evalset/human/

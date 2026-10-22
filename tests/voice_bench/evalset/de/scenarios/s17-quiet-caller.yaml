@@ -1,0 +1,15 @@
+id: s17-quiet-caller
+title: A quiet caller
+why: A caller far from the microphone is still heard (VAD volume threshold), not missed.
+categories: [facts]
+voice: f-older-slow
+condition: quiet
+turns:
+  - say: Bis wann ist die Rezeption abends besetzt?
+    expect:
+      outcome: answer
+      values: [{keyword: "22|zweiundzwanzig", in: reply}]
+  - say: Und ab wann gibt es Frühstück?
+    expect:
+      outcome: answer
+      values: [{keyword: "6:30|630|sechs uhr dreißig|halb sieben", in: reply}]

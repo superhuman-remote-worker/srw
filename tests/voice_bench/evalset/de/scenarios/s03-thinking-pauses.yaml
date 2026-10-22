@@ -1,0 +1,21 @@
+id: s03-thinking-pauses
+title: A caller who pauses while thinking
+why: >-
+  The owner's call (local_voice_gateway.md §9.9): "Fünf Personen … drei Tage
+  von Montag … bis Mittwoch" was cut into pieces at the 2 s turn limit and
+  the delegation went out without "Mittwoch".
+categories: [back_office, counts, dates_times]
+voice: m-older-slow
+condition: g711a
+turns:
+  - say: Wir sind fünf Personen <pause 2.4> und bräuchten zwei Zimmer <pause 2.0> von Montag <pause 1.8> bis Mittwoch.
+    expect:
+      outcome: delegate
+      values:
+        - {number: 5, in: request}
+        - {keyword: montag, in: request}
+        - {keyword: mittwoch, in: request}
+    back_office:
+      match: ["zimmer|personen|montag|mittwoch"]
+      answer: Von Montag bis Mittwoch sind zwei Doppelzimmer frei, je 129 Euro pro Nacht.
+      after: 6

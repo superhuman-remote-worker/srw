@@ -1,0 +1,17 @@
+id: s06-transfer-person
+title: Transfer to a named person over G.722
+why: The voice hands a transfer wish on and says it connects only once the back office decided.
+categories: [transfer, names]
+voice: f-young-fast
+condition: g722
+turns:
+  - say: Verbinden Sie mich bitte mit Herrn Beispiel vom Restaurant.
+    expect:
+      outcome: transfer
+      values:
+        - {name: Beispiel, in: request}
+        - {keyword: verbind, in: reply}
+    back_office:
+      answer: Herr Beispiel ist da, ich verbinde Sie jetzt mit ihm.
+      after: 4
+      transfer: true

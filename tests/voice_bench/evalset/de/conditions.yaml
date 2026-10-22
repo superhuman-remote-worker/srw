@@ -1,0 +1,73 @@
+# Phone conditions (README.md, "Phone conditions"). Each is a chain of
+# operations on the rendered 16 kHz clip, in order; the result is what SRW's
+# gateway gets from Asterisk (16 kHz slin). acoustic operations (noise,
+# level, clip, band) happen in the caller's room and handset, line
+# operations (codec, loss) on the phone network. At call level the bench's
+# real line replaces the codec and loss; the acoustic part is applied to the
+# clip the bench caller plays.
+#
+# Noise is generated (conditions.py), never recorded, so no licence applies;
+# `cafe` mixes the bench's own synthetic Piper sentences as babble when they
+# are rendered (scripts/voice-bench.sh audio), else a generated murmur.
+# Random parts are seeded by condition and clip: the same clip under the
+# same condition is the same audio on every run.
+
+conditions:
+  - id: clean
+    description: 16 kHz as rendered, no phone line (the STT's ceiling)
+    ops: []
+  - id: g711a
+    description: 8 kHz G.711 A-law, the usual German phone line
+    ops:
+      - {op: codec, name: g711a}
+  - id: g711u
+    description: 8 kHz G.711 µ-law
+    ops:
+      - {op: codec, name: g711u}
+  - id: g722
+    description: 16 kHz G.722 (HD voice between IP phones)
+    ops:
+      - {op: codec, name: g722}
+  - id: mobile
+    description: a mobile caller, band 300-3400 Hz, AMR-NB 7.95 kbit/s, then A-law into the PBX
+    ops:
+      - {op: band, low: 300, high: 3400}
+      - {op: codec, name: amr-nb, bitrate: 7.95k}
+      - {op: codec, name: g711a}
+  - id: loss-3
+    description: A-law with 3 % of the 20 ms packets lost, short bursts, gaps left silent
+    ops:
+      - {op: codec, name: g711a}
+      - {op: loss, rate: 0.03, burst: 1.5, plc: zero}
+  - id: loss-8
+    description: A-law with 8 % of the packets lost in bursts of 3, gaps left silent
+    ops:
+      - {op: codec, name: g711a}
+      - {op: loss, rate: 0.08, burst: 3, plc: zero}
+  - id: street
+    description: street traffic at 10 dB SNR, mobile leg
+    ops:
+      - {op: noise, kind: street, snr_db: 10}
+      - {op: band, low: 300, high: 3400}
+      - {op: codec, name: amr-nb, bitrate: 7.95k}
+      - {op: codec, name: g711a}
+  - id: cafe
+    description: café babble and cups at 10 dB SNR, A-law
+    ops:
+      - {op: noise, kind: cafe, snr_db: 10}
+      - {op: codec, name: g711a}
+  - id: office
+    description: office (ventilation, keyboard, two far voices) at 15 dB SNR, A-law
+    ops:
+      - {op: noise, kind: office, snr_db: 15}
+      - {op: codec, name: g711a}
+  - id: quiet
+    description: a quiet caller, 16 dB below the rendered level (speech at about -36 dBFS), A-law
+    ops:
+      - {op: level, db: -16}
+      - {op: codec, name: g711a}
+  - id: clipped
+    description: a loud handset, 18 dB of gain clipped hard, A-law
+    ops:
+      - {op: clip, gain_db: 18}
+      - {op: codec, name: g711a}

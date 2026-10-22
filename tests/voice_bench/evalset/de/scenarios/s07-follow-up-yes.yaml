@@ -1,0 +1,24 @@
+id: s07-follow-up-yes
+title: The back office asks back, the caller just says yes
+why: >-
+  A short answer is a real turn when the voice is silent, and the
+  confirmation must reach the back office (C1: follow-up delegations).
+categories: [back_office, short_answers]
+voice: f-middle
+condition: g711a
+turns:
+  - say: Ich möchte meinen Aufenthalt um eine Nacht verlängern.
+    expect:
+      outcome: delegate
+      values: [{keyword: sonntag, in: reply}]
+    back_office:
+      match: ["verlänger|nacht|aufenthalt"]
+      answer: Eine Nacht mehr bis Sonntag ist frei, 129 Euro. Soll ich das so buchen?
+      after: 5
+  - say: Ja, genau.
+    expect:
+      outcome: delegate
+      values: [{keyword: "gebucht|verlängert|bestätig", in: reply}]
+    back_office:
+      answer: Die Verlängerung bis Sonntag ist gebucht.
+      after: 4

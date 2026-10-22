@@ -1,0 +1,17 @@
+id: s09-barge-in-correction
+title: The caller corrects the day while the voice answers
+why: A real interruption stops the voice at once, and the answer follows the correction.
+categories: [facts, barge_in]
+voice: f-young-fast
+condition: g711a
+turns:
+  - say: Hat Ihr Restaurant am Montagabend geöffnet?
+    expect:
+      outcome: answer
+  - say: Moment, Entschuldigung, ich meinte Dienstag.
+    when: during_voice
+    offset: 1.0
+    expect:
+      outcome: answer
+      barge_in: true
+      values: [{keyword: "17|siebzehn|halb sechs|geöffnet|offen", in: reply}]

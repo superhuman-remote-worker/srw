@@ -1,0 +1,18 @@
+id: s11-long-wait
+title: The back office takes 15 seconds
+why: >-
+  Long back-office waits (§9.9: 5-10 s on k3d): how long the caller hears
+  nothing, and whether the answer still arrives (C1: bridging the wait).
+categories: [back_office]
+voice: f-older-slow
+condition: g711a
+turns:
+  - say: Ich habe letzte Woche bei Ihnen übernachtet und finde meine Rechnung nicht mehr. Können Sie mir die noch einmal schicken?
+    expect:
+      outcome: delegate
+      values:
+        - {keyword: rechnung, in: request}
+        - {keyword: "rechnung|mail", in: reply}
+    back_office:
+      answer: Die Rechnung vom letzten Aufenthalt geht heute noch per E-Mail an Sie raus.
+      after: 15

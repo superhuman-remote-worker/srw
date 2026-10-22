@@ -1,0 +1,92 @@
+# Synthetic German caller voices for the test set (README.md, "Voices").
+#
+# qwen-design: Qwen3-TTS 12Hz 1.7B VoiceDesign (Apache-2.0) makes a voice
+#   from the description in `instruct` with torch seeded to `seed`; it says
+#   `reference_text`, and that take is the voice's reference clip. Every
+#   caller line is then spoken in that voice by Qwen3-TTS 12Hz 0.6B Base
+#   (Apache-2.0, voice clone). No real person's voice is recorded or cloned.
+#   `tempo` speeds a voice up or slows it down after synthesis (ffmpeg
+#   atempo, pitch kept), so "fast" and "slow" do not depend on the take.
+# piper: Piper de_DE-mls-medium (MIT; trained on Multilingual LibriSpeech,
+#   CC BY 4.0), the bench's own voice, kept as the hard voice: it garbles
+#   some sentences on its own (local_voice_gateway.md §9.3, §9.8).
+#
+# The seeds are the takes chosen when the set was built (README.md says
+# how); rendering on another machine or thread count can give a slightly
+# different take, so the render manifest records each clip's hash.
+
+language: German
+reference_text: >-
+  Guten Tag, ich rufe wegen meiner Reservierung an. Können Sie mir da bitte
+  kurz weiterhelfen? Das wäre sehr nett.
+
+# Corpus lines that name no voice take these in turn.
+rotation: [f-young-fast, m-middle, f-older-slow, m-young-fast, f-middle, m-older-slow]
+
+voices:
+  - id: f-young-fast
+    engine: qwen-design
+    gender: female
+    age: young
+    pace: fast
+    seed: 202
+    tempo: 1.08
+    instruct: >-
+      A young woman in her mid-twenties with a bright, clear voice. She speaks
+      German quickly and casually, like someone calling between two
+      appointments.
+  - id: f-middle
+    engine: qwen-design
+    gender: female
+    age: middle
+    pace: normal
+    seed: 101
+    instruct: >-
+      A woman in her forties with a warm, medium-pitched voice. She speaks
+      German at a normal, relaxed pace, friendly and clear.
+  - id: f-older-slow
+    engine: qwen-design
+    gender: female
+    age: older
+    pace: slow
+    seed: 303
+    tempo: 0.92
+    instruct: >-
+      An elderly woman of about seventy-five with a soft, slightly thin and
+      shaky voice. She speaks German slowly and carefully.
+  - id: m-young-fast
+    engine: qwen-design
+    gender: male
+    age: young
+    pace: fast
+    seed: 202
+    tempo: 1.1
+    instruct: >-
+      A young man in his early twenties with a light, energetic voice. He
+      speaks German fast and a little mumbled.
+  - id: m-middle
+    engine: qwen-design
+    gender: male
+    age: middle
+    pace: normal
+    seed: 101
+    instruct: >-
+      A man in his late forties with a deep, calm voice. He speaks German at a
+      measured business pace, precise and polite.
+  - id: m-older-slow
+    engine: qwen-design
+    gender: male
+    age: older
+    pace: slow
+    seed: 101
+    tempo: 0.9
+    instruct: >-
+      An old man of about eighty with a low, gravelly, slightly hoarse voice.
+      He speaks German slowly, with small pauses between phrases.
+  - id: piper-mls
+    engine: piper
+    gender: unknown
+    age: unknown
+    pace: normal
+    speaker: 10
+    hard: true

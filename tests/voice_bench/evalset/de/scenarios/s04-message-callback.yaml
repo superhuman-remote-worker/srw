@@ -1,0 +1,28 @@
+id: s04-message-callback
+title: A message with a spelled rare name and a callback number in groups
+why: >-
+  Names and numbers misheard ("Hall1234", §9.9): a message for a person, then
+  the caller's name spelled and a callback number in groups.
+categories: [messages, names, phone_numbers]
+voice: f-older-slow
+condition: g711a
+turns:
+  - say: Ich möchte eine Nachricht für Frau Muster hinterlassen, es geht um unsere Firmenfeier im Dezember.
+    expect:
+      outcome: message
+      values:
+        - {name: Muster, in: request}
+        - {keyword: firmenfeier, in: request}
+    back_office:
+      match: ["muster|nachricht|feier"]
+      answer: Die Nachricht für Frau Muster ist notiert. Unter welcher Nummer erreicht sie Sie?
+      after: 5
+  - say: Mein Name ist Oelschlägel, O, E, L, S, C, H, L, Ä, G, E, L, und meine Nummer ist null drei null, zwei drei eins zwei fünf, vier eins sieben.
+    expect:
+      outcome: message
+      values:
+        - {name: Oelschlägel, in: request}
+        - {phone: "030 23125 417", in: request}
+    back_office:
+      answer: Danke, Name und Nummer sind notiert, Frau Muster ruft Sie zurück.
+      after: 4

@@ -1,0 +1,14 @@
+id: s12-email-office
+title: An e-mail address in an office
+why: A spoken e-mail address must reach the back office exactly.
+categories: [back_office, emails]
+voice: m-middle
+condition: office
+turns:
+  - say: Schicken Sie mir die Rechnung bitte an m punkt weber at post punkt example.
+    expect:
+      outcome: delegate
+      values: [{email: m.weber@post.example, in: request}]
+    back_office:
+      answer: Die Rechnung geht heute an die Adresse m punkt weber at post punkt example.
+      after: 5

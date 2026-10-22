@@ -1,0 +1,20 @@
+id: s20-what-day
+title: Does the voice know today's date?
+why: >-
+  §9.9: the voice did not know the date, so "nächste Woche Montag" became a
+  back-office round trip (C1 puts the date into the voice's prompt). The
+  expected weekday is resolved against the day of the run.
+categories: [dates_times, facts]
+voice: f-young-fast
+condition: g711a
+turns:
+  - say: Welcher Wochentag ist eigentlich übermorgen?
+    expect:
+      outcome: answer
+      values: [{weekday: übermorgen, in: reply}]
+  - say: Und haben Sie da noch ein Einzelzimmer frei?
+    expect:
+      outcome: delegate
+    back_office:
+      answer: Übermorgen ist ein Einzelzimmer frei, 89 Euro mit Frühstück.
+      after: 5

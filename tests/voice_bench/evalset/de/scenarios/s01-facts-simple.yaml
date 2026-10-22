@@ -1,0 +1,18 @@
+id: s01-facts-simple
+title: Two questions the facts answer, then goodbye
+why: The voice answers from the facts sheet itself, quickly and without a delegation.
+categories: [facts]
+voice: f-middle
+condition: g711a
+turns:
+  - say: Ab wann kann ich am Anreisetag einchecken?
+    expect:
+      outcome: answer
+      values: [{keyword: "15|fünfzehn", in: reply}]
+  - say: Und was kostet bei Ihnen das Parken?
+    expect:
+      outcome: answer
+      values: [{keyword: "10|zehn", in: reply}, {keyword: euro, in: reply}]
+  - say: Danke, das war schon alles.
+    expect:
+      outcome: any

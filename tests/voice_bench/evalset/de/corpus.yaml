@@ -1,0 +1,597 @@
+# The German caller corpus (README.md, "Corpus"): single caller lines for
+# the file-level STT pass, scored under every condition below.
+#
+# Everything is fictional: the hotel is testset/de/facts.md's Hotel
+# Beispielhof; names are common or rare German (and German-resident)
+# surnames with no person behind them; phone numbers come only from the
+# Bundesnetzagentur's ranges for films and books ("Drama Numbers", never
+# assigned: 030 23125 xxx, 069 90009 xxx, 040 66969 xxx, 0221 4710 xxx,
+# 089 99998 xxx, 0152 28817386, 0171 39200 xx, 0172 9925904, 0174 9091317,
+# 0176 040690 xx …); e-mail domains end in .example (RFC 2606); towns are
+# made up (Beispielstadt, Musterhausen, Teststadt …).
+#
+# text:   what the caller says; numbers in words, as people say them;
+#         <pause S> is S seconds of silence mid-sentence.
+# style:  plain, hesitation (ähm, äh), pause, self_correction, spelled,
+#         grouped (numbers in groups), short.
+# values: what must survive STT exactly (values.py): name, phone, date
+#         (absolute "13.11." or a relative phrase), time, email, number,
+#         address, keyword ("a|b" for either).
+# voice:  a voice from voices.yaml; default: the rotation.
+# sweep:  also rendered in every voice (the voice comparison).
+
+conditions: [clean, g711a, g711u, g722, mobile, loss-3, loss-8, street, cafe, office, quiet, clipped]
+sweep_conditions: [clean, g711a, mobile]
+
+utterances:
+  # -- facts: the voice answers from the facts sheet ------------------------------
+  - id: fac-01
+    category: facts
+    text: Ab wie viel Uhr kann ich am Anreisetag ins Zimmer?
+    values: [{keyword: anreisetag}]
+    sweep: true
+  - id: fac-02
+    category: facts
+    text: Was kostet bei Ihnen das Parken pro Nacht?
+    values: [{keyword: parken}]
+  - id: fac-03
+    category: facts
+    text: Haben Sie eine Sauna, und wann ist die offen?
+    values: [{keyword: sauna}]
+    sweep: true
+  - id: fac-04
+    category: facts
+    text: Darf ich meinen Hund mitbringen?
+    values: [{keyword: hund}]
+  - id: fac-05
+    category: facts
+    text: Gibt es bei Ihnen WLAN für die Gäste?
+    values: [{keyword: wlan|w-lan|wifi}]
+  - id: fac-06
+    category: facts
+    text: Bis wann gibt es am Sonntag Frühstück?
+    values: [{keyword: frühstück}, {keyword: sonntag}]
+  - id: fac-07
+    category: facts
+    text: Kann man bei Ihnen Fahrräder leihen?
+    values: [{keyword: fahrräder|fahrrad}]
+  - id: fac-08
+    category: facts
+    text: Haben Sie auch barrierefreie Zimmer?
+    values: [{keyword: barrierefrei}]
+  - id: fac-09
+    category: facts
+    text: Wie weit ist es vom Bahnhof zu Ihnen?
+    values: [{keyword: bahnhof}]
+  - id: fac-10
+    category: facts
+    text: Kann ich bei Ihnen mit Karte bezahlen?
+    values: [{keyword: karte}]
+  - id: fac-11
+    category: facts
+    style: hesitation
+    text: Ähm, ich wollte fragen, ob Ihr Restaurant, äh, montags offen hat.
+    values: [{keyword: restaurant}, {keyword: montag}]
+  - id: fac-12
+    category: facts
+    text: Was kostet ein Einzelzimmer bei Ihnen?
+    values: [{keyword: einzelzimmer}]
+
+  # -- back office: the voice must hand it on ----------------------------------------
+  - id: bof-01
+    category: back_office
+    text: Haben Sie vom zwölften bis vierzehnten März noch ein Doppelzimmer frei?
+    values: [{date: "12.3."}, {date: "14.3."}, {keyword: doppelzimmer}]
+    sweep: true
+  - id: bof-02
+    category: back_office
+    text: Ich möchte meine Buchung um eine Nacht verlängern.
+    values: [{keyword: verlängern}]
+  - id: bof-03
+    category: back_office
+    text: Können Sie mir die Rechnung vom letzten Aufenthalt noch mal schicken?
+    values: [{keyword: rechnung}]
+    sweep: true
+  - id: bof-04
+    category: back_office
+    text: Ich glaube, ich habe meine Brille in Zimmer zwölf liegen lassen.
+    values: [{keyword: brille}, {number: 12}]
+  - id: bof-05
+    category: back_office
+    text: Kann ich am Sonntag ausnahmsweise erst um vierzehn Uhr auschecken?
+    values: [{time: "14:00"}, {keyword: sonntag}]
+  - id: bof-06
+    category: back_office
+    text: Ich möchte für Samstagabend einen Tisch für vier Personen reservieren.
+    values: [{number: 4}, {keyword: samstag}]
+  - id: bof-07
+    category: back_office
+    text: Ist meine Buchung für nächste Woche schon bestätigt?
+    values: [{keyword: buchung}, {keyword: bestätigt}]
+  - id: bof-08
+    category: back_office
+    text: Wir sind eine Firma und bräuchten im Mai zehn Zimmer.
+    values: [{number: 10}, {keyword: mai}]
+  - id: bof-09
+    category: back_office
+    style: pause
+    text: Ich hätte gern ein Zimmer <pause 2.2> für drei Nächte <pause 1.8> ab dem fünften Mai.
+    values: [{number: 3}, {date: "5.5."}]
+  - id: bof-10
+    category: back_office
+    style: self_correction
+    text: Ich muss meine Buchung stornieren, nein, eigentlich nur das Datum ändern.
+    values: [{keyword: datum}, {keyword: ändern}]
+
+  # -- transfer: the caller wants a person -------------------------------------------
+  - id: trf-01
+    category: transfer
+    text: Können Sie mich bitte mit der Rezeption verbinden?
+    values: [{keyword: rezeption}]
+    sweep: true
+  - id: trf-02
+    category: transfer
+    text: Ich möchte bitte mit einem Menschen sprechen.
+    values: [{keyword: menschen}]
+  - id: trf-03
+    category: transfer
+    text: Verbinden Sie mich bitte mit Frau Muster.
+    values: [{name: Muster}]
+  - id: trf-04
+    category: transfer
+    text: Ich möchte mich beschweren, und zwar bei jemandem persönlich.
+    values: [{keyword: beschwer}]
+  - id: trf-05
+    category: transfer
+    text: Ist Herr Beispiel vom Restaurant zu sprechen?
+    values: [{name: Beispiel}]
+  - id: trf-06
+    category: transfer
+    text: Geben Sie mir bitte einfach einen Mitarbeiter.
+    values: [{keyword: mitarbeiter}]
+
+  # -- messages: something to pass on ------------------------------------------------
+  - id: msg-01
+    category: messages
+    text: Richten Sie Frau Muster bitte aus, dass ich wegen der Firmenfeier zurückrufe.
+    values: [{name: Muster}, {keyword: firmenfeier}]
+    sweep: true
+  - id: msg-02
+    category: messages
+    text: Sagen Sie der Küche bitte, dass mein Mann keine Laktose verträgt.
+    values: [{keyword: laktose}, {keyword: küche}]
+  - id: msg-03
+    category: messages
+    text: Bitte sagen Sie Herrn Beispiel, er soll mich heute noch zurückrufen.
+    values: [{name: Beispiel}, {keyword: zurückrufen}]
+  - id: msg-04
+    category: messages
+    text: Wir kommen heute erst gegen dreiundzwanzig Uhr an, sagen Sie das bitte der Rezeption.
+    values: [{time: "23:00"}]
+  - id: msg-05
+    category: messages
+    text: Ich möchte eine Nachricht hinterlassen, der Termin am Freitag fällt aus.
+    values: [{keyword: freitag}, {keyword: termin}]
+  - id: msg-06
+    category: messages
+    style: hesitation
+    text: Ähm, könnten Sie, äh, ausrichten, dass Familie Ekinci später kommt?
+    values: [{name: Ekinci}]
+
+  # -- names ----------------------------------------------------------------------
+  - id: nam-01
+    category: names
+    text: Mein Name ist Müller, Thomas Müller.
+    values: [{name: Müller}]
+    sweep: true
+  - id: nam-02
+    category: names
+    text: Hier spricht Schmidt, Anja Schmidt.
+    values: [{name: Schmidt}]
+  - id: nam-03
+    category: names
+    text: Guten Tag, hier ist Frau Schneider.
+    values: [{name: Schneider}]
+  - id: nam-04
+    category: names
+    text: Die Reservierung ist auf Becker, Becker mit c k.
+    values: [{name: Becker}]
+  - id: nam-05
+    category: names
+    text: Die Buchung läuft auf Hoffmann, mit zwei f und zwei n.
+    values: [{name: Hoffmann}]
+  - id: nam-06
+    category: names
+    style: spelled
+    text: Mein Name ist Przybilla, ich buchstabiere, P, R, Z, Y, B, I, L, L, A.
+    values: [{name: Przybilla}]
+    sweep: true
+  - id: nam-07
+    category: names
+    style: spelled
+    text: Wojciechowski, W, O, J, C, I, E, C, H, O, W, S, K, I.
+    values: [{name: Wojciechowski}]
+  - id: nam-08
+    category: names
+    text: Mein Nachname ist Oelschlägel, mit O E am Anfang.
+    values: [{name: Oelschlägel}]
+  - id: nam-09
+    category: names
+    text: Ich heiße Ekinci, Deniz Ekinci.
+    values: [{name: Ekinci}]
+  - id: nam-10
+    category: names
+    text: Mein Name ist Nguyen, Minh Nguyen.
+    values: [{name: Nguyen}]
+  - id: nam-11
+    category: names
+    text: Vöhringer ist mein Name, Vöhringer mit V.
+    values: [{name: Vöhringer}]
+  - id: nam-12
+    category: names
+    style: [hesitation, pause]
+    text: Ähm, ja, also mein Name ist <pause 1.6> Kowalczyk.
+    values: [{name: Kowalczyk}]
+  - id: nam-13
+    category: names
+    style: spelled
+    text: Leuschner, L wie Leipzig, E wie Essen, U wie Unna, S wie Salzwedel, C wie Chemnitz, H wie Hamburg, N wie Nürnberg, E wie Essen, R wie Rostock.
+    values: [{name: Leuschner}]
+  - id: nam-14
+    category: names
+    text: Es geht um eine Reservierung auf den Namen Hall, Peter Hall.
+    values: [{name: Hall}]
+    sweep: true
+  - id: nam-15
+    category: names
+    text: Mein Name ist Quandt-Reiter, mit Bindestrich.
+    values: [{name: Quandt-Reiter}]
+  - id: nam-16
+    category: names
+    style: self_correction
+    text: Mein Name ist Maier, nein, Meyer, mit e y.
+    values: [{name: Meyer}]
+  - id: nam-17
+    category: names
+    text: Hier ist Svenja Tschirner aus Beispielstadt.
+    values: [{name: Tschirner}]
+  - id: nam-18
+    category: names
+    text: Ich rufe für die Familie Brzezinski an.
+    values: [{name: Brzezinski}]
+
+  # -- phone numbers (Drama Numbers only) --------------------------------------------
+  - id: pho-01
+    category: phone_numbers
+    style: grouped
+    text: Meine Nummer ist null drei null, zwei drei eins zwei fünf, vier eins sieben.
+    values: [{phone: "030 23125 417"}]
+    sweep: true
+  - id: pho-02
+    category: phone_numbers
+    style: grouped
+    text: Sie erreichen mich unter null neunundsechzig, neunzig null null neun, eins dreiundzwanzig.
+    values: [{phone: "069 90009 123"}]
+  - id: pho-03
+    category: phone_numbers
+    style: grouped
+    text: Meine Handynummer ist null eins fünf zwei, zwei acht acht, eins sieben, drei acht sechs.
+    values: [{phone: "0152 28817386"}]
+    sweep: true
+  - id: pho-04
+    category: phone_numbers
+    style: grouped
+    text: Plus vier neun, vier null, sechs sechs neun sechs neun, drei null null.
+    values: [{phone: "+49 40 66969 300"}]
+  - id: pho-05
+    category: phone_numbers
+    text: Null zwei zwei eins, vier sieben eins null, fünf fünf fünf.
+    values: [{phone: "0221 4710 555"}]
+  - id: pho-06
+    category: phone_numbers
+    text: Die Nummer ist null acht neun, neun neun neun neun acht, null zwo vier.
+    values: [{phone: "089 99998 024"}]
+  - id: pho-07
+    category: phone_numbers
+    style: self_correction
+    text: Die Nummer ist null eins sieben eins, drei neun zwei null null, vier sieben, nein, vier acht.
+    values: [{phone: "0171 3920048"}]
+    sweep: true
+  - id: pho-08
+    category: phone_numbers
+    style: [hesitation, pause]
+    text: Ähm, meine Nummer, Moment, <pause 2.0> null eins sieben vier, neun null neun, eins drei eins sieben.
+    values: [{phone: "0174 9091317"}]
+  - id: pho-09
+    category: phone_numbers
+    style: grouped
+    text: Rufen Sie mich bitte unter null eins sieben zwei, neunundneunzig, fünfundzwanzig, neun null vier zurück.
+    values: [{phone: "0172 9925904"}]
+  - id: pho-10
+    category: phone_numbers
+    style: grouped
+    text: Das ist die Zentrale, null drei null, zwei drei eins zwei fünf, und dann die Durchwahl sechs null null.
+    values: [{phone: "030 23125 600"}]
+  - id: pho-11
+    category: phone_numbers
+    text: Null eins sieben sechs, null vier null sechs neun null, zwei sieben.
+    values: [{phone: "0176 04069027"}]
+  - id: pho-12
+    category: phone_numbers
+    style: grouped
+    text: Null sechs neun, neun null null null neun, achthundertzwölf.
+    values: [{phone: "069 90009 812"}]
+
+  # -- dates and times -------------------------------------------------------------
+  - id: dat-01
+    category: dates_times
+    text: Wir kommen am zwölften März an.
+    values: [{date: "12.3."}]
+  - id: dat-02
+    category: dates_times
+    text: Vom dritten bis zum fünften Dezember, bitte.
+    values: [{date: "5.12."}]
+  - id: dat-03
+    category: dates_times
+    text: Am vierundzwanzigsten Dezember hätten wir gern einen Tisch.
+    values: [{date: "24.12."}]
+  - id: dat-04
+    category: dates_times
+    text: Haben Sie nächste Woche Montag noch etwas frei?
+    values: [{date: nächste Woche Montag}]
+    sweep: true
+  - id: dat-05
+    category: dates_times
+    text: Wir würden übermorgen anreisen.
+    values: [{date: übermorgen}]
+    sweep: true
+  - id: dat-06
+    category: dates_times
+    text: Geht es auch morgen Abend um halb acht?
+    values: [{time: "19:30"}, {keyword: morgen}]
+  - id: dat-07
+    category: dates_times
+    text: In zwei Wochen am Dienstag, ginge das?
+    values: [{date: in zwei Wochen am Dienstag}]
+  - id: dat-08
+    category: dates_times
+    text: Wir kommen so gegen Viertel nach drei.
+    values: [{time: "15:15"}]
+  - id: dat-09
+    category: dates_times
+    text: Um vierzehn Uhr dreißig wäre gut.
+    values: [{time: "14:30"}]
+    sweep: true
+  - id: dat-10
+    category: dates_times
+    style: pause
+    text: Wir bräuchten das Zimmer von Montag <pause 2.0> bis Mittwoch.
+    values: [{keyword: montag}, {keyword: mittwoch}]
+  - id: dat-11
+    category: dates_times
+    style: self_correction
+    text: Am elften, nein, am zwölften November.
+    values: [{date: "12.11."}]
+  - id: dat-12
+    category: dates_times
+    text: Kommenden Freitag um sieben Uhr abends.
+    values: [{date: kommenden Freitag}, {time: "19:00"}]
+  - id: dat-13
+    category: dates_times
+    text: Unser Hochzeitstag ist am achten August.
+    values: [{date: "8.8."}]
+  - id: dat-14
+    category: dates_times
+    text: Wir reisen am Samstag, den ersten November, ab.
+    values: [{date: "1.11."}]
+  - id: dat-15
+    category: dates_times
+    text: Ginge auch der einunddreißigste Januar?
+    values: [{date: "31.1."}]
+  - id: dat-16
+    category: dates_times
+    style: [hesitation, pause]
+    text: Ähm, ich glaube, das war am <pause 1.8> zweiundzwanzigsten September.
+    values: [{date: "22.9."}]
+  - id: dat-17
+    category: dates_times
+    text: Unser Flug landet um sechs Uhr fünfundvierzig.
+    values: [{time: "6:45"}]
+  - id: dat-18
+    category: dates_times
+    text: Ginge das Frühstück schon um Viertel vor sieben?
+    values: [{time: "6:45"}]
+
+  # -- addresses (made-up towns) ----------------------------------------------------
+  - id: adr-01
+    category: addresses
+    text: Schicken Sie es bitte an Lindenallee dreiundzwanzig, neun neun neun neun neun Beispielstadt.
+    values: [{address: "Lindenallee 23, 99999 Beispielstadt"}]
+    sweep: true
+  - id: adr-02
+    category: addresses
+    text: Meine Adresse ist Musterweg zwölf a, null eins zwei drei vier Musterhausen.
+    values: [{address: "Musterweg 12, 01234 Musterhausen"}]
+  - id: adr-03
+    category: addresses
+    text: Am Mühlbach sieben, zwei zwei zwei zwei zwei Teststadt.
+    values: [{address: "Am Mühlbach 7, 22222 Teststadt"}]
+  - id: adr-04
+    category: addresses
+    text: Die Firma sitzt in der Hauptstraße hundertzwölf in Beispieldorf, Postleitzahl neun acht sieben sechs fünf.
+    values: [{address: "Hauptstraße 112, 98765 Beispieldorf"}]
+  - id: adr-05
+    category: addresses
+    style: hesitation
+    text: Ähm, Gartenstraße, äh, vierzig, in neun neun null null eins Beispielstadt.
+    values: [{address: "Gartenstraße 40, 99001 Beispielstadt"}]
+  - id: adr-06
+    category: addresses
+    text: Rosenweg drei, das ist in Musterbach, Postleitzahl drei drei drei drei drei.
+    values: [{address: "Rosenweg 3, 33333 Musterbach"}]
+
+  # -- e-mail addresses (.example) -----------------------------------------------------
+  - id: eml-01
+    category: emails
+    text: Meine E-Mail-Adresse ist jana punkt probe at beispiel punkt example.
+    values: [{email: jana.probe@beispiel.example}]
+    sweep: true
+  - id: eml-02
+    category: emails
+    text: Schreiben Sie bitte an info at musterfirma minus bau punkt example.
+    values: [{email: info@musterfirma-bau.example}]
+  - id: eml-03
+    category: emails
+    text: Das ist m punkt weber at post punkt example, Weber mit W.
+    values: [{email: m.weber@post.example}]
+  - id: eml-04
+    category: emails
+    style: spelled
+    text: Die Adresse ist K, O, W, A, at test punkt example.
+    values: [{email: kowa@test.example}]
+  - id: eml-05
+    category: emails
+    text: Das ist reisen unterstrich zwanzig sechsundzwanzig at beispiel punkt example.
+    values: [{email: reisen_2026@beispiel.example}]
+  - id: eml-06
+    category: emails
+    text: Thomas punkt Müller at beispiel minus hotel punkt example, Müller mit u e.
+    values: [{email: thomas.mueller@beispiel-hotel.example}]
+
+  # -- room and person counts --------------------------------------------------------
+  - id: cnt-01
+    category: counts
+    text: Wir sind zwei Erwachsene und drei Kinder.
+    values: [{number: 2}, {number: 3}]
+    sweep: true
+  - id: cnt-02
+    category: counts
+    text: Einen Tisch für sechs Personen, bitte.
+    values: [{number: 6}]
+  - id: cnt-03
+    category: counts
+    text: Wir bräuchten drei Doppelzimmer und ein Einzelzimmer.
+    values: [{number: 3}, {keyword: doppelzimmer}]
+  - id: cnt-04
+    category: counts
+    text: Zwölf Zimmer für zwei Nächte.
+    values: [{number: 12}, {number: 2}]
+  - id: cnt-05
+    category: counts
+    text: Wir sind zu fünft.
+    values: [{number: 5}]
+    sweep: true
+  - id: cnt-06
+    category: counts
+    style: [hesitation, pause]
+    text: Wir sind, ähm, <pause 1.5> sieben Leute, glaube ich.
+    values: [{number: 7}]
+  - id: cnt-07
+    category: counts
+    style: self_correction
+    text: Für vier, nein, für fünf Nächte.
+    values: [{number: 5}]
+  - id: cnt-08
+    category: counts
+    text: Achtzehn Gäste kommen zur Feier.
+    values: [{number: 18}]
+
+  # -- very short answers (to a question the voice asked) -----------------------------
+  - id: sho-01
+    category: short_answers
+    style: short
+    text: Ja.
+    values: [{keyword: ja}]
+    sweep: true
+  - id: sho-02
+    category: short_answers
+    style: short
+    text: Nein.
+    values: [{keyword: nein}]
+  - id: sho-03
+    category: short_answers
+    style: short
+    text: Genau.
+    values: [{keyword: genau}]
+  - id: sho-04
+    category: short_answers
+    style: short
+    text: Ja, genau.
+    values: [{keyword: genau}]
+  - id: sho-05
+    category: short_answers
+    style: short
+    text: Nein, danke.
+    values: [{keyword: nein}]
+  - id: sho-06
+    category: short_answers
+    style: short
+    text: Richtig.
+    values: [{keyword: richtig}]
+  - id: sho-07
+    category: short_answers
+    style: short
+    text: Stimmt.
+    values: [{keyword: stimmt}]
+  - id: sho-08
+    category: short_answers
+    style: short
+    text: Okay.
+    values: [{keyword: okay|ok}]
+  - id: sho-09
+    category: short_answers
+    style: short
+    text: Ja, bitte.
+    values: [{keyword: bitte}]
+  - id: sho-10
+    category: short_answers
+    style: short
+    text: Nein, das war's.
+    values: [{keyword: nein}]
+
+  # -- backchannels (said while the voice talks) ---------------------------------------
+  - id: bch-01
+    category: backchannels
+    style: short
+    text: Mhm.
+  - id: bch-02
+    category: backchannels
+    style: short
+    text: Aha.
+  - id: bch-03
+    category: backchannels
+    style: short
+    text: Ja, ja.
+  - id: bch-04
+    category: backchannels
+    style: short
+    text: Ach so.
+
+  # -- barge-in (said over the voice on purpose) -----------------------------------------
+  - id: brg-01
+    category: barge_in
+    text: Moment, Entschuldigung, ich meinte Dienstag.
+    values: [{keyword: dienstag}]
+  - id: brg-02
+    category: barge_in
+    text: Stopp, das wollte ich gar nicht wissen.
+    values: [{keyword: stopp|stop}]
+  - id: brg-03
+    category: barge_in
+    text: Warten Sie, ich habe eine andere Frage.
+    values: [{keyword: frage}]
+  - id: brg-04
+    category: barge_in
+    text: Nein, nein, das ist falsch.
+    values: [{keyword: falsch}]
+
+  # -- silence: only the line (and the background of noisy conditions) ------------------
+  - id: sil-02
+    category: silence
+    silence: 2.0
+  - id: sil-05
+    category: silence
+    silence: 5.0
+  - id: sil-08
+    category: silence
+    silence: 8.0
