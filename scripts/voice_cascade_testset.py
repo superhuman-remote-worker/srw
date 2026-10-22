@@ -12,7 +12,9 @@ from __future__ import annotations
 import ast
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -61,6 +63,39 @@ def live_voice_rules() -> str:
     raise RuntimeError("LIVE_VOICE_RULES not found in instructions.py")
 
 
+#: What ``call_time_section`` needs from ``instructions.py``.
+_CALL_TIME_NAMES = {
+    "CALENDAR_DAYS",
+    "_WEEKDAYS",
+    "_MONTHS",
+    "_day",
+    "call_time_section",
+}
+
+
+def call_time_section(now: datetime | None = None) -> str:
+    """``call_time_section`` from the orchestrator's source (no import, as
+    above) for the call's start in Europe/Berlin, the chart's default."""
+    tree = ast.parse(INSTRUCTIONS_PY.read_text(encoding="utf-8"))
+    body = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name in _CALL_TIME_NAMES)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id in _CALL_TIME_NAMES
+                for t in node.targets
+            )
+        )
+    ]
+    namespace: dict = {"datetime": datetime, "timedelta": timedelta}
+    module = ast.Module(body=body, type_ignores=[])
+    exec(compile(module, str(INSTRUCTIONS_PY), "exec"), namespace)  # noqa: S102
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("Europe/Berlin"))
+    return namespace["call_time_section"](local)
+
+
 def facts() -> str:
     text = (TESTSET_DIR / "facts.md").read_text(encoding="utf-8")
     # Drop the "fictional" note for the voice; it stays in the file.
@@ -68,8 +103,10 @@ def facts() -> str:
 
 
 def instructions() -> str:
-    """As ``live/instructions.py::session_instructions`` builds them."""
-    return f"{PERSONA}\n\n## Facts\n{facts()}\n\n{live_voice_rules()}"
+    """As ``live/instructions.py::session_instructions`` builds them, with
+    the date section the handoff appends (``with_call_time``)."""
+    session = f"{PERSONA}\n\n## Facts\n{facts()}\n\n{live_voice_rules()}"
+    return f"{session}\n\n{call_time_section()}"
 
 
 def greeting_instruction(greeting: str = GREETING) -> str:

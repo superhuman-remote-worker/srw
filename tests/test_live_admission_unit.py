@@ -10,9 +10,11 @@ The SQL is proven in ``test_live_sessions_postgres.py``.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -195,6 +197,22 @@ class TestCallTime:
         text = with_call_time("")
         today = datetime.now(timezone.utc)
         assert f"{today.day} " in text and str(today.year) in text
+
+    def test_the_voice_test_harness_appends_the_same_section(self, monkeypatch):
+        # scripts/voice_cascade_testset.py reads it from this module's source
+        # (the voice venv cannot import the orchestrator).
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        path = Path(__file__).resolve().parents[1] / "scripts"
+        spec = importlib.util.spec_from_file_location(
+            "voice_cascade_testset_under_test", path / "voice_cascade_testset.py"
+        )
+        testset = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(testset)
+        assert testset.call_time_section(CALL_START) == call_time_section(
+            CALL_START.astimezone(live_timezone())
+        )
+        last = testset.instructions().rsplit("\n\n## Date and time\n", 1)[1]
+        assert last.startswith("The call started on ")
 
 
 class TestGreeting:
