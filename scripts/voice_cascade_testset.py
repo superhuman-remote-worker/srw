@@ -66,6 +66,7 @@ def live_voice_rules() -> str:
 #: What ``call_time_section`` needs from ``instructions.py``.
 _CALL_TIME_NAMES = {
     "CALENDAR_DAYS",
+    "_NAMED_DAYS",
     "_WEEKDAYS",
     "_MONTHS",
     "_day",

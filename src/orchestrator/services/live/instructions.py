@@ -65,6 +65,8 @@ TIMEZONE_ENV = "LIVE_TIMEZONE"
 DEFAULT_TIMEZONE = "Europe/Berlin"
 #: Days after the call's own that the date section lists by name.
 CALENDAR_DAYS = 14
+#: Days after the call's own that the list names.
+_NAMED_DAYS = {1: "tomorrow", 2: "the day after tomorrow"}
 #: What the instruction budget keeps free for the date section.
 CALL_TIME_CHARS = 640
 _WEEKDAYS = (
@@ -181,9 +183,15 @@ def _day(value: datetime) -> str:
 def call_time_section(now: datetime) -> str:
     """When the call started (``now``, in the line's time zone) and the next
     two weeks' dates by weekday: a small voice model resolves "next Monday"
-    from a list reliably, and from the date alone often a day off."""
+    from a list reliably, and from the date alone often a day off. Tomorrow
+    and the day after are named: counting in the list, Gemma 4 took
+    "übermorgen" for tomorrow (voice test set, 2026-10-22)."""
     zone = getattr(now.tzinfo, "key", None) or now.tzname() or "UTC"
-    days = "; ".join(_day(now + timedelta(days=n)) for n in range(1, CALENDAR_DAYS + 1))
+    days = "; ".join(
+        _day(now + timedelta(days=n))
+        + (f" ({_NAMED_DAYS[n]})" if n in _NAMED_DAYS else "")
+        for n in range(1, CALENDAR_DAYS + 1)
+    )
     return (
         "## Date and time\n"
         f"The call started on {_WEEKDAYS[now.weekday()]}, {now.day} "

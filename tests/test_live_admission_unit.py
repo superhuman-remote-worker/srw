@@ -152,7 +152,8 @@ class TestCallTime:
             "RULES\n\n## Date and time\n"
             "The call started on Thursday, 22 October 2026, at 14:15 "
             "(time zone Europe/Berlin).\n"
-            "The next two weeks: Friday 23 October; Saturday 24 October; "
+            "The next two weeks: Friday 23 October (tomorrow); "
+            "Saturday 24 October (the day after tomorrow); "
             "Sunday 25 October; Monday 26 October; Tuesday 27 October; "
             "Wednesday 28 October; Thursday 29 October; Friday 30 October; "
             "Saturday 31 October; Sunday 1 November; Monday 2 November; "
@@ -174,7 +175,7 @@ class TestCallTime:
         late = datetime(2026, 12, 31, 23, 30, tzinfo=timezone.utc)
         text = with_call_time("", late)
         assert "on Friday, 1 January 2027, at 00:30 (time zone Europe/Berlin)" in text
-        assert "The next two weeks: Saturday 2 January;" in text
+        assert "The next two weeks: Saturday 2 January (tomorrow);" in text
 
     def test_an_unknown_time_zone_falls_back_to_berlin_with_a_warning(
         self, monkeypatch, caplog
