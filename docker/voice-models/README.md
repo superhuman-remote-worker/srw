@@ -134,7 +134,14 @@ for `cascade-gpu`, 14.6 GB for `cascade-gpu-rocm`.
 | Judge, Qwen3-ASR 0.6B Q8_0 (benchmarks only) | 1.4 GB |
 
 So a 16 GB card holds the cascade for one call at a time; a desktop on the
-same card leaves no room for the judge. More calls need more LLM context
+same card leaves no room for the judge.
+
+A full card stays slow after the pressure is gone: the driver moves buffers
+to system memory and leaves them there. On 2026-10-22 the LLM decoded at
+22 instead of ~60 tokens/s for hours (after the host ran out of memory), so
+every turn took about 0.7 s longer. One chat request shows it
+(`timings.predicted_per_second` in llama.cpp's answer); restart the LLM
+server's container when it is far below that. More calls need more LLM context
 (`VOICE_LLM_SLOTS`, `VOICE_LLM_CONTEXT`) and TTS slots (`VOICE_TTS_SLOTS`),
 i.e. the bigger cards of design note §2.3.
 
