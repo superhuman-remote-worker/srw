@@ -494,6 +494,15 @@ class BackOffice:
     #: Keywords (``a|b`` for either) the caller's words since the last
     #: delegation must hold for this answer; empty matches any request.
     match: tuple[str, ...] = ()
+    #: A line to say meanwhile, ``status_after`` seconds in (the back
+    #: office's ``Say exactly`` before a slow lookup).
+    status: str = ""
+    status_after: float = 2.0
+    #: SRW's live driver after ``answer_timeout_s`` without an answer: this
+    #: text as the delegation's result, ``follow_up_after`` seconds in; the
+    #: answer comes later.
+    follow_up: str = ""
+    follow_up_after: float = 25.0
 
     def as_driver_entry(self) -> dict:
         """The entry ``srw_driver.py``'s canned back office takes."""
@@ -504,6 +513,12 @@ class BackOffice:
         }
         if self.transfer:
             entry["transfer"] = True
+        if self.status:
+            entry["status"] = self.status
+            entry["status_delay"] = self.status_after
+        if self.follow_up:
+            entry["follow_up"] = self.follow_up
+            entry["follow_up_delay"] = self.follow_up_after
         return entry
 
 
@@ -577,21 +592,47 @@ def _parse_back_office(raw, label: str) -> BackOffice | None:
         return None
     if not isinstance(raw, dict) or not str(raw.get("answer") or "").strip():
         raise SpecError(f"{label} needs an answer")
-    unknown = set(raw) - {"answer", "after", "transfer", "match"}
+    unknown = set(raw) - {
+        "answer",
+        "after",
+        "transfer",
+        "match",
+        "status",
+        "status_after",
+        "follow_up",
+        "follow_up_after",
+    }
     if unknown:
         raise SpecError(f"{label}: unknown keys {sorted(unknown)}")
-    after = raw.get("after", 4.0)
-    if not isinstance(after, int | float) or not 0 <= after <= 60:
-        raise SpecError(f"{label}.after must be 0-60 seconds")
+    after = _seconds(raw, "after", 4.0, label)
     match = raw.get("match") or []
     if not isinstance(match, list):
         raise SpecError(f"{label}.match must be a list")
+    status_after = _seconds(raw, "status_after", 2.0, label)
+    follow_up_after = _seconds(raw, "follow_up_after", 25.0, label)
+    for key, at in (
+        ("status_after", status_after),
+        ("follow_up_after", follow_up_after),
+    ):
+        if key in raw and at >= after:
+            raise SpecError(f"{label}.{key} must come before the answer")
     return BackOffice(
         answer=str(raw["answer"]).strip(),
-        after=float(after),
+        after=after,
         transfer=bool(raw.get("transfer", False)),
         match=tuple(str(m).lower() for m in match),
+        status=str(raw.get("status") or "").strip(),
+        status_after=status_after,
+        follow_up=str(raw.get("follow_up") or "").strip(),
+        follow_up_after=follow_up_after,
     )
+
+
+def _seconds(raw: dict, key: str, default: float, label: str) -> float:
+    value = raw.get(key, default)
+    if not isinstance(value, int | float) or not 0 <= value <= 60:
+        raise SpecError(f"{label}.{key} must be 0-60 seconds")
+    return float(value)
 
 
 def parse_scenario(

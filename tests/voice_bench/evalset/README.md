@@ -256,7 +256,7 @@ same audio.
 
 ## Scenarios
 
-`de/scenarios/*.yaml`, one call each (21 calls, 37 caller turns). Format:
+`de/scenarios/*.yaml`, one call each (22 calls, 39 caller turns). Format:
 
 ```yaml
 id: s03-thinking-pauses            # = file name
@@ -282,6 +282,10 @@ turns:
       answer: Von Montag bis Mittwoch sind zwei Doppelzimmer frei …
       after: 6                     # seconds until the back office answers
       transfer: false              # then ask for the transfer to extension 3000
+      status: Ich schaue nach.     # optional: a line to say meanwhile ("Say exactly"),
+      status_after: 2              #   this many seconds in
+      follow_up: Tell the person … # optional: SRW's notice after answer_timeout_s, as the
+      follow_up_after: 25          #   delegation's result; the answer comes later
 ```
 
 | scenario | guards |
@@ -307,6 +311,7 @@ turns:
 | s19 number in pairs | a fast mobile caller's callback number in a message |
 | s20 what day | does the voice know today's date (C1 puts it into the prompt)? |
 | s21 answer during a hold sentence | the answer follows the hold sentence by itself, without the caller speaking (owner's call 2026-10-23) |
+| s22 slow lookup, late answer | the back office's line takes a hold sentence's place; the answer that comes in while the caller speaks is said once (owner's call 2026-10-23) |
 
 ## Real recordings
 

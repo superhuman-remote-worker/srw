@@ -214,6 +214,32 @@ class TestParsing:
         }
         assert s.default_answer == spec.DEFAULT_ANSWER
 
+    def test_a_slow_back_office_says_a_line_and_follows_up(self):
+        s = spec.parse_scenario(
+            self._scenario(
+                back_office={
+                    "answer": "Ja.",
+                    "after": 36,
+                    "status": "Ich schaue nach.",
+                    "status_after": 5,
+                    "follow_up": "Tell the person it takes longer.",
+                    "follow_up_after": 20,
+                },
+            )
+        )
+        assert s.back_office()[0].as_driver_entry() == {
+            "keywords": [],
+            "answer": "Ja.",
+            "delay": 36.0,
+            "status": "Ich schaue nach.",
+            "status_delay": 5.0,
+            "follow_up": "Tell the person it takes longer.",
+            "follow_up_delay": 20.0,
+        }
+        late = {"answer": "Ja.", "after": 4, "follow_up": "x", "follow_up_after": 4}
+        with pytest.raises(SpecError, match="before the answer"):
+            spec.parse_scenario(self._scenario(back_office=late))
+
     def test_scenario_errors(self):
         with pytest.raises(SpecError, match="barge_in"):
             spec.parse_scenario(self._scenario(expect={"barge_in": True}))

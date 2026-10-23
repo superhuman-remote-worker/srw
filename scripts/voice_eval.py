@@ -450,8 +450,29 @@ def make_harness(settings, scenario, background):
             if index >= 0:
                 self.used.add(index)
             record["answer_index"] = index
-            await asyncio.sleep(float(entry.get("delay", 4.0)))
-            self.log(f"back office answers ({entry.get('delay', 4.0)} s later)")
+            delay = float(entry.get("delay", 4.0))
+            waited = 0.0
+            steps = []
+            if entry.get("status"):
+                line = f'Say exactly: "{entry["status"]}"'
+                steps.append((entry["status_delay"], "instructions", line, None))
+            if entry.get("follow_up"):
+                steps.append(
+                    (
+                        entry["follow_up_delay"],
+                        "commentary",
+                        entry["follow_up"],
+                        record["id"],
+                    )
+                )
+            for at, kind, content, delegation_id in sorted(steps, key=lambda s: s[0]):
+                await asyncio.sleep(at - waited)
+                waited = at
+                self.log(f"back office {kind} ({at} s later)")
+                record[f"{kind}_at_ms"] = self.port.clock_ms
+                await self.command(kind, content, delegation_id)
+            await asyncio.sleep(delay - waited)
+            self.log(f"back office answers ({delay} s later)")
             record["answered_at_ms"] = self.port.clock_ms
             self.awaiting_voice_after = self.port.clock_ms
             self.answers_due -= 1

@@ -14,9 +14,12 @@ matched against what the caller said since the last delegation; the first
 entry whose keywords all appear answers with its ``answer`` as
 ``commentary`` after ``answer_delay`` seconds, and an entry with
 ``transfer: true`` then asks for the transfer to ``transfer_target``.
-With ``status`` it first sends that line as an ``instructions`` append to
-say word for word, ``status_delay`` seconds after the delegation (a back
-office that says what it is doing before a slow lookup).
+With ``status`` (config-wide or per entry) it first sends that line as an
+``instructions`` append to say word for word, ``status_delay`` seconds after
+the delegation (a back office that says what it is doing before a slow
+lookup). An entry's ``follow_up`` goes out as the delegation's
+``commentary`` ``follow_up_delay`` seconds in, before the answer (SRW's
+live driver after ``answer_timeout_s``).
 ``instructions`` and ``greeting`` replace the bench's accept instructions
 and greeting append. Only event kinds and the matched entry are logged,
 never what was said, unless ``log_transcripts`` asks for the transcripts
@@ -147,10 +150,11 @@ class Driver:
             return
         index, entry = found
         answer_delay = float(entry.get("delay", self.config.get("answer_delay", 4.0)))
-        status = self.config.get("status")
+        status = entry.get("status", self.config.get("status"))
         waited = 0.0
         if status:
-            waited = min(float(self.config.get("status_delay", 2.0)), answer_delay)
+            delay = entry.get("status_delay", self.config.get("status_delay", 2.0))
+            waited = min(float(delay), answer_delay)
             await asyncio.sleep(waited)
             await ws.send_json(
                 {
@@ -160,6 +164,19 @@ class Driver:
                 }
             )
             self.log("status", session_id=sid)
+        if entry.get("follow_up"):
+            at = max(float(entry["follow_up_delay"]), waited)
+            await asyncio.sleep(at - waited)
+            waited = at
+            await ws.send_json(
+                {
+                    "type": "session.commentary.append",
+                    "event_id": "evt_" + uuid.uuid4().hex,
+                    "delegation_id": delegation_id,
+                    "content": entry["follow_up"],
+                }
+            )
+            self.log("follow_up", session_id=sid)
         await asyncio.sleep(answer_delay - waited)
         await ws.send_json(
             {
