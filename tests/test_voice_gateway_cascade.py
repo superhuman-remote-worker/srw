@@ -763,7 +763,7 @@ def test_the_holding_sentence_and_its_call_are_one_message():
         {"role": "user", "content": "Montag bis"},
         {"role": "assistant", "content": FILLER},
         {"role": "assistant", "tool_calls": [call]},
-        {"role": "tool", "tool_call_id": "c1", "content": "running"},
+        async_tool_messages.build_started_message("c1"),
         {"role": "user", "content": "Mittwoch."},
     ]
     out = note_messages(messages, "system")
@@ -788,9 +788,13 @@ def test_after_the_answer_the_holding_sentence_stays_before_its_call():
         {"role": "tool", "tool_call_id": "c1", "content": '"Freitag frei."'},
     ]
     assert note_messages(messages, "system") == messages
-    # A call with more conversation after it is still one message.
-    later = [*messages, {"role": "user", "content": "Und Samstag?"}]
-    assert note_messages(later, "system")[2]["tool_calls"] == [call]
+    # And so they stay for the rest of the call: the cached prefix holds.
+    later = [
+        *messages,
+        {"role": "assistant", "content": "Ja, am Freitag ist eins frei."},
+        {"role": "user", "content": "Und Samstag?"},
+    ]
+    assert note_messages(later, "system") == later
 
 
 def test_a_running_call_says_an_addition_is_a_new_call():
