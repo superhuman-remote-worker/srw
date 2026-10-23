@@ -10,7 +10,7 @@ turns:
       outcome: transfer
       values:
         - {name: Beispiel, in: request}
-        - {keyword: verbind, in: reply}
+        - {keyword: "verbind|verbunden", in: reply}
     back_office:
       answer: Herr Beispiel ist da, ich verbinde Sie jetzt mit ihm.
       after: 4
