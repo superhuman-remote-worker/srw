@@ -703,6 +703,22 @@ async def test_a_hangup_while_the_pipeline_starts_ends_promptly(fakes):
 # =============================================================================
 
 
+def quiet_before(call, said: list[str], n: int) -> int:
+    """Milliseconds of quiet before the voice's ``n``-th sentence (the fake
+    TTS makes ``ms_per_char`` of audio per character). The engine's line is
+    free up to the playout lead before the audio ends: a quiet of ``x``
+    seconds can measure 250 ms short."""
+    starts = call.port.voice_starts
+    return starts[n] - starts[n - 1] - len(said[n - 1]) * call.fakes.ms_per_char
+
+
+def filler_to_hold(call) -> int:
+    """Milliseconds of quiet between the filler and the hold sentence after
+    it, the voice's last two starts."""
+    starts = call.port.voice_starts
+    return starts[-1] - starts[-2] - len(FILLER) * call.fakes.ms_per_char
+
+
 def delegation_ids(call) -> list[str]:
     return [
         e["delegation"]["id"]
@@ -901,7 +917,7 @@ async def test_the_voice_does_not_speak_into_the_caller(call, fakes):
 
 @pytest.mark.asyncio
 async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
-    call = Call(fakes, fakes.base, hold_after_secs=0.6, hold_max=2)
+    call = Call(fakes, fakes.base, hold_after_secs=0.6, hold_max=2, hold_later_secs=1.5)
     await call.accept()
     try:
         fakes.stt_texts = ["Ist am Freitag ein Doppelzimmer frei?"]
@@ -909,7 +925,7 @@ async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
         call.port.say(tone(1.0))
         await call.until(lambda: len(delegation_ids(call)) == 1)
         await call.until(lambda: len(call.transcripts("assistant")) >= 4, timeout=15)
-        await asyncio.sleep(2.5)  # nothing after the "longer" sentence
+        await asyncio.sleep(3.0)  # nothing after the "longer" sentence
         await call.quiet()
         said = [t.strip() for t in call.transcripts("assistant")]
         assert said[0] == FILLER
@@ -917,9 +933,12 @@ async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
         assert all(h in HOLD_PHRASES["de"] for h in holds)
         assert holds[0] != holds[1]
         assert said[3:] == [HOLD_LONGER["de"]]
-        # Never into each other: a pause of at least hold_after_secs each.
+        # Never into each other: a pause of at least hold_after_secs each,
+        # and after the call's hold_max of them, hold_later_secs.
         starts = call.port.voice_starts
         assert len(starts) == 4
+        quiet = [quiet_before(call, said, n) for n in (1, 2, 3)]
+        assert all(350 <= q < 1250 for q in quiet[:2]) and quiet[2] >= 1250, quiet
         # The answer ends the wait; the next wait starts afresh.
         fakes.llm_replies = ["Ja, am Freitag ist ein Doppelzimmer frei."]
         await call.append("commentary", "Freitag frei.", delegation_ids(call)[0])
@@ -927,6 +946,51 @@ async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
         await asyncio.sleep(1.5)
         assert len(call.transcripts("assistant")) == 5
         assert call.engine._holds == 0 and not call.engine._longer_said
+        assert call.engine._call_holds == 3
+    finally:
+        await call.close()
+
+
+@pytest.mark.asyncio
+async def test_after_the_calls_first_hold_sentences_later_ones_wait_longer(fakes):
+    # Owner 2026-10-23: the hold sentences came after every lookup, like a
+    # loop. Once a call has had hold_max of them, the next waits longer.
+    call = Call(
+        fakes,
+        fakes.base,
+        hold_after_secs=0.5,
+        hold_max=1,
+        hold_later_secs=2.5,
+        hold_longer="",
+    )
+    await call.accept()
+    try:
+        fakes.stt_texts = ["Ist am Freitag ein Doppelzimmer frei?"]
+        fakes.llm_replies = [("delegate", "Doppelzimmer Freitag")]
+        call.port.say(tone(1.0))
+        await call.until(lambda: len(delegation_ids(call)) == 1)
+        await call.until(lambda: len(call.transcripts("assistant")) == 2)
+        await call.until(lambda: len(call.port.voice_starts) == 2)
+        first = filler_to_hold(call)
+        fakes.llm_replies = ["Ja, am Freitag ist eins frei."]
+        await call.append("commentary", "Freitag frei.", delegation_ids(call)[0])
+        await call.until(lambda: len(call.transcripts("assistant")) == 3)
+        await call.quiet()
+
+        fakes.stt_texts = ["Und am Samstag?"]
+        fakes.llm_replies = [("delegate", "Doppelzimmer Samstag")]
+        call.port.say(tone(1.0))
+        await call.until(lambda: len(delegation_ids(call)) == 2)
+        await call.until(lambda: len(call.transcripts("assistant")) == 4)
+        await asyncio.sleep(1.5)
+        assert len(call.transcripts("assistant")) == 4  # filler only, so far
+        await call.until(lambda: len(call.transcripts("assistant")) == 5, timeout=6)
+        await call.quiet()
+        said = [t.strip() for t in call.transcripts("assistant")]
+        assert said[1] in HOLD_PHRASES["de"] and said[4] in HOLD_PHRASES["de"]
+        assert said[3] == FILLER
+        later = filler_to_hold(call)
+        assert 250 <= first < 2250 and later >= 2250, (first, later)
     finally:
         await call.close()
 

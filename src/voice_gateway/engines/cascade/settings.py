@@ -161,9 +161,12 @@ class CascadeSettings:
     #: While the back office has a request and neither side has spoken for
     #: this long, the voice says one of ``hold_phrases`` (never the same one
     #: twice in a row); 0 never.
-    hold_after_secs: float = 5.0
+    hold_after_secs: float = 6.0
     #: At most this many of them per wait, then ``hold_longer`` once.
     hold_max: int = 2
+    #: Once the call has had ``hold_max`` hold sentences, every later one
+    #: waits for this much quiet instead (owner 2026-10-23: no loop).
+    hold_later_secs: float = 15.0
     hold_phrases: tuple[str, ...] = HOLD_PHRASES["de"]
     #: Empty: none.
     hold_longer: str = HOLD_LONGER["de"]
@@ -423,6 +426,7 @@ _PROFILE_KEYS = {
     "prompt",
     "hold_after_secs",
     "hold_max",
+    "hold_later_secs",
     "hold_phrases",
     "hold_longer",
 }
@@ -459,8 +463,9 @@ def parse_settings(name: str, raw: dict, base: Path | None = None) -> CascadeSet
         barge_in=_barge_in(raw.get("barge_in", {}), f"{label}.barge_in", language),
         playout_lead_ms=_integer(raw, "playout_lead_ms", label, 200, 40, 2000),
         prompt=prompt.strip(),
-        hold_after_secs=_number(raw, "hold_after_secs", label, 5.0, 0.0, 60.0),
+        hold_after_secs=_number(raw, "hold_after_secs", label, 6.0, 0.0, 60.0),
         hold_max=_integer(raw, "hold_max", label, 2, 0, 10),
+        hold_later_secs=_number(raw, "hold_later_secs", label, 15.0, 0.0, 120.0),
         hold_phrases=_hold_phrases(raw, label, language),
         hold_longer=_phrase(
             raw.get("hold_longer", HOLD_LONGER[language]), f"{label}.hold_longer"

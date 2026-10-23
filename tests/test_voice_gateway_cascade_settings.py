@@ -58,9 +58,11 @@ class TestParseSettings:
         assert settings.tts.response_format == "pcm"
         assert settings.tts.clause_chars == 30
         assert settings.tts.cache_phrases is True
-        # Owner 2026-10-22: bridge a back office that takes long.
-        assert settings.hold_after_secs == 5.0
+        # Owner 2026-10-22: bridge a back office that takes long; 10-23: a
+        # second later, and after two of them a longer quiet, no loop.
+        assert settings.hold_after_secs == 6.0
         assert settings.hold_max == 2
+        assert settings.hold_later_secs == 15.0
         assert settings.hold_phrases == HOLD_PHRASES["de"]
         assert settings.hold_longer == HOLD_LONGER["de"]
 
@@ -74,11 +76,13 @@ class TestParseSettings:
             profile(
                 hold_after_secs=8,
                 hold_max=1,
+                hold_later_secs=30,
                 hold_phrases=[" Gleich geht's weiter. ", "Noch einen Augenblick."],
                 hold_longer="",
             ),
         )
         assert own.hold_after_secs == 8.0 and own.hold_max == 1
+        assert own.hold_later_secs == 30.0
         assert own.hold_phrases == ("Gleich geht's weiter.", "Noch einen Augenblick.")
         assert own.hold_longer == ""
         assert parse_settings("p", profile(hold_after_secs=0)).hold_after_secs == 0
@@ -167,6 +171,8 @@ class TestParseSettings:
             ({"hold_after_secs": -1}, "hold_after_secs"),
             ({"hold_after_secs": 61}, "hold_after_secs"),
             ({"hold_max": 1.5}, "hold_max"),
+            ({"hold_later_secs": -1}, "hold_later_secs"),
+            ({"hold_later_secs": 121}, "hold_later_secs"),
             ({"hold_phrases": "Moment."}, "hold_phrases must be a list"),
             ({"hold_phrases": ["Moment.", "  "]}, "empty sentence"),
             ({"hold_phrases": ["x" * 81]}, "at most 80 characters"),

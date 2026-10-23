@@ -35,7 +35,10 @@ everything it knows). While a request is open, a caller turn of only
 backchannel words ("Okay.", "Ja, gut.") gets no reply: the LLM tended to
 invent the open answer for it. When the line has been quiet for
 ``hold_after_secs`` the voice says one of ``hold_phrases`` (never the same
-twice in a row), at most ``hold_max`` times, then ``hold_longer`` once.
+twice in a row), at most ``hold_max`` times, then ``hold_longer`` once. Once
+the call has had ``hold_max`` of them, each later one needs
+``hold_later_secs`` of quiet: a caller who has heard them knows the voice is
+still there.
 """
 
 from __future__ import annotations
@@ -175,8 +178,9 @@ class CascadeEngine:
         self._caller_speaking = False
         self._turn_open = False
         self._last_busy = float("-inf")
-        #: Hold sentences in the current wait; the last one said.
+        #: Hold sentences in the current wait and in the call; the last one said.
         self._holds = 0
+        self._call_holds = 0
         self._longer_said = False
         self._last_hold: str | None = None
         self._random = random.Random()
@@ -575,12 +579,16 @@ class CascadeEngine:
         if self._held:
             await self._release(self._held.popleft())
             return
-        after = self.settings.hold_after_secs
+        settings = self.settings
+        after = settings.hold_after_secs
+        if self._call_holds >= settings.hold_max:
+            after = after and max(after, settings.hold_later_secs)
         if not self._pending:
             self._hold_reset()
         elif after and time.monotonic() - self._last_busy >= after:
             phrase = self._hold_phrase()
             if phrase:
+                self._call_holds += 1
                 await self._release([TTSSpeakFrame(phrase, append_to_context=False)])
 
     def _hold_phrase(self) -> str | None:
