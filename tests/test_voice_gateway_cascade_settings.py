@@ -51,6 +51,8 @@ class TestParseSettings:
         assert settings.barge_in.min_speech_secs == 0.5
         assert settings.barge_in.min_words == 2
         assert {"ja", "mhm", "genau"} <= set(settings.barge_in.backchannels)
+        # Owner's call 2026-10-23: "Jo." to a hold sentence.
+        assert {"jo", "joa"} <= set(settings.barge_in.backchannels)
         assert settings.turn.smart_turn is True
         assert settings.turn.smart_turn_stop_secs == 2.0
         assert settings.llm.base_url == "http://127.0.0.1:18451/v1"

@@ -568,17 +568,18 @@ async def test_delegation_follows_the_transcript_then_filler_then_phrased_answer
     tool = [m for m in answer_request if m["role"] == "tool"]
     assert tool and "129 Euro" in tool[-1]["content"]
     assert call.engine.timings.turns[0].delegated
-    # The filler stands with the call, as if the LLM had said it (one
-    # assistant message), and nothing after the result asks for another
-    # holding sentence.
+    # The filler stands right before the call, as if the LLM had said it,
+    # and nothing after the result asks for another holding sentence. With
+    # the result last they stay two messages (``note_messages``).
     roles = [(m["role"], bool(m.get("tool_calls"))) for m in answer_request]
     filler = next(
         i
         for i, m in enumerate(answer_request)
         if m["role"] == "assistant" and m.get("content") == FILLER
     )
-    assert answer_request[filler]["tool_calls"][0]["function"]["name"] == "delegate"
-    assert roles[filler + 1 :] == [("tool", False)]
+    call_message = answer_request[filler + 1]
+    assert call_message["tool_calls"][0]["function"]["name"] == "delegate"
+    assert roles[filler + 1 :] == [("assistant", True), ("tool", False)]
 
 
 @pytest.mark.asyncio
@@ -771,6 +772,25 @@ def test_the_holding_sentence_and_its_call_are_one_message():
     # A reply without a call stays as it is.
     plain = [messages[0], messages[1], {"role": "assistant", "content": "Gern."}]
     assert note_messages(plain, "system") == plain
+
+
+def test_after_the_answer_the_holding_sentence_stays_before_its_call():
+    # One message, Gemma 4's template put the sentence after the tool
+    # response and closed the turn; the LLM reasoned before relaying the
+    # answer (8 of 10, 2.3-5.2 s; once nothing at all). Two, it went on at
+    # once (0 of 10, owner's call 2026-10-23).
+    call = {"id": "c1", "type": "function", "function": {"name": "delegate"}}
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "Ist am Freitag ein Doppelzimmer frei?"},
+        {"role": "assistant", "content": FILLER},
+        {"role": "assistant", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "c1", "content": '"Freitag frei."'},
+    ]
+    assert note_messages(messages, "system") == messages
+    # A call with more conversation after it is still one message.
+    later = [*messages, {"role": "user", "content": "Und Samstag?"}]
+    assert note_messages(later, "system")[2]["tool_calls"] == [call]
 
 
 def test_a_running_call_says_an_addition_is_a_new_call():

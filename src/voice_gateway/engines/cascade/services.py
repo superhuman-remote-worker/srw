@@ -306,6 +306,11 @@ def note_messages(messages: list, role: str) -> list:
     shape chat models are trained on. Pipecat keeps them as two; Gemma 4
     then loops on empty thought markers, or repeats the holding sentence
     without calling the tool, when the caller speaks while the call runs.
+    Not when the request ends with the call's results: Gemma 4's template
+    puts a message's text after its tool responses and closes the turn, and
+    the LLM then reasoned before relaying the answer (8 of 10, 2.3-5.2 s,
+    once past ``max_tokens`` with nothing said; owner's call 2026-10-23).
+    Two messages it continues its own turn after the response (0 of 10).
     A call still running says it was handed on and that an addition goes
     out as a new call (``prompt.HANDED_ON``)."""
     out: list = []
@@ -314,6 +319,7 @@ def note_messages(messages: list, role: str) -> list:
             message = {**message, "role": role}
         message = _handed_on(message)
         previous = out[-1] if out else None
+        rest = messages[index + 1 :]
         if (
             previous is not None
             and message.get("role") == "assistant"
@@ -323,6 +329,7 @@ def note_messages(messages: list, role: str) -> list:
             and not previous.get("tool_calls")
             and isinstance(previous.get("content"), str)
             and previous["content"].strip()
+            and not (rest and all(m.get("role") == "tool" for m in rest))
         ):
             out[-1] = {**message, "content": previous["content"]}
             continue
