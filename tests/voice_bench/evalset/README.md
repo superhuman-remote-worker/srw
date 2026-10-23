@@ -256,7 +256,7 @@ same audio.
 
 ## Scenarios
 
-`de/scenarios/*.yaml`, one call each (20 calls, 35 caller turns). Format:
+`de/scenarios/*.yaml`, one call each (21 calls, 37 caller turns). Format:
 
 ```yaml
 id: s03-thinking-pauses            # = file name
@@ -306,6 +306,7 @@ turns:
 | s18 hard voice | the A1 call in the Piper voice |
 | s19 number in pairs | a fast mobile caller's callback number in a message |
 | s20 what day | does the voice know today's date (C1 puts it into the prompt)? |
+| s21 answer during a hold sentence | the answer follows the hold sentence by itself, without the caller speaking (owner's call 2026-10-23) |
 
 ## Real recordings
 
