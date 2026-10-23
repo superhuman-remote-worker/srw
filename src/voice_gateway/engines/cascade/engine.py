@@ -5,8 +5,9 @@ start, Smart Turn v3 stop) → voice LLM (delegate tool) → TTS → port →
 assistant context. How the protocol's appends map onto it:
 
 - ``instructions`` with quoted exact words (the greeting) are spoken as they
-  are, sentence by sentence; other instructions become a note the LLM acts
-  on now.
+  are, sentence by sentence; while a request is open they are the back
+  office's line about it and take the next hold sentence's place. Other
+  instructions become a note the LLM acts on now.
 - ``commentary`` with an open delegation's id is that ``delegate`` call's
   result, which the LLM phrases for the caller; any other ``commentary`` is
   a note to say now in its own words.
@@ -15,7 +16,9 @@ assistant context. How the protocol's appends map onto it:
 Whatever the voice says on its own (the exact words, the notes it acts on
 now) waits until the line is free: the caller neither speaking nor in a
 turn, the voice silent and the LLM idle. It never cuts into the caller or a
-sentence.
+sentence. A note that comes in while the caller speaks goes into the context
+at once, so the reply to the caller takes it in; the LLM runs for it once
+the line is free only if no request has.
 
 A ``delegate`` call emits ``session.delegation.created`` (after the caller's
 transcript, which STT emitted first) and plays the filler unless the LLM
@@ -34,11 +37,12 @@ earlier ones still open (the back office answers the latest piece with
 everything it knows). While a request is open, a caller turn of only
 backchannel words ("Okay.", "Ja, gut.") gets no reply: the LLM tended to
 invent the open answer for it. When the line has been quiet for
-``hold_after_secs`` the voice says one of ``hold_phrases`` (never the same
-twice in a row), at most ``hold_max`` times, then ``hold_longer`` once. Once
-the call has had ``hold_max`` of them, each later one needs
-``hold_later_secs`` of quiet: a caller who has heard them knows the voice is
-still there.
+``hold_after_secs`` the voice says the back office's line, if one came, or
+one of ``hold_phrases`` (never the same twice in a row), at most
+``hold_max`` times, then ``hold_longer`` once. Once the call has had
+``hold_max`` holding sentences, the filler and the back office's lines
+included, each later one needs ``hold_later_secs`` of quiet: a caller who
+has heard them knows the voice is still there.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ from pipecat.frames.frames import (
     Frame,
     FunctionCallResultProperties,
     LLMMessagesAppendFrame,
+    LLMRunFrame,
     TTSSpeakFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -178,9 +183,15 @@ class CascadeEngine:
         self._caller_speaking = False
         self._turn_open = False
         self._last_busy = float("-inf")
-        #: Hold sentences in the current wait and in the call; the last one said.
+        #: Hold sentences in the current wait and holding sentences in the
+        #: call; the last hold sentence said.
         self._holds = 0
         self._call_holds = 0
+        #: The back office's line about the open request, for the next hold.
+        self._status: str | None = None
+        #: A note went into the context while the caller spoke and no LLM
+        #: request has taken it in yet.
+        self._owed = False
         self._longer_said = False
         self._last_hold: str | None = None
         self._random = random.Random()
@@ -222,6 +233,11 @@ class CascadeEngine:
             await self._answered(delegation_id, content)
             return
         if kind == "instructions" and (words := exact_words(content)):
+            if self._pending and self.settings.hold_after_secs:
+                # Said at once, it followed the filler: two holding
+                # sentences in a row (owner 2026-10-23).
+                self._status = words
+                return
             # One TTS request per sentence: a TTS that answers once a
             # request is synthesised starts with the first sentence.
             await self._say_when_free(
@@ -229,11 +245,17 @@ class CascadeEngine:
             )
             return
         message = {"role": "developer", "content": note(kind, content)}
-        frame = LLMMessagesAppendFrame(messages=[message], run_llm=kind != "thinking")
-        if kind == "thinking" and not self._held:
-            await self._queue(frame)  # silent: nothing to wait for
+        silent = kind == "thinking"
+        if not self._held and (silent or self._caller_speaking or self._turn_open):
+            # Held until the caller's turn was over, a late answer came
+            # after the reply to it, which had guessed the answer: the
+            # caller heard it twice (owner 2026-10-23).
+            await self._queue(LLMMessagesAppendFrame(messages=[message], run_llm=False))
+            self._owed = self._owed or not silent
         else:
-            await self._say_when_free([frame])
+            await self._say_when_free(
+                [LLMMessagesAppendFrame(messages=[message], run_llm=not silent)]
+            )
 
     async def stop(self, session: Session) -> None:
         self._stopped = True
@@ -449,7 +471,10 @@ class CascadeEngine:
         # caller cut before its call went out).
         heard = bool(self._pending) or self._held_recently()
         self._pending[delegation_id] = pending
-        if self.settings.filler and not heard and not (self._llm and self._llm.spoke):
+        if not heard and self._llm and self._llm.spoke:
+            self._call_holds += 1  # the LLM's own holding sentence
+        elif self.settings.filler and not heard:
+            self._call_holds += 1
             pending.filler = self.settings.filler
             await params.llm.push_frame(
                 TTSSpeakFrame(self.settings.filler, append_to_context=False)
@@ -494,19 +519,21 @@ class CascadeEngine:
                 pending.tool_call_id, pending.filler
             ):
                 pending.filler = None
-        if not self._pending:
-            return True
         messages = context.messages
         last = messages[-1] if messages else None
         before = messages[-2] if len(messages) > 1 else None
-        return not (
-            isinstance(last, dict)
+        run = not (
+            self._pending
+            and isinstance(last, dict)
             and last.get("role") == "user"
             and isinstance(last.get("content"), str)
             and is_backchannel(last["content"], self.settings.barge_in.backchannels)
             # A note or an answer that came in meanwhile is still owed.
             and not (isinstance(before, dict) and before.get("role") == "developer")
         )
+        if run:
+            self._owed = False
+        return run
 
     def _said_before_call(self, tool_call_id: str, text: str) -> bool:
         """Put ``text`` into the context in front of the tool call, as an
@@ -579,6 +606,10 @@ class CascadeEngine:
         if self._held:
             await self._release(self._held.popleft())
             return
+        if self._owed:
+            self._owed = False
+            await self._release([LLMRunFrame()])
+            return
         settings = self.settings
         after = settings.hold_after_secs
         if self._call_holds >= settings.hold_max:
@@ -586,10 +617,19 @@ class CascadeEngine:
         if not self._pending:
             self._hold_reset()
         elif after and time.monotonic() - self._last_busy >= after:
-            phrase = self._hold_phrase()
+            phrase, self._status = self._status, None
+            if phrase:
+                self._holds += 1
+            else:
+                phrase = self._hold_phrase()
             if phrase:
                 self._call_holds += 1
-                await self._release([TTSSpeakFrame(phrase, append_to_context=False)])
+                await self._release(
+                    [
+                        TTSSpeakFrame(sentence, append_to_context=False)
+                        for sentence in sentences(phrase)
+                    ]
+                )
 
     def _hold_phrase(self) -> str | None:
         """The next hold sentence of this wait, if any is left."""
@@ -608,6 +648,7 @@ class CascadeEngine:
     def _hold_reset(self) -> None:
         self._holds = 0
         self._longer_said = False
+        self._status = None
 
     def _held_recently(self) -> bool:
         """Whether the voice's last sentence, started a moment ago, was a

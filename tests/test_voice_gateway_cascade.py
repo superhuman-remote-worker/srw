@@ -957,12 +957,13 @@ async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
         assert all(h in HOLD_PHRASES["de"] for h in holds)
         assert holds[0] != holds[1]
         assert said[3:] == [HOLD_LONGER["de"]]
-        # Never into each other: a pause of at least hold_after_secs each,
-        # and after the call's hold_max of them, hold_later_secs.
+        # Never into each other: a pause of at least hold_after_secs, and
+        # once the call has had hold_max holding sentences (the filler is
+        # the first), hold_later_secs.
         starts = call.port.voice_starts
         assert len(starts) == 4
         quiet = [quiet_before(call, said, n) for n in (1, 2, 3)]
-        assert all(350 <= q < 1250 for q in quiet[:2]) and quiet[2] >= 1250, quiet
+        assert 350 <= quiet[0] < 1250 and min(quiet[1:]) >= 1250, quiet
         # The answer ends the wait; the next wait starts afresh.
         fakes.llm_replies = ["Ja, am Freitag ist ein Doppelzimmer frei."]
         await call.append("commentary", "Freitag frei.", delegation_ids(call)[0])
@@ -970,7 +971,7 @@ async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
         await asyncio.sleep(1.5)
         assert len(call.transcripts("assistant")) == 5
         assert call.engine._holds == 0 and not call.engine._longer_said
-        assert call.engine._call_holds == 3
+        assert call.engine._call_holds == 4
     finally:
         await call.close()
 
@@ -978,12 +979,13 @@ async def test_a_long_wait_is_bridged_with_varied_hold_sentences(fakes):
 @pytest.mark.asyncio
 async def test_after_the_calls_first_hold_sentences_later_ones_wait_longer(fakes):
     # Owner 2026-10-23: the hold sentences came after every lookup, like a
-    # loop. Once a call has had hold_max of them, the next waits longer.
+    # loop. Once a call has had hold_max holding sentences, the filler
+    # included, the next waits longer.
     call = Call(
         fakes,
         fakes.base,
         hold_after_secs=0.5,
-        hold_max=1,
+        hold_max=2,
         hold_later_secs=2.5,
         hold_longer="",
     )
@@ -1017,6 +1019,110 @@ async def test_after_the_calls_first_hold_sentences_later_ones_wait_longer(fakes
         assert 250 <= first < 2250 and later >= 2250, (first, later)
     finally:
         await call.close()
+
+
+@pytest.mark.asyncio
+async def test_the_back_offices_line_takes_the_next_hold_sentences_place(fakes):
+    # Owner's call 2026-10-23: the back office's "ich prüfe gerade den
+    # Wetterdienst" came 3 s after the filler, then the hold sentences.
+    call = Call(
+        fakes,
+        fakes.base,
+        hold_after_secs=0.8,
+        hold_max=2,
+        hold_later_secs=2.0,
+        hold_longer="",
+    )
+    await call.accept()
+    try:
+        fakes.stt_texts = ["Wie wird das Wetter nächste Woche?"]
+        fakes.llm_replies = [("delegate", "Wetter nächste Woche")]
+        call.port.say(tone(1.0))
+        await call.until(lambda: len(delegation_ids(call)) == 1)
+        await call.until(lambda: call.transcripts("assistant"))
+        await call.append(
+            "instructions", 'Say exactly: "Ich prüfe gerade den Wetterdienst."'
+        )
+        await call.until(lambda: len(call.transcripts("assistant")) == 2, timeout=5)
+        await call.until(lambda: len(call.transcripts("assistant")) == 3, timeout=8)
+        await call.until(lambda: len(call.port.voice_starts) == 3)
+        said = [t.strip() for t in call.transcripts("assistant")]
+        assert said[:2] == [FILLER, "Ich prüfe gerade den Wetterdienst."]
+        assert said[2] in HOLD_PHRASES["de"]
+        assert len(fakes.llm_requests) == 1
+        # The line comes after the quiet a hold sentence waits for, and the
+        # filler and the line are the call's hold_max: the next one waits
+        # hold_later_secs.
+        quiet = [quiet_before(call, said, n) for n in (1, 2)]
+        assert 550 <= quiet[0] < 1750 and quiet[1] >= 1750, quiet
+    finally:
+        await call.close()
+
+
+@pytest.mark.asyncio
+async def test_an_answer_drops_the_back_offices_line_not_said_yet(fakes):
+    call = Call(fakes, fakes.base, hold_after_secs=1.5)
+    await call.accept()
+    try:
+        fakes.stt_texts = ["Wie wird das Wetter nächste Woche?"]
+        fakes.llm_replies = [
+            ("delegate", "Wetter nächste Woche"),
+            "Nächste Woche wird es sonnig.",
+        ]
+        call.port.say(tone(1.0))
+        await call.until(lambda: len(delegation_ids(call)) == 1)
+        await call.append(
+            "instructions", 'Say exactly: "Ich prüfe gerade den Wetterdienst."'
+        )
+        await call.append("commentary", "Sonnig.", delegation_ids(call)[0])
+        await call.until(lambda: len(fakes.llm_requests) == 2)
+        await asyncio.sleep(2.5)
+        await call.quiet()
+        said = " ".join(call.transcripts("assistant"))
+        assert "sonnig" in said and "Wetterdienst" not in said
+    finally:
+        await call.close()
+
+
+@pytest.mark.asyncio
+async def test_a_note_while_the_caller_speaks_goes_into_the_reply_to_them(call, fakes):
+    # Owner's call 2026-10-23: the late answer came in while the caller
+    # spoke, waited for the reply to them, which guessed it, and was then
+    # said again.
+    fakes.stt_texts = ["Ich wollte eigentlich wissen, wie das Wetter wird."]
+    fakes.llm_replies = ["Dazu habe ich leider keine verlässlichen Wetterdaten."]
+    call.port.say(tone(2.0))
+    await call.until(lambda: call.engine._caller_speaking)
+    await call.append("commentary", "Keine verlässlichen Wetterdaten.")
+    await call.until(lambda: call.transcripts("assistant"), timeout=10)
+    await asyncio.sleep(1.0)
+    await call.quiet()
+    assert len(fakes.llm_requests) == 1
+    messages = fakes.llm_requests[0]["messages"]
+    note_at = next(
+        i for i, m in enumerate(messages) if "Keine verlässlichen" in str(m["content"])
+    )
+    caller_at = next(i for i, m in enumerate(messages) if m["role"] == "user")
+    assert note_at < caller_at == len(messages) - 1
+    # Nothing played while the caller's clip ran.
+    assert call.port.voice_starts[0] > call.port.clip_ends[0]
+
+
+@pytest.mark.asyncio
+async def test_a_note_taken_in_while_the_caller_speaks_is_said_without_a_reply(
+    call, fakes
+):
+    fakes.stt_texts = [""]  # a noise: no words, no turn to reply to
+    fakes.llm_replies = ["Ein Kollege ruft Sie heute noch zurück."]
+    call.port.say(tone(1.5))
+    await call.until(lambda: call.engine._caller_speaking)
+    await call.append("commentary", "Ein Kollege ruft heute zurück.")
+    await call.until(lambda: call.transcripts("assistant"), timeout=15)
+    await asyncio.sleep(1.0)
+    await call.quiet()
+    assert len(fakes.llm_requests) == 1
+    assert "zurück" in "".join(call.transcripts("assistant"))
+    assert call.port.voice_starts[0] > call.port.clip_ends[0]
 
 
 @pytest.mark.asyncio

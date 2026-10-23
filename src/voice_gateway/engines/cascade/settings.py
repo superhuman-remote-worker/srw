@@ -168,8 +168,9 @@ class CascadeSettings:
     hold_after_secs: float = 6.0
     #: At most this many of them per wait, then ``hold_longer`` once.
     hold_max: int = 2
-    #: Once the call has had ``hold_max`` hold sentences, every later one
-    #: waits for this much quiet instead (owner 2026-10-23: no loop).
+    #: Once the call has had ``hold_max`` holding sentences (the filler and
+    #: the back office's own lines count), every later one waits for this
+    #: much quiet instead (owner 2026-10-23: no loop).
     hold_later_secs: float = 15.0
     hold_phrases: tuple[str, ...] = HOLD_PHRASES["de"]
     #: Empty: none.
