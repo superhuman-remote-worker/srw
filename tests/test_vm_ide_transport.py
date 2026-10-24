@@ -492,7 +492,7 @@ async def test_direct_channel_websocket_upgrades_and_relays_frames():
 @pytest.mark.asyncio
 async def test_websocket_recv_keeps_all_frames_from_one_protocol_read():
     from websockets.client import ClientProtocol
-    from websockets.frames import Frame, OP_BINARY, OP_CONT, OP_TEXT
+    from websockets.frames import Frame, Opcode
     from websockets.protocol import State
     from websockets.uri import parse_uri
 
@@ -500,9 +500,9 @@ async def test_websocket_recv_keeps_all_frames_from_one_protocol_read():
 
     protocol = ClientProtocol(parse_uri("ws://127.0.0.1:8080/vscode"), state=State.OPEN)
     protocol.receive_data(
-        Frame(OP_TEXT, b"fir", fin=False).serialize(mask=False)
-        + Frame(OP_CONT, b"st").serialize(mask=False)
-        + Frame(OP_BINARY, b"\x00\x01").serialize(mask=False)
+        Frame(Opcode.TEXT, b"fir", fin=False).serialize(mask=False)
+        + Frame(Opcode.CONT, b"st").serialize(mask=False)
+        + Frame(Opcode.BINARY, b"\x00\x01").serialize(mask=False)
     )
     reader = SimpleNamespace(read=AsyncMock(side_effect=AssertionError("lost frame")))
     channel = VMIDEWebSocket(reader, _Writer(), protocol)
@@ -513,7 +513,7 @@ async def test_websocket_recv_keeps_all_frames_from_one_protocol_read():
 
 @pytest.mark.asyncio
 async def test_websocket_handshake_keeps_immediate_coalesced_server_frames():
-    from websockets.frames import Frame, OP_PING, OP_PONG, OP_TEXT
+    from websockets.frames import Frame, Opcode
     from websockets.server import ServerProtocol
 
     from orchestrator.services.ide_proxy import IdeProxyTarget
@@ -536,9 +536,9 @@ async def test_websocket_handshake_keeps_immediate_coalesced_server_frames():
             server.send_response(server.accept(request))
             return (
                 b"".join(server.data_to_send())
-                + Frame(OP_PING, b"probe").serialize(mask=False)
-                + Frame(OP_TEXT, b"welcome").serialize(mask=False)
-                + Frame(OP_TEXT, b"ready").serialize(mask=False)
+                + Frame(Opcode.PING, b"probe").serialize(mask=False)
+                + Frame(Opcode.TEXT, b"welcome").serialize(mask=False)
+                + Frame(Opcode.TEXT, b"ready").serialize(mask=False)
             )
 
     proof = _proof()
@@ -571,7 +571,7 @@ async def test_websocket_handshake_keeps_immediate_coalesced_server_frames():
     )
     async with transport.open_websocket(target, path="/vscode") as channel:
         pong = writer.data[reader.handshake_length :]
-        assert len(pong) >= 2 and pong[0] & 0x0F == OP_PONG
+        assert len(pong) >= 2 and pong[0] & 0x0F == Opcode.PONG
         assert pong[1] & 0x80  # Client frames are masked.
         assert await channel.recv() == "welcome"
         assert await channel.recv() == "ready"
