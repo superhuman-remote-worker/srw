@@ -378,8 +378,8 @@ that tolerates `1` must still fail on `2`.
 | [langchain-text-splitters](https://docs.langchain.com/) | 1.1.2 | MIT License | ALLOW |
 | langdetect | 1.0.9 | Apache Software License | ALLOW |
 | [langgraph](https://docs.langchain.com/oss/python/langgraph/overview) | 1.2.10 | MIT | ALLOW |
-| [langgraph-checkpoint](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint) | 4.1.1 | MIT | ALLOW |
-| [langgraph-checkpoint-postgres](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres) | 3.1.1 | MIT | ALLOW |
+| [langgraph-checkpoint](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint) | 4.3.0 | MIT | ALLOW |
+| [langgraph-checkpoint-postgres](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres) | 3.1.3 | MIT | ALLOW |
 | [langgraph-checkpoint-sqlite](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-sqlite) | 3.1.1 | MIT | ALLOW |
 | [langgraph-prebuilt](https://github.com/langchain-ai/langgraph/tree/main/libs/prebuilt) | 1.1.0 | MIT | ALLOW |
 | [langgraph-sdk](https://github.com/langchain-ai/langgraph/tree/main/libs/sdk-py) | 0.4.4 | MIT | ALLOW |
