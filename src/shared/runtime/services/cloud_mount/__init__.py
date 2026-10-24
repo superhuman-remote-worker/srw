@@ -787,6 +787,10 @@ echo "{_OK}"
         Best effort at a claim (a resident that would not stop is retried at
         the next claim and at End, whose own pass is strict); True when the
         workspace holds none. Never raises."""
+        if not getattr(self.workspace_backend, "supports_shell", True):
+            # A workspace without a shell (the virtual tier) runs no rclone,
+            # and has no home for the script either.
+            return True
         try:
             output = self._run_remote_script(
                 "retire_unplanned_rclone.sh",

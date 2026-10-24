@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,8 @@ import pytest
 
 from agent.api.persistent_session import PersistentSession
 from agent.api.session_attach import cloud_mount_payload
+from agent.core.backends.virtual import VirtualWorkspaceBackend
+from shared.runtime.core.backends.object_store import InMemoryObjectStore
 from shared.runtime.core.loader import cloud_mount_system_floor
 from shared.runtime.services.cloud_mount.sidecar import (
     SidecarMountError,
@@ -1230,7 +1233,9 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
 
 
 @pytest.mark.asyncio
-async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted():
+async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted(
+    caplog,
+):
     """No cloud payload (every folder detached, say): a resident an earlier
     claim mounted is retired all the same, and nothing mounts. A workspace
     without a shell is left alone."""
@@ -1262,6 +1267,21 @@ async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted(
         lambda: PersistentSession._retire_unplanned_cloud_mounts(scratch)
     )
     await PersistentSession._setup_cloud_mount(scratch, None)
+    # The virtual tier has every backend method, but no shell and no home.
+    virtual = SimpleNamespace(
+        thread_id="t1",
+        workspace_manager=SimpleNamespace(
+            backend=VirtualWorkspaceBackend(InMemoryObjectStore()), path="/w"
+        ),
+        protected_cloud_required=False,
+    )
+    virtual._retire_unplanned_cloud_mounts = (
+        lambda: PersistentSession._retire_unplanned_cloud_mounts(virtual)
+    )
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await PersistentSession._setup_cloud_mount(virtual, None)
+    assert caplog.records == []
 
 
 def test_a_workspace_that_can_mount_no_folder_says_so_in_the_prompt():
