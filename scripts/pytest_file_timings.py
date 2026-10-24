@@ -16,7 +16,8 @@ def file_timings(reports, root=ROOT):
     totals = defaultdict(float)
     for report in reports:
         for case in ET.parse(report).iter("testcase"):
-            parts = case.get("classname", "").split(".")
+            # A module-level skip is reported with an empty classname.
+            parts = [part for part in case.get("classname", "").split(".") if part]
             for length in range(len(parts), 0, -1):
                 path = Path(*parts[:length]).with_suffix(".py")
                 if (root / path).is_file():
