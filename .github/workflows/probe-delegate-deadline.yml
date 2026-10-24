@@ -1,0 +1,96 @@
+# Temporary: find what holds up a session child's create in CI.
+# Lives only on ci-probe/delegate-deadline; delete the branch when done.
+name: probe-delegate-deadline
+
+on:
+  push:
+    branches: [ci-probe/delegate-deadline]
+
+jobs:
+  shard0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/docker-hub-mirror
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+      - name: Build Helm dependencies
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm dependency build helm/
+      - name: Install dependencies
+        run: >-
+          uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      - name: Install editable application packages
+        run: pip install --no-deps -e . ./ci-probe
+      - name: Record the environment
+        run: |
+          mkdir -p test-results/ledger-probe
+          pip freeze > test-results/ledger-probe/freeze.txt
+          nproc; free -m; docker version --format '{{.Server.Version}}'
+      - name: Run shard 0
+        env:
+          LEDGER_PROBE_DIR: ${{ github.workspace }}/test-results/ledger-probe
+        run: >-
+          python scripts/pytest_shard.py --index 0 --count 2
+          --report-dir test-results/python-0 tests/
+      - name: Show the probe log
+        if: always()
+        run: cat test-results/ledger-probe/*.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-shard0-${{ matrix.copy }}
+          path: test-results/
+          retention-days: 7
+
+  alone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/docker-hub-mirror
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: >-
+          uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      - name: Install editable application packages
+        run: pip install --no-deps -e . ./ci-probe
+      - name: Run the file alone, repeatedly
+        env:
+          LEDGER_PROBE_DIR: ${{ github.workspace }}/test-results/ledger-probe
+        run: |
+          for i in $(seq 1 12); do
+            python -m pytest tests/test_session_delegate_current_path_real_postgres.py \
+              -q -p no:cacheprovider --durations=5 \
+              -k test_successive_single_delegate_batches_complete_in_one_parent_turn || true
+          done
+      - name: Show the probe log
+        if: always()
+        run: cat test-results/ledger-probe/*.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-alone
+          path: test-results/
+          retention-days: 7

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ledger-probe"
+version = "0.0.0"
+
+[tool.setuptools]
+py-modules = ["ledger_probe"]
+
+[project.entry-points.pytest11]
+ledger_probe = "ledger_probe"
