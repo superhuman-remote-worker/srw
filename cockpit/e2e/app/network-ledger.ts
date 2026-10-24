@@ -104,7 +104,14 @@ export function sanitizedDiagnostic(raw: string): string {
 
 export class NetworkLedger {
   private phase: JourneyPhase = 'pre-navigation';
-  private readonly started = new WeakMap<Request, { at: number; phase: JourneyPhase }>();
+  private readonly started = new WeakMap<
+    Request,
+    { at: number; phase: JourneyPhase; document: number }
+  >();
+  // Main-frame document responses seen so far; a request's count says which
+  // document could have started it.
+  private documents = 0;
+  private reloadDocument: number | null = null;
   private readonly ownedThreadIds = new Set<string>();
   private readonly records: NetworkEntry[] = [];
   private pendingWarmupStreamReconnects = 0;
@@ -129,6 +136,7 @@ export class NetworkLedger {
   }
 
   setPhase(phase: JourneyPhase): void {
+    if (phase === 'reload') this.reloadDocument = this.documents;
     this.phase = phase;
   }
 
@@ -157,12 +165,15 @@ export class NetworkLedger {
 
   private onRequest(request: Request): void {
     if (!this.isFirstParty(request.url())) return;
-    this.started.set(request, { at: Date.now(), phase: this.phase });
+    this.started.set(request, { at: Date.now(), phase: this.phase, document: this.documents });
   }
 
   private onResponse(response: Response): void {
     const request = response.request();
     if (!this.isFirstParty(response.url())) return;
+    if (request.isNavigationRequest() && request.frame().parentFrame() === null) {
+      this.documents += 1;
+    }
     const start = this.started.get(request);
     const pathname = safePathname(response.url());
     if (!pathname) return;
@@ -181,9 +192,10 @@ export class NetworkLedger {
     const pathname = safePathname(request.url());
     if (!pathname) return;
     const reason = sanitizedDiagnostic(request.failure()?.errorText ?? 'unknown network failure');
-    const startedPhase = this.started.get(request)?.phase ?? null;
+    const start = this.started.get(request);
+    const startedPhase = start?.phase ?? null;
     const classification = this.cancellationClassification(
-      request.method(), pathname, reason, startedPhase,
+      request.method(), pathname, reason, startedPhase, start?.document ?? null,
     );
     this.records.push({
       kind: 'requestfailed',
@@ -201,6 +213,7 @@ export class NetworkLedger {
     pathname: string,
     reason: string,
     startedPhase: JourneyPhase | null,
+    startedDocument: number | null,
   ): FailureEntry['classification'] {
     if (method !== 'GET' || !ABORT_REASON.test(reason)) return 'unexpected';
 
@@ -220,11 +233,15 @@ export class NetworkLedger {
       return 'expected-navigation-cancellation';
     }
     const oldDocumentReadMatch = pathname.match(CONNECTION) ?? pathname.match(THREAD_DETAIL);
-    // A Chrome reload cancels an owned read from the old document. Keep
-    // failures of reads started by the new document visible to the guard.
+    // A Chrome reload cancels an owned read from the old document, which can
+    // still poll after the reload phase begins until the new document arrives.
+    // Keep failures of reads started by the new document visible to the guard.
+    const startedInOldDocument =
+      startedPhase === 'turn' ||
+      (startedPhase === 'reload' && startedDocument === this.reloadDocument);
     if (
       this.phase === 'reload' &&
-      startedPhase === 'turn' &&
+      startedInOldDocument &&
       reason === 'net::ERR_ABORTED' &&
       oldDocumentReadMatch !== null &&
       this.ownedThreadIds.has(decodeURIComponent(oldDocumentReadMatch[1]))
