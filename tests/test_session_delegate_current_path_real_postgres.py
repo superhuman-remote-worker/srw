@@ -45,6 +45,7 @@ from shared.session_subagent_authority import (
 from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
 from tests._fake_chat_model import FakeChatModel, text_turn
 from tests._fanout_gate import set_session_fanout
+from tests._warm_asgi_routes import warm_asgi_routes
 from tests.test_delegate_agent_tool import make_parent
 from tests.test_persistent_delegation_batch import _callbacks, _config, _context_manager
 
@@ -228,6 +229,7 @@ async def parent(migrated_dsn, monkeypatch):
                 event_hooks={"request": [record_request]},
             )
         )
+        await warm_asgi_routes(main.app)
         yield SimpleNamespace(
             db=db,
             agent=agent,

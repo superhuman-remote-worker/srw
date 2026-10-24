@@ -67,6 +67,7 @@ from shared.session_subagent_batch import (
     session_subagent_batch_delivery_id,
 )
 from tests._fake_chat_model import FakeChatModel, text_turn
+from tests._warm_asgi_routes import warm_asgi_routes
 from tests.test_persistent_delegation_batch import _callbacks, _config, _context_manager
 from tests.test_session_subagent_batch_settle_pg import (
     QUEUED_BEHIND_THE_INPUT,
@@ -141,6 +142,7 @@ class _Agent:
                 event_hooks={"request": [record]},
             )
         )
+        await warm_asgi_routes(main.app)
         self.client = client
         context, root = make_parent(self.tmp_path)
         context._subagent_parent_kind = "session"
