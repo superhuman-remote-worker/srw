@@ -1,6 +1,41 @@
 # The Claude Code harness (harnesses/claude-code/README.md) running a data-load Job.
 # Needs: manifest hosting with the image approved, a sandbox workspace, the
 # custom_harness_images grant, and the secrets referenced below.
+#
+# Network: the harness pod's only egress is the operator's
+# manifestHosting.harnessEgress (Helm values, not part of this Job). The default
+# [] means no DNS, no Anthropic API, no input downloads and no upload. A working
+# setting, DNS plus HTTPS to public addresses (specific CIDRs are tighter; see
+# harnesses/claude-code/README.md#network):
+#
+# manifestHosting:
+#   harnessEgress:
+#     # DNS: the cluster DNS pods.
+#     - to:
+#         - namespaceSelector:
+#             matchLabels: {kubernetes.io/metadata.name: kube-system}
+#           podSelector:
+#             matchLabels: {k8s-app: kube-dns}
+#       ports:
+#         - {protocol: UDP, port: 53}
+#         - {protocol: TCP, port: 53}
+#     # HTTPS to public addresses only: private, shared, loopback, link-local
+#     # (cloud metadata), multicast and reserved ranges are left out.
+#     - to:
+#         - ipBlock:
+#             cidr: 0.0.0.0/0
+#             except:
+#               - 0.0.0.0/8
+#               - 10.0.0.0/8
+#               - 100.64.0.0/10
+#               - 127.0.0.0/8
+#               - 169.254.0.0/16
+#               - 172.16.0.0/12
+#               - 192.168.0.0/16
+#               - 224.0.0.0/4
+#               - 240.0.0.0/4
+#       ports:
+#         - {protocol: TCP, port: 443}
 apiVersion: srw/v1alpha1
 kind: Job
 metadata:

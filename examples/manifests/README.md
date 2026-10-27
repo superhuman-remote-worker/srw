@@ -493,6 +493,46 @@ manifestHosting:
           port: 53
 ```
 
+An image that calls public services, such as the
+[Claude Code harness](../../harnesses/claude-code/README.md#network) (the
+Anthropic API, input downloads and the bundle upload), needs DNS and HTTPS.
+Without them it fails at its first request. This allows both, but no private,
+shared, link-local or reserved range:
+
+```yaml
+manifestHosting:
+  harnessEgress:
+    # DNS: the cluster DNS pods.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS to public addresses only: private, shared, loopback, link-local
+    # (cloud metadata), multicast and reserved ranges are left out.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - {protocol: TCP, port: 443}
+```
+
+Specific CIDRs (a model gateway, storage, dataset hosts) are tighter than
+`0.0.0.0/0`. Plain `http://` downloads also need TCP 80.
+
 Helm serializes this setting into `MANIFEST_HARNESS_EGRESS` and rolls the
 orchestrator when it changes. These rules apply to every generic harness on that
 installation; manifests cannot enlarge them through private settings or connector

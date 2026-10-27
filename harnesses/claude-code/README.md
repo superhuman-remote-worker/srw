@@ -195,6 +195,61 @@ The workspace image needs `bash`, coreutils (`timeout`), `tar` (GNU tar; the
 archive uses its options), `gzip` and `find` (GNU findutils: the archive uses
 `-printf`). Check that the workspace image you select provides them.
 
+## Network
+
+Generic harness pods run in the hosting namespace, which denies all traffic by
+default. The harness pod's egress is the operator's `manifestHosting.harnessEgress`
+and nothing else; an attached workspace adds only the SSH route to the
+workspace. The default `[]` leaves the harness without DNS, the Anthropic API,
+input downloads and the bundle upload, so a run fails at its first request. The
+harness needs:
+
+- DNS: UDP and TCP port 53 to the cluster DNS pods;
+- HTTPS (TCP 443) to the Anthropic API, to the hosts in `data.inputs[].url`
+  and to the upload URL. Plain `http://` URLs also need TCP 80.
+
+This setting allows DNS, and HTTPS to public addresses but not to private,
+shared, link-local or reserved ranges (the ranges a workspace's default policy
+leaves out too):
+
+```yaml
+manifestHosting:
+  harnessEgress:
+    # DNS: the cluster DNS pods.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS to public addresses only: private, shared, loopback, link-local
+    # (cloud metadata), multicast and reserved ranges are left out.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - {protocol: TCP, port: 443}
+```
+
+The rules apply to every generic harness on the installation, and they match
+IP addresses, not host names. Listing the specific CIDRs of your model gateway,
+storage and dataset hosts instead of `0.0.0.0/0` is tighter. An in-cluster
+destination (an object store, a proxy) needs its own `namespaceSelector` and
+`podSelector` rule. The [manifest guide](../../examples/manifests/README.md#execution-policy-and-current-host-capabilities)
+describes the setting in full.
+
 ## Timeouts
 
 `limits.timeoutSeconds` bounds the Claude Code session. A Job's own

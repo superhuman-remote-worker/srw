@@ -3,14 +3,17 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import re
 
 import pytest
+import yaml
 
 from orchestrator.services.manifest_harness_egress import (
     HARNESS_EGRESS_SCHEMA,
     HarnessEgressConfigurationError,
     validate_harness_egress,
 )
+from orchestrator.services.manifest_workspaces import public_workspace_egress
 
 
 @pytest.mark.parametrize(
@@ -184,3 +187,50 @@ def test_setting_name_appears_in_the_error_prefix():
     with pytest.raises(HarnessEgressConfigurationError) as err:
         validate_harness_egress("not json", setting="MANIFEST_WORKSPACE_EGRESS")
     assert str(err.value).startswith("Invalid MANIFEST_WORKSPACE_EGRESS: ")
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DOCUMENTED = (
+    "harnesses/claude-code/README.md",
+    "examples/manifests/README.md",
+    "examples/manifests/claude-code-harness-job.yaml",
+)
+
+
+def _documented_harness_egress(relative: str) -> list:
+    """The Claude Code harness's harnessEgress example in a doc or the Job's
+    comments: a `manifestHosting.harnessEgress` block with an HTTPS rule."""
+    text = (ROOT / relative).read_text()
+    if relative.endswith(".md"):
+        blocks = re.findall(r"```yaml\n(.*?)```", text, re.S)
+    else:
+        lines = text.splitlines()
+        start = lines.index("# manifestHosting:")
+        comment = []
+        for line in lines[start:]:
+            if not line.startswith("#"):
+                break
+            comment.append(line[2:] if line.startswith("# ") else line[1:])
+        blocks = ["\n".join(comment)]
+    found = []
+    for block in blocks:
+        data = yaml.safe_load(block)
+        rules = (data or {}).get("manifestHosting", {}).get("harnessEgress") or []
+        if any(port.get("port") == 443 for r in rules for port in r.get("ports", [])):
+            found.append(rules)
+    assert len(found) == 1, relative
+    return found[0]
+
+
+def test_the_documented_claude_code_harness_egress_is_accepted():
+    # I3: DNS to kube-dns, HTTPS to public addresses; one example in three places.
+    examples = {path: _documented_harness_egress(path) for path in DOCUMENTED}
+    first = examples[DOCUMENTED[0]]
+    for path, rules in examples.items():
+        assert rules == first, path
+        assert validate_harness_egress(json.dumps(rules)) == tuple(rules), path
+    dns, https = first
+    # The same DNS rule and public-address block as the workspace default.
+    default_dns, default_public = public_workspace_egress()
+    assert dns == default_dns
+    assert https == {**default_public, "ports": [{"protocol": "TCP", "port": 443}]}
