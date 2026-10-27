@@ -1,4 +1,5 @@
-# The process uses an ordinary env var, ignores SRW task/config files, and has no hooks.
+# A generic Job for an approved image with no SRW hooks: the process uses an ordinary
+# env var and ignores SRW task/config files. The image reference is a placeholder.
 apiVersion: srw/v1alpha1
 kind: Job
 metadata:
@@ -12,8 +13,8 @@ spec:
       inline:
         runtime:
           # Generic Jobs run the image's own entrypoint; command, args and probes are refused at admission.
-          # Placeholder digest: substitute the digest you approved in manifestHosting.approvedImages.
-          image: ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          # Placeholder: substitute an image you approved in manifestHosting.approvedImages (digest-pinned).
+          image: registry.example.invalid/your-approved-image@sha256:0000000000000000000000000000000000000000000000000000000000000000
           env:
             MESSAGE: hello from a container with no SRW callbacks
           config:

@@ -45,7 +45,7 @@ they do not mutate a Job snapshot or silently adopt newer template defaults.
 
 | Capability | Shipped `srw/v1` adapter | Generic image host |
 | --- | --- | --- |
-| Harness image | Omit the image to follow the installed SRW harness. An explicit image must match the installation at admission. | An ordinary image, with its image defaults or explicit launch settings; no mandatory SRW hooks. Requires enabled, verified hosting. |
+| Harness image | Omit the image to follow the installed SRW harness. An explicit image must match the installation at admission. | An image on the installation's approved list (`manifestHosting.approvedImages`; digest-pinned, exact match), started with its own entrypoint: `command`, `args` and `probes` are refused. No mandatory SRW hooks. Needs the `custom_harness_images` grant (administrators bypass it) and either verified hosting (`networkIsolationVerified`) or the operator's opt-in for unverified clusters (`allowApprovedImagesWithoutVerifiedIsolation`). |
 | No workspace | Supported through explicit `workspace: null`. | Supported. |
 | Virtual workspace | Backend selection supported. | Not implemented. |
 | Sandbox workspace | Image, pull policy, CPU, memory and storage supported ([reference](container-workspace-templates.md)); custom images run unprivileged unless the operator allows the full profile. prepare, cache: Rebuild, initialize and Retain are rejected. | Compatible SSH workspace image, resources, initialization and retained instances supported. Harness and workspace have separate lifecycles. |

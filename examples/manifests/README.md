@@ -5,7 +5,8 @@ verification state and remaining rollout decisions.
 
 Read [resources.yaml](resources.yaml), [referenced-job.yaml](referenced-job.yaml),
 then [project.yaml](project.yaml) for the basic composition.
-[inline-job.yaml](inline-job.yaml) describes an approved image with no SRW hooks;
+[inline-job.yaml](inline-job.yaml) describes an approved image with no SRW hooks (its image
+reference is a placeholder for one you approved);
 [claude-code-harness-job.yaml](claude-code-harness-job.yaml) runs the Claude Code harness image
 ([README](../../harnesses/claude-code/README.md)) against a sandbox workspace and an env connector;
 [retained-job.yaml](retained-job.yaml) selects an existing workspace instance. Images, credentials,
@@ -13,7 +14,8 @@ scopes and instance IDs in these examples are illustrative.
 
 [native-process-job.yaml](native-process-job.yaml) and
 [native-workspace-job.yaml](native-workspace-job.yaml) are executable examples for
-an enabled native Kubernetes host with an approved image. The latter shows an
+an enabled native Kubernetes host once their placeholder image reference is replaced
+with an image you approved. The latter shows an
 independently initialized, retained workspace; it requires the updated SRW workspace
 image and an available StorageClass, and a harness image that works in it over SSH.
 
