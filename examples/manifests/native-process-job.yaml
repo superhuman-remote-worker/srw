@@ -7,14 +7,14 @@ metadata:
     name: personal
 spec:
   task:
-    text: Run an ordinary container with no SRW callbacks.
+    text: Run an approved image with no SRW callbacks.
   execution:
     expert:
       inline:
         runtime:
-          image: busybox:1.36
-          command: ["/bin/sh", "-c"]
-          args: ["printf 'Hello from an ordinary image\\n'"]
+          # Generic Jobs run the image's own entrypoint; command, args and probes are refused at admission.
+          # Placeholder digest: substitute the digest you approved in manifestHosting.approvedImages.
+          image: ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:0000000000000000000000000000000000000000000000000000000000000000
           config:
             arbitraryPrivateSetting: null
     workspace: null

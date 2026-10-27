@@ -5,14 +5,15 @@ verification state and remaining rollout decisions.
 
 Read [resources.yaml](resources.yaml), [referenced-job.yaml](referenced-job.yaml),
 then [project.yaml](project.yaml) for the basic composition.
-[inline-job.yaml](inline-job.yaml) describes an ordinary image with no SRW hooks;
+[inline-job.yaml](inline-job.yaml) describes an approved image with no SRW hooks;
 [retained-job.yaml](retained-job.yaml) selects an existing workspace instance. Images, credentials,
 scopes and instance IDs in these examples are illustrative.
 
 [native-process-job.yaml](native-process-job.yaml) and
 [native-workspace-job.yaml](native-workspace-job.yaml) are executable examples for
-an enabled native Kubernetes host. The latter requires the updated SRW workspace image
-and an available StorageClass; its harness runs in a separate container over SSH.
+an enabled native Kubernetes host with an approved image. The latter shows an
+independently initialized, retained workspace; it requires the updated SRW workspace
+image and an available StorageClass, and a harness image that works in it over SSH.
 
 SRW stores, authorizes and resolves versioned resources through one configuration
 API. Manifest Jobs and existing UI/MCP requests use immutable execution
@@ -507,6 +508,79 @@ explicit `{}` rule allows all egress. CIDR exclusions must be strictly contained
 subnets. Configuring egress does not enable generic hosting or waive the separate
 startup-isolation verification requirement.
 
+### Approved harness images
+
+Generic hosting runs only images the operator has approved.
+`manifestHosting.approvedImages` is a list of `{name, image, description}` entries.
+Each `image` is digest-pinned (`repo[:tag]@sha256:<64 hex>`) and a Job's
+`runtime.image` must equal it exactly. The list binds administrators too: approving
+an image is the review step, and the default `[]` runs no generic image. Helm
+serializes the list into `MANIFEST_APPROVED_IMAGES`; an invalid list makes generic
+admission return `503 HostingConfigurationInvalid` before workload effects.
+
+```yaml
+manifestHosting:
+  approvedImages:
+    - name: claude-code
+      image: ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:<digest>
+      description: Claude Code harness
+```
+
+Any other image is refused with `422`: "Generic hosting runs only images on the
+installation's approved list (manifestHosting.approvedImages)."
+
+Running an approved image also needs the `custom_harness_images` capability grant
+(Admin → Grants). It is denied by default, resolves user, then project, then global,
+and administrators bypass it. Without it admission returns `403`: "Running approved
+harness images requires the 'custom_harness_images' capability grant. Ask an
+administrator to grant it (Admin → Grants)."
+
+### Approved images on unverified clusters
+
+Without `manifestHosting.networkIsolationVerified: true`, generic hosting is
+unavailable and admission returns `503 HostingCapabilityUnavailable`. An operator who
+accepts the risk can instead set
+`manifestHosting.allowApprovedImagesWithoutVerifiedIsolation: true`
+(`MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION`). On such a cluster a new
+harness pod may reach in-cluster destinations for its first seconds, until policy
+enforcement catches up. Only an approved image, run as built, executes there. With
+both values false hosting stays unavailable.
+
+### Workspace egress
+
+A workspace-attached run gets DNS plus the public internet with private ranges
+excluded. `manifestHosting.workspaceEgress` adds NetworkPolicy egress rules for
+private destinations, in the same schema as `harnessEgress`
+(`MANIFEST_WORKSPACE_EGRESS`). The rules are additive to the public default,
+validated like `harnessEgress` (invalid rules return `503 HostingConfigurationInvalid`)
+and read by new attempts. Manifests cannot enlarge them.
+
+They are installation-wide, so every generic workspace can reach every listed
+destination. Isolate runs from each other with per-run credentials for those
+services. Use namespace and pod selectors for in-cluster databases and `ipBlock` for
+host or LAN addresses:
+
+```yaml
+manifestHosting:
+  workspaceEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: graph-db
+          podSelector:
+            matchLabels:
+              app: neo4j
+      ports:
+        - protocol: TCP
+          port: 7687
+    - to:
+        - ipBlock:
+            cidr: 10.18.2.105/32
+      ports:
+        - protocol: TCP
+          port: 7474
+```
+
 Authored network profiles and VM/virtual workspaces for generic harnesses
 currently fail admission explicitly. Preparation/cache builds are supported by
 the same-cluster SRW VM adapter when enabled; generic builders remain unsupported. The reference SRW adapter keeps its
@@ -540,18 +614,10 @@ API and persists execution/attempt state in PostgreSQL. The Cilium service gate
 below exercises that complete path with real pods and retained storage. Runtime
 configuration never passes through the SRW reference harness loader.
 
-The Kubernetes backend follows these launch rules:
-
-| `command` | `args` | Process launch |
-|---|---|---|
-| Omitted | Omitted | Image ENTRYPOINT and CMD |
-| Omitted | Nonempty array | Image ENTRYPOINT with supplied arguments |
-| Array | Omitted or array | Supplied command, followed only by supplied arguments |
-| Omitted | Empty array | Rejected at execution admission; clearing CMD requires an explicit command |
-
-These rules follow [containerd's Kubernetes argument handling](https://github.com/containerd/containerd/blob/main/internal/cri/opts/spec_opts.go).
-The portable schema permits the last shape, but this backend cannot honor it
-without first resolving image entrypoint metadata. SRW adds no shell wrapper.
+The image's own `ENTRYPOINT` and `CMD` run. `command`, `args` and `probes` are
+refused at admission with "Approved harness images start with their own entrypoint;
+command, args and probes are not accepted." `config`, `env`, `resources` and
+connectors work as before. SRW adds no shell wrapper.
 
 When supplied, opaque config, task and binding descriptors are mounted read-only
 at `/run/srw/config.json`, `/run/srw/task.json` and `/run/srw/bindings.json`, with
