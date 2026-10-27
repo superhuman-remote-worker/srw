@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,16 +43,25 @@ CLI_FIXED_ENV = {
     "DISABLE_ERROR_REPORTING": "1",
 }
 
-# After an interrupt (deadline or stop), how long to wait for the CLI's final
-# ResultMessage before disconnecting regardless.
-INTERRUPT_GRACE_SECONDS = 15.0
-# How long to wait for ``disconnect()``. The SDK bounds its own close (~20 s:
-# stdin close, graceful exit, terminate, kill); it is never cancelled from here,
-# because a cancelled close skips the kill escalation. Past this the close keeps
+# Deadline path (defaults of ``run_session``'s keyword arguments): after the
+# interrupt, how long to wait for the CLI's final ResultMessage, then how long to
+# wait for ``disconnect()``. The SDK bounds its own close (~20 s: stdin close,
+# graceful exit, terminate, kill); it is never cancelled from here, because a
+# cancelled close skips the kill escalation. Past the wait the close keeps
 # running in the background and the session returns.
+INTERRUPT_GRACE_SECONDS = 15.0
 DISCONNECT_WAIT_SECONDS = 25.0
-# How long to wait for a cancelled conversation task to unwind.
+# Stop path (SIGTERM / SRW cancel; the pod has ~30 s before SIGKILL and still has
+# to write the partial result and upload). Once ``stop`` fires — before or during
+# the session, or during a deadline's grace — waiting for the ResultMessage and
+# unwinding the conversation end at most this long after it fired ...
+STOP_INTERRUPT_GRACE_SECONDS = 5.0
+# ... and the disconnect is waited for at most this long, then abandoned.
+STOP_DISCONNECT_WAIT_SECONDS = 2.0
+# How long to wait for a cancelled task to unwind (never less than the minimum,
+# so a cooperative task gets to finish even when the stop budget is spent).
 SETTLE_WAIT_SECONDS = 5.0
+SETTLE_MIN_SECONDS = 0.1
 
 
 def cli_env(
@@ -131,9 +140,13 @@ class SessionOutcome:
     """How a session ended.
 
     ``timed_out``: the wall-clock deadline fired. ``interrupted``: the stop
-    request (SIGTERM / SRW cancel) fired. At most one of them is set; either way
-    ``result`` holds the CLI's ResultMessage if one arrived within the grace.
-    ``error``: an SDK/CLI failure, described as ``"<Type>: <message>"``.
+    request (SIGTERM / SRW cancel) fired while the session was still running;
+    both are set when stop fires during the deadline's grace. Either way
+    ``result`` holds the CLI's ResultMessage if one arrived within the grace, and
+    in a race (the CLI finished as the interrupt landed) that may be a
+    ``success`` result: callers treat either flag as interrupted, whatever the
+    result says. ``error``: an SDK/CLI failure, described as
+    ``"<Type>: <message>"``.
     """
 
     result: ResultMessage | None
@@ -153,18 +166,71 @@ def _note(transcript: Transcript, payload: dict[str, Any]) -> None:
         transcript.record("harness", payload)
 
 
-async def _settle(task: asyncio.Task | None) -> None:
-    """Cancel ``task`` if still running and wait for it to finish.
+class _StopWatch:
+    """Notices ``stop`` during the shutdown waits and shortens them once it fires."""
+
+    def __init__(self, stop: asyncio.Event) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._stop = stop
+        self.waiter = asyncio.ensure_future(stop.wait())
+        self.fired_at: float | None = None
+
+    def now(self) -> float:
+        return self._loop.time()
+
+    def fired(self) -> bool:
+        if self.fired_at is None and self._stop.is_set():
+            self.fired_at = self._loop.time()
+        return self.fired_at is not None
+
+    async def wait(
+        self, task: asyncio.Future, *, end: float, stop_end: Callable[[float], float]
+    ) -> bool:
+        """Wait for ``task`` until ``end``; once stop fires, until ``stop_end(fired_at)``
+        if that is sooner. Returns whether ``task`` finished. Never cancels it."""
+        while not task.done():
+            fired = self.fired()
+            limit = min(end, stop_end(self.fired_at)) if fired else end
+            remaining = limit - self._loop.time()
+            if remaining <= 0:
+                break
+            waiters = {task}
+            if not fired and not self.waiter.done():
+                waiters.add(self.waiter)
+            await asyncio.wait(
+                waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+        return task.done()
+
+    async def close(self) -> None:
+        if not self.waiter.done():
+            self.waiter.cancel()
+            await asyncio.wait({self.waiter})
+
+
+def _stop_grace_end(fired_at: float) -> float:
+    return fired_at + STOP_INTERRUPT_GRACE_SECONDS
+
+
+async def _settle(task: asyncio.Future | None, watch: _StopWatch) -> None:
+    """Cancel ``task`` if still running and wait for it to unwind, bounded.
 
     ``asyncio.wait`` never raises the task's own exception, but a cancellation of
     the caller still propagates. A task that ignores cancellation is abandoned
-    after ``SETTLE_WAIT_SECONDS`` so the session stays bounded.
+    after ``SETTLE_WAIT_SECONDS``, or once the stop budget is spent.
     """
     if task is None:
         return
     if not task.done():
         task.cancel()
-        await asyncio.wait({task}, timeout=SETTLE_WAIT_SECONDS)
+        start = watch.now()
+        await watch.wait(
+            task,
+            end=start + SETTLE_WAIT_SECONDS,
+            stop_end=lambda fired: max(
+                _stop_grace_end(fired), start + SETTLE_MIN_SECONDS
+            ),
+        )
     if task.done() and not task.cancelled():
         task.exception()  # mark retrieved; the outcome was already taken
 
@@ -177,13 +243,21 @@ async def run_session(
     deadline_seconds: float,
     stop: asyncio.Event,
     client_factory: Any = None,
+    interrupt_grace_seconds: float = INTERRUPT_GRACE_SECONDS,
+    disconnect_wait_seconds: float = DISCONNECT_WAIT_SECONDS,
 ) -> SessionOutcome:
     """Run ``prompt`` to the first ResultMessage, the deadline or ``stop``.
 
     Never raises for SDK/CLI failures (they become ``error``);
     ``asyncio.CancelledError`` propagates after the client is disconnected.
-    After an interrupt it waits up to ``INTERRUPT_GRACE_SECONDS`` for the
-    ResultMessage, then disconnects regardless.
+
+    Deadline: interrupt, wait up to ``interrupt_grace_seconds`` for the
+    ResultMessage, then disconnect (waited for up to
+    ``disconnect_wait_seconds``). Stop (before or during the session, or during
+    a deadline's grace): everything up to the disconnect ends at most
+    ``STOP_INTERRUPT_GRACE_SECONDS`` after stop fired, and the disconnect is
+    waited for at most ``STOP_DISCONNECT_WAIT_SECONDS``, so the entrypoint keeps
+    most of the pod's grace period for the partial result and the upload.
     """
     outcome = SessionOutcome(
         result=None, timed_out=False, interrupted=False, error=None
@@ -195,10 +269,10 @@ async def run_session(
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.0, float(deadline_seconds))
+    watch = _StopWatch(stop)
     client: Any = None
     connected = False
     conversation: asyncio.Task | None = None
-    stop_waiter: asyncio.Task | None = None
     try:
         from claude_agent_sdk import ResultMessage
 
@@ -222,23 +296,32 @@ async def run_session(
             return None
 
         conversation = asyncio.create_task(converse())
-        stop_waiter = asyncio.create_task(stop.wait())
         await asyncio.wait(
-            {conversation, stop_waiter},
+            {conversation, watch.waiter},
             timeout=max(0.0, deadline - loop.time()),
             return_when=asyncio.FIRST_COMPLETED,
         )
         if not conversation.done():
-            if stop.is_set():
+            if watch.fired():
                 outcome.interrupted = True
-                _note(transcript, {"event": "stop"})
+                _note(transcript, {"event": "stop", "phase": "session"})
             else:
                 outcome.timed_out = True
                 _note(
                     transcript,
                     {"event": "deadline", "deadlineSeconds": deadline_seconds},
                 )
-            await _interrupt(client, conversation, connected, transcript)
+            await _interrupt(
+                client,
+                conversation,
+                connected=connected,
+                transcript=transcript,
+                watch=watch,
+                grace=interrupt_grace_seconds,
+            )
+            if watch.fired() and not outcome.interrupted:
+                outcome.interrupted = True
+                _note(transcript, {"event": "stop", "phase": "deadline_grace"})
         if not conversation.done():
             _note(transcript, {"event": "no_result_after_interrupt"})
         elif conversation.cancelled():
@@ -256,10 +339,10 @@ async def run_session(
         outcome.error = _describe(exc)
         _note(transcript, {"event": "error", "error": outcome.error})
     finally:
-        await _settle(stop_waiter)
-        await _settle(conversation)
+        await _settle(conversation, watch)
         if client is not None:
-            await _disconnect(client, transcript)
+            await _disconnect(client, transcript, watch, disconnect_wait_seconds)
+        await watch.close()
     _note(
         transcript,
         {
@@ -274,36 +357,59 @@ async def run_session(
 
 
 async def _interrupt(
-    client: Any, conversation: asyncio.Task, connected: bool, transcript: Transcript
+    client: Any,
+    conversation: asyncio.Task,
+    *,
+    connected: bool,
+    transcript: Transcript,
+    watch: _StopWatch,
+    grace: float,
 ) -> None:
     """Interrupt the CLI and give the conversation the grace to deliver a result.
 
-    Before the client is connected there is nothing to interrupt: the caller
-    cancels the conversation. If the interrupt itself fails the CLI is not
-    listening, so waiting the grace out would not help either.
+    The interrupt request and the wait for the result share one grace window,
+    shortened to the stop budget once stop fires. Before the client is
+    connected there is nothing to interrupt: the caller cancels the
+    conversation. If the interrupt itself fails the CLI is not listening, so
+    waiting the grace out would not help either.
     """
     if not connected:
         _note(transcript, {"event": "interrupt_skipped", "reason": "not_connected"})
         return
-    loop = asyncio.get_running_loop()
-    grace = INTERRUPT_GRACE_SECONDS
-    grace_end = loop.time() + grace
-    try:
-        await asyncio.wait_for(client.interrupt(), timeout=grace)
-    except Exception as exc:  # noqa: BLE001 - includes TimeoutError
-        _note(transcript, {"event": "interrupt_failed", "error": _describe(exc)})
+    grace_end = watch.now() + grace
+    interrupting = asyncio.ensure_future(client.interrupt())
+    if not await watch.wait(interrupting, end=grace_end, stop_end=_stop_grace_end):
+        await _settle(interrupting, watch)
+        _note(
+            transcript,
+            {"event": "interrupt_failed", "error": "no answer within the grace"},
+        )
+        return
+    exc = None if interrupting.cancelled() else interrupting.exception()
+    if interrupting.cancelled() or exc is not None:
+        error = _describe(exc) if exc is not None else "cancelled"
+        _note(transcript, {"event": "interrupt_failed", "error": error})
         return
     _note(transcript, {"event": "interrupt_sent"})
-    await asyncio.wait({conversation}, timeout=max(0.0, grace_end - loop.time()))
+    await watch.wait(conversation, end=grace_end, stop_end=_stop_grace_end)
 
 
-async def _disconnect(client: Any, transcript: Transcript) -> None:
+async def _disconnect(
+    client: Any, transcript: Transcript, watch: _StopWatch, seconds: float
+) -> None:
+    """Disconnect, waiting at most ``seconds`` (``STOP_DISCONNECT_WAIT_SECONDS``
+    once stop has fired); the close is never cancelled, only abandoned."""
     closing = asyncio.ensure_future(client.disconnect())
-    done, _ = await asyncio.wait({closing}, timeout=DISCONNECT_WAIT_SECONDS)
+    start = watch.now()
+    done = await watch.wait(
+        closing,
+        end=start + seconds,
+        stop_end=lambda fired: max(fired, start) + STOP_DISCONNECT_WAIT_SECONDS,
+    )
     if not done:
-        _note(transcript, {"event": "disconnect_timeout"})
+        _note(transcript, {"event": "disconnect_abandoned"})
         return
-    exc = closing.exception()
+    exc = None if closing.cancelled() else closing.exception()
     if exc is not None:
         _note(transcript, {"event": "disconnect_failed", "error": _describe(exc)})
 

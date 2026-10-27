@@ -59,6 +59,7 @@ class FakeClient:
         fail_receive=None,
         fail_connect=None,
         fail_interrupt=None,
+        hang_disconnect=False,
     ):
         self.options = options
         self.messages = list(messages)
@@ -67,11 +68,13 @@ class FakeClient:
         self.fail_receive = fail_receive
         self.fail_connect = fail_connect
         self.fail_interrupt = fail_interrupt
+        self.hang_disconnect = hang_disconnect
         self.prompts = []
         self.connected = False
         self.interrupted = False
         self.disconnected = False
         self._answer = asyncio.Event()
+        self._release_disconnect = asyncio.Event()
 
     async def connect(self):
         if self.fail_connect is not None:
@@ -98,7 +101,12 @@ class FakeClient:
             self._answer.set()
 
     async def disconnect(self):
-        self.disconnected = True
+        self.disconnected = True  # called; with hang_disconnect it never returns
+        if self.hang_disconnect:
+            await self._release_disconnect.wait()
+
+    def release_disconnect(self):
+        self._release_disconnect.set()
 
 
 def _factory(clients, messages=(), **kwargs):
@@ -267,11 +275,8 @@ async def test_run_session_turns_connect_failures_into_error(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_session_gives_up_when_the_interrupt_gets_no_answer(
-    tmp_path, monkeypatch
-):
+async def test_run_session_gives_up_when_the_interrupt_gets_no_answer(tmp_path):
     _sdk()
-    monkeypatch.setattr(session_module, "INTERRUPT_GRACE_SECONDS", 0.3)
     clients = []
     transcript = Transcript(tmp_path / "t.jsonl")
     started = time.monotonic()
@@ -284,6 +289,7 @@ async def test_run_session_gives_up_when_the_interrupt_gets_no_answer(
             deadline_seconds=0.2,
             stop=asyncio.Event(),
             client_factory=_factory(clients, hang=True, answer_interrupt=False),
+            interrupt_grace_seconds=0.3,
         ),
         timeout=5,
     )
@@ -291,6 +297,82 @@ async def test_run_session_gives_up_when_the_interrupt_gets_no_answer(
     assert time.monotonic() - started < 0.2 + 0.3 + 1.0
     assert outcome.timed_out is True and outcome.result is None
     assert clients[0].interrupted and clients[0].disconnected
+
+
+@pytest.mark.asyncio
+async def test_run_session_stop_path_fits_the_pod_grace_period(tmp_path):
+    """SIGTERM with a wedged CLI: no interrupt answer, a disconnect that hangs."""
+    _sdk()
+    clients = []
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, stop.set)
+    transcript = Transcript(tmp_path / "t.jsonl")
+    started = time.monotonic()
+    outcome = await asyncio.wait_for(
+        run_session(
+            "p",
+            None,
+            transcript=transcript,
+            deadline_seconds=3600,
+            stop=stop,
+            client_factory=_factory(
+                clients, hang=True, answer_interrupt=False, hang_disconnect=True
+            ),
+        ),
+        timeout=30,
+    )
+    elapsed = time.monotonic() - started
+    transcript.close()
+    clients[0].release_disconnect()
+    await asyncio.sleep(0)
+    # 0.2 s + STOP_INTERRUPT_GRACE_SECONDS (5) + STOP_DISCONNECT_WAIT_SECONDS (2)
+    assert elapsed < 9
+    assert outcome.interrupted is True and outcome.timed_out is False
+    assert outcome.result is None and outcome.error is None
+    assert clients[0].interrupted and clients[0].disconnected
+    events = [
+        line["payload"]["event"]
+        for line in _lines(tmp_path / "t.jsonl")
+        if line["kind"] == "harness"
+    ]
+    assert "no_result_after_interrupt" in events and "disconnect_abandoned" in events
+
+
+@pytest.mark.asyncio
+async def test_run_session_stop_during_the_deadline_grace_switches_to_the_stop_budget(
+    tmp_path, monkeypatch
+):
+    _sdk()
+    monkeypatch.setattr(session_module, "STOP_INTERRUPT_GRACE_SECONDS", 1.0)
+    clients = []
+    stop = asyncio.Event()
+    # The deadline fires at 0.2 s; stop arrives 0.3 s into the 15 s grace.
+    asyncio.get_running_loop().call_later(0.5, stop.set)
+    transcript = Transcript(tmp_path / "t.jsonl")
+    started = time.monotonic()
+    outcome = await asyncio.wait_for(
+        run_session(
+            "p",
+            None,
+            transcript=transcript,
+            deadline_seconds=0.2,
+            stop=stop,
+            client_factory=_factory(clients, hang=True, answer_interrupt=False),
+        ),
+        timeout=30,
+    )
+    elapsed = time.monotonic() - started
+    transcript.close()
+    # 0.5 s + the (patched) 1 s stop budget, far under the 15 s deadline grace.
+    assert elapsed < 3
+    assert outcome.timed_out is True and outcome.interrupted is True
+    assert outcome.result is None and clients[0].disconnected
+    stops = [
+        line["payload"]
+        for line in _lines(tmp_path / "t.jsonl")
+        if line["kind"] == "harness" and line["payload"]["event"] == "stop"
+    ]
+    assert stops and stops[0]["phase"] == "deadline_grace"
 
 
 @pytest.mark.asyncio
