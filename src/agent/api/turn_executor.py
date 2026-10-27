@@ -96,6 +96,7 @@ from agent.api.workspace_upgrade_seed import (
     claim_bundle_workspace_upgrade_seed,
     seed_upgraded_workspace,
 )
+from agent.core.thread_messages import content_text
 from shared.event_journal import append_system_frame, bump_epoch
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
@@ -623,12 +624,7 @@ def _message_text(msg: Any) -> str:
     """Best-effort text of a message's content (list content is flattened
     exactly like ``_serialize_message_row`` does at persist time, so a
     restored row's stored content compares equal)."""
-    content = getattr(msg, "content", None)
-    if isinstance(content, list):
-        return " ".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
-        )
-    return content if isinstance(content, str) else str(content or "")
+    return content_text(getattr(msg, "content", None))
 
 
 def attach_fingerprint(attach: Dict[str, Any]) -> str:
