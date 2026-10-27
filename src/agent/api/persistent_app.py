@@ -8843,14 +8843,28 @@ def _sanitize_restored_history(restored: list) -> list:
     native blocks (``provider_raw``): reasoning a different family produced
     is stripped, and tool-call ids are remapped to the bound model's accepted
     format. No-op (beyond the pairing re-check) when the history is native to
-    the bound model.
+    the bound model. A tool's image row keeps its image only for a model with
+    vision: a text-only one gets the row's text, as every restore did before
+    the rows kept the image.
     """
+    from langchain_core.messages import HumanMessage
+
     from agent.core.context import sanitize_history_for_provider_boundary
+    from agent.core.thread_messages import content_text
 
     model = ""
+    multimodal = True
     if _session is not None:
-        model = getattr(getattr(_session, "config", None), "llm", None)
-        model = getattr(model, "model", "") or ""
+        llm = getattr(getattr(_session, "config", None), "llm", None)
+        model = getattr(llm, "model", "") or ""
+        multimodal = getattr(llm, "multimodal", None) is not False
+    if not multimodal:
+        restored = [
+            message.model_copy(update={"content": content_text(message.content)})
+            if isinstance(message, HumanMessage) and isinstance(message.content, list)
+            else message
+            for message in restored
+        ]
     return sanitize_history_for_provider_boundary(restored, model)
 
 
@@ -8908,13 +8922,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     A ``role='context'`` row comes back as the typed context entry it was
     (its stored text, never re-rendered) and folds into its carrier at the
     next request build; an unreadable one is dropped, and the planner
-    re-injects what is still relevant.
+    re-injects what is still relevant. A tool's image row comes back with its
+    image, and a tool call with its arguments in the live key order, so the
+    restored request sends the bytes the live one did.
     """
     import uuid as _uuid
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+    from agent.core.thread_messages import (
+        restored_human_content,
+        restored_tool_call_args,
+    )
     from shared.runtime.core.context_entries import context_entry_from_row
-    from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
+    from shared.runtime.core.message_markers import (
+        PERSIST_ROLE_CONTEXT,
+        PERSIST_ROLE_EVENT,
+        PERSIST_ROLE_KEY,
+    )
 
     restored: list = []
     pending_tool_call_ids: list[str] = []
@@ -8931,7 +8955,9 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
         msg_id = str(db_msg.get("id") or _uuid.uuid4())
 
         if role in ("human", "user"):
-            restored.append(HumanMessage(content=content, id=msg_id))
+            restored.append(
+                HumanMessage(content=restored_human_content(db_msg), id=msg_id)
+            )
 
         elif role == "event":
             # System-injected notice (a worker job this session created reached
@@ -8961,7 +8987,15 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     )
                 )
             else:
-                restored.append(HumanMessage(content=content, id=msg_id))
+                # With its persist role, as the live message carried it: a
+                # restored notice that is saved again stays an event row.
+                restored.append(
+                    HumanMessage(
+                        content=restored_human_content(db_msg),
+                        additional_kwargs={PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT},
+                        id=msg_id,
+                    )
+                )
 
         elif role == PERSIST_ROLE_CONTEXT:
             # A typed context entry (append-only context injection). The
@@ -8981,7 +9015,7 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     {
                         "id": tc.get("id", ""),
                         "name": tc.get("name", ""),
-                        "args": tc.get("args", {}),
+                        "args": restored_tool_call_args(tc),
                     }
                     for tc in tool_calls
                 ]

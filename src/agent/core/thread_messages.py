@@ -9,12 +9,13 @@ re-exports these names unchanged (its tests import them from there).
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from shared.runtime.llm.reasoning_chat import extract_reasoning_text_from_block
 from shared.runtime.core.context_entries import SRW_INJECTION_KEY
-from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT, PERSIST_ROLE_EVENT
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,89 @@ def native_ai_fields(provider_raw: Any) -> Dict[str, Any]:
     return fields
 
 
+#: provider_raw key for the content parts of a human or event row (a tool's
+#: image row), as JSON text: jsonb would reorder the keys of each part.
+HUMAN_CONTENT_KEY = "human_content"
+#: tool_calls entry key: the call's arguments as JSON text.
+ARGUMENTS_KEY = "arguments"
+
+
+def content_text(content: Any) -> str:
+    """The text the ``content`` column stores for a message's content.
+
+    Only text-bearing parts of list content join. Joining every part stored a
+    [thinking, tool_use] turn as " ", which a restore replays as a
+    whitespace-only text block that Anthropic rejects, and a tool's image row
+    as its text plus a trailing space.
+    """
+    if isinstance(content, list):
+        parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
+        return " ".join(part for part in parts if part)
+    return content if isinstance(content, str) else str(content or "")
+
+
+def _jsonb_key_order(value: Any) -> Any:
+    """``value`` with every object's keys in the order jsonb returns them:
+    shorter keys first, keys of one length in byte order."""
+    if isinstance(value, dict):
+        return {
+            key: _jsonb_key_order(value[key])
+            for key in sorted(
+                value, key=lambda k: (len(str(k).encode()), str(k).encode())
+            )
+        }
+    if isinstance(value, list):
+        return [_jsonb_key_order(item) for item in value]
+    return value
+
+
+def _arguments_text(args: Any) -> Optional[str]:
+    """A tool call's arguments as JSON text, when jsonb would reorder them.
+
+    ``tool_calls`` is a jsonb column, which keeps no key order, and the
+    provider clients serialise ``args`` in its own order (``json.dumps``). A
+    restored call whose keys came back reordered sends other bytes than the
+    live one: a cache miss from that message on. The text keeps the order;
+    ``args`` stays for every other reader.
+    """
+    if not isinstance(args, dict):
+        return None
+    text = json.dumps(args)
+    if text == json.dumps(_jsonb_key_order(args)):
+        return None
+    return text
+
+
+def restored_tool_call_args(call: Mapping[str, Any]) -> Any:
+    """A stored tool call's ``args``, in the key order the live call had."""
+    text = call.get(ARGUMENTS_KEY)
+    if isinstance(text, str):
+        try:
+            return json.loads(text)
+        except ValueError:
+            logger.debug("Unreadable stored arguments of tool call %s", call.get("id"))
+    return call.get("args", {})
+
+
+def restored_human_content(row: Mapping[str, Any]) -> Any:
+    """The content of a human or event row as the live history held it.
+
+    A tool's image row keeps its parts (text, image) in ``provider_raw``; the
+    ``content`` column holds their text only, for the transcript.
+    """
+    raw = row.get("provider_raw")
+    text = raw.get(HUMAN_CONTENT_KEY) if isinstance(raw, dict) else None
+    if isinstance(text, str):
+        try:
+            parts = json.loads(text)
+        except ValueError:
+            parts = None
+            logger.debug("Unreadable stored content parts of row %s", row.get("id"))
+        if isinstance(parts, list) and parts:
+            return parts
+    return row.get("content") or ""
+
+
 def _serialize_message_row(
     msg: Any,
     turn_number: int,
@@ -193,6 +277,9 @@ def _serialize_message_row(
                 "args": t.get("args"),
                 "id": t.get("id"),
             }
+            arguments = _arguments_text(t.get("args"))
+            if arguments is not None:
+                entry[ARGUMENTS_KEY] = arguments
             decision = (tool_decisions or {}).get(t.get("id") or "")
             if decision:
                 entry["decision"] = decision
@@ -202,13 +289,13 @@ def _serialize_message_row(
     thinking = _extract_thinking(msg) if role == "ai" else None
     provider_raw = _native_provider_raw(msg) if role == "ai" else None
     tool_call_id = getattr(msg, "tool_call_id", None) if role == "tool" else None
-    # Normalize content for Anthropic list-of-dicts format
-    # Only text-bearing parts join: a [thinking, tool_use] turn persisted as
-    # " ", which a restore replays as a whitespace-only text block that
-    # Anthropic rejects.
     if isinstance(content, list):
-        parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
-        content = " ".join(part for part in parts if part)
+        if role in ("human", PERSIST_ROLE_EVENT):
+            # A tool's image row: the image and the text parts as the live
+            # history holds them, so a restore sends what the live loop sends
+            # (the image included) and a context entry folds in as a part.
+            provider_raw = {HUMAN_CONTENT_KEY: json.dumps(content)}
+        content = content_text(content)
     # Attach metrics only to AI messages (not tool results)
     msg_metrics = metrics if role == "ai" else None
     row: Dict[str, Any] = {
@@ -251,9 +338,14 @@ async def _persist_one_message(
 
 
 __all__ = [
+    "ARGUMENTS_KEY",
+    "HUMAN_CONTENT_KEY",
     "_ROLE_MAP",
     "_extract_thinking",
     "_persist_one_message",
     "_serialize_message_row",
+    "content_text",
     "native_ai_fields",
+    "restored_human_content",
+    "restored_tool_call_args",
 ]
