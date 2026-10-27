@@ -628,6 +628,21 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: MANIFEST_HARNESS_EGRESS
+            - name: MANIFEST_APPROVED_IMAGES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_APPROVED_IMAGES
+            - name: MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION
+            - name: MANIFEST_WORKSPACE_EGRESS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MANIFEST_WORKSPACE_EGRESS
             - name: WORKSPACE_STORAGE_CLASS
               valueFrom:
                 configMapKeyRef:

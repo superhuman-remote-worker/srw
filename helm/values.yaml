@@ -142,6 +142,17 @@ manifestHosting:
   # Explicitly select the provider/gateway and any needed DNS destination.
   # Rules apply to new attempts. Cancel active attempts for immediate revocation.
   harnessEgress: []
+  # Harness images admins may run through generic manifest Jobs, as
+  # {name, image, description}. Images must be digest-pinned (repo[:tag]@sha256:...).
+  # The list binds administrators too: [] runs no generic image.
+  approvedImages: []
+  # Accept the documented risk of running approved images on a cluster that
+  # fails the network-isolation gate (networkIsolationVerified: false).
+  allowApprovedImagesWithoutVerifiedIsolation: false
+  # Extra NetworkPolicy egress rules for workspace-attached harness runs, same
+  # shape as harnessEgress. Additive to the public-internet default and
+  # installation-wide (per-run credentials isolate runs from each other).
+  workspaceEgress: []
 
 # =============================================================================
 # Connector drivers: service-plane hosting (connector drivers D5)

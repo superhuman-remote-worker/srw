@@ -99,3 +99,14 @@ def test_schema_is_draft_2020_12_and_closed():
     assert APPROVED_IMAGES_SCHEMA["type"] == "array"
     assert APPROVED_IMAGES_SCHEMA["items"]["additionalProperties"] is False
     assert set(APPROVED_IMAGES_SCHEMA["items"]["required"]) == {"name", "image"}
+
+
+def test_helm_schema_matches_the_server_structure_contracts():
+    from pathlib import Path
+
+    from orchestrator.services.manifest_harness_egress import HARNESS_EGRESS_SCHEMA
+
+    path = Path(__file__).resolve().parents[1] / "helm/values.schema.json"
+    props = json.loads(path.read_text())["properties"]["manifestHosting"]["properties"]
+    assert props["approvedImages"] == APPROVED_IMAGES_SCHEMA
+    assert props["workspaceEgress"] == HARNESS_EGRESS_SCHEMA

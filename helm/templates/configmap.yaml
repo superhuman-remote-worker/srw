@@ -309,6 +309,9 @@ data:
   MANIFEST_NAMESPACE: {{ .Values.manifestHosting.namespace | default (printf "%s-native" (include "srw.fullname" . | trunc 56 | trimSuffix "-")) | quote }}
   MANIFEST_MAX_CONCURRENT_JOBS: {{ .Values.manifestHosting.maxConcurrentJobs | quote }}
   MANIFEST_HARNESS_EGRESS: {{ toJson .Values.manifestHosting.harnessEgress | quote }}
+  MANIFEST_APPROVED_IMAGES: {{ toJson .Values.manifestHosting.approvedImages | quote }}
+  MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION: {{ .Values.manifestHosting.allowApprovedImagesWithoutVerifiedIsolation | quote }}
+  MANIFEST_WORKSPACE_EGRESS: {{ toJson .Values.manifestHosting.workspaceEgress | quote }}
   # PostgreSQL (App DB) — non-secret connection parts. The DSN is composed
   # at runtime from these + POSTGRES_USER/POSTGRES_PASSWORD (Secret), with
   # URL-quoting applied to the credentials. Storing a full DATABASE_URL in

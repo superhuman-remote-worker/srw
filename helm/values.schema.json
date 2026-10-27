@@ -1997,6 +1997,220 @@
               }
             }
           }
+        },
+        "approvedImages": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "image"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+              },
+              "image": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?::[0-9]{1,5})?(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[a-f0-9]{64}$"
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 512
+              }
+            }
+          }
+        },
+        "allowApprovedImagesWithoutVerifiedIsolation": {
+          "type": "boolean"
+        },
+        "workspaceEgress": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "to": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "ipBlock": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "cidr": {
+                          "type": "string",
+                          "minLength": 3
+                        },
+                        "except": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 3
+                          }
+                        }
+                      },
+                      "required": [
+                        "cidr"
+                      ]
+                    },
+                    "namespaceSelector": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "matchLabels": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 317,
+                            "pattern": "^([a-z0-9]([a-z0-9.-]*[a-z0-9])?/)?[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                          },
+                          "additionalProperties": {
+                            "type": "string",
+                            "maxLength": 63,
+                            "pattern": "^$|^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                          }
+                        },
+                        "matchExpressions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "key": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 317,
+                                "pattern": "^([a-z0-9]([a-z0-9.-]*[a-z0-9])?/)?[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                              },
+                              "operator": {
+                                "enum": [
+                                  "In",
+                                  "NotIn",
+                                  "Exists",
+                                  "DoesNotExist"
+                                ]
+                              },
+                              "values": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "maxLength": 63,
+                                  "pattern": "^$|^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                                }
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "operator"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "podSelector": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "matchLabels": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 317,
+                            "pattern": "^([a-z0-9]([a-z0-9.-]*[a-z0-9])?/)?[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                          },
+                          "additionalProperties": {
+                            "type": "string",
+                            "maxLength": 63,
+                            "pattern": "^$|^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                          }
+                        },
+                        "matchExpressions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                              "key": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 317,
+                                "pattern": "^([a-z0-9]([a-z0-9.-]*[a-z0-9])?/)?[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                              },
+                              "operator": {
+                                "enum": [
+                                  "In",
+                                  "NotIn",
+                                  "Exists",
+                                  "DoesNotExist"
+                                ]
+                              },
+                              "values": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "maxLength": 63,
+                                  "pattern": "^$|^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+                                }
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "operator"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "ports": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "protocol": {
+                      "enum": [
+                        "TCP",
+                        "UDP",
+                        "SCTP"
+                      ]
+                    },
+                    "port": {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 65535
+                        },
+                        {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 15,
+                          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                        }
+                      ]
+                    },
+                    "endPort": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

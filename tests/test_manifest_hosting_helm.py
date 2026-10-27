@@ -268,3 +268,72 @@ def test_operator_provider_and_dns_rules_reach_the_installed_json_setting():
             "ports": [{"port": 53, "protocol": "UDP"}],
         },
     ]
+
+
+def _config(docs, key):
+    return next(
+        d for d in docs if d["kind"] == "ConfigMap" and key in d.get("data", {})
+    )["data"][key]
+
+
+def _env(docs, name):
+    """The env entry on whichever Deployment container already receives MANIFEST_HARNESS_EGRESS."""
+    for doc in docs:
+        if doc["kind"] != "Deployment":
+            continue
+        for container in doc["spec"]["template"]["spec"].get("containers", []):
+            names = {e["name"] for e in container.get("env", [])}
+            if "MANIFEST_HARNESS_EGRESS" in names:
+                return next(e for e in container["env"] if e["name"] == name)
+    raise AssertionError(f"{name} is not wired into the orchestrator container")
+
+
+def test_approved_images_and_opt_in_default_closed():
+    docs = render()
+    assert json.loads(_config(docs, "MANIFEST_APPROVED_IMAGES")) == []
+    assert (
+        _config(docs, "MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION")
+        == "false"
+    )
+    assert json.loads(_config(docs, "MANIFEST_WORKSPACE_EGRESS")) == []
+    for name in (
+        "MANIFEST_APPROVED_IMAGES",
+        "MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION",
+        "MANIFEST_WORKSPACE_EGRESS",
+    ):
+        assert _env(docs, name)["valueFrom"]["configMapKeyRef"]["key"] == name
+
+
+def test_approved_images_reach_the_installed_json_setting():
+    digest = "sha256:" + "b" * 64
+    docs = render(
+        "manifestHosting.approvedImages[0].name=claude-code",
+        f"manifestHosting.approvedImages[0].image=ghcr.io/org/harness@{digest}",
+        "manifestHosting.approvedImages[0].description=Claude Code",
+        "manifestHosting.allowApprovedImagesWithoutVerifiedIsolation=true",
+        "manifestHosting.workspaceEgress[0].to[0].ipBlock.cidr=10.18.2.0/24",
+        "manifestHosting.workspaceEgress[0].ports[0].port=7687",
+    )
+    assert json.loads(_config(docs, "MANIFEST_APPROVED_IMAGES")) == [
+        {
+            "name": "claude-code",
+            "image": f"ghcr.io/org/harness@{digest}",
+            "description": "Claude Code",
+        }
+    ]
+    assert (
+        _config(docs, "MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION")
+        == "true"
+    )
+    assert json.loads(_config(docs, "MANIFEST_WORKSPACE_EGRESS")) == [
+        {"to": [{"ipBlock": {"cidr": "10.18.2.0/24"}}], "ports": [{"port": 7687}]}
+    ]
+
+
+def test_invalid_approved_image_entry_fails_render():
+    result = render(
+        "manifestHosting.approvedImages[0].name=x",
+        "manifestHosting.approvedImages[0].image=ghcr.io/org/harness:latest",
+        check=False,
+    )
+    assert result.returncode != 0
