@@ -613,6 +613,50 @@ async def test_opt_in_admits_approved_images_on_an_unverified_cluster(database, 
 
 
 @pytest.mark.asyncio
+async def test_opt_in_job_reaches_launch_on_an_unverified_cluster(database):
+    # Unverified isolation, the administrator's opt-in, an approved digest and a
+    # member holding the custom_harness_images grant: the Job gets its pod.
+    user = await _approved_non_admin(database)
+    await database.execute(
+        "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+        "VALUES('user',$1,'custom_harness_images','true'::jsonb)",
+        user["id"],
+    )
+    execution, runtime, _, _, work_id, snapshot = await admit(
+        database,
+        user,
+        assignment(),
+        native_hosting_enabled=False,
+        allow_unverified_approved_images=True,
+    )
+    assert runtime.launches == []
+    await execution.reconcile_one(str(snapshot["id"]))
+    assert (await database.get_job(work_id))["status"] == "processing"
+    [plan] = runtime.launches
+    assert plan.pod["spec"]["containers"][0]["image"] == PLAIN_IMAGE
+
+
+@pytest.mark.asyncio
+async def test_opt_in_withdrawn_before_reconcile_launches_nothing(database, actor):
+    execution, runtime, _, _, work_id, snapshot = await admit(
+        database,
+        actor,
+        assignment(),
+        native_hosting_enabled=False,
+        allow_unverified_approved_images=True,
+    )
+    # The administrator turns the opt-in off between admission and reconcile.
+    execution.allow_unverified_approved_images = False
+    await execution.reconcile_one(str(snapshot["id"]))
+    job = await database.get_job(work_id)
+    assert job["status"] == "failed"
+    assert job["error_message"] == (
+        "Native hosting capability is no longer enabled; no new process was launched."
+    )
+    assert runtime.launches == []
+
+
+@pytest.mark.asyncio
 async def test_both_flags_off_keeps_generic_hosting_unavailable(database, actor):
     with pytest.raises(HTTPException) as unavailable:
         await admit(
