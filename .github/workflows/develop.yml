@@ -617,6 +617,7 @@ jobs:
       vm-controller: ${{ steps.check.outputs.vm-controller }}
       vm-preparer: ${{ steps.check.outputs.vm-preparer }}
       driver-shim: ${{ steps.check.outputs.driver-shim }}
+      harness-claude-code: ${{ steps.check.outputs.harness-claude-code }}
       driver-mcp-front: ${{ steps.check.outputs.driver-mcp-front }}
       driver-git-swap: ${{ steps.check.outputs.driver-git-swap }}
       driver-gpt-live-sip: ${{ steps.check.outputs.driver-gpt-live-sip }}
@@ -639,6 +640,7 @@ jobs:
       vm-controller-sha: ${{ steps.check.outputs.vm-controller-sha }}
       vm-preparer-sha: ${{ steps.check.outputs.vm-preparer-sha }}
       driver-shim-sha: ${{ steps.check.outputs.driver-shim-sha }}
+      harness-claude-code-sha: ${{ steps.check.outputs.harness-claude-code-sha }}
       driver-mcp-front-sha: ${{ steps.check.outputs.driver-mcp-front-sha }}
       driver-git-swap-sha: ${{ steps.check.outputs.driver-git-swap-sha }}
       driver-gpt-live-sip-sha: ${{ steps.check.outputs.driver-gpt-live-sip-sha }}
@@ -942,6 +944,11 @@ jobs:
           DRIVER_SHIM_SHA=$(last_input_sha "${DRIVER_SHIM_PATHS[@]}")
           DRIVER_SHIM=$(image_missing driver-shim "$DRIVER_SHIM_SHA")
 
+          # The Claude Code harness image: Python package, pinned requirements.
+          HARNESS_CLAUDE_CODE_PATHS=(harnesses/claude-code/ .dockerignore docker/Dockerfile.harness-claude-code)
+          HARNESS_CLAUDE_CODE_SHA=$(last_input_sha "${HARNESS_CLAUDE_CODE_PATHS[@]}")
+          HARNESS_CLAUDE_CODE=$(image_missing harness-claude-code "$HARNESS_CLAUDE_CODE_SHA")
+
           # The managed MCP front (D5a): one static Go binary, stdlib only,
           # and the stdio bridge its image carries (D5b, drivers/mcp-bridge).
           DRIVER_MCP_FRONT_PATHS=(drivers/mcp-front/ drivers/mcp-bridge/ .dockerignore docker/Dockerfile.driver-mcp-front)
@@ -1081,6 +1088,7 @@ jobs:
           echo "  mcp=$MCP  workspace=$WORKSPACE"
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1"
           echo "  vm-preparer=$VM_PREPARER  driver-shim=$DRIVER_SHIM (${DRIVER_SHIM_SHA::7})"
+          echo "  harness-claude-code=$HARNESS_CLAUDE_CODE (${HARNESS_CLAUDE_CODE_SHA::7})"
           echo "  driver-mcp-front=$DRIVER_MCP_FRONT (${DRIVER_MCP_FRONT_SHA::7})"
           echo "  driver-git-swap=$DRIVER_GIT_SWAP (${DRIVER_GIT_SWAP_SHA::7})"
           echo "  driver-gpt-live-sip=$DRIVER_GPT_LIVE_SIP (${DRIVER_GPT_LIVE_SIP_SHA::7})"
@@ -1107,6 +1115,8 @@ jobs:
             echo "vm-preparer-sha=$VM_PREPARER_SHA"
             echo "driver-shim=$DRIVER_SHIM"
             echo "driver-shim-sha=$DRIVER_SHIM_SHA"
+            echo "harness-claude-code=$HARNESS_CLAUDE_CODE"
+            echo "harness-claude-code-sha=$HARNESS_CLAUDE_CODE_SHA"
             echo "driver-mcp-front=$DRIVER_MCP_FRONT"
             echo "driver-mcp-front-sha=$DRIVER_MCP_FRONT_SHA"
             echo "driver-git-swap=$DRIVER_GIT_SWAP"
@@ -2316,6 +2326,78 @@ jobs:
             SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
+  # The Claude Code harness image (harnesses/claude-code): built and published
+  # for operators to approve by digest in manifestHosting.approvedImages. Its
+  # Python tests run in test-python; the chart is not stamped with it.
+  build-harness-claude-code:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.harness-claude-code == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.harness-claude-code-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-harness-claude-code
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.harness-claude-code
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=harness-claude-code
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # The development MCP server (D5a) the front's integration tests and the
   # k3d gate run behind it: vetted and tested when it changes, never built or

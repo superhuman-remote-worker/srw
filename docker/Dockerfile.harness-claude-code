@@ -1,0 +1,17 @@
+# =============================================================================
+# srw-harness-claude-code — the Claude Code harness image
+# =============================================================================
+# A generic-Job harness: reads the delivered config/task files, drives the
+# Claude Code CLI (bundled in the claude-agent-sdk wheel; needs glibc, which
+# slim Debian has) and operates the Job's workspace over SSH. No Node, no git.
+# See harnesses/claude-code/README.md.
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/harness HOME=/tmp
+COPY harnesses/claude-code/requirements.txt /harness/requirements.txt
+RUN pip install --no-cache-dir -r /harness/requirements.txt
+COPY harnesses/claude-code/srw_claude_code_harness /harness/srw_claude_code_harness
+# The CLI's local cwd mirrors the workspace root path the model sees.
+RUN mkdir -p /home/agent-host/workspace && chown -R 10001:10001 /home/agent-host
+USER 10001:10001
+ENTRYPOINT ["python3", "-m", "srw_claude_code_harness"]

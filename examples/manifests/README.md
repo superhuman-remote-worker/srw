@@ -6,6 +6,8 @@ verification state and remaining rollout decisions.
 Read [resources.yaml](resources.yaml), [referenced-job.yaml](referenced-job.yaml),
 then [project.yaml](project.yaml) for the basic composition.
 [inline-job.yaml](inline-job.yaml) describes an approved image with no SRW hooks;
+[claude-code-harness-job.yaml](claude-code-harness-job.yaml) runs the Claude Code harness image
+([README](../../harnesses/claude-code/README.md)) against a sandbox workspace and an env connector;
 [retained-job.yaml](retained-job.yaml) selects an existing workspace instance. Images, credentials,
 scopes and instance IDs in these examples are illustrative.
 

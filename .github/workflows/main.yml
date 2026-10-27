@@ -1737,6 +1737,69 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
+  # The Claude Code harness image (harnesses/claude-code): built and published
+  # for operators to approve by digest in manifestHosting.approvedImages. Its
+  # Python tests run in test-python; the chart is not stamped with it.
+  build-harness-claude-code:
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: needs.resolve-version.result == 'success'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-harness-claude-code
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.harness-claude-code
+          platforms: linux/amd64
+          push: ${{ needs.resolve-version.result == 'success' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=harness-claude-code
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
   # The managed MCP front (D5a): vetted and tested with the toolchain the
   # image builds with, then published; the release chart pins its digest.
   build-driver-mcp-front:

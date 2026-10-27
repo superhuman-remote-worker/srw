@@ -1,0 +1,53 @@
+# The Claude Code harness (harnesses/claude-code/README.md) running a data-load Job.
+# Needs: manifest hosting with the image approved, a sandbox workspace, the
+# custom_harness_images grant, and the secrets referenced below.
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: claude-code-etl-example
+  scope: {kind: Account, name: personal}
+spec:
+  task:
+    text: Load data/customers.csv into the Neo4j database described by NEO4J_URI, following schema.md.
+    data:
+      inputs:
+        - {url: https://files.example.invalid/customers.csv, path: data/customers.csv}
+        - {url: https://files.example.invalid/schema.md, path: schema.md}
+      # Presigned target for the bundle (transcript, result.json, workspace archive).
+      upload: {url: "https://archive.example.invalid/runs/42/bundle.tar.gz?signature=example", method: PUT}
+  execution:
+    expert:
+      inline:
+        runtime:
+          # Placeholder digest: substitute the digest you approved in manifestHosting.approvedImages.
+          image: ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          env:
+            # From `claude setup-token`; ANTHROPIC_API_KEY works the same way.
+            CLAUDE_CODE_OAUTH_TOKEN:
+              secretRef: {name: claude-code, key: token, scope: {kind: Account, name: personal}}
+          config:
+            version: 1
+            model: claude-sonnet-5-5
+            systemPrompt: {type: preset}
+            limits: {maxTurns: 200, maxBudgetUsd: 20, timeoutSeconds: 3600}
+            workspaceEnv: [NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD]
+    workspace:
+      template:
+        inline:
+          backend: sandbox
+          resources: {cpu: 2, memory: 4Gi, storage: 10Gi}
+    connectors:
+      database:
+        inline:
+          driver: srw.env/v1
+          config:
+            env:
+              NEO4J_URI: bolt://10.18.2.105:7687
+              NEO4J_USER: run-42
+              NEO4J_PASSWORD: {credential: password}
+          credentials:
+            password:
+              secretRef: {name: run-42-neo4j, key: password, scope: {kind: Account, name: personal}}
+  completion: {mode: ProcessExit}
+  # Includes queue time; limits.timeoutSeconds above bounds the run itself.
+  timeoutSeconds: 259200
