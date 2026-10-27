@@ -64310,6 +64310,38 @@ class PostgresDB:
             )
             return False
 
+    async def user_can_run_custom_harness_images(
+        self, user: dict, project_id: str | None
+    ) -> bool:
+        """Effective custom_harness_images grant (generic Job admission).
+
+        Admins short-circuit to True. Mirrors
+        user_can_run_unattended_operations: user, project and global scopes are
+        resolved together so a global denial cannot be widened by a user grant.
+        Fail mode is CLOSED: running an arbitrary approved image is the thing
+        being gated, and a failed read is not a capability the caller has.
+        """
+        if user.get("is_admin"):
+            return True
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]),
+                project_ids=[str(project_id)] if project_id else [],
+            )
+            from shared.runtime.core.capability_grants import resolve_grants
+
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            return bool(g.get("custom_harness_images"))
+        except Exception:
+            logger.exception(
+                "custom_harness_images grant read failed; denying custom harness"
+            )
+            return False
+
     async def user_can_autonomous_send(self, user: dict) -> bool:
         """Effective email_autonomous_send grant (unattended email send).
 

@@ -42,6 +42,7 @@ def test_catalog_keys_and_defaults():
         "catalog_authoring",
         "complete_unmerged_pr",
         "unattended_operations",
+        "custom_harness_images",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
     assert CATALOG["personal_default_experts"]["default"] is True
@@ -65,6 +66,8 @@ def test_catalog_keys_and_defaults():
     # Deny-by-default and NOT backfilled: loops and officers are unbounded
     # unattended spend, and nobody held a key for them before.
     assert CATALOG["unattended_operations"]["default"] is False
+    # Deny-by-default, not backfilled: no one held it before.
+    assert CATALOG["custom_harness_images"]["default"] is False
 
 
 def test_meet_bool_enum_list():
@@ -676,6 +679,10 @@ _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP = {
         "gates the terminal job transition against LIVE forge state at "
         "approve_job and the autonomous seal — there is no config fragment "
         "to strip, so evaluate() never reads it"
+    ),
+    "custom_harness_images": (
+        "gates generic Job admission in ManifestExecutionService.admit, not a "
+        "field evaluate() reads on an expert fragment"
     ),
 }
 

@@ -97,6 +97,9 @@ The current grant catalog covers:
   refused, and a session configuration that switches `officer.enabled` on is
   rejected. Reading a loop's state, pausing it, and stopping it stay available —
   nobody is locked out of halting work that is already running;
+- `custom_harness_images` — run an admin-approved custom harness image
+  (`manifestHosting.approvedImages`) as a generic manifest Job. Denied by
+  default; admins bypass it;
 - `complete_unmerged_pr` — approve or auto-complete a job whose delivered pull
   request has not been merged. Without it, a job that opened a pull request stays
   in review until that pull request lands: approval is refused, and a job that

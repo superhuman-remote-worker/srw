@@ -86,6 +86,12 @@ CATALOG: dict[str, dict[str, Any]] = {
     #     `complete_unmerged_pr` above).
     # Spec: knowledge-history/done/unattended_operations_grant.md.
     "unattended_operations": {"type": "bool", "default": False, "restrict_only": True},
+    # Run an admin-approved custom harness image (manifestHosting.approvedImages)
+    # as a generic manifest Job. Deny-by-default and NOT backfilled: nobody held
+    # it before. Checked at generic Job admission via
+    # `user_can_run_custom_harness_images`.
+    # Spec: knowledge-base/knowledge/superpowers/specs/2026-10-26-custom-harness-claude-code-design.md
+    "custom_harness_images": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
     "model_selection": {"type": "list", "default": None, "restrict_only": True},
