@@ -28,11 +28,12 @@ The causes, each pinned below:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from langchain_core.messages import (
@@ -540,6 +541,17 @@ async def _run_session(
 
     provider = harness.FakeProvider(SCRIPT, family)
     provider.install(monkeypatch)
+    # Gemini answers without call ids and langchain-google-genai mints a uuid4
+    # for each, which the image row quotes. Minted from 0 in every run, the
+    # warm run and the live one (whose rows are restored) mint the same ids.
+    from langchain_google_genai import chat_models as genai_chat_models
+
+    minted = itertools.count()
+    monkeypatch.setattr(
+        genai_chat_models,
+        "uuid",
+        SimpleNamespace(uuid4=lambda: UUID(int=next(minted))),
+    )
     llm_config = family.llm_config()
     llm = harness.bind_like_srw(
         create_llm(llm_config), llm_config, harness.SESSION_TOOLS
@@ -628,9 +640,9 @@ class TestTurnThreeAfterRestore:
     memory entry, through a call whose arguments jsonb reorders. Turn three's
     request must equal the live one byte for byte.
 
-    The Responses and Gemini routes also replay provider-native reasoning on
-    the assistant turns, which a restore does not rebuild yet (F1); they
-    diverge there first.
+    The Responses and Gemini routes also replay each assistant turn's native
+    blocks (reasoning items and item ids, thought parts and signatures),
+    which come back from provider_raw in the live key order.
     """
 
     @pytest.mark.asyncio
@@ -643,6 +655,9 @@ class TestTurnThreeAfterRestore:
             "anthropic-claude-proxy",
             "anthropic",
             "glm-5.2",
+            "responses-openai",
+            "responses-codex",
+            "gemini",
         ],
     )
     async def test_restored_turn_three_matches_the_live_request(
