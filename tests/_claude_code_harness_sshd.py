@@ -57,7 +57,7 @@ class LocalSshd:
         self._root = root
         self._key_dir = key_dir
         self._server: asyncssh.SSHAcceptor | None = None
-        self._children: set[asyncio.subprocess.Process] = set()
+        self._sessions: set[int] = set()
         self.access: WorkspaceAccess | None = None
         self.commands: list[str] = []
 
@@ -107,7 +107,7 @@ class LocalSshd:
             env={"HOME": str(self._root), "PATH": os.environ["PATH"]},
             start_new_session=True,
         )
-        self._children.add(child)
+        self._sessions.add(child.pid)
         stdin_task = asyncio.create_task(_pump_stdin(process.stdin, child))
         try:
             # Like OpenSSH, the session ends only when every process holding the
@@ -119,24 +119,32 @@ class LocalSshd:
             )
             returncode = await child.wait()
         except BaseException:
-            _kill_group(child)
+            _kill_sessions({child.pid})
             raise
         finally:
             stdin_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await stdin_task
-            self._children.discard(child)
         process.exit(returncode if returncode >= 0 else 128 - returncode)
 
     async def close(self) -> None:
         self._server.close()
         await self._server.wait_closed()
-        for child in list(self._children):
-            _kill_group(child)
+        # Background jobs outlive their call (as on a real workspace); end them here.
+        _kill_sessions(self._sessions)
         shutil.rmtree(self._key_dir, ignore_errors=True)
 
 
-def _kill_group(child: asyncio.subprocess.Process) -> None:
-    """Teardown only: kill a still-running command's process group."""
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(child.pid, signal.SIGKILL)
+def _kill_sessions(sessions: set[int]) -> None:
+    """Teardown only: SIGKILL every process left in the given sessions."""
+    try:
+        pids = [int(entry) for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            if os.getsid(pid) in sessions:
+                os.kill(pid, signal.SIGKILL)
+    for session in sessions:
+        with contextlib.suppress(OSError):
+            os.killpg(session, signal.SIGKILL)
