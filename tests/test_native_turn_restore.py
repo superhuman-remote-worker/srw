@@ -238,6 +238,38 @@ class TestResponses:
         if case != "text-only":
             assert '"type": "reasoning"' in sent
 
+    @RESTORES
+    @pytest.mark.parametrize(
+        "output, kept",
+        [
+            ([_REASONING, _call(1), _call(2)], ["reasoning", "function_call"]),
+            (
+                [_REASONING, _message("Reading."), _call(1), _call(2)],
+                ["reasoning", "message", "function_call"],
+            ),
+        ],
+        ids=["calls", "commentary-and-calls"],
+    )
+    def test_a_call_without_its_result_leaves_with_its_item(
+        self, output, kept, restore
+    ):
+        # The pod died before the second call's result was stored. The
+        # restore strips that call; its function_call item must go too (the
+        # Responses API rejects an item without its output), and the
+        # reasoning stays with the call it led to.
+        llm = loader.create_llm(_config("gpt-6.1-sol", "openai"))
+        live = _history(_responses_turn(output, "gpt-6.1-sol"), {"call_1": "one"})
+
+        restored = _restored(live, restore, "gpt-6.1-sol")
+
+        sent = llm._get_request_payload(restored)["input"]
+        calls = [i["call_id"] for i in sent if i.get("type") == "function_call"]
+        outputs = [
+            i["call_id"] for i in sent if i.get("type") == "function_call_output"
+        ]
+        assert calls == outputs == ["call_1"]
+        assert [i["type"] for i in sent[1 : 1 + len(kept)]] == kept
+
     def test_the_row_keeps_the_text_and_the_reasoning_readable(self):
         output, _ = RESPONSES_TURNS["reasoning-commentary-and-call"]
         row = _serialize_message_row(_responses_turn(output, "gpt-6.1-sol"), 1)

@@ -419,11 +419,13 @@ def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
     """List ``content`` minus blocks a provider must not see again.
 
     Drops ``tool_use`` blocks whose id is not in ``keep_tool_use_ids`` (their
-    call was stripped, so Anthropic would see a call without a result) and
-    ``thinking`` blocks without a signature (an interrupted stream's partial
-    block, which fails signature validation on replay). Returns ``""`` when
-    neither text nor a kept ``tool_use`` remains: a thinking block alone is no
-    turn to replay. A string is returned unchanged.
+    call was stripped, so Anthropic would see a call without a result), the
+    Responses API's ``function_call`` items whose ``call_id`` is not (the
+    same, as an item without its output), and ``thinking`` blocks without a
+    signature (an interrupted stream's partial block, which fails signature
+    validation on replay). Returns ``""`` when neither text nor a kept call
+    remains: a thinking block or reasoning item alone is no turn to replay. A
+    string is returned unchanged.
     """
     if not isinstance(content, list):
         return content
@@ -433,6 +435,11 @@ def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
             kind = block.get("type")
             if kind == "tool_use" and block.get("id") not in keep_tool_use_ids:
                 continue
+            if (
+                kind == "function_call"
+                and block.get("call_id") not in keep_tool_use_ids
+            ):
+                continue
             if kind == "thinking" and not block.get("signature"):
                 continue
         kept.append(block)
@@ -441,7 +448,7 @@ def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
         or (
             isinstance(b, dict)
             and (
-                b.get("type") == "tool_use"
+                b.get("type") in ("tool_use", "function_call")
                 or (b.get("type") == "text" and str(b.get("text", "")).strip())
             )
         )
@@ -498,7 +505,8 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
                 # fixed pairing while silently discarding everything else on
                 # the turn; model_copy changes only the poisoned field.
                 # Anthropic content carries the calls again as tool_use
-                # blocks, which a provider would still receive.
+                # blocks and Responses content as function_call items, which
+                # a provider would still receive.
                 m = m.model_copy(
                     update={
                         "tool_calls": kept,
