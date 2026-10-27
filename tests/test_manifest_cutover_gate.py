@@ -147,6 +147,47 @@ def test_cleanup_refuses_changed_ownership_marker(gate_module):
     assert gate.evidence["cleanup"]["failedOperations"] == 1
 
 
+@pytest.mark.parametrize("opt_in", [True, False])
+def test_the_unverified_opt_in_fails_the_gate_early_and_by_name(
+    gate_module, monkeypatch, opt_in
+):
+    import hashlib
+
+    def command(args):
+        if "config" in args:
+            server = "https://127.0.0.1:6443"
+            return json.dumps({"clusters": [{"cluster": {"server": server}}]})
+        if "nodes" in args:
+            return json.dumps({"items": [{"metadata": {"name": "k3d-srw-server-0"}}]})
+        if "pods" in args:
+            return json.dumps({"items": []})
+        pytest.fail(f"unexpected command {args}")
+
+    files = {
+        path: hashlib.sha256((gate_module.ROOT / path).read_bytes()).hexdigest()
+        for path in gate_module.source_paths()
+    }
+    monkeypatch.setattr(gate_module, "command", command)
+    monkeypatch.setattr(
+        gate_module,
+        "remote_json",
+        lambda code: {
+            "files": files,
+            "nativeHostingEnabled": False,
+            "unverifiedOptIn": opt_in,
+            "nativeNamespace": "srw-native",
+        },
+    )
+    with pytest.raises(gate_module.GateFailure) as failure:
+        gate_module.deployed_identity()
+    message = str(failure.value)
+    if opt_in:
+        assert "MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION" in message
+        assert "unset the opt-in" in message
+    else:  # past the opt-in check: no ready orchestrator in the fake cluster
+        assert "ready local orchestrator" in message
+
+
 def test_arbitrary_api_errors_never_enter_gate_output(gate_module, monkeypatch, capsys):
     monkeypatch.setattr(
         gate_module, "deployed_identity", lambda: {"nativeNamespace": "srw-native"}

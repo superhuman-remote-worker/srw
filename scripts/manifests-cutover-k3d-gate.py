@@ -151,6 +151,7 @@ def deployed_identity():
         f"paths={paths!r}; "
         "print(json.dumps({'files':{p:hashlib.sha256(Path('/app',p).read_bytes()).hexdigest() for p in paths},"
         "'nativeHostingEnabled':os.getenv('MANIFEST_NETWORK_ISOLATION_VERIFIED','false').lower()=='true',"
+        "'unverifiedOptIn':os.getenv('MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION','false').lower()=='true',"
         "'nativeNamespace':os.getenv('MANIFEST_NAMESPACE','srw-native')}))"
     )
     remote = remote_json(code)
@@ -164,6 +165,15 @@ def deployed_identity():
     require(
         remote["nativeHostingEnabled"] is False,
         "This gate requires generic hosting disabled on the unverified k3d-srw profile.",
+    )
+    # The opt-in makes generic hosting available on an unverified cluster, so the
+    # expected 503 would become a different answer; say why up front.
+    require(
+        remote.get("unverifiedOptIn") is False,
+        "This gate expects generic hosting unavailable, but "
+        "manifestHosting.allowApprovedImagesWithoutVerifiedIsolation "
+        "(MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION) is on; "
+        "unset the opt-in and redeploy.",
     )
     require(
         re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", remote["nativeNamespace"])
