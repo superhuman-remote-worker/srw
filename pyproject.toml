@@ -22,7 +22,7 @@ manifests = ["PyYAML>=6.0", "jsonschema>=4.18,<5"]
 cli = ["httpx>=0.27,<1", "PyYAML>=6.0", "jsonschema>=4.18,<5"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "harnesses/claude-code"]
 include = [
   "agent", "agent.*",
   "orchestrator", "orchestrator.*",
@@ -30,6 +30,7 @@ include = [
   "vm_controller", "vm_controller.*",
   "voice_gateway", "voice_gateway.*",
   "shared", "shared.*",
+  "srw_claude_code_harness", "srw_claude_code_harness.*",
 ]
 namespaces = false
 
