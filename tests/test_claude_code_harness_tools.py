@@ -1,0 +1,179 @@
+import pytest
+import pytest_asyncio
+from srw_claude_code_harness.tools import (
+    ToolHandlers,
+    make_tools,
+    truncate_output,
+)
+from srw_claude_code_harness.workspace import Workspace
+from tests._claude_code_harness_sshd import LocalSshd
+
+
+@pytest_asyncio.fixture
+async def sshd(tmp_path):
+    server = await LocalSshd.start(tmp_path / "workspace")
+    yield server
+    await server.close()
+
+
+@pytest_asyncio.fixture
+async def workspace(sshd):
+    ws = await Workspace.connect(sshd.access)
+    yield ws
+    await ws.close()
+
+
+@pytest.fixture
+def handlers(workspace):
+    return ToolHandlers(workspace)
+
+
+@pytest.mark.asyncio
+async def test_bash_returns_stdout_stderr_and_exit_code(handlers):
+    out = await handlers.bash({"command": "echo hi; echo bad >&2; exit 2"})
+    assert (
+        out["content"][0]["text"] == "hi\n\nbad\n\nExit code 2"
+        and "is_error" not in out
+    )
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_is_an_error_result(handlers):
+    out = await handlers.bash({"command": "sleep 20", "timeout": 1000})
+    assert out["is_error"] is True and "timed out" in out["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_output_is_truncated_and_saved(handlers, workspace):
+    out = await handlers.bash({"command": "yes abcdefghij | head -c 100000"})
+    text = out["content"][0]["text"]
+    assert (
+        len(text) < 31_000 and "truncated" in text and ".srw/tool-output/1.txt" in text
+    )
+    assert len(await workspace.read_bytes(".srw/tool-output/1.txt")) == 100000
+    again = await handlers.bash({"command": "yes abcdefghij | head -c 100000"})
+    assert ".srw/tool-output/2.txt" in again["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_keeps_cwd_and_survives_concurrent_calls(handlers):
+    import asyncio
+
+    await handlers.bash({"command": "mkdir -p d && cd d"})
+    a, b = await asyncio.gather(
+        handlers.bash({"command": "pwd"}), handlers.bash({"command": "pwd"})
+    )
+    assert a["content"][0]["text"].strip().endswith("/d")
+    assert b["content"][0]["text"].strip().endswith("/d")
+
+
+@pytest.mark.asyncio
+async def test_read_numbers_lines_and_honours_offset_and_limit(handlers, workspace):
+    await workspace.write_bytes("f.txt", b"a\nb\nc\nd\n")
+    assert (await handlers.read({"file_path": "f.txt", "offset": 2, "limit": 2}))[
+        "content"
+    ][0]["text"] == "     2\tb\n     3\tc"
+
+
+@pytest.mark.asyncio
+async def test_read_empty_and_long_lines(handlers, workspace):
+    await workspace.write_bytes("e.txt", b"")
+    assert (await handlers.read({"file_path": "e.txt"}))["content"][0][
+        "text"
+    ] == "(empty file)"
+    await workspace.write_bytes("l.txt", b"x" * 5000 + b"\n")
+    line = (await handlers.read({"file_path": "l.txt"}))["content"][0]["text"]
+    assert line.endswith("…") and len(line) < 2100
+
+
+@pytest.mark.asyncio
+async def test_read_refuses_binary_and_missing_files(handlers, workspace):
+    await workspace.write_bytes("b.bin", b"\x00\x01")
+    assert (await handlers.read({"file_path": "b.bin"}))["is_error"] is True
+    assert (
+        "does not exist"
+        in (await handlers.read({"file_path": "nope"}))["content"][0]["text"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_refuses_paths_outside_the_workspace_root(handlers):
+    out = await handlers.read({"file_path": "/etc/passwd"})
+    assert out["is_error"] is True and "outside" in out["content"][0]["text"]
+    for result in (
+        await handlers.write({"file_path": "../../x", "content": "x"}),
+        await handlers.edit(
+            {"file_path": "/etc/passwd", "old_string": "a", "new_string": "b"}
+        ),
+    ):
+        assert result["is_error"] is True and "outside" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_write_creates_parents_and_edit_replaces_exactly_once(
+    handlers, workspace
+):
+    await handlers.write({"file_path": "a/b/c.py", "content": "x = 1\ny = x\n"})
+    once = await handlers.edit(
+        {"file_path": "a/b/c.py", "old_string": "x = 1", "new_string": "x = 2"}
+    )
+    assert "Replaced 1" in once["content"][0]["text"]
+    many = await handlers.edit(
+        {"file_path": "a/b/c.py", "old_string": "x", "new_string": "z"}
+    )
+    assert many["is_error"] is True and "2" in many["content"][0]["text"]
+    assert (
+        "Replaced 2"
+        in (
+            await handlers.edit(
+                {
+                    "file_path": "a/b/c.py",
+                    "old_string": "x",
+                    "new_string": "z",
+                    "replace_all": True,
+                }
+            )
+        )["content"][0]["text"]
+    )
+    assert await workspace.read_bytes("a/b/c.py") == b"z = 2\ny = z\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_error_cases(handlers, workspace):
+    await workspace.write_bytes("f.txt", b"abc\n")
+    await workspace.write_bytes("b.bin", b"\x00abc")
+    for args in (
+        {"file_path": "f.txt", "old_string": "a", "new_string": "a"},
+        {"file_path": "f.txt", "old_string": "zzz", "new_string": "y"},
+        {"file_path": "nope", "old_string": "a", "new_string": "b"},
+        {"file_path": "b.bin", "old_string": "a", "new_string": "b"},
+    ):
+        assert (await handlers.edit(args))["is_error"] is True
+    assert (
+        "not found"
+        in (
+            await handlers.edit(
+                {"file_path": "f.txt", "old_string": "zzz", "new_string": "y"}
+            )
+        )["content"][0]["text"]
+    )
+    assert await workspace.read_bytes("f.txt") == b"abc\n"
+
+
+def test_truncate_keeps_head_and_tail():
+    text, truncated = truncate_output("H" * 40000 + "T" * 40000, limit=30000)
+    assert (
+        truncated
+        and text.startswith("H" * 100)
+        and text.endswith("T" * 100)
+        and "truncated" in text
+    )
+    assert truncate_output("short") == ("short", False)
+
+
+def test_make_tools_selects_only_the_requested_names(workspace):
+    pytest.importorskip("claude_agent_sdk")
+    tools = make_tools(workspace, ["Bash", "Read"])
+    assert [t.name for t in tools] == ["Bash", "Read"]
+    assert set(tools[0].input_schema["properties"]) == {"command", "timeout"}
+    assert tools[0].input_schema["required"] == ["command"]
