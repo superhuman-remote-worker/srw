@@ -1136,7 +1136,13 @@ class WorkspaceProcessRuntime(ProcessRuntime):
 
 
 async def native_workspace_execution(
-    database, actor, *, retention="Retain", mode="ProcessExit", attempts=2
+    database,
+    actor,
+    *,
+    retention="Retain",
+    mode="ProcessExit",
+    attempts=2,
+    workspace_egress="[]",
 ):
     from orchestrator.services.manifest_execution import ManifestExecutionService
     from orchestrator.services.connector_drivers import builtin_connector_drivers
@@ -1149,6 +1155,7 @@ async def native_workspace_execution(
         namespace="ws",
         harness_namespace="agents",
         default_image="workspace:test",
+        workspace_egress=workspace_egress,
     )
     executions = ManifestExecutionService(
         database,
@@ -1181,6 +1188,35 @@ async def native_workspace_execution(
         snapshot,
         result,
     )
+
+
+@pytest.mark.asyncio
+async def test_workspace_egress_rules_are_appended_to_the_public_default(
+    database, actor
+):
+    from orchestrator.services.manifest_workspaces import public_workspace_egress
+
+    rule = {
+        "to": [{"ipBlock": {"cidr": "10.18.2.105/32"}}],
+        "ports": [{"protocol": "TCP", "port": 7687}],
+    }
+    executions, *_, ws_processes, snapshot, _ = await native_workspace_execution(
+        database, actor, workspace_egress=json.dumps([rule])
+    )
+    await executions.reconcile_one(str(snapshot["id"]))
+    egress = ws_processes.launches[0].runtime.network_policy["spec"]["egress"]
+    assert egress[-1] == rule
+    assert egress[:-1] == list(public_workspace_egress())
+
+
+@pytest.mark.asyncio
+async def test_invalid_workspace_egress_blocks_admission_with_503(database, actor):
+    with pytest.raises(HTTPException) as invalid:
+        await native_workspace_execution(database, actor, workspace_egress="[{bad")
+    assert invalid.value.status_code == 503
+    assert invalid.value.detail["code"] == "HostingConfigurationInvalid"
+    assert "MANIFEST_WORKSPACE_EGRESS" in invalid.value.detail["message"]
+    assert "bad" not in invalid.value.detail["message"]
 
 
 @pytest.mark.asyncio

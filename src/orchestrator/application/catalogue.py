@@ -211,6 +211,7 @@ def manifest_execution_service(resources: ApplicationResources):
         storage_class_name=container_provisioner_module.container_provisioner._storage_class,
         harness_namespace=namespace,
         vm_provisioner=vm_provisioner_module.vm_provisioner,
+        workspace_egress=os.environ.get("MANIFEST_WORKSPACE_EGRESS", "[]"),
     )
     return ManifestExecutionService(
         resources.postgres_db,

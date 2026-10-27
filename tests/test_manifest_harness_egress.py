@@ -178,3 +178,9 @@ def test_helm_policy_schema_matches_the_server_structure_contract():
         schema["properties"]["manifestHosting"]["properties"]["harnessEgress"]
         == HARNESS_EGRESS_SCHEMA
     )
+
+
+def test_setting_name_appears_in_the_error_prefix():
+    with pytest.raises(HarnessEgressConfigurationError) as err:
+        validate_harness_egress("not json", setting="MANIFEST_WORKSPACE_EGRESS")
+    assert str(err.value).startswith("Invalid MANIFEST_WORKSPACE_EGRESS: ")

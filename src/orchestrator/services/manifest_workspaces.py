@@ -9,6 +9,10 @@ from fastapi import HTTPException
 from orchestrator.security.crypto import decrypt, encrypt
 from orchestrator.services.generic_harness_runtime import GenericBindings, pinned_image
 from orchestrator.services.manifest_authority import ManifestAuthority
+from orchestrator.services.manifest_harness_egress import (
+    HarnessEgressConfigurationError,
+    validate_harness_egress,
+)
 from orchestrator.services.manifest_store import ManifestStore
 from orchestrator.services.manifest_workspace_runtime import (
     WorkspaceRuntimeIdentity,
@@ -68,12 +72,30 @@ class ManifestWorkspaceService:
         storage_class_name=None,
         harness_namespace=None,
         vm_provisioner=None,
+        workspace_egress="[]",
     ):
         self.db, self.runtime = db, runtime
+        self._workspace_egress_error = None
+        try:
+            self._workspace_egress = validate_harness_egress(
+                workspace_egress, setting="MANIFEST_WORKSPACE_EGRESS"
+            )
+        except HarnessEgressConfigurationError as exc:
+            self._workspace_egress, self._workspace_egress_error = (), str(exc)
         self.vm_provisioner = vm_provisioner
         self.namespace, self.default_image = namespace, default_image
         self.storage_class_name = storage_class_name
         self.harness_namespace = harness_namespace or namespace
+
+    def _require_workspace_egress(self) -> None:
+        if self._workspace_egress_error:
+            raise HTTPException(
+                503,
+                {
+                    "code": "HostingConfigurationInvalid",
+                    "message": self._workspace_egress_error,
+                },
+            )
 
     async def preparation_cache(self, user, scope, *, uid=None, request=None):
         """Inspect/evict scoped immutable artifacts through authenticated hosting."""
@@ -142,6 +164,7 @@ class ManifestWorkspaceService:
         return dict(row)
 
     async def validate(self, workspace, user, *, request=None):
+        self._require_workspace_egress()
         if "instanceRef" in workspace:
             try:
                 row = await self.read(
@@ -292,7 +315,7 @@ class ManifestWorkspaceService:
             initialize=not row["initialized"],
             storage_class_name=self.storage_class_name,
             ingress=ingress,
-            egress=public_workspace_egress(),
+            egress=(*public_workspace_egress(), *deepcopy(self._workspace_egress)),
         )
         pvc_uid = await self.runtime.ensure_volume(
             plan, expected_pvc_uid=row["pvc_uid"]
