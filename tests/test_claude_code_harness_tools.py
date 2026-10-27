@@ -1,6 +1,9 @@
+import asyncio
+
 import pytest
 import pytest_asyncio
 from srw_claude_code_harness.tools import (
+    OUTPUT_LIMIT_CHARS,
     ToolHandlers,
     make_tools,
     truncate_output,
@@ -44,15 +47,17 @@ async def test_bash_timeout_is_an_error_result(handlers):
 
 
 @pytest.mark.asyncio
-async def test_bash_output_is_truncated_and_saved(handlers, workspace):
+async def test_bash_output_is_truncated_and_saved(handlers, workspace, sshd):
     out = await handlers.bash({"command": "yes abcdefghij | head -c 100000"})
     text = out["content"][0]["text"]
     assert (
-        len(text) < 31_000 and "truncated" in text and ".srw/tool-output/1.txt" in text
+        len(text) < 31_000
+        and "truncated" in text
+        and f"{sshd.access.root}/.srw/tool-output/1.txt" in text
     )
     assert len(await workspace.read_bytes(".srw/tool-output/1.txt")) == 100000
     again = await handlers.bash({"command": "yes abcdefghij | head -c 100000"})
-    assert ".srw/tool-output/2.txt" in again["content"][0]["text"]
+    assert f"{sshd.access.root}/.srw/tool-output/2.txt" in again["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -177,3 +182,59 @@ def test_make_tools_selects_only_the_requested_names(workspace):
     assert [t.name for t in tools] == ["Bash", "Read"]
     assert set(tools[0].input_schema["properties"]) == {"command", "timeout"}
     assert tools[0].input_schema["required"] == ["command"]
+
+
+@pytest.mark.asyncio
+async def test_read_window_of_a_huge_file_is_fast(handlers, workspace):
+    await workspace.run("yes 0123456789 | head -c 50000000 > big.txt")
+    out = await asyncio.wait_for(
+        handlers.read({"file_path": "big.txt", "limit": 5}), 10
+    )
+    assert out["content"][0]["text"].count("\n") == 4 and "is_error" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_refuses_devices_and_fifos_without_hanging(handlers, workspace):
+    await workspace.run("ln -s /dev/zero z && mkfifo f")
+    for name in ("z", "f"):
+        out = await asyncio.wait_for(handlers.read({"file_path": name}), 10)
+        assert out["is_error"] is True
+        assert "not a regular file" in out["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_read_output_is_capped_with_continuation_hint(handlers, workspace):
+    await workspace.write_bytes("w.txt", ("x" * 79 + "\n").encode() * 2000)
+    text = (await handlers.read({"file_path": "w.txt"}))["content"][0]["text"]
+    assert len(text) <= OUTPUT_LIMIT_CHARS + 200 and "continue with offset=" in text
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_with_large_output_is_truncated_and_saved(
+    handlers, workspace, sshd
+):
+    out = await handlers.bash(
+        {"command": "yes x | head -c 400000; sleep 5", "timeout": 1000}
+    )
+    text = out["content"][0]["text"]
+    path = f"{sshd.access.root}/.srw/tool-output/1.txt"
+    assert out["is_error"] is True and "timed out" in text and path in text
+    assert len(text) < 31_000 and await workspace.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_saved_output_path_is_absolute_even_after_cd(handlers, sshd):
+    await handlers.bash({"command": "mkdir -p proj && cd proj"})
+    out = await handlers.bash({"command": "yes abcdefghij | head -c 100000"})
+    path = f"{sshd.access.root}/.srw/tool-output/1.txt"
+    assert path in out["content"][0]["text"]
+    assert "is_error" not in await handlers.read({"file_path": path, "limit": 2})
+
+
+@pytest.mark.asyncio
+async def test_edit_refuses_files_over_the_size_limit(handlers, workspace):
+    await workspace.run("head -c 11534336 /dev/zero | tr '\\0' a > huge.txt")
+    out = await handlers.edit(
+        {"file_path": "huge.txt", "old_string": "a", "new_string": "b"}
+    )
+    assert out["is_error"] is True and "too large" in out["content"][0]["text"]

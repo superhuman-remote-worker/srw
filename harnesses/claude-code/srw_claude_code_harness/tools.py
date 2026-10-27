@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import shlex
 from collections.abc import Sequence
 from typing import Any
 
-from .workspace import Workspace, WorkspaceError
+from .workspace import Workspace, WorkspaceError, _failure
 
 OUTPUT_LIMIT_CHARS = 30_000
 READ_DEFAULT_LIMIT = 2000
@@ -19,6 +20,8 @@ READ_MAX_LINE_CHARS = 2000
 BASH_DEFAULT_TIMEOUT_MS = 120_000
 BASH_MAX_TIMEOUT_MS = 600_000
 SAVED_OUTPUT_DIR = ".srw/tool-output"
+READ_FETCH_MAX_BYTES = 4 * 1024 * 1024
+EDIT_MAX_BYTES = 10 * 1024 * 1024
 
 _PATH_MARK = "<path>"
 
@@ -69,13 +72,13 @@ class ToolHandlers:
                 ms = BASH_DEFAULT_TIMEOUT_MS
             ms = min(ms, BASH_MAX_TIMEOUT_MS)
             async with self._bash_lock:
-                spill = self.workspace.resolve(
-                    f"{SAVED_OUTPUT_DIR}/{self._saved + 1}.txt"
+                spill = posixpath.join(
+                    self.workspace.root, SAVED_OUTPUT_DIR, f"{self._saved + 1}.txt"
                 )
                 result = await self.workspace.run(
                     command,
                     timeout=ms / 1000,
-                    spill_path=spill,
+                    spill_path=self.workspace.resolve(spill),
                     spill_threshold=OUTPUT_LIMIT_CHARS,
                 )
                 if result.spilled_to:
@@ -83,52 +86,71 @@ class ToolHandlers:
             text = result.stdout
             if result.stderr:
                 text += ("\n" if text else "") + result.stderr
-            if result.timed_out:
-                seconds = ms / 1000
-                head = f"Command timed out after {seconds:g} seconds"
-                return _err(f"{text}\n\n{head}" if text else head)
-            if result.exit_code != 0:
+            if not result.timed_out and result.exit_code != 0:
                 text += f"\nExit code {result.exit_code}"
-            saved = None
-            if result.spilled_to:
-                saved = posixpath.relpath(result.spilled_to, self.workspace.root)
-            text, _ = _truncate(text, OUTPUT_LIMIT_CHARS, saved)
+            text, _ = _truncate(text, OUTPUT_LIMIT_CHARS, result.spilled_to)
+            if result.timed_out:
+                head = f"Command timed out after {ms / 1000:g} seconds"
+                return _err(f"{text}\n\n{head}" if text else head)
             return _ok(text)
         except WorkspaceError as exc:
             return _err(str(exc))
         except Exception as exc:  # noqa: BLE001 - handlers must not raise
             return _err(f"Bash failed: {type(exc).__name__}: {exc}"[:300])
 
-    async def _load(self, path: Any) -> tuple[str | None, bytes | None, dict | None]:
-        """Resolve and fetch a text file; returns (resolved, data, error_result)."""
-        if not isinstance(path, str) or not path:
-            return None, None, _err("file_path is required")
-        resolved = self.workspace.resolve(path)
-        if not await self.workspace.exists(resolved):
-            return resolved, None, _err("File does not exist.")
-        data = await self.workspace.read_bytes(resolved)
-        if b"\x00" in data[:8192]:
-            return resolved, None, _err("Cannot process a binary file.")
-        return resolved, data, None
+    async def _stat(self, resolved: str) -> tuple[bool, int, dict | None]:
+        """Remote regular-file check; returns (ok, size, error_result)."""
+        rc, out, _ = await self.workspace._exec(
+            f"stat -L -c '%F|%s' -- {shlex.quote(resolved)}"
+        )
+        if rc != 0:
+            return False, 0, _err("File does not exist.")
+        kind, _, size = out.decode("utf-8", errors="replace").strip().partition("|")
+        if not kind.startswith("regular"):
+            return False, 0, _err(f"{resolved} is not a regular file")
+        return True, int(size or 0), None
 
     async def read(self, args: dict) -> dict:
         try:
-            _, data, error = await self._load(args.get("file_path"))
-            if error or data is None:
+            path = args.get("file_path")
+            if not isinstance(path, str) or not path:
+                return _err("file_path is required")
+            resolved = self.workspace.resolve(path)
+            ok, size, error = await self._stat(resolved)
+            if not ok:
                 return error or _err("File does not exist.")
-            if not data:
+            if size == 0:
                 return _ok("(empty file)")
+            if await self.workspace.is_binary(resolved):
+                return _err("Cannot read a binary file.")
             offset = max(1, _int(args.get("offset"), 1))
             limit = max(1, _int(args.get("limit"), READ_DEFAULT_LIMIT))
-            lines = data.decode("utf-8", errors="replace").splitlines()
-            chosen = lines[offset - 1 : offset - 1 + limit]
-            if not chosen:
-                return _ok(f"(no lines at offset {offset}; file has {len(lines)})")
-            out = []
-            for number, line in enumerate(chosen, start=offset):
+            end = offset + limit - 1
+            rc, data, stderr = await self.workspace._exec(
+                f"sed -n '{offset},{end}p;{end}q' -- {shlex.quote(resolved)}"
+                f" | head -c {READ_FETCH_MAX_BYTES}"
+            )
+            if rc != 0:
+                return _err(_failure(rc, stderr))
+            lines = data.decode("utf-8", errors="replace").split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
+            if not lines:
+                return _ok(f"(no lines at offset {offset})")
+            out: list[str] = []
+            used = 0
+            for number, line in enumerate(lines, start=offset):
                 if len(line) > READ_MAX_LINE_CHARS:
                     line = line[:READ_MAX_LINE_CHARS] + "…"
-                out.append(f"{number:>6}\t{line}")
+                rendered = f"{number:>6}\t{line}"
+                if out and used + len(rendered) + 1 > OUTPUT_LIMIT_CHARS:
+                    out.append(
+                        f"… [output capped at line {number - 1}; "
+                        f"continue with offset={number}]"
+                    )
+                    break
+                out.append(rendered)
+                used += len(rendered) + 1
             return _ok("\n".join(out))
         except WorkspaceError as exc:
             return _err(str(exc))
@@ -160,9 +182,20 @@ class ToolHandlers:
                 return _err("old_string and new_string are identical; nothing to do")
             if not old:
                 return _err("old_string must not be empty")
-            resolved, data, error = await self._load(args.get("file_path"))
-            if error or data is None or resolved is None:
+            path = args.get("file_path")
+            if not isinstance(path, str) or not path:
+                return _err("file_path is required")
+            resolved = self.workspace.resolve(path)
+            ok, size, error = await self._stat(resolved)
+            if not ok:
                 return error or _err("File does not exist.")
+            if size > EDIT_MAX_BYTES:
+                return _err(
+                    f"File is too large to edit ({size} bytes; limit {EDIT_MAX_BYTES})"
+                )
+            if await self.workspace.is_binary(resolved):
+                return _err("Cannot edit a binary file.")
+            data = await self.workspace.read_bytes(resolved)
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError:
