@@ -14,7 +14,8 @@ from typing import Literal
 
 TOOL_NAMES = ("Bash", "Read", "Write", "Edit")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+_CREDENTIAL_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 
 FIXED_SETTINGS = {
     "permissionMode": "default",
@@ -151,11 +152,14 @@ def _parse_thinking(value: object) -> dict:
 
 def _parse_workspace_env(value: object) -> tuple[str, ...]:
     if not isinstance(value, list) or any(
-        not isinstance(n, str) or not _ENV_NAME.match(n) for n in value
+        not isinstance(n, str) or not _ENV_NAME.fullmatch(n) for n in value
     ):
         raise ConfigError(
             "workspaceEnv must be a list of upper-case environment variable names"
         )
+    for name in value:
+        if name in _CREDENTIAL_ENV:
+            raise ConfigError("workspaceEnv must not expose the model credential")
     return tuple(value)
 
 

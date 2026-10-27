@@ -63,6 +63,12 @@ def test_full_config_round_trips_into_effective_settings():
         ({**MINIMAL, "thinking": {"type": "enabled"}}, "thinking"),
         ({**MINIMAL, "systemPrompt": {"type": "custom"}}, "systemPrompt"),
         ({**MINIMAL, "workspaceEnv": ["lower"]}, "workspaceEnv"),
+        ({**MINIMAL, "workspaceEnv": ["FOO\n"]}, "workspaceEnv"),
+        ({**MINIMAL, "workspaceEnv": ["CLAUDE_CODE_OAUTH_TOKEN"]}, "workspaceEnv"),
+        (
+            {**MINIMAL, "workspaceEnv": ["NEO4J_URI", "ANTHROPIC_API_KEY"]},
+            "workspaceEnv",
+        ),
         (
             {**MINIMAL, "limits": {"maxTurns": 5, "extra": 1}},
             "unknown setting: limits.extra",
