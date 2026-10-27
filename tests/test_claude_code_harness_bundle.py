@@ -2,8 +2,11 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import os
 import tarfile
+import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -115,16 +118,29 @@ async def test_stage_input_is_bounded_in_time(workspace):
     assert not await workspace.exists("in/a.bin")
 
 
+def _archived(dest) -> dict[str, bytes]:
+    with tarfile.open(dest, "r:gz") as tar:
+        return {
+            m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()
+        }
+
+
 @pytest.mark.asyncio
 async def test_archive_skips_files_over_the_limit(workspace, tmp_path):
     await workspace.write_bytes("small.txt", b"0123456789")
     await workspace.write_bytes("big.bin", b"\0" * (2 * 1024 * 1024))
     dest = tmp_path / "ws.tar.gz"
     info = await archive_workspace(workspace, dest, limit_bytes=1024 * 1024)
-    with tarfile.open(dest) as tar:
-        files = [m.name for m in tar.getmembers() if m.isfile()]
-    assert files == ["./small.txt"]
-    assert info == {"bytes": dest.stat().st_size, "skipped": ["./big.bin"]}
+    assert list(_archived(dest)) == ["./small.txt"]
+    assert info == {
+        "bytes": dest.stat().st_size,
+        "skipped": ["./big.bin"],
+        "excludedInputs": [],
+        "omitted": [],
+        "omittedCount": 0,
+        "omittedBytes": 0,
+        "truncated": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -135,9 +151,95 @@ async def test_archive_excludes_saved_tool_output_and_secrets(workspace, tmp_pat
     await workspace.run("true")
     dest = tmp_path / "ws.tar.gz"
     await archive_workspace(workspace, dest)
+    assert list(_archived(dest)) == ["./keep.txt"]
+
+
+@pytest.mark.asyncio
+async def test_archive_keeps_the_smallest_files_within_the_total_budget(
+    workspace, tmp_path
+):
+    sizes = {"a.bin": 40, "b.bin": 30, "c.bin": 30, "d.bin": 10, "sub/e.bin": 50}
+    for name, size in sizes.items():
+        await workspace.write_bytes(name, b"x" * size)
+    await workspace.run("mkdir empty && ln -s a.bin link")
+    dest = tmp_path / "ws.tar.gz"
+    info = await archive_workspace(workspace, dest, total_limit_bytes=75)
+    # 10 + 30 + 30 fit; the tie between b and c is broken by path.
+    assert set(_archived(dest)) == {"./d.bin", "./b.bin", "./c.bin"}
+    assert info["omitted"] == ["./a.bin", "./sub/e.bin"]
+    assert (info["omittedCount"], info["omittedBytes"]) == (2, 90)
+    assert info["truncated"] is True
     with tarfile.open(dest) as tar:
-        files = [m.name for m in tar.getmembers() if m.isfile()]
-    assert files == ["./keep.txt"]
+        names = set(tar.getnames())
+    # Directories and symlinks are archived as before.
+    assert {"./empty", "./sub", "./link"} <= names
+
+
+@pytest.mark.asyncio
+async def test_archive_leaves_out_staged_inputs(workspace, tmp_path):
+    await workspace.write_bytes("data/in.csv", b"input")
+    await workspace.write_bytes("data/out.csv", b"output")
+    dest = tmp_path / "ws.tar.gz"
+    info = await archive_workspace(workspace, dest, exclude_paths=["data/in.csv"])
+    assert _archived(dest) == {"./data/out.csv": b"output"}
+    assert info["excludedInputs"] == ["./data/in.csv"]
+
+
+@pytest.mark.asyncio
+async def test_archive_handles_any_file_name_exactly(workspace, tmp_path):
+    names = ["new\nline.txt", "-dash.txt", "star*.txt", "back\\slash.txt", "tab\tx"]
+    for index, name in enumerate(names):
+        await workspace.write_bytes(name, str(index).encode())
+    await workspace.write_bytes("star-x.txt", b"big" * 100)
+    dest = tmp_path / "ws.tar.gz"
+    # The budget keeps the five one-byte files and omits star-x.txt.
+    info = await archive_workspace(workspace, dest, total_limit_bytes=5)
+    assert _archived(dest) == {
+        f"./{name}": str(index).encode() for index, name in enumerate(names)
+    }
+    assert info["omitted"] == ["./star-x.txt"]
+
+
+@pytest.mark.asyncio
+async def test_archive_survives_start_up_output_and_unreadable_files(
+    workspace, sshd, tmp_path
+):
+    if os.geteuid() == 0:
+        pytest.skip("root reads every file")
+    await workspace.write_bytes("ok.txt", b"fine")
+    await workspace.write_bytes("locked.txt", b"secret")
+    await workspace.run("chmod 000 locked.txt")
+    sshd.prefix = "echo junk-out; echo junk-err >&2; trap 'echo late-junk' EXIT"
+    dest = tmp_path / "ws.tar.gz"
+    try:
+        await archive_workspace(workspace, dest)
+    finally:
+        sshd.prefix = None
+        await workspace.run("chmod 600 locked.txt")
+    # Valid gzip (tarfile reads to the end) with the readable file intact.
+    assert _archived(dest) == {"./ok.txt": b"fine"}
+    assert not any((Path(sshd.access.root) / ".srw-run").glob("archive.*"))
+
+
+@pytest.mark.asyncio
+async def test_archive_is_bounded_in_time(workspace, sshd, tmp_path):
+    await workspace.write_bytes("a.txt", b"a")
+    sshd.prefix = "sleep 5"
+    dest = tmp_path / "ws.tar.gz"
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(BundleError, match="timed out"):
+        await archive_workspace(workspace, dest, timeout=1)
+    assert loop.time() - started < 5 and not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_archive_file_over_the_byte_cap_fails_cleanly(workspace, tmp_path):
+    await workspace.run("head -c 300000 /dev/urandom > noise.bin")
+    dest = tmp_path / "ws.tar.gz"
+    with pytest.raises(BundleError, match="exceeds 100000 bytes"):
+        await archive_workspace(workspace, dest, max_archive_bytes=100_000)
+    assert not dest.exists()
 
 
 @pytest.mark.asyncio
@@ -147,12 +249,14 @@ async def test_archive_tolerates_tar_exit_code_one(workspace, tmp_path, monkeypa
 
     def wrapped(command, **kwargs):
         # Simulate "file changed as we read it": tar's exit 1 after a good archive.
-        return real(command.replace("-czf - .", "-czf - . ; (exit 1)", 1), **kwargs)
+        replaced = command.replace('-T "$list"\n', '-T "$list"; (exit 1)\n', 1)
+        assert replaced != command
+        return real(replaced, **kwargs)
 
     monkeypatch.setattr(workspace, "read_stream", wrapped)
     dest = tmp_path / "ws.tar.gz"
     info = await archive_workspace(workspace, dest)
-    assert info["bytes"] > 0
+    assert info["bytes"] > 0 and _archived(dest) == {"./a.txt": b"a"}
 
 
 @pytest.mark.asyncio
@@ -162,7 +266,7 @@ async def test_archive_refuses_non_gzip_output(workspace, tmp_path, monkeypatch)
 
     def wrapped(command, **kwargs):
         replaced = command.replace(
-            "tar --anchored", "sh -c 'echo usage: tar >&2; exit 1' --anchored", 1
+            "tar --null", "sh -c 'echo usage: tar >&2; exit 1' --null", 1
         )
         assert replaced != command
         seen.append(replaced)
@@ -175,7 +279,7 @@ async def test_archive_refuses_non_gzip_output(workspace, tmp_path, monkeypatch)
     assert seen and not dest.exists()
 
 
-def test_build_bundle_contains_the_three_members(tmp_path):
+def test_build_bundle_is_an_uncompressed_tar_and_drops_the_archive(tmp_path):
     (tmp_path / "t.jsonl").write_text("{}\n")
     (tmp_path / "r.json").write_text("{}")
     (tmp_path / "w.tar.gz").write_bytes(b"zz")
@@ -185,21 +289,38 @@ def test_build_bundle_contains_the_three_members(tmp_path):
         result=tmp_path / "r.json",
         workspace_archive=tmp_path / "w.tar.gz",
     )
-    assert out == tmp_path / "bundle.tar.gz"
-    with tarfile.open(out) as tar:
+    assert out == tmp_path / "bundle.tar"
+    with tarfile.open(out, "r:") as tar:
         assert sorted(tar.getnames()) == [
             "result.json",
             "transcript.jsonl",
             "workspace.tar.gz",
         ]
+        assert tar.extractfile("workspace.tar.gz").read() == b"zz"
+    assert not (tmp_path / "w.tar.gz").exists()
     out2 = build_bundle(
         tmp_path,
         transcript=tmp_path / "t.jsonl",
         result=tmp_path / "r.json",
         workspace_archive=None,
     )
-    with tarfile.open(out2) as tar:
+    with tarfile.open(out2, "r:") as tar:
         assert sorted(tar.getnames()) == ["result.json", "transcript.jsonl"]
+
+
+def test_build_bundle_stops_when_cancelled(tmp_path):
+    (tmp_path / "t.jsonl").write_text("{}\n")
+    (tmp_path / "r.json").write_text("{}")
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(BundleError, match="cancelled"):
+        build_bundle(
+            tmp_path,
+            transcript=tmp_path / "t.jsonl",
+            result=tmp_path / "r.json",
+            workspace_archive=None,
+            cancel=cancel,
+        )
 
 
 @pytest.fixture
@@ -209,7 +330,7 @@ def no_backoff(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_upload_retries_then_succeeds(tmp_path, no_backoff):
-    f = tmp_path / "bundle.tar.gz"
+    f = tmp_path / "bundle.tar"
     f.write_bytes(b"payload" * 1000)
     seen = []
 

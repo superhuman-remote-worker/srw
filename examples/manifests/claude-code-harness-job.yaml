@@ -14,7 +14,7 @@ spec:
         - {url: https://files.example.invalid/customers.csv, path: data/customers.csv}
         - {url: https://files.example.invalid/schema.md, path: schema.md}
       # Presigned target for the bundle (transcript, result.json, workspace archive).
-      upload: {url: "https://archive.example.invalid/runs/42/bundle.tar.gz?signature=example", method: PUT}
+      upload: {url: "https://archive.example.invalid/runs/42/bundle.tar?signature=example", method: PUT}
   execution:
     expert:
       inline:

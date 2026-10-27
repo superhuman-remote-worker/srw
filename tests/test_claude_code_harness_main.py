@@ -22,7 +22,7 @@ TOKEN = "oauth-token-value-0123456789"
 API_KEY = "api-key-value-0123456789"
 DB_PASSWORD = "db-password-value-0123456789"
 INPUT_URL = "https://files.example/datasets/customers.csv?token=input-secret"
-UPLOAD_URL = "https://archive.example/runs/42/bundle.tar.gz?X-Amz-Signature=sig-secret"
+UPLOAD_URL = "https://archive.example/runs/42/bundle.tar?X-Amz-Signature=sig-secret"
 CSV = b"id,name\n1,Ada\n2,Grace\n"
 SECRETS = (TOKEN, API_KEY, DB_PASSWORD, INPUT_URL, UPLOAD_URL, "sig-secret")
 
@@ -126,7 +126,8 @@ class Http:
 
 
 def _members(body: bytes) -> dict[str, bytes]:
-    with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
+    # bundle.tar is uncompressed: the workspace archive inside is gzipped already.
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as tar:
         return {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
 
 
@@ -276,6 +277,9 @@ async def test_happy_path_uploads_a_bundle_and_exits_0(tmp_path, sshd, capsys):
     assert result["inputs"][0]["path"] == "data/customers.csv"
     assert result["inputs"][0]["bytes"] == len(CSV)
     assert result["archive"]["bytes"] > 0
+    # The staged input's checksum is in result.json; the file is not archived.
+    assert result["archive"]["excludedInputs"] == ["./data/customers.csv"]
+    assert result["archive"]["truncated"] is False
     assert result["versions"]["harness"] == srw_claude_code_harness.__version__
     assert result["versions"]["sdk"] == sdk.__version__
     assert result["config"]["workspaceEnv"] == ["DB_PASSWORD"]
@@ -287,7 +291,10 @@ async def test_happy_path_uploads_a_bundle_and_exits_0(tmp_path, sshd, capsys):
     assert json.loads(members["result.json"])["exitCode"] == 0
     with tarfile.open(fileobj=io.BytesIO(members["workspace.tar.gz"])) as tar:
         names = tar.getnames()
-    assert "./data/customers.csv" in names and "./.srw-env" not in names
+    assert "./data" in names and "./data/customers.csv" not in names
+    assert "./.srw-env" not in names
+    # The archive file is deleted once it is in the bundle.
+    assert not (run_dir / "workspace.tar.gz").exists()
     lines = members["transcript.jsonl"].splitlines()
     kinds = [json.loads(line)["kind"] for line in lines]
     assert "AssistantMessage" in kinds and "ResultMessage" in kinds
@@ -632,7 +639,13 @@ async def test_archive_failure_exits_1_and_uploads_without_the_archive(
 
 
 @pytest.mark.asyncio
-async def test_no_upload_target_skips_upload_and_exits_0(tmp_path, sshd):
+async def test_no_upload_target_skips_archive_and_upload_and_exits_0(
+    tmp_path, sshd, monkeypatch
+):
+    async def no_archive(workspace, dest, **kwargs):
+        raise AssertionError("nothing to upload: the workspace must not be archived")
+
+    monkeypatch.setattr(entry, "archive_workspace", no_archive)
     http = Http()
     paths = _files(tmp_path, bindings=_bindings(sshd.access), upload=False)
     async with http.client() as client:
@@ -644,7 +657,68 @@ async def test_no_upload_target_skips_upload_and_exits_0(tmp_path, sshd):
         )
     assert code == entry.EXIT_OK
     assert http.uploads == [] and http.gets == [INPUT_URL]
-    assert _result_json(run_dir)["exitCode"] == 0
+    result = _result_json(run_dir)
+    assert result["exitCode"] == 0 and result["archive"] is None
+    assert not list(run_dir.glob("workspace.tar.gz")) + list(run_dir.glob("bundle*"))
+
+
+@pytest.mark.asyncio
+async def test_archive_timeout_is_recorded_and_the_upload_still_happens(
+    tmp_path, sshd, monkeypatch
+):
+    monkeypatch.setattr(entry, "ARCHIVE_TIMEOUT_SECONDS", 1)
+    http = Http()
+    paths = _files(tmp_path, bindings=_bindings(sshd.access))
+
+    def slow_workspace():
+        # From now on every workspace command waits behind a slow start-up file.
+        sshd.prefix = "sleep 5"
+
+    started = time.monotonic()
+    async with http.client() as client:
+        code, run_dir = await _run(
+            tmp_path,
+            paths,
+            client_factory=_factory([], [_result()], on_query=slow_workspace),
+            http_client=client,
+        )
+    assert time.monotonic() - started < 15
+    assert code == entry.EXIT_HARNESS_ERROR
+    result = _result_json(run_dir)
+    assert "timed out" in result["archive"]["error"]
+    [put] = http.uploads
+    members = _members(put["body"])
+    assert set(members) == {"transcript.jsonl", "result.json"}
+    assert "timed out" in json.loads(members["result.json"])["archive"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_stop_racing_the_archive_completion_exits_4(tmp_path, sshd, monkeypatch):
+    stop = asyncio.Event()
+    real = entry.archive_workspace
+
+    async def archive_then_stop(workspace, dest, **kwargs):
+        info = await real(workspace, dest, **kwargs)
+        stop.set()  # SIGTERM lands just as the archive completes
+        return info
+
+    monkeypatch.setattr(entry, "archive_workspace", archive_then_stop)
+    http = Http()
+    paths = _files(tmp_path, bindings=_bindings(sshd.access))
+    async with http.client() as client:
+        code, run_dir = await _run(
+            tmp_path,
+            paths,
+            stop=stop,
+            client_factory=_factory([], [_result()]),
+            http_client=client,
+        )
+    assert code == entry.EXIT_INTERRUPTED
+    assert _result_json(run_dir)["exitCode"] == 4
+    [put] = http.uploads
+    members = _members(put["body"])
+    assert set(members) == {"transcript.jsonl", "result.json"}
+    assert json.loads(members["result.json"])["exitCode"] == 4
 
 
 @pytest.mark.asyncio
@@ -748,3 +822,38 @@ def test_main_captures_the_environment_scrubs_it_and_sets_stop_on_sigterm(
     assert kwargs["task_file"] == paths["task_file"]
     assert kwargs["bindings_file"] == paths["bindings_file"]
     assert kwargs["run_dir"] == run_dir
+
+
+@pytest.mark.asyncio
+async def test_stop_during_the_bundle_build_cancels_the_thread(
+    tmp_path, sshd, monkeypatch
+):
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    real = entry.build_bundle
+    cancelled = []
+
+    def slow_build(run_dir, *, workspace_archive, cancel, **kwargs):
+        if workspace_archive is None:
+            return real(run_dir, workspace_archive=None, cancel=cancel, **kwargs)
+        loop.call_soon_threadsafe(stop.set)  # SIGTERM while the bundle is built
+        cancelled.append(cancel.wait(10))
+        raise BundleError("building the bundle was cancelled")
+
+    monkeypatch.setattr(entry, "build_bundle", slow_build)
+    http = Http()
+    paths = _files(tmp_path, bindings=_bindings(sshd.access))
+    started = time.monotonic()
+    async with http.client() as client:
+        code, run_dir = await _run(
+            tmp_path,
+            paths,
+            stop=stop,
+            client_factory=_factory([], [_result()]),
+            http_client=client,
+        )
+    assert time.monotonic() - started < 10
+    assert code == entry.EXIT_INTERRUPTED and cancelled == [True]
+    [put] = http.uploads
+    assert set(_members(put["body"])) == {"transcript.jsonl", "result.json"}
+    assert not (run_dir / "workspace.tar.gz").exists()

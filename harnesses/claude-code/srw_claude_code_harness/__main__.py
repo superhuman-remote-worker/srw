@@ -3,10 +3,12 @@
 ``run`` performs one harness run: read and validate the delivered files, pick the
 credential, collect the ``workspaceEnv`` values, connect to the workspace, write
 its environment file, stage the inputs, run the Claude Code session, write
-``result.json``, archive the workspace, build the bundle, upload it (when the
-task names a target) and close the workspace. It never raises (an unexpected
-exception becomes ``EXIT_HARNESS_ERROR``); every path writes ``result.json``,
-and the bundle is uploaded on every path once the target is known.
+``result.json`` and close the workspace. When the task names an upload target it
+also archives the workspace, builds the bundle (an uncompressed ``bundle.tar``)
+and uploads it; without one nothing is archived or uploaded. It never raises (an
+unexpected exception becomes ``EXIT_HARNESS_ERROR``); every path writes
+``result.json``, and the bundle is uploaded on every path once the target is
+known.
 
 Exit codes and their precedence:
 
@@ -44,6 +46,7 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,7 +56,15 @@ import httpx
 
 from . import __version__ as HARNESS_VERSION
 from .bindings import parse_bindings
-from .bundle import BundleError, archive_workspace, build_bundle, stage_inputs, upload
+from .bundle import (
+    ARCHIVE_TIMEOUT_SECONDS,
+    BUNDLE_NAME,
+    BundleError,
+    archive_workspace,
+    build_bundle,
+    stage_inputs,
+    upload,
+)
 from .config import (
     ConfigError,
     HarnessConfig,
@@ -539,14 +550,20 @@ class _Run:
             self._stopped_after_session("finishing the run")
         _progress("writing result.json")
         self._write_result()
+        # The archive only travels in the bundle: no target, no archive.
+        has_target = self.task is not None and self.task.upload is not None
         if (
-            self.workspace is not None
+            has_target
+            and self.workspace is not None
             and self.session_started
             and not self.stop.is_set()
         ):
             await self._archive()
+            if self.stop.is_set() and self.code == EXIT_OK:
+                # The stop fired as the archive completed: still interrupted.
+                self._stopped_after_session("archiving the workspace")
             self._write_result()
-        if self.task is not None and self.task.upload is not None:
+        if has_target:
             await self._upload()
         self._write_result()
 
@@ -556,7 +573,13 @@ class _Run:
         dest = self.run_dir / "workspace.tar.gz"
         try:
             self.archive = await self._unless_stopped(
-                archive_workspace(self.workspace, dest)
+                archive_workspace(
+                    self.workspace,
+                    dest,
+                    # Their checksums are in result.json already.
+                    exclude_paths=[item["path"] for item in self.inputs],
+                    timeout=ARCHIVE_TIMEOUT_SECONDS,
+                )
             )
         except _Stopped:
             self._stopped_after_session("archiving the workspace")
@@ -571,17 +594,21 @@ class _Run:
         self.archive_file = dest
         _progress(
             f"workspace archived ({self.archive['bytes']} bytes, "
-            f"{len(self.archive['skipped'])} file(s) over the size limit skipped)"
+            f"{len(self.archive['skipped'])} file(s) over the size limit skipped, "
+            f"{self.archive['omittedCount']} omitted over the total budget)"
         )
 
-    def _bundle(self, workspace_archive: Path | None) -> Path:
+    def _bundle(self, workspace_archive: Path | None, cancel: threading.Event) -> Path:
+        """Blocking (run it in a thread): a fresh ``bundle.tar``; the workspace
+        archive file is deleted once it is in the bundle."""
         # A fresh file: an abandoned upload may still hold the previous one open.
-        (self.run_dir / "bundle.tar.gz").unlink(missing_ok=True)
+        (self.run_dir / BUNDLE_NAME).unlink(missing_ok=True)
         return build_bundle(
             self.run_dir,
             transcript=self.transcript_path,
             result=self.result_path,
             workspace_archive=workspace_archive,
+            cancel=cancel,
         )
 
     def _upload_failed(self, reason: str) -> None:
@@ -596,13 +623,18 @@ class _Run:
         _, client = self._http()
         self._close_transcript()
         if not self.stop.is_set():
+            cancel = threading.Event()
+            archive, self.archive_file = self.archive_file, None
             try:
-                bundle = self._bundle(self.archive_file)
+                bundle = await self._unless_stopped(
+                    asyncio.to_thread(self._bundle, archive, cancel)
+                )
                 _progress(f"uploading the bundle ({bundle.stat().st_size} bytes)")
                 status = await self._unless_stopped(
                     upload(target, bundle, client=client)
                 )
             except _Stopped:
+                cancel.set()  # an abandoned bundle thread stops at its next read
                 self._stopped_after_session("uploading the bundle")
                 self._write_result()
             except Exception as exc:
@@ -611,14 +643,21 @@ class _Run:
             else:
                 _progress(f"bundle uploaded (HTTP {status})")
                 return
+            finally:
+                if archive is not None:
+                    archive.unlink(missing_ok=True)
         # Stop path: transcript and result only, within the remaining grace.
-        try:
-            bundle = self._bundle(None)
+        cancel = threading.Event()
+
+        async def partial() -> int:
+            bundle = await asyncio.to_thread(self._bundle, None, cancel)
             _progress(f"uploading the partial bundle ({bundle.stat().st_size} bytes)")
-            status = await asyncio.wait_for(
-                upload(target, bundle, client=client), STOP_UPLOAD_SECONDS
-            )
+            return await upload(target, bundle, client=client)
+
+        try:
+            status = await asyncio.wait_for(partial(), STOP_UPLOAD_SECONDS)
         except asyncio.TimeoutError:
+            cancel.set()
             self._upload_failed(
                 f"upload failed: no answer within {STOP_UPLOAD_SECONDS:g} s"
             )

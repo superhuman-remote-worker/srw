@@ -71,8 +71,9 @@ in-process MCP server named `ws`. The CLI runs with a frozen environment.
   the relative `path` (no leading `/`, no `..`) before the session starts. A
   failed download ends the run with exit code 2.
 - `data.upload`: where the bundle goes (`method` `PUT` or `POST`, default `PUT`;
-  optional string `headers`). Without it the bundle is built but not uploaded.
-  Prefer a presigned URL over a secret header.
+  optional string `headers`). Without it nothing is archived or uploaded:
+  `result.json` and the transcript stay in the pod and end with it (the exit
+  code still reports the outcome). Prefer a presigned URL over a secret header.
 
 ## Credentials
 
@@ -132,8 +133,8 @@ download and 10 minutes for the workspace archive.
 
 ## Bundle
 
-On every path once the target is known the harness uploads `bundle.tar.gz`
-holding:
+On every path once the target is known the harness uploads `bundle.tar`, an
+uncompressed tar (the workspace archive inside is gzipped already), holding:
 
 - `transcript.jsonl`: the session transcript.
 - `result.json`: `version`, `exitCode`, `exitReason`, `startedAt`, `finishedAt`,
@@ -143,10 +144,30 @@ holding:
   `usage`, `modelUsage`, `sessionId`, `stopReason`, `durationMs`,
   `durationApiMs`, `apiErrorStatus`), `timedOut`, `interrupted`, `error`.
 - `workspace.tar.gz`: the workspace tree, excluding `.srw/tool-output`,
-  `.srw-env` and `.srw-run`. Files over 256 MiB are skipped and listed in
-  `result.json` under `archive`. An empty or non-gzip archive is refused.
+  `.srw-env` and `.srw-run`. Only with an upload target.
 
-Uploads are tried three times with backoff.
+The harness pod has a fixed 2Gi of ephemeral storage, and at its peak it holds
+the workspace archive, a copy of it inside the bundle and the transcripts. So
+the archive is bounded, and `result.json` records under `archive` what it left
+out:
+
+- Staged inputs are not archived (`excludedInputs`): their size and SHA-256 are
+  in `result.json` under `inputs`. Changes the model made to an input file are
+  therefore not kept; write results to new files.
+- Regular files over 256 MiB are skipped (`skipped`).
+- The other regular files fill a budget of 768 MiB (uncompressed), smallest
+  first, ties by path. Files that do not fit are omitted: `omitted` lists them
+  (at most 1000 paths), `omittedCount` and `omittedBytes` count them, and
+  `truncated` is `true`.
+- Directories, symlinks and other entries are archived as tar stores them; an
+  unreadable or vanished file is left out without failing the archive.
+- The archive must finish within 10 minutes and stay under 832 MiB (the budget
+  plus 64 MiB for tar and gzip overhead); otherwise it fails (exit code 1), its
+  error is recorded under `archive.error`, and the bundle is uploaded with the
+  transcript and `result.json` only.
+
+The workspace archive file is deleted as soon as it is in the bundle. Uploads
+are tried three times with backoff.
 
 ## Exit codes
 
@@ -171,7 +192,8 @@ within 10 seconds.
 ## Workspace requirements
 
 The workspace image needs `bash`, coreutils (`timeout`), `tar` (GNU tar; the
-archive uses its options), `gzip` and `find`. Check that the workspace image you select provides them.
+archive uses its options), `gzip` and `find` (GNU findutils: the archive uses
+`-printf`). Check that the workspace image you select provides them.
 
 ## Timeouts
 
