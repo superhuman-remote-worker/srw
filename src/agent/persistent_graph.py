@@ -2296,7 +2296,11 @@ async def _idle_memory_prefetch(
 
 
 def _take_in_retrieval(
-    memory_service: Any, sources: ContextSources, *, bound_knowledge: bool
+    memory_service: Any,
+    sources: ContextSources,
+    *,
+    bound_knowledge: bool,
+    conversation: Optional[Any] = None,
 ) -> ContextSources:
     """WP3 (D8): the latest finished retrieval as planner input.
 
@@ -2305,9 +2309,10 @@ def _take_in_retrieval(
     evicted memory appended again without a new retrieval (WP2 spec §E.5).
     Its knowledge records are used only without bound KBs, which keep the
     turn-start chunk retrieval. Nothing finished: the sources stay as they
-    are.
+    are. ``conversation`` is where the session stands, for
+    ``memory.retrieval.same_conversation`` (P4).
     """
-    result = memory_service.take_retrieval()
+    result = memory_service.take_retrieval(conversation)
     if result is None:
         return sources
     memory: List[Any] = []
@@ -2946,8 +2951,17 @@ async def _execute_turn(
         if not await _admit_first_provider():
             return _closed_result()
         if turn_retrieval is not None:
+            from agent.services.memory.same_conversation import (
+                session_conversation_turns,
+            )
+
             context_sources = _take_in_retrieval(
-                memory_service, context_sources, bound_knowledge=bool(kb_bindings)
+                memory_service,
+                context_sources,
+                bound_knowledge=bool(kb_bindings),
+                # The turn and the compaction checkpoint's boundary the
+                # transport keeps on the context manager (P4).
+                conversation=session_conversation_turns(context_manager, turn_id),
             )
             if not turn_retrieval_started:
                 turn_retrieval_started = memory_service.start_retrieval(turn_retrieval)

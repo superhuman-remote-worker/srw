@@ -8714,6 +8714,9 @@ async def _persist_compaction_checkpoint(
     # that don't resolve to a persisted row).
     boundary_seq = None
     ctx_mgr = getattr(_session, "context_manager", None)
+    if ctx_mgr is not None:
+        # Where the live context now starts, for the memory take-in (P4).
+        ctx_mgr.compaction_boundary_turn = boundary_turn
     boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
     if boundary_id:
         try:
@@ -9056,6 +9059,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     return repair_tool_result_adjacency(restored)
 
 
+def _note_restored_compaction_boundary(
+    ctx_mgr: Any, db_messages: Sequence[Dict[str, Any]], checkpoint_turn: int
+) -> None:
+    """Record where a restored context starts, for the memory take-in (P4).
+
+    The restored history holds the turns after the checkpoint's
+    ``boundary_turn`` (no checkpoint: the whole log), unless the resume
+    floor dropped the oldest rows: then the turns before the first row it
+    loaded are out of context too. A compaction during the restore records
+    its own boundary afterwards (``_persist_compaction_checkpoint``).
+    """
+    if ctx_mgr is None:
+        return
+    first_turn = min((m.get("turn_number") or 0 for m in db_messages), default=0)
+    ctx_mgr.compaction_boundary_turn = max(checkpoint_turn, first_turn - 1, 0)
+
+
 async def _restore_session_messages() -> None:
     """Restore LangChain message history from DB into session.messages.
 
@@ -9190,6 +9210,7 @@ async def _restore_session_messages() -> None:
                     default=_bturn,
                 )
                 _session.turn_count = max(tail_turn_max, _bturn)
+                _note_restored_compaction_boundary(ctx_mgr, db_messages, _bturn)
                 cursor = (
                     f"seq>{boundary_seq}"
                     if boundary_seq is not None
@@ -9290,6 +9311,7 @@ async def _restore_session_messages() -> None:
             # Set turn_count from the last stored message's turn_number
             last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
+            _note_restored_compaction_boundary(ctx_mgr, db_messages, 0)
             logger.info(
                 f"Restored {len(restored)} messages for thread {_session_identity.thread_id} "
                 f"(from {len(db_messages)} stored; last turn: {last_turn})"

@@ -678,7 +678,7 @@ class TurnMemory(harness.RecordingMemoryManager):
         self.assemble_requests.append(req)
         return True
 
-    def take_retrieval(self) -> Optional[Any]:
+    def take_retrieval(self, conversation: Any = None) -> Optional[Any]:
         from agent.services.memory import (
             AssembleStats,
             InjectionBlock,

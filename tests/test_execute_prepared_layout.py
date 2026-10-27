@@ -68,7 +68,11 @@ from shared.runtime.core.context_entries import (
     make_context_entry,
     memory_handle,
 )
-from shared.runtime.core.loader import InstructionFileEntry, load_agent_config
+from shared.runtime.core.loader import (
+    InstructionFileEntry,
+    MemoryRetrievalConfig,
+    load_agent_config,
+)
 from shared.runtime.services.knowledge_store import KnowledgeRecord
 from shared.runtime.services.recall_store import MemoryRecord
 from shared.runtime.core.message_markers import (
@@ -80,11 +84,13 @@ from shared.runtime.core.workspace_injection import TODOS_INJECTION_CONTENT_PREF
 from agent.graph import create_execute_node
 from agent.managers import TodoManager
 from agent.services.memory import (
+    AssembleRequest,
     AssembleStats,
     InjectionBlock,
     MemoryPayload,
     RetrievalResult,
 )
+from agent.services.memory.same_conversation import ConversationTurns
 from agent.tools.context import ToolContext
 from tests._fs_backend import FilesystemTestBackend
 from tests._memory_fixtures import (
@@ -176,7 +182,7 @@ class RecordingManager:
         self._finished = RetrievalResult(payload=self._next_payload(req))
         return True
 
-    def take_retrieval(self) -> Optional[RetrievalResult]:
+    def take_retrieval(self, conversation: Any = None) -> Optional[RetrievalResult]:
         result, self._finished = self._finished, None
         return result
 
@@ -1267,6 +1273,104 @@ class TestAsyncRetrieval:
         assert data["retrieval"]["degraded"] is None
         assert data["retrieval"]["counters"]["drained"] == 1
         await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_the_take_in_gets_where_the_job_stands(self, env):
+        """P4: the job's turns, and the last turn a compaction removed,
+        derived from the responses its history still holds."""
+        seen: List[Any] = []
+        service = env["service"]
+        take = service.take_retrieval
+
+        def recording_take(conversation=None):
+            seen.append(conversation)
+            return take(conversation)
+
+        service.take_retrieval = recording_take
+        llm = CapturingLLM(responses=[_tool_call("c2")])
+
+        await _run(_make_node(env, llm), _state(turn_count=10))
+
+        # _history() holds one response: turns 1-9 were compacted away.
+        assert seen == [ConversationTurns(compacted_through=9, current=10)]
+
+    async def _same_conversation_turn(self, env, memories) -> tuple:
+        """One request at turn 10 under skip_in_context, the retrieval
+        finished before it; returns (request, memory_inject audit data)."""
+        env["config"].memory.retrieval = MemoryRetrievalConfig(
+            same_conversation="skip_in_context"
+        )
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(memories, auto=True), job_id=JOB_ID
+        )
+        manager.runtime.memory_config = env["config"].memory
+        manager.start_retrieval(AssembleRequest(query_text="earlier request"))
+        await settle_retrieval(manager)
+        llm = CapturingLLM(responses=[_tool_call("c2")])
+        auditor = MagicMock()
+
+        with patch("agent.graph.get_archiver", return_value=auditor):
+            patches = _patches()
+            for p in patches:
+                p.start()
+            try:
+                await _make_node(env, llm)(_state(turn_count=10))
+            finally:
+                for p in patches:
+                    p.stop()
+        await manager.close_background()
+
+        (data,) = [
+            c.kwargs["data"]
+            for c in auditor.audit_step.call_args_list
+            if c.kwargs.get("step_type") == "memory_inject"
+        ]
+        return llm.requests[0], data
+
+    @pytest.mark.asyncio
+    async def test_skip_in_context_drops_this_jobs_memory_and_audits_it(self, env):
+        """P4 arm B: this job's memory from a turn still in the history is
+        not appended; one a compaction removed and another job's are."""
+        in_context, evicted, other = (
+            MemoryRecord(
+                id=UUID(int=n),
+                job_id=job,
+                content=f"Fact {n}.",
+                token_count=3,
+                source_turn_end=turn,
+            )
+            for n, job, turn in ((11, JOB_ID, 10), (12, JOB_ID, 9), (13, "other", 10))
+        )
+
+        request, data = await self._same_conversation_turn(
+            env, [in_context, evicted, other]
+        )
+
+        text = "\n".join(str(m.content) for m in request)
+        assert f"[{memory_handle(in_context.id)}]" not in text
+        assert f"[{memory_handle(evicted.id)}]" in text
+        assert f"[{memory_handle(other.id)}]" in text
+        assert (data["count"], data["appended"]) == (2, 2)
+        assert data["stats"]["extra"]["same_conversation"] == {
+            "mode": "skip_in_context",
+            "compacted_through": 9,
+            "current_turn": 10,
+            "same_conversation": 2,
+            "skipped": 1,
+        }
+        assert data["retrieval"]["counters"]["same_conversation_skipped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_request_whose_memories_were_all_skipped_is_audited(self, env):
+        fresh = MemoryRecord(
+            id=UUID(int=14), job_id=JOB_ID, content="Fresh.", source_turn_end=10
+        )
+
+        request, data = await self._same_conversation_turn(env, [fresh])
+
+        assert _srw_count(request, "memory") == 0
+        assert (data["count"], data["appended"]) == (0, 0)
+        assert data["stats"]["extra"]["same_conversation"]["skipped"] == 1
 
     @pytest.mark.asyncio
     async def test_a_structural_reranker_failure_leaves_the_request_alive(self, env):

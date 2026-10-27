@@ -1314,6 +1314,14 @@ class ContextManager:
         # instead of whole post-boundary turns. None when the last call did not
         # actually compact. See knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
         self._last_compaction_boundary_id: Optional[str] = None
+        # The last conversation turn the newest summary covers, in the
+        # persistent-session transport's turn numbering: the compaction
+        # checkpoint's `boundary_turn`, set where the transport writes the
+        # checkpoint and when it restores from one. None until one is
+        # recorded. The memory take-in reads it to tell whether a memory's
+        # source turns are still in context (memory.retrieval.same_conversation,
+        # P4). Workers derive theirs from the history instead.
+        self.compaction_boundary_turn: Optional[int] = None
         # Monotonic count of *successful* summarizations. Transports snapshot
         # it around a compaction call to know whether a summary was actually
         # produced this call — the authoritative signal, replacing length-delta

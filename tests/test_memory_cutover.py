@@ -105,7 +105,7 @@ class RecordingManager:
         self._finished = RetrievalResult(payload=self.payload)
         return True
 
-    def take_retrieval(self) -> Optional[RetrievalResult]:
+    def take_retrieval(self, conversation: Any = None) -> Optional[RetrievalResult]:
         result, self._finished = self._finished, None
         return result
 

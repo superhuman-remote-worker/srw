@@ -42,6 +42,7 @@ from agent.persistent_graph import (
     _execute_turn,
     run_persistent_loop,
 )
+from agent.services.memory import InjectionBlock, MemoryPayload, RetrievalResult
 from shared.runtime.core.context_entries import (
     FOLDED_KEY,
     entry_body,
@@ -49,7 +50,9 @@ from shared.runtime.core.context_entries import (
     entry_meta,
     is_context_entry,
     make_context_entry,
+    memory_handle,
 )
+from shared.runtime.core.loader import MemoryConfig, MemoryRetrievalConfig
 from shared.runtime.core.message_markers import (
     stamp_turn_membership,
     turn_membership,
@@ -972,3 +975,98 @@ class TestIdlePrefetch:
 
         assert session.retriever.prefetch_queries == []
         assert session.metadata == {}
+
+
+# ---------------------------------------------------------------------------
+# Same-conversation memories at the take-in (P4)
+# ---------------------------------------------------------------------------
+
+P4_THREAD = "0f0e0d0c-0b0a-4908-8706-050403020100"
+
+
+def _p4_memory(n: int, job: str, end: int) -> MemoryRecord:
+    return MemoryRecord(
+        id=UUID(int=200 + n),
+        job_id=UUID(job),
+        content=f"Fact {n} from turn {end}.",
+        importance=0.7,
+        token_count=6,
+        source_turn_start=end - 1,
+        source_turn_end=end,
+    )
+
+
+#: Turn 10; the transport recorded a compaction that removed turns 1-6.
+P4_IN_CONTEXT = _p4_memory(1, P4_THREAD, 8)
+P4_EVICTED = _p4_memory(2, P4_THREAD, 6)
+P4_OTHER = _p4_memory(3, "11111111-2222-4333-8444-555555555555", 8)
+
+
+class TestSameConversationTakeIn:
+    """memory.retrieval.same_conversation (P4): the session takes the
+    pending set in with its turn and the compaction boundary the transport
+    recorded on the context manager."""
+
+    async def _handles(self, same_conversation: str) -> List[str]:
+        session = Session([text_turn("done")])
+        session.context_manager.compaction_boundary_turn = 6
+        manager = make_async_manager(GatedRetriever([], auto=True), job_id=P4_THREAD)
+        manager.runtime.memory_config = MemoryConfig(
+            retrieval=MemoryRetrievalConfig(same_conversation=same_conversation)
+        )
+        manager.seed_prefetch(
+            RetrievalResult(
+                payload=MemoryPayload(
+                    blocks=[
+                        InjectionBlock(
+                            kind="memory",
+                            records=[P4_IN_CONTEXT, P4_EVICTED, P4_OTHER],
+                        )
+                    ]
+                ),
+                source="prefetch",
+                pending_id="set-p4",
+            )
+        )
+        session.memory_service = manager
+        session.messages[:] = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            stamp_turn_membership(HumanMessage(content="Hello", id="input-10"), 10),
+        ]
+
+        result = await _execute_turn(
+            llm_with_tools=session.llm,
+            tool_map={tool.name: tool for tool in session.tools},
+            context_manager=session.context_manager,
+            messages=session.messages,
+            callbacks=session.callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=session.config,
+            knowledge_store=session.knowledge_store,
+            project_ids=[harness.PROJECT_ID],
+            tool_context=session.tool_context,
+            memory_service=manager,
+            turn_id=10,
+        )
+        await manager.close_background()
+
+        assert result.error is None
+        (sent,) = session.llm.calls
+        return [
+            memory_handle(m.id)
+            for m in (P4_IN_CONTEXT, P4_EVICTED, P4_OTHER)
+            if f"[{memory_handle(m.id)}]" in _texts(sent)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_allow_injects_the_memory_whose_source_is_in_context(self):
+        assert await self._handles("allow") == [
+            memory_handle(m.id) for m in (P4_IN_CONTEXT, P4_EVICTED, P4_OTHER)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_skip_in_context_drops_it_and_keeps_the_rest(self):
+        assert await self._handles("skip_in_context") == [
+            memory_handle(m.id) for m in (P4_EVICTED, P4_OTHER)
+        ]

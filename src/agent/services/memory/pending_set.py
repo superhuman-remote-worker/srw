@@ -9,7 +9,9 @@ JSON form and back.
 
 Only what the append-only planner needs is stored: per memory the fields
 :meth:`RecallStore.format_memory` renders and the presence item reads (id,
-content, importance, phase, type); per knowledge note the fields
+content, importance, phase, type) and where it came from (job or thread id,
+source turns: ``memory.retrieval.same_conversation`` reads them where the set
+is taken in, P4); per knowledge note the fields
 :meth:`KnowledgeStore.format_note` and ``knowledge_item_key`` read. A record
 read back renders to the same bytes and has the same presence key and hash
 as the row, so the planner treats it exactly like a fresh retrieval (D3: a
@@ -33,6 +35,8 @@ from shared.session_pending_memory import (
 )
 
 _MEMORY_FIELDS = ("content", "memory_type", "importance", "source_phase", "token_count")
+#: A memory's source turns, beside its ``job_id`` (P4 provenance).
+_MEMORY_TURN_FIELDS = ("source_turn_start", "source_turn_end")
 _KNOWLEDGE_FIELDS = (
     "note_id",
     "title",
@@ -72,6 +76,12 @@ def _memory_dict(record: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {"id": _id_text(getattr(record, "id", None))}
     for name in _MEMORY_FIELDS:
         out[name] = _plain(getattr(record, name, None))
+    out["job_id"] = _id_text(getattr(record, "job_id", None))
+    for name in _MEMORY_TURN_FIELDS:
+        turn = getattr(record, name, None)
+        out[name] = (
+            turn if isinstance(turn, int) and not isinstance(turn, bool) else None
+        )
     return out
 
 
@@ -103,7 +113,8 @@ def serialize_pending_set(
         {"v": 1, "id": "<pending_id>", "turn": 7,
          "created_at": "2026-10-05T12:00:00+00:00",
          "memory": [{"id", "content", "memory_type", "importance",
-                     "source_phase", "token_count"}, ...],
+                     "source_phase", "token_count", "job_id",
+                     "source_turn_start", "source_turn_end"}, ...],
          "knowledge": [{"id", "project_id", "kb_id", "note_id", "title",
                         "note_type", "status", "priority", "confidence",
                         "tags", "phase", "content", "matched_arms"}, ...]}
@@ -154,7 +165,17 @@ def deserialize_pending_set(value: Any) -> Optional[RetrievalResult]:
             continue
         fields = {name: item.get(name) for name in _MEMORY_FIELDS}
         fields = {name: v for name, v in fields.items() if v is not None}
-        memories.append(MemoryRecord(id=_id_value(item.get("id")), **fields))
+        for name in _MEMORY_TURN_FIELDS:
+            turn = item.get(name)
+            if isinstance(turn, int) and not isinstance(turn, bool):
+                fields[name] = turn
+        memories.append(
+            MemoryRecord(
+                id=_id_value(item.get("id")),
+                job_id=_id_value(item.get("job_id")),
+                **fields,
+            )
+        )
     notes: List[Any] = []
     for item in stored.get("knowledge") or []:
         if not isinstance(item, Mapping) or not isinstance(item.get("content"), str):

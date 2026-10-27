@@ -48,6 +48,11 @@ from agent.services.memory.registry import (
     RETIRED_MEMORY_PLUGINS,
     resolve_memory_plugin,
 )
+from agent.services.memory.same_conversation import (
+    ConversationTurns,
+    same_conversation_mode,
+    skip_in_context,
+)
 from agent.services.memory.types import (
     PREFETCH_CANCELLED,
     PREFETCH_DEGRADED,
@@ -69,6 +74,7 @@ from agent.services.memory.types import (
     TransientScorerError,
     _StopWatch,
 )
+from shared.runtime.core.loader import SAME_CONVERSATION_ALLOW
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +124,10 @@ RETRIEVAL_COUNTERS = (
     "prefetch_degraded",
     "prefetch_skipped",
     "prefetch_taken",
+    # memory.retrieval.same_conversation skip_in_context (P4 arm B): memories
+    # of this conversation dropped at take-in because their source was still
+    # in context. Always 0 under the default (allow).
+    "same_conversation_skipped",
 )
 
 _PREFETCH_COUNTER = {
@@ -478,7 +488,9 @@ class MemoryManager:
         task.add_done_callback(self._retrieval_settled)
         return True
 
-    def take_retrieval(self) -> Optional[RetrievalResult]:
+    def take_retrieval(
+        self, conversation: Optional[ConversationTurns] = None
+    ) -> Optional[RetrievalResult]:
         """Take in the pending retrieval result, if one has finished (D8).
 
         Never awaits; the request build calls it. The result is the latest
@@ -489,6 +501,13 @@ class MemoryManager:
         A pending idle-time prefetch (WP4) is handed out with it: alone, or
         merged with a request retrieval that finished too
         (:func:`merge_retrieval_results`), so neither replaces the other.
+
+        ``conversation`` is where the caller's conversation stands (its turn
+        and its latest compaction boundary). Under
+        ``memory.retrieval.same_conversation: skip_in_context`` (P4 arm B)
+        this conversation's memories whose source is still in context are
+        dropped here; None counts as nothing compacted. Under the default
+        (``allow``) the result is handed out as it finished.
         """
         result, self._pending_retrieval = self._pending_retrieval, None
         prefetched, self._prefetched = self._prefetched, None
@@ -502,6 +521,45 @@ class MemoryManager:
             )
         if result is not None:
             self._retrieval_counts["drained"] += 1
+            result = self._apply_same_conversation(result, conversation)
+        return result
+
+    def _apply_same_conversation(
+        self, result: RetrievalResult, conversation: Optional[ConversationTurns]
+    ) -> RetrievalResult:
+        """``memory.retrieval.same_conversation`` on a result taken in (P4).
+
+        Contained like the read pipeline: a failure logs and hands the
+        result out unfiltered (arm A's behaviour) instead of failing the
+        request.
+        """
+        if (
+            same_conversation_mode(self.runtime.memory_config)
+            == SAME_CONVERSATION_ALLOW
+        ):
+            return result
+        turns = conversation or ConversationTurns()
+        try:
+            result, skipped = skip_in_context(
+                result, conversation_id=self.runtime.job_id, turns=turns
+            )
+        except Exception as e:
+            logger.warning(
+                "Same-conversation memory filter failed (%s: %s); the result "
+                "is taken in unfiltered",
+                type(e).__name__,
+                e,
+            )
+            return result
+        self._retrieval_counts["same_conversation_skipped"] += skipped
+        if skipped:
+            logger.info(
+                "Memory take-in skipped %d memories of this conversation whose "
+                "source is still in context (compacted through turn %d, turn %s)",
+                skipped,
+                turns.compacted_through,
+                turns.current,
+            )
         return result
 
     def retrieval_stats(self) -> Dict[str, int]:

@@ -1235,14 +1235,19 @@ def create_execute_node(
         ) -> None:
             """One manager payload in: the planner's records and the
             memory_inject audit. ``retrieval`` describes the asynchronous
-            run it came from and rides on the audit."""
+            run it came from and rides on the audit. A memory block that
+            the same-conversation rule (P4 arm B) emptied is audited too,
+            so a bench run sees what it skipped."""
+            from agent.services.memory.same_conversation import skipped_count
+
+            _skipped = skipped_count(payload.stats)
             for _mm_block in payload.blocks:
                 if _mm_block.kind == "memory":
                     _memory_records.extend(getattr(_mm_block, "records", None) or [])
                 elif _mm_block.kind == "knowledge" and not _kb_bindings:
                     # Bound KBs come from the chunk retrieval below instead.
                     _knowledge_records.extend(getattr(_mm_block, "records", None) or [])
-                if _mm_block.kind == "memory" and _mm_block.items:
+                if _mm_block.kind == "memory" and (_mm_block.items or _skipped):
                     logger.debug(
                         f"[{job_id}] Memory injection: "
                         f"{len(_mm_block.items)} memories retrieved"
@@ -1507,7 +1512,16 @@ def create_execute_node(
         # result is used for this request only; memory a compaction evicted
         # comes back with the next result that still returns it (D4).
         if memory_service is not None:
-            _drained = memory_service.take_retrieval()
+            from agent.services.memory.same_conversation import (
+                worker_conversation_turns,
+            )
+
+            # Where this job stands, for memory.retrieval.same_conversation
+            # (P4): its turns and, derived from the compacted history, the
+            # last turn a compaction removed.
+            _drained = memory_service.take_retrieval(
+                worker_conversation_turns(messages, turn_count)
+            )
             if _drained is not None:
                 _take_in_manager_payload(
                     _drained.payload,

@@ -101,6 +101,9 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # (a new category, tools.memory) and its memory.pipeline.extensions entry,
     # both roles (D34). Both differ from the dataclass defaults ([]), so the
     # effective compare strips them on both sides.
+    # Append-only context injection P4: the shared root states
+    # memory.retrieval (same_conversation: allow, both roles; same value as
+    # the dataclass default, so the effective compare needs no exclusion).
     "worker": (
         "delegation.max_concurrent",
         "delegation.run_in_background_default",
@@ -108,6 +111,7 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "memory.max_memories_per_entry",
         "tools.memory",
         "memory.pipeline.extensions",
+        "memory.retrieval",
     ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
@@ -119,6 +123,7 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "memory.max_memories_per_entry",
         "tools.memory",
         "memory.pipeline.extensions",
+        "memory.retrieval",
     ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was

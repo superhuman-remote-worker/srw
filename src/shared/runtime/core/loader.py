@@ -2682,6 +2682,32 @@ class QueryConfig:
     digest_max_chars_per_message: int = 500
 
 
+#: ``memory.retrieval.same_conversation`` values (append-only context
+#: injection P4, a deferred test: vault
+#: knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md).
+#: ``allow`` keeps a memory whose source is the current job or session
+#: eligible (arm A, today); ``skip_in_context`` skips it while its source
+#: turns are still in context (arm B).
+SAME_CONVERSATION_ALLOW = "allow"
+SAME_CONVERSATION_SKIP_IN_CONTEXT = "skip_in_context"
+SAME_CONVERSATION_MODES = (SAME_CONVERSATION_ALLOW, SAME_CONVERSATION_SKIP_IN_CONTEXT)
+
+
+@dataclass
+class MemoryRetrievalConfig:
+    """memory.retrieval — what a finished retrieval may inject (P4).
+
+    ``same_conversation`` decides the memories the observer extracted from
+    the conversation that is retrieving them. Default ``allow``: they stay
+    eligible, as before. ``skip_in_context`` drops one while its source
+    turns are still in context and lets it in again once a compaction has
+    removed them (``agent.services.memory.same_conversation``). The model's
+    own ``memory_search`` is never filtered.
+    """
+
+    same_conversation: str = SAME_CONVERSATION_ALLOW
+
+
 @dataclass
 class MemoryConfig:
     """Memory Light (RecallStore) configuration.
@@ -2724,6 +2750,7 @@ class MemoryConfig:
     bounded: BoundedConfig = field(default_factory=BoundedConfig)
     gate: GateConfig = field(default_factory=GateConfig)
     query: QueryConfig = field(default_factory=QueryConfig)
+    retrieval: MemoryRetrievalConfig = field(default_factory=MemoryRetrievalConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
 
@@ -3219,6 +3246,27 @@ def _parse_prefetch_budget(value: Any) -> float:
     return parsed
 
 
+def _parse_memory_retrieval(value: Any) -> MemoryRetrievalConfig:
+    """``memory.retrieval``: ``same_conversation`` is allow | skip_in_context (P4).
+
+    Absent or null means ``allow``: a stored config written before the key
+    existed keeps today's behaviour.
+    """
+    if value is None:
+        return MemoryRetrievalConfig()
+    if not isinstance(value, dict):
+        raise ValueError(f"memory.retrieval must be a mapping, got {value!r}")
+    mode = value.get("same_conversation")
+    if mode is None:
+        return MemoryRetrievalConfig()
+    if mode not in SAME_CONVERSATION_MODES:
+        raise ValueError(
+            "memory.retrieval.same_conversation must be one of "
+            f"{', '.join(SAME_CONVERSATION_MODES)}, got {mode!r}"
+        )
+    return MemoryRetrievalConfig(same_conversation=mode)
+
+
 def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     """Parse memory configuration from dict.
 
@@ -3321,6 +3369,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         bounded=bounded,
         gate=gate,
         query=query,
+        retrieval=_parse_memory_retrieval(data.get("retrieval")),
         ingestion=ingestion,
         extraction=extraction,
     )

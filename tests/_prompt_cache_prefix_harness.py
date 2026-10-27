@@ -852,7 +852,7 @@ class RecordingMemoryManager:
             self._finished = result
         return True
 
-    def take_retrieval(self) -> Optional[Any]:
+    def take_retrieval(self, conversation: Any = None) -> Optional[Any]:
         result, self._finished = self._finished, None
         prefetched, self._prefetched = self._prefetched, None
         if prefetched is not None:
