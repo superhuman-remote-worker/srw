@@ -46,8 +46,9 @@ from langchain_core.messages import (
 from agent.api.persistent_app import _db_rows_to_lc_messages
 from agent.core.archiver import _message_to_dict
 from agent.core.thread_messages import (
+    ANTHROPIC_CONTENT_KEY,
     ARGUMENTS_KEY,
-    HUMAN_CONTENT_KEY,
+    NATIVE_CONTENT_KEY,
     _serialize_message_row,
     restored_tool_call_args,
 )
@@ -183,7 +184,7 @@ class TestImageRow:
         # What the cockpit shows (and hides by this exact text), without the
         # trailing space the old flattening left.
         assert row["content"] == MARKER
-        assert json.loads(row["provider_raw"][HUMAN_CONTENT_KEY]) == message.content
+        assert json.loads(row["provider_raw"][NATIVE_CONTENT_KEY]) == message.content
 
     @pytest.mark.asyncio
     async def test_it_comes_back_with_its_image_and_its_role(self):
@@ -333,6 +334,95 @@ class TestToolCallArguments:
         call = {"id": "c", "name": "t", "args": {"a": 1}, ARGUMENTS_KEY: "{not json"}
 
         assert restored_tool_call_args(call) == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# An assistant turn's native blocks through a jsonb column
+# ---------------------------------------------------------------------------
+
+
+class TestNativeBlocks:
+    """``provider_raw`` is jsonb as well, and a client sends a restored turn's
+    blocks as they come back (an Anthropic thinking block, a Responses item).
+    They are kept the way the arguments are: as JSON text where jsonb would
+    reorder a key, as the list where it would not."""
+
+    BLOCKS = [
+        {"type": "thinking", "thinking": "Open app.py first.", "signature": "sig-1"},
+        {"type": "text", "text": "Let me look."},
+        {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "edit_file",
+            "input": {"path": "app.py", "why": "look"},
+        },
+    ]
+
+    @staticmethod
+    def _turn(content: List[Any]) -> AIMessage:
+        return AIMessage(
+            content=content,
+            tool_calls=[
+                {
+                    "name": "edit_file",
+                    "args": {"path": "app.py", "why": "look"},
+                    "id": "call_1",
+                }
+            ],
+            response_metadata={
+                "model_name": "claude-opus-5-5",
+                "model_provider": "anthropic",
+            },
+            id=str(uuid4()),
+        )
+
+    def test_blocks_jsonb_would_reorder_are_kept_as_text(self):
+        raw = _serialize_message_row(self._turn(self.BLOCKS), 3)["provider_raw"]
+
+        assert raw[NATIVE_CONTENT_KEY] == json.dumps(self.BLOCKS)
+        assert [list(b) for b in _jsonb(self.BLOCKS)] != [list(b) for b in self.BLOCKS]
+
+    def test_blocks_jsonb_returns_in_order_stay_a_list(self):
+        # A thinking block's keys are in jsonb's order already.
+        blocks = self.BLOCKS[:1]
+
+        raw = _serialize_message_row(self._turn(blocks), 3)["provider_raw"]
+
+        assert raw[NATIVE_CONTENT_KEY] == blocks
+
+    @pytest.mark.asyncio
+    async def test_the_restored_turn_has_the_live_key_order(self):
+        (restored,) = await _round_trip([self._turn(self.BLOCKS)])
+
+        assert json.dumps(restored.content) == json.dumps(self.BLOCKS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            {NATIVE_CONTENT_KEY: BLOCKS},
+            {ANTHROPIC_CONTENT_KEY: BLOCKS},
+        ],
+        ids=["list", "anthropic-key"],
+    )
+    async def test_a_turn_stored_as_a_list_still_restores(self, envelope):
+        """Rows from before the text: the blocks come back in jsonb's order."""
+        row = _serialize_message_row(self._turn(self.BLOCKS), 3)
+        row["provider_raw"] = {**envelope, "model": "claude-opus-5-5"}
+
+        (restored,) = _db_rows_to_lc_messages(await _read_rows([row]))
+
+        assert restored.content == self.BLOCKS
+        assert restored.response_metadata == {"model_name": "claude-opus-5-5"}
+
+    @pytest.mark.asyncio
+    async def test_unreadable_text_falls_back_to_the_row_text(self):
+        row = _serialize_message_row(self._turn(self.BLOCKS), 3)
+        row["provider_raw"][NATIVE_CONTENT_KEY] = "[not json"
+
+        (restored,) = _db_rows_to_lc_messages(await _read_rows([row]))
+
+        assert restored.content == "Let me look."
 
 
 # ---------------------------------------------------------------------------

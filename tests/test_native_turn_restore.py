@@ -18,11 +18,12 @@ Chat Completions families carry reasoning in
 send either, so their plain row restores byte-identically.
 
 Each live turn here is what the provider SDK parses from a wire response.
-It goes through the real serializer, a JSON round trip (the jsonb column),
-the session restore or the child-transcript restore, and the provider
-boundary sanitizer the restore applies; the SDK's own request builder must
-then produce the same history. The streamed variants of these paths run end
-to end in ``tests/test_session_restore_round_trip.py``.
+It goes through the real serializer, a jsonb round trip (object keys come
+back shortest first), the session restore or the child-transcript restore,
+and the provider boundary sanitizer the restore applies; the SDK's own
+request builder must then produce the same history, key order included. The
+streamed variants of these paths run end to end in
+``tests/test_session_restore_round_trip.py``.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from agent.core.context import sanitize_history_for_provider_boundary
 from agent.core.thread_messages import _serialize_message_row
 from agent.subagents.persistence import restore_subagent_messages
 from shared.runtime.core import loader
+from tests.test_session_restore_byte_exact import _stored
 
 PROXY_URL = "http://srw-codex-proxy:8317/v1"
 SYSTEM = "You are the SRW session assistant under test."
@@ -79,7 +81,9 @@ def _history(turn: AIMessage, results: Dict[str, str]) -> List[BaseMessage]:
 
 def _rows(history: List[BaseMessage]) -> List[Dict[str, Any]]:
     """Serialized rows as the history reader hands them back (jsonb round trip)."""
-    return json.loads(json.dumps([_serialize_message_row(m, 1) for m in history]))
+    return _stored(
+        json.loads(json.dumps([_serialize_message_row(m, 1) for m in history]))
+    )
 
 
 def _session_restore(rows: List[Dict[str, Any]]) -> List[BaseMessage]:
@@ -231,7 +235,7 @@ class TestResponses:
         def wire(history):
             return llm._get_request_payload([SystemMessage(SYSTEM), *history])["input"]
 
-        assert wire(restored) == wire(live)
+        assert json.dumps(wire(restored)) == json.dumps(wire(live))
         # Non-vacuous: the items a flattened row lost are on the wire.
         sent = json.dumps(wire(live))
         assert '"id": "msg_1"' in sent or '"id": "fc_1"' in sent
@@ -365,7 +369,7 @@ class TestGemini:
                 for content in request["contents"]
             ]
 
-        assert wire(restored) == wire(live)
+        assert json.dumps(wire(restored)) == json.dumps(wire(live))
         model_turn = json.dumps(wire(live)[1])
         assert '"thought_signature"' in model_turn
 
@@ -471,7 +475,7 @@ class TestAnthropic:
             payload = llm._get_request_payload([SystemMessage(SYSTEM), *history])
             return payload["messages"]
 
-        assert wire(restored) == wire(live)
+        assert json.dumps(wire(restored)) == json.dumps(wire(live))
         assert wire(live)[1]["content"][0]["type"] == "thinking"
 
 
@@ -514,7 +518,7 @@ class TestChatCompletionsReasoning:
             payload = llm._get_request_payload([SystemMessage(SYSTEM), *history])
             return payload["messages"]
 
-        assert wire(restored) == wire(live)
+        assert json.dumps(wire(restored)) == json.dumps(wire(live))
         assert "Open a.md first." not in json.dumps(wire(live))
         ai_row = rows[1]
         assert ai_row["thinking"] == "Open a.md first."

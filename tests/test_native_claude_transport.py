@@ -7,6 +7,7 @@ knowledge-base/knowledge/issues/website_demo_findings_2026_10_11.md, F1.
 """
 
 import dataclasses
+import json
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -183,8 +184,9 @@ class TestPersistence:
         row = _serialize_message_row(self._claude_turn(), 1)
 
         assert row["content"] == ""
+        # As JSON text: jsonb would hand the tool_use block back "id" first.
         assert row["provider_raw"] == {
-            NATIVE_CONTENT_KEY: self._claude_turn().content,
+            NATIVE_CONTENT_KEY: json.dumps(self._claude_turn().content),
             "model": "claude-opus-5-5",
             "provider": "anthropic",
         }

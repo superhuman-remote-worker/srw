@@ -11,7 +11,8 @@ columns.
   its ``content`` still matches the text the cockpit and the rewind sweep
   recognise it by.
 - The serializer keeps a call's argument text exactly when Postgres hands
-  its keys back in another order (the unit tests emulate that order).
+  its keys back in another order (the unit tests emulate that order), and a
+  turn's native blocks the same way in ``provider_raw``.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from agent.api.persistent_app import _db_rows_to_lc_messages
 from agent.core.thread_messages import (
     ARGUMENTS_KEY,
+    NATIVE_CONTENT_KEY,
     _serialize_message_row,
     restored_tool_call_args,
 )
@@ -133,3 +135,74 @@ async def test_argument_text_is_kept_exactly_when_postgres_reorders(
     assert (ARGUMENTS_KEY in entry) == postgres_reorders
     restored: Dict[str, Any] = restored_tool_call_args(entry)
     assert json.dumps(restored) == json.dumps(args)
+
+
+_THINKING = {"type": "thinking", "thinking": "Open a.md.", "signature": "sig-1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocks", "postgres_reorders"),
+    [
+        # A Claude turn: the tool_use block's "id" sorts first.
+        (
+            [
+                _THINKING,
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "read_file",
+                    "input": {"path": "a.md", "why": "look"},
+                },
+            ],
+            True,
+        ),
+        # A thinking block's keys are in jsonb's order already.
+        ([_THINKING], False),
+        # A Responses turn: its items' "id" sorts first.
+        (
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Open a.md."}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": '{"path": "a.md"}',
+                },
+            ],
+            True,
+        ),
+    ],
+    ids=["claude", "thinking-only", "responses"],
+)
+async def test_native_blocks_are_kept_as_text_exactly_when_postgres_reorders(
+    db,  # noqa: F811 (fixture)
+    blocks,
+    postgres_reorders,
+):
+    thread_id = await _thread(db)
+    turn = AIMessage(
+        content=blocks,
+        response_metadata={"model_name": "m-1", "model_provider": "p"},
+        id=str(uuid4()),
+    )
+    await _save(db, thread_id, turn)
+
+    async with db.acquire() as conn:
+        as_jsonb = await conn.fetchval("SELECT $1::jsonb", json.dumps(blocks))
+        stored = await conn.fetchval(
+            "SELECT provider_raw FROM thread_messages WHERE id = $1", UUID(turn.id)
+        )
+    assert (as_jsonb != json.dumps(blocks)) == postgres_reorders
+    assert isinstance(json.loads(stored)[NATIVE_CONTENT_KEY], str) == postgres_reorders
+
+    rows = await db.get_thread_messages_history(
+        thread_id, order_by_seq=True, include_provider_raw=True
+    )
+    (restored,) = _db_rows_to_lc_messages(rows)
+    assert json.dumps(restored.content) == json.dumps(blocks)

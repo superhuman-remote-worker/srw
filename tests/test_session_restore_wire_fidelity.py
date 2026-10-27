@@ -73,24 +73,26 @@ Stubs and constructed placements:
 - Tool arguments are written in jsonb's key order in every scenario except
   ``tool-args-key-order``, so that one finding stays in one scenario.
 
-Markers: each case that differs today is ``xfail(strict=True)`` with its
-causes (``CAUSES``): ``F1: ...`` (provider-native assistant structure),
-``F7: ...`` (the synthetic image row) or ``new: ...``. Only a
-``RestoreDrift`` counts as the expected failure. ``expected_causes`` names the
-causes of each case and ``observed_causes`` detects them in the two requests;
-a case fails outright when they disagree, so a fix that removes one of a
-case's two causes turns the run red as well, until ``expected_causes`` is
-updated. A difference no detector explains fails outright too.
+Markers: no case differs today. A case in ``KNOWN_DRIFT`` is
+``xfail(strict=True)`` with its causes (``CAUSES``): ``F1: ...``
+(provider-native assistant structure), ``F7: ...`` (the synthetic image row)
+or ``jsonb: ...`` (key order through a jsonb column). Only a ``RestoreDrift``
+counts as the expected failure. ``expected_causes`` names the causes of each
+case and ``observed_causes`` detects every cause found so far in the two
+requests; a case fails outright when they disagree, so a case that differs
+again fails naming its causes, and a fix that removes one of a listed case's
+causes turns the run red until ``KNOWN_DRIFT`` is updated. A difference no
+detector explains fails outright too.
 
 F7 as the soak saw it (an empty AI message coming back as ``" "``, the image
 row gaining a trailing space) came from the serializer joining every list part
 with a space, empty ones included; since ``509118a3e`` it skips empty parts,
 and the plain and tool-call cases here pin that. F7 at the wire was
 ``image-dropped`` and ``image-entry-joined``, F1 the ``responses-*`` and
-``gemini-*`` causes, and ``jsonb-tool-args`` came with F7's argument text; all
-of them are fixed. What still differs is the key order of a turn's native
-blocks, which ``provider_raw`` (jsonb) hands back shortest key first:
-``anthropic-thinking-key-order`` and ``responses-item-key-order``.
+``gemini-*`` causes; ``jsonb-tool-args`` went with F7's argument text, and
+``anthropic-thinking-key-order`` and ``responses-item-key-order`` (a turn's
+native blocks handed back by ``provider_raw`` shortest key first) went when
+the blocks were stored the same way. Every case sends the live bytes.
 """
 
 from __future__ import annotations
@@ -1130,10 +1132,11 @@ def wire_differences(live: harness.Captured, restored: harness.Captured) -> List
 
 
 # ---------------------------------------------------------------------------
-# What differs today: causes, their detectors, and the cases they hit
+# Causes found so far, their detectors, and the cases that differ today
 # ---------------------------------------------------------------------------
 
 #: Every cause of a restore difference found so far, with its marker text.
+#: All are fixed; the detectors name them when one comes back.
 CAUSES: Dict[str, str] = {
     "responses-item-ids": (
         "F1: a restored Responses assistant turn loses its item ids (message "
@@ -1148,16 +1151,16 @@ CAUSES: Dict[str, str] = {
     ),
     "gemini-thought-parts": "F1: a restored Gemini model turn loses its thought parts",
     "anthropic-thinking-key-order": (
-        "new: a restored Anthropic thinking block comes back from provider_raw, a "
+        "jsonb: a restored Anthropic thinking block comes back from provider_raw, a "
         "jsonb column, with its keys reordered ('type' first; key order only)"
     ),
     "responses-item-key-order": (
-        "new: a restored Responses reasoning or function_call item comes back "
+        "jsonb: a restored Responses reasoning or function_call item comes back "
         "from provider_raw, a jsonb column, with its keys reordered ('id' "
         "first; key order only)"
     ),
     "jsonb-tool-args": (
-        "new: restored tool-call arguments come back in jsonb key order "
+        "jsonb: restored tool-call arguments come back in jsonb key order "
         "(thread_messages.tool_calls and provider_raw are jsonb: shorter keys "
         "first), so the arguments the provider sees are reordered"
     ),
@@ -1171,31 +1174,17 @@ CAUSES: Dict[str, str] = {
     ),
 }
 
-_RESPONSES = {"responses", "responses-codex"}
-_ANTHROPIC = {"anthropic", "anthropic-proxy"}
 _IMAGE_SCENARIOS = {"image", "image-memory-entry", "image-turn-boundary"}
-#: Scenarios whose probe request replays an assistant tool call.
-_REPLAYED_TOOL_CALLS = {
-    "tool-call-empty-content",
-    "parallel-tool-batch",
-    "text-and-tool-call",
-    "tool-args-key-order",
-    "image",
-    "image-memory-entry",
-    "image-turn-boundary",
-    "reasoning",
-    "compaction",
-}
+
+#: (scenario, client) -> the causes that make the case differ today: none. A
+#: difference whose fix cannot land with the change that caused it is listed
+#: here, and the case is a strict xfail until it is fixed.
+KNOWN_DRIFT: Dict[Tuple[str, str], Tuple[str, ...]] = {}
 
 
 def expected_causes(scenario_id: str, client: str) -> List[str]:
     """The causes that make ``(scenario_id, client)`` differ today."""
-    causes = []
-    if client in _RESPONSES and scenario_id in _REPLAYED_TOOL_CALLS:
-        causes.append("responses-item-key-order")
-    if client in _ANTHROPIC and scenario_id == "reasoning":
-        causes.append("anthropic-thinking-key-order")
-    return causes
+    return list(KNOWN_DRIFT.get((scenario_id, client), ()))
 
 
 def _strings(value: Any) -> List[str]:
@@ -1447,8 +1436,10 @@ def pg_dsn(scratch_pg_dsn: str) -> str:  # noqa: F811 (pytest fixture param)
     [
         # tool_calls jsonb with arguments jsonb reorders.
         ("tool-args-key-order", "chat"),
-        # provider_raw jsonb (Anthropic thinking and tool_use blocks).
+        # provider_raw jsonb (Anthropic thinking and tool_use blocks, and
+        # Responses reasoning and function_call items, as JSON text).
         ("reasoning", "anthropic"),
+        ("reasoning", "responses"),
         # The image row (role 'event') with a folded memory entry (role
         # 'context', additional_kwargs jsonb).
         ("image-memory-entry", "gemini"),
