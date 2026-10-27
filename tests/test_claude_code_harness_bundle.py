@@ -134,6 +134,26 @@ async def test_archive_tolerates_tar_exit_code_one(workspace, tmp_path, monkeypa
     assert info["bytes"] > 0
 
 
+@pytest.mark.asyncio
+async def test_archive_refuses_non_gzip_output(workspace, tmp_path, monkeypatch):
+    real = workspace.read_stream
+    seen = []
+
+    def wrapped(command):
+        replaced = command.replace(
+            "tar --anchored", "sh -c 'echo usage: tar >&2; exit 1' --anchored", 1
+        )
+        assert replaced != command
+        seen.append(replaced)
+        return real(replaced)
+
+    monkeypatch.setattr(workspace, "read_stream", wrapped)
+    dest = tmp_path / "ws.tar.gz"
+    with pytest.raises(BundleError, match="no gzip output"):
+        await archive_workspace(workspace, dest)
+    assert seen and not dest.exists()
+
+
 def test_build_bundle_contains_the_three_members(tmp_path):
     (tmp_path / "t.jsonl").write_text("{}\n")
     (tmp_path / "r.json").write_text("{}")

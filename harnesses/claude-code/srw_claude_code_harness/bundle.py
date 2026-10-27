@@ -77,13 +77,26 @@ async def archive_workspace(
     )
     written = 0
     try:
-        with dest.open("wb") as out:
-            async with contextlib.aclosing(workspace.read_stream(command)) as stream:
-                async for chunk in stream:
-                    out.write(chunk)
-                    written += len(chunk)
-    except WorkspaceError as exc:
-        raise BundleError(f"workspace archive failed: {exc}") from exc
+        try:
+            with dest.open("wb") as out:
+                async with contextlib.aclosing(
+                    workspace.read_stream(command)
+                ) as stream:
+                    async for chunk in stream:
+                        out.write(chunk)
+                        written += len(chunk)
+        except WorkspaceError as exc:
+            raise BundleError(f"workspace archive failed: {exc}") from exc
+        with dest.open("rb") as check:
+            magic = check.read(2)
+        if magic != b"\x1f\x8b":
+            raise BundleError(
+                "workspace archive failed: tar produced no gzip output "
+                "(is GNU tar installed in the workspace?)"
+            )
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
     listing = await workspace.run(
         f"cd -- {shlex.quote(workspace.root)} && find . -type f -size +{limit}c",
         capture_limit=4 * 1024 * 1024,
