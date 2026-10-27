@@ -1779,6 +1779,31 @@ jobs:
             type=sha,format=short,prefix=sha-
             type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
             type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      # Smoke test before anything is published: the SDK the image pins (the
+      # test venv may run another version) must import the harness, parse a
+      # config and build the session options. No session, no network.
+      # Loaded into the local daemon only; the push below reuses the layers.
+      - name: Build the image for the smoke test
+        run: >-
+          docker buildx build --load --platform linux/amd64
+          --file ./docker/Dockerfile.harness-claude-code
+          --cache-from type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-main
+          --tag srw-harness-claude-code:smoke .
+      - name: Smoke-test the image
+        run: |
+          docker run --rm --network none --entrypoint python3 srw-harness-claude-code:smoke -c '
+          from pathlib import Path
+          from srw_claude_code_harness.__main__ import _versions
+          from srw_claude_code_harness.config import parse_config
+          from srw_claude_code_harness.session import build_options
+          from srw_claude_code_harness.tools import make_tools
+          config = parse_config({"version": 1, "model": "claude-smoke"})
+          options = build_options(config, tools=make_tools(None, config.tools), env={"PATH": "/usr/bin"}, cwd=Path("/home/agent-host/workspace"))
+          assert options.model == "claude-smoke" and len(options.allowed_tools) == 4, options
+          versions = _versions()
+          assert versions["sdk"] and versions["cli"], versions
+          print("harness smoke ok", versions)
+          '
       - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:

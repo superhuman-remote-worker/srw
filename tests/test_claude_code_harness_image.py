@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import yaml
 from jsonschema import Draft202012Validator
 
 from shared.manifests import load_schema, parse_documents
@@ -70,3 +71,32 @@ def test_example_job_validates_against_the_manifest_schema():
     assert job["spec"]["execution"]["expert"]["inline"]["runtime"]["image"].endswith(
         "@sha256:" + "0" * 64
     )
+
+
+def test_ci_smoke_tests_the_image_before_it_is_published():
+    """M5: tests run against the venv's SDK; the image pins its own. Both CI
+    jobs run the built image (no network) through build_options before the
+    step that pushes."""
+    for workflow in ("develop.yml", "main.yml"):
+        jobs = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())[
+            "jobs"
+        ]
+        steps = jobs["build-harness-claude-code"]["steps"]
+        names = [step.get("name", "") for step in steps]
+        build = names.index("Build the image for the smoke test")
+        smoke = names.index("Smoke-test the image")
+        push = next(
+            i for i, step in enumerate(steps) if step.get("with", {}).get("push")
+        )
+        assert build < smoke < push, workflow
+        built = steps[build]["run"]
+        assert built.startswith("docker buildx build --load ")
+        assert "--file ./docker/Dockerfile.harness-claude-code" in built
+        assert "--tag srw-harness-claude-code:smoke" in built and "--push" not in built
+        command = steps[smoke]["run"]
+        assert (
+            "--network none --entrypoint python3 srw-harness-claude-code:smoke -c"
+            in command
+        )
+        for needle in ("parse_config(", "build_options(", "make_tools("):
+            assert needle in command, (workflow, needle)
