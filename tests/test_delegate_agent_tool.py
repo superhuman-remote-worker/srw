@@ -865,6 +865,7 @@ class TestRun:
         ctx, _ = make_parent(tmp_path)
         ctx._fork_source = [
             SystemMessage(content="PARENT SYSTEM PROMPT"),
+            SystemMessage(content="[Summary of prior work] PARENT SUMMARY"),
             HumanMessage(content="Parent asked about MARMALADE"),
             AIMessage(content="Parent answered."),
         ]
@@ -879,10 +880,11 @@ class TestRun:
         texts = [str(m.content) for m in forked]
         assert any("Parent asked about MARMALADE" in t for t in texts)
         assert any(FORK_NOTICE in t for t in texts)
-        # Every durable SystemMessage survives U5's exact fork seed. A real
-        # parent's system prompt is transient and therefore never appears in
-        # `_fork_source`; this synthetic durable one models a compacted summary.
-        assert any(t == "PARENT SYSTEM PROMPT" for t in texts)
+        # A session parent's durable list starts with its own prompt; the
+        # child runs under its own, so the seed drops it. A (legacy)
+        # compaction summary is history and survives.
+        assert not any("PARENT SYSTEM PROMPT" in t for t in texts)
+        assert any(t == "[Summary of prior work] PARENT SUMMARY" for t in texts)
         assert isinstance(forked[0], SystemMessage)  # the child's own prompt
         assert texts[-1].strip().endswith("Continue.") or "Continue." in texts[-1]
 

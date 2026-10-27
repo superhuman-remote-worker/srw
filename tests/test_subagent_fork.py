@@ -87,7 +87,7 @@ class TestSeedForkHistory:
         assert notice.additional_kwargs[PERSIST_ROLE_KEY] == "event"
         assert "brief" in FORK_NOTICE
 
-    def test_all_durable_system_messages_survive_including_the_leading_summary(self):
+    def test_legacy_summaries_survive_wherever_they_sit(self):
         history = [
             SystemMessage(content="[Summary of prior work] leading"),
             HumanMessage(content="hi"),
@@ -99,6 +99,33 @@ class TestSeedForkHistory:
         assert summaries == [
             "[Summary of prior work] leading",
             "[Summary of prior work] mid-history",
+        ]
+
+    def test_drops_the_parents_prompt_and_nudges(self):
+        """A session's durable list starts with its own prompt and a worker's
+        state holds nudges; neither is history for the child, which runs under
+        its own prompt (a second system message breaks one-system templates)."""
+        history = [
+            SystemMessage(content="Session prompt."),
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "p1", "name": "list_files", "args": {}, "type": "tool_call"}
+                ],
+            ),
+            ToolMessage(content="a.md", tool_call_id="p1"),
+            SystemMessage(content="OBSERVATION: 5 tool calls since the last write."),
+            AIMessage(content="ok"),
+        ]
+        seed = seed_fork_history(history)
+        assert not any(isinstance(m, SystemMessage) for m in seed)
+        assert [type(m).__name__ for m in seed] == [
+            "HumanMessage",
+            "AIMessage",
+            "ToolMessage",
+            "AIMessage",
+            "HumanMessage",
         ]
 
     def test_never_mutates_or_shares_nested_state_with_parent_messages(self):

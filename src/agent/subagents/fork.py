@@ -3,9 +3,14 @@
 A pure function over a message list. The seed is the parent's DURABLE
 ``messages`` (the compacted list — never a prepared/transient copy):
 
-1. preserve every durable ``SystemMessage`` (the parent's prompt is not
-   durable; a leading one is a legacy compaction summary) and the compaction
-   summary's user-role hand-back, which steps 2 and 3 leave alone;
+1. keep a compaction summary (the user-role hand-back, or a legacy
+   ``[Summary of prior work]`` ``SystemMessage``) and drop every other
+   ``SystemMessage``: a session's durable list starts with its own prompt
+   (the child runs under its own), and a worker's state holds nudges its
+   requests never send. Left in, either reached the child's provider as a
+   second system message, which a chat template that takes one leading
+   system turn has to fold away (``fold_system_messages``) and native
+   Anthropic rejects mid-history;
 2. drop protected phase blocks (``is_protected_message``), injected context
    (``is_context_injection``: the parent's context entries are the parent's;
    the child's own builds inject what it needs) and ``RemoveMessage``
@@ -34,7 +39,13 @@ import copy
 import uuid
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from agent.core.context import (
     _conforming_tool_call_id,
@@ -45,6 +56,7 @@ from shared.runtime.core.context_entries import is_context_injection
 from shared.runtime.core.message_markers import (
     PERSIST_ROLE_EVENT,
     PERSIST_ROLE_KEY,
+    is_compaction_summary,
     is_protected_message,
 )
 
@@ -301,6 +313,8 @@ def seed_fork_history(
             continue
         if is_protected_message(message) or is_context_injection(message):
             continue
+        if isinstance(message, SystemMessage) and not is_compaction_summary(message):
+            continue  # the parent's prompt or a nudge (step 1)
         seed.append(copy.deepcopy(message))
     while (
         seed

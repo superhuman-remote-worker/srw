@@ -556,7 +556,9 @@ class TestScenarioC:
 
         parent_ctx, _ = parent
         ledger = RefusingLedger()
-        seed = seed_fork_history([SystemMessage(content="[Summary] durable")])
+        seed = seed_fork_history(
+            [SystemMessage(content="[Summary of prior work] durable")]
+        )
         driver, fake, _ = await make_driver(
             parent_ctx,
             [text_turn("must never run")],
