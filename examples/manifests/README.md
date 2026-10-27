@@ -580,13 +580,23 @@ administrator to grant it (Admin → Grants)."
 ### Approved images on unverified clusters
 
 Without `manifestHosting.networkIsolationVerified: true`, generic hosting is
-unavailable and admission returns `503 HostingCapabilityUnavailable`. An operator who
-accepts the risk can instead set
-`manifestHosting.allowApprovedImagesWithoutVerifiedIsolation: true`
-(`MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION`). On such a cluster a new
-harness pod may reach in-cluster destinations for its first seconds, until policy
-enforcement catches up. Only an approved image, run as built, executes there. With
-both values false hosting stays unavailable.
+unavailable and admission returns `503 HostingCapabilityUnavailable`. An operator can
+instead set `manifestHosting.allowApprovedImagesWithoutVerifiedIsolation: true`
+(`MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION`). Setting it accepts
+these risks:
+
+- On such a cluster a new pod can reach in-cluster destinations, such as other pods
+  and Services, before NetworkPolicy enforcement catches up. Connections opened in
+  that window can survive after enforcement starts, as the k3d result above shows.
+- The setting enables the whole generic hosting path, not only the approved harness
+  image. A generic Job's workspace image, which the user submitting the Job chooses,
+  and its initialization commands also start in that window. Image approval covers
+  the harness image (`runtime.image`) only: WorkspaceTemplate images are not checked
+  against `approvedImages`.
+
+The approved list and the `custom_harness_images` grant still decide which harness
+images run and who may submit generic Jobs. With both values false hosting stays
+unavailable.
 
 ### Workspace egress
 

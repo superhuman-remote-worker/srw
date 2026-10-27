@@ -146,8 +146,14 @@ manifestHosting:
   # {name, image, description}. Images must be digest-pinned (repo[:tag]@sha256:...).
   # The list binds administrators too: [] runs no generic image.
   approvedImages: []
-  # Accept the documented risk of running approved images on a cluster that
-  # fails the network-isolation gate (networkIsolationVerified: false).
+  # Opt-in for a cluster that fails the network-isolation gate
+  # (networkIsolationVerified: false); read the risks in
+  # examples/manifests/README.md first. A new pod can reach in-cluster
+  # destinations until NetworkPolicy enforcement catches up, and connections
+  # opened in that window can survive after it starts. This enables the whole
+  # generic hosting path, not only approved harness images: user-chosen
+  # workspace images and their initialization commands also start in that
+  # window, and WorkspaceTemplate images are not covered by approvedImages.
   allowApprovedImagesWithoutVerifiedIsolation: false
   # Extra NetworkPolicy egress rules for workspace-attached harness runs, same
   # shape as harnessEgress. Additive to the public-internet default and
