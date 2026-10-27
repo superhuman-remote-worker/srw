@@ -1457,7 +1457,12 @@ class PostgresDB:
         # context entry, append-only context injection) is rebuilt from its
         # ``additional_kwargs.srw_injection`` schema, so the CASE fetches the
         # column for those rows only and stays NULL for every other row.
-        provider_projection = ", message.provider_raw" if include_provider_raw else ""
+        # A reader that asks for provider_raw (the restores) also gets the
+        # row's write time: a Responses turn's item ids are replayed only while
+        # OpenAI still stores what they point at (thread_messages.native_ai_fields).
+        provider_projection = (
+            ", message.provider_raw, message.created_at" if include_provider_raw else ""
+        )
         params: List[Any] = [thread_id]
         # The turn that consumed a row: an admitted delivery records it, the
         # row's own number is a hint for pinned input (restore orders by it,
@@ -1543,7 +1548,10 @@ class PostgresDB:
                     "turn_number": row["turn_number"],
                     "admitted_turn_number": row.get("admitted_turn_number"),
                     **(
-                        {"provider_raw": _j(row["provider_raw"])}
+                        {
+                            "provider_raw": _j(row["provider_raw"]),
+                            "created_at": row.get("created_at"),
+                        }
                         if include_provider_raw
                         else {}
                     ),

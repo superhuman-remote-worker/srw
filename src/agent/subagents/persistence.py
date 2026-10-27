@@ -241,8 +241,9 @@ def restore_subagent_messages(rows: Sequence[Mapping[str, Any]]) -> list[BaseMes
                     }
                 )
             pending_tool_call_ids = [call["id"] for call in canonical if call["id"]]
-            # The turn's native blocks, as the session restore rebuilds them.
-            native = native_ai_fields(raw.get("provider_raw"))
+            # The turn's native blocks, as the session restore rebuilds them
+            # (a Responses turn past OpenAI's retention flat).
+            native = native_ai_fields(raw.get("provider_raw"), raw.get("created_at"))
             restored.append(
                 AIMessage(
                     content=native.pop("content", content),

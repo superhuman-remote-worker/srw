@@ -9023,8 +9023,11 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
             # A turn comes back as the blocks the provider produced (Claude's
             # signed thinking, Responses reasoning items and item ids, Gemini
             # thought parts and signatures), so the restored request starts
-            # with the live one and keeps its reasoning.
-            native = native_ai_fields(db_msg.get("provider_raw"))
+            # with the live one and keeps its reasoning. A Responses turn past
+            # OpenAI's retention comes back flat (its item ids would 400).
+            native = native_ai_fields(
+                db_msg.get("provider_raw"), db_msg.get("created_at")
+            )
             restored.append(
                 AIMessage(
                     content=native.pop("content", content),

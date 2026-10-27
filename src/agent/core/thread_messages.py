@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Mapping, Optional
 
 from shared.runtime.llm.reasoning_chat import extract_reasoning_text_from_block
@@ -86,6 +87,8 @@ ANTHROPIC_CONTENT_KEY = "anthropic_content"
 #: langchain-google-genai keeps each function call's thought signature here,
 #: by tool-call id.
 _REPLAYED_KWARGS = ("__gemini_function_call_thought_signatures__",)
+#: Replay Responses item ids only this long: OpenAI stores responses 30 days.
+RESPONSES_ITEM_RETENTION = timedelta(days=25)
 
 
 def _native_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
@@ -122,20 +125,59 @@ def _native_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
     return raw
 
 
-def native_ai_fields(provider_raw: Any) -> Dict[str, Any]:
+def _aware(value: Any) -> Optional[datetime]:
+    """A row's ``created_at`` as an aware datetime; ``None`` without one."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _item_ids_expired(
+    provider_raw: Mapping[str, Any], content: list, created_at: Any
+) -> bool:
+    """Whether a Responses turn's item ids may point at a response OpenAI no
+    longer stores.
+
+    Replayed, every later request fails ("Item with id ... not found"), and
+    after that long the prompt cache is gone too. Claude's and Gemini's blocks
+    are self-contained and never expire; a row without its time counts as
+    young.
+    """
+    if provider_raw.get("provider") != "openai":
+        return False
+    if not any(isinstance(block, dict) and block.get("id") for block in content):
+        return False
+    created = _aware(created_at)
+    return (
+        created is not None
+        and datetime.now(timezone.utc) - created > RESPONSES_ITEM_RETENTION
+    )
+
+
+def native_ai_fields(provider_raw: Any, created_at: Any = None) -> Dict[str, Any]:
     """The ``AIMessage`` fields a row's ``provider_raw`` restores.
 
     ``content`` is the turn's native blocks, ``response_metadata`` names the
     model and provider that produced it (the provider boundary sanitizer and
     each SDK's formatting read them), and ``additional_kwargs`` holds what the
     SDK replays. Empty for a row without the envelope (a plain-text turn, or
-    one stored before it existed): the row's text is the content. Shared by
-    the session restore and the child-transcript restore.
+    one stored before it existed): the row's text is the content. Empty as
+    well for a Responses turn whose row (``created_at``) is older than
+    :data:`RESPONSES_ITEM_RETENTION`: it comes back as its text and calls, as
+    before the envelope. Shared by the session restore and the
+    child-transcript restore.
     """
     if not isinstance(provider_raw, dict):
         return {}
     fields: Dict[str, Any] = {}
     content = _native_content(provider_raw)
+    if content is not None and _item_ids_expired(provider_raw, content, created_at):
+        return {}
     if content is not None:
         fields["content"] = content
     metadata: Dict[str, Any] = {}
@@ -372,6 +414,7 @@ async def _persist_one_message(
 __all__ = [
     "ARGUMENTS_KEY",
     "NATIVE_CONTENT_KEY",
+    "RESPONSES_ITEM_RETENTION",
     "_ROLE_MAP",
     "_extract_thinking",
     "_persist_one_message",

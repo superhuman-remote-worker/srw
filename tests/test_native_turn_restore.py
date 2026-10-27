@@ -31,6 +31,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List
 
 import pytest
@@ -44,7 +45,10 @@ from langchain_core.messages import (
 
 from agent.api.persistent_app import _db_rows_to_lc_messages
 from agent.core.context import sanitize_history_for_provider_boundary
-from agent.core.thread_messages import _serialize_message_row
+from agent.core.thread_messages import (
+    RESPONSES_ITEM_RETENTION,
+    _serialize_message_row,
+)
 from agent.subagents.persistence import restore_subagent_messages
 from shared.runtime.core import loader
 from tests.test_session_restore_byte_exact import _stored
@@ -571,3 +575,113 @@ class TestForeignFamily:
         assert [c["id"] for c in restored.tool_calls] == [
             c["id"] for c in live.tool_calls
         ]
+
+
+# ---------------------------------------------------------------------------
+# A Responses turn past OpenAI's retention of its items
+# ---------------------------------------------------------------------------
+
+YOUNG = RESPONSES_ITEM_RETENTION - timedelta(days=1)
+OLD = RESPONSES_ITEM_RETENTION + timedelta(days=1)
+
+
+def _written(rows: List[Dict[str, Any]], age: timedelta) -> List[Dict[str, Any]]:
+    """The rows with the ``created_at`` the history reader hands back."""
+    created_at = datetime.now(timezone.utc) - age
+    return [{**row, "created_at": created_at} for row in rows]
+
+
+class TestResponsesItemRetention:
+    """A Responses turn's item ids point at a response OpenAI stores for 30
+    days; replayed after that, every request fails ("Item with id ... not
+    found"). A restore keeps the turn's blocks only while its row is younger
+    than ``RESPONSES_ITEM_RETENTION`` and otherwise rebuilds it from the row's
+    text and calls, as every restore did before the blocks were kept."""
+
+    MODEL = "gpt-6.1-sol"
+
+    def _live(self) -> List[BaseMessage]:
+        output, results = RESPONSES_TURNS["reasoning-commentary-and-call"]
+        return _history(_responses_turn(output, self.MODEL), results)
+
+    def _input(self, history: List[BaseMessage]) -> List[Any]:
+        llm = loader.create_llm(_config(self.MODEL, "openai", reasoning_level="high"))
+        return llm._get_request_payload([SystemMessage(SYSTEM), *history])["input"]
+
+    def _restore(self, rows, restore) -> List[BaseMessage]:
+        return sanitize_history_for_provider_boundary(restore(rows), self.MODEL)
+
+    @RESTORES
+    def test_a_young_row_restores_natively(self, restore):
+        live = self._live()
+
+        restored = self._restore(_written(_rows(live), YOUNG), restore)
+
+        assert json.dumps(self._input(restored)) == json.dumps(self._input(live))
+
+    @RESTORES
+    def test_an_old_row_restores_flat_and_its_request_is_valid(self, restore):
+        live = self._live()
+        rows = _rows(live)
+
+        restored = self._restore(_written(rows, OLD), restore)
+
+        # Exactly the restore of rows without the envelope.
+        flat = [{k: v for k, v in row.items() if k != "provider_raw"} for row in rows]
+        sent = self._input(restored)
+        assert json.dumps(sent) == json.dumps(self._input(self._restore(flat, restore)))
+        turn = _turn(restored)
+        assert (turn.content, turn.response_metadata) == ("Reading it now.", {})
+        # No item points at a stored response, and every call has its output.
+        assert [i for i in sent if i.get("id") or i.get("type") == "reasoning"] == []
+        calls = [i["call_id"] for i in sent if i.get("type") == "function_call"]
+        outputs = [
+            i["call_id"] for i in sent if i.get("type") == "function_call_output"
+        ]
+        assert calls == outputs == ["call_1"]
+
+    @RESTORES
+    @pytest.mark.parametrize(
+        "turn, model",
+        [
+            (
+                lambda: _anthropic_turn(
+                    ANTHROPIC_TURNS["thinking-and-call-without-text"]
+                ),
+                "claude-opus-5-5",
+            ),
+            (
+                lambda: _gemini_turn(
+                    GEMINI_TURNS["thought-and-parallel-calls"][1], "gemini-3.5-flash"
+                ),
+                "gemini-3.5-flash",
+            ),
+        ],
+        ids=["claude", "gemini"],
+    )
+    def test_an_old_claude_or_gemini_row_still_restores_natively(
+        self, turn, model, restore
+    ):
+        live = turn()
+        history = _history(live, {call["id"]: "x" for call in live.tool_calls})
+
+        (restored,) = [
+            m
+            for m in restore(_written(_rows(history), OLD))
+            if isinstance(m, AIMessage)
+        ]
+
+        assert json.dumps(restored.content) == json.dumps(live.content)
+        assert restored.response_metadata["model_name"] == model
+
+    @RESTORES
+    @pytest.mark.parametrize("created_at", ["missing", None], ids=["missing", "null"])
+    def test_a_row_without_its_time_counts_as_young(self, created_at, restore):
+        live = self._live()
+        rows = _rows(live)
+        if created_at != "missing":
+            rows = [{**row, "created_at": created_at} for row in rows]
+
+        restored = self._restore(rows, restore)
+
+        assert json.dumps(self._input(restored)) == json.dumps(self._input(live))

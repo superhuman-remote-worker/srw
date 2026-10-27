@@ -13,11 +13,14 @@ columns.
 - The serializer keeps a call's argument text exactly when Postgres hands
   its keys back in another order (the unit tests emulate that order), and a
   turn's native blocks the same way in ``provider_raw``.
+- The reader hands back each row's ``created_at``, and a Responses turn
+  older than ``RESPONSES_ITEM_RETENTION`` comes back as its text and calls.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from typing import Any, Dict
 from uuid import UUID, uuid4
 
@@ -28,6 +31,7 @@ from agent.api.persistent_app import _db_rows_to_lc_messages
 from agent.core.thread_messages import (
     ARGUMENTS_KEY,
     NATIVE_CONTENT_KEY,
+    RESPONSES_ITEM_RETENTION,
     _serialize_message_row,
     restored_tool_call_args,
 )
@@ -206,3 +210,34 @@ async def test_native_blocks_are_kept_as_text_exactly_when_postgres_reorders(
     )
     (restored,) = _db_rows_to_lc_messages(rows)
     assert json.dumps(restored.content) == json.dumps(blocks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old", [False, True], ids=["young", "old"])
+async def test_a_responses_turn_past_retention_comes_back_flat(db, old):  # noqa: F811 (fixture)
+    thread_id = await _thread(db)
+    blocks = [
+        {"type": "reasoning", "id": "rs_1", "summary": []},
+        {"type": "text", "text": "Reading it now.", "annotations": [], "id": "msg_1"},
+    ]
+    turn = AIMessage(
+        content=blocks,
+        response_metadata={"model_name": "gpt-6.1-sol", "model_provider": "openai"},
+        id=str(uuid4()),
+    )
+    await _save(db, thread_id, turn)
+    age = RESPONSES_ITEM_RETENTION + (timedelta(days=1) if old else -timedelta(days=1))
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE thread_messages SET created_at = now() - $2::interval"
+            " WHERE id = $1",
+            UUID(turn.id),
+            age,
+        )
+
+    rows = await db.get_thread_messages_history(
+        thread_id, order_by_seq=True, include_provider_raw=True
+    )
+    (restored,) = _db_rows_to_lc_messages(rows)
+
+    assert restored.content == ("Reading it now." if old else blocks)

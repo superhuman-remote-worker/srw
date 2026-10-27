@@ -42,9 +42,10 @@ Stubs and constructed placements:
   ``get_latest_compaction_checkpoint``, ``get_seq_for_message_id``). The
   jsonb columns come back in jsonb's key order (shorter keys first, then
   bytewise), as Postgres returns them; ``content`` is text and comes back
-  as written. ``test_stored_rows_read_back_like_postgres`` checks this model
-  against a real Postgres (testcontainers; skipped without a container
-  runtime).
+  as written. ``created_at`` is not modelled: a row without it counts as
+  young, as these rows are. ``test_stored_rows_read_back_like_postgres``
+  checks this model against a real Postgres (testcontainers; skipped
+  without a container runtime).
 - The provider answers its script in order (``Provider``): the harness's
   marker-based step choice cannot survive a compaction, and no request is
   retried here.
@@ -104,6 +105,7 @@ import itertools
 import json
 import re
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1491,9 +1493,12 @@ async def test_stored_rows_read_back_like_postgres(
             # The model wrote {"path", "why"}; Postgres hands back jsonb's order.
             (call_row,) = [row for row in real_rows if row["tool_calls"]]
             assert list(call_row["tool_calls"][0]["args"]) == ["why", "path"]
-        assert json.dumps(real_rows) == json.dumps(
-            await model.get_thread_messages_history(**read)
-        )
+        model_rows = await model.get_thread_messages_history(**read)
+        # The write time (the Responses retention check reads it) is the
+        # one column the model leaves out.
+        assert all(isinstance(row.pop("created_at"), datetime) for row in real_rows)
+        assert all(row.pop("created_at") is None for row in model_rows)
+        assert json.dumps(real_rows) == json.dumps(model_rows)
         assert json.dumps(await real.get_latest_compaction_checkpoint(THREAD)) == (
             json.dumps(await model.get_latest_compaction_checkpoint(THREAD))
         )
