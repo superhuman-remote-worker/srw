@@ -35,14 +35,14 @@ approve.
 | Field | Default | Bounds / values |
 |---|---|---|
 | `version` | required | `1` |
-| `model` | required | non-empty string |
-| `systemPrompt` | `{type: preset}` | `{type: preset}`, `{type: preset, append: "<text>"}` or `{type: custom, text: "<text>"}` |
+| `model` | required | non-empty string of at most 256 characters, no whitespace or control characters |
+| `systemPrompt` | `{type: preset}` | `{type: preset}`, `{type: preset, append: "<text>"}` or `{type: custom, text: "<text>"}`; `append` and `text` at most 65536 bytes (UTF-8) each, because the CLI receives each as one command-line argument |
 | `tools` | `[Bash, Read, Write, Edit]` | non-empty, distinct names from those four |
 | `limits.maxTurns` | 200 | integer 1 to 10000 |
 | `limits.maxBudgetUsd` | 20 | number above 0, at most 1000 |
 | `limits.timeoutSeconds` | 3600 | integer 60 to 604800; wall-clock bound on the session |
 | `effort` | unset | `low`, `medium`, `high`, `xhigh`, `max` |
-| `thinking` | unset | `{type: adaptive}`, `{type: disabled}` or `{type: enabled, budget_tokens: N}` |
+| `thinking` | unset | `{type: adaptive}`, `{type: disabled}` or `{type: enabled, budget_tokens: N}` with an integer N from 1024 to 1000000 |
 | `autoCompact` | `true` | boolean |
 | `workspaceEnv` | `[]` | upper-case environment variable names to forward into the workspace |
 

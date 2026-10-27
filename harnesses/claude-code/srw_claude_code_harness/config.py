@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
@@ -16,6 +17,12 @@ TOOL_NAMES = ("Bash", "Read", "Write", "Edit")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 _CREDENTIAL_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+# The SDK passes each prompt text as one CLI argument; Linux caps a single
+# argument at 131072 bytes, so a larger value would fail the launch opaquely.
+SYSTEM_PROMPT_MAX_BYTES = 65536
+MODEL_MAX_CHARS = 256
+THINKING_BUDGET_MIN = 1024  # the API's minimum
+THINKING_BUDGET_MAX = 1_000_000
 
 FIXED_SETTINGS = {
     "permissionMode": "default",
@@ -79,6 +86,27 @@ def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _check_prompt_size(text: str, name: str) -> None:
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError:  # lone surrogates from JSON escapes
+        raise ConfigError(f"{name} must be valid UTF-8 text") from None
+    if size > SYSTEM_PROMPT_MAX_BYTES:
+        raise ConfigError(
+            f"{name} must be at most {SYSTEM_PROMPT_MAX_BYTES} bytes (UTF-8)"
+        )
+
+
+def _valid_model(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MODEL_MAX_CHARS
+        and not any(
+            ch.isspace() or unicodedata.category(ch) in ("Cc", "Cs") for ch in value
+        )
+    )
+
+
 def _parse_system_prompt(value: object) -> SystemPrompt:
     obj = _object(value, "systemPrompt")
     _reject_unknown(obj, {"type", "append", "text"}, "systemPrompt.")
@@ -91,6 +119,7 @@ def _parse_system_prompt(value: object) -> SystemPrompt:
         append = obj["append"]
         if not isinstance(append, str) or not append:
             raise ConfigError("systemPrompt.append must be a non-empty string")
+        _check_prompt_size(append, "systemPrompt.append")
         return SystemPrompt("preset_append", append)
     if kind == "custom":
         if "append" in obj:
@@ -98,6 +127,7 @@ def _parse_system_prompt(value: object) -> SystemPrompt:
         text = obj.get("text")
         if not isinstance(text, str) or not text:
             raise ConfigError("systemPrompt: custom requires a non-empty text")
+        _check_prompt_size(text, "systemPrompt.text")
         return SystemPrompt("custom", text)
     raise ConfigError("systemPrompt.type must be 'preset' or 'custom'")
 
@@ -144,8 +174,14 @@ def _parse_thinking(value: object) -> dict:
     if kind == "enabled":
         _reject_unknown(obj, {"type", "budget_tokens"}, "thinking.")
         budget = obj.get("budget_tokens")
-        if not _is_int(budget) or budget <= 0:
-            raise ConfigError("thinking.budget_tokens must be a positive integer")
+        if (
+            not _is_int(budget)
+            or not THINKING_BUDGET_MIN <= budget <= THINKING_BUDGET_MAX
+        ):
+            raise ConfigError(
+                "thinking.budget_tokens must be an integer between "
+                f"{THINKING_BUDGET_MIN} and {THINKING_BUDGET_MAX}"
+            )
         return {"type": "enabled", "budget_tokens": budget}
     raise ConfigError("thinking.type must be 'adaptive', 'enabled' or 'disabled'")
 
@@ -183,8 +219,11 @@ def parse_config(data: object) -> HarnessConfig:
     if not _is_int(version) or version != 1:
         raise ConfigError("version must be 1")
     model = obj.get("model")
-    if not isinstance(model, str) or not model.strip():
-        raise ConfigError("model is required and must be a non-empty string")
+    if not _valid_model(model):
+        raise ConfigError(
+            f"model is required: a non-empty string of at most {MODEL_MAX_CHARS} "
+            "characters without whitespace or control characters"
+        )
     system_prompt = (
         _parse_system_prompt(obj["systemPrompt"])
         if "systemPrompt" in obj

@@ -151,3 +151,56 @@ def test_parse_bindings_reads_the_ssh_workspace_descriptor():
     )
     with pytest.raises(ConfigError, match="workspace"):
         parse_bindings({"connectors": {}})
+
+
+@pytest.mark.parametrize(("kind", "field"), [("preset", "append"), ("custom", "text")])
+def test_system_prompt_texts_are_bounded_in_utf8_bytes(kind, field):
+    at_limit = "é" * (65536 // 2)  # two bytes each: exactly 65536 bytes
+    config = parse_config({**MINIMAL, "systemPrompt": {"type": kind, field: at_limit}})
+    assert config.system_prompt.text == at_limit
+    over = at_limit + "x"  # 65537 bytes in only 32769 characters
+    with pytest.raises(ConfigError) as error:
+        parse_config({**MINIMAL, "systemPrompt": {"type": kind, field: over}})
+    message = str(error.value)
+    assert f"systemPrompt.{field}" in message and "65536 bytes" in message
+    assert "é" not in message
+
+
+def test_model_is_bounded_and_has_no_whitespace_or_control_characters():
+    assert parse_config({**MINIMAL, "model": "m" * 256}).model == "m" * 256
+    for bad in (
+        "",
+        "m" * 257,
+        "claude sonnet",
+        " claude",
+        "claude\t",
+        "claude\nx",
+        "claude\x00",
+        "claude\x7f",
+        "claude\u0085",
+        "claude ",
+        "claude\ud800",
+        42,
+        None,
+    ):
+        with pytest.raises(ConfigError) as error:
+            parse_config({**MINIMAL, "model": bad})
+        message = str(error.value)
+        assert message.startswith("model ") and "256 characters" in message
+        if isinstance(bad, str) and bad:
+            assert bad not in message
+
+
+def test_thinking_budget_is_bounded():
+    for good in (1024, 1_000_000):
+        thinking = {"type": "enabled", "budget_tokens": good}
+        assert parse_config({**MINIMAL, "thinking": thinking}).thinking == thinking
+    for bad in (1023, 1_000_001, 0, -5, 2048.0, True, "4096"):
+        with pytest.raises(ConfigError) as error:
+            parse_config(
+                {**MINIMAL, "thinking": {"type": "enabled", "budget_tokens": bad}}
+            )
+        message = str(error.value)
+        assert "thinking.budget_tokens" in message
+        assert "1024" in message and "1000000" in message
+        assert repr(bad) not in message.replace("1024", "").replace("1000000", "")
