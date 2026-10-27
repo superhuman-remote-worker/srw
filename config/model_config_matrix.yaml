@@ -331,7 +331,10 @@ muse-spark-1.3:
     file: default.yaml
   settings:
     shell_mode: persistent
-    structured_output_method: function_calling
+    # Meta's own endpoint (api.meta.ai) accepts only tool_choice "auto", so
+    # function_calling (a forced named tool) 400s every auxiliary task there;
+    # it serves response_format json_schema.
+    structured_output_method: json_schema
     # Conventional sampling defaults listed by OpenRouter; no Meta tuning verified.
     temperature: 1.0
     top_p: 1.0

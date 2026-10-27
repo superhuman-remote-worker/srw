@@ -138,7 +138,7 @@ def test_loaded_defaults_and_prompts(tmp_path, model, role):
     assert config.llm.multimodal is True
     assert config.llm.parallel_tool_calls is False
     settings = loader.resolve_model_settings(config.llm.model)
-    assert settings["structured_output_method"] == "function_calling"
+    assert settings["structured_output_method"] == "json_schema"
     assert config.extra["shell"]["mode"] == "persistent"
     assert config.llm.max_output_tokens == 131072
     assert config.limits.model_max_context_tokens == 1048576
