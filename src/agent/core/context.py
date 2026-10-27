@@ -676,11 +676,12 @@ def sanitize_history_for_provider_boundary(
 
             content = m.content
             if isinstance(content, list):
-                # A Claude turn replayed to the Claude family that produced it
-                # keeps its thinking blocks: they are the model's own reasoning
-                # and the native route replays them unchanged.
+                # A turn replayed to the family that produced it keeps its
+                # reasoning (Claude's signed thinking, a Responses reasoning
+                # item, Gemini's thought parts): it is the model's own, and
+                # its route replays it unchanged. ``default`` is no family.
                 produced_by = (m.response_metadata or {}).get("model_name") or ""
-                own_thinking = target_family.startswith("claude") and (
+                own_reasoning = target_family != "default" and (
                     family_of(produced_by) == target_family
                 )
                 kept = [
@@ -689,10 +690,7 @@ def sanitize_history_for_provider_boundary(
                     if not (
                         isinstance(b, dict)
                         and b.get("type") in _REASONING_BLOCK_TYPES
-                        and not (
-                            own_thinking
-                            and b.get("type") in ("thinking", "redacted_thinking")
-                        )
+                        and not own_reasoning
                     )
                 ]
                 if len(kept) != len(content):

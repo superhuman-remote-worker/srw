@@ -660,21 +660,14 @@ class TestTurnThreeAfterRestore:
             "openai-chat",
             "openai-chat-claude-proxy",
             "anthropic-claude-proxy",
+            "anthropic",
             "glm-5.2",
-            # A restore drops the Responses reasoning items (rs_*) the live
-            # process replays, so turn three diverges at the first one: a
-            # cache miss on the restored turn, not a rejected request. The
-            # codex lane has the same gap.
-            *(
-                pytest.param(
-                    family_id,
-                    marks=pytest.mark.xfail(
-                        strict=True,
-                        reason="restore drops Responses reasoning items",
-                    ),
-                )
-                for family_id in ("responses-openai", "responses-codex")
-            ),
+            # Turns come back with their native blocks (provider_raw): the
+            # Responses reasoning items and item ids, Gemini's thought parts
+            # and function-call signatures.
+            "responses-openai",
+            "responses-codex",
+            "gemini",
         ],
     )
     async def test_restored_turn_three_matches_the_live_request(

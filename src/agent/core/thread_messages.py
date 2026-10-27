@@ -74,35 +74,79 @@ _ROLE_MAP = {
 }
 
 
-#: provider_raw key for an Anthropic turn's native content blocks.
+#: provider_raw key for an assistant turn's native content blocks.
+NATIVE_CONTENT_KEY = "content"
+#: The key Anthropic turns were stored under before every provider's turn
+#: was; restore still reads it.
 ANTHROPIC_CONTENT_KEY = "anthropic_content"
-_ANTHROPIC_NATIVE_BLOCKS = frozenset({"thinking", "redacted_thinking", "tool_use"})
+#: additional_kwargs a provider SDK reads back when it formats the turn:
+#: langchain-google-genai keeps each function call's thought signature here,
+#: by tool-call id.
+_REPLAYED_KWARGS = ("__gemini_function_call_thought_signatures__",)
 
 
-def _anthropic_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
-    """The native content blocks of an Anthropic turn, for ``provider_raw``.
+def _native_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
+    """The provider-native form of an assistant turn, for ``provider_raw``.
 
     ``content`` stores the flattened text, which a restore cannot replay as the
-    turn the provider produced: its thinking blocks (with their signatures)
-    are gone and the text block becomes a string, so the next request no longer
-    starts with the previous one (a cache miss at that turn) and the model
-    loses its earlier reasoning. The blocks and the producing model are kept
-    here and restored by ``_db_rows_to_lc_messages``.
+    turn the provider produced: Anthropic's thinking blocks (with their
+    signatures), the Responses API's reasoning items and item ids, and
+    Gemini's thought parts and signatures are gone, so the next request no
+    longer starts with the previous one (a cache miss at that turn) and the
+    model loses its earlier reasoning. The blocks, the producing model and
+    provider, and the kwargs the provider's SDK replays are kept here and
+    restored by :func:`native_ai_fields`. A plain-text turn needs none of it.
     """
     content = getattr(msg, "content", None)
-    if not isinstance(content, list):
+    kwargs = getattr(msg, "additional_kwargs", None) or {}
+    replayed = {k: kwargs[k] for k in _REPLAYED_KWARGS if kwargs.get(k)}
+    if not isinstance(content, list) and not replayed:
         return None
     metadata = getattr(msg, "response_metadata", None) or {}
-    # A text-only Claude turn (adaptive thinking skipped) is a list too.
-    if metadata.get("model_provider") != "anthropic" and not any(
-        isinstance(b, dict) and b.get("type") in _ANTHROPIC_NATIVE_BLOCKS
-        for b in content
-    ):
-        return None
-    return {
-        ANTHROPIC_CONTENT_KEY: [b for b in content if isinstance(b, (dict, str))],
-        "model": metadata.get("model_name") or metadata.get("model"),
-    }
+    raw: Dict[str, Any] = {}
+    model = metadata.get("model_name") or metadata.get("model")
+    if model:
+        raw["model"] = model
+    if metadata.get("model_provider"):
+        raw["provider"] = metadata["model_provider"]
+    if isinstance(content, list):
+        raw[NATIVE_CONTENT_KEY] = [b for b in content if isinstance(b, (dict, str))]
+    if replayed:
+        raw["additional_kwargs"] = replayed
+    return raw
+
+
+def native_ai_fields(provider_raw: Any) -> Dict[str, Any]:
+    """The ``AIMessage`` fields a row's ``provider_raw`` restores.
+
+    ``content`` is the turn's native blocks, ``response_metadata`` names the
+    model and provider that produced it (the provider boundary sanitizer and
+    each SDK's formatting read them), and ``additional_kwargs`` holds what the
+    SDK replays. Empty for a row without the envelope (a plain-text turn, or
+    one stored before it existed): the row's text is the content. Shared by
+    the session restore and the child-transcript restore.
+    """
+    if not isinstance(provider_raw, dict):
+        return {}
+    fields: Dict[str, Any] = {}
+    content = provider_raw.get(NATIVE_CONTENT_KEY)
+    if content is None:
+        content = provider_raw.get(ANTHROPIC_CONTENT_KEY)
+    if isinstance(content, list):
+        fields["content"] = content
+    metadata: Dict[str, Any] = {}
+    if provider_raw.get("model"):
+        metadata["model_name"] = provider_raw["model"]
+    if provider_raw.get("provider"):
+        metadata["model_provider"] = provider_raw["provider"]
+    if metadata:
+        fields["response_metadata"] = metadata
+    kwargs = provider_raw.get("additional_kwargs")
+    if isinstance(kwargs, dict):
+        replayed = {k: kwargs[k] for k in _REPLAYED_KWARGS if kwargs.get(k)}
+        if replayed:
+            fields["additional_kwargs"] = replayed
+    return fields
 
 
 def _serialize_message_row(
@@ -156,7 +200,7 @@ def _serialize_message_row(
     # Extract reasoning content + tool-call back-reference BEFORE we flatten
     # Anthropic's list-of-dicts content (which drops the thinking blocks).
     thinking = _extract_thinking(msg) if role == "ai" else None
-    provider_raw = _anthropic_provider_raw(msg) if role == "ai" else None
+    provider_raw = _native_provider_raw(msg) if role == "ai" else None
     tool_call_id = getattr(msg, "tool_call_id", None) if role == "tool" else None
     # Normalize content for Anthropic list-of-dicts format
     # Only text-bearing parts join: a [thinking, tool_use] turn persisted as
@@ -211,4 +255,5 @@ __all__ = [
     "_extract_thinking",
     "_persist_one_message",
     "_serialize_message_row",
+    "native_ai_fields",
 ]

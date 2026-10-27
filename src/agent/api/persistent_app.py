@@ -150,11 +150,11 @@ from agent.agent import UniversalAgent
 # import the thread_messages serialiser from here (lifted to src/core in U3 WP1
 # so the subagent runtime shares it).
 from agent.core.thread_messages import (  # noqa: F401
-    ANTHROPIC_CONTENT_KEY,
     _ROLE_MAP,
     _extract_thinking,
     _persist_one_message,
     _serialize_message_row,
+    native_ai_fields,
 )
 from agent.persistent_graph import (
     INTERRUPT_SENTINEL,
@@ -8839,11 +8839,11 @@ def _sanitize_restored_history(restored: list) -> list:
 
     The durable config's model may have changed while the session was
     detached (the owner-facing offline PATCH), so rows persisted under one
-    provider can be replayed under another. Reasoning shapes are already
-    flattened at persist time (``_serialize_message_row``); what survives
-    restore verbatim is tool-call ids — remap any that don't conform to the
-    bound model's accepted format. No-op (beyond the pairing re-check) when
-    the history is native to the bound model.
+    provider can be replayed under another. A turn comes back with its
+    native blocks (``provider_raw``): reasoning a different family produced
+    is stripped, and tool-call ids are remapped to the bound model's accepted
+    format. No-op (beyond the pairing re-check) when the history is native to
+    the bound model.
     """
     from agent.core.context import sanitize_history_for_provider_boundary
 
@@ -8986,22 +8986,17 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     for tc in tool_calls
                 ]
             pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
-            # An Anthropic turn comes back as the blocks the provider produced
-            # (thinking with its signature, text, tool_use), so the restored
-            # request starts with the live one and keeps its reasoning.
-            raw = db_msg.get("provider_raw")
-            native = raw.get(ANTHROPIC_CONTENT_KEY) if isinstance(raw, dict) else None
-            response_metadata = {}
-            if isinstance(native, list) and native:
-                content = native
-                if raw.get("model"):
-                    response_metadata["model_name"] = raw["model"]
+            # A turn comes back as the blocks the provider produced (Claude's
+            # signed thinking, Responses reasoning items and item ids, Gemini
+            # thought parts and signatures), so the restored request starts
+            # with the live one and keeps its reasoning.
+            native = native_ai_fields(db_msg.get("provider_raw"))
             restored.append(
                 AIMessage(
-                    content=content,
+                    content=native.pop("content", content),
                     tool_calls=lc_tool_calls,
                     id=msg_id,
-                    response_metadata=response_metadata,
+                    **native,
                 )
             )
 

@@ -17,7 +17,11 @@ from agent.core.context import (
     sanitize_history_for_provider_boundary,
     strip_unreplayable_blocks,
 )
-from agent.core.thread_messages import ANTHROPIC_CONTENT_KEY, _serialize_message_row
+from agent.core.thread_messages import (
+    ANTHROPIC_CONTENT_KEY,
+    NATIVE_CONTENT_KEY,
+    _serialize_message_row,
+)
 from shared.runtime.core import loader
 
 PROXY_URL = "http://srw-codex-proxy:8317/v1"
@@ -180,14 +184,31 @@ class TestPersistence:
 
         assert row["content"] == ""
         assert row["provider_raw"] == {
-            ANTHROPIC_CONTENT_KEY: self._claude_turn().content,
+            NATIVE_CONTENT_KEY: self._claude_turn().content,
             "model": "claude-opus-5-5",
+            "provider": "anthropic",
         }
 
-    def test_other_list_content_is_not_kept(self):
-        message = AIMessage(content=[{"type": "text", "text": "hello"}])
+    def test_a_plain_text_turn_keeps_no_envelope(self):
+        message = AIMessage(content="hello")
 
         assert "provider_raw" not in _serialize_message_row(message, 1)
+
+    def test_a_row_stored_under_the_anthropic_key_still_restores(self):
+        from agent.api.persistent_app import _db_rows_to_lc_messages
+
+        row = {
+            **_serialize_message_row(self._claude_turn(), 1),
+            "id": "ai-1",
+            "provider_raw": {
+                ANTHROPIC_CONTENT_KEY: self._claude_turn().content,
+                "model": "claude-opus-5-5",
+            },
+        }
+        (ai,) = _db_rows_to_lc_messages([row])
+
+        assert ai.content == self._claude_turn().content
+        assert ai.response_metadata == {"model_name": "claude-opus-5-5"}
 
     def test_restore_rebuilds_the_blocks_and_keeps_own_thinking(self):
         from agent.api.persistent_app import _db_rows_to_lc_messages

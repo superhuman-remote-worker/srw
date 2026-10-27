@@ -56,7 +56,7 @@ from langchain_core.messages import (
 )
 
 from agent.core.context import repair_tool_pairing
-from agent.core.thread_messages import _serialize_message_row
+from agent.core.thread_messages import _serialize_message_row, native_ai_fields
 from shared.runtime.core.context_entries import context_entry_from_row
 from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 from shared.subagent_parent_authority import (
@@ -155,13 +155,14 @@ def restore_subagent_messages(rows: Sequence[Mapping[str, Any]]) -> list[BaseMes
     """Rebuild a child's durable provider history for terminal revival.
 
     Fork-seed rows use their lossless ``provider_raw`` LangChain envelope; all
-    later rows use the ordinary transcript columns.  The child's system prompt
-    remains transient and is therefore skipped unless it is a fork seed (for
-    example a compacted summary).  Malformed rows fail closed: revival must not
-    silently forget evidence before spending a successor generation.  A
-    ``role='context'`` row is harness context, not evidence: it comes back as
-    the typed entry it was, and an unreadable one is dropped (the planner
-    re-injects what is still relevant).
+    later rows use the ordinary transcript columns, an assistant turn with its
+    native blocks (``native_ai_fields``) as a session restore does.  The
+    child's system prompt remains transient and is therefore skipped unless it
+    is a fork seed (for example a compacted summary).  Malformed rows fail
+    closed: revival must not silently forget evidence before spending a
+    successor generation.  A ``role='context'`` row is harness context, not
+    evidence: it comes back as the typed entry it was, and an unreadable one
+    is dropped (the planner re-injects what is still relevant).
     """
 
     restored: list[BaseMessage] = []
@@ -232,8 +233,15 @@ def restore_subagent_messages(rows: Sequence[Mapping[str, Any]]) -> list[BaseMes
                     }
                 )
             pending_tool_call_ids = [call["id"] for call in canonical if call["id"]]
+            # The turn's native blocks, as the session restore rebuilds them.
+            native = native_ai_fields(raw.get("provider_raw"))
             restored.append(
-                AIMessage(content=content, tool_calls=canonical, **identity)
+                AIMessage(
+                    content=native.pop("content", content),
+                    tool_calls=canonical,
+                    **identity,
+                    **native,
+                )
             )
         elif role == "tool":
             fallback = pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
