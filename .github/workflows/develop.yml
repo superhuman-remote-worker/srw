@@ -756,6 +756,7 @@ jobs:
             'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
+            'harnesses/' 'docker/Dockerfile.harness-claude-code' 'examples/manifests/' \
             'requirements.txt' 'requirements-dev.txt' 'requirements/' 'pyproject.toml' '.squawk.toml' \
             | grep -q .; then
             echo "python=true" >> "$GITHUB_OUTPUT"

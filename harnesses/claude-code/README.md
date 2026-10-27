@@ -20,7 +20,7 @@ SRW delivers three files; the harness reads them from the paths in
 the workspace SSH material under `/run/srw-workspace/` (`id_ed25519`,
 `known_hosts`, `ssh`). The workspace is reached as `agent-host` on port 30022,
 root `/home/agent-host/workspace`. A missing or invalid file ends the run with
-exit code 2 and a message that starts `Invalid <NAME>:`; supplied values are
+exit code 2 and a message naming the file or setting; supplied values are
 never echoed.
 
 The process environment is scrubbed to `PATH`. The harness is proxy-less:

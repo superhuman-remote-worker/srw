@@ -45,6 +45,20 @@ def test_ci_builds_the_harness_like_a_driver():
     assert "io.srw.component=harness-claude-code" in develop
 
 
+def test_develop_runs_the_python_tests_for_harness_only_changes():
+    develop = (ROOT / ".github/workflows/develop.yml").read_text()
+    start = develop.index(
+        "git diff --name-only \"$BASE\" HEAD -- \\\n            'src/'"
+    )
+    python_filter = develop[start : develop.index('echo "python=true"', start)]
+    for path in (
+        "'harnesses/'",
+        "'docker/Dockerfile.harness-claude-code'",
+        "'examples/manifests/'",
+    ):
+        assert path in python_filter
+
+
 def test_example_job_validates_against_the_manifest_schema():
     text = (ROOT / "examples/manifests/claude-code-harness-job.yaml").read_text()
     documents = parse_documents(text)
