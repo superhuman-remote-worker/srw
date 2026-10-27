@@ -50,6 +50,11 @@ def truncate_output(text: str, *, limit: int = OUTPUT_LIMIT_CHARS) -> tuple[str,
     return _truncate(text, limit, _PATH_MARK)
 
 
+def _too_large(size: int | None) -> dict[str, Any]:
+    known = f"{size} bytes" if size is not None else f"over {EDIT_MAX_BYTES} bytes"
+    return _err(f"File is too large to edit ({known}; limit {EDIT_MAX_BYTES})")
+
+
 def _int(value: Any, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return default
@@ -100,15 +105,13 @@ class ToolHandlers:
 
     async def _stat(self, resolved: str) -> tuple[bool, int, dict | None]:
         """Remote regular-file check; returns (ok, size, error_result)."""
-        rc, out, _ = await self.workspace._exec(
-            f"stat -L -c '%F|%s' -- {shlex.quote(resolved)}"
-        )
-        if rc != 0:
+        found = await self.workspace.stat(resolved)
+        if found is None:
             return False, 0, _err("File does not exist.")
-        kind, _, size = out.decode("utf-8", errors="replace").strip().partition("|")
+        kind, size = found
         if not kind.startswith("regular"):
             return False, 0, _err(f"{resolved} is not a regular file")
-        return True, int(size or 0), None
+        return True, size, None
 
     async def read(self, args: dict) -> dict:
         try:
@@ -128,7 +131,8 @@ class ToolHandlers:
             end = offset + limit - 1
             rc, data, stderr = await self.workspace._exec(
                 f"sed -n '{offset},{end}p;{end}q' -- {shlex.quote(resolved)}"
-                f" | head -c {READ_FETCH_MAX_BYTES}"
+                f" | head -c {READ_FETCH_MAX_BYTES}",
+                stdout_limit=READ_FETCH_MAX_BYTES,
             )
             if rc != 0:
                 return _err(_failure(rc, stderr))
@@ -166,6 +170,8 @@ class ToolHandlers:
                 return _err("content is required")
             resolved = self.workspace.resolve(path)
             data = content.encode("utf-8")
+            # An existing target that is not a regular file is refused remotely
+            # ("<path> is not a regular file"), so a FIFO cannot block the write.
             await self.workspace.write_bytes(resolved, data)
             return _ok(f"Wrote {len(data)} bytes to {resolved}")
         except WorkspaceError as exc:
@@ -190,12 +196,13 @@ class ToolHandlers:
             if not ok:
                 return error or _err("File does not exist.")
             if size > EDIT_MAX_BYTES:
-                return _err(
-                    f"File is too large to edit ({size} bytes; limit {EDIT_MAX_BYTES})"
-                )
+                return _too_large(size)
             if await self.workspace.is_binary(resolved):
                 return _err("Cannot edit a binary file.")
-            data = await self.workspace.read_bytes(resolved)
+            # Bounded: the file may have grown since the stat.
+            data = await self.workspace.read_bytes(resolved, limit=EDIT_MAX_BYTES + 1)
+            if len(data) > EDIT_MAX_BYTES:
+                return _too_large(None)
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError:

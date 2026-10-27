@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -95,6 +96,26 @@ async def test_stage_input_midway_failure_removes_partial_file(workspace):
 
 
 @pytest.mark.asyncio
+async def test_stage_input_is_bounded_in_time(workspace):
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"partial"
+            await asyncio.sleep(60)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Body()))
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(BundleError, match="in/a.bin: .*timed out"):
+        await stage_inputs(
+            workspace, [InputFile("http://x/a", "in/a.bin")], client=client, timeout=1
+        )
+    assert loop.time() - started < 10
+    assert not await workspace.exists("in/a.bin")
+
+
+@pytest.mark.asyncio
 async def test_archive_skips_files_over_the_limit(workspace, tmp_path):
     await workspace.write_bytes("small.txt", b"0123456789")
     await workspace.write_bytes("big.bin", b"\0" * (2 * 1024 * 1024))
@@ -124,9 +145,9 @@ async def test_archive_tolerates_tar_exit_code_one(workspace, tmp_path, monkeypa
     await workspace.write_bytes("a.txt", b"a")
     real = workspace.read_stream
 
-    def wrapped(command):
+    def wrapped(command, **kwargs):
         # Simulate "file changed as we read it": tar's exit 1 after a good archive.
-        return real(command.replace("-czf - .", "-czf - . ; (exit 1)", 1))
+        return real(command.replace("-czf - .", "-czf - . ; (exit 1)", 1), **kwargs)
 
     monkeypatch.setattr(workspace, "read_stream", wrapped)
     dest = tmp_path / "ws.tar.gz"
@@ -139,13 +160,13 @@ async def test_archive_refuses_non_gzip_output(workspace, tmp_path, monkeypatch)
     real = workspace.read_stream
     seen = []
 
-    def wrapped(command):
+    def wrapped(command, **kwargs):
         replaced = command.replace(
             "tar --anchored", "sh -c 'echo usage: tar >&2; exit 1' --anchored", 1
         )
         assert replaced != command
         seen.append(replaced)
-        return real(replaced)
+        return real(replaced, **kwargs)
 
     monkeypatch.setattr(workspace, "read_stream", wrapped)
     dest = tmp_path / "ws.tar.gz"

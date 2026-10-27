@@ -113,13 +113,22 @@ in the workspace over SSH:
   120000, maximum 600000.
 - `Read(file_path, offset, limit)`: line-windowed (2000 lines by default, long
   lines cut at 2000 characters). Non-regular files and binary files are refused.
-- `Write(file_path, content)`: writes a whole file.
+- `Write(file_path, content)`: writes a whole file. An existing target that is
+  not a regular file (a FIFO, a device, a directory) is refused.
 - `Edit(file_path, old_string, new_string, replace_all)`: exact replacement;
   files over 10 MiB are refused.
 
 Output over 30000 characters is truncated. The full output is saved under
 `<workspace root>/.srw/tool-output/N.txt` and the truncated result names that
 absolute path so the model can `Read` a window of it.
+
+The model controls its workspace, including the login shell's start-up files
+(`~/.bashrc` runs before every command sent over SSH). The harness tolerates
+them: every workspace operation frames its output with a per-call random marker
+and ignores what a start-up file prints before it (more than 1 MiB is an
+error), keeps at most 64 KiB of stderr, and is bounded in time: 120 seconds for
+each file operation, the `Bash` timeout for commands, 30 minutes for each input
+download and 10 minutes for the workspace archive.
 
 ## Bundle
 

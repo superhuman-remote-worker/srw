@@ -17,6 +17,9 @@ from .task import InputFile, UploadTarget
 from .workspace import Workspace, WorkspaceError
 
 ARCHIVE_FILE_LIMIT_BYTES = 256 * 1024 * 1024
+# Time budgets: each input's download and transfer; the workspace archive.
+STAGE_INPUT_TIMEOUT_SECONDS = 1800.0
+ARCHIVE_TIMEOUT_SECONDS = 600.0
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _BACKOFF_SECONDS = (2.0, 4.0)
@@ -29,8 +32,13 @@ class BundleError(RuntimeError):
 
 
 async def stage_inputs(
-    workspace: Workspace, inputs: Sequence[InputFile], *, client: httpx.AsyncClient
+    workspace: Workspace,
+    inputs: Sequence[InputFile],
+    *,
+    client: httpx.AsyncClient,
+    timeout: float = STAGE_INPUT_TIMEOUT_SECONDS,
 ) -> list[dict]:
+    """Download each input into the workspace; each gets ``timeout`` seconds."""
     staged = []
     for item in inputs:
         target = workspace.resolve(posixpath.join(workspace.root, item.path))
@@ -44,13 +52,22 @@ async def stage_inputs(
                 size += len(chunk)
                 yield chunk
 
-        try:
+        async def stage() -> None:
             async with client.stream("GET", item.url) as response:
                 if not response.is_success:
                     raise BundleError(f"input {item.path}: HTTP {response.status_code}")
-                await workspace.write_stream(target, chunks(response))
+                await workspace.write_stream(target, chunks(response), timeout=timeout)
+
+        try:
+            await asyncio.wait_for(stage(), timeout + 5)
         except BundleError:
             raise
+        except asyncio.TimeoutError as exc:
+            with contextlib.suppress(Exception):
+                await workspace.run(f"rm -f -- {shlex.quote(target)}")
+            raise BundleError(
+                f"input {item.path}: download timed out after {timeout:g} s"
+            ) from exc
         except (httpx.HTTPError, WorkspaceError) as exc:
             with contextlib.suppress(Exception):
                 await workspace.run(f"rm -f -- {shlex.quote(target)}")
@@ -80,7 +97,7 @@ async def archive_workspace(
         try:
             with dest.open("wb") as out:
                 async with contextlib.aclosing(
-                    workspace.read_stream(command)
+                    workspace.read_stream(command, timeout=ARCHIVE_TIMEOUT_SECONDS)
                 ) as stream:
                     async for chunk in stream:
                         out.write(chunk)

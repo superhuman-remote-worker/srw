@@ -1,7 +1,9 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from srw_claude_code_harness import workspace as workspace_mod
 from srw_claude_code_harness.workspace import Workspace, WorkspaceError
 from tests._claude_code_harness_sshd import LocalSshd
 
@@ -187,3 +189,157 @@ async def test_a_cwd_containing_a_newline_round_trips(workspace):
     await workspace.run("mkdir -p $'a\\nb' && cd $'a\\nb'")
     assert workspace.cwd.endswith("/a\nb")
     assert (await workspace.run("pwd")).stdout == workspace.cwd + "\n"
+
+
+# -- shell start-up files (Ruling R18) --------------------------------------------
+
+_JUNK = (
+    "echo junk-out; echo junk-err >&2; printf 'SRW1\\0' ; trap 'echo late-junk' EXIT"
+)
+
+
+@pytest.mark.asyncio
+async def test_start_up_output_does_not_corrupt_run(workspace, sshd):
+    sshd.prefix = _JUNK
+    result = await workspace.run(
+        "mkdir -p sub && cd sub && echo hi && echo oops >&2; exit 3"
+    )
+    assert (result.exit_code, result.stdout, result.stderr) == (3, "hi\n", "oops\n")
+    assert result.cwd == sshd.access.root + "/sub" == workspace.cwd
+
+
+@pytest.mark.asyncio
+async def test_start_up_output_does_not_corrupt_file_helpers(workspace, sshd):
+    data = bytes(range(256)) * 300
+    await workspace.write_bytes("blob.bin", data)
+    sshd.prefix = _JUNK
+    assert await workspace.read_bytes("blob.bin") == data
+    assert await workspace.read_bytes("blob.bin", limit=7) == data[:7]
+    assert await workspace.exists("blob.bin") is True
+    assert await workspace.exists("nope") is False
+    assert await workspace.is_binary("blob.bin") is True
+    assert await workspace.stat("blob.bin") == ("regular file", len(data))
+    await workspace.write_bytes("copy.bin", data)
+    await workspace.write_env_file({"A": "1"})
+    sshd.prefix = None
+    assert await workspace.read_bytes("copy.bin") == data
+    streamed = b"".join([c async for c in workspace.read_stream("cat blob.bin")])
+    assert streamed == data
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_start_up_file_cannot_hang_a_helper(
+    workspace, sshd, monkeypatch
+):
+    monkeypatch.setattr(workspace_mod, "_HELPER_GRACE", 0.2)
+    monkeypatch.setattr(workspace_mod, "_BACKSTOP_GRACE", 0.2)
+    await workspace.write_bytes("keep.txt", b"original")
+    sshd.prefix = "sleep 4"
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    async def stream():
+        return [c async for c in workspace.read_stream("cat keep.txt", timeout=1)]
+
+    outcomes = await asyncio.gather(
+        workspace.exists("keep.txt", timeout=1),
+        workspace.read_bytes("keep.txt", timeout=1),
+        workspace.stat("keep.txt", timeout=1),
+        workspace.write_bytes("keep.txt", b"replaced", timeout=1),
+        workspace.write_env_file({"A": "1"}, timeout=1),
+        stream(),
+        return_exceptions=True,
+    )
+    assert loop.time() - started < 3
+    for outcome in outcomes:
+        assert isinstance(outcome, WorkspaceError) and "timed out" in str(outcome)
+    result = await workspace.run("echo hi", timeout=1)
+    assert result.timed_out is True and loop.time() - started < 5
+    # Once the start-up file finishes, the abandoned write finds its channel
+    # closed and dies at the marker, before it can truncate the file.
+    sshd.prefix = None
+    await asyncio.sleep(max(0.0, 5.5 - (loop.time() - started)))
+    assert await workspace.read_bytes("keep.txt") == b"original"
+
+
+@pytest.mark.asyncio
+async def test_endless_start_up_stdout_fails_fast(workspace, sshd):
+    sshd.prefix = "yes junk"
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(WorkspaceError, match="before the command started"):
+        await workspace.exists("x", timeout=60)
+    with pytest.raises(WorkspaceError, match="before the command started"):
+        await workspace.run("echo hi", timeout=60)
+    assert loop.time() - started < 10
+
+
+@pytest.mark.asyncio
+async def test_endless_start_up_stderr_is_bounded(workspace, sshd, monkeypatch):
+    monkeypatch.setattr(workspace_mod, "_HELPER_GRACE", 0.2)
+    monkeypatch.setattr(workspace_mod, "_BACKSTOP_GRACE", 0.2)
+    seen = []
+    collect = workspace_mod._collect
+
+    async def recording(reader, framed, buffer, cap, *, strict):
+        seen.append((framed, buffer, cap))
+        await collect(reader, framed, buffer, cap, strict=strict)
+
+    monkeypatch.setattr(workspace_mod, "_collect", recording)
+    sshd.prefix = "yes junk >&2"
+    with pytest.raises(WorkspaceError, match="timed out"):
+        await workspace.exists("x", timeout=1)
+    result = await workspace.run("echo hi", timeout=1, capture_limit=1000)
+    assert result.timed_out is True
+    assert 0 < len(result.stderr.encode()) <= 1000 + workspace_mod._CHANNEL_SLACK
+    assert len(seen) == 4
+    for framed, buffer, cap in seen:
+        assert len(buffer) <= cap
+        assert len(framed.preamble) <= max(cap, workspace_mod.STDERR_LIMIT_BYTES)
+
+
+@pytest.mark.asyncio
+async def test_helper_output_is_capped(workspace):
+    await workspace.run("head -c 100000 /dev/zero > zeros")
+    with pytest.raises(WorkspaceError, match="exceeds 1000 bytes"):
+        await workspace._exec("cat zeros", stdout_limit=1000)
+    error = await workspace._exec("head -c 300000 /dev/zero | tr '\\0' e >&2; exit 4")
+    assert error[0] == 4 and len(error[2]) == workspace_mod.STDERR_LIMIT_BYTES
+
+
+@pytest.mark.asyncio
+async def test_write_refuses_a_target_that_is_not_a_regular_file(workspace):
+    await workspace.run("mkfifo pipe && mkdir dir")
+    for name in ("pipe", "dir"):
+        with pytest.raises(WorkspaceError, match="is not a regular file"):
+            await asyncio.wait_for(workspace.write_bytes(name, b"x"), 10)
+
+
+@pytest.mark.asyncio
+async def test_run_removes_its_directory_when_the_channel_closes_early(
+    workspace, sshd, monkeypatch
+):
+    # The backstop closes the channel while the command still runs; the outer
+    # shell must survive the closed channel (SIGPIPE) and clean up.
+    monkeypatch.setattr(workspace_mod, "_BACKSTOP_GRACE", 0.3)
+    result = await workspace.run("trap '' TERM; sleep 2; echo done", timeout=1)
+    assert result.timed_out is True and result.exit_code == -1
+    scratch = Path(sshd.access.root) / ".srw-run"
+    for _ in range(50):
+        if not any(scratch.iterdir()):
+            break
+        await asyncio.sleep(0.1)
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_write_stream_stops_feeding_once_the_remote_has_exited(workspace):
+    await workspace.run("mkfifo pipe")
+
+    async def slow():
+        yield b"x"
+        await asyncio.sleep(60)
+        yield b"y"
+
+    with pytest.raises(WorkspaceError, match="not a regular file"):
+        await asyncio.wait_for(workspace.write_stream("pipe", slow()), 10)

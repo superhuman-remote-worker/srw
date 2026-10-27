@@ -3,6 +3,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 from srw_claude_code_harness.tools import (
+    EDIT_MAX_BYTES,
     OUTPUT_LIMIT_CHARS,
     ToolHandlers,
     make_tools,
@@ -238,3 +239,65 @@ async def test_edit_refuses_files_over_the_size_limit(handlers, workspace):
         {"file_path": "huge.txt", "old_string": "a", "new_string": "b"}
     )
     assert out["is_error"] is True and "too large" in out["content"][0]["text"]
+
+
+_JUNK = "echo junk-out; echo junk-err >&2; trap 'echo late-junk' EXIT"
+
+
+@pytest.mark.asyncio
+async def test_read_and_edit_ignore_start_up_output(handlers, workspace, sshd):
+    original = "alpha\nbeta é\ngamma\n".encode()
+    await workspace.write_bytes("f.txt", original)
+    sshd.prefix = _JUNK
+    out = await handlers.read({"file_path": "f.txt"})
+    assert out == {
+        "content": [
+            {"type": "text", "text": "     1\talpha\n     2\tbeta é\n     3\tgamma"}
+        ]
+    }
+    edited = await handlers.edit(
+        {"file_path": "f.txt", "old_string": "beta", "new_string": "delta"}
+    )
+    assert "Replaced 1" in edited["content"][0]["text"]
+    written = await handlers.write({"file_path": "g.txt", "content": "x\ny\n"})
+    assert "is_error" not in written
+    sshd.prefix = None
+    assert await workspace.read_bytes("f.txt") == original.replace(b"beta", b"delta")
+    assert await workspace.read_bytes("g.txt") == b"x\ny\n"
+
+
+@pytest.mark.asyncio
+async def test_write_refuses_a_fifo_without_hanging(handlers, workspace):
+    await workspace.run("mkfifo f")
+    out = await asyncio.wait_for(handlers.write({"file_path": "f", "content": "x"}), 10)
+    assert out["is_error"] is True
+    assert "not a regular file" in out["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_edit_refuses_a_file_that_grew_past_the_limit_after_the_stat(
+    handlers, workspace, monkeypatch
+):
+    await workspace.run("head -c 11534336 /dev/zero | tr '\\0' a > grown.txt")
+    stat = workspace.stat
+
+    async def stale_stat(path, **kwargs):
+        kind, _ = await stat(path, **kwargs)
+        return kind, 10  # what the stat saw before the file grew
+
+    monkeypatch.setattr(workspace, "stat", stale_stat)
+    reads = []
+    read_bytes = workspace.read_bytes
+
+    async def recording(path, **kwargs):
+        data = await read_bytes(path, **kwargs)
+        reads.append((kwargs.get("limit"), len(data)))
+        return data
+
+    monkeypatch.setattr(workspace, "read_bytes", recording)
+    out = await handlers.edit(
+        {"file_path": "grown.txt", "old_string": "a", "new_string": "b"}
+    )
+    assert out["is_error"] is True and "too large" in out["content"][0]["text"]
+    limit = EDIT_MAX_BYTES + 1
+    assert (limit, limit) in reads  # the content read was bounded

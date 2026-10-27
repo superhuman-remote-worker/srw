@@ -4,6 +4,11 @@ Stands in for the workspace sshd in the Claude Code harness tests: every exec
 request runs through ``/bin/sh -c`` with the workspace root as working directory
 and ``HOME``, so the harness's shell wrapper, ``timeout`` and file transfers are
 exercised against real processes. Channels are binary (``encoding=None``).
+
+``prefix`` simulates the login shell's start-up files (``~/.bashrc``): when set,
+it runs in the same shell before every command, as a start-up file would. Like
+sshd, a channel the client closes closes the command's pipes, so its next write
+fails (SIGPIPE) and its stdin ends.
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ class LocalSshd:
         self._sessions: set[int] = set()
         self.access: WorkspaceAccess | None = None
         self.commands: list[str] = []
+        self.prefix: str | None = None
 
     @classmethod
     async def start(cls, root: Path) -> LocalSshd:
@@ -98,8 +104,11 @@ class LocalSshd:
 
     async def _handle(self, process: asyncssh.SSHServerProcess) -> None:
         self.commands.append(process.command)
+        command = process.command
+        if self.prefix is not None:
+            command = f"{self.prefix}\n{command}"
         child = await asyncio.create_subprocess_shell(
-            process.command,
+            command,
             cwd=self._root,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -108,6 +117,8 @@ class LocalSshd:
             start_new_session=True,
         )
         self._sessions.add(child.pid)
+        closed = asyncio.ensure_future(process.channel.wait_closed())
+        closed.add_done_callback(lambda _: _close_pipes(child))
         stdin_task = asyncio.create_task(_pump_stdin(process.stdin, child))
         try:
             # Like OpenSSH, the session ends only when every process holding the
@@ -126,6 +137,8 @@ class LocalSshd:
             with contextlib.suppress(asyncio.CancelledError):
                 await stdin_task
         process.exit(returncode if returncode >= 0 else 128 - returncode)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(closed, 5)
 
     async def close(self) -> None:
         self._server.close()
@@ -133,6 +146,19 @@ class LocalSshd:
         # Background jobs outlive their call (as on a real workspace); end them here.
         _kill_sessions(self._sessions)
         shutil.rmtree(self._key_dir, ignore_errors=True)
+
+
+def _close_pipes(child) -> None:
+    """Close the command's stdin, stdout and stderr pipes, as sshd does when the
+    channel closes."""
+    transport = getattr(child, "_transport", None)
+    if transport is None:
+        return
+    for fd in (0, 1, 2):
+        with contextlib.suppress(Exception):
+            pipe = transport.get_pipe_transport(fd)
+            if pipe is not None:
+                pipe.close()
 
 
 def _kill_sessions(sessions: set[int]) -> None:
