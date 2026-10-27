@@ -260,6 +260,27 @@ async def test_archive_tolerates_tar_exit_code_one(workspace, tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_archive_refuses_a_find_that_lists_nothing(
+    workspace, tmp_path, monkeypatch
+):
+    await workspace.write_bytes("a.txt", b"a")
+    real = workspace._exec
+
+    def wrapped(command, **kwargs):
+        # A non-GNU find rejects -printf: exit 1 and no output.
+        replaced = command.replace(
+            bundle_mod._LIST_COMMAND, "echo 'find: unknown -printf' >&2; exit 1", 1
+        )
+        return real(replaced, **kwargs)
+
+    monkeypatch.setattr(workspace, "_exec", wrapped)
+    dest = tmp_path / "ws.tar.gz"
+    with pytest.raises(BundleError, match="listing the workspace failed"):
+        await archive_workspace(workspace, dest)
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
 async def test_archive_refuses_non_gzip_output(workspace, tmp_path, monkeypatch):
     real = workspace.read_stream
     seen = []

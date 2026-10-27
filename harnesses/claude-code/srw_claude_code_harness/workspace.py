@@ -199,7 +199,9 @@ def _new_token() -> tuple[str, bytes]:
 def _helper_remote(script: str, token: str, seconds: int) -> str:
     """The exec request for a framed helper: the marker first, then ``script``."""
     mark = f"printf '%s%s' {_FRAME_TAG} {token}"
-    body = f"{mark}; {mark} >&2\n{script}\n"
+    # A start-up file may have hung and ignored SIGPIPE: if the client has
+    # already given up, the marker write fails and the script must not run late.
+    body = f"{mark} || exit 1; {mark} >&2 || exit 1\n{script}\n"
     return f"exec timeout -k {_KILL_AFTER} {seconds} bash --norc -c {shlex.quote(body)}"
 
 

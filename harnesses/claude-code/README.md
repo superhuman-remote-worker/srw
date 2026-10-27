@@ -127,7 +127,8 @@ The model controls its workspace, including the login shell's start-up files
 (`~/.bashrc` runs before every command sent over SSH). The harness tolerates
 them: every workspace operation frames its output with a per-call random marker
 and ignores what a start-up file prints before it (more than 1 MiB is an
-error), keeps at most 64 KiB of stderr, and is bounded in time: 120 seconds for
+error), keeps at most 64 KiB of a file operation's stderr (`Bash` output is
+capped as described above), and is bounded in time: 120 seconds for
 each file operation, the `Bash` timeout for commands, 30 minutes for each input
 download and 10 minutes for the workspace archive.
 

@@ -121,7 +121,9 @@ async def _list_entries(
         timeout=timeout,
         stdout_limit=ARCHIVE_LISTING_LIMIT_BYTES,
     )
-    if rc not in (0, 1):
+    # GNU find exits 1 after unreadable entries but still lists the rest; a find
+    # without -printf also exits 1, with nothing listed: that must not archive nothing.
+    if rc not in (0, 1) or (rc == 1 and not stdout):
         raise BundleError(f"listing the workspace failed: {_failure(rc, stderr)}")
     entries = []
     for record in stdout.split(b"\0"):
