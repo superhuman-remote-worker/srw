@@ -925,13 +925,14 @@ def fold_system_messages(messages: list) -> list:
     """Leave at most one system message, and only as the first message.
 
     For chat templates that accept a single leading system turn — Qwen3.x
-    raises ``System message must be at the beginning.`` on any other — while
-    SRW may add system nudges mid-history (and histories from before the
-    compaction summary became a user message hold it as a second system
-    message). The leading run of system messages merges into
-    one; each later system message becomes a user turn where it stands, so the
-    messages before it (and the provider's cached prefix) are unchanged.
-    Returns a new list; the input dicts are not mutated.
+    raises ``System message must be at the beginning.`` on any other. Every
+    lane SRW runs sends exactly one, first, so this is a no-op for them
+    (tests/test_single_system_message_lanes.py); what it still folds is a
+    history from before the compaction summary became a user message, which
+    holds it as a second system message. The leading run of system messages
+    merges into one; each later system message becomes a user turn where it
+    stands, so the messages before it (and the provider's cached prefix) are
+    unchanged. Returns a new list; the input dicts are not mutated.
     """
     lead = 0
     while lead < len(messages) and messages[lead].get("role") == "system":

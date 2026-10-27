@@ -56,6 +56,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     RemoveMessage,
+    SystemMessage,
     ToolMessage,
 )
 
@@ -675,6 +676,10 @@ ACTIVE_SUBAGENTS = (
     "Reports push automatically; do not poll.\n"
     "</active_subagents>"
 )
+#: The tools node's progress nudge (``graph.py``), as ``nudges`` appends it.
+PROGRESS_NUDGE = (
+    "OBSERVATION: 5 tool calls since the last file write or todo completion."
+)
 GUIDANCE = [
     {
         "id": "g-1",
@@ -1008,6 +1013,7 @@ async def run_worker_scenario(
     churn: bool = False,
     memory_lag: int = 0,
     memory_search: bool = True,
+    nudges: bool = False,
 ) -> List[Captured]:
     """Run the tactical tool loop through ``create_execute_node``.
 
@@ -1036,7 +1042,9 @@ async def run_worker_scenario(
     heartbeat inbox keeps an entry until the ack lands;
     ``delivered_guidance_ids`` is carried into state. ``memory_search``
     binds the memory tool with the context sources, which brings the
-    up-front memory summary (D35).
+    up-front memory summary (D35). ``nudges`` appends :data:`PROGRESS_NUDGE`
+    after each tool round, as the tools node appends its progress nudge: a
+    ``SystemMessage`` in state.
     """
     from shared.runtime.core.loader import create_llm, load_agent_config
     from shared.runtime.services.guardrails import format_nudge
@@ -1178,6 +1186,8 @@ async def run_worker_scenario(
                         content=str(output), tool_call_id=call["id"], name=call["name"]
                     )
                 )
+            if nudges:
+                state["messages"].append(SystemMessage(content=PROGRESS_NUDGE))
     expected_forced = int(safety_rebuild_at is not None) + int(overflow is not None)
     if context_mgr.forced_rebuilds != expected_forced:
         raise AssertionError(

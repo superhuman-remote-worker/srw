@@ -432,9 +432,10 @@ kimi-k3:
 # ignores the top-level field, the template default (xhigh) applies.
 #
 # The template also RAISES on a system message that is not first ("System
-# message must be at the beginning.") — and SRW sends the compaction summary
-# as a second system message. `single_system_message` folds the request to
-# one leading system turn (later system messages become user turns).
+# message must be at the beginning."). SRW sends one; only a checkpoint from
+# before the compaction summary became a user message holds a second.
+# `single_system_message` folds the request to one leading system turn
+# (later system messages become user turns).
 #
 # Sampling is the model card's thinking-mode set (temperature 1.0, top_p 0.95,
 # top_k 20; min_p / penalties at their defaults, so not sent).

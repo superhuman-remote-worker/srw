@@ -9067,7 +9067,7 @@ async def _restore_session_messages() -> None:
 
     * **Path A — checkpoint resume:** if a ``role='summary'`` row exists with
       a ``metrics.boundary_turn`` set, restore
-      ``[SystemMessage(summary)] + history(since_turn=boundary_turn)``. The
+      ``[summary hand-back] + history(since_turn=boundary_turn)``. The
       summary covers turns ≤ boundary_turn; the tail covers everything after.
       This avoids re-loading the full pre-checkpoint history and
       re-summarizing on every resume — the fix for the OOM observed on a
