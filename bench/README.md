@@ -73,6 +73,25 @@ as loss of the current block. The query's single-phase tool list has a test that
 compares it directly with `TOOL_REGISTRY`, so registry changes cannot silently
 stale the acceptance check.
 
+For the P4 test (does a conversation get its own memories back while their
+source is still in context?), two read-only steps measure arm A on existing
+traffic: step 1 reads the audit database once and writes the injected memory
+handles with each conversation's turn and compaction boundary; step 2 resolves
+them in the vector database and counts what arm B
+(`memory.retrieval.same_conversation: skip_in_context`) would have skipped.
+
+```bash
+psql "$AUDIT_DB_URL" -X -q -v from='2026-10-20' -v to='2026-10-21' \
+  -v out=p4_step1.json -f bench/queries/p4_same_conversation_step1_audit.sql
+psql "$VECTOR_DB_URL" -X -q -v step1=p4_step1.json \
+  -f bench/queries/p4_same_conversation_step2_vector.sql
+```
+
+Step 1 scans each request body in the window once; keep the window short and
+never run it beside another body scan (the dev audit replica has 4 GiB). Under
+arm B, each worker `memory_inject` audit row reports the skip in
+`stats.extra.same_conversation`.
+
 ## Task families
 
 | prefix | family | config | what it exercises |
