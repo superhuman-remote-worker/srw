@@ -235,6 +235,11 @@ def manifest_execution_service(resources: ApplicationResources):
         ).lower()
         == "true",
         harness_egress=os.environ.get("MANIFEST_HARNESS_EGRESS", "[]"),
+        approved_images=os.environ.get("MANIFEST_APPROVED_IMAGES", "[]"),
+        allow_unverified_approved_images=os.environ.get(
+            "MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION", "false"
+        ).lower()
+        == "true",
         connector_drivers=resources.connector_drivers,
     )
 

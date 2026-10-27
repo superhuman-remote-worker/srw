@@ -70,6 +70,14 @@ async def actor(database):
     return dict(row)
 
 
+async def _approved_non_admin(database) -> dict:
+    row = await database.fetchrow(
+        "INSERT INTO users(display_name,is_approved,is_admin) "
+        "VALUES('Native integration member',TRUE,FALSE) RETURNING *"
+    )
+    return dict(row)
+
+
 class ProcessRuntime:
     """The sole external boundary: Kubernetes observation and process cleanup."""
 
@@ -114,9 +122,12 @@ class ProcessRuntime:
         return True
 
 
+PLAIN_IMAGE = "test.invalid/plain@sha256:" + "a" * 64
+
+
 def assignment(*, adapter="generic", mode="ProcessExit"):
     runtime = {
-        "image": "test.invalid/plain:v1",
+        "image": PLAIN_IMAGE,
         "config": {
             "tools": ["arbitrary_read_file"],
             "a": None,
@@ -150,15 +161,30 @@ def assignment(*, adapter="generic", mode="ProcessExit"):
     }
 
 
-async def admit(database, actor, document, *, harness_egress="[]"):
+async def admit(
+    database,
+    actor,
+    document,
+    *,
+    harness_egress="[]",
+    approved_images=None,
+    native_hosting_enabled=True,
+    allow_unverified_approved_images=False,
+):
     runtime = ProcessRuntime()
     execution = ManifestExecutionService(
         database,
         runtime=runtime,
         namespace="test",
         srw_image=database.manifest_runtime_image,
-        native_hosting_enabled=True,
+        native_hosting_enabled=native_hosting_enabled,
         harness_egress=harness_egress,
+        approved_images=(
+            [{"name": "plain", "image": PLAIN_IMAGE}]
+            if approved_images is None
+            else approved_images
+        ),
+        allow_unverified_approved_images=allow_unverified_approved_images,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -398,6 +424,7 @@ async def test_retry_uses_current_operator_egress_while_image_settings_remain_op
         namespace="test",
         native_hosting_enabled=True,
         harness_egress=next_policy,
+        approved_images=[{"name": "plain", "image": PLAIN_IMAGE}],
         connector_drivers=builtin_connector_drivers(),
     )
     for _ in range(3):
@@ -480,6 +507,15 @@ async def test_admin_submission_executes_as_the_scoped_account_owner(database, a
     )
     document = assignment()
     document["metadata"]["scope"] = {"kind": "Account", "name": str(owner_id)}
+    # The grant is the executing owner's: the administrator's bypass is not lent.
+    with pytest.raises(HTTPException) as refused:
+        await admit(database, actor, document)
+    assert refused.value.status_code == 403
+    await database.execute(
+        "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+        "VALUES('user',$1,'custom_harness_images','true'::jsonb)",
+        owner_id,
+    )
     execution, runtime, _, _, work_id, snapshot = await admit(database, actor, document)
     assert (await database.get_job(work_id))["user_id"] == owner_id
     assert snapshot["owner_id"] == owner_id
@@ -489,6 +525,124 @@ async def test_admin_submission_executes_as_the_scoped_account_owner(database, a
     runtime.exit()
     await execution.reconcile_one(str(snapshot["id"]))
     assert (await database.get_job(work_id))["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_unapproved_image_is_refused_before_any_effect(database, actor):
+    document = assignment()
+    document["spec"]["execution"]["expert"]["inline"]["runtime"]["image"] = (
+        "test.invalid/other@sha256:" + "b" * 64
+    )
+    with pytest.raises(HTTPException) as refused:
+        await admit(database, actor, document)
+    assert refused.value.status_code == 422
+    assert "approvedImages" in refused.value.detail
+    for table in ("jobs", "srw_resources", "srw_execution_specs"):
+        assert await database.fetchval(f"SELECT count(*) FROM {table}") == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_approved_list_runs_nothing_even_for_admins(database, actor):
+    with pytest.raises(HTTPException) as refused:
+        await admit(database, actor, assignment(), approved_images=[])
+    assert refused.value.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("command", ["/bin/sh"]),
+        ("args", ["-c", "id"]),
+        ("probes", {"liveness": {"exec": {"command": ["true"]}}}),
+    ],
+)
+async def test_launch_overrides_are_refused_for_generic_jobs(
+    database, actor, field, value
+):
+    document = assignment()
+    document["spec"]["execution"]["expert"]["inline"]["runtime"][field] = value
+    with pytest.raises(HTTPException) as refused:
+        await admit(database, actor, document)
+    assert refused.value.status_code == 422
+    assert "entrypoint" in refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_invalid_approved_list_is_a_503_before_admission_effects(database, actor):
+    with pytest.raises(HTTPException) as invalid:
+        await admit(
+            database,
+            actor,
+            assignment(),
+            approved_images='[{"name": "x", "image": "test.invalid/plain:v1"}]',
+        )
+    assert invalid.value.status_code == 503
+    assert invalid.value.detail["code"] == "HostingConfigurationInvalid"
+    assert "MANIFEST_APPROVED_IMAGES" in invalid.value.detail["message"]
+    for table in ("jobs", "srw_resources", "srw_execution_specs"):
+        assert await database.fetchval(f"SELECT count(*) FROM {table}") == 0
+
+
+@pytest.mark.asyncio
+async def test_non_admin_without_grant_is_refused_and_with_grant_admitted(database):
+    user = await _approved_non_admin(database)
+    with pytest.raises(HTTPException) as refused:
+        await admit(database, user, assignment())
+    assert refused.value.status_code == 403
+    assert "custom_harness_images" in refused.value.detail
+    await database.execute(
+        "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+        "VALUES('user',$1,'custom_harness_images','true'::jsonb)",
+        user["id"],
+    )
+    _, _, _, _, work_id, _ = await admit(database, user, assignment())
+    assert (await database.get_job(work_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_opt_in_admits_approved_images_on_an_unverified_cluster(database, actor):
+    _, _, _, _, work_id, _ = await admit(
+        database,
+        actor,
+        assignment(),
+        native_hosting_enabled=False,
+        allow_unverified_approved_images=True,
+    )
+    assert (await database.get_job(work_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_both_flags_off_keeps_generic_hosting_unavailable(database, actor):
+    with pytest.raises(HTTPException) as unavailable:
+        await admit(
+            database,
+            actor,
+            assignment(),
+            native_hosting_enabled=False,
+            allow_unverified_approved_images=False,
+        )
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.detail["code"] == "HostingCapabilityUnavailable"
+    assert (
+        "allowApprovedImagesWithoutVerifiedIsolation"
+        in unavailable.value.detail["message"]
+    )
+    assert await database.fetchval("SELECT count(*) FROM jobs") == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_refuses_launch_when_image_is_no_longer_approved(
+    database, actor
+):
+    execution, runtime, _, _, work_id, snapshot = await admit(
+        database, actor, assignment()
+    )
+    execution._approved_images = ()
+    await execution.reconcile_one(str(snapshot["id"]))
+    job = await database.get_job(work_id)
+    assert job["status"] == "failed" and "approved list" in job["error_message"]
+    assert not runtime.launches
 
 
 @pytest.mark.asyncio

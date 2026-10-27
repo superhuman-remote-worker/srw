@@ -302,16 +302,21 @@ class TestLiveSessionOfAManifestJob:
         assert status in error.value.detail
 
 
+GENERIC_IMAGE = "example/x@sha256:" + "d" * 64
+
+
 class TestAdmitRefusesALiveGenericImage:
     @pytest.mark.asyncio
     async def test_a_generic_image_cannot_take_a_live_session(self):
         user_id = str(uuid4())
         db = MagicMock()
+        db.user_can_run_custom_harness_images = AsyncMock(return_value=True)
         service = ManifestExecutionService(
             db,
             runtime=MagicMock(),
             namespace="srw",
             native_hosting_enabled=True,
+            approved_images=[{"name": "x", "image": GENERIC_IMAGE}],
             connector_drivers=MagicMock(),
         )
         prepared = {
@@ -320,7 +325,7 @@ class TestAdmitRefusesALiveGenericImage:
                 "spec": {
                     "liveSession": True,
                     "execution": {
-                        "expert": {"inline": {"runtime": {"image": "example/x:1"}}},
+                        "expert": {"inline": {"runtime": {"image": GENERIC_IMAGE}}},
                         "connectors": {"telefon": _line_connector()},
                         "session": {"connector": "telefon", "id": "rtc_1"},
                     },

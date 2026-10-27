@@ -21,6 +21,11 @@ from orchestrator.services.generic_harness_runtime import (
     build_generic_launch,
     pinned_image,
 )
+from orchestrator.services.manifest_approved_images import (
+    ApprovedImagesConfigurationError,
+    approved_image_entry,
+    validate_approved_images,
+)
 from orchestrator.services.manifest_authority import ManifestAuthority
 from orchestrator.services.manifest_harness_egress import (
     HarnessEgressConfigurationError,
@@ -46,6 +51,8 @@ class ManifestExecutionService:
         cancel_srw=None,
         native_hosting_enabled=False,
         harness_egress="[]",
+        approved_images="[]",
+        allow_unverified_approved_images=False,
         connector_drivers,
     ):
         self.db, self.store = db, ManifestStore(db)
@@ -56,20 +63,49 @@ class ManifestExecutionService:
         self.srw_image = srw_image
         self.cancel_srw = cancel_srw
         self.native_hosting_enabled = native_hosting_enabled
+        self.allow_unverified_approved_images = allow_unverified_approved_images
         self._harness_egress_error = None
         try:
             self._harness_egress = validate_harness_egress(harness_egress)
         except HarnessEgressConfigurationError as exc:
             self._harness_egress, self._harness_egress_error = (), str(exc)
+        self._approved_images_error = None
+        try:
+            self._approved_images = validate_approved_images(approved_images)
+        except ApprovedImagesConfigurationError as exc:
+            self._approved_images, self._approved_images_error = (), str(exc)
 
-    def _require_harness_egress(self):
-        if self._harness_egress_error:
+    @property
+    def generic_hosting_available(self) -> bool:
+        # Verified isolation, or the administrator's explicit opt-in to run
+        # approved images on a cluster whose isolation is not verified.
+        return self.native_hosting_enabled or self.allow_unverified_approved_images
+
+    def _require_hosting_configuration(self) -> None:
+        error = self._harness_egress_error or self._approved_images_error
+        if error:
             raise HTTPException(
                 503,
                 {
                     "code": "HostingConfigurationInvalid",
-                    "message": self._harness_egress_error,
+                    "message": error,
                 },
+            )
+
+    def _approved_runtime(self, runtime: dict) -> dict:
+        entry = approved_image_entry(self._approved_images, runtime.get("image"))
+        if entry is None:
+            raise HTTPException(
+                422,
+                "Generic hosting runs only images on the installation's approved list (manifestHosting.approvedImages).",
+            )
+        return entry
+
+    def _require_fixed_launch(self, runtime: dict) -> None:
+        if any(key in runtime for key in ("command", "args", "probes")):
+            raise HTTPException(
+                422,
+                "Approved harness images start with their own entrypoint; command, args and probes are not accepted.",
             )
 
     async def admit(self, prepared, resource, user, *, request=None):
@@ -85,16 +121,18 @@ class ManifestExecutionService:
         execution = spec["execution"]
         runtime = execution["expert"]["inline"]["runtime"]
         adapter = runtime.get("adapter", "generic")
-        if adapter == "generic" and not self.native_hosting_enabled:
+        if adapter == "generic" and not self.generic_hosting_available:
             raise HTTPException(
                 503,
                 {
                     "code": "HostingCapabilityUnavailable",
-                    "message": "Generic hosting requires an installation-verified network profile that enforces isolation before container startup.",
+                    "message": "Generic hosting requires an installation-verified network profile that enforces isolation before container startup. Alternatively an administrator may allow approved images on an unverified cluster (manifestHosting.allowApprovedImagesWithoutVerifiedIsolation).",
                 },
             )
         if adapter == "generic":
-            self._require_harness_egress()
+            self._require_hosting_configuration()
+            self._approved_runtime(runtime)
+            self._require_fixed_launch(runtime)
         if scope["kind"] == "Account" and scope["name"] != str(user["id"]):
             # Publishing into another account never lends the administrator's
             # runtime credentials, grants or model defaults to that account.
@@ -103,6 +141,15 @@ class ManifestExecutionService:
                 raise HTTPException(403, "Execution account is unavailable.")
             require_account_approved(owner)
             user = owner
+        # Checked as the executing account, after the swap above.
+        if (
+            adapter == "generic"
+            and not await self.db.user_can_run_custom_harness_images(user, project_id)
+        ):
+            raise HTTPException(
+                403,
+                "Running approved harness images requires the 'custom_harness_images' capability grant. Ask an administrator to grant it (Admin → Grants).",
+            )
         datasource_ids, policy_revisions = [], {}
         live_alias = (execution.get("session") or {}).get("connector")
         if spec.get("liveSession") and adapter != "srw/v1":
@@ -422,7 +469,7 @@ class ManifestExecutionService:
         )
 
     async def bindings(self, snapshot, user, *, materialize=True):
-        self._require_harness_egress()
+        self._require_hosting_configuration()
         authority = ManifestAuthority(self.db, user)
         resolved = snapshot["resolved"]
         await authority.scope(resolved["metadata"]["scope"], write=True)
@@ -669,12 +716,28 @@ class ManifestExecutionService:
             and observed.pod_absent
             and not latest["pod_uid"]
         ):
-            if not self.native_hosting_enabled:
+            if not self.generic_hosting_available:
                 await self.db.update_job_status(
                     str(job["id"]),
                     status="failed",
                     expected_status=job["status"],
                     error_message="Native hosting capability is no longer enabled; no new process was launched.",
+                )
+                return
+            # Every new attempt re-checks the current approved list; a retry
+            # never launches an image the administrator has since removed.
+            if (
+                approved_image_entry(
+                    self._approved_images,
+                    spec["execution"]["expert"]["inline"]["runtime"].get("image"),
+                )
+                is None
+            ):
+                await self.db.update_job_status(
+                    str(job["id"]),
+                    status="failed",
+                    expected_status=job["status"],
+                    error_message="The harness image is no longer on the approved list; no new process was launched.",
                 )
                 return
             user = await self.db.get_user(str(snapshot["owner_id"]))

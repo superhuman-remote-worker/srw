@@ -67,6 +67,11 @@ class ResourceDB(PostgresDB):
             )
             return dict(row)
 
+    async def user_can_run_custom_harness_images(self, user, project_id):
+        # Grant resolution has its own full-schema coverage; this fixture's
+        # schema has no capability_grants table.
+        return True
+
     async def get_project(self, project_id):
         try:
             return await self.fetchrow(
@@ -171,6 +176,10 @@ async def actor(database):
     return user
 
 
+WORKER_IMAGE = "example/worker@sha256:" + "c" * 64
+APPROVED_WORKER = [{"name": "worker", "image": WORKER_IMAGE}]
+
+
 def expert(name="worker", **runtime):
     return {
         "apiVersion": "srw/v1alpha1",
@@ -178,7 +187,7 @@ def expert(name="worker", **runtime):
         "metadata": {"name": name},
         "spec": {
             "runtime": {
-                "image": "example/worker:v1",
+                "image": WORKER_IMAGE,
                 "config": {"a": None, "tools": ["unknown"]},
                 **runtime,
             }
@@ -275,7 +284,7 @@ async def test_reviewed_dependency_changes_and_pinned_revisions(database, actor)
     runtime = resolved["resolved"][0]["spec"]["execution"]["expert"]["inline"][
         "runtime"
     ]
-    assert runtime["image"] == "example/worker:v1"
+    assert runtime["image"] == WORKER_IMAGE
     assert (
         await database.fetchval("SELECT count(*) FROM srw_resources WHERE kind='Job'")
         == 0
@@ -330,7 +339,7 @@ async def test_project_activation_is_atomic_and_defaults_use_pinned_content(
         preview["resolved"][0]["spec"]["execution"]["expert"]["inline"]["runtime"][
             "image"
         ]
-        == "example/worker:v1"
+        == WORKER_IMAGE
     )
     changed = deepcopy(project)
     changed["spec"]["resources"]["experts"]["worker"]["inline"]["runtime"]["image"] = (
@@ -456,6 +465,7 @@ async def admit_generic_project_job(database, actor, monkeypatch, project_id):
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -719,6 +729,7 @@ async def native_execution(database, actor, *, max_attempts=1, mode="ProcessExit
         runtime=process,
         namespace="test",
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -1049,6 +1060,7 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
         runtime=process,
         namespace="test",
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -1144,6 +1156,7 @@ async def native_workspace_execution(
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=executions.admit)
