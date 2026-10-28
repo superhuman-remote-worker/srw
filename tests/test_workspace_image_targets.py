@@ -204,7 +204,7 @@ def test_the_contract_script_is_installed_and_checks_the_contract():
         "AuthorizedPrincipalsFile /etc/ssh/principals/%u",
     ):
         assert setting in script, setting
-    assert "1.70.0" in script and "1.13" in script
+    assert "1.75.1" in script and "1.13" in script
     # Credential installs run /usr/bin/python3 -I, never PATH's python3.
     assert "test -x /usr/bin/python3" in script
 
@@ -212,3 +212,73 @@ def test_the_contract_script_is_installed_and_checks_the_contract():
 def test_tilt_sends_the_contract_script_to_the_build():
     tiltfile = (REPO / "Tiltfile").read_text()
     assert "'docker/assert-workspace-contract.sh'," in tiltfile
+
+
+# ---------------------------------------------------------------------------
+# rclone is pinned once, in every image that carries it.
+# ---------------------------------------------------------------------------
+
+RCLONE_FLOOR = (1, 75, 1)
+AGENT_DOCKERFILES = ("docker/Dockerfile.agent", "docker/Dockerfile.agent.dev")
+AGENT_CONTRACT = REPO / "docker/assert-agent-contract.sh"
+
+
+def _arg(text: str, name: str) -> str:
+    found = re.findall(rf"(?m)^(?:ARG )?{name}=([^\s]+)$", text)
+    assert len(found) == 1, (name, found)
+    return found[0]
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def test_every_image_pins_the_same_upstream_rclone():
+    """The agent image (the virtual tier's object store and its cloud folders),
+    the workspace image, the VM base and the mount sidecar run one rclone
+    generation, at or above the floor the agent contract gate enforces."""
+    workspace_version = _arg(DOCKERFILE, "SRW_RCLONE_VERSION")
+    workspace_sha = _arg(DOCKERFILE, "SRW_RCLONE_SHA256")
+    assert _version_tuple(workspace_version) >= RCLONE_FLOOR
+    for name in AGENT_DOCKERFILES:
+        text = (REPO / name).read_text()
+        assert _arg(text, "SRW_RCLONE_VERSION") == workspace_version, name
+        assert _arg(text, "SRW_RCLONE_SHA256") == workspace_sha, name
+    vm = (REPO / "docker/agent-vm-base/scripts/provision-stage1.sh").read_text()
+    assert _arg(vm, "SRW_RCLONE_VERSION") == workspace_version
+    assert _arg(vm, "SRW_RCLONE_SHA256") == workspace_sha
+    sidecar = (REPO / "docker/Dockerfile.in-pod-mount").read_text()
+    pinned = re.findall(
+        r"(?m)^FROM rclone/rclone:([^@\s]+)@sha256:[0-9a-f]{64} ", sidecar
+    )
+    assert pinned == [workspace_version], pinned
+
+
+def test_the_agent_images_install_rclone_pinned_not_from_apt():
+    for name in AGENT_DOCKERFILES:
+        text = (REPO / name).read_text()
+        assert "rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" in text, name
+        assert '"${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c -' in text, name
+        # Not the distribution package (1.60.1 on bookworm).
+        assert "\n    rclone \\\n" not in text, name
+
+
+def test_the_agent_images_run_the_agent_contract_gate():
+    for name in AGENT_DOCKERFILES:
+        text = (REPO / name).read_text()
+        assert (
+            text.count(
+                "COPY --chmod=0755 docker/assert-agent-contract.sh "
+                "/usr/local/bin/assert-agent-contract"
+            )
+            == 1
+        ), name
+        assert "RUN /usr/local/bin/assert-agent-contract" in text, name
+    script = AGENT_CONTRACT.read_text()
+    assert script.startswith("#!/usr/bin/env bash\n")
+    floor = ".".join(str(part) for part in RCLONE_FLOOR)
+    assert f'"rclone >= {floor}"' in script and f'"{floor}"' in script
+    for binary in ("rclone", "node", "npx", "uvx", "git", "rg", "jq"):
+        assert f'"{binary}"' in script, binary
+    tiltfile = (REPO / "Tiltfile").read_text()
+    assert "'docker/assert-agent-contract.sh'," in tiltfile

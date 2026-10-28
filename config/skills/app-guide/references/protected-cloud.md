@@ -13,7 +13,7 @@ journey_ids:
 An ordinary writable cloud mount is **live**: an agent's write or delete can
 reach the real folder immediately. **Protected Cloud** gives one persistent
 session a read-only view of a project folder plus a private staging layer.
-Files under `workspace/cloud` look writable to the agent, but additions,
+Files under `cloud/` look writable to the agent, but additions,
 edits, and deletions remain staged until the user explicitly applies the
 whole diff.
 
@@ -54,7 +54,7 @@ authority.
 2. Enable **Protected cloud — agent writes are staged for your review**.
 3. In the **Workspace** field, choose a **Container** template (for example
    `container-full`), then create the session.
-4. Ask the agent to work in `workspace/cloud`. It should describe completed
+4. Ask the agent to work in `cloud/`. It should describe completed
    cloud writes as “staged for your review,” not saved or shared.
 5. After a turn stages at least one change, click **Cloud changes (N)** in the
    session status bar. Inspect each added, modified, or deleted path.
@@ -100,11 +100,11 @@ already-resolved, identical content after resume; reject that duplicate diff.
 
 - **No checkbox:** verify that a non-default Nextcloud project is selected;
   otherwise the deployment flag may be off.
-- **Checkbox selected but no `workspace/cloud`:** Protected Cloud requires a
+- **Checkbox selected but no `cloud/`:** Protected Cloud requires a
   Container, or the read-only engage failed. It will not silently mount live
   storage.
 - **No Cloud changes badge:** the badge appears only when the staged count is
-  greater than zero. Finish a turn that changes `workspace/cloud`; if repeated
+  greater than zero. Finish a turn that changes `cloud/`; if repeated
   turns never stage, ask an administrator to check the staging transport and
   service health.
 - **Apply says the diff changed:** review the automatically reloaded epoch.

@@ -76,7 +76,7 @@ Workspace:
 
 {% if protected_cloud %}
 Protected cloud mode:
-- The cloud folder (workspace/cloud) is in PROTECTED mode: everything you write there is STAGED for the user's review — nothing is saved to the cloud or visible to anyone else until the user applies it in the review panel.
+- The cloud folder (cloud/ in the workspace) is in PROTECTED mode: everything you write there is STAGED for the user's review — nothing is saved to the cloud or visible to anyone else until the user applies it in the review panel.
 - Never say a cloud file is "saved", "uploaded", or "shared". Say it is "staged for your review".
 - When a piece of work is ready, tell the user so they can open the review panel ("Cloud changes" in the session header) and apply it.
 {% endif %}

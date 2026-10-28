@@ -5917,7 +5917,8 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
     or "" when it has none.
 
     Every folder in the workspace is named (main cloud slice 3): where it
-    is, whose it is and its access, so the agent never mistakes the
+    is (``cloud/<name>``, the path the file tools take from the workspace
+    root; ``cloud`` for a session's only folder), whose it is and its access, so the agent never mistakes the
     session's outbox for the project's folder. ``mounted`` rows carry
     ``path`` (or ``name``) and plain ``text``. A mount that does not come up
     never blocks the workspace (connector drivers D7, decision 23): the
@@ -5947,8 +5948,9 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
             [
                 "<cloud_folders>",
                 f"Protected cloud unavailable: {text}.",
-                "This protected session has no cloud folder at all: workspace/"
-                "cloud does not exist and nothing you write reaches the cloud. "
+                "This protected session has no cloud folder at all: there is no "
+                "cloud/ folder in the workspace and nothing you write reaches the "
+                "cloud. "
                 "Tell the user plainly if their request needs the cloud; "
                 "srw_cloud_status shows the current state, and the user can "
                 "start a new session once it is fixed.",
@@ -5960,11 +5962,9 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
         lines.append("Cloud folders in this session's workspace:")
         for row in present:
             name = str(row.get("name") or "")
-            path = str(row.get("path") or "") or (
-                f"workspace/cloud/{name}" if name else ""
-            )
+            path = str(row.get("path") or "") or (f"cloud/{name}" if name else "")
             pending = " (still coming up)" if row.get("state") == "pending" else ""
-            lines.append(f"- {path or 'workspace/cloud'}: {row['text']}{pending}.")
+            lines.append(f"- {path or 'cloud'}: {row['text']}{pending}.")
     if rows:
         lines.append(
             "Some cloud folders of this session are not available:"
@@ -5973,9 +5973,7 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
         )
         for row in rows:
             name = str(row.get("name") or "")
-            path = str(row.get("path") or "") or (
-                f"workspace/cloud/{name}" if name else ""
-            )
+            path = str(row.get("path") or "") or (f"cloud/{name}" if name else "")
             title = str(row.get("title") or "")
             if path:
                 lines.append(f"- {path}: {row['text']}.")

@@ -21,8 +21,9 @@
 export interface CloudFolderProblem {
   /** The folder's name, or '' for one that was not attached. */
   name: string;
-  /** Where the agent finds it: workspace/cloud for a session's only folder,
-   * workspace/cloud/<name> for one of several, '' when not attached. */
+  /** Where the agent finds it, relative to the workspace root as the file
+   * tools take it: cloud for a session's only folder, cloud/<name> for one
+   * of several, '' when not attached. */
   path: string;
   /** For a folder that was not attached: what it was (session_folder,
    * project…), or ''. */
@@ -126,7 +127,7 @@ function kindOf(value: unknown): string {
 }
 
 function pathOf(name: string, total: number): string {
-  return total === 1 ? 'workspace/cloud' : `workspace/cloud/${name}`;
+  return total === 1 ? 'cloud' : `cloud/${name}`;
 }
 
 function excludedEntries(excluded: unknown): Record<string, unknown>[] {

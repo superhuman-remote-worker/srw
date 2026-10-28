@@ -217,6 +217,7 @@ docker_build(
         '.dockerignore',
         'docker/Dockerfile.agent.dev',
         'docker/prepare-tokenizer-cache.py',
+        'docker/assert-agent-contract.sh',
     ],
     ignore=[
         '**/__pycache__',

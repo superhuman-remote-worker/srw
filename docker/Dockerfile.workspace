@@ -23,11 +23,14 @@ ARG CODE_SERVER_VERSION=4.100.3
 # Pinned upstream rclone (Ubuntu's packaged 1.60.1-DEV predates the webdav
 # `infinitescale` vendor needed for OpenCloud mounts and lacks modern VFS
 # cache flags — see knowledge-base/knowledge/features/rclone_cloud_mount.md §12). Keep version
-# and checksum in sync with docker/agent-vm-base/scripts/provision-stage1.sh.
+# and checksum in sync with docker/Dockerfile.agent, docker/Dockerfile.agent.dev,
+# docker/Dockerfile.in-pod-mount (the same release, by digest) and
+# docker/agent-vm-base/scripts/provision-stage1.sh; tests/test_workspace_image_targets.py
+# checks that they agree.
 # SRW_ prefix is load-bearing: rclone parses RCLONE_* env vars as flags, so
 # an ARG named RCLONE_VERSION crashes `rclone version` inside the RUN.
-ARG SRW_RCLONE_VERSION=1.74.3
-ARG SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
+ARG SRW_RCLONE_VERSION=1.75.2
+ARG SRW_RCLONE_SHA256=efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c
 
 LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
 LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"

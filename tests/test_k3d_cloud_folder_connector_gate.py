@@ -125,14 +125,14 @@ def test_the_prompt_block_is_read_out_of_an_archived_request():
                 {
                     "role": "system",
                     "content": "Hi\n\n<cloud_folders>\nCloud folders in this "
-                    "session's workspace:\n- workspace/cloud/outbox: a folder SRW "
+                    "session's workspace:\n- cloud/outbox: a folder SRW "
                     "created for this session\n</cloud_folders>\n",
                 }
             ]
         }
     )
     block = gate.prompt_block(request)
-    assert "- workspace/cloud/outbox: a folder SRW created" in block
+    assert "- cloud/outbox: a folder SRW created" in block
     assert gate.prompt_block('{"messages": []}') == ""
 
 

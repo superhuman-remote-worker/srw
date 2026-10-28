@@ -798,8 +798,8 @@ class CloudFolderConnectorGate:
         self.report.check(
             "omitted: the prompt's cloud folder block names both folders, the "
             "outbox as not the project folder",
-            f"workspace/cloud/{name}:" in block
-            and "workspace/cloud/outbox: a folder SRW created for this session" in block
+            f"- cloud/{name}:" in block
+            and "- cloud/outbox: a folder SRW created for this session" in block
             and "not the project folder" in block,
             block.strip()[:500],
         )

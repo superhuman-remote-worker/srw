@@ -164,7 +164,7 @@ def excluded_row(entry: dict[str, Any]) -> dict[str, str]:
     )
     return {
         "name": name,
-        "path": f"workspace/cloud/{name}" if name else "",
+        "path": f"cloud/{name}" if name else "",
         "title": str(entry.get("title") or ""),
         "kind": str(entry.get("mount_kind") or ""),
         "reason": reason,
@@ -383,10 +383,14 @@ class SidecarMountWatcher:
         self._unavailable_reason = reason
 
     def path_of(self, mount: SidecarMountState) -> str:
-        """Where the agent finds a folder in its workspace."""
+        """Where the agent finds a folder in its workspace, as the file
+        tools take it: relative to the workspace root, where the link
+        ``cloud`` points at the sidecars' folders. (``workspace/cloud``
+        was the same place named from the home directory, which the tools
+        resolved to ``workspace/workspace/cloud``.)"""
         if len(self.planned) == 1:
-            return "workspace/cloud"
-        return f"workspace/cloud/{mount.workspace_name}"
+            return "cloud"
+        return f"cloud/{mount.workspace_name}"
 
     def report(self) -> list[dict[str, Any]]:
         """Each mount's state for the orchestrator: mounted, pending, or
@@ -446,8 +450,8 @@ class SidecarMountWatcher:
 
     def unavailable(self) -> list[dict[str, str]]:
         """What did not mount, in plain words (for the agent's prompt):
-        ``name``, its ``path`` in the workspace (``workspace/cloud`` for a
-        single folder), the closed ``reason`` and its ``text``; ``protected``
+        ``name``, its ``path`` in the workspace (``cloud`` for a single
+        folder), the closed ``reason`` and its ``text``; ``protected``
         when it is a protected session's whole cloud."""
         rows: list[dict[str, Any]] = []
         for row, mount in zip(self.report(), self.planned):

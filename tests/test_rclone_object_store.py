@@ -20,7 +20,9 @@ import pytest
 
 from shared.runtime.core.backends.object_store import (  # noqa: E402
     InMemoryObjectStore,
+    ObjectStat,
     ObjectStoreError,
+    ObjectVersionMismatch,
 )
 from shared.runtime.core.backends.rclone import (  # noqa: E402
     RcloneObjectStore,
@@ -301,7 +303,15 @@ class TestPut:
         run_mock.return_value = _cp()
         store.put("jobs/1/a.txt", b"payload")
         argv = run_mock.call_args.args[0]
-        assert argv == ["rclone", "rcat", "srw:my-bucket/jobs/1/a.txt"]
+        # The size is known, so rclone can take one PUT with a Content-Length
+        # on a remote without streaming uploads (WebDAV).
+        assert argv == [
+            "rclone",
+            "rcat",
+            "--size",
+            "7",
+            "srw:my-bucket/jobs/1/a.txt",
+        ]
         assert run_mock.call_args.kwargs["input"] == b"payload"
 
     def test_put_rejects_non_bytes(self, store):
@@ -312,6 +322,145 @@ class TestPut:
         run_mock.return_value = _cp(returncode=1, stderr=b"quota exceeded")
         with pytest.raises(ObjectStoreError):
             store.put("k", b"x")
+
+
+class TestStat:
+    """``stat``: one ``lsjson --stat`` call, a version token from the
+    modification time and the size, folders as ``is_dir``."""
+
+    def test_stat_file_carries_size_mtime_and_version(self, store, run_mock):
+        run_mock.return_value = _cp(
+            stdout=b'{"Path":"a.txt","Name":"a.txt","Size":42,'
+            b'"ModTime":"2026-10-28T10:00:00.123456789Z","IsDir":false}'
+        )
+        info = store.stat("jobs/1/a.txt")
+        argv = run_mock.call_args.args[0]
+        assert argv == ["rclone", "lsjson", "--stat", "srw:my-bucket/jobs/1/a.txt"]
+        assert info == ObjectStat(
+            key="jobs/1/a.txt",
+            size=42,
+            is_dir=False,
+            version="2026-10-28T10:00:00.123456789Z:42",
+            mtime="2026-10-28T10:00:00.123456789Z",
+        )
+
+    def test_stat_without_modtime_has_no_version(self, store, run_mock):
+        run_mock.return_value = _cp(stdout=b'{"Path":"a","Size":1,"IsDir":false}')
+        info = store.stat("a")
+        assert info.size == 1 and info.version is None and info.mtime is None
+
+    def test_stat_directory(self, store, run_mock):
+        run_mock.return_value = _cp(
+            stdout=b'{"Path":"d","Size":-1,"ModTime":"2026-01-01T00:00:00Z","IsDir":true}'
+        )
+        assert store.stat("jobs/1/d") == ObjectStat(
+            key="jobs/1/d", size=0, is_dir=True, version=None, mtime=None
+        )
+
+    def test_stat_missing_returns_none(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=3, stderr=b"directory not found")
+        assert store.stat("ghost") is None
+
+    def test_stat_other_error_is_transport(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=1, stderr=b"connection refused")
+        with pytest.raises(ObjectStoreError):
+            store.stat("a")
+
+    @pytest.mark.parametrize(
+        "output",
+        [b"null", b'{"Size":3}', b'{"IsDir":false,"Size":"3"}', b"{not json"],
+    )
+    def test_stat_rejects_malformed_entries(self, store, run_mock, output):
+        run_mock.return_value = _cp(stdout=output)
+        with pytest.raises(ObjectStoreError):
+            store.stat("a")
+
+
+class TestListDir:
+    """``list_dir``: one non-recursive ``lsjson`` call, folders included."""
+
+    def test_list_dir_parses_files_and_folders(self, store, run_mock):
+        run_mock.return_value = _cp(
+            stdout=b'[{"Path":"b.txt","Name":"b.txt","Size":2,'
+            b'"ModTime":"2026-10-28T10:00:00Z","IsDir":false},'
+            b'{"Path":"sub","Name":"sub","Size":-1,'
+            b'"ModTime":"2026-10-28T09:00:00Z","IsDir":true},'
+            b'{"Path":"a.txt","Name":"a.txt","Size":1,'
+            b'"ModTime":"2026-10-28T08:00:00Z","IsDir":false}]'
+        )
+        entries = store.list_dir("jobs/1/")
+        argv = run_mock.call_args.args[0]
+        assert argv == ["rclone", "lsjson", "srw:my-bucket/jobs/1/"]
+        assert entries == [
+            ObjectStat(
+                key="jobs/1/a.txt",
+                size=1,
+                version="2026-10-28T08:00:00Z:1",
+                mtime="2026-10-28T08:00:00Z",
+            ),
+            ObjectStat(
+                key="jobs/1/b.txt",
+                size=2,
+                version="2026-10-28T10:00:00Z:2",
+                mtime="2026-10-28T10:00:00Z",
+            ),
+            ObjectStat(key="jobs/1/sub", size=0, is_dir=True),
+        ]
+
+    def test_list_dir_missing_prefix_is_empty(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=3, stderr=b"directory not found")
+        assert store.list_dir("jobs/none/") == []
+
+    def test_list_dir_empty_output_is_empty(self, store, run_mock):
+        run_mock.return_value = _cp(stdout=b"[]")
+        assert store.list_dir("jobs/1/") == []
+
+    def test_list_dir_other_error_raises(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=1, stderr=b"403 Forbidden")
+        with pytest.raises(ObjectStoreError):
+            store.list_dir("jobs/1/")
+
+    @pytest.mark.parametrize(
+        "output", [b"{}", b'[{"Size":1,"IsDir":false}]', b'[{"Path":"","IsDir":false}]']
+    )
+    def test_list_dir_rejects_malformed_entries(self, store, run_mock, output):
+        run_mock.return_value = _cp(stdout=output)
+        with pytest.raises(ObjectStoreError):
+            store.list_dir("jobs/1/")
+
+
+class TestPutIfMatch:
+    """``put_if_match`` over rclone is the seam's stat-then-write default."""
+
+    def test_matching_version_writes_and_returns_the_new_stat(self, store, run_mock):
+        run_mock.side_effect = [
+            _cp(
+                stdout=b'{"Path":"a","Size":3,"ModTime":"2026-10-28T10:00:00Z","IsDir":false}'
+            ),
+            _cp(),
+            _cp(
+                stdout=b'{"Path":"a","Size":5,"ModTime":"2026-10-28T10:00:01Z","IsDir":false}'
+            ),
+        ]
+        after = store.put_if_match("jobs/1/a", b"hello", "2026-10-28T10:00:00Z:3")
+        verbs = [call.args[0][1] for call in run_mock.call_args_list]
+        assert verbs == ["lsjson", "rcat", "lsjson"]
+        assert after.version == "2026-10-28T10:00:01Z:5" and after.size == 5
+
+    def test_changed_version_refuses_before_writing(self, store, run_mock):
+        run_mock.return_value = _cp(
+            stdout=b'{"Path":"a","Size":4,"ModTime":"2026-10-28T11:00:00Z","IsDir":false}'
+        )
+        with pytest.raises(ObjectVersionMismatch) as excinfo:
+            store.put_if_match("jobs/1/a", b"hello", "2026-10-28T10:00:00Z:3")
+        assert excinfo.value.actual == "2026-10-28T11:00:00Z:4"
+        assert [call.args[0][1] for call in run_mock.call_args_list] == ["lsjson"]
+
+    def test_vanished_object_is_a_mismatch(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=3, stderr=b"not found")
+        with pytest.raises(ObjectVersionMismatch) as excinfo:
+            store.put_if_match("jobs/1/a", b"x", "2026-10-28T10:00:00Z:3")
+        assert excinfo.value.actual is None
 
 
 class TestHead:

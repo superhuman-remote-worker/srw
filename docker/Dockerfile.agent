@@ -66,6 +66,14 @@ RUN groupadd -r srw && useradd -r -g srw -m srw
 # Build SHA for stale-image detection (passed via --build-arg)
 ARG BUILD_SHA=""
 ARG UV_VERSION="0.7.12"
+# Pinned upstream rclone for the `virtual` tier's object store and its cloud
+# folders (bookworm packages 1.60.1, which predates `rcat --size`, the WebDAV
+# vendors a cloud folder needs and the Nextcloud fixes of 1.75.1). Keep version
+# and checksum in sync with docker/Dockerfile.workspace (the same values);
+# tests/test_workspace_image_targets.py checks that they agree. The SRW_
+# prefix is load-bearing: rclone parses RCLONE_* env vars as flags.
+ARG SRW_RCLONE_VERSION=1.75.2
+ARG SRW_RCLONE_SHA256=efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -91,7 +99,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # code execution (shell, browser) happens on the workspace, not in this pod.
 # rclone is the exception that proves the rule: a fixed-destination typed
 # client (no_workspace_agent_mode.md §3.1) used only by the `virtual` tier's
-# object-store backend. Needs >= 1.59 for `lsjson --stat` (bookworm ships 1.60).
+# object-store backend; it is installed pinned below, not from apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
@@ -100,7 +108,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ripgrep \
     jq \
-    rclone \
     nodejs \
     build-essential \
     cmake \
@@ -118,6 +125,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# rclone: pinned upstream release with checksum verification (the workspace
+# image's mechanism). The deb lands in /usr/bin/rclone.
+RUN curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" \
+        -o /tmp/rclone.deb \
+    && echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c - \
+    && dpkg -i /tmp/rclone.deb \
+    && rm /tmp/rclone.deb \
+    && rclone version
 
 # MCP stdio runtimes: NodeSource's nodejs package supplies node/npm/npx above;
 # uv supplies the Python server launcher (uvx). Keep uv exact-pinned so an
@@ -242,6 +258,12 @@ assert seen == {
     "argv": [canonical_file, "--compatibility-smoke"],
 }, seen
 SRW_TERMINATION_SMOKE
+
+# Agent image contract gate: fails the build when a program the agent shells
+# out to is missing or too old. Installed as well as run, so a live Pod can be
+# checked with `assert-agent-contract`.
+COPY --chmod=0755 docker/assert-agent-contract.sh /usr/local/bin/assert-agent-contract
+RUN /usr/local/bin/assert-agent-contract
 
 # Expose default port (can be overridden)
 EXPOSE 8001

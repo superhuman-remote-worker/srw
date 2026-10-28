@@ -13,8 +13,19 @@ variables passed to each child process, so credentials never appear in
 
 Object keys map to rclone paths as ``<name>:<root>/<key>`` where ``root`` is
 the bucket (or bucket/subpath) from the spec and ``key`` is the full,
-prefix-inclusive key the backend hands us. Requires rclone ≥ 1.59 for
-``lsjson --stat``.
+prefix-inclusive key the backend hands us. The agent image pins upstream
+rclone (docker/Dockerfile.agent, ≥ 1.75.1): ``rcat --size``, the WebDAV vendors
+a cloud folder needs and the Nextcloud fixes of 1.75.1 all postdate the
+distribution package.
+
+The same remote descriptor also describes a user's cloud folder on the
+``virtual`` tier (``features/cloud_folders_on_virtual_sessions.md``). For those
+the optional seam operations are answered natively here: ``stat`` and
+``list_dir`` through ``lsjson`` (one call each), ``put_if_match`` through the
+seam's stat-then-write default, since rclone sends no ``If-Match``. The version
+token is rclone's modification time with the size: it changes on every write
+the remote records, which is what the read-modify-write tools need, and is
+replaced by an ETag once a native WebDAV store exists.
 """
 
 import json
@@ -29,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from shared.runtime.core.backends.object_store import (
     ObjectInfo,
+    ObjectStat,
     ObjectStore,
     ObjectStoreError,
 )
@@ -437,8 +449,12 @@ class RcloneObjectStore(ObjectStore):
             raise TypeError(
                 f"ObjectStore.put requires bytes, got {type(data).__name__}"
             )
+        # The size is always known here (the data is in memory). Telling
+        # rclone lets a remote without streaming uploads (WebDAV, Nextcloud
+        # included) take one PUT with a Content-Length instead of a buffered
+        # or chunked upload.
         proc = self._run(
-            ["rcat", self._remote_path(key)],
+            ["rcat", "--size", str(len(data)), self._remote_path(key)],
             input_bytes=bytes(data),
             timeout=self._transfer_timeout,
         )
@@ -449,6 +465,62 @@ class RcloneObjectStore(ObjectStore):
 
     def head(self, key: str) -> Optional[int]:
         return self._exact_file_size(key)
+
+    @staticmethod
+    def _stat_from_entry(key: str, entry: Any) -> ObjectStat:
+        """One ``lsjson`` entry as an :class:`ObjectStat`, validated."""
+        if not isinstance(entry, dict) or type(entry.get("IsDir")) is not bool:
+            raise ObjectStoreError(f"rclone lsjson entry was invalid for {key}")
+        if entry["IsDir"]:
+            return ObjectStat(key=key, size=0, is_dir=True)
+        size = entry.get("Size")
+        if type(size) is not int or size < 0:
+            raise ObjectStoreError(f"rclone lsjson file size was invalid for {key}")
+        mtime = entry.get("ModTime")
+        if not isinstance(mtime, str) or not mtime:
+            mtime = None
+        version = f"{mtime}:{size}" if mtime is not None else None
+        return ObjectStat(key=key, size=size, version=version, mtime=mtime)
+
+    def stat(self, key: str) -> Optional[ObjectStat]:
+        """One object or folder of the remote, in one ``lsjson --stat`` call."""
+        proc = self._run(["lsjson", "--stat", self._remote_path(key)])
+        if proc.returncode in (3, 4):
+            return None
+        if proc.returncode != 0:
+            raise ObjectStoreError(f"rclone lsjson stat failed for {key}")
+        try:
+            entry = json.loads(proc.stdout.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ObjectStoreError(f"rclone lsjson stat was invalid for {key}") from exc
+        return self._stat_from_entry(key, entry)
+
+    def list_dir(self, prefix: str) -> List[ObjectStat]:
+        """The entries directly under ``prefix`` in one ``lsjson`` call:
+        files with their version token, folders as ``is_dir`` entries. A
+        prefix the remote does not have lists as empty."""
+        proc = self._run(["lsjson", self._remote_path(prefix)])
+        if proc.returncode != 0:
+            if proc.returncode in (3, 4) or self._is_not_found(proc):
+                return []
+            raise ObjectStoreError(
+                f"rclone lsjson failed for {prefix}: {self._stderr(proc)}"
+            )
+        try:
+            entries = json.loads(proc.stdout.decode("utf-8") or "[]")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ObjectStoreError(
+                f"rclone lsjson returned unparseable JSON for {prefix}"
+            ) from exc
+        if not isinstance(entries, list):
+            raise ObjectStoreError(f"rclone lsjson returned no list for {prefix}")
+        results = []
+        for entry in entries:
+            name = entry.get("Path") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name:
+                raise ObjectStoreError(f"rclone lsjson entry was invalid for {prefix}")
+            results.append(self._stat_from_entry(prefix + name, entry))
+        return sorted(results, key=lambda info: info.key)
 
     def list(self, prefix: str) -> List[ObjectInfo]:
         proc = self._run(

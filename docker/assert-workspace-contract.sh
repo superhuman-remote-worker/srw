@@ -145,7 +145,7 @@ _check "code-server"               _on_path "code-server"
 
 # Cloud mounts.
 _check "rclone"                    _on_path "rclone"
-_check "rclone >= 1.70.0"          _at_least "$(_rclone_version)" "1.70.0"
+_check "rclone >= 1.75.1"          _at_least "$(_rclone_version)" "1.75.1"
 _check "fusermount3"               _on_path "fusermount3"
 _check "/etc/mtab"                 test -e /etc/mtab
 _check "mountpoint"                _on_path "mountpoint"

@@ -82,6 +82,11 @@ LABEL maintainer="SRW Team"
 LABEL description="Universal Agent (Tilt dev image)"
 
 ARG UV_VERSION="0.7.12"
+# Pinned upstream rclone, the same values as docker/Dockerfile.agent (the
+# distribution package is 1.60.1); tests/test_workspace_image_targets.py
+# checks that they agree.
+ARG SRW_RCLONE_VERSION=1.75.2
+ARG SRW_RCLONE_SHA256=efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c
 
 RUN groupadd -r srw && useradd -r -g srw -m srw
 
@@ -115,7 +120,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ffmpeg \
     ripgrep \
     jq \
-    rclone \
     nodejs \
     build-essential \
     cmake \
@@ -133,6 +137,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zip \
     unzip \
     tmux
+
+# rclone: pinned upstream release with checksum verification, as in
+# docker/Dockerfile.agent. The deb lands in /usr/bin/rclone.
+RUN curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" \
+        -o /tmp/rclone.deb \
+    && echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c - \
+    && dpkg -i /tmp/rclone.deb \
+    && rm /tmp/rclone.deb \
+    && rclone version
 
 # Match the production agent's MCP stdio runtime. node/npm/npx come from the
 # NodeSource nodejs package above; uv provides the exact-pinned uvx launcher.
@@ -256,6 +269,10 @@ assert seen == {
     "argv": [canonical_file, "--compatibility-smoke"],
 }, seen
 SRW_TERMINATION_SMOKE
+
+# Agent image contract gate, as in docker/Dockerfile.agent.
+COPY --chmod=0755 docker/assert-agent-contract.sh /usr/local/bin/assert-agent-contract
+RUN /usr/local/bin/assert-agent-contract
 
 EXPOSE 8001
 EXPOSE 8002

@@ -203,7 +203,7 @@ def _in_workspace_cloud_folders(
     mounted = [
         {
             "name": state.workspace_name,
-            "path": f"workspace/cloud/{state.workspace_name}",
+            "path": f"cloud/{state.workspace_name}",
             "kind": state.mount_kind,
             "state": "mounted",
             "text": describe_mounted(
@@ -2316,7 +2316,7 @@ class PersistentSession:
                     self.cloud_mount_manager and self.cloud_mount_manager.active
                 ),
                 "root": "/cloud",
-                "workspace_entry": "/workspace/cloud",
+                "workspace_entry": "cloud",
                 "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
                 # A protected session without its cloud (decision 42) keeps
                 # only the sidecar watcher, for srw_cloud_status to say why.

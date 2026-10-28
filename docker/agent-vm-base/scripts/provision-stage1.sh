@@ -295,8 +295,8 @@ _section "Installing rclone (pinned)"
 
 # SRW_ prefix matters: rclone parses RCLONE_* env vars as flags, so a stray
 # exported RCLONE_VERSION would crash every rclone invocation.
-SRW_RCLONE_VERSION=1.74.3
-SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
+SRW_RCLONE_VERSION=1.75.2
+SRW_RCLONE_SHA256=efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c
 curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" \
     -o /tmp/rclone.deb
 echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c -
