@@ -39,7 +39,9 @@ class HarnessState:
     pod_uid: str = ""
     started: float = field(default_factory=time.monotonic)
     current: JobSpec | None = None
-    rejected_job_id: str | None = None  # accepted, then reported as rejected
+    # The one source of truth for the accepted job; `current` is its spec, None
+    # when the job was accepted only to be reported as rejected.
+    current_job_id: str | None = None
     acknowledgement: dict[str, Any] | None = None
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
     job_finished: asyncio.Event = field(default_factory=asyncio.Event)
@@ -67,9 +69,7 @@ def _recipient_matches(state: HarnessState, recipient: Any, job_id: str | None) 
 
 
 def _current_id(state: HarnessState) -> str | None:
-    if state.current is not None:
-        return state.current.job_id
-    return state.rejected_job_id
+    return state.current_job_id
 
 
 def _busy(state: HarnessState) -> bool:
@@ -135,7 +135,8 @@ def create_app(state: HarnessState) -> Starlette:
 
     async def reject(job_id: str, pinned: PinnedEcho | None, message: str) -> None:
         try:
-            await state.report_rejection(job_id, pinned, message)
+            if not state.stop_requested.is_set():  # cancelled: do not complete
+                await state.report_rejection(job_id, pinned, message)
         finally:
             state.job_finished.set()
 
@@ -163,7 +164,7 @@ def create_app(state: HarnessState) -> Starlette:
         try:
             spec = parse_job_start(body)
             require_anthropic_route(spec.model)
-            state.current, state.rejected_job_id = spec, None
+            state.current, state.current_job_id = spec, spec.job_id
             coro = run(spec)
         except JobRejected as exc:
             # Answering non-2xx would leave the job claimed and requeued forever;
@@ -171,7 +172,7 @@ def create_app(state: HarnessState) -> Starlette:
             if not job_id:
                 return _detail(422, str(exc))
             pinned = PinnedEcho(*present) if any(present) else None
-            state.rejected_job_id = job_id
+            state.current, state.current_job_id = None, job_id
             coro = reject(job_id, pinned, str(exc))
         state.job_finished.clear()
         task = asyncio.create_task(coro)

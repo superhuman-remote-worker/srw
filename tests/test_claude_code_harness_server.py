@@ -279,3 +279,59 @@ async def test_cancel_reports_not_graceful_after_the_wait(client, state):
 @pytest.mark.asyncio
 async def test_unknown_routes_are_404(client):
     assert (await client.post("/job/pause", json={})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_job_after_a_finished_one_is_the_current_job(client, state):
+    _wire_reporter(state)
+    await client.post("/job/start", json=body())
+    await asyncio.sleep(0.01)  # job A ran and finished
+    cfg = copy.deepcopy(BODY["resolved_config"])
+    cfg["agent"]["llm"]["client_protocol"] = "openai-chat"
+    b_recipient = {**RECIPIENT, "expected_job_id": "j2"}
+    start_b = body(job_id="j2", resolved_config=cfg, recipient=b_recipient)
+    assert (await client.post("/job/start", json=start_b)).status_code == 202
+    assert (await client.get("/status")).json()["current_job_id"] == "j2"
+    again = await client.post("/job/start", json=start_b)
+    assert again.status_code == 202
+    assert again.json()["message"] == "Job was already accepted by this runtime"
+
+
+@pytest.mark.asyncio
+async def test_cancel_for_a_rejected_job_after_a_finished_one_is_accepted(
+    client, state
+):
+    _wire_reporter(state)
+    await client.post("/job/start", json=body())
+    await asyncio.sleep(0.01)  # job A ran and finished
+    gate = asyncio.Event()
+    original = state.report_rejection
+
+    async def slow(job_id, pinned, message):
+        await gate.wait()
+        await original(job_id, pinned, message)
+
+    state.report_rejection = slow
+    state.cancel_wait_seconds = 1.0
+    b_recipient = {**RECIPIENT, "expected_job_id": "j2"}
+    await client.post(
+        "/job/start", json=body(job_id="j2", resolved_config={}, recipient=b_recipient)
+    )
+    cancel = asyncio.create_task(
+        client.post("/job/cancel", json={"recipient": b_recipient})
+    )
+    await asyncio.sleep(0.01)
+    gate.set()
+    r = await asyncio.wait_for(cancel, 0.5)
+    assert r.status_code == 200 and r.json()["job_id"] == "j2"
+    assert r.json()["graceful"] is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_the_rejection_runs_never_reports(client, state):
+    _wire_reporter(state)
+    state.stop_requested.set()
+    await client.post("/job/start", json=body(resolved_config={}))
+    await asyncio.sleep(0.01)
+    assert state.reports == []
+    assert state.job_finished.is_set()
