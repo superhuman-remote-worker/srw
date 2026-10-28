@@ -7,7 +7,7 @@ credentials, provisioning and lifecycle. HTTP errors and row redaction remain
 the compatibility contract for existing callers.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -27,6 +27,7 @@ from orchestrator.services.job_admission_scope import (
 )
 from orchestrator.services.job_admission_config import (
     JobAdmissionConfigDependencies,
+    admit_expert_harness,
     prepare_job_admission_config,
 )
 from orchestrator.services.job_admission_officer import (
@@ -127,6 +128,20 @@ async def admit_job(
                 requested_category=command.work_category,
                 owner_id=scope.user_id,
                 preview_refusals=config_dependencies.preview_expert_refusals,
+            )
+        if config.pending_harness_expert is not None:
+            # The default was kept: its harness is this job's, so its launch
+            # rule and grant apply now (never to a displaced default).
+            config = replace(
+                config,
+                harness_image=await admit_expert_harness(
+                    config.pending_harness_expert,
+                    principal=scope.principal,
+                    user_id=scope.user_id,
+                    project_id=config.project_id,
+                    dependencies=config_dependencies,
+                ),
+                pending_harness_expert=None,
             )
         workspace_selection = config.workspace_selection
         if workspace_selection and workspace_selection.get("project_revision"):

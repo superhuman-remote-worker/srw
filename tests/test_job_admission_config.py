@@ -664,14 +664,13 @@ def saved_expert(**runtime):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["explicit", "project", "user"])
-async def test_a_saved_expert_on_an_approved_image_needs_the_grant(deps, scope, source):
+async def test_a_saved_expert_on_an_approved_image_needs_the_grant(deps, scope):
     deps.resolve_worker_expert.return_value = ExpertSelection(
-        saved_expert(image=CUSTOM), source
+        saved_expert(image=CUSTOM), "explicit"
     )
     deps.store.user_can_run_custom_harness_images.return_value = False
     with pytest.raises(HTTPException) as denied:
-        await prepare(deps, scope, expert_id=EXPERT if source == "explicit" else None)
+        await prepare(deps, scope, expert_id=EXPERT)
     assert denied.value.status_code == 403
     assert denied.value.detail == (
         "Running approved harness images requires the 'custom_harness_images' "
@@ -733,3 +732,32 @@ async def test_an_inline_expert_still_cannot_name_an_approved_image(deps, scope)
         await prepare(deps, scope, expert=inline_expert(image=CUSTOM))
     assert refused.value.status_code == 422
     assert "installed harness" in refused.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["project", "user", "application"])
+@pytest.mark.parametrize("approved", [APPROVED, ()], ids=["approved", "unapproved"])
+async def test_a_default_on_a_custom_image_is_admitted_only_once_kept(
+    deps, scope, source, approved
+):
+    """The work-default stage may still displace a default, so its launch
+    rule and grant are left to the coordinator (admit_expert_harness)."""
+    expert = saved_expert(image=CUSTOM)
+    deps.resolve_worker_expert.return_value = ExpertSelection(expert, source)
+    deps.store.user_can_run_custom_harness_images.return_value = False
+    deps.approved_images.return_value = approved
+    config = await prepare(deps, scope)
+    assert config.expert_source in ("scope", "fallback")
+    assert config.harness_image == CUSTOM
+    assert config.pending_harness_expert is expert
+    deps.store.user_can_run_custom_harness_images.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_callers_expert_owes_nothing_after_the_config_stage(deps, scope):
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        saved_expert(image=CUSTOM), "explicit"
+    )
+    config = await prepare(deps, scope, expert_id=EXPERT)
+    assert config.expert_source == "caller"
+    assert config.pending_harness_expert is None

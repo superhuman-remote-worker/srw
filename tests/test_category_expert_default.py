@@ -126,6 +126,8 @@ def harness(monkeypatch):
         grants=GRANTED,
         preview=None,
         bundled=Mock(return_value=True),
+        custom_harness_grant=True,
+        approved=APPROVED,
     )
     creation = AsyncMock(return_value={"id": "job"})
 
@@ -160,7 +162,9 @@ def harness(monkeypatch):
                 get_project=AsyncMock(return_value={"id": PROJECT}),
                 # No project_workspace_defaults row: the installation decides.
                 fetchrow=AsyncMock(return_value=None),
-                user_can_run_custom_harness_images=AsyncMock(return_value=True),
+                user_can_run_custom_harness_images=AsyncMock(
+                    return_value=state.custom_harness_grant
+                ),
             ),
             require_project_access=AsyncMock(),
             bundled_expert_exists=state.bundled,
@@ -169,7 +173,7 @@ def harness(monkeypatch):
             resolve_worker_expert=AsyncMock(return_value=state.selection),
             preview_expert_refusals=preview,
             srw_image=Mock(return_value="installed:1"),
-            approved_images=Mock(return_value=APPROVED),
+            approved_images=Mock(return_value=state.approved),
         )
 
     def officer_deps():
@@ -420,6 +424,70 @@ async def test_a_displaced_custom_image_default_takes_its_image_with_it(harness)
 
     assert (inputs.config_name, inputs.expert_id) == ("designer", None)
     assert inputs.harness_image is None
+
+
+def _displace(harness, how: str) -> dict:
+    """Set up a displacement of the pre-selected custom-image default; return
+    the request fields. A ticket pin displaces a project default; a category
+    default displaces only the application fallback."""
+    if how == "ticket":
+        harness.officer = True
+        harness.slot_category = EXECUTOR
+        harness.ticket_tags = ["ready", "category:executor", "expert:designer"]
+        harness.selection = _selection("project", image=CUSTOM)
+        return {"thread_id": THREAD, "ticket": "build-the-ui"}
+    harness.selection = _selection("application", image=CUSTOM)
+    return {"work_category": "executor"}
+
+
+_DISPLACED_BY = {"ticket": "designer", "category": "engineer"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["ticket", "category"])
+@pytest.mark.parametrize("refusal", ["no_grant", "unapproved"])
+async def test_a_displaced_custom_image_default_never_refuses_the_job(
+    harness, how, refusal
+):
+    """A default chosen for the owner must never turn a job that would have
+    been created into one that is refused: the grant and the approved list
+    apply to the Expert the job runs on, not to the default it displaced."""
+    if refusal == "no_grant":
+        harness.custom_harness_grant = False
+    else:
+        harness.approved = ()
+    fields = _displace(harness, how)
+
+    inputs = await harness.admit(**fields)
+
+    assert (inputs.config_name, inputs.expert_id) == (_DISPLACED_BY[how], None)
+    assert inputs.harness_image is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["project", "user", "application"])
+async def test_a_kept_custom_image_default_needs_the_grant(harness, source):
+    harness.custom_harness_grant = False
+    harness.selection = _selection(source, image=CUSTOM)
+
+    with pytest.raises(HTTPException) as refused:
+        await harness.admit()
+
+    assert refused.value.status_code == 403
+    assert "custom_harness_images" in refused.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["project", "user", "application"])
+async def test_a_kept_default_on_an_unapproved_image_is_refused(harness, source):
+    harness.approved = ()
+    harness.selection = _selection(source, image=CUSTOM)
+
+    with pytest.raises(HTTPException) as refused:
+        await harness.admit()
+
+    assert refused.value.status_code == 422
+    assert "approved list" in refused.value.detail
 
 
 @pytest.mark.asyncio
