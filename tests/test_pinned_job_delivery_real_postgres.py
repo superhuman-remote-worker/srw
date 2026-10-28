@@ -203,6 +203,7 @@ async def test_real_vm_start_dispatch_posts_accepted_receipt(
             return_value=SimpleNamespace(
                 agent={"pod_ip": "10.0.0.2", "pod_port": 8001},
                 recipient=recipient,
+                capabilities={},
             )
         ),
         redispatch_livelock_trip=lambda _job: None,

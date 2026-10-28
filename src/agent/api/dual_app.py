@@ -1308,6 +1308,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         capabilities = {
             "resolved_config_resume": True,
             "pinned_recipient_binding": True,
+            # Harness capabilities: SRW's agent implements every mode and
+            # optional control route; a custom harness image declares its own.
+            "jobs": True,
+            "sessions": True,
+            "pause": True,
+            "steer": True,
         }
         if _pinned_session_recipient_capable():
             capabilities["pinned_session_recipient_binding"] = True

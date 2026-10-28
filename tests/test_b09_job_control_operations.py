@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.schemas.job_runtime import JobStartRequest
 from orchestrator.services import job_control_delivery as job_control_delivery_module
 from orchestrator.services import (
     managed_repository_process_retirement,
@@ -22,6 +23,7 @@ from orchestrator.services.job_control_delivery import (
     initiate_pause,
     resume_job_on_agent,
 )
+from orchestrator.services.job_mutation_target import PinnedJobMutationTarget
 from orchestrator.services.job_start_bundle import JobStartRefusal
 from orchestrator.services.model_availability import (
     WHERE_JOB,
@@ -33,6 +35,7 @@ from orchestrator.services.job_mutation_controls import (
     JobControlDependencies,
     JobControlOperations,
 )
+from shared.pinned_session_identity import PinnedJobRecipient
 
 
 class _AsyncContext:
@@ -280,7 +283,9 @@ async def test_dispatch_confirms_command_owner_after_exact_recipient_accepts():
         model_dump=MagicMock(return_value={"agent_id": "agent-1", "generation": 3})
     )
     target = SimpleNamespace(
-        agent={"pod_ip": "10.0.0.2", "pod_port": 8001}, recipient=recipient
+        agent={"pod_ip": "10.0.0.2", "pod_port": 8001},
+        recipient=recipient,
+        capabilities={},
     )
     response = SimpleNamespace(status_code=202)
     client = SimpleNamespace(post=AsyncMock(return_value=response))
@@ -329,7 +334,9 @@ async def test_legacy_dispatch_does_not_resurrect_a_control_that_won_after_claim
     """Flag off: a pause/cancel landing during delivery must keep its row."""
     recipient = SimpleNamespace(model_dump=MagicMock(return_value={}))
     target = SimpleNamespace(
-        agent={"pod_ip": "10.0.0.2", "pod_port": 8001}, recipient=recipient
+        agent={"pod_ip": "10.0.0.2", "pod_port": 8001},
+        recipient=recipient,
+        capabilities={},
     )
     client = SimpleNamespace(
         post=AsyncMock(return_value=SimpleNamespace(status_code=202))
@@ -962,3 +969,297 @@ async def test_dispatcher_pause_always_releases_in_memory_pending_marker():
 
     assert "job-1" not in pending
     dependencies.completion_control.abort.assert_not_awaited()
+
+
+# A pod's /ready capabilities decide whether it gets the job (swappable
+# harness images). An explicit refusal fails the job with a plain error; a key
+# the pod does not declare allows it, because a /ready without it is SRW's own
+# agent or a pod of the previous release.
+
+HARNESS_NO_JOBS = "This harness does not run jobs (capabilities.jobs is false)."
+CLAUDE_CODE_READY = {
+    "pinned_recipient_binding": True,
+    "jobs": True,
+    "model_protocols": ["anthropic-messages"],
+}
+
+
+def _recipient() -> PinnedJobRecipient:
+    return PinnedJobRecipient(
+        expected_agent_id="agent-1",
+        expected_process_generation="generation-1",
+        expected_job_id=JOB_ID,
+    )
+
+
+def _llm(**llm) -> dict:
+    return {"resolved_config": {"agent": {"llm": llm}}}
+
+
+def _job_start(**sections) -> JobStartRequest:
+    return JobStartRequest(job_id=JOB_ID, description="Task", **sections)
+
+
+def _probed_delivery(capabilities, job_start, *, commands_on=True):
+    target = PinnedJobMutationTarget(
+        agent={"pod_ip": "10.0.0.2", "pod_port": 8001},
+        recipient=_recipient(),
+        capabilities=capabilities,
+    )
+    client = SimpleNamespace(
+        post=AsyncMock(return_value=SimpleNamespace(status_code=202))
+    )
+    store = SimpleNamespace(
+        managed_repository_authorities_are_current=AsyncMock(return_value=True),
+        confirm_pinned_job_dispatch=AsyncMock(return_value=True),
+        update_job_status=AsyncMock(return_value=True),
+        heartbeat=AsyncMock(),
+    )
+    dependencies = _delivery(
+        store=store,
+        completion_commands_enabled=lambda: commands_on,
+        prepare_job_workspace_runtime=AsyncMock(
+            side_effect=lambda job: ("proceed", job, None)
+        ),
+        attest_pinned_k8s_job_workspace=AsyncMock(side_effect=lambda job: (job, None)),
+        build_job_start_request=AsyncMock(return_value=job_start),
+        pinned_k8s_job_workspace_authority_is_current=AsyncMock(return_value=True),
+        prepare_pinned_job_mutation_target=AsyncMock(return_value=target),
+        redispatch_livelock_trip=MagicMock(return_value=None),
+        bind_log_context=MagicMock(return_value="token"),
+        reset_log_context=MagicMock(),
+        http_client_factory=MagicMock(return_value=_AsyncContext(client)),
+        refuse_job_start=AsyncMock(return_value=True),
+    )
+    return dependencies, client
+
+
+async def _dispatch(dependencies) -> bool:
+    return await dispatch_job_to_agent(
+        {"id": JOB_ID, "runtime_kind": "srw", "execution_lane": "pinned"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+
+def test_job_model_protocol_reads_the_delivered_llm_section():
+    protocol = job_control_delivery_module.job_model_protocol
+
+    assert protocol(_job_start(**_llm(client_protocol="openai-responses"))) == (
+        "openai-responses"
+    )
+    # Without the resolved blob the override carries the llm section.
+    assert (
+        protocol(
+            _job_start(config_override={"llm": {"client_protocol": "openai-chat"}})
+        )
+        == "openai-chat"
+    )
+    assert protocol(_job_start(**_llm(model="gpt-5.5", client_protocol=None))) is None
+    assert protocol(_job_start()) is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuses_a_harness_that_declares_no_jobs():
+    dependencies, client = _probed_delivery(
+        {"pinned_recipient_binding": True, "jobs": False}, _job_start()
+    )
+
+    assert await _dispatch(dependencies) is False
+
+    dependencies.refuse_job_start.assert_awaited_once()
+    refusal = dependencies.refuse_job_start.await_args
+    assert refusal.args == (JOB_ID,)
+    assert refusal.kwargs == {
+        "reason": "harness_unsupported",
+        "message": HARNESS_NO_JOBS,
+        # A fresh start: the finalizer tears down what was provisioned.
+        "resume": False,
+        "agent_id": "agent-1",
+    }
+    assert "does not run jobs" in refusal.kwargs["message"]
+    client.post.assert_not_awaited()
+    dependencies.store.confirm_pinned_job_dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuses_a_model_the_harness_cannot_speak():
+    dependencies, client = _probed_delivery(
+        CLAUDE_CODE_READY,
+        _job_start(**_llm(model="gpt-5.5", client_protocol="openai-chat")),
+    )
+
+    assert await _dispatch(dependencies) is False
+
+    kwargs = dependencies.refuse_job_start.await_args.kwargs
+    assert kwargs["reason"] == "harness_unsupported"
+    assert kwargs["message"] == (
+        "This harness speaks anthropic-messages; the job's model gpt-5.5 is "
+        "openai-chat."
+    )
+    assert "openai-chat" in kwargs["message"]
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_with_completion_commands_off_a_harness_refusal_fails_the_job():
+    """Flag off the claim owner writes ``failed`` itself, as a persisting
+    build does; left processing, the job would be redispatched to a pod of
+    the same image at every recovery pass."""
+    dependencies, client = _probed_delivery(
+        {"jobs": False}, _job_start(), commands_on=False
+    )
+
+    assert await _dispatch(dependencies) is False
+
+    dependencies.refuse_job_start.assert_not_awaited()
+    dependencies.store.update_job_status.assert_awaited_once_with(
+        job_id=JOB_ID,
+        status="failed",
+        error_message=HARNESS_NO_JOBS,
+        expected_status="processing",
+    )
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_allows_a_legacy_ready_payload_without_the_keys():
+    dependencies, client = _probed_delivery(
+        {"pinned_recipient_binding": True},
+        _job_start(**_llm(model="gpt-5.5", client_protocol="openai-chat")),
+    )
+
+    assert await _dispatch(dependencies) is True
+
+    dependencies.refuse_job_start.assert_not_awaited()
+    assert client.post.await_args.args == ("http://10.0.0.2:8001/job/start",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_start",
+    [
+        _job_start(**_llm(model="claude-sonnet", client_protocol="anthropic-messages")),
+        _job_start(
+            config_override={
+                "llm": {
+                    "model": "claude-sonnet",
+                    "client_protocol": "anthropic-messages",
+                }
+            }
+        ),
+        # A job whose protocol is unknown is never refused for it.
+        _job_start(**_llm(model="legacy-model")),
+    ],
+    ids=["resolved-protocol", "override-protocol", "unknown-protocol"],
+)
+async def test_dispatch_gives_a_harness_the_models_it_speaks(job_start):
+    dependencies, client = _probed_delivery(CLAUDE_CODE_READY, job_start)
+
+    assert await _dispatch(dependencies) is True
+
+    dependencies.refuse_job_start.assert_not_awaited()
+    client.post.assert_awaited_once()
+
+
+# A control action the harness did not declare fails with a plain error, and
+# no pause state is written: the job keeps running on its pod.
+
+PAUSE_UNSUPPORTED = "This job's harness does not support pause; cancel it instead."
+RUNNING_PINNED_JOB = {
+    "id": "job-1",
+    "runtime_kind": "srw",
+    "execution_lane": "pinned",
+    "status": "processing",
+    "assigned_agent_id": "agent-1",
+}
+
+
+def _pod_answering(status_code: int):
+    client = SimpleNamespace(
+        post=AsyncMock(return_value=SimpleNamespace(status_code=status_code))
+    )
+    return client, MagicMock(return_value=_AsyncContext(client))
+
+
+def _pause_target(capabilities) -> PinnedJobMutationTarget:
+    return PinnedJobMutationTarget(
+        agent={"pod_ip": "10.0.0.9", "pod_port": 8001},
+        recipient=_recipient(),
+        capabilities=capabilities,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands_on", [True, False])
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        # The Claude Code harness: jobs declared, pause not; its /job/pause
+        # answers 404.
+        CLAUDE_CODE_READY,
+        {"pinned_recipient_binding": True, "pause": False},
+    ],
+    ids=["pause-undeclared", "pause-false"],
+)
+async def test_pause_against_a_harness_without_the_route_is_a_plain_409(
+    capabilities, commands_on
+):
+    store = SimpleNamespace(
+        get_descendant_jobs=AsyncMock(return_value=[]),
+        pause_job=AsyncMock(return_value=True),
+    )
+    client, http_client_factory = _pod_answering(404)
+    operations = _controls(
+        store,
+        completion_commands_enabled=lambda: commands_on,
+        prepare_pinned_mutation_target=AsyncMock(
+            return_value=_pause_target(capabilities)
+        ),
+        http_client_factory=http_client_factory,
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        await operations.pause("job-1", job=dict(RUNNING_PINNED_JOB), paused_by="u")
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail == PAUSE_UNSUPPORTED
+    assert "does not support pause" in raised.value.detail
+    # Refused before the claim: in command mode the claim itself publishes
+    # the pause, so nothing may be claimed for a harness that cannot pause.
+    operations.dependencies.completion_control.claim_pause.assert_not_awaited()
+    store.pause_job.assert_not_awaited()
+    client.post.assert_not_awaited()
+    operations.dependencies.maybe_wake_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        {"pinned_recipient_binding": True, "jobs": True, "pause": True},
+        # SRW's agent of the previous release declares neither key.
+        {"pinned_recipient_binding": True, "resolved_config_resume": True},
+    ],
+    ids=["srw-agent", "previous-release"],
+)
+async def test_a_404_from_srw_agent_pause_keeps_its_handling(capabilities):
+    """SRW's agent answers /job/pause with 404 "No job currently running" when
+    the job ended first; that is a race, not a missing route."""
+    store = SimpleNamespace(get_descendant_jobs=AsyncMock(return_value=[]))
+    client, http_client_factory = _pod_answering(404)
+    operations = _controls(
+        store,
+        prepare_pinned_mutation_target=AsyncMock(
+            return_value=_pause_target(capabilities)
+        ),
+        http_client_factory=http_client_factory,
+    )
+
+    result = await operations.pause("job-1", job=dict(RUNNING_PINNED_JOB))
+
+    assert result == {"status": "paused", "job_id": "job-1"}
+    client.post.assert_awaited_once()
+    assert client.post.await_args.args == ("http://10.0.0.9:8001/job/pause",)
+    # Ambiguous quiescence retains the claim, as before.
+    operations.dependencies.completion_control.abort.assert_not_awaited()

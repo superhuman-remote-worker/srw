@@ -908,6 +908,11 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             capabilities={
                 "resolved_config_resume": True,
                 "pinned_recipient_binding": True,
+                # Harness capabilities: worker mode runs jobs with every
+                # optional control route; a custom harness declares its own.
+                "jobs": True,
+                "pause": True,
+                "steer": True,
             },
         )
 

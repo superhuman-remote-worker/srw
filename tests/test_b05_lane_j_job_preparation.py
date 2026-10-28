@@ -510,7 +510,7 @@ class TestPureHelperParity:
         assert (
             job_start_bundle.PinnedJobMutationTarget._fields
             == job_mutation_target_module.PinnedJobMutationTarget._fields
-            == ("agent", "recipient")
+            == ("agent", "recipient", "capabilities")
         )
 
     @pytest.mark.parametrize(

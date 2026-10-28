@@ -117,6 +117,7 @@ def _operations(db: PostgresDB, *, commands_enabled: bool) -> JobControlOperatio
     target = SimpleNamespace(
         agent={"pod_ip": "10.0.0.9", "pod_port": 8080},
         recipient=SimpleNamespace(model_dump=lambda **_kwargs: {}),
+        capabilities={},
     )
     client = _AgentClient()
     return JobControlOperations(

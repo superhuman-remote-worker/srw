@@ -14,6 +14,9 @@ from shared.pinned_session_identity import PinnedJobRecipient
 class PinnedJobMutationTarget(NamedTuple):
     agent: dict[str, Any]
     recipient: PinnedJobRecipient
+    #: The ``capabilities`` the pod's ``/ready`` declared: what its harness
+    #: image implements (``jobs``, ``pause``, ``model_protocols``, ...).
+    capabilities: dict[str, Any] = {}
 
 
 # A freshly pinned recipient can still be mid-attestation when a mutation
@@ -160,6 +163,7 @@ async def prepare_pinned_job_mutation_target(
             expected_process_generation=process_generation,
             expected_job_id=job_id,
         ),
+        capabilities=dict(ready_payload["capabilities"]),
     )
 
 

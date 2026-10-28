@@ -165,6 +165,49 @@ async def test_local_recipient_requires_new_runtime_capability():
 
 
 @pytest.mark.asyncio
+async def test_target_carries_the_probed_capabilities():
+    capabilities = {
+        "pinned_recipient_binding": True,
+        "jobs": True,
+        "model_protocols": ["anthropic-messages"],
+    }
+    with (
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "get_agent",
+            AsyncMock(return_value=_agent()),
+        ),
+        patch.object(httpx, "AsyncClient", _ReadyClient),
+        patch.object(
+            _ReadyClient, "payload", {"ready": True, "capabilities": capabilities}
+        ),
+    ):
+        target = await controls_composition.prepare_pinned_job_mutation_target(
+            main.app.state.resources,
+            agent_id=AGENT_ID,
+            job_id=JOB_ID,
+            require_idle=True,
+        )
+
+    assert target is not None
+    assert target.capabilities == capabilities
+    assert target.capabilities["model_protocols"] == ["anthropic-messages"]
+
+
+def test_a_target_built_without_a_probe_declares_nothing():
+    target = job_mutation_target_module.PinnedJobMutationTarget(
+        agent={"id": AGENT_ID},
+        recipient=PinnedJobRecipient(
+            expected_agent_id=AGENT_ID,
+            expected_process_generation=PROCESS_GENERATION,
+            expected_job_id=JOB_ID,
+        ),
+    )
+
+    assert target.capabilities == {}
+
+
+@pytest.mark.asyncio
 async def test_k8s_replacement_is_refused_after_capability_probe():
     _ReadyClient.urls = []
     attest = AsyncMock(return_value=False)
