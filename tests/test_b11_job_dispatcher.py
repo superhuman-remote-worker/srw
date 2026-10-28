@@ -648,6 +648,7 @@ class _AgentPool:
         self.max_agents = 5
         self.active_count = AsyncMock(return_value=0)
         self.active_count_for_image = AsyncMock(return_value=0)
+        self.busy_agent_count_for_image = AsyncMock(return_value=0)
         self.provision_agent = AsyncMock(return_value="srw-agent-j-1")
 
 
@@ -944,7 +945,9 @@ class TestClaimedJobsAreNotPending:
 
 
 CUSTOM = "example.invalid/h@sha256:" + "b" * 64
-APPROVED = ({"name": "cc", "image": CUSTOM},)
+CUSTOM2 = "example.invalid/other@sha256:" + "c" * 64
+APPROVED = ({"name": "cc", "image": CUSTOM}, {"name": "other", "image": CUSTOM2})
+INSTALLED = "ghcr.io/superhuman-remote-worker/srw-agent:latest"
 
 
 def _approved_store(**kwargs: Any) -> FakeStore:
@@ -1125,6 +1128,194 @@ class TestHarnessImagePairing:
             and CUSTOM in r.getMessage()
             for r in no_dispatcher_error.records
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bound", [None, ()], ids=["unbound", "empty"])
+    async def test_a_pod_of_an_unknown_image_never_gets_a_default_job(
+        self, bound, no_dispatcher_error
+    ):
+        """No ``:sha-`` tag configured, so the stale-build check fails open:
+        a pod whose image is neither installed nor approved must still serve
+        nothing."""
+        job = _job("j1")
+        store = FakeStore(
+            pinned=[job], agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        if bound is not None:
+            store.manifest_approved_images = bound
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+
+    @pytest.mark.asyncio
+    async def test_without_an_approved_list_a_custom_pod_serves_nothing(
+        self, no_dispatcher_error
+    ):
+        """An invalid MANIFEST_APPROVED_IMAGES binds ``()`` at startup."""
+        jobs = [_job("j1", harness_image=CUSTOM), _job("j2")]
+        store = FakeStore(
+            pinned=jobs, agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        store.manifest_approved_images = ()
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+
+    @pytest.mark.asyncio
+    async def test_a_previous_release_pod_still_serves_default_jobs(
+        self, no_dispatcher_error
+    ):
+        """Another tag of the installed repository is a default pod: with no
+        SHA-tagged image configured it keeps serving, as before the upgrade."""
+        job = _job("j1")
+        agent = {
+            "id": "a0",
+            "metadata": {},
+            "image": "ghcr.io/superhuman-remote-worker/srw-agent:sha-old",
+        }
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "image",
+        [INSTALLED, "ghcr.io/superhuman-remote-worker/srw-agent:sha-other"],
+        ids=["installed", "installed-repository"],
+    )
+    async def test_a_job_naming_the_installed_image_is_a_default_job(
+        self, image, no_dispatcher_error
+    ):
+        job, agent = _job("j1", harness_image=image), {"id": "a1", "metadata": {}}
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_a_job_naming_the_installed_image_gets_a_default_pod(
+        self, no_dispatcher_error
+    ):
+        store = _approved_store(pinned=[_job("j1", harness_image=INSTALLED)])
+        pool = _AgentPool()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+        pool.active_count_for_image.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_custom_pod_does_not_starve_a_default_job(
+        self, no_dispatcher_error
+    ):
+        # Preflights reach matching in batches of two: one batch here.
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM), _job("j2")])
+        pool = _AgentPool()
+
+        async def provision(*, purpose, image=None):
+            return None if image else "srw-agent-j-1"
+
+        pool.provision_agent = AsyncMock(side_effect=provision)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM},
+            {"purpose": "job"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_custom_pod_is_not_retried_in_the_same_pass(
+        self, no_dispatcher_error
+    ):
+        jobs = [_job("j1", harness_image=CUSTOM), _job("j2", harness_image=CUSTOM)]
+        store = _approved_store(pinned=jobs)
+        pool = _AgentPool()
+        pool.provision_agent = AsyncMock(return_value=None)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_awaited_once_with(purpose="job", image=CUSTOM)
+
+    @pytest.mark.asyncio
+    async def test_each_custom_image_has_its_own_budget(self, no_dispatcher_error):
+        jobs = [_job("j1", harness_image=CUSTOM), _job("j2", harness_image=CUSTOM2)]
+        store = _approved_store(pinned=jobs)
+        pool = _AgentPool()
+        live = {CUSTOM: 1, CUSTOM2: 0}
+        pool.active_count_for_image = AsyncMock(side_effect=lambda image: live[image])
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        assert [c.args for c in pool.active_count_for_image.await_args_list] == [
+            (CUSTOM,),
+            (CUSTOM2,),
+        ]
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM2}
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("live", "busy", "started"),
+        [(1, 1, 1), (2, 1, 0), (1, 0, 0), (1, 3, 1)],
+    )
+    async def test_a_busy_custom_pod_does_not_hold_back_the_next_job(
+        self, live, busy, started, no_dispatcher_error
+    ):
+        """A live pod still running its job cannot take another; only idle or
+        starting pods of the image count against the pending jobs."""
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM)])
+        pool = _AgentPool()
+        pool.active_count_for_image = AsyncMock(return_value=live)
+        pool.busy_agent_count_for_image = AsyncMock(return_value=busy)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.busy_agent_count_for_image.assert_awaited_once_with(CUSTOM)
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM}
+        ] * started
+
+    @pytest.mark.asyncio
+    async def test_a_default_job_never_preempts_a_custom_running_job(
+        self, no_dispatcher_error
+    ):
+        """Pausing a custom-image job frees a pod a default job cannot use;
+        the next default candidate is preempted instead."""
+        on_custom = {"id": "custom-run", "priority": 1, "assigned_agent_id": "a8"}
+        on_default = {"id": "default-run", "priority": 2, "assigned_agent_id": "a9"}
+        store = _approved_store(
+            pinned=[_job("pending", priority=9)],
+            candidates=[on_custom, on_default],
+            jobs={
+                "custom-run": {"id": "custom-run", "harness_image": CUSTOM},
+                "default-run": {"id": "default-run", "harness_image": None},
+            },
+        )
+        state, delivery = JobDispatchState(), FakeDelivery()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, state=state, delivery=delivery)
+        )
+        await _drain_tasks()
+
+        delivery.initiate_pause.assert_awaited_once_with(on_default)
+        assert state.pause_pending_job_ids == {"default-run"}
 
     @pytest.mark.asyncio
     async def test_a_custom_job_preempts_nothing(self, no_dispatcher_error):

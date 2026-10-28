@@ -60,10 +60,10 @@ from orchestrator.services.job_workspace_runtime import stateless_worker_workspa
 from orchestrator.services.job_workspace_runtime import (
     scholar_provision_parent_id as _scholar_provision_parent_id,
 )
-from orchestrator.services.manifest_approved_images import approved_image_entry
 from orchestrator.services.manifest_experts import (
+    HarnessImageClass,
     approved_srw_images,
-    custom_agent_image,
+    harness_image_class,
     trusted_srw_image,
 )
 from orchestrator.services.model_availability import WHERE_JOB
@@ -1348,30 +1348,45 @@ async def _preflight_job(
     return job
 
 
-def _job_harness_image(job: dict[str, Any]) -> str | None:
-    """The harness image a job runs on; ``None`` is the installed default."""
-    return job.get("harness_image") or None
+@dataclass(frozen=True)
+class _HarnessImages:
+    """The installation's harness images for one matching pass."""
+
+    installed: str
+    approved: tuple[dict[str, Any], ...]
+
+    def classify(self, image: str | None) -> tuple[HarnessImageClass, str | None]:
+        return harness_image_class(
+            image, approved=self.approved, installed=self.installed
+        )
+
+    def of_job(self, job: dict[str, Any]) -> tuple[HarnessImageClass, str | None]:
+        """A job's class: ``harness_image`` NULL, the installed image or its
+        repository is a default job (key ``None``)."""
+        return self.classify(job.get("harness_image"))
 
 
 async def _available_agents_by_image(
-    dependencies: JobDispatchDependencies,
-    *,
-    installed: str,
-    approved: tuple[dict[str, Any], ...],
+    dependencies: JobDispatchDependencies, images: _HarnessImages
 ) -> dict[str | None, list[dict[str, Any]]]:
     """Ready agents (cooldown passed) grouped by harness image, each group in
     heartbeat order; ``None`` groups the default pods.
 
     A default pod of a stale build is skipped; the lifecycle reconciler drains
     it. A custom-image pod is identified by its approved image, never by the
-    SRW build SHA its image happens to bake in.
+    SRW build SHA its image happens to bake in. A pod whose image is neither
+    installed nor approved serves nothing.
     """
     groups: dict[str | None, list[dict[str, Any]]] = {}
     for ag in await dependencies.store.get_available_agents(limit=50):
-        image = custom_agent_image(
-            ag.get("image"), approved=approved, installed=installed
-        )
-        if image is None:
+        kind, image = images.classify(ag.get("image"))
+        if kind == "ineligible":
+            logger.debug(
+                "Skipping agent %s: its image is neither installed nor approved",
+                ag["id"],
+            )
+            continue
+        if kind == "default":
             meta = ag.get("metadata") or {}
             if isinstance(meta, str):
                 try:
@@ -1391,38 +1406,40 @@ async def _available_agents_by_image(
 
 async def _provision_job_pods(
     remaining: list[dict[str, Any]],
+    images: _HarnessImages,
     *,
-    approved: tuple[dict[str, Any], ...],
     dependencies: JobDispatchDependencies,
 ) -> None:
     """Phase 1.5: start a pod of its harness image for each unclaimed job.
 
     A default job gets today's pod. A custom image has no warm pool: it gets at
-    most one pod per pending job of that image in this pass, less the pods of
-    that image already live, so an image that never registers cannot eat the
-    agent capacity. A job whose image left the approved list starts nothing
-    and stays pending.
+    most one pod per pending job of that image in this batch, less the pods of
+    that image that are live but not running a job (starting, or idle), so an
+    image that never registers cannot eat the agent capacity. A custom pod
+    that fails to start ends that image's attempts for the batch without
+    holding back other jobs. A job whose image is neither installed nor
+    approved starts nothing and stays pending.
     """
     provisioner = dependencies.agent_provisioner
-    # Pods each custom image may still start in this pass.
+    # Pods each custom image may still start in this batch.
     budgets: dict[str, int] = {}
     for job in remaining:
         job_id = str(job["id"])
-        image = _job_harness_image(job)
+        kind, image = images.of_job(job)
+        if kind == "ineligible":
+            logger.warning(
+                "Dispatcher: job %s runs harness image %s, which is neither "
+                "installed nor on the approved list; no pod is started for it",
+                job_id,
+                image,
+            )
+            continue
         if image is not None:
-            if approved_image_entry(approved, image) is None:
-                logger.warning(
-                    "Dispatcher: job %s runs harness image %s, which is not on "
-                    "the approved list; no pod is started for it",
-                    job_id,
-                    image,
-                )
-                continue
             if image not in budgets:
-                pending = sum(1 for j in remaining if _job_harness_image(j) == image)
-                budgets[image] = pending - await provisioner.active_count_for_image(
-                    image
-                )
+                pending = sum(1 for j in remaining if images.of_job(j)[1] == image)
+                live = await provisioner.active_count_for_image(image)
+                busy = await provisioner.busy_agent_count_for_image(image)
+                budgets[image] = pending - max(0, live - busy)
             if budgets[image] <= 0:
                 continue
         if await provisioner.active_count() >= provisioner.max_agents:
@@ -1432,7 +1449,10 @@ async def _provision_job_pods(
         else:
             pod_name = await provisioner.provision_agent(purpose="job", image=image)
         if not pod_name:
-            break  # At capacity or error
+            if image is None:
+                break  # At capacity or error
+            budgets[image] = 0
+            continue
         if image is not None:
             budgets[image] -= 1
         logger.info(
@@ -1455,12 +1475,11 @@ async def _match_jobs(
         return
 
     # A job runs only on a pod of its harness image (None: the installed one).
-    approved = approved_srw_images(dependencies.store)
-    agents_by_image = await _available_agents_by_image(
-        dependencies,
+    images = _HarnessImages(
         installed=trusted_srw_image(dependencies.store),
-        approved=approved,
+        approved=approved_srw_images(dependencies.store),
     )
+    agents_by_image = await _available_agents_by_image(dependencies, images)
 
     # Phase 1: Direct assignment
     matched_agent_ids = set()
@@ -1476,7 +1495,8 @@ async def _match_jobs(
     claimed_job_ids = set()
 
     for job in dispatchable_jobs:
-        free_agents = agents_by_image.get(_job_harness_image(job))
+        kind, image = images.of_job(job)
+        free_agents = agents_by_image.get(image) if kind != "ineligible" else None
         if not free_agents:
             continue  # No free agent of this job's image
         agent = free_agents.pop(0)
@@ -1523,20 +1543,18 @@ async def _match_jobs(
     # Phase 1.5: Provision agent pods for unclaimed jobs (K8s only)
     remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
     if remaining and dependencies.agent_provisioner.is_available:
-        await _provision_job_pods(
-            remaining, approved=approved, dependencies=dependencies
-        )
+        await _provision_job_pods(remaining, images, dependencies=dependencies)
 
     # Phase 2: Preemption (non-blocking). D1 placeability guard: only
     # workspace-ready jobs (dispatchable_jobs, not the full pending set)
     # may drive preemption — pausing a running job to free an agent is
     # pointless for a job that has no workspace to run in. Default-image
-    # jobs only: preempting frees a default pod, which a custom-image job
-    # cannot run on.
+    # jobs only, and only over jobs running on default pods: a pod of
+    # another image cannot serve the job that preempted it.
     remaining = [
         j
         for j in dispatchable_jobs
-        if str(j["id"]) not in claimed_job_ids and _job_harness_image(j) is None
+        if str(j["id"]) not in claimed_job_ids and images.of_job(j)[0] == "default"
     ]
     if not remaining:
         return
@@ -1545,6 +1563,9 @@ async def _match_jobs(
     if not candidates:
         return
 
+    # Candidate id -> whether its job runs on a default pod. The candidate
+    # rows carry no harness image; one lookup each, only on this rare path.
+    on_default_pod: dict[str, bool] = {}
     for pending_job in remaining:
         pending_priority = pending_job.get("priority", 5)
         pending_job_id = str(pending_job["id"])
@@ -1582,6 +1603,12 @@ async def _match_jobs(
 
             # Skip if already matched (agent taken)
             if str(candidate.get("assigned_agent_id", "")) in matched_agent_ids:
+                continue
+
+            if candidate_id not in on_default_pod:
+                running = await dependencies.store.get_job(candidate_id) or {}
+                on_default_pod[candidate_id] = images.of_job(running)[0] == "default"
+            if not on_default_pod[candidate_id]:
                 continue
 
             # Initiate preemption (fire-and-forget)

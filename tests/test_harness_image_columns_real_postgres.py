@@ -35,7 +35,7 @@ async def database(pg_dsn, monkeypatch):
     finally:
         await conn.close()
     monkeypatch.setenv("DATABASE_URL", pg_dsn)
-    db = PostgresDB()
+    db = PostgresDB(connection_string=pg_dsn)
     await db.connect()
     try:
         yield db
@@ -68,3 +68,45 @@ async def test_jobs_and_agents_carry_the_image_columns(database):
             "SELECT image FROM agents WHERE id = $1::uuid", agent["agent_id"]
         )
     assert lifecycle == IMAGE
+
+
+@pytest.mark.asyncio
+async def test_busy_agent_count_for_image_counts_agents_on_processing_jobs(database):
+    from orchestrator.services.agent_provisioner import AgentProvisioner
+
+    other = "example.invalid/other@sha256:" + "c" * 64
+    busy = await database.register_agent(
+        config_name="worker_base", pod_ip="10.0.0.11", image=IMAGE
+    )
+    idle = await database.register_agent(
+        config_name="worker_base", pod_ip="10.0.0.12", image=IMAGE
+    )
+    paused = await database.register_agent(
+        config_name="worker_base", pod_ip="10.0.0.13", image=IMAGE
+    )
+    elsewhere = await database.register_agent(
+        config_name="worker_base", pod_ip="10.0.0.14", image=other
+    )
+    # The dispatch-claim trigger guards UPDATEs only: insert the rows as found.
+    async with database.acquire() as conn:
+        for agent, status in (
+            (busy, "processing"),
+            (busy, "processing"),
+            (paused, "paused"),
+            (elsewhere, "processing"),
+        ):
+            await conn.execute(
+                "INSERT INTO jobs (description, status, execution_lane, "
+                "assigned_agent_id, harness_image) "
+                "VALUES ('z', $1, 'pinned', $2::uuid, $3)",
+                status,
+                agent["agent_id"],
+                IMAGE,
+            )
+    assert idle["agent_id"]
+
+    provisioner = AgentProvisioner()
+    provisioner._db = database
+    assert await provisioner.busy_agent_count_for_image(IMAGE) == 1
+    assert await provisioner.busy_agent_count_for_image(other) == 1
+    assert await provisioner.busy_agent_count_for_image("nothing:here") == 0

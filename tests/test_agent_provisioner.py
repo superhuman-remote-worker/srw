@@ -2600,3 +2600,26 @@ class TestProvisionImage:
             side_effect=_fake_to_thread,
         ):
             assert await p.active_count_for_image(CUSTOM) == 2
+
+    @pytest.mark.asyncio
+    async def test_busy_agent_count_for_image_asks_the_database(self):
+        p, _ = _make_provisioner()
+        conn = p._db.acquire.return_value.__aenter__.return_value
+        conn.fetchval = AsyncMock(return_value=3)
+
+        assert await p.busy_agent_count_for_image(CUSTOM) == 3
+
+        sql, image = conn.fetchval.await_args.args
+        assert image == CUSTOM
+        assert "status = 'processing'" in sql
+
+    @pytest.mark.asyncio
+    async def test_busy_agent_count_for_image_is_zero_without_or_on_a_failing_db(
+        self,
+    ):
+        p, _ = _make_provisioner()
+        conn = p._db.acquire.return_value.__aenter__.return_value
+        conn.fetchval = AsyncMock(side_effect=RuntimeError("db down"))
+        assert await p.busy_agent_count_for_image(CUSTOM) == 0
+        p._db = None
+        assert await p.busy_agent_count_for_image(CUSTOM) == 0

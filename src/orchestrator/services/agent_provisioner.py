@@ -2384,6 +2384,28 @@ class AgentProvisioner:
             logger.error("Failed to count agent pods for image: %s", e)
             return 0
 
+    async def busy_agent_count_for_image(self, image: str) -> int:
+        """Count registered agents running ``image`` that hold a processing job.
+
+        Such a pod is live but cannot take another job, so dispatch subtracts
+        it from :meth:`active_count_for_image` before deciding whether a
+        pending job of that image needs a pod of its own.
+        """
+        if not self._db:
+            return 0
+        try:
+            async with self._db.acquire() as conn:
+                count = await conn.fetchval(
+                    "SELECT COUNT(DISTINCT a.id) FROM agents a "
+                    "JOIN jobs j ON j.assigned_agent_id = a.id "
+                    "WHERE a.image = $1 AND j.status = 'processing'",
+                    image,
+                )
+                return int(count or 0)
+        except Exception as e:
+            logger.error("Failed to count busy agents for image: %s", e)
+            return 0
+
     async def active_counts_by_purpose(self) -> dict[str, int]:
         """Count managed agent pods by purpose (job/session).
 

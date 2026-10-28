@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -68,24 +68,46 @@ def approved_srw_images(store: Any) -> tuple[dict[str, Any], ...]:
     return ()
 
 
-def custom_agent_image(
+HarnessImageClass = Literal["default", "custom", "ineligible"]
+
+
+def image_repository(image: str) -> str:
+    """``image`` without its ``@digest`` and its ``:tag`` (a colon after the
+    last ``/``; a registry port is not a tag)."""
+    reference = image.split("@", 1)[0]
+    colon = reference.rfind(":")
+    if colon > reference.rfind("/"):
+        reference = reference[:colon]
+    return reference
+
+
+def harness_image_class(
     image: str | None,
     *,
     approved: Iterable[Mapping[str, Any]],
     installed: str,
-) -> str | None:
-    """The custom harness image an agent pod runs, or ``None`` for a default pod.
+) -> tuple[HarnessImageClass, str | None]:
+    """Classify an agent pod's reported image or a job's ``harness_image``.
 
-    A pod is custom only when it reports an image other than the installed one
-    that is on the approved list. Every other pod is a default pod, including
-    one of an earlier release that reports its old tag after an upgrade: the
-    stale-build skip and drain keep applying to it.
+    - ``("default", None)``: no image, the installed image, or another tag of
+      the installed image's repository. A pod of the previous release reports
+      its old tag after an upgrade; it stays a default pod, so the stale-build
+      skip and the drain keep applying to it.
+    - ``("custom", image)``: an image on the approved list other than the
+      installed one. It serves only jobs whose harness image equals it. The
+      approved list wins over the repository rule: an operator who approves a
+      pinned build of the SRW repository gets that build.
+    - ``("ineligible", image)``: anything else. It serves no job at all, so an
+      image taken off the approved list (or an approved list that failed
+      validation) never turns its pods into default pods.
     """
     if not image or image == installed:
-        return None
-    if approved_image_entry(approved, image) is None:
-        return None
-    return image
+        return "default", None
+    if approved_image_entry(approved, image) is not None:
+        return "custom", image
+    if image_repository(image) == image_repository(installed):
+        return "default", None
+    return "ineligible", image
 
 
 def _object(value: Any) -> dict[str, Any]:
