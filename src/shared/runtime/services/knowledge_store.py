@@ -1641,6 +1641,11 @@ class KnowledgeStore:
         ``grace`` (anchored on ``indexed_at``, the last write) protects a
         just-written provisional row whose file is committed but not yet in the
         fetched HEAD. Returns the number of rows archived.
+
+        A row of a :data:`GENERATED_PATHLESS_NOTE_TYPES` type is no orphan: it
+        never has a file to wait for. Without the exclusion every connector
+        note (``ds-<id8>``) in a project with a vault was archived an hour
+        after it was written, and the projection's upsert never revives it.
         """
         rows = await self.db.fetch(
             """
@@ -1649,6 +1654,7 @@ class KnowledgeStore:
              WHERE project_id = $1
                AND path IS NULL
                AND status = 'active'
+               AND note_type <> ALL($4::text[])
                AND note_id <> ALL($2::text[])
                AND indexed_at < now() - $3::interval
             RETURNING id
@@ -1656,6 +1662,7 @@ class KnowledgeStore:
             project_id,
             list(tree_slugs),
             grace,
+            list(GENERATED_PATHLESS_NOTE_TYPES),
         )
         return len(rows)
 

@@ -180,7 +180,13 @@ class TestEnsure:
 
         ours = inspect.getsource(dpk.project_has_unadopted_legacy_rows)
         theirs = inspect.getsource(KnowledgeStore.reconcile_orphans)
-        for clause in ("project_id = $1", "path IS NULL", "status = 'active'"):
+        for clause in (
+            "project_id = $1",
+            "path IS NULL",
+            "status = 'active'",
+            "note_type <> ALL(",
+            "GENERATED_PATHLESS_NOTE_TYPES",
+        ):
             assert clause in ours and clause in theirs, clause
 
     @pytest.mark.asyncio
