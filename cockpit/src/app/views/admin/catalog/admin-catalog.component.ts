@@ -219,6 +219,39 @@ export function mergePricingId(
   return Object.keys(next).length ? next : null;
 }
 
+/** The API shapes an endpoint-backed model can be called with. */
+export const CLIENT_PROTOCOLS: readonly {value: string; label: string}[] = [
+  {value: 'openai-chat', label: 'OpenAI Chat Completions (openai-chat)'},
+  {value: 'openai-responses', label: 'OpenAI Responses (openai-responses)'},
+  {value: 'anthropic-messages', label: 'Anthropic Messages (anthropic-messages)'},
+];
+
+/**
+ * Merge an API shape into an existing `params_json`, preserving every other
+ * key (PATCH replaces `params_json` wholesale, see `mergePricingId`). A null
+ * protocol removes `routing.client_protocol` and leaves the rest of `routing`.
+ */
+export function mergeRoutingProtocol(
+  params: Record<string, unknown> | null,
+  protocol: string | null,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = {...(params ?? {})};
+  const routing: Record<string, unknown> = {
+    ...((next['routing'] as Record<string, unknown> | null | undefined) ?? {}),
+  };
+  if (protocol === null) {
+    delete routing['client_protocol'];
+  } else {
+    routing['client_protocol'] = protocol;
+  }
+  if (Object.keys(routing).length) {
+    next['routing'] = routing;
+  } else {
+    delete next['routing'];
+  }
+  return next;
+}
+
 export function reasoningStarveWarning(ctx: number | null): string | null {
   if (ctx == null || ctx <= 0) return null; // unset → family/default governs
   const backstop = Math.max(4096, ctx - Math.floor(ctx * 0.8) - 4096);
@@ -276,6 +309,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                     <span class="col-family">Family</span>
                     <span class="col-context">Context</span>
                     <span class="col-pricing">Pricing</span>
+                    <span class="col-protocol">API shape</span>
                     <span class="col-enabled">Enabled</span>
                     <span class="col-actions"></span>
                   </div>
@@ -312,6 +346,21 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                           [attr.aria-label]="'Pricing source for ' + m.display_label + ': ' + pricingLabelOf(m.params_json) + '. Edit.'"
                           (click)="openPricing(m)"
                         >{{ pricingLabelOf(m.params_json) }}</button>
+                      </span>
+                      <span class="col-protocol">
+                        @if (m.provider_kind === 'endpoint') {
+                          <app-select
+                            [value]="m.client_protocol ?? 'openai-chat'"
+                            [ariaLabel]="'API shape for ' + m.display_label"
+                            (changed)="setProtocol(m, $event)"
+                          >
+                            @for (p of clientProtocols; track p.value) {
+                              <option [value]="p.value">{{ p.label }}</option>
+                            }
+                          </app-select>
+                        } @else {
+                          <span class="muted" title="Set by the provider, not editable here">—</span>
+                        }
                       </span>
                       <span class="col-enabled">
                         <app-checkbox
@@ -377,6 +426,19 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                   }
                 </app-select>
               </app-form-field>
+              @if (selectedIsEndpoint()) {
+                <app-form-field label="API shape">
+                  <app-select
+                    [value]="formClientProtocol()"
+                    [disabled]="creating()"
+                    (changed)="formClientProtocol.set($event ?? 'openai-chat')"
+                  >
+                    @for (p of clientProtocols; track p.value) {
+                      <option [value]="p.value">{{ p.label }}</option>
+                    }
+                  </app-select>
+                </app-form-field>
+              }
               <app-form-field label="Capabilities">
                 <fieldset class="cap-fieldset" [disabled]="creating()">
                   @for (c of capabilities; track c) {
@@ -927,7 +989,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     .model-header,
     .model-row {
       display: grid;
-      grid-template-columns: 1.4fr 2fr 160px 100px 100px 150px 70px 260px;
+      grid-template-columns: 1.4fr 2fr 160px 100px 100px 150px 210px 70px 260px;
       gap: 8px;
       align-items: center;
       padding: 8px 12px;
@@ -1279,9 +1341,18 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
         content: 'Pricing: ';
         color: var(--text-muted);
       }
-      .col-actions {
+      .col-protocol {
         grid-column: 1 / -1;
         grid-row: 6;
+        font-size: 12px;
+      }
+      .col-protocol::before {
+        content: 'API shape: ';
+        color: var(--text-muted);
+      }
+      .col-actions {
+        grid-column: 1 / -1;
+        grid-row: 7;
         margin-top: 2px;
       }
       /* Stack the cramped two-up form rows (two ~137px fields side-by-side). */
@@ -1345,6 +1416,9 @@ export class AdminCatalogComponent implements OnInit {
   readonly formVoice = signal('');
   // Optional OpenRouter pricing ID, also params_json. Empty = auto-detect.
   readonly formPricingId = signal('');
+  readonly clientProtocols = CLIENT_PROTOCOLS;
+  /** API shape for a new endpoint-backed model (ignored for provider rows). */
+  readonly formClientProtocol = signal('openai-chat');
   // True when the operator picked "Custom…" (or the backend is unrecognized);
   // then formVoice is a free-text voice id rather than a catalog selection.
   readonly formVoiceCustom = signal(false);
@@ -1520,6 +1594,11 @@ export class AdminCatalogComponent implements OnInit {
   });
 
   /** True when the form provider is the shared subscription proxy. */
+  /** Plain endpoints only: the subscription proxy takes its API shape from discovery. */
+  readonly selectedIsEndpoint = computed(
+    () => this.formProviderKey().startsWith('endpoint:') && !this.selectedIsSubscription(),
+  );
+
   readonly selectedIsSubscription = computed(() =>
     isSubscriptionEndpoint(
       this.providers.systemEndpoints().find((e) => e.id === this.selectedEndpointRef()),
@@ -1763,7 +1842,12 @@ export class AdminCatalogComponent implements OnInit {
     const candidate = this.selectedIsSubscription()
       ? (this.subscriptionModels().find((m) => m.id === modelId) ?? null)
       : null;
-    if (candidate) Object.assign(params, subscriptionRoutingParams(candidate));
+    if (candidate) {
+      Object.assign(params, subscriptionRoutingParams(candidate));
+    } else if (this.selectedIsEndpoint()) {
+      // A plain endpoint has no discovery routing: the admin's pick is the model's API shape.
+      params['routing'] = {client_protocol: this.formClientProtocol()};
+    }
     const paramsJson = Object.keys(params).length ? params : undefined;
     const servedModelId = this.formServedModelId().trim();
     this.creating.set(true);
@@ -1791,6 +1875,7 @@ export class AdminCatalogComponent implements OnInit {
           this.formVoice.set('');
           this.formVoiceCustom.set(false);
           this.formPricingId.set('');
+          this.formClientProtocol.set('openai-chat');
           this.formSearchProvider.set('');
           this.formSearchOps.set([]);
           this.creating.set(false);
@@ -1816,6 +1901,13 @@ export class AdminCatalogComponent implements OnInit {
   toggleEnabled(model: CatalogModel, checked: boolean): void {
     if (!this.confirmHelmOverride(model)) return;
     this.models.updateModel(model.id, {enabled: checked}).subscribe();
+  }
+
+  setProtocol(model: CatalogModel, protocol: string): void {
+    if (!this.confirmHelmOverride(model)) return;
+    this.models
+      .updateModel(model.id, {params_json: mergeRoutingProtocol(model.params_json, protocol)})
+      .subscribe();
   }
 
   /** Hover/title text spelling out what the cell's shorthand actually means. */

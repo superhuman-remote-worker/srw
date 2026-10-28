@@ -989,6 +989,10 @@ export interface CatalogModel {
   source?: HelmProvenanceSource | null;
   managed_by_helm?: boolean;
   helm_drift?: boolean;
+  /** API shape the model is called with; null for provider-anchored (system) rows. */
+  client_protocol: string | null;
+  subscription_sources?: string[];
+  routing_needs_review?: boolean;
 }
 
 export interface CatalogModelCreateRequest {
