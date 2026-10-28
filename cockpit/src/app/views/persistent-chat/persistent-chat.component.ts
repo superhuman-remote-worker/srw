@@ -856,6 +856,40 @@ export function shouldPin(autoScroll: boolean, isRestoringScroll: boolean): bool
 }
 
 /**
+ * The language label of a rendered code fence, read back from its
+ * `language-…` class. The fence info string is model output, and the markdown
+ * sanitizer keeps it inside the class attribute verbatim, so the value is
+ * reduced to the characters a language name uses (`c++`, `c#`, `objective-c`,
+ * `x.y`) and capped. The label is still set as text, never as markup.
+ */
+export function codeFenceLanguage(className: string | null | undefined): string {
+    const raw = className?.match(/(?:^|\s)language-(\S+)/)?.[1] ?? '';
+    return raw.replace(/[^A-Za-z0-9_+.#-]/g, '').slice(0, 32);
+}
+
+/**
+ * The `<summary>` of a collapsed code block: icon, language label and expand
+ * hint, each a text node. Built with DOM calls, not `innerHTML`, because the
+ * label comes from model output and this runs after the markdown sanitizer.
+ */
+export function buildCodeCollapseSummary(doc: Document, lang: string, expandHint: string): HTMLElement {
+    const summary = doc.createElement('summary');
+    summary.className = 'code-collapse-summary';
+    const parts: [string, string][] = [
+        ['code-collapse-icon', 'code'],
+        ['code-collapse-label', lang || 'code'],
+        ['code-collapse-hint', expandHint],
+    ];
+    for (const [className, text] of parts) {
+        const span = doc.createElement('span');
+        span.className = className;
+        span.textContent = text;
+        summary.appendChild(span);
+    }
+    return summary;
+}
+
+/**
  * Header-fold geometry. Same reason as the scroll pin above: the decision is
  * pure and unit tested, the wiring is a browser check.
  *
@@ -4513,16 +4547,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             if (pre.closest('.streaming-block')) continue;
             pre.setAttribute('data-collapsed', '');
             if (pre.scrollHeight <= 200) continue;
-            const lang = pre.querySelector('code')?.className?.match(/language-(\S+)/)?.[1] || '';
+            const lang = codeFenceLanguage(pre.querySelector('code')?.getAttribute('class'));
             const wrapper = document.createElement('details');
             wrapper.className = 'code-collapse';
-            const summary = document.createElement('summary');
-            summary.className = 'code-collapse-summary';
             const expandHint = this.transloco.translate('chat.code.expandHint');
-            summary.innerHTML = `<span class="code-collapse-icon">code</span>`
-                + `<span class="code-collapse-label">${lang || 'code'}</span>`
-                + `<span class="code-collapse-hint">${expandHint}</span>`;
-            wrapper.appendChild(summary);
+            wrapper.appendChild(buildCodeCollapseSummary(document, lang, expandHint));
             pre.parentNode!.insertBefore(wrapper, pre);
             wrapper.appendChild(pre);
         }

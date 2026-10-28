@@ -5,6 +5,7 @@ import {
     canComposeDuringSession,
     canSendMessage,
     clearDraft,
+    codeFenceLanguage,
     composeDenyPrefill,
     countTurnsAfter,
     describeAttachmentRejection,
@@ -1005,6 +1006,98 @@ describe('shouldPin', () => {
         // would yank the user to the bottom of the history they just opened.
         expect(shouldPin(true, true)).toBe(false);
         expect(shouldPin(false, true)).toBe(false);
+    });
+});
+
+describe('codeFenceLanguage', () => {
+    it('keeps the characters language names use', () => {
+        expect(codeFenceLanguage('language-python')).toBe('python');
+        expect(codeFenceLanguage('hljs language-c++')).toBe('c++');
+        expect(codeFenceLanguage('language-c#')).toBe('c#');
+        expect(codeFenceLanguage('language-objective-c')).toBe('objective-c');
+        expect(codeFenceLanguage('language-foo_bar.v2')).toBe('foo_bar.v2');
+    });
+
+    it('drops every other character from a model-written info string', () => {
+        expect(codeFenceLanguage('language-<img/src=x/onerror=alert(1)>')).toBe(
+            'imgsrcxonerroralert1',
+        );
+        expect(codeFenceLanguage('language-"><b>x</b>')).toBe('bxb');
+    });
+
+    it('caps the label and is empty without a language class', () => {
+        expect(codeFenceLanguage(`language-${'a'.repeat(100)}`)).toHaveLength(32);
+        expect(codeFenceLanguage('xlanguage-python')).toBe('');
+        expect(codeFenceLanguage('hljs')).toBe('');
+        expect(codeFenceLanguage(null)).toBe('');
+        expect(codeFenceLanguage(undefined)).toBe('');
+    });
+});
+
+describe('collapseCodeBlocks', () => {
+    /**
+     * Run the private pass over a container holding one tall code block. jsdom
+     * has no layout, so the block's scrollHeight is faked past the 200px fold.
+     */
+    function collapse(codeClass: string, expandHint = 'Click to expand'): HTMLElement {
+        const container = document.createElement('div');
+        const body = document.createElement('div');
+        body.className = 'message-body';
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.setAttribute('class', codeClass);
+        code.textContent = 'print(1)';
+        pre.appendChild(code);
+        Object.defineProperty(pre, 'scrollHeight', {value: 500});
+        body.appendChild(pre);
+        container.appendChild(body);
+
+        const host = {
+            messagesContainer: {nativeElement: container},
+            transloco: {translate: () => expandHint},
+        };
+        (
+            PersistentChatComponent.prototype as unknown as {
+                collapseCodeBlocks(this: typeof host): void;
+            }
+        ).collapseCodeBlocks.call(host);
+        return container;
+    }
+
+    it('sets a hostile fence language as text, with no injected element', () => {
+        const container = collapse('language-<img/src=x/onerror=alert(1)>');
+
+        const summary = container.querySelector('details.code-collapse > summary')!;
+        expect(summary).not.toBeNull();
+        expect(summary.querySelector('img')).toBeNull();
+        expect(Array.from(summary.children).map((c) => c.className)).toEqual([
+            'code-collapse-icon',
+            'code-collapse-label',
+            'code-collapse-hint',
+        ]);
+        for (const span of Array.from(summary.children)) {
+            expect(span.children).toHaveLength(0);
+        }
+        expect(summary.querySelector('.code-collapse-label')!.textContent).toBe(
+            'imgsrcxonerroralert1',
+        );
+        // The whole wrapper holds only what the pass built plus the original block.
+        expect(
+            Array.from(container.querySelectorAll('details *')).map((e) => e.tagName),
+        ).toEqual(['SUMMARY', 'SPAN', 'SPAN', 'SPAN', 'PRE', 'CODE']);
+    });
+
+    it('sets the expand hint as text too', () => {
+        const container = collapse('language-ts', '<b>expand</b>');
+        const hint = container.querySelector('.code-collapse-hint')!;
+        expect(hint.textContent).toBe('<b>expand</b>');
+        expect(hint.querySelector('b')).toBeNull();
+        expect(container.querySelector('.code-collapse-label')!.textContent).toBe('ts');
+    });
+
+    it('labels a block without a usable language as code', () => {
+        const container = collapse('language-<>');
+        expect(container.querySelector('.code-collapse-label')!.textContent).toBe('code');
     });
 });
 
