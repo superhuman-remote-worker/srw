@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -304,7 +305,7 @@ def workspace_upgrade_container_ready(metadata: Any) -> bool:
 
 
 _LATEST_UPGRADE_REQUEST_SQL = """
-SELECT id, outcome, error_code, payload
+SELECT id, outcome, error_code, payload, requested_at
 FROM thread_control_requests
 WHERE thread_id = $1::uuid AND verb = 'upgrade-to-workspace'
   AND runtime_generation = $2::uuid
@@ -316,13 +317,19 @@ LIMIT 1
 async def latest_workspace_upgrade_request(
     store: Any, thread: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    """The newest upgrade request of this runtime generation (C2's projection).
+    """The newest upgrade request of this runtime generation.
 
-    Only a pinned row can hold a C2 request; 0185 re-stamps a pending one on
-    Resume, so an End-then-Resume cancellation is still found.
+    C2's projection reads its outcome, on a pinned row only (0185 re-stamps a
+    pending one on Resume, so an End-then-Resume cancellation is still found).
+    A stateless row is read only while C1's copy is owed, for its
+    ``requested_at``: C1 admits the request in the same commit as its
+    transition.
     """
-    if thread.get("execution_lane") != LANE_PINNED or not thread.get(
-        "runtime_generation"
+    if not thread.get("runtime_generation"):
+        return None
+    if (
+        thread.get("execution_lane") != LANE_PINNED
+        and workspace_upgrade_seed_from(metadata_object(thread.get("metadata"))) is None
     ):
         return None
     row = await store.fetchrow(
@@ -416,7 +423,27 @@ def workspace_upgrade_view(
     *,
     latest_request: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """The Session read's ``workspace_upgrade`` field (C1 container, C2 VM)."""
+    """The Session read's ``workspace_upgrade`` field (C1 container, C2 VM).
+
+    An upgrade still running says when it was requested (``started_at``), so
+    the cockpit's upgrade card keeps counting across a reload.
+    """
+    view = _workspace_upgrade_phase(thread, creation_view, latest_request)
+    requested_at = latest_request.get("requested_at") if latest_request else None
+    if (
+        view is not None
+        and view["phase"] != "failed"
+        and isinstance(requested_at, datetime)
+    ):
+        view["started_at"] = requested_at.isoformat()
+    return view
+
+
+def _workspace_upgrade_phase(
+    thread: Mapping[str, Any],
+    creation_view: Mapping[str, Any] | None,
+    latest_request: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
     metadata = metadata_object(thread.get("metadata"))
     if workspace_upgrade_seed_from(metadata) is None:
         return _vm_upgrade_view(thread, metadata, latest_request)

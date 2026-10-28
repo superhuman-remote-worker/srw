@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -414,6 +415,37 @@ def test_workspace_upgrade_view_reports_the_vm_phases(lane, vm, latest, expected
     if vm is not None:
         thread["metadata"]["vm"] = vm
     assert swu.workspace_upgrade_view(thread, None, latest_request=latest) == expected
+
+
+@pytest.mark.parametrize(
+    "vm,outcome,expected",
+    [
+        (None, None, {"target_tier": "vm", "phase": "requested"}),
+        (
+            {"status": "provisioning", "upgrade_seed": PENDING_MARKER},
+            "applied",
+            {"target_tier": "vm", "phase": "provisioning"},
+        ),
+        (
+            {"status": "ready", "upgrade_seed": PENDING_MARKER},
+            "applied",
+            {"target_tier": "vm", "phase": "copying"},
+        ),
+    ],
+    ids=["requested", "provisioning", "copying"],
+)
+def test_a_vm_upgrade_view_says_when_the_upgrade_was_requested(vm, outcome, expected):
+    thread = _thread(lane="pinned")
+    if vm is not None:
+        thread["metadata"]["vm"] = vm
+    latest = {
+        **_request(outcome),
+        "requested_at": datetime(2026, 10, 28, 9, 30, tzinfo=timezone.utc),
+    }
+    assert swu.workspace_upgrade_view(thread, None, latest_request=latest) == {
+        **expected,
+        "started_at": "2026-10-28T09:30:00+00:00",
+    }
 
 
 def test_the_route_composition_binds_the_pinned_prepare_checks(monkeypatch):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -308,6 +309,57 @@ def test_workspace_upgrade_view(container, creation, expected):
     if container is not None:
         thread["metadata"]["workspace_container"] = container
     assert swu.workspace_upgrade_view(thread, creation) == expected
+
+
+@pytest.mark.parametrize(
+    "container,creation,expected",
+    [
+        (
+            {"status": "pending", "seed_from": SEED},
+            None,
+            {
+                "target_tier": "sandbox",
+                "phase": "provisioning",
+                "started_at": "2026-10-28T09:30:00+00:00",
+            },
+        ),
+        (
+            {"status": "ready", "seed_from": SEED},
+            None,
+            {
+                "target_tier": "sandbox",
+                "phase": "copying",
+                "started_at": "2026-10-28T09:30:00+00:00",
+            },
+        ),
+        (
+            {"status": "pending", "seed_from": SEED},
+            ATTENTION,
+            {
+                "target_tier": "sandbox",
+                "phase": "failed",
+                "reason_code": "invalid_image",
+            },
+        ),
+    ],
+    ids=["provisioning", "copying", "a-failure-has-no-clock"],
+)
+def test_workspace_upgrade_view_says_when_the_upgrade_was_requested(
+    container, creation, expected
+):
+    """The cockpit's upgrade card counts from here, also after a reload."""
+    thread = _thread(backend="sandbox")
+    thread["metadata"]["workspace_container"] = container
+    latest = {
+        "id": "r-1",
+        "outcome": None,
+        "error_code": None,
+        "payload": {},
+        "requested_at": datetime(2026, 10, 28, 9, 30, tzinfo=timezone.utc),
+    }
+    assert (
+        swu.workspace_upgrade_view(thread, creation, latest_request=latest) == expected
+    )
 
 
 def test_seed_spec_for_a_virtual_source_carries_the_lite_mount(monkeypatch):

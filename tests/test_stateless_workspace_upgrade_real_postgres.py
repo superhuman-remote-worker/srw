@@ -380,6 +380,20 @@ async def test_admission_commits_the_transition_the_request_and_the_wake(
     assert queue["state"] == "queued"
     assert int(queue["control_input_seq"]) == admitted.request_seq
 
+    # The Session read says when it was requested, so the cockpit's upgrade
+    # card can keep counting after a reload.
+    thread = await database.get_thread(thread_id)
+    requested_at = await database.fetchval(
+        "SELECT requested_at FROM thread_control_requests WHERE id = $1",
+        admitted.id,
+    )
+    latest = await latest_workspace_upgrade_request(database, thread)
+    assert workspace_upgrade_view(thread, None, latest_request=latest) == {
+        "target_tier": "sandbox",
+        "phase": "provisioning",
+        "started_at": requested_at.isoformat(),
+    }
+
     replay = await admit_upgrade(
         database, actor, thread_id, client_request_id=request_id
     )
@@ -491,6 +505,7 @@ from orchestrator.services import container_provisioner as provisioner_module  #
 from orchestrator.services.container_provisioner import ContainerProvisioner  # noqa: E402
 from orchestrator.services.session_provisioner import ensure_session_workspace  # noqa: E402
 from orchestrator.services.stateless_workspace_upgrade import (  # noqa: E402
+    latest_workspace_upgrade_request,
     workspace_upgrade_view,
 )
 from orchestrator.services.workspace_lifecycle import (  # noqa: E402
