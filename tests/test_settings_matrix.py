@@ -1065,6 +1065,36 @@ class TestRealMatrixFamilies:
         assert data["llm"]["top_k"] == 40
         assert data["llm"]["top_p"] == 0.95
 
+    @pytest.mark.parametrize(
+        "model,family",
+        [
+            ("gemini-3.5-flash", "gemini"),
+            ("openrouter/google/gemini-3.5-flash", "gemini"),
+            ("openrouter/google/gemini-3.1-pro-preview", "gemini"),
+            ("openrouter/google/gemini-2.5-flash", "gemini"),
+            ("gemini-4-argon", "gemini-4-argon"),
+            ("openrouter/google/gemini-3.8-flash", "gemini-3.8-flash"),
+        ],
+    )
+    def test_every_gemini_family_runs_at_temperature_one(self, model, family):
+        """Gemini 3.x thinking models loop at temperature 0
+        (knowledge-base/knowledge/issues/gemini3_thinking_temperature_loop.md).
+        The native factory floors 3.x at 1.0; the OpenRouter and other
+        OpenAI-compatible lanes send what the matrix resolves, and the generic
+        `gemini` block had no temperature, so it fell through to `default`'s 0.0.
+        """
+        assert family_of(model) == family
+        data = {"llm": {"model": model, "temperature": 0.0}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["temperature"] == 1.0
+
+    def test_an_expert_temperature_still_wins_on_gemini(self):
+        data = {
+            "llm": {"model": "openrouter/google/gemini-3.5-flash", "temperature": 0.3}
+        }
+        _apply_settings_matrix(data, expert_llm_keys={"temperature"})
+        assert data["llm"]["temperature"] == 0.3
+
 
 # =============================================================================
 # load_uploaded_config integration

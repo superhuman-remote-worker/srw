@@ -563,6 +563,11 @@ gemini:
   reasoning: { method: none }
   settings:
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    # Gemini 3.x thinking models loop at temperature 0 until the output cap
+    # runs out (knowledge-base/knowledge/issues/gemini3_thinking_temperature_loop.md).
+    # The native factory floors 3.x at 1.0; OpenRouter and the other
+    # OpenAI-compatible lanes send this value. 1.0 is also Google's default for 2.5.
+    temperature: 1.0
     top_p: 0.95
     top_k: 40
     multimodal: true  # Gemini models are natively multimodal
