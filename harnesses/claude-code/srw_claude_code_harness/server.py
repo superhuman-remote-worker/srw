@@ -13,6 +13,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .orchestrator import PinnedEcho
 from .job import JobRejected, JobSpec, parse_job_start, require_anthropic_route
 
 CANCEL_WAIT_SECONDS = 120.0
@@ -27,6 +28,10 @@ async def _no_runner(spec: JobSpec) -> None:  # replaced by the entrypoint
     raise RuntimeError("no job runner is wired")
 
 
+async def _no_reporter(job_id: str, pinned: PinnedEcho | None, message: str) -> None:
+    raise RuntimeError("no rejection reporter is wired")
+
+
 @dataclass
 class HarnessState:
     agent_id: str | None = None
@@ -34,10 +39,14 @@ class HarnessState:
     pod_uid: str = ""
     started: float = field(default_factory=time.monotonic)
     current: JobSpec | None = None
+    rejected_job_id: str | None = None  # accepted, then reported as rejected
     acknowledgement: dict[str, Any] | None = None
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
     job_finished: asyncio.Event = field(default_factory=asyncio.Event)
     run_job: Callable[[JobSpec], Awaitable[None]] = _no_runner
+    report_rejection: Callable[[str, PinnedEcho | None, str], Awaitable[None]] = (
+        _no_reporter
+    )
     cancel_wait_seconds: float = CANCEL_WAIT_SECONDS
     tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
 
@@ -57,8 +66,14 @@ def _recipient_matches(state: HarnessState, recipient: Any, job_id: str | None) 
     )
 
 
+def _current_id(state: HarnessState) -> str | None:
+    if state.current is not None:
+        return state.current.job_id
+    return state.rejected_job_id
+
+
 def _busy(state: HarnessState) -> bool:
-    return state.current is not None and not state.job_finished.is_set()
+    return _current_id(state) is not None and not state.job_finished.is_set()
 
 
 def _uptime(state: HarnessState) -> float:
@@ -107,7 +122,7 @@ def create_app(state: HarnessState) -> Starlette:
         return JSONResponse(
             {
                 "mode": "claude-code",
-                "current_job_id": state.current.job_id if state.current else None,
+                "current_job_id": _current_id(state),
                 "uptime_seconds": _uptime(state),
             }
         )
@@ -115,6 +130,12 @@ def create_app(state: HarnessState) -> Starlette:
     async def run(spec: JobSpec) -> None:
         try:
             await state.run_job(spec)
+        finally:
+            state.job_finished.set()
+
+    async def reject(job_id: str, pinned: PinnedEcho | None, message: str) -> None:
+        try:
+            await state.report_rejection(job_id, pinned, message)
         finally:
             state.job_finished.set()
 
@@ -132,7 +153,7 @@ def create_app(state: HarnessState) -> Starlette:
         if all(present):
             accepted["pinned_delivery_id"] = body["pinned_delivery_id"]
             accepted["pinned_projection_digest"] = body["pinned_projection_digest"]
-        if state.current is not None and state.current.job_id == job_id:
+        if job_id and _current_id(state) == job_id:
             return JSONResponse(
                 {**accepted, "message": "Job was already accepted by this runtime"},
                 status_code=202,
@@ -142,11 +163,18 @@ def create_app(state: HarnessState) -> Starlette:
         try:
             spec = parse_job_start(body)
             require_anthropic_route(spec.model)
+            state.current, state.rejected_job_id = spec, None
+            coro = run(spec)
         except JobRejected as exc:
-            return _detail(422, str(exc))
-        state.current = spec
+            # Answering non-2xx would leave the job claimed and requeued forever;
+            # accept it and complete it with the plain error instead.
+            if not job_id:
+                return _detail(422, str(exc))
+            pinned = PinnedEcho(*present) if any(present) else None
+            state.rejected_job_id = job_id
+            coro = reject(job_id, pinned, str(exc))
         state.job_finished.clear()
-        task = asyncio.create_task(run(spec))
+        task = asyncio.create_task(coro)
         state.tasks.add(task)
         task.add_done_callback(state.tasks.discard)
         return JSONResponse(
@@ -157,8 +185,7 @@ def create_app(state: HarnessState) -> Starlette:
         body = await _json_body(request)
         if not _busy(state):
             return _detail(404, "No job currently running")
-        assert state.current is not None
-        job_id = state.current.job_id
+        job_id = _current_id(state)
         if not _recipient_matches(state, body.get("recipient"), job_id):
             return _detail(409, "pinned recipient mismatch")
         state.stop_requested.set()

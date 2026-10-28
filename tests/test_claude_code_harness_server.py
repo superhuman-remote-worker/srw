@@ -173,14 +173,62 @@ async def test_start_is_503_before_registration(client, state):
     assert (await client.post("/job/start", json=body())).status_code == 503
 
 
+def _wire_reporter(state):
+    state.reports = []
+
+    async def report(job_id, pinned, message):
+        state.reports.append((job_id, pinned, message))
+
+    state.report_rejection = report
+
+
 @pytest.mark.asyncio
-async def test_start_turns_a_rejected_model_into_422(client, state):
+async def test_start_accepts_a_non_anthropic_model_and_reports_the_rejection(
+    client, state
+):
+    _wire_reporter(state)
     cfg = copy.deepcopy(BODY["resolved_config"])
     cfg["agent"]["llm"]["client_protocol"] = "openai-chat"
     r = await client.post("/job/start", json=body(resolved_config=cfg))
-    assert r.status_code == 422
-    assert "anthropic-messages" in r.json()["detail"]
-    assert state.current is None
+    assert r.status_code == 202
+    assert r.json()["pinned_delivery_id"] == "d1"
+    await asyncio.sleep(0.01)
+    assert len(state.reports) == 1
+    job_id, pinned, message = state.reports[0]
+    assert job_id == "j1" and "anthropic-messages" in message
+    assert (pinned.delivery_id, pinned.projection_digest, pinned.delivery_proof) == (
+        "d1",
+        "p1",
+        "pr1",
+    )
+    assert state.runs == []
+    again = await client.post("/job/start", json=body(resolved_config=cfg))
+    assert again.json()["message"] == "Job was already accepted by this runtime"
+    assert len(state.reports) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_accepts_a_job_without_a_workspace_and_reports_it(client, state):
+    _wire_reporter(state)
+    r = await client.post("/job/start", json=body(resolved_config={}))
+    assert r.status_code == 202
+    await asyncio.sleep(0.01)
+    assert [x[0] for x in state.reports] == ["j1"]
+    assert "workspace" in state.reports[0][2] and state.runs == []
+
+
+@pytest.mark.asyncio
+async def test_start_without_a_job_id_stays_422(client, state):
+    _wire_reporter(state)
+    r = await client.post(
+        "/job/start",
+        json=body(
+            job_id="",
+            resolved_config={},
+            recipient={**RECIPIENT, "expected_job_id": ""},
+        ),
+    )
+    assert r.status_code == 422 and state.reports == []
 
 
 @pytest.mark.asyncio
