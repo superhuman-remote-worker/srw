@@ -1,8 +1,9 @@
 """Authorized workspace-file materialization for Dynamic Canvas.
 
-The gateway is intentionally Canvas-scoped: callers provide an already
-authorized thread plus the path selected in the authoritative Canvas row. It
-is not a general thread filesystem browser.
+The gateway is Canvas-scoped: callers provide an already authorized thread
+plus the path selected in the authoritative Canvas row. It is not a general
+thread filesystem browser. Its one other reader is the owner's download of a
+single named file (``read_download``), which never renders the bytes.
 """
 
 from __future__ import annotations
@@ -675,7 +676,7 @@ async def _evict_sftp_generation(thread_id: str, generation: UUID) -> None:
 
 
 async def _read_sftp_workspace_file(
-    sftp: Any, *, root: str, path: str
+    sftp: Any, *, root: str, path: str, read_limit: int | None = None
 ) -> RawWorkspaceFile:
     """Read one regular file while rejecting symlinks in root and source paths."""
 
@@ -737,7 +738,8 @@ async def _read_sftp_workspace_file(
 
     if attrs is None:
         raise CanvasFileError(404, "canvas_file_not_found", "File not found")
-    read_limit = _workspace_read_limit(path)
+    if read_limit is None:
+        read_limit = _workspace_read_limit(path)
     if attrs.size is not None and attrs.size > read_limit:
         raise CanvasFileError(413, "canvas_file_too_large", "File is too large")
     async with sftp.open(current, "rb") as remote_file:
@@ -836,6 +838,7 @@ async def _read_remote_default(
     expected_generation: UUID,
     *,
     generation_resolver: GenerationResolver | None = None,
+    read_limit: int | None = None,
 ) -> RawWorkspaceFile:
     if asyncssh is None:
         raise CanvasFileError(
@@ -885,7 +888,9 @@ async def _read_remote_default(
                         str(thread.get("id") or ""), expected_generation
                     )
                     raise
-                result = await _read_sftp_workspace_file(sftp, root=root, path=path)
+                result = await _read_sftp_workspace_file(
+                    sftp, root=root, path=path, read_limit=read_limit
+                )
                 authoritative = (
                     await generation_resolver()
                     if generation_resolver is not None
@@ -984,7 +989,11 @@ async def _write_remote_default(
 
 
 async def _read_virtual_default(
-    thread: dict[str, Any], path: str, expected_generation: UUID
+    thread: dict[str, Any],
+    path: str,
+    expected_generation: UUID,
+    *,
+    read_limit: int | None = None,
 ) -> RawWorkspaceFile:
     if current_workspace_generation(thread) != expected_generation:
         raise CanvasFileError(
@@ -1020,7 +1029,8 @@ async def _read_virtual_default(
         )
 
     cancelled = threading.Event()
-    read_limit = _workspace_read_limit(path)
+    if read_limit is None:
+        read_limit = _workspace_read_limit(path)
 
     def read() -> bytes:
         from shared.runtime.core.backends.rclone import (
@@ -1469,6 +1479,54 @@ class ThreadWorkspaceFileGateway:
                 "workspace_generation_changed",
                 "The selected workspace generation changed during the save",
             )
+
+    async def read_download(
+        self, thread: dict[str, Any], path: str
+    ) -> tuple[str, RawWorkspaceFile]:
+        """Bound-read one workspace file for its owner to save.
+
+        Any file type up to the file ceiling: the bytes leave as an attachment
+        and are never rendered, so the renderer validators don't apply. Path,
+        symlink and generation checks are the same as for presentation.
+        """
+        path = canonical_workspace_path(path)
+        thread = await self._authoritative_thread(thread)
+        generation = current_workspace_generation(thread)
+
+        async def resolve_generation() -> dict[str, Any]:
+            return await self._authoritative_thread(thread)
+
+        async with _materialization_slot(_FULL_MATERIALIZATION_SEMAPHORE):
+            if _backend(thread) == "virtual":
+                raw = await self._virtual_loader(
+                    thread, path, generation, read_limit=MAX_FILE_BYTES
+                )
+            elif self._remote_loader is not None:
+                raw = await self._remote_loader(
+                    thread, path, generation, read_limit=MAX_FILE_BYTES
+                )
+            else:
+                raw = await _read_remote_default(
+                    thread,
+                    path,
+                    generation,
+                    generation_resolver=resolve_generation,
+                    read_limit=MAX_FILE_BYTES,
+                )
+            if len(raw.data) > MAX_FILE_BYTES:
+                raise CanvasFileError(413, "canvas_file_too_large", "File is too large")
+            authoritative = await self._authoritative_thread(thread)
+            if current_workspace_generation(authoritative) != generation:
+                if asyncssh is not None:
+                    await _evict_sftp_generation(
+                        str(thread.get("id") or ""), generation
+                    )
+                raise CanvasFileError(
+                    409,
+                    "workspace_generation_changed",
+                    "The selected workspace generation is no longer current",
+                )
+        return path, raw
 
     async def _materialize(
         self,

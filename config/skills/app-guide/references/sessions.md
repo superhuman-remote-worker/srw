@@ -121,6 +121,9 @@ deployment authorization.
   once anything is cited, **Files** only when the session has a session folder
   in the cloud, and **Git**, **IDE**, or **SSH** when the workspace provides
   them. A session without a session folder has no **Files** entry anywhere.
+- **Downloads**: a workspace file link the agent writes in chat downloads that
+  file when tapped; the Canvas toolbar has **Download** for the presented
+  file.
 
 ## Change this session while keeping the conversation
 

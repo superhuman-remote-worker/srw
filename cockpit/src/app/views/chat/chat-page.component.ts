@@ -32,6 +32,7 @@ import {normalizeWorkspacePath} from '../../core/markdown/link-extension';
 import {SettingsPaneComponent} from './settings-pane.component';
 import {ConfigDriftDialogComponent} from './config-drift-dialog.component';
 import {ApiService} from '../../core/services/api.service';
+import {WorkspaceFileDownloadService} from '../../core/services/workspace-file-download.service';
 import {PersistentThreadMessage, Thread} from '../../core/models/api.model';
 import {SubagentTranscriptComponent} from './subagent-transcript.component';
 
@@ -279,6 +280,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly transloco = inject(TranslocoService);
     private readonly api = inject(ApiService);
     private readonly canvas = inject(CanvasService);
+    private readonly downloads = inject(WorkspaceFileDownloadService);
     readonly viewport = inject(ViewportService);
     private readonly destroyRef = inject(DestroyRef);
     private routeGeneration = 0;
@@ -543,9 +545,9 @@ export class ChatPageComponent implements OnInit, OnDestroy {
             this.openCanvas(true);
             return;
         }
-        this.toast.info(
-            this.transloco.translate('canvas.workspaceFile.notPresented', {path: requested}),
-        );
+        // Any other file the agent links to: save it to the user's device.
+        const threadId = this.chat.threadId();
+        if (threadId) void this.downloads.download(threadId, requested);
     }
 
     openSharedBrowser(): void {

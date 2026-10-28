@@ -127,6 +127,8 @@
     "untrusted": "Agent-provided content",
     "lastSynced": "Last synced",
     "refresh": "Refresh Canvas status",
+    "download": "Download file",
+    "staticHtmlNotice": "This preview hides the page's scripts and styles for safety. Download the file to open it in your browser.",
     "popOut": "Open Canvas in a new window",
     "close": "Close Canvas",
     "open": "Open Canvas",
@@ -134,7 +136,10 @@
     "skipToCanvas": "Skip to Canvas",
     "newContent": "New Canvas content waiting",
     "workspaceFile": {
-      "notPresented": "{{path}} is a file in this session's workspace. Ask the agent to present it on the Canvas."
+      "notFound": "{{path}} isn't in this session's workspace.",
+      "tooLarge": "{{path}} is too large to download here (the limit is 50 MB).",
+      "unavailable": "{{path}} can't be downloaded while the workspace is asleep. Send a message to wake the session, then try again.",
+      "downloadFailed": "{{path}} couldn't be downloaded."
     },
     "returnToChat": "Return to chat",
     "resize": "Resize chat and Canvas",

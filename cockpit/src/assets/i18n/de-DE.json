@@ -127,6 +127,8 @@
     "untrusted": "Vom Agenten bereitgestellter Inhalt",
     "lastSynced": "Zuletzt synchronisiert",
     "refresh": "Canvas-Status aktualisieren",
+    "download": "Datei herunterladen",
+    "staticHtmlNotice": "Diese Vorschau blendet die Skripte und Styles der Seite aus Sicherheitsgründen aus. Lade die Datei herunter, um sie in deinem Browser zu öffnen.",
     "popOut": "Canvas in einem neuen Fenster öffnen",
     "close": "Canvas schließen",
     "open": "Canvas öffnen",
@@ -134,7 +136,10 @@
     "skipToCanvas": "Zum Canvas springen",
     "newContent": "Neuer Canvas-Inhalt verfügbar",
     "workspaceFile": {
-      "notPresented": "{{path}} ist eine Datei im Workspace dieser Session. Bitte den Agenten, sie im Canvas zu präsentieren."
+      "notFound": "{{path}} liegt nicht im Workspace dieser Session.",
+      "tooLarge": "{{path}} ist zu groß zum Herunterladen (Limit: 50 MB).",
+      "unavailable": "{{path}} kann nicht heruntergeladen werden, solange der Workspace schläft. Schick eine Nachricht, um die Session zu wecken, und versuch es dann noch einmal.",
+      "downloadFailed": "{{path}} konnte nicht heruntergeladen werden."
     },
     "returnToChat": "Zurück zum Chat",
     "resize": "Chat und Canvas in der Größe ändern",

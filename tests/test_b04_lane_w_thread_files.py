@@ -1100,3 +1100,93 @@ class TestDependencyResolution:
 
         assert first is not second
         assert first.store is second.store
+
+
+# =============================================================================
+# Workspace file download
+# =============================================================================
+
+
+class TestThreadFileDownload:
+    PATH = f"/api/persistent/threads/{THREAD}/files/output/site/index.html"
+
+    @pytest.fixture
+    def gateway(self, monkeypatch):
+        from orchestrator.services.canvas_files import RawWorkspaceFile
+
+        seen = SimpleNamespace(
+            calls=[],
+            result=("output/site/index.html", RawWorkspaceFile(b"<h1>hi</h1>")),
+            error=None,
+        )
+
+        class FakeGateway:
+            def __init__(self, *, thread_loader=None):
+                seen.thread_loader = thread_loader
+
+            async def read_download(self, thread, path):
+                seen.calls.append((thread["id"], path))
+                if seen.error is not None:
+                    raise seen.error
+                return seen.result
+
+        monkeypatch.setattr(thread_routes, "ThreadWorkspaceFileGateway", FakeGateway)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_the_owner_gate_runs_first(self, wire, gateway):
+        response = await call(wire, "GET", self.PATH, headers={})
+        assert response.status_code == 401
+        assert gateway.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_owner_gets_the_file_as_an_attachment(self, wire, gateway):
+        response = await call(wire, "GET", self.PATH)
+
+        assert response.status_code == 200
+        assert response.content == b"<h1>hi</h1>"
+        assert gateway.calls == [(THREAD, "output/site/index.html")]
+        assert gateway.thread_loader is wire.holder.store.get_thread
+        assert response.headers["content-type"] == "application/octet-stream"
+        assert response.headers["content-disposition"] == (
+            "attachment; filename*=UTF-8''index.html"
+        )
+        assert response.headers["content-length"] == "11"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["cache-control"] == "private, no-store"
+        assert "sandbox" in response.headers["content-security-policy"]
+        # Ownership is checked again after the read.
+        assert wire.events == ["owner", "owner"]
+
+    @pytest.mark.asyncio
+    async def test_a_name_outside_ascii_is_percent_encoded(self, wire, gateway):
+        from orchestrator.services.canvas_files import RawWorkspaceFile
+
+        gateway.result = ("Bericht ü.html", RawWorkspaceFile(b"x"))
+        response = await call(
+            wire, "GET", f"/api/persistent/threads/{THREAD}/files/Bericht%20ü.html"
+        )
+        assert gateway.calls == [(THREAD, "Bericht ü.html")]
+        assert response.headers["content-disposition"] == (
+            "attachment; filename*=UTF-8''Bericht%20%C3%BC.html"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "code"),
+        [
+            (404, "canvas_file_not_found"),
+            (409, "workspace_unavailable"),
+            (413, "canvas_file_too_large"),
+            (422, "invalid_canvas_path"),
+        ],
+    )
+    async def test_a_read_failure_keeps_its_status_and_code(
+        self, wire, gateway, status, code
+    ):
+        from orchestrator.services.canvas_files import CanvasFileError
+
+        gateway.error = CanvasFileError(status, code, "nope")
+        response = await call(wire, "GET", self.PATH)
+        assert response.status_code == status
+        assert response.json()["detail"] == {"code": code, "message": "nope"}

@@ -12,6 +12,7 @@ import type {ConfigDriftItem} from '../../core/services/resume-error';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppToastService} from '../../ui/toast';
 import {ApiService} from '../../core/services/api.service';
+import {WorkspaceFileDownloadService} from '../../core/services/workspace-file-download.service';
 import type {
   PersistentThreadHistory,
   PersistentThreadMessage,
@@ -54,6 +55,7 @@ function createFixture(options: {
   };
   viewport: {isMobile: ReturnType<typeof signal<boolean>>};
   toast: {danger: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>};
+  downloads: {download: ReturnType<typeof vi.fn>};
   router: {navigate: ReturnType<typeof vi.fn>};
   api: {
     getPersistentThread: ReturnType<typeof vi.fn>;
@@ -97,6 +99,7 @@ function createFixture(options: {
   });
   const viewport = {isMobile: signal(false)};
   const toast = {danger: vi.fn(), info: vi.fn()};
+  const downloads = {download: vi.fn().mockResolvedValue(true)};
   const router = {navigate: vi.fn().mockResolvedValue(true)};
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(of(options.thread ?? {
@@ -128,6 +131,7 @@ function createFixture(options: {
       {provide: CanvasService, useValue: canvas},
       {provide: ViewportService, useValue: viewport},
       {provide: AppToastService, useValue: toast},
+      {provide: WorkspaceFileDownloadService, useValue: downloads},
       {provide: ErrorMessageService, useValue: {translate: vi.fn()}},
       {
         provide: TranslocoService,
@@ -145,6 +149,7 @@ function createFixture(options: {
     canvas,
     viewport,
     toast,
+    downloads,
     router,
     api,
   };
@@ -918,20 +923,20 @@ describe('ChatPageComponent workspace file links', () => {
     }
   });
 
-  it('names a file the Canvas is not presenting instead of opening it', () => {
-    const {component, canvas, toast} = createFixture({threadId: 'thread-1'});
+  it('downloads a file the Canvas is not presenting', () => {
+    const {component, chat, canvas, toast, downloads} = createFixture({threadId: 'thread-1'});
     component.ngOnInit();
     TestBed.tick();
+    chat.threadId.set('thread-1');
     canvas.state.set(presentedState(1, 'output/report.md'));
     TestBed.tick();
     component.closeCanvas();
 
-    component.openWorkspaceFile('output/prospects.csv');
+    component.openWorkspaceFile('./output/prospects.csv');
 
     expect(component.canvasContentVisible()).toBe(false);
-    expect(toast.info).toHaveBeenCalledWith(
-      'canvas.workspaceFile.notPresented:output/prospects.csv',
-    );
+    expect(downloads.download).toHaveBeenCalledWith('thread-1', 'output/prospects.csv');
+    expect(toast.info).not.toHaveBeenCalled();
   });
 
   it('ignores an activation that does not address a workspace file', () => {

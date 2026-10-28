@@ -16,6 +16,7 @@ import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {CanvasService} from '../../core/services/canvas.service';
+import {WorkspaceFileDownloadService} from '../../core/services/workspace-file-download.service';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconComponent} from '../../ui/icon';
@@ -180,6 +181,14 @@ export function browserOpenErrorKey(code: string | null): string {
                            (clicked)="canvas.reconcile()">
             <app-icon size="sm">refresh</app-icon>
           </app-icon-button>
+          @if (downloadPath()) {
+            <app-icon-button size="sm" [ariaLabel]="'canvas.download' | transloco"
+                             [tooltip]="'canvas.download' | transloco"
+                             [loading]="downloading()"
+                             (clicked)="downloadFile()">
+              <app-icon size="sm">download</app-icon>
+            </app-icon-button>
+          }
           @if (isLiveAppSource()) {
             <app-icon-button size="sm"
                              [ariaLabel]="'canvas.app.reset.action' | transloco"
@@ -219,6 +228,13 @@ export function browserOpenErrorKey(code: string | null): string {
               {{ 'canvas.offline.bodyUndated' | transloco }}
             }
           </span>
+        </div>
+      }
+
+      @if (staticHtmlPreview()) {
+        <div class="canvas-offline-notice" role="note">
+          <app-icon size="sm">code_off</app-icon>
+          <span>{{ 'canvas.staticHtmlNotice' | transloco }}</span>
         </div>
       }
 
@@ -430,6 +446,7 @@ export class CanvasPaneComponent {
   readonly dirtyChange = output<boolean>();
 
   readonly canvas = inject(CanvasService);
+  private readonly downloads = inject(WorkspaceFileDownloadService);
   private readonly content = inject(CanvasContentController);
   readonly editor = inject(CanvasEditController);
   readonly viewer = inject(CanvasViewerController);
@@ -522,6 +539,19 @@ export class CanvasPaneComponent {
   readonly snapshotBacked = computed(() => this.state()?.content_origin === 'snapshot');
   readonly snapshotCapturedAt = computed(() => this.state()?.content_captured_at ?? null);
   readonly isLiveAppSource = computed(() => this.chromeState()?.source?.type === 'workspace_app');
+  /** The presented workspace file, which the toolbar offers to download. */
+  readonly downloadPath = computed(() => {
+    const source = this.chromeState()?.source;
+    return source?.type === 'workspace_file' && typeof source.path === 'string'
+      ? source.path
+      : null;
+  });
+  readonly downloading = signal(false);
+  /** The static preview strips scripts and styles; say so, so a page that
+   *  looks broken isn't mistaken for a broken file. */
+  readonly staticHtmlPreview = computed(() =>
+    declaredCanvasRenderer(this.state()) === 'html' && !this.editor.editMode(),
+  );
   readonly sourceKindLabel = computed(() => {
     const type = this.chromeState()?.source?.type;
     const kind = type === 'workspace_file'
@@ -764,6 +794,18 @@ export class CanvasPaneComponent {
     }
     this.editor.enterEdit();
     queueMicrotask(() => this.canvasEditor()?.focus());
+  }
+
+  async downloadFile(): Promise<void> {
+    const threadId = this.canvas.threadId();
+    const path = this.downloadPath();
+    if (!threadId || !path || this.downloading()) return;
+    this.downloading.set(true);
+    try {
+      await this.downloads.download(threadId, path);
+    } finally {
+      this.downloading.set(false);
+    }
   }
 
   popOutCanvas(): void {

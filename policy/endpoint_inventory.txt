@@ -413,6 +413,7 @@ POST   /api/persistent/threads/{thread_id}/cloud-diff/restage                   
 GET    /api/persistent/threads/{thread_id}/cloud-diff/{file_path:path}                  pat=chat:read       gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}/config                                       pat=chat:write      gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/controls                                     pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/files/{path:path}                            pat=chat:read       gated:require_thread_owner
 DELETE /api/persistent/threads/{thread_id}/ide                                          pat=chat:write      gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/ide                                          pat=chat:read       gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/ide                                          pat=chat:write      gated:require_thread_owner

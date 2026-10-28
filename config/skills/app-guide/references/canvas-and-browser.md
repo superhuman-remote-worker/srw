@@ -107,6 +107,10 @@ access, or external and sibling resources; every CSS, script, image, and font
 must be in the one bounded HTML file. It is an isolated artifact, not a live
 workspace application.
 
+A static HTML preview says that it hides scripts and styles. **Download** in
+the Canvas toolbar saves any presented file, so the user can open the page in
+their own browser as it was written.
+
 An Office document is detected from the file itself, so `auto` is enough and
 no other renderer will accept it. On a deployment without the Office editor
 the presentation fails outright instead of degrading to text, so ask the agent

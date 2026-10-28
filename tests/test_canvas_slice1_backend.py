@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
@@ -28,6 +29,7 @@ from orchestrator.services.canvas import (
     build_public_canvas_representation,
     canonical_source_fingerprint,
 )
+from orchestrator.services import canvas_files as canvas_files_module
 from orchestrator.services.canvas_files import (
     CanvasFileError,
     RawWorkspaceFile,
@@ -453,6 +455,116 @@ async def test_sftp_transport_uses_renderer_specific_read_ceiling(
         FakeSFTP(), root="/home/agent-host/workspace", path=path
     )
     assert reads == [expected_read]
+
+
+@pytest.mark.asyncio
+async def test_a_download_read_takes_the_file_ceiling_for_any_type(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from orchestrator.services import canvas_files
+
+    monkeypatch.setattr(canvas_files, "MAX_TEXT_BYTES", 11)
+    monkeypatch.setattr(canvas_files, "MAX_FILE_BYTES", 100)
+    reads: list[int] = []
+
+    class RemoteFile:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def read(self, limit):
+            reads.append(limit)
+            return b"<html>"
+
+    class FakeSFTP:
+        async def lstat(self, current):
+            mode = stat.S_IFREG if current.endswith("site.html") else stat.S_IFDIR
+            return SimpleNamespace(permissions=mode | 0o700, size=50, mtime=None)
+
+        async def realpath(self, current):
+            return current
+
+        def open(self, current, mode):
+            return RemoteFile()
+
+    raw = await canvas_files._read_sftp_workspace_file(
+        FakeSFTP(),
+        root="/home/agent-host/workspace",
+        path="output/site.html",
+        read_limit=canvas_files.MAX_FILE_BYTES,
+    )
+    assert raw.data == b"<html>"
+    assert reads == [101]
+
+
+@pytest.mark.asyncio
+async def test_a_download_returns_unrendered_bytes_of_the_current_workspace() -> None:
+    seen: list[tuple[str, int]] = []
+
+    async def virtual_loader(thread, path, generation, *, read_limit):
+        seen.append((path, read_limit))
+        return RawWorkspaceFile(b"PK\x03\x04 any bytes")
+
+    gateway = ThreadWorkspaceFileGateway(virtual_loader=virtual_loader)
+    path, raw = await gateway.read_download(
+        _thread(backend="virtual"), "output/site.zip"
+    )
+
+    assert path == "output/site.zip"
+    assert raw.data == b"PK\x03\x04 any bytes"
+    assert seen == [("output/site.zip", canvas_files_module.MAX_FILE_BYTES)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["../secrets", "/etc/passwd", "a/./b", "a\\b"])
+async def test_a_download_refuses_a_non_canonical_path_before_reading(path) -> None:
+    loader = AsyncMock()
+    gateway = ThreadWorkspaceFileGateway(virtual_loader=loader)
+
+    with pytest.raises(CanvasFileError) as error:
+        await gateway.read_download(_thread(backend="virtual"), path)
+
+    assert error.value.status_code == 422
+    loader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_download_over_the_file_ceiling_is_too_large(monkeypatch) -> None:
+    monkeypatch.setattr(canvas_files_module, "MAX_FILE_BYTES", 4)
+
+    async def virtual_loader(thread, path, generation, *, read_limit):
+        return RawWorkspaceFile(b"12345")
+
+    gateway = ThreadWorkspaceFileGateway(virtual_loader=virtual_loader)
+    with pytest.raises(CanvasFileError) as error:
+        await gateway.read_download(_thread(backend="virtual"), "big.bin")
+
+    assert (error.value.status_code, error.value.code) == (413, "canvas_file_too_large")
+
+
+@pytest.mark.asyncio
+async def test_a_download_fails_when_the_workspace_changed_during_the_read() -> None:
+    async def virtual_loader(thread, path, generation, *, read_limit):
+        return RawWorkspaceFile(b"data")
+
+    current = _thread(backend="virtual")
+    rebound = _thread(
+        backend="virtual", generation=UUID("22222222-bbbb-4bbb-8bbb-222222222222")
+    )
+    loads = iter([current, rebound])
+
+    async def thread_loader(_thread_id):
+        return next(loads)
+
+    gateway = ThreadWorkspaceFileGateway(
+        virtual_loader=virtual_loader, thread_loader=thread_loader
+    )
+    with pytest.raises(CanvasFileError) as error:
+        await gateway.read_download(current, "output/report.md")
+
+    assert error.value.code == "workspace_generation_changed"
 
 
 @pytest.mark.asyncio

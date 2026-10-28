@@ -24,11 +24,20 @@ project's knowledge.
 
 Virtual workspaces keep their own files in SRW's storage between turns and
 resumes. That storage is not your cloud storage, and a Virtual session has no
-shell, git, or IDE: its workspace files show only through the session, for
-example when the agent presents one on Canvas. A cloud folder attached to a
-Virtual session is different: it is reached at `cloud/<name>` like on any other
-tier (see Cloud storage below). Container and VM workspaces can be
+shell, git, or IDE: its workspace files show only through the session, when
+the agent links one in chat or presents one on Canvas. A cloud folder attached
+to a Virtual session is different: it is reached at `cloud/<name>` like on any
+other tier (see Cloud storage below). Container and VM workspaces can be
 git-versioned. None workspaces have no workspace files.
+
+## Handing a file to the user
+
+In a session, write a workspace-relative link to the file in chat, for example
+`[index.html](output/site/index.html)`. Tapping it downloads the file, on a
+phone too: any type, up to 50 MB; a Container or VM workspace must be running.
+A file presented on the Canvas also has **Download** in the Canvas toolbar.
+Never link an absolute path such as `/home/agent-host/workspace/...`. Don't
+promise a **Files** button unless the session has a cloud folder (below).
 
 ## Git
 
@@ -68,10 +77,10 @@ at **Read-only**); a file written anywhere else in the workspace does not.
 - **Sessions** can have a session folder in the cloud (the **Session outbox**
   connector). While one is attached, **Files** in the chat header's **More
   actions** (⋮) menu opens it, and an ended session keeps a **Files** button
-  in the header. A session without a session folder has no **Files** entry,
-  and the chat offers no other download of its workspace files. With the
-  outbox attached, the agent hands you a file by writing it into
-  `cloud/outbox`.
+  in the header. A session without a session folder has no **Files** entry;
+  its workspace files reach you as links in chat (see Handing a file to the
+  user above). With the outbox attached, the agent can also hand you a file
+  by writing it into `cloud/outbox`.
 - **Virtual** sessions reach attached cloud folders too, at the same
   `cloud/<name>` path, with the agent's file tools and no shell: there is no
   workspace Pod, and each file operation goes to the cloud directly. Listings

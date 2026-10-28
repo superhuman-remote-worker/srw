@@ -1537,6 +1537,14 @@ export class ApiService {
    * after the bytes have already landed, and without this the "cancel" would
    * be a lie that also litters a directory the agent can list.
    */
+  /** One file of the Session's workspace, as the bytes to save. */
+  downloadThreadFile(threadId: string, path: string): Observable<Blob> {
+    return this.http.get(
+      `${this.baseUrl}/persistent/threads/${threadId}/files/${encodeUploadPath(path)}`,
+      {params: {'ngsw-bypass': 'true'}, responseType: 'blob'},
+    );
+  }
+
   deleteThreadUpload(threadId: string, name: string): Observable<void> {
     return this.http
       .delete<{deleted: boolean}>(
