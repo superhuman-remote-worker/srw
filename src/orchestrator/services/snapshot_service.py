@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 SnapshotCaptureAuthority = Callable[[], Awaitable[bool]]
 
+# Waits between re-probes of a store that failed its startup probe; the last
+# one repeats until the store answers.
+SNAPSHOT_REPROBE_DELAYS_S = (5, 10, 20, 40, 60)
+
 DEFAULT_BLOB_READ_MAX_BYTES = 64 * 1024 * 1024
 MAX_SNAPSHOT_MANIFEST_BYTES = 16 * 1024 * 1024
 _BLOB_STREAM_CHUNK_BYTES = 1024 * 1024
@@ -216,11 +220,25 @@ class SnapshotService:
         self._db: Any = None
         self._bucket: str = ""
         self._available: bool = False
+        # The store's configuration, kept after a failed probe so the
+        # re-probe can build the client again; None when S3 is unconfigured.
+        self._store_settings: Optional[dict[str, str]] = None
+        self._reprobe_failures: int = 0
 
     @property
     def is_available(self) -> bool:
         """True if S3 is configured and reachable."""
         return self._available
+
+    @property
+    def needs_reprobe(self) -> bool:
+        """A configured store that has not answered its probe yet.
+
+        A fresh ``helm install --wait`` probes before the Garage bootstrap
+        hook grants the key, so the first answer is a 403;
+        :func:`snapshot_gc_sweeper` probes again until the store answers.
+        """
+        return self._store_settings is not None and not self._available
 
     # =========================================================================
     # Lifecycle
@@ -239,6 +257,7 @@ class SnapshotService:
             # Warning, not info: everything downstream of this degrades
             # silently. Name the casualties so an operator reading startup logs
             # can tell this apart from a healthy deployment.
+            self._store_settings = None
             reason = (
                 "boto3 not installed" if not BOTO3_AVAILABLE else "S3_ENDPOINT not set"
             )
@@ -252,45 +271,94 @@ class SnapshotService:
             )
             return
 
-        access_key = os.environ.get("SNAPSHOT_S3_ACCESS_KEY_ID", "")
-        secret_key = os.environ.get("SNAPSHOT_S3_SECRET_ACCESS_KEY", "")
         self._bucket = os.environ.get("S3_BUCKET", "srw-snapshots")
-        region = os.environ.get("S3_REGION", "us-east-1")
+        self._store_settings = {
+            "endpoint": endpoint,
+            "access_key": os.environ.get("SNAPSHOT_S3_ACCESS_KEY_ID", ""),
+            "secret_key": os.environ.get("SNAPSHOT_S3_SECRET_ACCESS_KEY", ""),
+            "region": os.environ.get("S3_REGION", "us-east-1"),
+        }
+        self._reprobe_failures = 0
+        self._s3 = None
+        self._available = False
 
         try:
-            self._s3 = boto3.client(
-                "s3",
-                endpoint_url=endpoint,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                region_name=region,
-                config=BotoConfig(
-                    signature_version="s3v4",
-                    retries={"max_attempts": 3, "mode": "standard"},
-                ),
-            )
-
-            # Ensure bucket exists (auto-create for dev)
-            await _joined_blocking_call(self._ensure_bucket)
-            self._available = True
+            await self._probe_store()
             logger.info(
                 "Snapshot service ready: endpoint=%s bucket=%s",
                 endpoint,
                 self._bucket,
             )
         except Exception as e:
-            logger.warning("Snapshot service: S3 connection failed — disabled: %s", e)
-            self._s3 = None
-            self._available = False
+            logger.warning(
+                "Snapshot service: S3 connection failed — disabled until the "
+                "store answers (re-probed in the background): %s",
+                e,
+            )
 
-    def _ensure_bucket(self) -> None:
-        """Create the bucket if it doesn't exist (synchronous, run in thread)."""
+    async def _probe_store(self) -> None:
+        """Build the client, ensure the bucket, then publish both; raises."""
+        settings = self._store_settings or {}
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings["endpoint"],
+            aws_access_key_id=settings["access_key"],
+            aws_secret_access_key=settings["secret_key"],
+            region_name=settings["region"],
+            config=BotoConfig(
+                signature_version="s3v4",
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+        # Ensure bucket exists (auto-create for dev)
+        await _joined_blocking_call(self._ensure_bucket, client)
+        # The client first: a reader that sees is_available uses it at once.
+        self._s3 = client
+        self._available = True
+
+    async def reprobe(self) -> bool:
+        """Probe a configured store that failed its probe; True once it answers.
+
+        Logs the recovery once, the first failure and every tenth after it
+        as a warning (a permanently refused key would otherwise log once a
+        minute forever), the rest at debug.
+        """
+        if self._available:
+            return True
+        if self._store_settings is None:
+            return False
         try:
-            self._s3.head_bucket(Bucket=self._bucket)
+            await self._probe_store()
+        except Exception as e:
+            self._reprobe_failures += 1
+            level = (
+                logging.WARNING if self._reprobe_failures % 10 == 1 else logging.DEBUG
+            )
+            logger.log(
+                level,
+                "Snapshot service: S3 re-probe %d failed — still disabled: %s",
+                self._reprobe_failures,
+                e,
+            )
+            return False
+        logger.info(
+            "Snapshot service ready on re-probe %d: endpoint=%s bucket=%s",
+            self._reprobe_failures + 1,
+            self._store_settings["endpoint"],
+            self._bucket,
+        )
+        self._reprobe_failures = 0
+        return True
+
+    def _ensure_bucket(self, client: Any = None) -> None:
+        """Create the bucket if it doesn't exist (synchronous, run in thread)."""
+        s3 = client if client is not None else self._s3
+        try:
+            s3.head_bucket(Bucket=self._bucket)
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "")
             if error_code in ("404", "NoSuchBucket"):
-                self._s3.create_bucket(Bucket=self._bucket)
+                s3.create_bucket(Bucket=self._bucket)
                 logger.info("Created S3 bucket: %s", self._bucket)
             else:
                 raise
@@ -2405,11 +2473,29 @@ async def snapshot_gc_sweeper(
 
     Applies retention policies, soft-deletes expired snapshots, and
     purges items past the 7-day grace period.
+
+    It is also the store's re-probe: while a configured store has not
+    answered (a fresh install probes before the Garage key grant exists),
+    it probes again after 5, 10, 20, 40 and then every 60 s, so workspace
+    suspension and every other ``is_available`` reader come up without a
+    restart. Every replica runs it; availability is per-process state.
     """
     logger.info("Snapshot GC sweeper started")
     gc_interval = 24 * 3600  # 24 hours
+    reprobe_attempt = 0
 
     while not shutdown_event.is_set():
+        if snapshots.needs_reprobe:
+            if not await snapshots.reprobe():
+                delay = SNAPSHOT_REPROBE_DELAYS_S[
+                    min(reprobe_attempt, len(SNAPSHOT_REPROBE_DELAYS_S) - 1)
+                ]
+                reprobe_attempt += 1
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+                    break
+                except asyncio.TimeoutError:
+                    continue
         try:
             if snapshots.is_available:
                 stats = await snapshots.run_gc()

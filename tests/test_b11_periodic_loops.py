@@ -701,6 +701,7 @@ class TestSnapshotGcSweeper:
         )
         snapshots = MagicMock()
         snapshots.is_available = True
+        snapshots.needs_reprobe = False
         stats = {"soft_deleted": 1, "purged": 0}
         snapshots.run_gc = AsyncMock(side_effect=[RuntimeError("s3 down"), stats])
 
@@ -725,9 +726,11 @@ class TestSnapshotGcSweeper:
     async def test_unavailable_service_is_not_collected(self, monkeypatch):
         snapshots = MagicMock()
         snapshots.is_available = False
+        snapshots.needs_reprobe = False  # S3 not configured: nothing to probe
         snapshots.run_gc = AsyncMock()
+        snapshots.reprobe = AsyncMock()
 
-        await _drive(
+        cadence = await _drive(
             monkeypatch,
             snapshot_service_module,
             snapshot_service_module.snapshot_gc_sweeper,
@@ -735,6 +738,61 @@ class TestSnapshotGcSweeper:
             snapshots=snapshots,
         )
 
+        snapshots.run_gc.assert_not_awaited()
+        snapshots.reprobe.assert_not_awaited()
+        assert cadence.timeouts == [86400]
+
+    @pytest.mark.asyncio
+    async def test_a_store_that_failed_its_probe_is_probed_again_with_backoff(
+        self, monkeypatch
+    ):
+        # A fresh install: the store refuses until the bootstrap hook grants
+        # the key, here after the third re-probe.
+        class _Store:
+            is_available = False
+            answers = iter([False, False, True])
+
+            @property
+            def needs_reprobe(self):
+                return not self.is_available
+
+            async def _reprobe(self):
+                self.is_available = next(self.answers)
+                return self.is_available
+
+        snapshots = _Store()
+        snapshots.reprobe = AsyncMock(side_effect=snapshots._reprobe)
+        snapshots.run_gc = AsyncMock(return_value={})
+
+        cadence = await _drive(
+            monkeypatch,
+            snapshot_service_module,
+            snapshot_service_module.snapshot_gc_sweeper,
+            ticks=3,
+            snapshots=snapshots,
+        )
+
+        assert cadence.timeouts == [5, 10, 86400]
+        assert snapshots.reprobe.await_count == 3
+        snapshots.run_gc.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_permanently_refused_store_backs_off_to_a_minute(self, monkeypatch):
+        snapshots = MagicMock()
+        snapshots.is_available = False
+        snapshots.needs_reprobe = True
+        snapshots.reprobe = AsyncMock(return_value=False)
+        snapshots.run_gc = AsyncMock()
+
+        cadence = await _drive(
+            monkeypatch,
+            snapshot_service_module,
+            snapshot_service_module.snapshot_gc_sweeper,
+            ticks=7,
+            snapshots=snapshots,
+        )
+
+        assert cadence.timeouts == [5, 10, 20, 40, 60, 60, 60]
         snapshots.run_gc.assert_not_awaited()
 
 
