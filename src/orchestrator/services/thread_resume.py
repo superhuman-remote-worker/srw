@@ -547,6 +547,16 @@ async def resume_thread(
                         raise HTTPException(
                             503, "Retained initial workspace storage changed"
                         )
+                if isinstance(settled, dict) and "unpublished_creation" in settled:
+                    # The cluster refused this Session's only workspace Pod, so
+                    # it has no workspace to resume (as after a failed upgrade).
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The cluster refused this Session's workspace, so it "
+                            "can't be resumed; start a new Session"
+                        ),
+                    )
                 if not await postgres_db.resume_thread(thread_id):
                     raise HTTPException(
                         status_code=409,

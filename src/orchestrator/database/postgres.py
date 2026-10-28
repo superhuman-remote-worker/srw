@@ -47196,6 +47196,347 @@ class PostgresDB:
                     return None
                 return initial
 
+    async def _unpublished_creation_retirement_is_current_on_conn(
+        self,
+        conn: Any,
+        thread: Any,
+        unpublished: dict[str, Any],
+        *,
+        admission: bool = False,
+        require_settled: bool = False,
+    ) -> dict[str, Any] | None:
+        """Validate a refused creation's End under owner -> queue -> ledger locks.
+
+        The cluster refused the one Pod create, so the creation never recorded
+        a runtime or Pod UID and its Pod effect was never observed. Admission
+        also needs every effect past its ambiguity window, so no late create
+        can still land. Returns the locked reservation row, else None.
+        """
+        from shared.session_retirement import (
+            active_claim_authority,
+            stateless_retirement_authority,
+            stateless_settled_retirement_authority,
+            unpublished_creation_retirement_authority,
+        )
+        from shared.workspace_upgrade import workspace_upgrade_seed_from
+
+        try:
+            unpublished = unpublished_creation_retirement_authority(unpublished)
+            metadata = _strict_json_object(thread["metadata"], label="thread metadata")
+        except RuntimeError:
+            return None
+        workspace = metadata.get("workspace_container")
+        if (
+            thread["execution_lane"] != "stateless"
+            or str(thread["runtime_generation"]) != unpublished["generation"]
+            or not isinstance(workspace, dict)
+            or workspace.get("provisioner") != "k8s"
+            or workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY) is not None
+            or workspace.get("_creation_reservation_id")
+            not in {None, unpublished["reservation_id"]}
+            or metadata.get("_workspace_binding")
+            or workspace.get("_canvas_workspace_generation") is not None
+            or workspace.get("_snapshot_restore_required", False) is not False
+        ):
+            return None
+        queue = await conn.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE", thread["id"]
+        )
+        if admission:
+            # The same queue and claim history the initial End admits,
+            # including a container upgrade's (C1) served lite turns.
+            upgrade_history = bool(
+                workspace_upgrade_seed_from(metadata) is not None
+                and queue is not None
+                and queue["state"] != "leased"
+                and queue["leased_by"] is None
+            )
+            if thread["status"] not in (
+                ("created", "active", "awaiting_user")
+                if upgrade_history
+                else ("created",)
+            ) or (
+                queue is not None
+                and (
+                    queue["unit_kind"] != "session_turn"
+                    or queue["state"] == "leased"
+                    or (queue["lease_token"] != 0 and not upgrade_history)
+                )
+            ):
+                return None
+            if any(
+                key in metadata
+                for key in (
+                    "_stateless_claim_retirement",
+                    "_stateless_workspace_retirement_settled",
+                    "_stateless_claim_losses",
+                    "_stateless_claim_loss_hold",
+                )
+            ):
+                return None
+            if "_stateless_active_claim" in metadata:
+                try:
+                    active = active_claim_authority(metadata)
+                except RuntimeError:
+                    return None
+                if (
+                    not upgrade_history
+                    or active is None
+                    or active[0] > queue["lease_token"]
+                ):
+                    return None
+        else:
+            try:
+                marker = stateless_retirement_authority(
+                    metadata
+                ) or stateless_settled_retirement_authority(metadata)
+            except RuntimeError:
+                return None
+            if (
+                thread["status"] != "ended"
+                or not isinstance(marker, dict)
+                or marker.get("unpublished_creation") != unpublished
+                or queue is None
+                or queue["unit_kind"] != "session_turn"
+                or queue["state"] != "done"
+                or queue["lease_token"] != marker.get("terminal_token")
+                or queue["leased_by"] is not None
+            ):
+                return None
+        creation = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            unpublished["reservation_id"],
+            thread["id"],
+        )
+        if creation is None or any(
+            (
+                str(creation["thread_runtime_generation"]) != unpublished["generation"],
+                creation["reservation_generation"]
+                != unpublished["reservation_generation"],
+                creation["operation_kind"] != "create",
+                creation["runtime_incarnation"] is not None,
+                creation["pod_uid"] is not None,
+            )
+        ):
+            return None
+        try:
+            effects = _strict_json_object(
+                creation["external_effects"], label="creation effects"
+            )
+        except RuntimeError:
+            return None
+        pod_effect = effects.get("pod")
+        if (
+            not isinstance(pod_effect, dict)
+            or pod_effect.get("issued_at") is None
+            or pod_effect.get("observed_uid") is not None
+        ):
+            return None
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$2::uuid) "
+            "OR EXISTS(SELECT 1 FROM thread_turn_commits WHERE thread_id=$1::uuid) "
+            "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid)",
+            thread["id"],
+            unpublished["reservation_id"],
+        ):
+            return None
+        if admission:
+            try:
+                creation_marker = _stateless_runtime_creation_marker(workspace)
+            except RuntimeError:
+                return None
+            # The lease may have lapsed; quiescence alone says no late create
+            # can still land.
+            if not (
+                creation_marker
+                == {
+                    "generation": unpublished["generation"],
+                    "mode": "create",
+                    "attempted": True,
+                    "replaces_uid": None,
+                    "legacy": False,
+                }
+                and workspace.get("status") != "ready"
+                and creation["phase"] == "mutating"
+                and creation["settled_at"] is None
+                and creation["cancel_requested_at"] is None
+                and await conn.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM "
+                    "jsonb_each($1::jsonb) AS effect "
+                    "WHERE effect.value ->> 'observed_uid' IS NULL "
+                    "AND (effect.value ->> 'ambiguity_until')::timestamptz > now())",
+                    json.dumps(effects),
+                )
+            ):
+                return None
+            return dict(creation)
+        if (
+            creation["cancel_requested_at"] is None
+            or creation["cancel_target_disposition"] != "deleted"
+        ):
+            return None
+        if require_settled and not (
+            creation["result_kind"] == "aborted"
+            and creation["settled_at"] is not None
+            and creation["cancel_cleanup_completed_at"] is not None
+        ):
+            return None
+        return dict(creation)
+
+    async def get_stateless_unpublished_creation_candidate(
+        self, thread_id: str, *, namespace: str
+    ) -> dict[str, Any] | None:
+        """Name the current refused creation End may retire, else None."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return None
+                creation = await conn.fetchrow(
+                    "SELECT id, reservation_generation, thread_runtime_generation "
+                    "FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND scope='workspace_container' AND settled_at IS NULL",
+                    thread["id"],
+                )
+                if creation is None or creation["thread_runtime_generation"] is None:
+                    return None
+                unpublished = {
+                    "generation": str(creation["thread_runtime_generation"]),
+                    "reservation_id": str(creation["id"]),
+                    "reservation_generation": int(creation["reservation_generation"]),
+                    "namespace": namespace,
+                }
+                if not await self._unpublished_creation_retirement_is_current_on_conn(
+                    conn, thread, unpublished, admission=True
+                ):
+                    return None
+                return unpublished
+
+    async def get_stateless_unpublished_creation_retirement(
+        self,
+        thread_id: str,
+        *,
+        require_settled: bool = False,
+    ) -> dict[str, Any] | None:
+        """Read the exact refused-creation End ledger, after a restart too."""
+        storage = await self.get_stateless_unpublished_creation_storage(
+            thread_id, require_settled=require_settled
+        )
+        return storage["unpublished_creation"] if storage is not None else None
+
+    async def get_stateless_unpublished_creation_storage(
+        self,
+        thread_id: str,
+        *,
+        require_settled: bool = True,
+    ) -> dict[str, Any] | None:
+        """The ended refused creation and the storage its reservation recorded."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return None
+                metadata = _strict_json_object(
+                    thread["metadata"], label="thread metadata"
+                )
+                marker = metadata.get("_stateless_claim_retirement") or metadata.get(
+                    "_stateless_workspace_retirement_settled"
+                )
+                unpublished = (
+                    marker.get("unpublished_creation")
+                    if isinstance(marker, dict)
+                    else None
+                )
+                if not isinstance(unpublished, dict):
+                    return None
+                creation = (
+                    await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn,
+                        thread,
+                        unpublished,
+                        require_settled=require_settled,
+                    )
+                )
+                if creation is None:
+                    return None
+                return {
+                    "unpublished_creation": unpublished,
+                    "resource_policy": creation["cancel_resource_policy"],
+                    **{
+                        field: (
+                            str(creation[field])
+                            if creation[field] is not None
+                            else None
+                        )
+                        for field in ("pvc_uid", "service_uid", "seed_configmap_uid")
+                    },
+                }
+
+    async def record_unpublished_creation_storage_reclaimed(
+        self, thread_id: str, *, unpublished: dict[str, Any]
+    ) -> bool:
+        """Mark a soft-Ended refused creation's kept storage as reclaimed.
+
+        Soft End kept the PVC under a preserve cancellation. Permanent End
+        removed it, and its exact queue authority now records that on the same
+        aborted reservation, which the owner-delete guard reads (0561).
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return False
+                try:
+                    state = _strict_json_object(
+                        thread["metadata"], label="thread metadata"
+                    )
+                except RuntimeError:
+                    return False
+                if (
+                    await self._lock_terminal_workspace_reclaim_authority(
+                        conn,
+                        owner_kind="thread",
+                        owner_id=thread["id"],
+                        owner_status=str(thread["status"] or ""),
+                        owner_state=state,
+                    )
+                    is None
+                ):
+                    return False
+                creation = (
+                    await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn, thread, unpublished, require_settled=True
+                    )
+                )
+                if creation is None:
+                    return False
+                updated = await conn.execute(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET cancel_resource_policy = 'terminal_reclaim' "
+                    "WHERE id = $1 AND settled_at IS NOT NULL "
+                    "AND result_kind = 'aborted' AND runtime_incarnation IS NULL "
+                    "AND pod_uid IS NULL AND cancel_cleanup_completed_at IS NOT NULL",
+                    creation["id"],
+                )
+                return updated == "UPDATE 1"
+
     async def begin_stateless_thread_workspace_retirement(
         self,
         thread_id: str,
@@ -47205,6 +47546,7 @@ class PostgresDB:
         workspace_absence_proven: bool = False,
         initial_creation: dict[str, Any] | None = None,
         retained_startup_attention: dict[str, Any] | None = None,
+        unpublished_creation: dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Atomically close a stateless session queue before external teardown.
 
@@ -47222,6 +47564,10 @@ class PostgresDB:
         """
         if retained_startup_attention is not None and permanent:
             raise RuntimeError("retained startup attention supports soft End only")
+        if unpublished_creation is not None and (
+            initial_creation is not None or retained_startup_attention is not None
+        ):
+            raise RuntimeError("one stateless End names one creation authority")
         from orchestrator.services.container_provisioner import (
             WORKSPACE_RUNTIME_INCARNATION_KEY,
         )
@@ -47371,6 +47717,11 @@ class PostgresDB:
                                 ]
                             }
                             if "retained_startup_attention" in settled
+                            else {}
+                        ),
+                        **(
+                            {"unpublished_creation": settled["unpublished_creation"]}
+                            if "unpublished_creation" in settled
                             else {}
                         ),
                         "terminal_token": token,
@@ -47590,7 +47941,26 @@ class PostgresDB:
                     raise RuntimeError(
                         "stateless workspace absence proof contradicts runtime authority"
                     )
-                if physical_without_runtime and not workspace_absence_proven:
+                if (
+                    unpublished_creation is not None
+                    and not await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn,
+                        thread,
+                        unpublished_creation,
+                        admission=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "unpublished creation retirement authority changed"
+                    )
+                # A refused creation never had a Pod: the locked ledger above
+                # is the runtime preflight, and End then settles that
+                # creation through its own Pod read.
+                if (
+                    physical_without_runtime
+                    and not workspace_absence_proven
+                    and unpublished_creation is None
+                ):
                     # Kubernetes probing must happen before queue/thread
                     # mutation. The DB cannot distinguish a deterministic 404
                     # from a live or ambiguous Pod when no UID was persisted.
@@ -47762,8 +48132,12 @@ class PostgresDB:
                             "stateless session queue close lost its fence"
                         )
 
+                # A refused creation never had a Pod, so it has no shell and no
+                # residents; its End settles the creation instead.
                 shell_retirement_required = bool(
-                    terminal_token > 0 and workspace_has_physical_authority
+                    terminal_token > 0
+                    and workspace_has_physical_authority
+                    and unpublished_creation is None
                 )
                 # Every exact-live physical workspace can contain writers with
                 # buffered durable effects (IDE, browser, rclone VFS). Drain
@@ -47800,6 +48174,8 @@ class PostgresDB:
                     marker["retained_startup_attention"] = dict(
                         retained_startup_attention
                     )
+                if unpublished_creation is not None:
+                    marker["unpublished_creation"] = dict(unpublished_creation)
                 if not permanent:
                     await self._terminalize_live_session_subagents_for_retirement(
                         conn,
@@ -48596,6 +48972,25 @@ class PostgresDB:
                     return False
                 initial = marker.get("initial_creation")
                 retained = marker.get("retained_startup_attention")
+                unpublished = marker.get("unpublished_creation")
+                if unpublished is not None:
+                    # The refused creation settled with no Pod; its one-shot
+                    # create marker has nothing left to protect.
+                    if not await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn, thread, unpublished, require_settled=True
+                    ):
+                        return False
+                    creation = workspace.get(_STATELESS_RUNTIME_CREATION_KEY)
+                    if creation != {
+                        "generation": unpublished["generation"],
+                        "mode": "create",
+                        "attempted": True,
+                        "replaces_uid": None,
+                    }:
+                        return False
+                    workspace = dict(workspace)
+                    workspace.pop(_STATELESS_RUNTIME_CREATION_KEY)
+                    metadata["workspace_container"] = workspace
                 if initial is not None:
                     if not await self._initial_creation_retirement_is_current_on_conn(
                         conn,
@@ -48684,6 +49079,8 @@ class PostgresDB:
                     settled["initial_creation"] = initial
                 if retained is not None:
                     settled["retained_startup_attention"] = retained
+                if unpublished is not None:
+                    settled["unpublished_creation"] = unpublished
                 await self._terminalize_live_session_subagents_for_retirement(
                     conn,
                     parent_thread_id=thread_id,

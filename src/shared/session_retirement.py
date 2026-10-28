@@ -132,6 +132,38 @@ def initial_creation_retirement_authority(value: Any) -> dict[str, Any]:
     return result
 
 
+def unpublished_creation_retirement_authority(value: Any) -> dict[str, Any]:
+    """Parse one creation the cluster refused before any Pod existed.
+
+    It names only the aborted reservation: there is no runtime UID, so no
+    shell, resident or process ever needs a stop proof.
+    """
+
+    fields = {"generation", "reservation_id", "reservation_generation", "namespace"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("unpublished creation retirement authority is malformed")
+    result = dict(value)
+    for field in ("generation", "reservation_id"):
+        raw = result[field]
+        try:
+            if not isinstance(raw, str) or str(UUID(raw)) != raw:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                "unpublished creation retirement identity is malformed"
+            ) from exc
+    if (
+        _exact_nonnegative_int(
+            result["reservation_generation"], label="reservation_generation"
+        )
+        <= 0
+    ):
+        raise RuntimeError("unpublished creation retirement claim is malformed")
+    if not isinstance(result["namespace"], str) or not result["namespace"].strip():
+        raise RuntimeError("unpublished creation retirement namespace is malformed")
+    return result
+
+
 def retained_startup_attention_retirement_authority(value: Any) -> dict[str, Any]:
     """Parse one retained G2 attention End; this never grants Ready authority."""
 
@@ -335,6 +367,27 @@ def stateless_retirement_authority(
             raise RuntimeError(
                 "retained startup attention disagrees with terminal authority"
             )
+    if "unpublished_creation" in marker:
+        unpublished_creation_retirement_authority(marker["unpublished_creation"])
+        # No Pod was ever accepted, so there is no shell or resident to retire.
+        if (
+            "initial_creation" in marker
+            or "retained_startup_attention" in marker
+            or marker["runtime_incarnation"] is not None
+            or marker["terminal_token"] <= 0
+            or not marker["claimant_quiesced"]
+            or marker["shell_retirement_required"]
+            or marker["resident_cleanup_required"]
+            or any(
+                marker[field] is not None
+                for field in (
+                    "workspace_generation",
+                    "endpoint_generation",
+                    "host_key_fingerprint",
+                )
+            )
+        ):
+            raise RuntimeError("unpublished creation disagrees with terminal authority")
 
     # Compatibility for acknowledgements written by the first S2 build: its
     # nested jsonb_set used create_if_missing=false, so PostgreSQL could commit
@@ -503,6 +556,17 @@ def stateless_settled_retirement_authority(
             or backing_id != f"k8s-pvc:{retained['namespace']}:{retained['pvc_uid']}"
         ):
             raise RuntimeError("settled retained startup attention disagrees")
+    if "unpublished_creation" in settled:
+        unpublished_creation_retirement_authority(settled["unpublished_creation"])
+        if (
+            "initial_creation" in settled
+            or "retained_startup_attention" in settled
+            or settled["runtime_incarnation"] is not None
+            or settled["terminal_token"] <= 0
+            or settled["snapshot_restore_required"] is not False
+            or backing_id is not None
+        ):
+            raise RuntimeError("settled unpublished creation authority disagrees")
     return settled
 
 

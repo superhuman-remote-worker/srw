@@ -3783,6 +3783,15 @@ BEGIN
     THEN
         old_workspace := '{}'::JSONB;
     END IF;
+    -- A Session whose only Pod create the cluster refused has no Pod once
+    -- End settled that creation (0561).
+    IF source_kind = 'thread'
+       AND public.stateless_unpublished_creation_settled_without_pod(
+           source_id, old_state, FALSE
+       )
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
 
     -- Origin migration 0185/0200 is the authority for a *pinned* thread's
     -- Kubernetes agent runtime, so that scope is handed over here.  It does
@@ -16944,6 +16953,14 @@ BEGIN
            AND public.job_workspace_creation_reclaimed_without_pod(OLD.id) THEN
             CONTINUE;
         END IF;
+        -- A Session whose only Pod create the cluster refused, once End
+        -- settled that creation with no Pod and reclaimed its storage (0561).
+        IF source_kind = 'thread' AND scope_name = 'workspace_container'
+           AND public.stateless_unpublished_creation_settled_without_pod(
+               OLD.id, source_state, TRUE
+           ) THEN
+            CONTINUE;
+        END IF;
         runtime_uid := runtime_state ->> '_runtime_incarnation';
         IF runtime_uid IS NULL THEN
             -- A caller-authored terminal-looking projection is not evidence
@@ -20869,6 +20886,53 @@ EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
     RETURN FALSE;
 END;
 $_$;
+
+
+--
+-- Name: stateless_unpublished_creation_settled_without_pod(uuid, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_unpublished_creation_settled_without_pod(requested_thread uuid, requested_state jsonb, require_reclaimed boolean) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT COALESCE((
+        SELECT jsonb_typeof(requested_state -> 'workspace_container') = 'object'
+           AND requested_state #>> '{workspace_container,provisioner}' = 'k8s'
+           AND requested_state #>> '{workspace_container,_runtime_incarnation}'
+               IS NULL
+           AND COALESCE(requested_state -> '_workspace_binding', '{}'::JSONB)
+               = '{}'::JSONB
+           AND r.id::TEXT = COALESCE(
+               requested_state #>> ARRAY[
+                   '_stateless_claim_retirement', 'unpublished_creation',
+                   'reservation_id'
+               ],
+               requested_state #>> ARRAY[
+                   '_stateless_workspace_retirement_settled',
+                   'unpublished_creation', 'reservation_id'
+               ]
+           )
+           AND r.operation_kind = 'create'
+           AND r.settled_at IS NOT NULL
+           AND r.phase = 'aborted'
+           AND r.result_kind = 'aborted'
+           AND r.pod_uid IS NULL
+           AND r.runtime_incarnation IS NULL
+           AND r.cancel_target_disposition = 'deleted'
+           AND r.cancel_cleanup_completed_at IS NOT NULL
+           AND r.external_effects #>> '{pod,observed_uid}' IS NULL
+           AND (
+               NOT require_reclaimed
+               OR r.cancel_resource_policy = 'terminal_reclaim'
+           )
+          FROM public.managed_repository_workspace_creation_reservations AS r
+         WHERE r.owner_kind = 'thread'
+           AND r.owner_id = requested_thread
+           AND r.scope = 'workspace_container'
+         ORDER BY r.reservation_generation DESC
+         LIMIT 1
+    ), FALSE);
+$$;
 
 
 --

@@ -8148,6 +8148,181 @@ class ContainerProvisioner:
                 },
             }
 
+    async def capture_unpublished_stateless_creation_retirement(
+        self,
+        owner: WorkspaceOwner,
+    ) -> dict[str, Any] | None:
+        """Observe a creation the cluster refused before any Pod existed.
+
+        The ledger must show no runtime or Pod UID, a Pod effect never
+        observed and no create that can still land; the Pod name must read
+        404. Any Pod refuses. Release the physical mutation guard before
+        Begin: its terminal trigger acquires that same domain.
+        """
+        if owner.kind != "session" or self._db is None or not self._k8s_available:
+            return None
+        candidate = getattr(
+            type(self._db), "get_stateless_unpublished_creation_candidate", None
+        )
+        if not callable(candidate):
+            return None
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return None
+            unpublished = await candidate(self._db, owner.id, namespace=self._namespace)
+            if unpublished is None:
+                return None
+            try:
+                await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return None
+            else:
+                return None
+            if (
+                await candidate(self._db, owner.id, namespace=self._namespace)
+                != unpublished
+            ):
+                return None
+            return unpublished
+
+    async def reclaim_unpublished_creation_storage(
+        self,
+        owner: WorkspaceOwner,
+        unpublished: dict[str, Any],
+    ) -> bool:
+        """Remove the storage a soft End kept for a refused creation.
+
+        Permanent End after soft End: the aborted reservation still names the
+        exact PVC and Service it created. With no Pod by name, delete each by
+        UID, then record the reclaim on that reservation. Anything else that
+        answers to these names refuses, and the call stays retryable.
+        """
+        if owner.kind != "session" or self._db is None or not self._k8s_available:
+            return False
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return False
+            storage = await self._db.get_stateless_unpublished_creation_storage(
+                owner.id
+            )
+            if (
+                storage is None
+                or storage["unpublished_creation"] != unpublished
+                or unpublished["namespace"] != self._namespace
+            ):
+                return False
+            if storage["resource_policy"] == "terminal_reclaim":
+                return True
+            reservation_id = unpublished["reservation_id"]
+            try:
+                await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+            else:
+                return False
+            seed_name = self._seed_configmap_name(owner.pod_name)
+            try:
+                seed = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+                seed = None
+            if seed is not None:
+                try:
+                    seed_uid = self._require_stateless_seed_configmap_identity(
+                        seed,
+                        owner=owner,
+                        pod_name=owner.pod_name,
+                        creation_reservation_id=reservation_id,
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    return False
+                if storage["seed_configmap_uid"] not in {None, seed_uid}:
+                    return False
+                if not await self._delete_seed_configmap(
+                    owner.pod_name,
+                    expected_owner=owner,
+                    expected_creation_reservation_id=reservation_id,
+                    expected_configmap_uid=seed_uid,
+                ):
+                    return False
+            pvc_name = _pvc_name_for(owner)
+            try:
+                pvc = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+                pvc = None
+            if pvc is not None:
+                try:
+                    pvc_uid = self._require_stateless_pvc_identity(
+                        pvc,
+                        owner=owner,
+                        pvc_name=pvc_name,
+                        allow_any_storage_class=True,
+                    )
+                    self._require_workspace_creation_reservation_annotation(
+                        pvc, reservation_id=reservation_id
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    return False
+                if storage["pvc_uid"] not in {None, pvc_uid}:
+                    return False
+                outcome = await self._delete_pvc_outcome(
+                    pvc_name, expected_owner=owner, expected_uid=pvc_uid
+                )
+                if not outcome.captured_absent:
+                    return False
+            try:
+                service = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_service,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+                service = None
+            if service is not None:
+                try:
+                    service_uid = self._require_stateless_service_identity(
+                        service, owner=owner
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    return False
+                if storage["service_uid"] not in {None, service_uid}:
+                    return False
+                outcome = await self._delete_service_outcome(
+                    owner, require_exact_owner=True, expected_uid=service_uid
+                )
+                if not outcome.captured_absent:
+                    return False
+            return await self._db.record_unpublished_creation_storage_reclaimed(
+                owner.id, unpublished=unpublished
+            )
+
     async def capture_retained_stateless_startup_attention_retirement(
         self, owner: WorkspaceOwner
     ) -> dict[str, Any] | None:

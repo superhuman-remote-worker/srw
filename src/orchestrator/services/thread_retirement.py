@@ -384,6 +384,7 @@ async def reconcile_stateless_thread_retirement(
     workspace_absence_proven = False
     initial_creation = None
     retained_startup_attention = None
+    unpublished_creation = None
     preflight_thread = await postgres_db.get_thread(thread_id)
     if preflight_thread is None:
         return {"state": "missing"}
@@ -443,6 +444,11 @@ async def reconcile_stateless_thread_retirement(
             and "retained_startup_attention" in pending_authority
         ):
             retained_startup_attention = pending_authority["retained_startup_attention"]
+        elif (
+            isinstance(pending_authority, dict)
+            and "unpublished_creation" in pending_authority
+        ):
+            unpublished_creation = pending_authority["unpublished_creation"]
         elif creation_pending and not restore_pending:
             retained_source = (
                 await postgres_db.get_current_retained_startup_attention_source(
@@ -473,8 +479,25 @@ async def reconcile_stateless_thread_retirement(
                 initial_creation = await capture_initial(
                     container_provisioner, WorkspaceOwner.session(thread_id)
                 )
+            # The cluster refused the one Pod create (a LimitRange, a quota, a
+            # policy): no Pod or UID exists, so none can ever reach Ready.
+            capture_unpublished = getattr(
+                type(container_provisioner),
+                "capture_unpublished_stateless_creation_retirement",
+                None,
+            )
+            if (
+                retained_source is None
+                and initial_creation is None
+                and callable(capture_unpublished)
+            ):
+                unpublished_creation = await capture_unpublished(
+                    container_provisioner, WorkspaceOwner.session(thread_id)
+                )
         if (creation_pending or restore_pending) and (
-            initial_creation is None and retained_startup_attention is None
+            initial_creation is None
+            and retained_startup_attention is None
+            and unpublished_creation is None
         ):
             # Cancellation after the one-shot Pod call may leave a published
             # UID but no Ready binding/fingerprint. Terminal retirement cannot
@@ -556,6 +579,11 @@ async def reconcile_stateless_thread_retirement(
                     if retained_startup_attention is not None
                     else {}
                 ),
+                **(
+                    {"unpublished_creation": unpublished_creation}
+                    if unpublished_creation is not None
+                    else {}
+                ),
             )
         except RuntimeError as exc:
             raise HTTPException(
@@ -590,7 +618,18 @@ async def reconcile_stateless_thread_retirement(
         if permanent:
             backing_id = closure.get("backing_id")
             runtime_incarnation = closure.get("runtime_incarnation")
-            if (
+            if "unpublished_creation" in closure:
+                # Soft End kept the refused creation's PVC. No Pod ever ran, so
+                # its exact storage goes without a stop proof.
+                if not await container_provisioner.reclaim_unpublished_creation_storage(
+                    WorkspaceOwner.session(thread_id),
+                    closure["unpublished_creation"],
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Refused workspace creation storage cleanup is incomplete",
+                    )
+            elif (
                 isinstance(backing_id, str)
                 and backing_id.startswith("k8s-")
                 or "initial_creation" in closure
@@ -721,6 +760,47 @@ async def reconcile_stateless_thread_retirement(
             "thread": await postgres_db.get_thread(thread_id),
             "closure": closure,
             "retained_startup_attention": retained,
+        }
+    if unpublished_creation is not None:
+        # The cluster refused the only Pod create, so there is no shell,
+        # resident or process to stop. Settle the creation the way a refused
+        # Job's settles: its reconciliation reads the Pod by name, then removes
+        # the seed and, for permanent End, the PVC. A PVC it just deleted can
+        # stay Terminating for a moment, so try a few times.
+        unpublished = await postgres_db.get_stateless_unpublished_creation_retirement(
+            thread_id
+        )
+        if unpublished != unpublished_creation or not closure.get("claimant_quiesced"):
+            raise HTTPException(503, "Refused workspace creation authority changed")
+        for attempt in range(3):
+            if await postgres_db.get_stateless_unpublished_creation_retirement(
+                thread_id, require_settled=True
+            ):
+                break
+            if attempt:
+                await asyncio.sleep(2)
+            await container_provisioner.request_workspace_creation_cancellation(
+                WorkspaceOwner.session(thread_id),
+                target_disposition="deleted",
+                reclaim_shared_resources=permanent,
+            )
+        if not await postgres_db.get_stateless_unpublished_creation_retirement(
+            thread_id, require_settled=True
+        ):
+            raise HTTPException(503, "Refused workspace creation is still settling")
+        if (
+            not permanent
+            and not await postgres_db.finish_stateless_thread_workspace_retirement(
+                thread_id
+            )
+        ):
+            raise HTTPException(
+                503, "Refused workspace retirement settlement remains incomplete"
+            )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
         }
     if initial_creation is not None:
         # No Ready binding ever existed. The captured initial creation may skip

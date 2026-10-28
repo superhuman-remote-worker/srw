@@ -617,6 +617,193 @@ async def test_end_holds_before_begin_when_published_runtime_cannot_reach_ready(
     db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
 
 
+UNPUBLISHED = {
+    "generation": "44444444-4444-4444-8444-444444444444",
+    "reservation_id": "55555555-5555-4555-8555-555555555555",
+    "reservation_generation": 3,
+    "namespace": "agent-workspaces",
+}
+
+
+def _refused_creation_thread() -> dict:
+    """The cluster refused the one Pod create: no runtime was ever published."""
+    thread = _in_progress_creation_thread()
+    thread["metadata"]["workspace_container"] = {
+        "status": "pending",
+        "provisioner": "k8s",
+        "_runtime_creation": {
+            "generation": UNPUBLISHED["generation"],
+            "mode": "create",
+            "attempted": True,
+            "replaces_uid": None,
+        },
+    }
+    return thread
+
+
+def _refused_creation_provisioner(*, captured, outcomes=("aborted",)):
+    class RefusedCreationProvisioner:
+        capture_initial_stateless_creation_retirement = AsyncMock(return_value=None)
+        capture_unpublished_stateless_creation_retirement = AsyncMock(
+            return_value=captured
+        )
+        request_workspace_creation_cancellation = AsyncMock(
+            side_effect=[{"reconciliation_outcome": outcome} for outcome in outcomes]
+        )
+
+    return RefusedCreationProvisioner()
+
+
+def _refused_creation_db(*, settled_reads, permanent=False) -> SimpleNamespace:
+    thread = _refused_creation_thread()
+    closure = {
+        "state": "closed",
+        "terminal_token": 1,
+        "claimant_quiesced": True,
+        "claim_losses": [],
+        "resident_cleanup_required": False,
+        "resident_acknowledged": True,
+        "shell_retirement_required": False,
+        "remote_acknowledged": True,
+        "permanent": permanent,
+        "retry": False,
+    }
+    return SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread),
+        get_current_retained_startup_attention_source=AsyncMock(return_value=None),
+        begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
+        get_stateless_unpublished_creation_retirement=AsyncMock(
+            side_effect=lambda _thread_id, require_settled=False: (
+                settled_reads.pop(0) if require_settled else UNPUBLISHED
+            )
+        ),
+        finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_end_settles_a_refused_creation_instead_of_driving_it_to_ready(
+    permanent,
+) -> None:
+    db = _refused_creation_db(
+        settled_reads=[None, UNPUBLISHED, UNPUBLISHED], permanent=permanent
+    )
+    provisioner = _refused_creation_provisioner(captured=UNPUBLISHED)
+    ensure = AsyncMock()
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(thread_retirement_module, "ensure_session_workspace", ensure),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+    ):
+        result = await control_seams.reconcile_stateless_thread_retirement(
+            THREAD_ID, force=False, permanent=permanent
+        )
+
+    assert result["state"] == "settled"
+    ensure.assert_not_awaited()
+    db.begin_stateless_thread_workspace_retirement.assert_awaited_once_with(
+        THREAD_ID,
+        force=False,
+        permanent=permanent,
+        workspace_absence_proven=False,
+        unpublished_creation=UNPUBLISHED,
+    )
+    provisioner.request_workspace_creation_cancellation.assert_awaited_once_with(
+        ANY,
+        target_disposition="deleted",
+        reclaim_shared_resources=permanent,
+    )
+    if permanent:
+        # Permanent End deletes the row next; soft End leaves a tombstone.
+        db.finish_stateless_thread_workspace_retirement.assert_not_awaited()
+    else:
+        db.finish_stateless_thread_workspace_retirement.assert_awaited_once_with(
+            THREAD_ID
+        )
+
+
+@pytest.mark.asyncio
+async def test_end_retries_a_refused_creation_whose_volume_is_terminating() -> None:
+    db = _refused_creation_db(settled_reads=[None, None, UNPUBLISHED, UNPUBLISHED])
+    provisioner = _refused_creation_provisioner(
+        captured=UNPUBLISHED, outcomes=("retryable", "aborted")
+    )
+    sleep = AsyncMock()
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(thread_retirement_module.asyncio, "sleep", sleep),
+    ):
+        result = await control_seams.reconcile_stateless_thread_retirement(
+            THREAD_ID, force=False, permanent=True
+        )
+
+    assert result["state"] == "settled"
+    assert provisioner.request_workspace_creation_cancellation.await_count == 2
+    sleep.assert_awaited_once_with(2)
+
+
+@pytest.mark.asyncio
+async def test_end_holds_a_refused_creation_that_does_not_settle() -> None:
+    db = _refused_creation_db(settled_reads=[None, None, None, None])
+    provisioner = _refused_creation_provisioner(
+        captured=UNPUBLISHED, outcomes=("retryable",) * 3
+    )
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(thread_retirement_module.asyncio, "sleep", AsyncMock()),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await control_seams.reconcile_stateless_thread_retirement(
+            THREAD_ID, force=False, permanent=False
+        )
+
+    assert exc.value.status_code == 503
+    assert provisioner.request_workspace_creation_cancellation.await_count == 3
+    db.finish_stateless_thread_workspace_retirement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_end_keeps_the_ready_hold_when_no_refused_creation_is_captured() -> None:
+    """A live or ambiguous Pod, or an open create window, captures nothing."""
+    db = _refused_creation_db(settled_reads=[])
+    provisioner = _refused_creation_provisioner(captured=None)
+    ensure = AsyncMock()
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(thread_retirement_module, "ensure_session_workspace", ensure),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(
+            workspace_suspension_module,
+            "workspace_suspension_service",
+            SimpleNamespace(),
+        ),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await control_seams.reconcile_stateless_thread_retirement(
+            THREAD_ID, force=True, permanent=True
+        )
+
+    assert exc.value.status_code == 503
+    ensure.assert_awaited_once()
+    db.begin_stateless_thread_workspace_retirement.assert_not_awaited()
+    provisioner.request_workspace_creation_cancellation.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_end_continues_exact_runtime_to_ready_before_begin() -> None:
     in_progress = _in_progress_creation_thread()
