@@ -9,7 +9,8 @@ One log reader serves both the job and the thread routes. Job logs prefer the
 live per-job file and fall back to the S3 archive written at agent-pod deletion;
 session logs are archive-only, because a live session's log is on its pod. Both
 paths run the same level/grep filter and the same id-scoping, so a shared pod
-log is disaggregated identically no matter which route asked for it.
+log is disaggregated identically no matter which route asked for it, raw or
+not, and a log with no line tagged for the id yields nothing.
 
 Design: knowledge-base/knowledge/features/job_log_archive.md.
 """
@@ -142,12 +143,17 @@ def scope_archived_lines(text: str, token: str) -> list[str]:
 
     In-cluster lines are correlation-tagged JSON (Slice 0 of
     centralized_logging), so substring-matching the uuid disaggregates a
-    multi-job worker-pod log. If nothing matches, the log predates tagging
-    (or ran LOG_FORMAT=text) — return it whole rather than hide it.
+    multi-job worker-pod log. Fails closed: if nothing matches (a log that
+    predates tagging, or ran LOG_FORMAT=text) the result is empty, because
+    an untagged pooled pod log is other jobs' and sessions' output (N32).
     """
-    all_lines = text.splitlines()
-    matched = [line for line in all_lines if token in line]
-    return matched or all_lines
+    if not token:
+        return []
+    return [line for line in text.splitlines() if token in line]
+
+
+def _raw_text(lines: list[str]) -> PlainTextResponse:
+    return PlainTextResponse("\n".join(lines))
 
 
 # =============================================================================
@@ -188,11 +194,12 @@ async def get_job_logs(
                 status_code=404, detail=f"Log file not found for job {job_id}"
             )
         archived = True
-        text = archived_text
-        all_lines = scope_archived_lines(text, job_id)
+        all_lines = scope_archived_lines(archived_text, job_id)
 
     if raw:
-        return PlainTextResponse(text)
+        # The live per-job file is this job's alone; an archived pod log is
+        # the pooled pod's, so raw serves only this job's lines from it.
+        return _raw_text(all_lines) if archived else PlainTextResponse(text)
 
     all_lines, filtered = filter_log_lines(all_lines, level, grep)
     total_lines = len(all_lines)
@@ -238,10 +245,10 @@ async def get_thread_logs(
                 "be running, or it was deleted before the log archive existed"
             ),
         )
-    if raw:
-        return PlainTextResponse(text)
-
     all_lines = scope_archived_lines(text, thread_id)
+    if raw:
+        return _raw_text(all_lines)
+
     all_lines, filtered = filter_log_lines(all_lines, level, grep)
     total_lines = len(all_lines)
 
