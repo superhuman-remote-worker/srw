@@ -7644,8 +7644,9 @@ export class PersistentChatService {
     const step = view ? upgradeStepForPhase(view.phase) : null;
     if (!view || !step) {
       // A failure has its own announcer. No upgrade at all after one was seen
-      // running means the server finished it: on the stateless lane the done
-      // frame goes out on the agent's socket, which this tab never holds.
+      // running means the server finished it; the done frame normally ends
+      // the card first, and this ends it when that frame was missed (a
+      // dropped stream, another tab's upgrade).
       this.workspaceUpgradeEndedByFrame = false;
       if (!view && this.workspaceUpgradeSeenOnServer) {
         this.workspaceUpgradeSeenOnServer = false;
