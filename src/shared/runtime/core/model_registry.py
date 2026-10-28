@@ -645,6 +645,26 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     )
 
 
+#: Client protocol implied by a model's factory provider when the model
+#: carries no explicit ``client_protocol`` (provider-anchored rows).
+_PROVIDER_CLIENT_PROTOCOL = {
+    "anthropic": "anthropic-messages",
+    "codex": "openai-responses",
+    "openai": "openai-chat",
+    "openrouter": "openai-chat",
+    "local": "openai-chat",
+}
+
+
+def effective_client_protocol(meta: ModelMeta) -> str:
+    """The API shape ``meta`` is called with: explicit, else provider-implied."""
+    return (
+        meta.client_protocol
+        or _PROVIDER_CLIENT_PROTOCOL.get(meta.provider)
+        or f"{meta.provider}-native"
+    )
+
+
 async def resolve_model(
     model_id: str,
     user_id: Optional[str] = None,

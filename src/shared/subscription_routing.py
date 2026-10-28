@@ -16,7 +16,8 @@ guesses:
 ``client_protocol``
     The API schema SRW *sends*. Today one of ``openai-responses`` (the
     OpenAI Responses API, which carries reasoning summaries and is the
-    established Codex path) or ``openai-chat`` (Chat Completions). The proxy
+    established Codex path), ``openai-chat`` (Chat Completions) or
+    ``anthropic-messages`` (Anthropic's Messages API). The proxy
     converts to whatever the upstream account actually speaks — an OpenAI
     wire protocol does NOT mean the upstream model is an OpenAI model.
 
@@ -75,12 +76,19 @@ PROTOCOL_OPENAI_RESPONSES = "openai-responses"
 #: generic ``openai`` factory.
 PROTOCOL_OPENAI_CHAT = "openai-chat"
 
-CLIENT_PROTOCOLS = frozenset({PROTOCOL_OPENAI_RESPONSES, PROTOCOL_OPENAI_CHAT})
+#: Anthropic Messages API (``POST {base_url}/v1/messages``). SRW's
+#: ``anthropic`` factory; what a Claude Code harness speaks.
+PROTOCOL_ANTHROPIC_MESSAGES = "anthropic-messages"
+
+CLIENT_PROTOCOLS = frozenset(
+    {PROTOCOL_OPENAI_RESPONSES, PROTOCOL_OPENAI_CHAT, PROTOCOL_ANTHROPIC_MESSAGES}
+)
 
 #: Agent-side LLM factory that serves each client protocol.
 _PROTOCOL_FACTORY = {
     PROTOCOL_OPENAI_RESPONSES: "codex",
     PROTOCOL_OPENAI_CHAT: "openai",
+    PROTOCOL_ANTHROPIC_MESSAGES: "anthropic",
 }
 
 # ---------------------------------------------------------------------------
@@ -224,6 +232,34 @@ def routing_from_params(params_json: Any) -> RoutingMetadata:
         subscription_sources=normalize_channels(sources),
         needs_review=bool(block.get("needs_review")),
     )
+
+
+def validate_routing_params(
+    params_json: Any, *, provider_kind: str | None = None
+) -> None:
+    """Refuse a ``routing.client_protocol`` the resolver would silently drop.
+
+    ``routing_from_params`` is tolerant on read; this is the strict write-side
+    check. Raises ``ValueError`` for an unknown protocol, or for a protocol on
+    a row that is not endpoint-backed (when ``provider_kind`` is given).
+    """
+    if not isinstance(params_json, Mapping):
+        return
+    block = params_json.get(ROUTING_PARAMS_KEY)
+    if not isinstance(block, Mapping) or "client_protocol" not in block:
+        return
+    value = block["client_protocol"]
+    normalized = value.strip().lower() if isinstance(value, str) else None
+    if normalized not in CLIENT_PROTOCOLS:
+        raise ValueError(
+            f"Unknown client_protocol {value!r}; "
+            f"expected one of {sorted(CLIENT_PROTOCOLS)}"
+        )
+    if provider_kind is not None and provider_kind != "endpoint":
+        raise ValueError(
+            "client_protocol applies to endpoint-backed models only; a "
+            "provider-anchored model keeps the protocol its provider implies"
+        )
 
 
 def routing_params_block(
