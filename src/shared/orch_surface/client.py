@@ -23,6 +23,14 @@ from shared.runtime_actor import (
     RuntimeActorContext,
 )
 
+# A Session End/Delete answers only after the orchestrator has joined the
+# workspace handoff (up to 30 s, SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S),
+# waited for the agent's detach (final memory capture + git push, up to a
+# 150 s read) and torn the pod and workspace down. An ordinary End takes about
+# 30 s, the client default, so the read timed out: the tool reported a failure
+# for an End that went on to succeed, and the caller ended it again.
+SESSION_END_TIMEOUT = httpx.Timeout(240.0, connect=30.0)
+
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 DatasourceScopeMode = Literal["all", "projects"]
 DatasourceVisibility = Literal["public", "private"]
@@ -3374,6 +3382,7 @@ class AsyncCockpitClient:
             "DELETE",
             f"/api/persistent/threads/{thread_id}",
             params={"permanent": permanent},
+            timeout=SESSION_END_TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()
