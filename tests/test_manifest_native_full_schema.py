@@ -606,6 +606,29 @@ async def test_non_admin_without_grant_is_refused_and_with_grant_admitted(databa
 
 
 @pytest.mark.asyncio
+async def test_srw_adapter_job_on_an_approved_image_stores_it_as_harness_image(
+    database,
+):
+    user = await _approved_non_admin(database)
+    await database.execute(
+        "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+        "VALUES('user',$1,'custom_harness_images','true'::jsonb)",
+        user["id"],
+    )
+    document = assignment(adapter="srw/v1", mode="Reported")
+    document["spec"]["execution"]["expert"]["inline"]["runtime"]["image"] = PLAIN_IMAGE
+    _, _, _, _, work_id, _ = await admit(database, user, document)
+    job = await database.get_job(work_id)
+    assert job["status"] == "created"
+    assert (
+        await database.fetchval(
+            "SELECT harness_image FROM jobs WHERE id=$1", UUID(work_id)
+        )
+        == PLAIN_IMAGE
+    )
+
+
+@pytest.mark.asyncio
 async def test_opt_in_admits_approved_images_on_an_unverified_cluster(database, actor):
     _, _, _, _, work_id, _ = await admit(
         database,

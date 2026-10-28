@@ -125,6 +125,19 @@ class ManifestExecutionService:
         if adapter == "generic":
             self._require_hosting_configuration()
             self._approved_runtime(runtime)
+        private, custom_image = None, None
+        if adapter == "srw/v1":
+            from orchestrator.services.manifest_runtime_ownership import (
+                custom_srw_image,
+                require_srw_launch_configuration,
+            )
+
+            private = require_srw_launch_configuration(
+                runtime,
+                trusted_image=self.srw_image,
+                approved_images=self._approved_images,
+            )
+            custom_image = custom_srw_image(runtime, trusted_image=self.srw_image)
         if scope["kind"] == "Account" and scope["name"] != str(user["id"]):
             # Publishing into another account never lends the administrator's
             # runtime credentials, grants or model defaults to that account.
@@ -135,9 +148,8 @@ class ManifestExecutionService:
             user = owner
         # Checked as the executing account, after the swap above.
         if (
-            adapter == "generic"
-            and not await self.db.user_can_run_custom_harness_images(user, project_id)
-        ):
+            adapter == "generic" or custom_image
+        ) and not await self.db.user_can_run_custom_harness_images(user, project_id):
             raise HTTPException(
                 403,
                 "Running approved harness images requires the 'custom_harness_images' capability grant. Ask an administrator to grant it (Admin → Grants).",
@@ -260,13 +272,7 @@ class ManifestExecutionService:
             from orchestrator.services.manifest_execution_snapshot import (
                 prepare_srw_snapshot,
             )
-            from orchestrator.services.manifest_runtime_ownership import (
-                require_srw_launch_configuration,
-            )
 
-            private = require_srw_launch_configuration(
-                runtime, trusted_image=self.srw_image
-            )
             config_name = private.get("config_name", "worker_base")
             from orchestrator.services.manifest_workspace_selection import (
                 srw_workspace_config,
@@ -308,7 +314,7 @@ class ManifestExecutionService:
             # image selected at admission in the immutable execution snapshot.
             snapshot["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"][
                 "image"
-            ] = self.srw_image
+            ] = custom_image or self.srw_image
         else:
             bindings = await self.bindings(snapshot, user, materialize=False)
             try:
@@ -357,6 +363,7 @@ class ManifestExecutionService:
             job_id=job_id,
             requested_workspace_backend=backend or "sandbox",
             execution_lane="pinned",
+            harness_image=custom_image,
             datasource_ids=datasource_ids,
             datasource_policy_revisions=policy_revisions,
             datasource_selection_provenance={
