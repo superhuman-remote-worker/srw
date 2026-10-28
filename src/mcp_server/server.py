@@ -481,11 +481,18 @@ async def get_workspace_file(job_id: str, path: str) -> str:
               "notes/decisions.md", "archive/phase_1_retrospective.md")
 
     Returns:
-        File content as text
+        File content as text, or a one-line note for a binary file
     """
     client = _get_client()
     try:
         result = await client.get_workspace_file(job_id, path)
+        if result.get("encoding") == "base64":
+            # A PDF, image or database: its base64 would fill the context
+            # and say nothing; the size and the fact that it exists do.
+            return (
+                f"Workspace file: {path} (job {job_id})\n---\n"
+                f"Binary file, {result.get('size', 0)} bytes; not shown as text."
+            )
         content = result.get("content", "")
         return f"Workspace file: {path} (job {job_id})\n---\n{content}"
     except Exception as e:

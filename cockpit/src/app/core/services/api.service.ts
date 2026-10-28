@@ -314,6 +314,17 @@ export interface SnapshotStorageStats {
 }
 
 /**
+ * One file read from a job's workspace repository. `encoding` is `base64`
+ * for a file that is not UTF-8 text; older orchestrators omit it.
+ */
+export interface RepoFile {
+  path: string;
+  content: string;
+  size: number;
+  encoding?: 'utf-8' | 'base64';
+}
+
+/**
  * Client-side deadline for the tool-groups read, which the settings pane
  * blocks on. The server bounds its own agent probe at 3s; this sits above that
  * so only a genuinely stuck request trips it, and guarantees the pane's
@@ -2548,13 +2559,15 @@ export class ApiService {
 
   /**
    * Get file content from a job's Gitea repository.
+   * A file that is not UTF-8 text (PDF, image, database) arrives with
+   * `encoding: 'base64'`, its bytes base64-encoded and `size` in bytes.
    * @param jobId Job ID
    * @param path File path within the repo
    */
-  getRepoFile(jobId: string, path: string): Observable<{ path: string; content: string; size: number } | null> {
+  getRepoFile(jobId: string, path: string): Observable<RepoFile | null> {
     const params = new HttpParams().set('path', path);
     return this.http
-      .get<{ path: string; content: string; size: number }>(`${this.baseUrl}/jobs/${jobId}/repo/file`, { params })
+      .get<RepoFile>(`${this.baseUrl}/jobs/${jobId}/repo/file`, { params })
       .pipe(
         catchError((error) => {
           console.error(`Failed to fetch repo file ${path} for job ${jobId}:`, error);

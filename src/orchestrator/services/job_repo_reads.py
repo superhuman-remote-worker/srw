@@ -15,10 +15,17 @@ properties are load-bearing and moved unchanged:
   content reads, and ``sha if sha != "main" else (job_branch or sha)`` on the
   commit listing: a subjob asking for the literal default lands on its own
   branch, not on the root job's ``main``.
+
+A file read answers ``encoding: "utf-8"`` with the text as ``content``, or,
+for a file that is not valid UTF-8 (a PDF, an image, a SQLite database),
+``encoding: "base64"`` with the bytes base64-encoded and ``size`` in bytes.
+The text decode used to fail inside the forge client, so the route answered
+404 for a file the directory listing showed.
 """
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -36,9 +43,9 @@ class RepoForge(Protocol):
         self, repo_name: str, path: str, *, ref: str | None = None
     ) -> list[dict[str, Any]] | None: ...
 
-    async def get_file_content(
+    async def get_file_bytes(
         self, repo_name: str, path: str, *, ref: str | None = None
-    ) -> str | None: ...
+    ) -> bytes | None: ...
 
     async def get_commits_between(
         self, repo_name: str, base: str, head: str
@@ -110,7 +117,10 @@ async def get_repo_file(
     """Get file content from a job's Gitea repository.
 
     Returns:
-        Dict with path, content (text), and size
+        Dict with path, content, encoding and size. ``encoding`` is
+        ``"utf-8"`` (``content`` is the text, ``size`` its length) or
+        ``"base64"`` (``content`` is a binary file's bytes base64-encoded,
+        ``size`` the byte count).
     """
     if not dependencies.forge.is_initialized:
         raise HTTPException(
@@ -119,19 +129,30 @@ async def get_repo_file(
         )
 
     repo_name, job_branch = await dependencies.resolve_job_repo(job_id)
-    content = await dependencies.forge.get_file_content(
+    raw = await dependencies.forge.get_file_bytes(
         repo_name, path, ref=ref or job_branch
     )
 
-    if content is None:
+    if raw is None:
         raise HTTPException(
             status_code=404,
             detail=f"File '{path}' not found in repo for job '{job_id}'",
         )
 
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "path": path,
+            "content": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+            "size": len(raw),
+        }
+
     return {
         "path": path,
         "content": content,
+        "encoding": "utf-8",
         "size": len(content),
     }
 
