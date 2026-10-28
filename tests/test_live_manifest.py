@@ -435,3 +435,14 @@ class TestAdmitSrwJobOnAnApprovedImage:
         kwargs = db.create_job.call_args.kwargs
         assert kwargs["harness_image"] is None
         db.user_can_run_custom_harness_images.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_live_job_on_a_custom_srw_image_is_refused(self, monkeypatch):
+        _srw_snapshot(monkeypatch)
+        service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE, grant=True)
+        prepared["resolved"]["spec"]["liveSession"] = True
+        with pytest.raises(HTTPException) as error:
+            await service.admit(prepared, {}, user)
+        assert error.value.status_code == 422
+        assert "SRW harness" in error.value.detail
+        db.create_job.assert_not_called()

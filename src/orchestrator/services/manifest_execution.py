@@ -156,11 +156,11 @@ class ManifestExecutionService:
             )
         datasource_ids, policy_revisions = [], {}
         live_alias = (execution.get("session") or {}).get("connector")
-        if spec.get("liveSession") and adapter != "srw/v1":
+        if spec.get("liveSession") and (adapter != "srw/v1" or custom_image):
             raise HTTPException(
                 422,
                 "A live-session Job runs the SRW harness (its voice subagent is "
-                "SRW's); a generic image cannot take a live session.",
+                "SRW's); a generic or custom image cannot take a live session.",
             )
         live_connector_id = None
         for alias, connector in execution["connectors"].items():
