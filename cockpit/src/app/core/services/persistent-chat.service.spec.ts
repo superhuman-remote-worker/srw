@@ -9643,6 +9643,7 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
 
   it('workspace_upgrade.complete mentions sudo for a vm target only', async () => {
     const { service, es } = await setup();
+    const translate = vi.spyOn((service as any).transloco, 'translate');
     fireSseMessage(
       es,
       {
@@ -9651,9 +9652,10 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
       },
       '1:1',
     );
-    const lines = sysLines(service);
-    expect(lines.some((l) => l.toLowerCase().includes('sudo'))).toBe(true);
-    expect(lines.some((l) => l.includes('3 file(s) carried over'))).toBe(true);
+    expect(sysLines(service)).toContain(
+      'chat.workspaceUpgrade.ready chat.workspaceUpgrade.readySudo chat.workspaceUpgrade.readySeeded',
+    );
+    expect(translate).toHaveBeenCalledWith('chat.workspaceUpgrade.readySeeded', { count: 3 });
   });
 
   it('workspace_upgrade.complete for a sandbox target does not mention sudo', async () => {
@@ -9666,7 +9668,8 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
       },
       '1:1',
     );
-    expect(sysLines(service).some((l) => l.toLowerCase().includes('sudo'))).toBe(false);
+    expect(sysLines(service)).toContain('chat.workspaceUpgrade.ready');
+    expect(sysLines(service).some((l) => l.includes('readySudo'))).toBe(false);
   });
 });
 

@@ -2428,6 +2428,9 @@
         "copying": "Copying your files"
       },
       "skippedFiles": "These files were over the 100 MB copy limit and weren't copied; they're still in the old storage: {{files}}",
+      "ready": "Workspace ready — shell, git, and file tools are now available.",
+      "readySudo": "Running on a VM — sudo is now available.",
+      "readySeeded": "{{count}} file(s) carried over.",
       "failed": {
         "upgradeCancelled": "The VM upgrade was cancelled when this session ended.",
         "upgradeRefused": "The VM upgrade couldn't start: SRW refused it when the session reconnected. The session keeps its current workspace; you can try /upgrade-workspace vm again.",

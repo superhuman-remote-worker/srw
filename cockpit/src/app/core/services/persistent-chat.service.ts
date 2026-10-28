@@ -8753,15 +8753,20 @@ export class PersistentChatService {
         this.workspaceUpgradeEndedByFrame = true;
         this.workspaceUpgradeSeenOnServer = false;
         const seeded = params['seeded_files'] as number | undefined;
-        const seededNote = typeof seeded === 'number' ? ` ${seeded} file(s) carried over.` : '';
         const tier = (params['target_tier'] as string) || '';
         if (tier) this.workspaceTier.set(tier);
         this.workspaceUpgradeInProgress.set(null);
         this.pendingWorkspaceOffer.set(null);
-        const sudoNote = tier === 'vm' ? ' Running on a VM — sudo is now available.' : '';
         this._systemMessage(
-          `Workspace ready — shell, git, and file tools are now available.` +
-            `${sudoNote}${seededNote}`,
+          [
+            this.transloco.translate('chat.workspaceUpgrade.ready'),
+            tier === 'vm' ? this.transloco.translate('chat.workspaceUpgrade.readySudo') : '',
+            typeof seeded === 'number'
+              ? this.transloco.translate('chat.workspaceUpgrade.readySeeded', { count: seeded })
+              : '',
+          ]
+            .filter(Boolean)
+            .join(' '),
         );
         const skipped = params['skipped_files'];
         if (Array.isArray(skipped) && skipped.length > 0) {
