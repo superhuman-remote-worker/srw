@@ -7,7 +7,9 @@ grant checks and writes retain their sequencing without importing HTTP Request.
 
 from __future__ import annotations
 
+import io
 import logging
+import zipfile
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -45,6 +47,90 @@ from orchestrator.services.expert_catalog_contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Caps on an uploaded skill zip (N61). ``unpack_skill_zip`` reads every entry
+#: whole into memory, so the archive is bounded before it is handed over.
+SKILL_IMPORT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+SKILL_IMPORT_MAX_ENTRIES = 500
+SKILL_IMPORT_MAX_ENTRY_BYTES = 10 * 1024 * 1024
+SKILL_IMPORT_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+_SKILL_IMPORT_READ_CHUNK = 64 * 1024
+_SKILL_IMPORT_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+
+
+def _too_large(detail: str) -> HTTPException:
+    return HTTPException(status_code=413, detail=f"Skill archive {detail}")
+
+
+def bounded_skill_archive(archive: bytes) -> bytes:
+    """Return ``archive`` re-packed with only honest, bounded entries.
+
+    A zip's declared sizes are the uploader's word, and one ``read()`` of a
+    deflate member decompresses its whole stream before cutting it to the
+    declared size. So each member is read here in small chunks (which caps the
+    output at its declared size), every cap is enforced on what was read, and
+    the content is re-packed stored: the unpacker then decompresses nothing.
+    A malformed archive is passed through for ``unpack_skill_zip`` to report.
+    """
+    if len(archive) > SKILL_IMPORT_MAX_UPLOAD_BYTES:
+        raise _too_large(f"exceeds {SKILL_IMPORT_MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+    try:
+        source = zipfile.ZipFile(io.BytesIO(archive))
+    except zipfile.BadZipFile:
+        return archive
+    with source:
+        entries = source.infolist()
+        if len(entries) > SKILL_IMPORT_MAX_ENTRIES:
+            raise _too_large(f"has more than {SKILL_IMPORT_MAX_ENTRIES} entries")
+        contents: dict[str, bytes] = {}
+        total = 0
+        for info in entries:
+            if info.is_dir():
+                continue
+            if info.flag_bits & 0x1:
+                raise HTTPException(
+                    status_code=422, detail=f"{info.filename}: encrypted entry"
+                )
+            if info.compress_type not in _SKILL_IMPORT_COMPRESSION:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{info.filename}: only stored or deflated entries",
+                )
+            if info.file_size > SKILL_IMPORT_MAX_ENTRY_BYTES:
+                raise _too_large(
+                    f"entry {info.filename} exceeds "
+                    f"{SKILL_IMPORT_MAX_ENTRY_BYTES // (1024 * 1024)} MB"
+                )
+            chunks: list[bytes] = []
+            size = 0
+            try:
+                with source.open(info) as member:
+                    while chunk := member.read(_SKILL_IMPORT_READ_CHUNK):
+                        size += len(chunk)
+                        total += len(chunk)
+                        if size > SKILL_IMPORT_MAX_ENTRY_BYTES:
+                            raise _too_large(
+                                f"entry {info.filename} exceeds "
+                                f"{SKILL_IMPORT_MAX_ENTRY_BYTES // (1024 * 1024)} MB"
+                            )
+                        if total > SKILL_IMPORT_MAX_TOTAL_BYTES:
+                            raise _too_large(
+                                "exceeds "
+                                f"{SKILL_IMPORT_MAX_TOTAL_BYTES // (1024 * 1024)} MB "
+                                "uncompressed"
+                            )
+                        chunks.append(chunk)
+            except zipfile.BadZipFile as e:
+                raise HTTPException(
+                    status_code=422, detail=f"not a valid zip archive: {e}"
+                ) from e
+            # A repeated name reads as its last entry, as ``ZipFile.read`` does.
+            contents[info.filename] = b"".join(chunks)
+    repacked = io.BytesIO()
+    with zipfile.ZipFile(repacked, "w", zipfile.ZIP_STORED) as target:
+        for name, data in contents.items():
+            target.writestr(name, data)
+    return repacked.getvalue()
 
 
 def _refuse_contradicting_extends(
@@ -864,7 +950,7 @@ class ExpertAuthoringService:
         from shared.runtime.core.skill_format import SkillFormatError, unpack_skill_zip
 
         try:
-            files = unpack_skill_zip(archive)
+            files = unpack_skill_zip(bounded_skill_archive(archive))
         except SkillFormatError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         name, description, files = parse_skill_bundle(files)

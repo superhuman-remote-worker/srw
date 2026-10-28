@@ -7,7 +7,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -365,6 +365,133 @@ def test_skill_bad_archive_is_422_after_identity_without_write(catalogue_wire):
     assert response.status_code == 422
     assert env.calls == ["approved"]
     env.store.create_skill.assert_not_awaited()
+
+
+def _zip(entries, compression=ZIP_DEFLATED):
+    archive = BytesIO()
+    with ZipFile(archive, "w", compression) as packed:
+        for name, data in entries:
+            packed.writestr(name, data)
+    return archive.getvalue()
+
+
+def _post_skill_zip(env, data):
+    return env.client.post(
+        "/api/skills/import",
+        files={"file": ("bomb.zip", data, "application/zip")},
+    )
+
+
+class TestSkillImportCaps:
+    """N61: the import reads every entry into memory, so the upload, the entry
+    count and the uncompressed sizes are capped before anything is unpacked."""
+
+    def test_an_oversized_upload_is_refused(self, catalogue_wire):
+        from orchestrator.services.expert_authoring import (
+            SKILL_IMPORT_MAX_UPLOAD_BYTES,
+        )
+
+        response = _post_skill_zip(
+            catalogue_wire, b"\0" * (SKILL_IMPORT_MAX_UPLOAD_BYTES + 1)
+        )
+        assert response.status_code == 413
+        catalogue_wire.store.create_skill.assert_not_awaited()
+
+    def test_one_entry_that_inflates_past_the_entry_cap_is_refused(
+        self, catalogue_wire
+    ):
+        from orchestrator.services.expert_authoring import (
+            SKILL_IMPORT_MAX_ENTRY_BYTES,
+        )
+
+        bomb = _zip(
+            [
+                ("quiet-helper/SKILL.md", SKILL_TEXT),
+                ("quiet-helper/zeros.txt", b"\0" * (SKILL_IMPORT_MAX_ENTRY_BYTES + 1)),
+            ]
+        )
+        assert len(bomb) < 64 * 1024  # small on the wire
+        response = _post_skill_zip(catalogue_wire, bomb)
+        assert response.status_code == 413
+        assert "zeros.txt" in response.json()["detail"]
+        catalogue_wire.store.create_skill.assert_not_awaited()
+
+    def test_entries_that_sum_past_the_total_cap_are_refused(self, catalogue_wire):
+        from orchestrator.services.expert_authoring import (
+            SKILL_IMPORT_MAX_ENTRY_BYTES,
+            SKILL_IMPORT_MAX_TOTAL_BYTES,
+        )
+
+        count = SKILL_IMPORT_MAX_TOTAL_BYTES // SKILL_IMPORT_MAX_ENTRY_BYTES + 1
+        bomb = _zip(
+            [("quiet-helper/SKILL.md", SKILL_TEXT)]
+            + [
+                (f"quiet-helper/z{i}.txt", b"a" * SKILL_IMPORT_MAX_ENTRY_BYTES)
+                for i in range(count)
+            ]
+        )
+        response = _post_skill_zip(catalogue_wire, bomb)
+        assert response.status_code == 413
+        assert "uncompressed" in response.json()["detail"]
+        catalogue_wire.store.create_skill.assert_not_awaited()
+
+    def test_too_many_entries_are_refused(self, catalogue_wire):
+        from orchestrator.services.expert_authoring import SKILL_IMPORT_MAX_ENTRIES
+
+        archive = _zip(
+            [("quiet-helper/SKILL.md", SKILL_TEXT)]
+            + [(f"quiet-helper/f{i}.txt", "x") for i in range(SKILL_IMPORT_MAX_ENTRIES)]
+        )
+        response = _post_skill_zip(catalogue_wire, archive)
+        assert response.status_code == 413
+        assert "entries" in response.json()["detail"]
+        catalogue_wire.store.create_skill.assert_not_awaited()
+
+    def test_an_entry_that_lies_about_its_size_is_cut_to_the_declared_size(self):
+        """A deflate stream far longer than its header admits: the unpacker
+        must never get to decompress it in one read."""
+        import struct
+        import zlib
+
+        from orchestrator.services.expert_authoring import bounded_skill_archive
+
+        declared = 100
+        honest = _zip([("quiet-helper/zeros.txt", b"\0" * (4 * 1024 * 1024))])
+        crc = zlib.crc32(b"\0" * declared)
+        lying = bytearray(honest)
+        local = lying.find(b"PK\x03\x04")
+        central = lying.find(b"PK\x01\x02")
+        struct.pack_into("<I", lying, local + 14, crc)
+        struct.pack_into("<I", lying, local + 22, declared)
+        struct.pack_into("<I", lying, central + 16, crc)
+        struct.pack_into("<I", lying, central + 24, declared)
+
+        repacked = bounded_skill_archive(bytes(lying))
+
+        with ZipFile(BytesIO(repacked)) as packed:
+            (info,) = packed.infolist()
+            assert info.compress_type == ZIP_STORED
+            assert info.file_size == declared
+            assert packed.read(info) == b"\0" * declared
+
+    def test_an_ordinary_archive_still_imports(self, catalogue_wire):
+        catalogue_wire.store.create_skill.return_value = {
+            "id": SKILL_ID,
+            "name": "quiet-helper",
+        }
+        archive = _zip(
+            [
+                ("quiet-helper/", b""),
+                ("quiet-helper/SKILL.md", SKILL_TEXT),
+                ("quiet-helper/notes.md", "kept\n"),
+            ]
+        )
+        response = _post_skill_zip(catalogue_wire, archive)
+        assert response.status_code == 200
+        assert catalogue_wire.store.create_skill.await_args.kwargs["files"] == {
+            "SKILL.md": SKILL_TEXT,
+            "notes.md": "kept\n",
+        }
 
 
 def test_skill_owner_refusal_precedes_bundle_parse(catalogue_wire):

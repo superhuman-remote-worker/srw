@@ -15,7 +15,10 @@ from orchestrator.schemas.expert_catalog import (
     ExpertDefaultForkRequest,
 )
 from orchestrator.services.expert_catalog import ExpertCatalogService
-from orchestrator.services.expert_authoring import ExpertAuthoringService
+from orchestrator.services.expert_authoring import (
+    SKILL_IMPORT_MAX_UPLOAD_BYTES,
+    ExpertAuthoringService,
+)
 from orchestrator.services.expert_catalog_contracts import ExpertWritePolicy
 
 
@@ -429,7 +432,10 @@ async def import_skill(
     """Create an owned skill from an uploaded skill zip (fork-on-name-collision)."""
     deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
-    return await deps.authoring.import_skill(user=user, archive=await file.read())
+    # One byte past the cap is enough for the service to refuse the upload,
+    # without reading an oversized one whole into memory (N61).
+    archive = await file.read(SKILL_IMPORT_MAX_UPLOAD_BYTES + 1)
+    return await deps.authoring.import_skill(user=user, archive=archive)
 
 
 @router.get("/api/projects/{project_id}/experts")
