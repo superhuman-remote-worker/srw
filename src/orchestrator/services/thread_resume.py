@@ -587,7 +587,21 @@ async def resume_thread(
                     "retry_after": pending_fence["gc_after"].isoformat(),
                 },
             )
-        if not await postgres_db.resume_thread(thread_id):
+        from orchestrator.services.vm_thread_retained_resume import (
+            VmUpgradeDiskPurged,
+        )
+
+        try:
+            resumed = await postgres_db.resume_thread(thread_id)
+        except VmUpgradeDiskPurged as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This Session's VM upgrade failed and its VM was removed, "
+                    "so it can't be resumed; start a new Session"
+                ),
+            ) from exc
+        if not resumed:
             raise HTTPException(
                 status_code=409,
                 detail="Thread could not be resumed while workspace cleanup is active",

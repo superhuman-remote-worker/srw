@@ -598,3 +598,25 @@ async def test_retained_creation_wait_preserves_ended_and_does_not_schedule_resu
     assert thread["status"] == "ended"
     assert thread["runtime_generation"] == ENDED_RUNTIME_GENERATION
     fake_db.resume_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_after_a_failed_vm_upgrade_is_a_clear_refusal(
+    user_a, thread_a, fake_db, fake_request
+):
+    """Roadmap item 10: it used to surface the database's 23514 as a 500."""
+    from orchestrator.services.vm_thread_retained_resume import VmUpgradeDiskPurged
+    from tests._b09_control_seams import resume_thread
+
+    thread = _ended_thread(thread_a)
+    thread["execution_lane"] = "pinned"
+    with _patch_caller_and_db(user_a, fake_db):
+        fake_db.resume_thread.side_effect = VmUpgradeDiskPurged()
+        with patch(
+            "orchestrator.services.thread_resume.thread_config_drift", _fake_drift([])
+        ):
+            with pytest.raises(HTTPException) as refused:
+                await resume_thread(str(thread["id"]), fake_request)
+
+    assert refused.value.status_code == 409
+    assert "VM upgrade failed" in refused.value.detail

@@ -233,6 +233,24 @@ async def test_end_after_a_failed_upgrade_releases_the_charge_and_settles(
 
 
 @pytest.mark.asyncio
+async def test_resume_after_a_failed_upgrade_says_its_vm_is_gone(db, monkeypatch):
+    """Roadmap item 10: the retained-resume check failed with a bare 23514."""
+    from orchestrator.services.vm_thread_retained_resume import VmUpgradeDiskPurged
+
+    case = await failed_upgrade(db, monkeypatch, abort="finished")
+    await end(db, case)
+    assert await db.settle_pinned_thread_retirement(
+        str(case["thread_id"]),
+        token=case["retirement"]["token"],
+        generation=case["retirement"]["generation"],
+    )
+
+    with pytest.raises(VmUpgradeDiskPurged):
+        await db.resume_thread(str(case["thread_id"]))
+    assert (await db.get_thread(str(case["thread_id"])))["status"] == "ended"
+
+
+@pytest.mark.asyncio
 async def test_a_failed_upgrade_session_is_deleted_after_its_end(db, monkeypatch):
     case = await failed_upgrade(db, monkeypatch, abort="open")
     await end(db, case)
