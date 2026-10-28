@@ -115,7 +115,9 @@ class AgentRegistrationDependencies:
     # Guards and audit (orchestrator.security.access, bound by main).
     require_internal: Callable[[Request], Awaitable[None]]
     require_admin: Callable[[Request], Awaitable[dict[str, Any]]]
-    is_internal_call: Callable[[Request], bool]
+    # A valid internal key WITHOUT a delegated user: the agent's own call,
+    # never an MCP user's (``access.is_internal_service_call``).
+    is_internal_service_call: Callable[[Request], bool]
     log_security_event: Callable[..., Awaitable[Any]]
 
     # Import-time flags as callables (§P1).

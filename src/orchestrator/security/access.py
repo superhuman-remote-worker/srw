@@ -1435,6 +1435,28 @@ def is_internal_call(request: Request) -> bool:
     return request.headers.get("X-Internal-Key", "") == _INTERNAL_KEY
 
 
+#: The user the MCP server forwards a call for. It rides along with
+#: ``X-Internal-Key`` on every user-driven MCP tool call
+#: (``shared/orch_surface/client.py``), and ``security/auth.py`` resolves it as
+#: the caller.
+DELEGATED_USER_HEADER = "X-MCP-User-Id"
+
+
+def is_internal_service_call(request: Request) -> bool:
+    """True iff a valid ``X-Internal-Key`` arrives with no delegated user.
+
+    The key alone does not make a call the service's own: the MCP server
+    sends it together with ``X-MCP-User-Id`` on every tool call a user
+    drives, and such a call must pass that user's gates. Only a bare
+    internal-key call (an agent deregistering itself on shutdown) is the
+    service acting for itself. Use this, not :func:`is_internal_call`, where
+    the internal key skips a user gate (N9).
+    """
+    if not is_internal_call(request):
+        return False
+    return not request.headers.get(DELEGATED_USER_HEADER, "").strip()
+
+
 async def require_internal(request: Request) -> None:
     """Pure-internal endpoint guard. Raises 401 without a valid X-Internal-Key.
 

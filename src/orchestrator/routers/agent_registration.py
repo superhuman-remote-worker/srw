@@ -182,9 +182,13 @@ async def delete_agent(request: Request, agent_id: str) -> dict[str, str]:
     ``/api/agents/{id}`` so clean exits stop aging into missed-heartbeat
     corpses (Track B will move them to a bearer-credentialled path). The
     heartbeat timeout (3min) remains the backstop for crashes.
+
+    Only a bare internal-key call skips the admin gate. The MCP server sends
+    the key with ``X-MCP-User-Id`` on every tool call a user drives, so the
+    MCP ``deregister_agent`` tool is an admin call like the cockpit's (N9).
     """
     dependencies = get_agent_registration_dependencies(request)
-    if not dependencies.is_internal_call(request):
+    if not dependencies.is_internal_service_call(request):
         await dependencies.require_admin(request)
     return await agent_registration.delete_agent(
         request, agent_id, dependencies=dependencies

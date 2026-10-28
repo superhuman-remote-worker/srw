@@ -125,7 +125,7 @@ def _deps(store=None, **over) -> AgentRegistrationDependencies:
         logger=MagicMock(),
         require_internal=AsyncMock(return_value=None),
         require_admin=AsyncMock(return_value={"id": "admin"}),
-        is_internal_call=MagicMock(return_value=False),
+        is_internal_service_call=MagicMock(return_value=False),
         log_security_event=AsyncMock(),
         completion_commands_enabled=lambda: False,
         require_pinned_status_identity=lambda: False,
@@ -941,7 +941,7 @@ def test_delete_agent_accepts_the_internal_key_without_admin(fleet):
     store = _store()
     deps = _deps(
         store=store,
-        is_internal_call=MagicMock(return_value=True),
+        is_internal_service_call=MagicMock(return_value=True),
         require_admin=AsyncMock(
             side_effect=AssertionError("admin gate must not run for internal callers")
         ),
@@ -961,6 +961,77 @@ def test_delete_agent_requires_admin_for_everyone_else(fleet):
     resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 403
     deps.store.delete_agent.assert_not_awaited()
+
+
+INTERNAL_KEY = "test-internal-key"
+NON_ADMIN_ID = "77777777-7777-4777-8777-777777777777"
+ADMIN_ID = "88888888-8888-4888-8888-888888888888"
+
+
+@pytest.fixture
+def real_internal_gates(monkeypatch):
+    """The real key predicate and the real admin gate over MCP header auth.
+
+    ``X-MCP-User-Id`` resolves through ``security/auth.py`` against the store,
+    as an MCP tool call does in the cluster; only the database is fake.
+    """
+    from orchestrator.security import access as access_module
+
+    monkeypatch.setattr(access_module, "_INTERNAL_KEY", INTERNAL_KEY)
+    monkeypatch.setenv("MCP_INTERNAL_KEY", INTERNAL_KEY)
+    users = {
+        NON_ADMIN_ID: {"id": NON_ADMIN_ID, "is_admin": False, "is_approved": True},
+        ADMIN_ID: {"id": ADMIN_ID, "is_admin": True, "is_approved": True},
+    }
+    store = _store(get_user=AsyncMock(side_effect=lambda uid: dict(users[uid])))
+    audit = AsyncMock()
+
+    async def require_admin(request):
+        return await access_module.require_admin(request, store, audit=audit)
+
+    deps = _deps(
+        store=store,
+        is_internal_service_call=access_module.is_internal_service_call,
+        require_admin=require_admin,
+    )
+    return SimpleNamespace(client=_client(deps), store=store, audit=audit)
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_bare_internal_key_is_the_agents_own_call(
+    fleet, real_internal_gates
+):
+    resp = real_internal_gates.client.delete(
+        f"{fleet}/{AGENT_ID}", headers={"X-Internal-Key": INTERNAL_KEY}
+    )
+    assert resp.status_code == 200
+    real_internal_gates.store.get_user.assert_not_awaited()
+    real_internal_gates.store.delete_agent.assert_awaited_once_with(AGENT_ID)
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_refuses_an_mcp_non_admin_despite_the_internal_key(
+    fleet, real_internal_gates
+):
+    """N9: the MCP server sends the key with the user on every tool call, so a
+    non-admin's ``deregister_agent`` passed as an internal call."""
+    resp = real_internal_gates.client.delete(
+        f"{fleet}/{AGENT_ID}",
+        headers={"X-Internal-Key": INTERNAL_KEY, "X-MCP-User-Id": NON_ADMIN_ID},
+    )
+    assert resp.status_code == 403
+    real_internal_gates.store.delete_agent.assert_not_awaited()
+    assert real_internal_gates.audit.await_args.kwargs["event_type"] == "admin_denied"
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_admits_an_mcp_admin(fleet, real_internal_gates):
+    resp = real_internal_gates.client.delete(
+        f"{fleet}/{AGENT_ID}",
+        headers={"X-Internal-Key": INTERNAL_KEY, "X-MCP-User-Id": ADMIN_ID},
+    )
+    assert resp.status_code == 200
+    real_internal_gates.store.delete_agent.assert_awaited_once_with(AGENT_ID)
 
 
 @_FLEET_PREFIXES

@@ -139,6 +139,30 @@ class TestIsInternalCall:
             assert access_module.is_internal_call(req) is True
 
 
+class TestIsInternalServiceCall:
+    """The key alone, never the key with a delegated MCP user (N9)."""
+
+    def test_bare_key_is_a_service_call(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "secret"})
+            assert access_module.is_internal_service_call(req) is True
+
+    def test_key_with_a_delegated_user_is_the_users_call(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "secret", "X-MCP-User-Id": "user-1"})
+            assert access_module.is_internal_service_call(req) is False
+
+    def test_blank_delegated_user_counts_as_absent(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "secret", "X-MCP-User-Id": " "})
+            assert access_module.is_internal_service_call(req) is True
+
+    def test_wrong_key_is_never_a_service_call(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "wrong"})
+            assert access_module.is_internal_service_call(req) is False
+
+
 class TestRequireInternal:
     @pytest.mark.asyncio
     async def test_raises_401_without_key(self):

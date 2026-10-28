@@ -215,6 +215,8 @@ class TestAgentsAdminOnly:
         )
 
         fake_db.delete_agent = AsyncMock(return_value=True)
+        # A bare internal-key call: no delegated X-MCP-User-Id rides along.
+        fake_request.headers = {}
         with ExitStack() as stack:
             stack.enter_context(
                 patch(

@@ -21,7 +21,7 @@
 
 GET    /api/actions/pending                                                             pat=jobs:read       gated:require_approved_user
 GET    /api/admin/agents                                                                pat=admin           admin:_require_admin
-DELETE /api/admin/agents/{agent_id}                                                     pat=admin           internal:is_internal_call
+DELETE /api/admin/agents/{agent_id}                                                     pat=admin           internal:is_internal_service_call
 GET    /api/admin/agents/{agent_id}                                                     pat=admin           admin:_require_admin
 GET    /api/admin/agents/{agent_id}/system-info                                         pat=admin           admin:_require_admin
 GET    /api/admin/capacity                                                              pat=admin           admin:_require_admin
@@ -146,7 +146,7 @@ GET    /api/agents/threads/{thread_id}/workspace                                
 POST   /api/agents/threads/{thread_id}/workspace-upgrade/interrupted                    pat=refused         internal:require_internal
 GET    /api/agents/threads/{thread_id}/workspace-upgrade/seed-source                    pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/workspace-upgrade/seeded                         pat=refused         internal:require_internal
-DELETE /api/agents/{agent_id}                                                           pat=admin           internal:is_internal_call
+DELETE /api/agents/{agent_id}                                                           pat=admin           internal:is_internal_service_call
 GET    /api/agents/{agent_id}                                                           pat=admin           admin:_require_admin
 POST   /api/agents/{agent_id}/heartbeat                                                 pat=refused         internal:require_internal
 POST   /api/agents/{agent_id}/runtime-actor/session                                     pat=refused         internal:require_internal

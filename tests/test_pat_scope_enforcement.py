@@ -479,7 +479,7 @@ def _moved_routes_app(store: _ThreadStore, monkeypatch) -> FastAPI:
         )
     )
     app.state.agent_registration_dependencies_factory = lambda: SimpleNamespace(
-        require_admin=_require_admin, is_internal_call=lambda _request: False
+        require_admin=_require_admin, is_internal_service_call=lambda _request: False
     )
     app.include_router(diff_routes.router)
     app.include_router(fleet_routes.router)
