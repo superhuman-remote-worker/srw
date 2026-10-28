@@ -20118,6 +20118,66 @@ class PostgresDB:
                 )
                 return dict(row) if row is not None else None
 
+    async def record_refused_workspace_creation_pod_effect(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        reservation_generation: int,
+        claimant: str,
+        claim_token: int,
+        refused_status: int,
+    ) -> bool:
+        """End the wait for a late Pod create after a definite refusal.
+
+        The API server answered this claim's Pod create with a 403/422 Status,
+        so that request persisted nothing and no later answer can land for it.
+        Cleanup still reads the Pod by name before it settles anything; only
+        the ambiguity window for an unobserved create closes now.
+        """
+
+        if (
+            owner_kind not in {"job", "thread"}
+            or scope != "workspace_container"
+            or refused_status not in {403, 422}
+            or isinstance(reservation_generation, bool)
+            or not isinstance(reservation_generation, int)
+            or isinstance(claim_token, bool)
+            or not isinstance(claim_token, int)
+            or not isinstance(claimant, str)
+            or not claimant
+        ):
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            updated = await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET external_effects = jsonb_set(external_effects, '{pod}', "
+                "(external_effects -> 'pod') || jsonb_build_object("
+                "'ambiguity_until', LEAST(now(), "
+                "(external_effects #>> '{pod,ambiguity_until}')::timestamptz), "
+                "'refused_at', now(), 'refused_status', $7::int)) "
+                "WHERE owner_kind = $1 AND owner_id = $2 AND scope = $3 "
+                "AND reservation_generation = $4 AND claimed_by = $5 "
+                "AND claim_token = $6 AND settled_at IS NULL "
+                "AND phase = 'mutating' AND runtime_incarnation IS NULL "
+                "AND pod_uid IS NULL AND external_effects ? 'pod' "
+                "AND external_effects #>> '{pod,observed_uid}' IS NULL "
+                "AND (external_effects #>> '{pod,claim_token}')::bigint = $6",
+                owner_kind,
+                owner_uuid,
+                scope,
+                reservation_generation,
+                claimant,
+                claim_token,
+                refused_status,
+            )
+        return updated == "UPDATE 1"
+
     async def managed_repository_workspace_creation_effects_are_quiescent(
         self,
         owner_id: str,
@@ -21259,6 +21319,19 @@ class PostgresDB:
                 raw_runtime = state.get(state_key)
                 if raw_runtime is not None and not isinstance(raw_runtime, dict):
                     return False
+                # A Job whose Pod was refused before any runtime was recorded
+                # holds only its creation error (`_record_creation_diagnostic`).
+                # No provisioner ever claimed it, so there is no runtime status
+                # to project: close the reservation and leave the error to show.
+                # The guards read that error-only record as metadata, so the
+                # Job can then be deleted (migration 0560).
+                error_only = (
+                    owner_kind == "job"
+                    and scope == "workspace_container"
+                    and isinstance(raw_runtime, dict)
+                    and "error" in raw_runtime
+                    and set(raw_runtime) <= {"error", "status"}
+                )
                 next_runtime = dict(raw_runtime or {})
                 raw_uid = next_runtime.get(_STATELESS_RUNTIME_INCARNATION_KEY)
                 if raw_uid is not None:
@@ -21319,6 +21392,8 @@ class PostgresDB:
                 )
                 if closed != "UPDATE 1":
                     return False
+                if error_only:
+                    return True
                 updated = await conn.execute(
                     f"UPDATE {table} SET {json_column} = $2::jsonb, "
                     f"{timestamp_column} = CURRENT_TIMESTAMP WHERE id = $1",

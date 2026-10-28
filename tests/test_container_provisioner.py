@@ -2894,6 +2894,51 @@ async def test_dark_reconciler_finishes_every_committed_generation():
     }
 
 
+@pytest.mark.asyncio
+async def test_one_failing_creation_reconciliation_does_not_stop_the_others():
+    """A generation whose reconciliation raises is retried later; the rest run.
+
+    One such row used to abort every sweep before the cleanup intents ran.
+    """
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    class _PendingCreationDB:
+        async def list_pending_managed_repository_workspace_creation_reservations(
+            self, *, limit
+        ):
+            return [
+                {"id": "r1", "cancel_requested_at": "t"},
+                {"id": "r2", "cancel_requested_at": "t"},
+            ]
+
+        async def claim_managed_repository_workspace_creation_reconciliation(
+            self, reservation_id, *, claimant, lease_seconds
+        ):
+            return {"id": reservation_id}
+
+    provisioner = ContainerProvisioner()
+    provisioner._db = _PendingCreationDB()
+    provisioner._k8s_available = True
+
+    async def reconcile(reservation):
+        if reservation["id"] == "r1":
+            raise RuntimeError("projection refused")
+        return "aborted"
+
+    provisioner._reconcile_claimed_workspace_creation_reservation = AsyncMock(
+        side_effect=reconcile
+    )
+
+    counts = await provisioner.reconcile_pending_workspace_creation_reservations(
+        limit=25
+    )
+
+    assert counts == {"handed_off": 0, "aborted": 1, "retryable": 1}
+    assert (
+        provisioner._reconcile_claimed_workspace_creation_reservation.await_count == 2
+    )
+
+
 class TestCreateWorkspace:
     """Tests for workspace creation."""
 

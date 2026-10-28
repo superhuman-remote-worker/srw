@@ -104,6 +104,7 @@ from orchestrator.services.sandbox_workspace_settings import (
     SandboxPodProfile,
     SandboxSettings,
     classify_image_pull,
+    definite_admission_refusal_status,
     image_repository,
     pod_admission_rejection,
     resolve_sandbox_settings,
@@ -3943,6 +3944,7 @@ class ContainerProvisioner:
                 e,
                 strict_stateless=strict_stateless,
             )
+            await self._record_refused_pod_create(owner, _creation_reservation, e)
             # Once the durable reservation crosses its external-effect edge,
             # every response is potentially ambiguous.  Do not perform
             # name-based rollback or publish a failure projection here; the
@@ -4372,6 +4374,7 @@ class ContainerProvisioner:
                 e,
                 strict_stateless=strict_stateless,
             )
+            await self._record_refused_pod_create(owner, _creation_reservation, e)
             # Once the durable reservation crosses its external-effect edge,
             # every response is potentially ambiguous.  Do not perform
             # name-based rollback or publish a failure projection here; the
@@ -9700,9 +9703,19 @@ class ContainerProvisioner:
             if not isinstance(reservation, dict):
                 counts["retryable"] += 1
                 continue
-            outcome = await self._reconcile_claimed_workspace_creation_reservation(
-                reservation
-            )
+            try:
+                outcome = await self._reconcile_claimed_workspace_creation_reservation(
+                    reservation
+                )
+            except Exception:
+                # Its claim lapses and a later sweep retries it. Raising here
+                # would also skip every other generation and all cleanup
+                # intents behind them.
+                logger.exception(
+                    "Workspace creation reconciliation failed for reservation %s",
+                    observed.get("id"),
+                )
+                outcome = "retryable"
             counts[outcome] += 1
         return counts
 
@@ -18568,6 +18581,42 @@ class ContainerProvisioner:
             return
         if current:
             await self._set_context(owner, {"error": message})
+
+    async def _record_refused_pod_create(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        exc: BaseException,
+    ) -> None:
+        """End the wait for a late Pod create once the cluster refused it.
+
+        A 403/422 Status answer means the create stored nothing, so cleanup
+        need not wait out the ambiguity window. Best effort: it runs inside
+        the creation's failure handler, so it never raises there.
+        """
+        status = definite_admission_refusal_status(exc)
+        record = getattr(
+            type(self._db), "record_refused_workspace_creation_pod_effect", None
+        )
+        if status is None or not callable(record):
+            return
+        try:
+            await record(
+                self._db,
+                owner.id,
+                owner_kind=("thread" if owner.kind == "session" else "job"),
+                scope="workspace_container",
+                reservation_generation=int(reservation["reservation_generation"]),
+                claimant=str(reservation["claimed_by"]),
+                claim_token=int(reservation["claim_token"]),
+                refused_status=status,
+            )
+        except Exception:
+            logger.exception(
+                "Could not record the refused workspace Pod for %s %s",
+                owner.kind,
+                owner.id,
+            )
 
     async def _settle_failed_job_creation(
         self,

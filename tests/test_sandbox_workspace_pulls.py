@@ -1,6 +1,7 @@
 """A custom image that cannot be pulled fails with its reason, never hangs."""
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType, SimpleNamespace
@@ -21,6 +22,7 @@ from orchestrator.services.container_provisioner import (
 from orchestrator.services.sandbox_workspace_settings import (
     SandboxSettings,
     classify_image_pull,
+    definite_admission_refusal_status,
     pod_admission_rejection,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
@@ -153,6 +155,35 @@ def test_quota_rejection_reads_the_kubernetes_client_bytes_body():
     assert pod_admission_rejection(exc) == (
         "Workspace pod was rejected by the cluster: exceeded quota: workspace-quota"
     )
+
+
+def _status_body(code, **extra):
+    return json.dumps(
+        {"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": code}
+        | extra
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (403, _status_body(403), 403),
+        (422, _status_body(422), 422),
+        (403, _status_body(403).decode(), 403),
+        (403, None, None),
+        (403, b'{"message": "forbidden"}', None),
+        (403, _status_body(403, status="Success"), None),
+        (403, _status_body(422), None),
+        (409, _status_body(409), None),
+        (429, _status_body(429), None),
+        (500, _status_body(500), None),
+    ],
+)
+def test_only_a_status_refusal_counts_as_storing_nothing(status, body, expected):
+    exc = ApiException(status=status, reason="x")
+    exc.body = body
+    assert definite_admission_refusal_status(exc) == expected
+    assert definite_admission_refusal_status(TimeoutError()) is None
 
 
 def provisioner_reading(p):

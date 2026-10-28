@@ -338,6 +338,32 @@ def classify_image_pull(
     return PullVerdict("pulling")
 
 
+def definite_admission_refusal_status(exc: BaseException) -> int | None:
+    """The status of an API-server refusal that persisted nothing, else None.
+
+    Only a 403 or 422 that carries the API server's own v1 Failure Status
+    counts. A 409, 429, 5xx, timeout or bare status may have stored the object.
+    """
+    status = getattr(exc, "status", None)
+    if status not in (403, 422):
+        return None
+    body = getattr(exc, "body", None)
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    try:
+        parsed = json.loads(body or "")
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(parsed, dict)
+        and parsed.get("kind") == "Status"
+        and parsed.get("status") == "Failure"
+        and parsed.get("code") == status
+    ):
+        return status
+    return None
+
+
 def pod_admission_rejection(exc: BaseException) -> str | None:
     """Describe a 403 from pod admission (ResourceQuota, LimitRange, policy)."""
     if getattr(exc, "status", None) != 403:
