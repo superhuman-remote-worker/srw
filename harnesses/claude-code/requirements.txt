@@ -1,3 +1,5 @@
 claude-agent-sdk==0.2.174
 asyncssh==2.24.0
 httpx==0.28.1
+starlette==1.6.0
+uvicorn==0.47.0
