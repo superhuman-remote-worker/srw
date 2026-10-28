@@ -12,6 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 TOOL_NAMES = ("Bash", "Read", "Write", "Edit")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -21,6 +22,9 @@ _CREDENTIAL_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 # argument at 131072 bytes, so a larger value would fail the launch opaquely.
 SYSTEM_PROMPT_MAX_BYTES = 65536
 MODEL_MAX_CHARS = 256
+# Where the CLI sends the credential (ANTHROPIC_BASE_URL): an https origin with
+# an optional path, for an Anthropic-compatible endpoint other than Anthropic's.
+API_BASE_URL_MAX_CHARS = 512
 THINKING_BUDGET_MIN = 1024  # the API's minimum
 THINKING_BUDGET_MAX = 1_000_000
 
@@ -64,6 +68,7 @@ class HarnessConfig:
     thinking: dict | None
     auto_compact: bool
     workspace_env: tuple[str, ...]
+    api_base_url: str | None = None
 
 
 def _object(value: object, name: str) -> dict:
@@ -97,14 +102,42 @@ def _check_prompt_size(text: str, name: str) -> None:
         )
 
 
-def _valid_model(value: object) -> bool:
+def _clean_string(value: object, max_chars: int) -> bool:
     return (
         isinstance(value, str)
-        and 0 < len(value) <= MODEL_MAX_CHARS
+        and 0 < len(value) <= max_chars
         and not any(
             ch.isspace() or unicodedata.category(ch) in ("Cc", "Cs") for ch in value
         )
     )
+
+
+def _valid_model(value: object) -> bool:
+    return _clean_string(value, MODEL_MAX_CHARS)
+
+
+def _parse_api_base_url(value: object) -> str:
+    ok = _clean_string(value, API_BASE_URL_MAX_CHARS)
+    if ok:
+        try:
+            parts = urlsplit(value)
+        except ValueError:
+            ok = False
+        else:
+            ok = (
+                parts.scheme == "https"
+                and bool(parts.hostname)
+                and parts.username is None
+                and parts.password is None
+                and not parts.query
+                and not parts.fragment
+            )
+    if not ok:
+        raise ConfigError(
+            f"apiBaseUrl must be an https URL of at most {API_BASE_URL_MAX_CHARS} "
+            "characters with a host and no credentials, query or fragment"
+        )
+    return value.rstrip("/")
 
 
 def _parse_system_prompt(value: object) -> SystemPrompt:
@@ -213,6 +246,7 @@ def parse_config(data: object) -> HarnessConfig:
             "thinking",
             "autoCompact",
             "workspaceEnv",
+            "apiBaseUrl",
         },
     )
     version = obj.get("version")
@@ -241,6 +275,9 @@ def parse_config(data: object) -> HarnessConfig:
     workspace_env = (
         _parse_workspace_env(obj["workspaceEnv"]) if "workspaceEnv" in obj else ()
     )
+    api_base_url = (
+        _parse_api_base_url(obj["apiBaseUrl"]) if "apiBaseUrl" in obj else None
+    )
     return HarnessConfig(
         model=model,
         system_prompt=system_prompt,
@@ -250,6 +287,7 @@ def parse_config(data: object) -> HarnessConfig:
         thinking=thinking,
         auto_compact=auto_compact,
         workspace_env=workspace_env,
+        api_base_url=api_base_url,
     )
 
 
@@ -275,6 +313,7 @@ def effective_settings(config: HarnessConfig) -> dict:
         "thinking": dict(config.thinking) if config.thinking is not None else None,
         "autoCompact": config.auto_compact,
         "workspaceEnv": list(config.workspace_env),
+        "apiBaseUrl": config.api_base_url,
         **{
             k: (list(v) if isinstance(v, list) else v)
             for k, v in FIXED_SETTINGS.items()

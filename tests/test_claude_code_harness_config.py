@@ -25,6 +25,7 @@ def test_minimal_config_gets_the_documented_defaults():
         and config.thinking is None
     )
     assert config.auto_compact is True and config.workspace_env == ()
+    assert config.api_base_url is None
 
 
 def test_full_config_round_trips_into_effective_settings():
@@ -37,8 +38,10 @@ def test_full_config_round_trips_into_effective_settings():
         "thinking": {"type": "enabled", "budget_tokens": 8000},
         "autoCompact": False,
         "workspaceEnv": ["NEO4J_URI"],
+        "apiBaseUrl": "https://api.meta.ai",
     }
     settings = effective_settings(parse_config(data))
+    assert settings["apiBaseUrl"] == "https://api.meta.ai"
     assert settings["model"] == "claude-sonnet-5-5" and settings["tools"] == [
         "Bash",
         "Read",
@@ -73,12 +76,36 @@ def test_full_config_round_trips_into_effective_settings():
             {**MINIMAL, "limits": {"maxTurns": 5, "extra": 1}},
             "unknown setting: limits.extra",
         ),
+        ({**MINIMAL, "apiBaseUrl": "http://api.meta.ai"}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": "https://user:pw@api.meta.ai"}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": "https://api.meta.ai/v1 "}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": "https://api.meta.ai/?x=1"}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": "https://api.meta.ai/#f"}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": "https://"}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": ""}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": "https://" + "a" * 600}, "apiBaseUrl"),
+        ({**MINIMAL, "apiBaseUrl": 42}, "apiBaseUrl"),
         ("not an object", "object"),
     ],
 )
 def test_invalid_configs_name_the_offending_setting(bad, needle):
     with pytest.raises(ConfigError, match=needle):
         parse_config(bad)
+
+
+def test_api_base_url_accepts_https_origins_and_paths_without_a_trailing_slash():
+    """Where the CLI sends the credential: an https origin, optionally a path,
+    recorded canonically so result.json names the endpoint that served the run."""
+    assert (
+        parse_config({**MINIMAL, "apiBaseUrl": "https://api.meta.ai/"}).api_base_url
+        == "https://api.meta.ai"
+    )
+    assert (
+        parse_config(
+            {**MINIMAL, "apiBaseUrl": "https://gateway.example:8443/anthropic"}
+        ).api_base_url
+        == "https://gateway.example:8443/anthropic"
+    )
 
 
 def test_config_hash_is_canonical():

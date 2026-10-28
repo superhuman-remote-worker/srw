@@ -464,6 +464,32 @@ def test_cli_env_contains_only_the_fixed_set_and_the_credential(tmp_path):
     assert env["DISABLE_AUTO_COMPACT"] == "1"
     assert all(env[name] == value for name, value in CLI_FIXED_ENV.items())
     assert all((tmp_path / d).is_dir() for d in ("home", "claude", "tmp"))
+    assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_cli_env_sets_the_base_url_only_when_configured(tmp_path):
+    """apiBaseUrl is the one setting that decides where the credential goes:
+    it reaches the CLI as ANTHROPIC_BASE_URL and nothing else changes."""
+    without = cli_env(
+        parse_config({"version": 1, "model": "muse-spark-1.3"}),
+        ("ANTHROPIC_API_KEY", "k"),
+        run_dir=tmp_path / "a",
+        path="/bin",
+    )
+    with_url = cli_env(
+        parse_config(
+            {
+                "version": 1,
+                "model": "muse-spark-1.3",
+                "apiBaseUrl": "https://api.meta.ai",
+            }
+        ),
+        ("ANTHROPIC_API_KEY", "k"),
+        run_dir=tmp_path / "b",
+        path="/bin",
+    )
+    assert with_url["ANTHROPIC_BASE_URL"] == "https://api.meta.ai"
+    assert set(with_url) == set(without) | {"ANTHROPIC_BASE_URL"}
 
 
 def test_cli_env_with_oauth_token_and_auto_compact_on(tmp_path):

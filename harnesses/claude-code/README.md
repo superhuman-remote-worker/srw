@@ -45,6 +45,7 @@ approve.
 | `thinking` | unset | `{type: adaptive}`, `{type: disabled}` or `{type: enabled, budget_tokens: N}` with an integer N from 1024 to 1000000 |
 | `autoCompact` | `true` | boolean |
 | `workspaceEnv` | `[]` | upper-case environment variable names to forward into the workspace |
+| `apiBaseUrl` | unset | `https://` URL of at most 512 characters with a host and no credentials, query or fragment; an Anthropic-compatible endpoint other than Anthropic's, reached as `ANTHROPIC_BASE_URL` (a trailing slash is dropped) |
 
 Fixed settings, not configurable and recorded in `result.json`:
 `permissionMode: default`, `settingSources: []`, `toolSearch: false`,
@@ -97,6 +98,13 @@ env:
 `workspaceEnv` cannot forward the model credential: naming
 `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` there is a configuration error.
 The model never sees it; the commands it runs in the workspace cannot read it.
+
+The credential goes to Anthropic's API unless `apiBaseUrl` names another
+Anthropic-compatible endpoint (Meta's Muse Spark API, for example, with that
+provider's key as `ANTHROPIC_API_KEY`). The Job that sets `apiBaseUrl` decides
+where its credential is sent, so share a Project-scoped credential only with
+members you trust to choose the endpoint; the operator's `harnessEgress` bounds
+the hosts a harness can reach at all.
 
 ### workspaceEnv and env connectors
 
@@ -215,6 +223,12 @@ harness needs:
 - DNS: UDP and TCP port 53 to the cluster DNS pods;
 - HTTPS (TCP 443) to the Anthropic API, to the hosts in `data.inputs[].url`
   and to the upload URL. Plain `http://` URLs also need TCP 80.
+
+An in-cluster input or upload URL (an object store in the control-plane
+namespace, for example) must name the service by its fully qualified name,
+`<service>.<namespace>.svc.cluster.local`, and the egress rule must select that
+service's pods on the port the URL names. The harness pod runs in the hosting
+namespace, where a bare service name from another namespace does not resolve.
 
 This setting allows DNS, and HTTPS to public addresses but not to private,
 shared, link-local or reserved ranges (the ranges a workspace's default policy

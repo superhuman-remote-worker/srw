@@ -92,6 +92,8 @@ def cli_env(
     if not config.auto_compact:
         env["DISABLE_AUTO_COMPACT"] = "1"
     env[name] = value
+    if config.api_base_url:
+        env["ANTHROPIC_BASE_URL"] = config.api_base_url
     return env
 
 
