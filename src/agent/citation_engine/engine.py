@@ -33,6 +33,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin
 
 from shared.runtime.citation_engine.models import (
     Annotation,
@@ -50,9 +51,62 @@ from shared.runtime.citation_engine.models import (
     VerificationResult,
     VerificationStatus,
 )
+from shared.url_safety import UnsafeURLError, check_public_http_url
 
 # Set up logging
 log = logging.getLogger(__name__)
+
+#: Redirect hops a web-source fetch follows, each re-checked by address.
+MAX_WEB_FETCH_REDIRECTS = 5
+
+
+def _get_public_url(url: str, *, headers: dict[str, str], timeout: float):
+    """GET ``url`` from the agent pod, following redirects only to public hosts.
+
+    Every hop (the first URL and each ``Location``) passes
+    :func:`check_public_http_url` before it is sent: http(s) only, and the
+    host must be, or resolve only to, public addresses. A model-supplied URL
+    can otherwise make the pod fetch a cluster service, its own pod or cloud
+    metadata, and the body becomes readable through ``search_library``.
+
+    The check reads the URL ``requests`` prepared, which is the one it sends
+    (its adapter dials that URL's host): requests' own parse decides the host
+    (``http://10.0.0.1\\@public.example/`` dials 10.0.0.1, ``%31%30.0.0.1`` is
+    10.0.0.1), not the spelling the model wrote. Otherwise this is what
+    ``requests.get`` does, environment proxies included.
+
+    Raises:
+        UnsafeURLError: a hop was refused.
+        requests.TooManyRedirects: more than ``MAX_WEB_FETCH_REDIRECTS`` hops.
+
+    DNS rebinding: ``requests`` resolves the name again when it connects, so
+    a name that answers public to the check and private to the connect gets
+    through. Pinning the connection to the checked address (name kept for
+    Host and TLS, as ``shared.oci_registry`` does with httpx) would close it.
+    """
+    import requests
+
+    current = url
+    with requests.Session() as session:
+        for _hop in range(MAX_WEB_FETCH_REDIRECTS + 1):
+            prepared = session.prepare_request(
+                requests.Request("GET", current, headers=headers)
+            )
+            check_public_http_url(prepared.url)
+            settings = session.merge_environment_settings(
+                prepared.url, {}, None, None, None
+            )
+            response = session.send(
+                prepared, timeout=timeout, allow_redirects=False, **settings
+            )
+            if not response.is_redirect:
+                return response
+            location = response.headers["location"]
+            response.close()
+            current = urljoin(prepared.url, location)
+    raise requests.TooManyRedirects(
+        f"more than {MAX_WEB_FETCH_REDIRECTS} redirects from {url}"
+    )
 
 
 class CitationEngine:
@@ -251,6 +305,10 @@ class CitationEngine:
         When ``content`` is supplied, archive those provider-returned bytes and
         perform no network request. Otherwise, download the page at registration
         time for legacy direct-citation callers.
+
+        Raises:
+            UnsafeURLError: the page would be downloaded and the URL (or a
+                redirect from it) is not a public http(s) address.
         """
         log.debug(f"Registering web source: {url}")
 
@@ -573,6 +631,11 @@ class CitationEngine:
 
         Returns (extracted_text, metadata). On fetch failure, returns a
         placeholder + metadata so the source still registers.
+
+        Raises:
+            UnsafeURLError: the URL, or a redirect it sent, is not a public
+                http(s) address. Nothing is registered, so the caller sees
+                the refusal instead of a placeholder source.
         """
         try:
             import requests
@@ -582,7 +645,7 @@ class CitationEngine:
             headers = {
                 "User-Agent": "Mozilla/5.0 (compatible; CitationEngine/1.0)",
             }
-            response = requests.get(url, timeout=30, headers=headers)
+            response = _get_public_url(url, headers=headers, timeout=30)
             response.raise_for_status()
 
             content_type = response.headers.get("content-type", "")
@@ -632,6 +695,9 @@ class CitationEngine:
                 "requests and beautifulsoup4 are required for web fetching. "
                 "Install with: pip install requests beautifulsoup4"
             ) from e
+        except UnsafeURLError as e:
+            log.warning(f"Refused to fetch web source {url}: {e}")
+            raise
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
             log.warning(

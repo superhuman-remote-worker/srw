@@ -181,6 +181,7 @@ SERVED_SETS = (
         (SHARED_CONNECTORS, DRIVERS),
         (
             "src/shared/oci_registry.py",
+            "src/shared/url_safety.py",
             "src/orchestrator/application/__init__.py",
             "src/orchestrator/application/background_tasks.py",
             "src/orchestrator/application/connectors.py",

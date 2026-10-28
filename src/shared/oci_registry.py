@@ -19,8 +19,9 @@ address: the host is resolved once, every answer must be a public address
 named in ``private_hosts``; link-local and cloud metadata never), and the
 request dials the checked address with the name kept for the Host header and
 TLS, so a second lookup cannot send it elsewhere. Token realms and blob
-redirect targets go through the same check. Errors are generic: a caller
-never learns an internal status or address (they are logged).
+redirect targets go through the same check (``address_refusal``, which lives
+in :mod:`shared.url_safety`). Errors are generic: a caller never learns an
+internal status or address (they are logged).
 """
 
 from __future__ import annotations
@@ -32,13 +33,14 @@ import json
 import logging
 import re
 import socket
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
+from shared.url_safety import address_refusal
 from shared.workspace_preparation import ARCHITECTURE, image_reference
 
 logger = logging.getLogger(__name__)
@@ -56,86 +58,9 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 #: Docker Hub answers its registry's challenge from another host.
 DEFAULT_TOKEN_HOSTS = frozenset({"auth.docker.io"})
 
-_Address = ipaddress.IPv4Address | ipaddress.IPv6Address
-_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
-#: Never dialled, whatever a host is listed as.
-_NEVER: tuple[_Network, ...] = tuple(
-    ipaddress.ip_network(cidr)
-    for cidr in (
-        "0.0.0.0/8",
-        "169.254.0.0/16",  # link-local, cloud metadata
-        "168.63.129.16/32",  # Azure wireserver
-        "224.0.0.0/4",
-        "240.0.0.0/4",
-        "::/128",
-        "fe80::/10",
-        "fd00:ec2::254/128",  # AWS metadata over IPv6
-        "ff00::/8",
-    )
-)
-#: Public by the registry of special addresses, yet able to carry a private
-#: IPv4 address: only for listed hosts, and never one whose embedded IPv4
-#: address is never dialled.
-_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
-_6TO4 = ipaddress.ip_network("2002::/16")
-_TRANSLATED: tuple[_Network, ...] = (*_NAT64, _6TO4)
-#: Deprecated IPv4-compatible IPv6 (``::a.b.c.d``), never dialled (``::``
-#: and ``::1`` excepted, which are not IPv4 addresses).
-_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
-
-
-def _embedded_ipv4(address: _Address) -> ipaddress.IPv4Address | None:
-    """The IPv4 address a NAT64 or 6to4 address carries, or ``None``."""
-    if address.version != 6:
-        return None
-    value = int(address)
-    if any(address in network for network in _NAT64):
-        return ipaddress.IPv4Address(value & 0xFFFFFFFF)
-    if address in _6TO4:
-        return ipaddress.IPv4Address((value >> 80) & 0xFFFFFFFF)
-    return None
-
 
 class RegistryResolutionError(ValueError):
     pass
-
-
-def address_refusal(
-    address: _Address,
-    *,
-    private_allowed: bool = False,
-    refused: Iterable[_Network] = (),
-) -> str | None:
-    """Why a registry request may not dial ``address``, or ``None``.
-
-    Link-local, metadata, multicast and unspecified addresses never.
-    Loopback, private, shared (CGNAT), translated and every other non-global
-    address, and the ``refused`` networks (the cluster's ranges), only when
-    the host is listed as private.
-    """
-    mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        address = mapped
-    if address.version == 6 and address in _IPV4_COMPATIBLE and int(address) > 1:
-        return "is an IPv4-compatible address"
-    embedded = _embedded_ipv4(address)
-    for candidate in (address, embedded):
-        if candidate is None:
-            continue
-        for network in _NEVER:
-            if network.version == candidate.version and candidate in network:
-                return "is link-local, metadata, multicast or unspecified"
-    if private_allowed:
-        return None
-    for network in refused:
-        if network.version == address.version and address in network:
-            return "is inside the cluster's ranges"
-    for network in _TRANSLATED:
-        if network.version == address.version and address in network:
-            return "is a translated address"
-    if not address.is_global:
-        return "is not a public address"
-    return None
 
 
 HostResolver = Callable[[str], Awaitable[Sequence[str]]]
