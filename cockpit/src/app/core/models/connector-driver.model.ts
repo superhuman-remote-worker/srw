@@ -154,6 +154,10 @@ export interface ConnectorDriver {
   serves_stored_type: boolean;
   protocol_version: string;
   plane: 'harness' | 'bind_time' | 'service' | 'in_pod';
+  /** Where each delivery form runs when the forms run in different planes
+   *  (a cloud folder: the in-pod sidecar for a Container, the agent process
+   *  for a Virtual Session); empty or absent when every form runs on `plane`. */
+  form_planes?: Record<string, string>;
   delivery_forms: string[];
   supported_backends: string[];
   workspace_requirements: string;

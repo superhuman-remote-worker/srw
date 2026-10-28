@@ -670,3 +670,88 @@ class TestObjectStoreFromSpec:
     def test_missing_type_raises(self):
         with pytest.raises(ValueError, match="type"):
             object_store_from_spec({"config": {}})
+
+
+class TestDirectoryVerbs:
+    """``mkdir``/``rmdir``/``purge`` for a remote with real folders."""
+
+    def test_mkdir_argv(self, store, run_mock):
+        run_mock.return_value = _cp()
+        store.mkdir("sessions/t/drafts/")
+        assert run_mock.call_args.args[0] == [
+            "rclone",
+            "mkdir",
+            "srw:my-bucket/sessions/t/drafts",
+        ]
+
+    def test_mkdir_failure_is_transport(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=1, stderr=b"403 Forbidden")
+        with pytest.raises(ObjectStoreError, match="mkdir failed"):
+            store.mkdir("d/")
+
+    def test_rmdir_argv_and_missing_is_fine(self, store, run_mock):
+        run_mock.return_value = _cp(returncode=1, stderr=b"directory not found")
+        store.rmdir("d/")
+        assert run_mock.call_args.args[0] == ["rclone", "rmdir", "srw:my-bucket/d"]
+        run_mock.return_value = _cp(returncode=1, stderr=b"directory not empty")
+        with pytest.raises(ObjectStoreError, match="rmdir failed"):
+            store.rmdir("d/")
+
+    def test_delete_tree_counts_then_purges(self, store, run_mock):
+        run_mock.side_effect = [
+            _cp(
+                stdout=b'[{"Path":"a","Size":1,"IsDir":false},{"Path":"b/c","Size":2,"IsDir":false}]'
+            ),
+            _cp(),
+        ]
+        assert store.delete_tree("d/") == 2
+        argv = [c.args[0] for c in run_mock.call_args_list]
+        assert argv[0][:3] == ["rclone", "lsjson", "--recursive"]
+        assert argv[1] == ["rclone", "purge", "srw:my-bucket/d"]
+
+
+class TestCloudStoreFromSpec:
+    def test_remote_name_is_safe_for_the_environment(self):
+        from shared.runtime.core.backends.rclone import rclone_remote_name
+
+        assert rclone_remote_name("cloud_outbox") == "cloud_outbox"
+        assert rclone_remote_name("cloud_My Cloud!") == "cloud_my_cloud"
+        assert rclone_remote_name("") == "cloud"
+        assert rclone_remote_name("srw") == "cloud_srw"  # never the workspace alias
+
+    def test_cloud_store_uses_its_own_alias_and_root(self):
+        from shared.runtime.core.backends.rclone import cloud_object_store_from_spec
+
+        store = cloud_object_store_from_spec(
+            {
+                "name": "outbox",
+                "rclone_spec": {
+                    "type": "webdav",
+                    "config": {
+                        "url": "https://c/dav",
+                        "vendor": "nextcloud",
+                        "user": "u",
+                        "pass": "p",
+                    },
+                    "root": "sessions/t",
+                },
+            },
+            remote_name="cloud_outbox",
+        )
+        assert isinstance(store, RcloneObjectStore)
+        assert store._env_overlay == {
+            "RCLONE_CONFIG_CLOUD_OUTBOX_TYPE": "webdav",
+            "RCLONE_CONFIG_CLOUD_OUTBOX_URL": "https://c/dav",
+            "RCLONE_CONFIG_CLOUD_OUTBOX_VENDOR": "nextcloud",
+            "RCLONE_CONFIG_CLOUD_OUTBOX_USER": "u",
+            "RCLONE_CONFIG_CLOUD_OUTBOX_PASS": "p",
+        }
+        assert store._remote_path("") == "cloud_outbox:sessions/t/"
+        assert isinstance(
+            cloud_object_store_from_spec(
+                {"name": "x", "rclone_spec": {"type": "memory"}}, remote_name="cloud_x"
+            ),
+            InMemoryObjectStore,
+        )
+        with pytest.raises(ValueError, match="no rclone remote type"):
+            cloud_object_store_from_spec({"name": "x"}, remote_name="cloud_x")

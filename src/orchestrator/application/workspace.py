@@ -364,6 +364,37 @@ async def _prepare_session_cloud(
     return thread
 
 
+def cloud_remote_planner(
+    resources: ApplicationResources,
+) -> Callable[..., Awaitable[Any]]:
+    """The workspace delivery's planner of a Virtual Session's cloud folders
+    (features/cloud_folders_on_virtual_sessions.md § Orchestrator): the
+    session's cloud prepared first, as a Pod's planner does (the one-time
+    conversion, the outbox folder and its share retry, the owner's root,
+    the per-folder grants), then every attached connector bound for the
+    ``virtual`` tier and handed over as a remote descriptor. Runs on every
+    delivery, since the stateless lane re-attaches on any executor."""
+    from orchestrator.services import cloud_remote_plan
+
+    async def plan(
+        thread: dict[str, Any], *, mount_rows: list[dict[str, Any]] | None
+    ) -> cloud_remote_plan.CloudRemotePlan | None:
+        store = resources.postgres_db
+        rows = (
+            mount_rows
+            if mount_rows is not None
+            else await store.list_thread_mounts(str(thread["id"]))
+        )
+        thread = await _prepare_session_cloud(resources, thread, rows)
+        return await cloud_remote_plan.resolve_cloud_remote_plan(
+            thread,
+            mount_rows=rows,
+            dependencies=agent_cloud_mount_dependencies(resources),
+        )
+
+    return plan
+
+
 def cloud_mount_planner(
     resources: ApplicationResources,
 ) -> Callable[..., Awaitable[cloud_mount_plan.CloudMountPlan | None]]:

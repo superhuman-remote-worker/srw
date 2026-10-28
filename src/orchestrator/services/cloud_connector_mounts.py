@@ -460,14 +460,17 @@ def excluded_entry(
     return entry
 
 
-#: ``mount_unsupported``'s detail for a Virtual Session: its workspace mounts
-#: no cloud folder, so its own were left out when it was created.
+#: ``mount_unsupported``'s detail for a Virtual Session: a folder it cannot
+#: serve at the level requested (``protected``, or a provider the Virtual
+#: delivery does not serve yet) was left out when it was created; an upgrade
+#: to a Container restores it (``restore_virtual_exclusions``).
 VIRTUAL_WORKSPACE_DETAIL = "virtual_workspace"
 
 
 def virtual_workspace_exclusion(row: Mapping[str, Any]) -> dict[str, str]:
     """A cloud connector (a datasource row) a Virtual Session left out at
-    creation, as an exclusion of its record (owner 2026-10-21)."""
+    creation, as an exclusion of its record (owner 2026-10-21; since
+    2026-10-28 only the rows Virtual cannot serve at the requested level)."""
     if isinstance(cloud_mount_driver(row), CloudOutboxDriver):
         kind = "cloud_outbox"
     else:

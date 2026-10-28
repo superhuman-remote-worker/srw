@@ -222,27 +222,81 @@ def _in_workspace_cloud_folders(
     return mounted, unavailable
 
 
+def _remote_cloud_folders(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(mounted, unavailable)`` prompt rows of a Virtual Session's cloud
+    folders (``VirtualWorkspaceBackend.cloud_folders()``): a folder that is
+    bound or answered its probe is in the workspace at ``cloud/<name>``; one
+    whose probe failed is named with its reason, in the same words the
+    sidecar's rows use, so the two deliveries read alike."""
+    from shared.runtime.services.cloud_mount.sidecar import (
+        REASON_TEXT,
+        describe_mounted,
+    )
+
+    mounted: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        path = str(row.get("path") or f"cloud/{name}")
+        if row.get("state") == "failed":
+            reason = str(row.get("reason") or "mount_failed")
+            unavailable.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "kind": str(row.get("kind") or ""),
+                    "reason": reason,
+                    "text": REASON_TEXT.get(reason, REASON_TEXT["mount_failed"]),
+                }
+            )
+            continue
+        shared = row.get("shared")
+        mounted.append(
+            {
+                "name": name,
+                "path": path,
+                "kind": str(row.get("kind") or ""),
+                "access": str(row.get("access") or "read_write"),
+                "state": "mounted",
+                "text": describe_mounted(
+                    str(row.get("kind") or ""),
+                    str(row.get("access") or "read_write"),
+                    shared=shared if isinstance(shared, bool) else None,
+                ),
+            }
+        )
+    return mounted, unavailable
+
+
 def _config_with_cloud_folders(
     config: Any,
     mounted: list[dict[str, Any]],
     unavailable: list[dict[str, Any]],
+    *,
+    status_tool: Optional[bool] = None,
 ) -> Any:
     """``config`` keeping a session's cloud folders for its system prompt:
     what is mounted, what is not (``cloud_mount_system_floor``). A copy,
     never an in-place write: the config may be the pod-wide singleton a
-    later session reuses."""
+    later session reuses. ``status_tool=False`` tells the floor that
+    ``srw_cloud_status`` is not bound (a Virtual Session has no shell
+    category), so the prompt never names a tool the agent cannot call."""
     if (not mounted and not unavailable) or not (
         _dc_is_dataclass(config) and hasattr(config, "extra")
     ):
         return config
-    return _dc_replace(
-        config,
-        extra={
-            **config.extra,
-            "_cloud_mounts_mounted": mounted,
-            "_cloud_mounts_unavailable": unavailable,
-        },
-    )
+    extra = {
+        **config.extra,
+        "_cloud_mounts_mounted": mounted,
+        "_cloud_mounts_unavailable": unavailable,
+    }
+    if status_tool is not None:
+        extra["_cloud_status_tool"] = status_tool
+    return _dc_replace(config, extra=extra)
 
 
 @dataclass
@@ -277,6 +331,10 @@ class PersistentSession:
     # U5 session-parent delegation.  These are injected by persistent_app so
     # this state object never imports process-global owner/lease machinery.
     orchestrator_client: Optional[Any] = None
+    # The Virtual planner's record of this claim's cloud folders
+    # (``{"fingerprint", "incarnation"}``): the probe's report names it so
+    # the orchestrator keeps the state for the right claim.
+    cloud_remote_plan: Optional[Dict[str, Any]] = None
     session_parent_authority_provider: Optional[Callable[[], Any]] = None
     subagent_provider_admission: Optional[Callable[[], bool]] = None
     subagent_effect_authority: Optional[Callable[[], Any]] = None
@@ -745,6 +803,50 @@ class PersistentSession:
         except Exception:
             logger.debug("backend read-cache close failed", exc_info=True)
 
+    def cloud_remote_rows(self) -> list[dict[str, Any]]:
+        """The Virtual Session's cloud folders as the backend reports them
+        (``VirtualWorkspaceBackend.cloud_folders()``), or ``[]`` on any other
+        tier or when none is bound."""
+        try:
+            from agent.core.backends.overlay import unwrap_backend
+
+            backend = getattr(self.workspace_manager, "backend", None)
+            if backend is None:
+                return []
+            rows = getattr(unwrap_backend(backend), "cloud_folders", None)
+            return list(rows()) if callable(rows) else []
+        except Exception:
+            logger.debug("cloud folder rows unavailable", exc_info=True)
+            return []
+
+    def _refresh_cloud_remote_prompt(self, backend: Any) -> None:
+        """Name the backend's cloud folders in the system prompt (the
+        ``<cloud_folders>`` floor), bound and failed alike."""
+        rows = getattr(backend, "cloud_folders", None)
+        rows = rows() if callable(rows) else []
+        if not rows:
+            return
+        self.config = _config_with_cloud_folders(
+            self.config, *_remote_cloud_folders(rows), status_tool=False
+        )
+
+    async def probe_cloud_remotes(self) -> list[dict[str, Any]]:
+        """Probe each cloud folder's root once, off the turn, and refresh the
+        prompt rows with the outcome (``ready`` or ``failed`` with a reason).
+        Returns the rows; ``[]`` when the session has no cloud folders."""
+        from agent.core.backends.overlay import unwrap_backend
+
+        backend = getattr(self.workspace_manager, "backend", None)
+        if backend is None:
+            return []
+        real = unwrap_backend(backend)
+        probe = getattr(real, "probe_cloud_folders", None)
+        if not callable(probe) or not getattr(real, "cloud_remotes", None):
+            return []
+        rows = await asyncio.to_thread(probe)
+        self._refresh_cloud_remote_prompt(real)
+        return rows
+
     def _drain_store_stats(self) -> str:
         """Object-store op tally for the phase that just ran, if the backend
         keeps one (rclone-backed virtual workspaces do — every op there is a
@@ -755,9 +857,18 @@ class PersistentSession:
             backend = getattr(self.workspace_manager, "backend", None)
             if backend is None:
                 return "n/a"
-            store = getattr(unwrap_backend(backend), "_store", None)
+            real = unwrap_backend(backend)
+            store = getattr(real, "_store", None)
             drain = getattr(store, "drain_op_stats", None)
-            return drain() if drain is not None else "n/a"
+            parts = [drain() if drain is not None else "n/a"]
+            # A Virtual Session's cloud folders, each its own remote: their
+            # tally beside the workspace's is the per-operation latency the
+            # feature's gate records (cloud_folders_on_virtual_sessions.md).
+            for remote in getattr(real, "cloud_remotes", None) or []:
+                remote_drain = getattr(remote.store, "drain_op_stats", None)
+                if remote_drain is not None:
+                    parts.append(f"{remote.path}: {remote_drain()}")
+            return "; ".join(parts)
         except Exception:
             return "n/a"
 
@@ -804,14 +915,28 @@ class PersistentSession:
         if effective_backend in LITE_BACKENDS:
             from types import SimpleNamespace
 
-            lite_cfg = SimpleNamespace(
-                backend=effective_backend,
-                mounts=(workspace_override or {}).get("mounts") or ws_data.mounts,
+            # The Session's cloud folders, served by the backend under
+            # cloud/<name> (features/cloud_folders_on_virtual_sessions.md):
+            # the workspace delivery's ``cloud_remote`` entries follow the
+            # workspace prefix in the mount list. Named in the prompt from
+            # the start; their probe runs after the attach
+            # (``probe_cloud_remotes``) and never holds it.
+            cloud_remote = (workspace_override or {}).get("cloud_remote") or {}
+            if not isinstance(cloud_remote, dict):
+                cloud_remote = {}
+            mounts = list(
+                (workspace_override or {}).get("mounts") or ws_data.mounts or []
             )
+            if mounts and effective_backend == "virtual":
+                mounts = [mounts[0], *(cloud_remote.get("mounts") or [])]
+            lite_cfg = SimpleNamespace(backend=effective_backend, mounts=mounts)
             workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
             self._workspace_backend_for_cleanup = workspace_backend
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, workspace_backend.connect)
+            plan = cloud_remote.get("plan")
+            self.cloud_remote_plan = plan if isinstance(plan, dict) else None
+            self._refresh_cloud_remote_prompt(workspace_backend)
             # Setup asks the store "does this exist?" dozens of times about
             # one small tree (scaffolding, instruction files, skill files,
             # the legacy-tools sweep) and every ask is an rclone spawn.

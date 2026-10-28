@@ -308,10 +308,14 @@ def seed_from_lite_workspace(
         return 0
     if backend != "virtual":
         raise ValueError(f"cannot seed from a {backend!r} workspace")
+    # The workspace prefix only: a Session's cloud folders (the entries after
+    # the first mount) are bound again by the Container as mounts, never
+    # copied into its PVC (features/cloud_folders_on_virtual_sessions.md).
     source = create_lite_backend(
         SimpleNamespace(backend="virtual", mounts=list(workspace.get("mounts") or [])),
         job_id=owner_id,
         max_read_bytes=VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+        cloud_folders=False,
     )
     return seed_workspace(
         source,

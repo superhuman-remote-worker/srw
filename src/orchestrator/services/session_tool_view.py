@@ -350,7 +350,8 @@ async def preview_tool_groups(
         request=request,
     )
     # Admission's rule (resolve_thread_creation_plan): a Session whose tier
-    # came from the defaults and whose cloud connectors would attach gets a
+    # came from the defaults and whose cloud connectors Virtual cannot serve
+    # (a protected folder, a provider without the Virtual delivery) gets a
     # Container. The form then lists and submits those connectors, and keeps
     # its cloud folders selectable while it predicts Virtual: ticking one
     # takes the Session to a Container rather than being refused.
@@ -366,7 +367,10 @@ async def preview_tool_groups(
     ):
         try:
             needs_container = await dependencies.cloud_folders_need_a_container(
-                user, project_id=body.project_id, datasource_ids=body.datasource_ids
+                user,
+                project_id=body.project_id,
+                datasource_ids=body.datasource_ids,
+                datasource_access=getattr(body, "datasource_access", None),
             )
             cloud_folders_take_container = (
                 needs_container

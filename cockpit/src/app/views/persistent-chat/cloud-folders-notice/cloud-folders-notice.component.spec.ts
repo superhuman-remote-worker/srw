@@ -299,7 +299,7 @@ describe('CloudFoldersNoticeComponent', () => {
     const root = await render({problems: state.problems, folders: state.folders, agentOutdated: false});
     const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
     expect(text(rows[0])).toBe(
-      "Acme cloud folder · a Virtual workspace can't hold cloud folders; a Container gets it: upgrade this session, or start a new one with a Container",
+      "Acme cloud folder · a Virtual workspace can't serve it at the level requested; a Container gets it: upgrade this session, or start a new one with a Container",
     );
     expect(text(rows[1])).toBe("Other · this workspace can't mount cloud folders; they aren't delivered here");
   });

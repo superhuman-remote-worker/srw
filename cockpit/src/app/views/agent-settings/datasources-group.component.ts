@@ -45,7 +45,8 @@ export function isRepositoryDatasource(type: DatasourceType | string): boolean {
 const LITE_BACKENDS: readonly string[] = ['virtual', 'none'];
 
 /** The built-in drivers that need a shell workspace: a copy of the server's
- *  `workspace_tier_refuses`, used only until the capability matrix loads. */
+ *  `workspace_tier_refuses` for a lite tier it does not know, used only until
+ *  the capability matrix loads. */
 const SHELL_WORKSPACE_TYPES = new Set([
   'repository',
   'credentials',
@@ -53,39 +54,55 @@ const SHELL_WORKSPACE_TYPES = new Set([
   'ssh_key',
   'kubeconfig',
   'generic_file',
-  // Mounted into the workspace (sandbox or VM tier).
+  // Mounted into the workspace (sandbox or VM tier); a Virtual Session
+  // serves it itself (the cloud_remote form), see VIRTUAL_SERVED_TYPES.
   'cloud_folder',
-  // A session's mount, or a copy from a job's repository.
+  // A session's mount, or a copy from a job's repository; on a Virtual
+  // Session served like a cloud folder.
   'cloud_outbox',
   // Copied into a job's repository before it starts.
   'cloud_folder_checkout',
 ]);
 
+/** The built-in types a Virtual Session serves without a shell (the
+ *  `cloud_remote` form, cloud_folders_on_virtual_sessions.md): the fallback's
+ *  answer for the `virtual` tier until the matrix loads. */
+const VIRTUAL_SERVED_TYPES = new Set(['cloud_folder', 'cloud_outbox']);
+
 /** Whether a connector type needs a shell workspace: its driver's
- *  `supported_backends` leaves a lite tier out. The picker knows only that the
- *  backend is lite, not which tier, so a driver missing either one is held
- *  back (the server refuses per tier). Before the matrix loads, or for a type
- *  it does not list, the built-in copy decides. */
+ *  `supported_backends` leaves the lite tier out. With the tier known
+ *  (`backend`), that one tier decides, as the server does; without it the
+ *  picker knows only that the backend is lite, so a driver missing either lite
+ *  tier is held back. Before the matrix loads, or for a type it does not list,
+ *  the built-in copy decides. */
 export function requiresShellWorkspace(
   type: DatasourceType | string,
   drivers?: readonly ConnectorDriver[] | null,
+  backend?: string | null,
 ): boolean {
   const driver = driverForType(drivers, (type || '').toString());
-  if (driver) return LITE_BACKENDS.some((tier) => !driver.supported_backends.includes(tier));
-  return SHELL_WORKSPACE_TYPES.has((type || '').toString().toLowerCase());
+  if (driver) {
+    if (backend) return !driver.supported_backends.includes(backend);
+    return LITE_BACKENDS.some((tier) => !driver.supported_backends.includes(tier));
+  }
+  const key = (type || '').toString().toLowerCase();
+  if (backend === 'virtual' && VIRTUAL_SERVED_TYPES.has(key)) return false;
+  return SHELL_WORKSPACE_TYPES.has(key);
 }
 
 /** Whether a lite tier holds a connector back from the picker. A cloud
  *  folder is not held back where one takes a default Virtual Session to a
  *  Container (`cloudFoldersTakeContainer`, the server's rule): ticking it
- *  changes the tier rather than being refused. */
+ *  changes the tier rather than being refused. `backend` names the lite tier
+ *  when the picker knows it. */
 export function liteHoldsBack(
   type: DatasourceType | string,
   drivers?: readonly ConnectorDriver[] | null,
   cloudFoldersTakeContainer = false,
+  backend?: string | null,
 ): boolean {
   if (cloudFoldersTakeContainer && CLOUD_MOUNT_TYPES.has((type || '').toString())) return false;
-  return requiresShellWorkspace(type, drivers);
+  return requiresShellWorkspace(type, drivers, backend);
 }
 
 /** How the picker shows the access level of a connector with strict levels
@@ -225,12 +242,13 @@ export function selectedDatasourceIds(
   serverDefaultsEnabled = false,
   drivers?: readonly ConnectorDriver[] | null,
   cloudFoldersTakeContainer = false,
+  backend?: string | null,
 ): string[] {
   const active = activeDatasourceIds(
     datasources, selection, defaultIds, serverDefaultsEnabled,
   );
   return datasources
-    .filter(d => active.has(d.id) && !(isLiteBackend && liteHoldsBack(d.type, drivers, cloudFoldersTakeContainer)))
+    .filter(d => active.has(d.id) && !(isLiteBackend && liteHoldsBack(d.type, drivers, cloudFoldersTakeContainer, backend)))
     .map(d => d.id);
 }
 
@@ -242,11 +260,12 @@ export function tierHiddenAttachedIds(
   attachedIds: readonly string[],
   isLiteBackend: boolean,
   drivers?: readonly ConnectorDriver[] | null,
+  backend?: string | null,
 ): string[] {
   if (!isLiteBackend) return [];
   const attached = new Set(attachedIds);
   return datasources
-    .filter(d => attached.has(d.id) && requiresShellWorkspace(d.type, drivers))
+    .filter(d => attached.has(d.id) && requiresShellWorkspace(d.type, drivers, backend))
     .map(d => d.id);
 }
 
@@ -261,10 +280,11 @@ export function allDatasourcesSelected(
   serverDefaultsEnabled = false,
   drivers?: readonly ConnectorDriver[] | null,
   cloudFoldersTakeContainer = false,
+  backend?: string | null,
 ): boolean {
   const locked = new Set(lockedIds ?? []);
   const selectable = datasources.filter(
-    d => !(isLiteBackend && liteHoldsBack(d.type, drivers, cloudFoldersTakeContainer)) && !locked.has(d.id),
+    d => !(isLiteBackend && liteHoldsBack(d.type, drivers, cloudFoldersTakeContainer, backend)) && !locked.has(d.id),
   );
   if (selectable.length === 0) return false;
   const active = activeDatasourceIds(
@@ -787,6 +807,10 @@ export class DatasourcesGroupComponent {
    * the orchestrator, so they remain selectable.
    */
   isLiteBackend = input(false);
+  /** The lite tier's name when the picker knows it (`virtual` or `none`):
+   *  a Virtual Session serves cloud folders itself, so they stay selectable
+   *  there; `null` holds back whatever either lite tier refuses. */
+  liteBackendName = input<string | null>(null);
   /** New Session on a default Virtual tier that a cloud folder takes to a
    *  Container: cloud folders stay selectable (see `liteHoldsBack`). */
   cloudFoldersTakeContainer = input(false);
@@ -903,6 +927,7 @@ export class DatasourcesGroupComponent {
     const ids = new Set(selectedDatasourceIds(
       this.datasources(), this.selection(), this.isLiteBackend(), this.defaultIds(),
       this.datasourceDefaultsEnabled(), this.drivers(), this.cloudFoldersTakeContainer(),
+      this.liteBackendName(),
     ));
     return this.datasources().filter(d => ids.has(d.id));
   });
@@ -945,12 +970,16 @@ export class DatasourcesGroupComponent {
       this.datasourceDefaultsEnabled(),
       this.drivers(),
       this.cloudFoldersTakeContainer(),
+      this.liteBackendName(),
     )
   );
 
   /** A driver that needs a shell is held back on a lite workspace. */
   isLiteExcluded(ds: Datasource): boolean {
-    return this.isLiteBackend() && liteHoldsBack(ds.type, this.drivers(), this.cloudFoldersTakeContainer());
+    return (
+      this.isLiteBackend() &&
+      liteHoldsBack(ds.type, this.drivers(), this.cloudFoldersTakeContainer(), this.liteBackendName())
+    );
   }
 
   /** Frozen at its current state — rendered, never toggleable. */
@@ -1153,6 +1182,7 @@ export class DatasourcesGroupComponent {
       this.datasourceDefaultsEnabled(),
       this.drivers(),
       this.cloudFoldersTakeContainer(),
+      this.liteBackendName(),
     );
   }
 

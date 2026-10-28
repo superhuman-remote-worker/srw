@@ -16,6 +16,11 @@
  * slices 3 to 6) every attached cloud connector binds on its own: `folders`
  * lists each one with its level and state, and one that was left out says
  * why (`excluded`, keyed by its connector id); nothing takes its place.
+ *
+ * A Virtual Session's folders are served by its agent process, not a Pod
+ * (cloud_folders_on_virtual_sessions.md): its record and events carry
+ * `delivery: "remote"`, and every folder is at `cloud/<name>` there, also a
+ * session's only one (a Container links a single folder at `cloud`).
  */
 
 export interface CloudFolderProblem {
@@ -91,9 +96,13 @@ export const CLOUD_FOLDER_REASONS = [
   'delivery_unsupported',
   // A workspace that can mount none (container mounts off, FUSE denied).
   'mount_unsupported',
-  // A Virtual Session's workspace holds none (`mount_unsupported` with the
-  // detail `virtual_workspace`): a Container gets it.
+  // A Virtual Session cannot serve it at the level requested
+  // (`mount_unsupported` with the detail `virtual_workspace`): a Container
+  // gets it.
   'virtual_workspace',
+  // A Virtual Session cannot hold its provider's bearer token yet
+  // (`delivery_unsupported` with the detail `bearer_token`).
+  'bearer_token',
 ] as const;
 
 /** What a cloud folder is, as the notice names it: a project's folder, the
@@ -117,17 +126,27 @@ function reasonOf(value: unknown): string {
 
 /** A left-out folder's reason, the Virtual tier's named as such. */
 function excludedReason(entry: Record<string, unknown>): string {
-  return entry['reason'] === 'mount_unsupported' && entry['detail'] === 'virtual_workspace'
-    ? 'virtual_workspace'
-    : reasonOf(entry['reason']);
+  if (entry['reason'] === 'mount_unsupported' && entry['detail'] === 'virtual_workspace') {
+    return 'virtual_workspace';
+  }
+  if (entry['reason'] === 'delivery_unsupported' && entry['detail'] === 'bearer_token') {
+    return 'bearer_token';
+  }
+  return reasonOf(entry['reason']);
 }
 
 function kindOf(value: unknown): string {
   return typeof value === 'string' && KINDS.has(value) ? value : '';
 }
 
-function pathOf(name: string, total: number): string {
-  return total === 1 ? 'cloud' : `cloud/${name}`;
+/** Where the agent finds a folder: `cloud/<name>`; a Container links a
+ *  session's only folder at `cloud`, a Virtual Session (`remote`) never. */
+function pathOf(name: string, total: number, remote = false): string {
+  return total === 1 && !remote ? 'cloud' : `cloud/${name}`;
+}
+
+function isRemote(record: Record<string, unknown>): boolean {
+  return record['delivery'] === 'remote';
 }
 
 function excludedEntries(excluded: unknown): Record<string, unknown>[] {
@@ -189,10 +208,11 @@ export function cloudFolderStateFromStatus(status: unknown): CloudFolderState {
   let protectedDown = false;
   if (mounts && typeof mounts === 'object' && !Array.isArray(mounts)) {
     const entries = Object.entries(mounts as Record<string, unknown>);
+    const remote = isRemote(record);
     for (const [name, entry] of entries) {
       if (!entry || typeof entry !== 'object') continue;
       const row = entry as Record<string, unknown>;
-      const path = pathOf(name, entries.length);
+      const path = pathOf(name, entries.length, remote);
       const state = stateOf(row['state']);
       const reason = state === 'unavailable' ? reasonOf(row['reason']) : '';
       if (state === 'unavailable') {
@@ -234,10 +254,11 @@ export function cloudFolderStateFromEvent(
     (row): row is Record<string, unknown> => !!row && typeof row === 'object',
   );
   const known = new Map((previous?.folders ?? []).filter((f) => f.name).map((f) => [f.name, f]));
+  const remote = isRemote(params);
   const problems: CloudFolderProblem[] = [];
   const folders: CloudFolderBinding[] = rows.map((row) => {
     const name = String(row['name'] ?? '');
-    const path = pathOf(name, rows.length);
+    const path = pathOf(name, rows.length, remote);
     const state = stateOf(row['state']);
     const reason = state === 'unavailable' ? reasonOf(row['reason']) : '';
     if (state === 'unavailable') problems.push({name, path, kind: '', reason});

@@ -630,6 +630,96 @@ class SessionAttachCoordinator:
         self._report_tasks.add(task)
         task.add_done_callback(self._report_tasks.discard)
 
+    @staticmethod
+    def _remote_cloud_event_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The Virtual folders' rows in the shape the session header reads
+        (``event_rows`` of the sidecar watcher): a bound or ready folder is
+        in the workspace (``mounted``), a failed one is ``unavailable`` with
+        its reason; ``delivery: remote`` tells the two deliveries apart."""
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            failed = row.get("state") == "failed"
+            entry: dict[str, Any] = {
+                "name": row.get("name"),
+                "state": "unavailable" if failed else "mounted",
+                "mount_kind": row.get("kind"),
+                "level": row.get("access"),
+                "connector_id": row.get("mount_id"),
+                "delivery": "remote",
+            }
+            if failed:
+                entry["reason"] = row.get("reason") or "mount_failed"
+            out.append(entry)
+        return out
+
+    def _broadcast_remote_cloud_folders(self, rows: list[dict[str, Any]]) -> None:
+        self._ports.broadcast(
+            "cloud_mount.status",
+            {
+                "mounts": self._remote_cloud_event_rows(rows),
+                "excluded": [],
+                "protected": False,
+                "delivery": "remote",
+            },
+        )
+
+    async def _probe_and_report_remote_cloud_folders(self) -> None:
+        """Probe the Virtual Session's cloud folders once, then publish the
+        outcome: a cockpit event, and the orchestrator's record for this
+        claim's plan when the planner named one. Never raises."""
+        try:
+            rows = await self._session.probe_cloud_remotes()
+        except Exception as exc:
+            self._logger.warning(
+                "Could not probe the cloud folders: %s", type(exc).__name__
+            )
+            return
+        if not rows:
+            return
+        self._broadcast_remote_cloud_folders(rows)
+        plan = getattr(self._session, "cloud_remote_plan", None)
+        thread_id = self._identity.thread_id
+        report_status = getattr(self._client, "report_cloud_mount_status", None)
+        if not (
+            thread_id
+            and isinstance(plan, dict)
+            and plan.get("fingerprint")
+            and plan.get("incarnation")
+            and callable(report_status)
+        ):
+            return
+        try:
+            accepted = await report_status(
+                str(thread_id),
+                fingerprint=str(plan["fingerprint"]),
+                pod_uid=str(plan["incarnation"]),
+                # The record's closed states: a folder that answered its
+                # probe is in the workspace, one that did not is unavailable
+                # with its reason.
+                mounts=[
+                    {
+                        "name": row.get("name"),
+                        "state": (
+                            "unavailable" if row.get("state") == "failed" else "mounted"
+                        ),
+                        **(
+                            {"reason": row.get("reason") or "mount_failed"}
+                            if row.get("state") == "failed"
+                            else {}
+                        ),
+                    }
+                    for row in rows
+                ],
+            )
+            if not accepted:
+                self._logger.warning(
+                    "The orchestrator did not keep the cloud folders' state"
+                )
+        except Exception as exc:
+            self._logger.warning(
+                "Could not report the cloud folders' state: %s", type(exc).__name__
+            )
+
     async def _poll_workspace(self, thread_id: str, **kwargs: Any) -> Any:
         """The readiness poll of this attach, fenced by the ending refusal."""
 
@@ -1294,14 +1384,19 @@ class SessionAttachCoordinator:
                             )
                     elif not cloud_mount_cfg:
                         cloud_mount_cfg = cloud_mount_payload(ws_info)
-                    if workspace_override is None and ws_info.get(
-                        "cloud_folders_excluded"
+                    if workspace_override is None and (
+                        ws_info.get("cloud_folders_excluded")
+                        or ws_info.get("cloud_remote")
                     ):
-                        # A lite session has no pod payload, but the cloud
-                        # folders its tier left out still reach its prompt
-                        # (setup reads an absent override as empty).
+                        # A lite session has no pod payload, but its cloud
+                        # folders (served by its own backend, the
+                        # cloud_remote form) and the ones its tier left out
+                        # still reach it (setup reads an absent override as
+                        # empty).
                         workspace_override = {
-                            "cloud_folders_excluded": ws_info["cloud_folders_excluded"]
+                            key: ws_info[key]
+                            for key in ("cloud_folders_excluded", "cloud_remote")
+                            if ws_info.get(key)
                         }
                 elif protected_cloud:
                     raise ProtectedCloudUnavailable(
@@ -2087,6 +2182,19 @@ class SessionAttachCoordinator:
                 sidecar_mounts.start_monitor(
                     lambda report: self._report_sidecar_mounts(sidecar_mounts, report)
                 )
+        remote_rows = getattr(self._session, "cloud_remote_rows", lambda: [])()
+        if remote_rows:
+            # A Virtual Session's cloud folders, served by its backend
+            # (features/cloud_folders_on_virtual_sessions.md § Lifecycle):
+            # the cockpit hears of them now, and one probe per folder runs
+            # off the attach and reports what it found.
+            self._broadcast_remote_cloud_folders(remote_rows)
+            task = asyncio.create_task(
+                self._probe_and_report_remote_cloud_folders(),
+                name="cloud-remote-probe",
+            )
+            self._report_tasks.add(task)
+            task.add_done_callback(self._report_tasks.discard)
 
         # Restore deliberately excludes persisted-but-unadmitted delivery rows:
         # they are executable inbox work, not passive conversation context. Claim

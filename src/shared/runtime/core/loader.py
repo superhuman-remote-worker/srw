@@ -5912,9 +5912,13 @@ def append_expert_workflow_addendum(body: str, addendum: str) -> str:
     return f"{body.rstrip()}\n\n{addendum}\n"
 
 
-def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
+def cloud_mount_system_floor(
+    unavailable: Any, mounted: Any = None, *, status_tool: bool = True
+) -> str:
     """Return what the agent must know about this session's cloud folders,
-    or "" when it has none.
+    or "" when it has none. ``status_tool=False`` leaves ``srw_cloud_status``
+    unmentioned (a Virtual Session serves its folders without the shell
+    category that tool lives in).
 
     Every folder in the workspace is named (main cloud slice 3): where it
     is (``cloud/<name>``, the path the file tools take from the workspace
@@ -5952,8 +5956,12 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
                 "cloud/ folder in the workspace and nothing you write reaches the "
                 "cloud. "
                 "Tell the user plainly if their request needs the cloud; "
-                "srw_cloud_status shows the current state, and the user can "
-                "start a new session once it is fixed.",
+                + (
+                    "srw_cloud_status shows the current state, and the user can "
+                    if status_tool
+                    else "the user can "
+                )
+                + "start a new session once it is fixed.",
                 "</cloud_folders>",
             ]
         )
@@ -5985,8 +5993,13 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
         "Save work for the user only into a folder listed here as in the "
         "workspace, and say which one; never say a file is saved to the cloud "
         "in a folder that is not available. Tell the user plainly what is "
-        "missing if their request needs it; srw_cloud_status shows the current "
-        "state, and the user can start a new session once a folder is fixed."
+        "missing if their request needs it; "
+        + (
+            "srw_cloud_status shows the current state, and the user can "
+            if status_tool
+            else "the user can "
+        )
+        + "start a new session once a folder is fixed."
     )
     lines.append("</cloud_folders>")
     return "\n".join(lines)
@@ -6302,6 +6315,7 @@ def get_phase_system_prompt(
         cloud_floor = cloud_mount_system_floor(
             config.extra.get("_cloud_mounts_unavailable"),
             config.extra.get("_cloud_mounts_mounted"),
+            status_tool=config.extra.get("_cloud_status_tool", True) is not False,
         )
         if cloud_floor:
             rendered = f"{rendered}\n\n{cloud_floor}"

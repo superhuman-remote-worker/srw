@@ -50,7 +50,19 @@
           "ssh_identity",
           "lease_token",
           "cloud_mount",
-          "cloud_checkout"
+          "cloud_checkout",
+          "cloud_remote"
+        ]
+      }
+    },
+    "form_planes": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "harness",
+          "bind_time",
+          "service",
+          "in_pod"
         ]
       }
     },

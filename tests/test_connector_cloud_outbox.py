@@ -111,17 +111,18 @@ class TestSpec:
             "srw.cloud-outbox/v1",
             "cloud_outbox",
             "in_pod",
-            ("cloud_mount",),
+            ("cloud_mount", "cloud_remote"),
         )
+        assert spec.plane_for("cloud_remote") == "harness"
         assert set(spec.executions) == {"job", "session"}
         assert spec.user_creatable is False
         assert spec.publishable is False
         assert (spec.live_attach, spec.live_detach) == (False, "next_attach")
         assert spec.credential_slots == ()
         assert spec.legacy_connection_url == "forbidden"
-        # Both shell tiers: a job's copy works on either; a session's mount
-        # is narrowed per tier by offered_access.
-        assert spec.supported_backends == SHELL_BACKENDS
+        # Both shell tiers and Virtual: a job's copy works on either shell
+        # tier; a session's binding is narrowed per tier by offered_access.
+        assert spec.supported_backends == SHELL_BACKENDS | {"virtual"}
         assert spec_for_type("cloud_outbox") is spec
 
     def test_it_is_in_no_catalogue_users_create_from(self):
@@ -138,11 +139,11 @@ class TestSpec:
             (d.type_id, d.runtime_kind) for d in PLATFORM_TYPE_CATALOG
         ]
 
-    def test_a_lite_tier_refuses_it(self):
+    def test_only_the_none_tier_refuses_it(self):
         from orchestrator.services.datasource_policy import workspace_tier_refuses
 
         row = {"type": "cloud_outbox"}
-        assert workspace_tier_refuses(row, "virtual")
+        assert not workspace_tier_refuses(row, "virtual")  # the cloud_remote form
         assert workspace_tier_refuses(row, "none")
         assert not workspace_tier_refuses(row, "sandbox")
         assert not workspace_tier_refuses(row, "vm")
@@ -287,7 +288,12 @@ class TestOfferedAccess:
         )
         # The service account's credential must not reach a root VM.
         assert driver.offered_access(_row(), _session("vm", backend)) == ()
-        assert driver.offered_access(_row(), _session("virtual", backend)) == ()
+        # A Virtual Session holds it in the executor process (ruling 2 of
+        # features/cloud_folders_on_virtual_sessions.md); OpenCloud's bearer
+        # token follows in the feature's second run.
+        assert driver.offered_access(_row(), _session("virtual", backend)) == (
+            ("read_write",) if backend == "nextcloud" else ()
+        )
 
     def test_a_jobs_copy_is_offered_on_any_tier(self):
         driver = CloudOutboxDriver()

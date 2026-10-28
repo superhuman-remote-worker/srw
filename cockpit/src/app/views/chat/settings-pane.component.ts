@@ -651,6 +651,7 @@ export class SettingsPaneComponent {
             this.attachedIds(),
             this.isLiteBackend(),
             this.connectorDrivers.drivers(),
+            this.workspaceTier(),
         );
         return [...new Set([...groupIds, ...hidden, ...tierHidden])].sort();
     }

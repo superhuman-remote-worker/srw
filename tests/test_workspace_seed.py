@@ -251,3 +251,45 @@ class TestSeedFromLiteWorkspace:
 
         with pytest.raises(ValueError, match="Not a file"):
             seed_workspace(src, FilesystemTestBackend(tmp_path), max_file_bytes=10)
+
+
+class TestSeedLeavesTheCloudFoldersAlone:
+    """A Virtual Session's cloud folders (the mount entries after the first)
+    are never copied by the upgrade seed: the Container binds them again as
+    mounts (features/cloud_folders_on_virtual_sessions.md § Agent)."""
+
+    def test_only_the_workspace_prefix_is_copied(self, tmp_path, monkeypatch):
+        store = InMemoryObjectStore()
+        old = VirtualWorkspaceBackend(store, prefix="threads/t/")
+        old.write_file("plan.md", "p")
+        monkeypatch.setattr(
+            "shared.runtime.core.backends.rclone.object_store_from_spec",
+            lambda _spec: store,
+        )
+        cloud_store_calls: list[str] = []
+
+        def _cloud_store(entry, *, remote_name):
+            cloud_store_calls.append(remote_name)
+            return InMemoryObjectStore()
+
+        monkeypatch.setattr(
+            "shared.runtime.core.backends.rclone.cloud_object_store_from_spec",
+            _cloud_store,
+        )
+        dst = FilesystemTestBackend(tmp_path)
+        n = seed_from_lite_workspace(
+            {
+                "backend": "virtual",
+                "mounts": [
+                    {"rclone_spec": {"type": "memory"}, "prefix": "threads/t/"},
+                    {
+                        "name": "outbox",
+                        "rclone_spec": {"type": "webdav", "config": {}, "root": "s/t"},
+                    },
+                ],
+            },
+            owner_id="t",
+            destination=dst,
+        )
+        assert n == 1 and dst.read_file("plan.md") == "p"
+        assert not dst.exists("cloud") and cloud_store_calls == []

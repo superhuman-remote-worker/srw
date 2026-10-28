@@ -738,8 +738,14 @@ async def _resolve_live_mount_set(
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
     withholding: InWorkspaceWithholding | None = None,
+    workspace_backend: str | None = None,
 ) -> LiveMountSet:
     """Each cloud connector the thread has attached, bound on its own.
+
+    ``workspace_backend`` names the tier the binding is for when it is not
+    the Container or VM ``runtime_is_vm`` decides between: the Virtual
+    planner passes ``"virtual"`` and gets the levels the matrix offers
+    there (features/cloud_folders_on_virtual_sessions.md).
 
     The selection is the thread's (``metadata.datasource_ids``); a connector
     its owner may no longer attach is ``not_eligible``. ``mount_rows`` only
@@ -770,16 +776,23 @@ async def _resolve_live_mount_set(
         runtime_is_vm=runtime_is_vm,
         dependencies=dependencies,
         withholding=withholding,
+        workspace_backend=workspace_backend,
     )
 
 
-def _access_context(thread: dict[str, Any], *, runtime_is_vm: bool) -> AccessContext:
+def _access_context(
+    thread: dict[str, Any],
+    *,
+    runtime_is_vm: bool,
+    workspace_backend: str | None = None,
+) -> AccessContext:
     # An ordinary session's folders never bind at the reviewed level: only a
     # protected session has the review lane, and it takes its own path. A
     # link default of ``protected`` is lowered (read-only where offered),
-    # never mounted live at it.
+    # never mounted live at it. ``workspace_backend`` overrides the Container
+    # or VM choice for a tier that is neither (``virtual``).
     return AccessContext(
-        workspace_backend="vm" if runtime_is_vm else "sandbox",
+        workspace_backend=workspace_backend or ("vm" if runtime_is_vm else "sandbox"),
         protected_mode_enabled=False,
         execution="session",
         main_cloud_backend=str(thread.get("main_cloud_backend") or "") or None,
@@ -793,11 +806,14 @@ async def _bind_cloud_connectors(
     runtime_is_vm: bool,
     dependencies: AgentCloudMountDependencies,
     withholding: InWorkspaceWithholding | None = None,
+    workspace_backend: str | None = None,
 ) -> LiveMountSet:
     """``selected`` mounted one by one; the outbox first, so it keeps
     ``cloud/outbox`` whatever a project is called. Each keeps the name the
     thread recorded for it (:class:`_MountNames`)."""
-    ctx = _access_context(thread, runtime_is_vm=runtime_is_vm)
+    ctx = _access_context(
+        thread, runtime_is_vm=runtime_is_vm, workspace_backend=workspace_backend
+    )
     withholding = withholding or InWorkspaceWithholding()
     names = _MountNames(thread)
     mounts: list[dict[str, Any]] = []

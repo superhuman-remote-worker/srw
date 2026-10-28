@@ -2076,7 +2076,8 @@
         "cloud_grant_revoked": "the cloud no longer accepts your connection: reconnect it under Settings → Connectors",
         "delivery_unsupported": "this deployment syncs files instead of mounting them; cloud folders aren't delivered here",
         "mount_unsupported": "this workspace can't mount cloud folders; they aren't delivered here",
-        "virtual_workspace": "a Virtual workspace can't hold cloud folders; a Container gets it: upgrade this session, or start a new one with a Container"
+        "virtual_workspace": "a Virtual workspace can't serve it at the level requested; a Container gets it: upgrade this session, or start a new one with a Container",
+        "bearer_token": "your cloud signs in with a token a Virtual workspace can't hold yet; a Container gets it: upgrade this session, or start a new one with a Container"
       }
     },
     "cloudReview": {

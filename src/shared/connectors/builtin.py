@@ -1559,7 +1559,13 @@ OFFICIAL_SERVICE_SPECS: tuple[DriverSpec, ...] = (GIT_SWAP_SPEC,) + LIVE_SPECS
 # main cloud provisions (a project's folder; a user's root later): its config
 # names the folder, never a credential, which SRW resolves from the main
 # cloud when it mounts the folder. It never reaches the agent as a
-# connector: the mount is the delivery.
+# connector: the mount is the delivery. A Virtual Session has no workspace
+# to mount into; there the same connector is delivered in the cloud_remote
+# form (features/cloud_folders_on_virtual_sessions.md): the orchestrator
+# hands the executor a remote descriptor and the Virtual backend performs
+# explicit operations against it under the same cloud/<name> path. The two
+# forms run in different planes (the sidecar; the agent process), which is
+# what ``form_planes`` says.
 #
 # Its levels are the union of what any provider enforces; the driver offers
 # a connector the ones its provider's support matrix declares for the
@@ -1574,7 +1580,8 @@ CLOUD_FOLDER_SPEC = DriverSpec(
     title="Cloud folder",
     guide_topic="files-and-integrations",
     plane="in_pod",
-    delivery_forms=("cloud_mount",),
+    delivery_forms=("cloud_mount", "cloud_remote"),
+    form_planes={"cloud_mount": "in_pod", "cloud_remote": "harness"},
     config_schema={
         "type": "object",
         "additionalProperties": False,
@@ -1635,10 +1642,12 @@ CLOUD_FOLDER_SPEC = DriverSpec(
             writes="direct",
         ),
     ),
-    supported_backends=SHELL_BACKENDS,
+    supported_backends=SHELL_BACKENDS | {"virtual"},
     workspace_requirements=(
         "A workspace the folder is mounted into at cloud/<name>: SRW's in-pod "
-        "mount sidecar, or an rclone mount in the workspace."
+        "mount sidecar, or an rclone mount in the workspace; on a Virtual "
+        "Session the agent reaches the folder at the same path through "
+        "explicit operations, with no workspace Pod."
     ),
     publishable=False,
     live_attach=False,
@@ -1654,19 +1663,22 @@ CLOUD_FOLDER_SPEC = DriverSpec(
 # completes. The connector names no folder (its config is empty): the folder
 # is the execution's, recorded on it.
 #
-# Its tiers are both shell tiers, the union over executions. A session
-# mounts the folder with the service account's credential, which must not
-# reach a root VM, so the driver offers a session's binding only on the
-# tiers its provider declares (offered_access); a job's copy is SRW's, made
-# from the job's repository, so any tier with a repository serves it. The
-# lite tiers have neither a workspace nor a repository.
+# Its tiers are the shell tiers and Virtual, the union over executions. A
+# session mounts the folder with the service account's credential, which
+# must not reach a root VM, so the driver offers a session's binding only on
+# the tiers its provider declares (offered_access); a job's copy is SRW's,
+# made from the job's repository, so any tier with a repository serves it.
+# A Virtual Session gets the folder in the cloud_remote form: the credential
+# stays in the executor process (owner, 2026-10-28, ruling 2; the follow-up
+# issues/session_outbox_runs_on_the_agent_service_credential.md).
 CLOUD_OUTBOX_SPEC = DriverSpec(
     name="srw.cloud-outbox/v1",
     legacy_type="cloud_outbox",
     title="Session outbox",
     guide_topic="files-and-integrations",
     plane="in_pod",
-    delivery_forms=("cloud_mount",),
+    delivery_forms=("cloud_mount", "cloud_remote"),
+    form_planes={"cloud_mount": "in_pod", "cloud_remote": "harness"},
     config_schema={"type": "object", "additionalProperties": False, "properties": {}},
     access_levels=(
         AccessLevel(
@@ -1679,11 +1691,12 @@ CLOUD_OUTBOX_SPEC = DriverSpec(
             writes="direct",
         ),
     ),
-    supported_backends=SHELL_BACKENDS,
+    supported_backends=SHELL_BACKENDS | {"virtual"},
     workspace_requirements=(
         "A session's workspace the folder is mounted into at cloud/outbox "
-        "(the sandbox tier); a job needs only its repository, which SRW copies "
-        "the deliverables from when it completes."
+        "(the sandbox tier), or a Virtual Session that reaches it at the same "
+        "path with no workspace Pod; a job needs only its repository, which "
+        "SRW copies the deliverables from when it completes."
     ),
     publishable=False,
     live_attach=False,

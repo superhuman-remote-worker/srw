@@ -195,7 +195,20 @@ describe('datasources-group selection logic', () => {
     expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, true)).toBe(false);
     expect(liteHoldsBack('cloud_outbox', BUILTIN_DRIVERS, true)).toBe(false);
     expect(liteHoldsBack('repository', BUILTIN_DRIVERS, true)).toBe(true);
+    // Without the tier's name either lite tier may refuse it; a Virtual
+    // Session named serves cloud folders itself (the cloud_remote form).
     expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS)).toBe(true);
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, false, 'virtual')).toBe(false);
+    expect(liteHoldsBack('cloud_outbox', BUILTIN_DRIVERS, false, 'virtual')).toBe(false);
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, false, 'none')).toBe(true);
+    expect(liteHoldsBack('repository', BUILTIN_DRIVERS, false, 'virtual')).toBe(true);
+    // The fallback copy knows the Virtual tier's two served types too.
+    expect(requiresShellWorkspace('cloud_folder', null, 'virtual')).toBe(false);
+    expect(requiresShellWorkspace('cloud_outbox', [], 'virtual')).toBe(false);
+    expect(requiresShellWorkspace('cloud_folder', null, 'none')).toBe(true);
+    expect(requiresShellWorkspace('repository', null, 'virtual')).toBe(true);
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS, false, 'virtual'))
+      .toEqual(['folder', 'outbox', 'kb']);
     // Ticked on Virtual, the cloud folders are sent (they take the Session
     // to a Container); a repository still waits for a shell.
     expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS, true))

@@ -1283,6 +1283,20 @@ class ToolContext:
         current = "sha256:" + hashlib.sha256(raw).hexdigest()
         return current == expected
 
+    def recent_read_changed(self, path: str, content: str | bytes) -> bool:
+        """Whether this agent did read ``path`` (a versioned read) and the
+        file's text is no longer what it read: another writer edited it in
+        between. False when the file was never read, which is the other
+        reason :meth:`recent_read_matches` says no."""
+
+        normalized = path.lstrip("/").strip()
+        if normalized not in self._recent_reads:
+            return False
+        expected = self._recent_read_versions.get(normalized)
+        if expected is None:
+            return False
+        return not self.recent_read_matches(path, content)
+
     def invalidate_recent_read(self, path: str) -> bool:
         """Forget a file read after an out-of-band user edit.
 

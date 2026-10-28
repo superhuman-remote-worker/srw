@@ -581,6 +581,7 @@ def thread_workspace_delivery_dependencies(
             dispatch_credential_dependencies,
             resources,
         ),
+        plan_cloud_remotes=workspace_composition.cloud_remote_planner(resources),
         protected_cloud_delivery_state=bound(
             protected_cloud_engage._protected_cloud_delivery_state,
             workspace_composition.protected_cloud_engage_dependencies,

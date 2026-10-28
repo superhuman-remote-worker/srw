@@ -1462,8 +1462,9 @@ class TestSessionCreateBoundary:
         # Execution now owns workspace selection, and the documented account/role
         # default is sandbox for a worker but virtual for a session
         # (config/README.md, "Workspace ownership"). A Virtual Session also asks
-        # once what a Container would hold, for its own cloud folders (owner
-        # 2026-10-21); the selection it gets is the Virtual one.
+        # what a Container would hold and what Virtual admits, for the cloud
+        # folders only a Container can serve (owner 2026-10-21, narrowed
+        # 2026-10-28); the selection it gets is the Virtual one.
         assert resolver.await_args == call(
             db,
             SESSION_USER_ID,
@@ -1472,7 +1473,11 @@ class TestSessionCreateBoundary:
             execution_kind="session",
             native_only=False,
         )
-        assert [c.args[3] for c in resolver.await_args_list] == ["sandbox", "virtual"]
+        assert [c.args[3] for c in resolver.await_args_list] == [
+            "sandbox",
+            "virtual",
+            "virtual",
+        ]
         kwargs = db.create_thread.await_args.kwargs
         assert kwargs["datasource_ids"] == [SESSION_DATASOURCE_ID]
         assert kwargs["datasource_policy_revisions"] == {SESSION_DATASOURCE_ID: 7}

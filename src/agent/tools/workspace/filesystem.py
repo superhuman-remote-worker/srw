@@ -340,14 +340,27 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 exclude_dirs=exclude_dirs,
             )
 
+            # A search under a cloud folder considers a bounded number of
+            # files and says so (the hydration guard of the virtual tier).
+            truncated_note = ""
+            if getattr(results, "truncated", False):
+                truncated_note = (
+                    f"\n[truncated: only the first {getattr(results, 'scanned', '?')} "
+                    f"files under {path or '/'} were searched (limit "
+                    f"{getattr(results, 'limit', '?')}); search a narrower folder "
+                    f"for the rest]"
+                )
+
             if not results:
                 # An empty result must not read as "the text is absent" when
                 # the search itself was off: a path that does not exist, or a
                 # regex-shaped query that was (by contract) matched literally.
                 if path and not workspace.exists(path):
                     return f"Error: path not found: {path}"
-                return f"No matches found for: {query}" + _literal_query_note(
-                    query, context.has_shell_tool()
+                return (
+                    f"No matches found for: {query}"
+                    + _literal_query_note(query, context.has_shell_tool())
+                    + truncated_note
                 )
 
             # Limit results
@@ -382,6 +395,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             elif total > max_search_results:
                 lines.append("")
                 lines.append(f"[Showing {max_search_results} of {total} matches]")
+            if truncated_note:
+                lines.append(truncated_note.strip("\n"))
 
             return "\n".join(lines)
 

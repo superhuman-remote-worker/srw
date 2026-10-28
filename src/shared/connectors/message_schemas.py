@@ -268,6 +268,12 @@ def spec_schema() -> dict[str, Any]:
                 "minItems": 1,
                 "items": {"enum": list(DELIVERY_FORMS)},
             },
+            # The plane per form where the forms run in different ones; a
+            # form left out runs on ``plane``.
+            "form_planes": {
+                "type": "object",
+                "additionalProperties": {"enum": list(PLANES)},
+            },
             "config_schema": {"type": "object"},
             "credential_slots": {"type": "array", "items": slot},
             "access_levels": {"type": "array", "items": level},

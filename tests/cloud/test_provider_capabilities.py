@@ -53,16 +53,19 @@ class TestTheDeclarations:
         assert adapter.capabilities.backend_id == adapter.backend_id
 
     def test_nextcloud_is_the_design_table(self):
+        # Virtual serves a folder through the cloud_remote form since
+        # 2026-10-28 (features/cloud_folders_on_virtual_sessions.md): every
+        # level the executor can hold the credential for, never protected.
         assert [_cell(NEXTCLOUD, row) for row in MATRIX_ROWS] == [
-            ("offered", ["sandbox", "vm"], None),  # project · read_only (reader)
-            ("offered", ["sandbox"], None),  # project · read_write (writer)
+            ("offered", ["sandbox", "virtual", "vm"], None),  # project · read_only
+            ("offered", ["sandbox", "virtual"], None),  # project · read_write (writer)
             ("offered", ["sandbox"], None),  # project · protected (container only)
-            ("offered", ["sandbox"], None),  # user root · read_write (app token)
+            ("offered", ["sandbox", "virtual"], None),  # user root · read_write
             ("unsupported", [], None),  # user root · read_only
             ("unsupported", [], None),  # user root · protected
             ("offered", ["sandbox", "vm"], None),  # checkout
             ("offered", ["sandbox", "vm"], None),  # checkout · reviewed write-back
-            ("offered", ["sandbox"], None),  # outbox
+            ("offered", ["sandbox", "virtual"], None),  # outbox
         ]
 
     def test_opencloud_is_the_design_table(self):

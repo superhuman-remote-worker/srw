@@ -8,6 +8,7 @@
       "serves_stored_type": false,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "pod_env"
       ],
@@ -91,6 +92,7 @@
       "serves_stored_type": false,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "pod_file"
       ],
@@ -177,6 +179,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "env_file"
       ],
@@ -282,6 +285,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "env_file"
       ],
@@ -387,6 +391,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "checkout",
         "ssh_identity"
@@ -581,6 +586,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "knowledge_index"
       ],
@@ -719,6 +725,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "managed_connection"
       ],
@@ -806,6 +813,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "managed_connection"
       ],
@@ -916,6 +924,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "managed_connection"
       ],
@@ -1006,6 +1015,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "managed_connection"
       ],
@@ -1119,6 +1129,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "managed_connection"
       ],
@@ -1423,6 +1434,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "mcp_client"
       ],
@@ -1532,6 +1544,7 @@
       "serves_stored_type": false,
       "protocol_version": "1.0",
       "plane": "harness",
+      "form_planes": {},
       "delivery_forms": [
         "mcp_client"
       ],
@@ -1653,6 +1666,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "credential_file"
       ],
@@ -1834,6 +1848,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "ssh_identity"
       ],
@@ -2001,6 +2016,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "credential_file"
       ],
@@ -2153,14 +2169,20 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "in_pod",
+      "form_planes": {
+        "cloud_mount": "in_pod",
+        "cloud_remote": "harness"
+      },
       "delivery_forms": [
-        "cloud_mount"
+        "cloud_mount",
+        "cloud_remote"
       ],
       "supported_backends": [
         "sandbox",
+        "virtual",
         "vm"
       ],
-      "workspace_requirements": "A workspace the folder is mounted into at cloud/<name>: SRW's in-pod mount sidecar, or an rclone mount in the workspace.",
+      "workspace_requirements": "A workspace the folder is mounted into at cloud/<name>: SRW's in-pod mount sidecar, or an rclone mount in the workspace; on a Virtual Session the agent reaches the folder at the same path through explicit operations, with no workspace Pod.",
       "tool_category": null,
       "operations": [],
       "access_levels": [
@@ -2286,14 +2308,20 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "in_pod",
+      "form_planes": {
+        "cloud_mount": "in_pod",
+        "cloud_remote": "harness"
+      },
       "delivery_forms": [
-        "cloud_mount"
+        "cloud_mount",
+        "cloud_remote"
       ],
       "supported_backends": [
         "sandbox",
+        "virtual",
         "vm"
       ],
-      "workspace_requirements": "A session's workspace the folder is mounted into at cloud/outbox (the sandbox tier); a job needs only its repository, which SRW copies the deliverables from when it completes.",
+      "workspace_requirements": "A session's workspace the folder is mounted into at cloud/outbox (the sandbox tier), or a Virtual Session that reaches it at the same path with no workspace Pod; a job needs only its repository, which SRW copies the deliverables from when it completes.",
       "tool_category": null,
       "operations": [],
       "access_levels": [
@@ -2354,6 +2382,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
+      "form_planes": {},
       "delivery_forms": [
         "cloud_checkout"
       ],

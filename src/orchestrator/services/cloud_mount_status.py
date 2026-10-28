@@ -50,6 +50,11 @@ logger = logging.getLogger(__name__)
 STATUS_KEY = "cloud_mount_status"
 MOUNT_STATES = frozenset({"pending", "mounted", "unavailable"})
 NOTICES = frozenset({"agent_outdated"})
+#: The record's ``delivery`` for a Virtual Session, whose folders the agent
+#: process reaches through explicit operations and no Pod mounts
+#: (features/cloud_folders_on_virtual_sessions.md § Status). Absent on a
+#: Pod's record.
+REMOTE_DELIVERY = "remote"
 
 
 def _now() -> str:
@@ -132,6 +137,72 @@ def report_entries(
             "updated_at": stamp,
         }
     return entries
+
+
+def remote_status(
+    plan: Mapping[str, Any], runtime_incarnation: str, *, now: str | None = None
+) -> dict[str, Any]:
+    """The orchestrator's record of a Virtual Session's cloud folders, written
+    at each claim the planner serves (``delivery: remote``): every bound
+    folder ``pending`` until the agent's first probe reports it ``mounted``
+    or ``unavailable``, and every row the plan left out under ``excluded``.
+    ``plan`` is the planner's non-secret body (``fingerprint``, ``mounts``,
+    ``excluded``); ``runtime_incarnation`` names the claim, so a report from
+    an earlier claim's executor changes nothing."""
+    status = initial_status(plan, runtime_incarnation, now=now)
+    status["delivery"] = REMOTE_DELIVERY
+    return status
+
+
+def recorded_remote_plan(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The plan a Virtual Session's current record names, in the shape
+    :func:`report_entries` reads (``fingerprint``, ``runtime_incarnation``,
+    ``mounts`` with ``name``), or ``None`` for any other record."""
+    status = metadata.get(STATUS_KEY) if isinstance(metadata, Mapping) else None
+    if not isinstance(status, Mapping) or status.get("delivery") != REMOTE_DELIVERY:
+        return None
+    fingerprint = status.get("fingerprint")
+    incarnation = status.get("runtime_incarnation")
+    mounts = status.get("mounts")
+    if (
+        not isinstance(fingerprint, str)
+        or not isinstance(incarnation, str)
+        or not isinstance(mounts, Mapping)
+    ):
+        return None
+    return {
+        "fingerprint": fingerprint,
+        "runtime_incarnation": incarnation,
+        "mounts": [
+            {
+                "name": name,
+                "mount_kind": entry.get("mount_kind"),
+                "target_path": entry.get("target_path"),
+                "access": entry.get("access"),
+            }
+            for name, entry in mounts.items()
+            if isinstance(entry, Mapping)
+        ],
+    }
+
+
+async def record_remote_plan(
+    store: Any, thread_id: str, status: Mapping[str, Any] | None
+) -> bool:
+    """Write a Virtual Session's record (``None`` clears it). Best effort:
+    False when the store cannot, never raises."""
+    setter = getattr(type(store), "set_thread_cloud_mount_status", None)
+    if not callable(setter):
+        return False
+    try:
+        return bool(await setter(store, thread_id, dict(status) if status else None))
+    except Exception:
+        logger.warning(
+            "Thread %s: could not record its cloud folders' plan",
+            thread_id,
+            exc_info=True,
+        )
+        return False
 
 
 async def record_pod(
@@ -282,12 +353,16 @@ async def record_agent_outdated(
 __all__ = [
     "MOUNT_STATES",
     "NOTICES",
+    "REMOTE_DELIVERY",
     "STATUS_KEY",
     "initial_status",
     "record_agent_outdated",
     "record_pod",
+    "record_remote_plan",
     "record_report",
     "record_sync_exclusions",
+    "recorded_remote_plan",
+    "remote_status",
     "report_entries",
     "sync_status",
 ]

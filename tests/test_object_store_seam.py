@@ -159,3 +159,33 @@ class TestInMemoryVersions:
     def test_object_stat_is_an_object_info(self):
         info = ObjectStat(key="k", size=1, version="v")
         assert isinstance(info, ObjectInfo) and (info.key, info.size) == ("k", 1)
+
+
+class TestDirectoryOperations:
+    """``mkdir``/``rmdir``/``delete_tree``: no-ops on a flat store, real
+    folders in the in-memory store (standing in for a cloud remote)."""
+
+    def test_bare_store_defaults(self):
+        store = BareStore()
+        store.mkdir("p/d/")  # nothing to create on a flat key space
+        assert store.stat("p/d") is None
+        for key in ("p/a", "p/d/b", "p/d/e/c", "q/x"):
+            store.put(key, b"1")
+        assert store.delete_tree("p/") == 3
+        assert [i.key for i in store.list("")] == ["q/x"]
+        store.rmdir("p/")  # idempotent, nothing there
+
+    def test_in_memory_folders_are_real(self):
+        store = InMemoryObjectStore()
+        store.mkdir("p/d/")
+        assert store.stat("p/d") == ObjectStat(key="p/d", size=0, is_dir=True)
+        assert store.list_dir("p/") == [ObjectStat(key="p/d", size=0, is_dir=True)]
+        assert store.list_dir("") == [ObjectStat(key="p", size=0, is_dir=True)]
+        store.rmdir("p/d/")
+        assert store.stat("p/d") is None and store.list_dir("p/") == []
+        # A prefix with objects under it is a folder whether or not it was made.
+        store.put("p/x/f", b"1")
+        assert store.stat("p/x").is_dir is True
+        store.mkdir("p/x/sub/")
+        assert store.delete_tree("p/") == 1
+        assert store.stat("p/x") is None and store.list_dir("") == []

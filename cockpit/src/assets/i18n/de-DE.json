@@ -2076,7 +2076,8 @@
         "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren",
         "delivery_unsupported": "diese Installation synchronisiert Dateien, statt sie einzubinden; Cloud-Ordner werden hier nicht bereitgestellt",
         "mount_unsupported": "dieser Arbeitsbereich kann keine Cloud-Ordner einbinden; sie werden hier nicht bereitgestellt",
-        "virtual_workspace": "ein virtueller Arbeitsbereich kann keine Cloud-Ordner aufnehmen; ein Container bekommt ihn: Upgrade dieser Session oder eine neue Session mit Container"
+        "virtual_workspace": "ein virtueller Arbeitsbereich kann ihn auf der gewünschten Zugriffsstufe nicht bereitstellen; ein Container bekommt ihn: Upgrade dieser Session oder eine neue Session mit Container",
+        "bearer_token": "deine Cloud meldet sich mit einem Token an, das ein virtueller Arbeitsbereich noch nicht halten kann; ein Container bekommt ihn: Upgrade dieser Session oder eine neue Session mit Container"
       }
     },
     "cloudReview": {

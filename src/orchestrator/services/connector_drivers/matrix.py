@@ -243,6 +243,10 @@ def driver_entry(
         ),
         "protocol_version": spec.protocol_version,
         "plane": spec.plane,
+        # Where each form runs, when the forms run in different planes (a
+        # cloud folder: the in-pod sidecar for a Container, the agent process
+        # for a Virtual Session); empty when every form runs on ``plane``.
+        "form_planes": dict(spec.form_planes),
         "delivery_forms": list(spec.delivery_forms),
         "supported_backends": sorted(spec.supported_backends),
         "workspace_requirements": spec.workspace_requirements,

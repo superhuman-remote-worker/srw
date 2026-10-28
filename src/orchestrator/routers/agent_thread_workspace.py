@@ -81,8 +81,9 @@ async def agent_report_cloud_mount_status(
     request: Request, thread_id: str
 ) -> dict[str, Any]:
     """The agent reports the state of the cloud folders its workspace Pod's
-    sidecars mounted (connector drivers D7). **Internal** (P4b) — requires
-    ``X-Internal-Key``. Ingress strips this path.
+    sidecars mounted (connector drivers D7), or the ones a Virtual Session's
+    executor serves (the probe of each folder's root). **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
     Kept only for the plan the thread's current Pod records (the report names
     its fingerprint), checked against that plan and the closed state and
@@ -106,7 +107,12 @@ async def agent_report_cloud_mount_status(
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="thread not found")
-    recorded = recorded_sidecar_plan(thread_metadata_object(thread))
+    metadata = thread_metadata_object(thread)
+    # A Pod's recorded sidecar plan, or a Virtual Session's remote plan (the
+    # executor reports its probe of each folder the same way).
+    recorded = recorded_sidecar_plan(
+        metadata
+    ) or cloud_mount_status.recorded_remote_plan(metadata)
     # Two Pods of one plan share a fingerprint: the UID tells them apart, so
     # an agent of an earlier Pod never overwrites its successor's state.
     if (

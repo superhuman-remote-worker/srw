@@ -274,6 +274,7 @@ import type {BadgeTone} from '../../ui/badge';
             [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
             [isLiteBackend]="mode() === 'live' ? liteBackend() : workspacePicker() ? isLite(pickerBackend()) : false"
+            [liteBackendName]="mode() === 'live' ? (liveTier() ?? null) : workspacePicker() ? pickerBackend() : null"
             [cloudFoldersTakeContainer]="workspacePicker() && cloudFoldersTakeContainer()"
             [initialSelectedIds]="mode() === 'live' || mode() === 'session' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"

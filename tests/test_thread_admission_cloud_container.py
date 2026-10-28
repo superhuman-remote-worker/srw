@@ -1,11 +1,13 @@
-"""A Session whose own cloud folders would attach gets a Container (owner 2026-10-21).
+"""A Session whose cloud folders Virtual cannot serve gets a Container.
 
-A Virtual Session can't serve a cloud folder or the session outbox: both are
-mounted into a workspace. Since stateless Sessions default to Virtual, such a
-Session silently got no cloud at all
-(issues/virtual_sessions_get_no_cloud_connectors.md). When the tier comes from
-the defaults and the selection holds a cloud connector, the Session gets a
-Container instead, where the Container tier is available and allowed.
+The rule of 2026-10-21 (a Virtual Session mounts no cloud folder, so a
+defaulted Virtual with a cloud connector became a Container) was narrowed on
+2026-10-28 (features/cloud_folders_on_virtual_sessions.md, ruling 8): a
+Virtual Session now serves a project folder and the session outbox itself,
+in the ``cloud_remote`` form, so a defaulted Virtual becomes a Container only
+when a selected folder's requested level is not offered on Virtual (a
+``protected`` folder) or its provider has no Virtual delivery yet. The
+left-out record is written only for those rows.
 """
 
 from __future__ import annotations
@@ -72,9 +74,41 @@ async def _plan(deps, **fields: Any):
     return await ta.resolve_thread_creation_plan(body, USER, dependencies=deps)
 
 
+def _opencloud_folder_row() -> dict[str, Any]:
+    """A folder on a provider the Virtual delivery does not serve yet."""
+    row = _folder_row()
+    row["config"] = {**row["config"], "backend_id": "opencloud"}
+    return row
+
+
 @pytest.mark.asyncio
-async def test_a_session_with_its_cloud_folder_gets_a_container():
+async def test_a_session_with_its_cloud_folder_stays_virtual():
+    """Virtual serves the folder itself now (the cloud_remote form)."""
     plan = await _plan(_deps_with([_folder_row()]), datasource_ids=[FOLDER])
+
+    assert _backend(plan) == "virtual"
+    assert plan.selected_datasource_ids == [FOLDER]
+    assert _left_out(plan) == []
+
+
+@pytest.mark.asyncio
+async def test_a_protected_request_for_its_cloud_folder_gets_a_container():
+    """The one level Virtual cannot serve: the user's explicit safety choice."""
+    plan = await _plan(
+        _deps_with([_folder_row()]),
+        datasource_ids=[FOLDER],
+        datasource_access={FOLDER: "protected"},
+    )
+
+    assert _backend(plan) == "sandbox"
+    assert plan.selected_datasource_ids == [FOLDER]
+
+
+@pytest.mark.asyncio
+async def test_a_provider_without_a_virtual_delivery_gets_a_container():
+    """OpenCloud's bearer token reaches a Virtual Session only in the feature's
+    second run: until then its folders take a Container as before."""
+    plan = await _plan(_deps_with([_opencloud_folder_row()]), datasource_ids=[FOLDER])
 
     assert _backend(plan) == "sandbox"
     assert plan.selected_datasource_ids == [FOLDER]
@@ -89,21 +123,16 @@ async def test_a_session_without_cloud_connectors_stays_virtual():
 
 @pytest.mark.asyncio
 async def test_an_explicit_virtual_choice_is_kept():
-    # The user chose the tier: their choice, and the folder is left out.
-    deps = _deps_with([_folder_row()])
-    deps.authorize_thread_datasource_selection.side_effect = (
-        lambda _u, ids, *, workspace_backend, **_kw: (
-            [] if workspace_backend == "virtual" else list(ids),
-            {},
-        )
-    )
+    # The user chose the tier: their choice, even for a provider Virtual
+    # does not serve yet; the folder is selected and named at delivery.
     plan = await _plan(
-        deps,
+        _deps_with([_opencloud_folder_row()]),
         datasource_ids=[FOLDER],
         workspace={"template": {"inline": {"backend": "virtual"}}},
     )
 
     assert _backend(plan) == "virtual"
+    assert plan.selected_datasource_ids == [FOLDER]
 
 
 @pytest.mark.asyncio
@@ -114,7 +143,7 @@ async def test_an_explicit_virtual_choice_is_kept():
 )
 async def test_without_an_allowed_container_the_session_stays_virtual(unavailable):
     plan = await _plan(
-        _deps_with([_folder_row()], **unavailable), datasource_ids=[FOLDER]
+        _deps_with([_opencloud_folder_row()], **unavailable), datasource_ids=[FOLDER]
     )
 
     assert _backend(plan) == "virtual"
@@ -152,33 +181,56 @@ def _left_out(plan) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
-async def test_the_owners_default_outbox_gets_a_container():
+async def test_the_owners_default_outbox_stays_virtual():
     """The new-chat draft's case: no connector list, the defaults attach the
-    owner's outbox (dev's fa2a9885 got none on Virtual)."""
+    owner's outbox (dev's fa2a9885 got none on Virtual); Virtual serves it
+    itself now, so the Session starts in seconds, as a Virtual."""
     plan = await _plan(_defaults_deps(), use_datasource_defaults=True)
 
-    assert _backend(plan) == "sandbox"
+    assert _backend(plan) == "virtual"
     assert plan.selected_datasource_ids == [OUTBOX]
     assert _left_out(plan) == []
 
 
+def _tier_refuses_the_outbox(deps):
+    """A connector the Virtual tier itself refuses (a driver without the
+    cloud_remote form): the selection drops it on Virtual."""
+    deps.authorize_thread_datasource_selection.side_effect = (
+        lambda _u, ids, *, workspace_backend, **_kw: (
+            [] if workspace_backend == "virtual" else list(ids),
+            {},
+        )
+    )
+    deps.store.list_default_datasource_candidates = AsyncMock(
+        return_value=[_outbox_row()]
+    )
+    return deps
+
+
+def _outbox_on_opencloud(deps):
+    """The owner's cloud is OpenCloud, whose outbox the Virtual delivery does
+    not serve yet (the bearer token follows in the feature's second run)."""
+    from dataclasses import replace
+
+    return replace(
+        deps,
+        main_cloud_router=SimpleNamespace(
+            active_instance_id="instance-1",
+            for_owner=lambda _user: SimpleNamespace(backend_id="opencloud"),
+        ),
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "case",
-    ["virtual-chosen", "container-not-granted"],
-)
-async def test_a_virtual_session_records_the_cloud_folders_it_leaves_out(case):
-    """So the session's cloud notice and the agent name them, never silent."""
-    if case == "virtual-chosen":
-        plan = await _plan(
-            _defaults_deps(),
-            use_datasource_defaults=True,
-            workspace={"template": {"inline": {"backend": "virtual"}}},
-        )
-    else:
-        plan = await _plan(
-            _defaults_deps(container_granted=False), use_datasource_defaults=True
-        )
+async def test_a_virtual_session_records_the_cloud_folders_it_leaves_out():
+    """A connector the Virtual tier refuses, with no Container allowed: it is
+    recorded as left out, so the session's cloud notice and the agent name
+    it, never silent. (A folder Virtual admits but cannot bind, a provider
+    gap, is named at each delivery instead, by the planner's exclusions.)"""
+    plan = await _plan(
+        _tier_refuses_the_outbox(_defaults_deps(container_granted=False)),
+        datasource_ids=[OUTBOX],
+    )
 
     assert _backend(plan) == "virtual"
     assert plan.selected_datasource_ids == []
@@ -200,14 +252,53 @@ async def test_a_virtual_session_records_the_cloud_folders_it_leaves_out(case):
     ids=["container", "no-container-provisioner", "container-not-granted"],
 )
 async def test_the_new_session_form_predicts_the_container(unavailable, expected):
-    """The form's preview asks admission's own rule for the defaults it submits."""
-    deps = _defaults_deps(**unavailable)
+    """The form's preview asks admission's own rule for the defaults it
+    submits: an outbox on a provider Virtual does not serve yet still takes
+    a Container."""
+    deps = _outbox_on_opencloud(_defaults_deps(**unavailable))
 
     assert (
         await ta.cloud_folders_need_a_container(
             USER, project_id=PROJECT, dependencies=deps
         )
         is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_new_session_form_predicts_virtual_for_the_default_outbox():
+    deps = _defaults_deps()
+
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER, project_id=PROJECT, dependencies=deps
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_form_predicts_the_container_for_a_protected_level():
+    deps = _deps_with([_folder_row()])
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER,
+            project_id=PROJECT,
+            datasource_ids=[FOLDER],
+            datasource_access={FOLDER: "protected"},
+            dependencies=deps,
+        )
+        is True
+    )
+    assert (
+        await ta.cloud_folders_need_a_container(
+            USER,
+            project_id=PROJECT,
+            datasource_ids=[FOLDER],
+            datasource_access={FOLDER: "read_write"},
+            dependencies=deps,
+        )
+        is False
     )
 
 
@@ -241,9 +332,9 @@ async def test_a_refused_project_predicts_no_container():
 
 @pytest.mark.asyncio
 async def test_the_form_predicts_from_the_connectors_it_submits():
-    """Unticked in the form, the cloud folder takes no Container; ticked, it
-    does, even where it isn't a default."""
-    deps = _deps_with([_folder_row()])
+    """Unticked in the form, the cloud folder takes no Container; ticked, a
+    folder Virtual cannot serve does, even where it isn't a default."""
+    deps = _deps_with([_opencloud_folder_row()])
     deps.store.list_default_datasource_candidates = AsyncMock(return_value=[_kb_row()])
     assert (
         await ta.cloud_folders_need_a_container(
@@ -295,8 +386,9 @@ def _listing_deps(**over: Any):
 @pytest.mark.asyncio
 async def test_a_chosen_virtual_with_a_list_records_the_defaults_it_cannot_serve():
     """The cockpit always sends a list and greys out what a chosen Virtual
-    can't serve: the defaults' cloud folders are still named as left out,
-    so the notice, the agent and an upgrade know them (owner 2026-10-21)."""
+    can't serve: a default the Virtual tier refuses is still named as left
+    out, so the notice, the agent and an upgrade know it (owner 2026-10-21).
+    The owner's outbox is served on Virtual now, so it is not among them."""
     plan = await _plan(
         _listing_deps(),
         datasource_ids=[KB],
@@ -305,6 +397,13 @@ async def test_a_chosen_virtual_with_a_list_records_the_defaults_it_cannot_serve
 
     assert _backend(plan) == "virtual"
     assert plan.selected_datasource_ids == [KB]
+    assert _left_out(plan) == []
+
+    plan = await _plan(
+        _outbox_on_opencloud(_listing_deps()),
+        datasource_ids=[KB],
+        workspace={"template": {"inline": {"backend": "virtual"}}},
+    )
     assert [entry["source_ref"] for entry in _left_out(plan)] == [OUTBOX]
 
 

@@ -27,6 +27,12 @@ user's cloud folder rather than SRW's own S3 prefix
 since it was read). Each has a default built from the required surface, so an
 S3 prefix or an in-memory store needs nothing new; a transport that answers
 them natively, or cheaper, overrides.
+
+Three more optional operations exist for remotes with real directories:
+:meth:`ObjectStore.mkdir` and :meth:`ObjectStore.rmdir` create and remove an
+empty folder (a no-op on a flat key space, where folders are emergent), and
+:meth:`ObjectStore.delete_tree` removes everything under a prefix (the default
+lists and deletes object by object; rclone purges server-side).
 """
 
 from abc import ABC, abstractmethod
@@ -221,6 +227,32 @@ class ObjectStore(ABC):
             raise ObjectStoreError(f"{key} was not found right after it was written")
         return after
 
+    def mkdir(self, prefix: str) -> None:
+        """Create the folder ``prefix`` (a key prefix ending in ``/``) on a
+        remote that has real directories; idempotent. The default does
+        nothing: on a flat key space a folder exists once an object is
+        under it, and the backend keeps its own marker where it needs one.
+        """
+
+    def rmdir(self, prefix: str) -> None:
+        """Remove the empty folder ``prefix`` on a remote that has real
+        directories; a folder that is not there is not an error. The default
+        does nothing, like :meth:`mkdir`.
+        """
+
+    def delete_tree(self, prefix: str) -> int:
+        """Delete every object under ``prefix`` and, where the remote has
+        them, the folders; return how many objects went. The default lists
+        and deletes one by one; a transport with a recursive delete (rclone
+        ``purge``) overrides.
+        """
+        deleted = 0
+        for info in self.list(prefix):
+            if self.delete(info.key):
+                deleted += 1
+        self.rmdir(prefix)
+        return deleted
+
     # --- lifecycle (default no-op) ---
 
     def connect(self) -> None:
@@ -242,12 +274,16 @@ class InMemoryObjectStore(ObjectStore):
     built for (§5). Production uses ``RcloneObjectStore``.
 
     Every write bumps the object's version counter, so the seam's conditional
-    write can be exercised without a remote.
+    write can be exercised without a remote. ``mkdir`` records an explicit
+    folder, so a backend over a remote with real directories (a user's cloud
+    folder) can be exercised too: ``stat`` reports it, ``list_dir`` lists it,
+    ``rmdir`` and ``delete_tree`` remove it.
     """
 
     def __init__(self) -> None:
         self._data: dict[str, bytes] = {}
         self._versions: dict[str, int] = {}
+        self._dirs: set[str] = set()
 
     def get(self, key: str) -> bytes:
         try:
@@ -270,6 +306,9 @@ class InMemoryObjectStore(ObjectStore):
     def stat(self, key: str) -> Optional[ObjectStat]:
         value = self._data.get(key, _MISSING)
         if value is _MISSING:
+            folder = key.rstrip("/") + "/"
+            if folder in self._dirs or any(k.startswith(folder) for k in self._data):
+                return ObjectStat(key=key, size=0, is_dir=True)
             return None
         return ObjectStat(key=key, size=len(value), version=str(self._versions[key]))
 
@@ -283,6 +322,31 @@ class InMemoryObjectStore(ObjectStore):
             key=lambda info: info.key,
         )
 
+    def list_dir(self, prefix: str) -> List[ObjectStat]:
+        entries = {entry.key: entry for entry in super().list_dir(prefix)}
+        for folder in self._dirs:
+            if folder == prefix or not folder.startswith(prefix):
+                continue
+            head = folder[len(prefix) :].partition("/")[0]
+            if head and prefix + head not in entries:
+                entries[prefix + head] = ObjectStat(
+                    key=prefix + head, size=0, is_dir=True
+                )
+        return sorted(entries.values(), key=lambda entry: entry.key)
+
     def delete(self, key: str) -> bool:
         self._versions.pop(key, None)
         return self._data.pop(key, _MISSING) is not _MISSING
+
+    def mkdir(self, prefix: str) -> None:
+        folder = prefix.rstrip("/") + "/"
+        if folder != "/":
+            self._dirs.add(folder)
+
+    def rmdir(self, prefix: str) -> None:
+        self._dirs.discard(prefix.rstrip("/") + "/")
+
+    def delete_tree(self, prefix: str) -> int:
+        deleted = super().delete_tree(prefix)
+        self._dirs = {d for d in self._dirs if not d.startswith(prefix)}
+        return deleted

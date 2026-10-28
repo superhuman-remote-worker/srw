@@ -576,6 +576,38 @@ class RcloneObjectStore(ObjectStore):
                 f"rclone copyto failed {src} -> {dst}: {self._stderr(proc)}"
             )
 
+    def mkdir(self, prefix: str) -> None:
+        """Create a real folder on a remote that has them (WebDAV ``MKCOL``);
+        a no-op on a bucket, where rclone has nothing to create."""
+        proc = self._run(["mkdir", self._remote_path(prefix.rstrip("/"))])
+        if proc.returncode != 0:
+            raise ObjectStoreError(
+                f"rclone mkdir failed for {prefix}: {self._stderr(proc)}"
+            )
+
+    def rmdir(self, prefix: str) -> None:
+        """Remove an empty folder; one that is not there is left alone."""
+        proc = self._run(["rmdir", self._remote_path(prefix.rstrip("/"))])
+        if proc.returncode != 0 and not self._is_not_found(proc):
+            raise ObjectStoreError(
+                f"rclone rmdir failed for {prefix}: {self._stderr(proc)}"
+            )
+
+    def delete_tree(self, prefix: str) -> int:
+        """Remove the folder ``prefix`` with everything in it (``purge``:
+        recursive and, where the remote offers it, one server-side call).
+        Returns how many files were under it, counted before the purge."""
+        count = len(self.list(prefix))
+        proc = self._run(
+            ["purge", self._remote_path(prefix.rstrip("/"))],
+            timeout=self._transfer_timeout,
+        )
+        if proc.returncode != 0 and not self._is_not_found(proc):
+            raise ObjectStoreError(
+                f"rclone purge failed for {prefix}: {self._stderr(proc)}"
+            )
+        return count
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -623,3 +655,44 @@ def object_store_from_spec(spec: Dict[str, Any]) -> ObjectStore:
     # (`root`/`bucket`), mirroring cloud_mount's `source.root`.
     root = rspec.get("root") or spec.get("root") or spec.get("bucket") or ""
     return RcloneObjectStore(remote_type=remote_type, config=config, root=root)
+
+
+def rclone_remote_name(label: str, *, fallback: str = "cloud") -> str:
+    """An rclone remote alias for ``label`` that is safe in an environment
+    variable name (``RCLONE_CONFIG_<NAME>_<KEY>``): letters and digits kept,
+    everything else an underscore, never empty and never the workspace's own
+    alias (:data:`_DEFAULT_REMOTE_NAME`)."""
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", str(label or "")).strip("_").lower()
+    if not safe or safe == _DEFAULT_REMOTE_NAME:
+        safe = f"{fallback}_{safe}" if safe else fallback
+    return safe
+
+
+def cloud_object_store_from_spec(
+    entry: Dict[str, Any], *, remote_name: str
+) -> ObjectStore:
+    """Build the store for one cloud folder entry of ``workspace.mounts``
+    (``features/cloud_folders_on_virtual_sessions.md`` § The remote
+    descriptor) under its own rclone alias, so several remotes in one
+    process never share an ``RCLONE_CONFIG_<NAME>_*`` namespace.
+
+    The entry carries ``rclone_spec`` = ``{type, config, root}`` with the
+    credential folded in the way rclone wants it; ``memory`` builds an
+    in-memory store for tests and local smoke runs.
+    """
+    rspec = (entry or {}).get("rclone_spec") or {}
+    remote_type = rspec.get("type")
+    if not remote_type:
+        raise ValueError(
+            f"cloud folder entry {entry.get('name')!r} has no rclone remote type"
+        )
+    if remote_type == "memory":
+        from shared.runtime.core.backends.object_store import InMemoryObjectStore
+
+        return InMemoryObjectStore()
+    return RcloneObjectStore(
+        remote_type=remote_type,
+        config=rspec.get("config") or {},
+        root=rspec.get("root") or "",
+        remote_name=remote_name,
+    )
