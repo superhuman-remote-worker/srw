@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 from shared.worker_errors import worker_workspace_exhaustion_cause
 from shared.workspace_contract import WorkspaceContractError, resolve_workspace_contract
+from shared.workspace_disk import WorkspaceDiskFullReport, WorkspaceVolumeGrowth
 from shared.job_freeze_types import (
     CONTINUE_AS_NEW_FREEZE_TYPES,
     ERROR_IMMUNE_FREEZE_TYPES,
@@ -501,6 +502,75 @@ def should_persist_completion_freeze(
     )
 
 
+async def _settle_full_workspace_disk(
+    job: dict[str, Any],
+    job_id: str,
+    error: dict[str, Any],
+    disk_full: WorkspaceDiskFullReport,
+    *,
+    container_ctx: dict[str, Any],
+    db: Any,
+    trigger_dispatch: Callable[[], None],
+    grow_workspace_volume: Callable[[], Awaitable[WorkspaceVolumeGrowth]] | None,
+    completion_command_id: str | None,
+    completion_finalizing_by: str | None,
+) -> dict[str, Any]:
+    """Grow a full volume once and resume, or hold with the disk's usage.
+
+    No probe and no cleanup: the worker's own script measured the volume, so
+    the transport works. Growth happens at most once per job (the jobs-row
+    ``workspace_container.disk_growth`` record). A resize that finished lets
+    the job resume only when no command was running; otherwise the explicit
+    Resume hold stays, with a reason that says what happened.
+    """
+    growth: WorkspaceVolumeGrowth | None = None
+    previous = container_ctx.get("disk_growth")
+    if isinstance(previous, dict):
+        size = previous.get("size_bytes")
+        growth = WorkspaceVolumeGrowth(
+            "used", size_bytes=size if isinstance(size, int) else None
+        )
+    elif grow_workspace_volume is not None:
+        try:
+            growth = await grow_workspace_volume()
+        except Exception as exc:  # noqa: BLE001 — a failed growth still holds
+            logger.exception("Job %s: growing the full workspace volume failed", job_id)
+            growth = WorkspaceVolumeGrowth("refused", detail=type(exc).__name__)
+    resume = (
+        growth is not None
+        and growth.outcome == "resized"
+        and not disk_full.command_in_flight
+    )
+    outcome = await db.hold_full_workspace_disk(
+        job_id,
+        expected_workspace=container_ctx,
+        expected_agent_id=job.get("assigned_agent_id"),
+        error_detail=error.get("message") or "workspace_disk_full",
+        disk_full=disk_full,
+        growth=growth,
+        resume=resume,
+        completion_command_id=completion_command_id,
+        completion_finalizing_by=completion_finalizing_by,
+    )
+    if outcome is None:
+        if (
+            completion_command_id is not None
+            or job.get("execution_lane") == "stateless"
+        ):
+            raise RuntimeError("workspace disk-full disposition lost its term")
+        return {
+            "status": "handled",
+            "job_id": job_id,
+            "new_status": "paused",
+            "paused": False,
+            "actions": [],
+        }
+    logger.warning("Job %s: %s", job_id, outcome["actions"][0])
+    if resume:
+        trigger_dispatch()
+    return outcome
+
+
 async def handle_pod_workspace_recovery(
     job: dict[str, Any],
     job_id: str,
@@ -514,6 +584,7 @@ async def handle_pod_workspace_recovery(
     completion_finalizing_by: str | None = None,
     expected_status: str | None = None,
     cleanup_service: Any | None = None,
+    grow_workspace_volume: Callable[[], Awaitable[WorkspaceVolumeGrowth]] | None = None,
 ) -> dict[str, Any]:
     """G1 pod (sandbox/PVC) workspace recovery — the ``workspace_unavailable``
     arm of the completion endpoint, extracted for testability.
@@ -531,6 +602,12 @@ async def handle_pod_workspace_recovery(
     ``expected_status`` fences legacy pinned completion against cancellation
     after its entry read. A lost disposition returns ``paused=False`` so the
     caller stops before reporting recovery or continuing completion effects.
+
+    A full workspace disk (``reason: workspace_disk_full``) is not a lost
+    transport: the worker measured the volume through it. That report grows
+    the volume once (``grow_workspace_volume``) and resumes when no command
+    was running, or holds with a reason that names the full disk.
+    knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
     """
     container_ctx = _get_ctx(job)
 
@@ -657,6 +734,21 @@ async def handle_pod_workspace_recovery(
                         )
                 trigger_dispatch()
             return dict(stored_outcome)
+
+    disk_full = WorkspaceDiskFullReport.from_error(error)
+    if disk_full is not None:
+        return await _settle_full_workspace_disk(
+            job,
+            job_id,
+            error,
+            disk_full,
+            container_ctx=container_ctx,
+            db=db,
+            trigger_dispatch=trigger_dispatch,
+            grow_workspace_volume=grow_workspace_volume,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+        )
 
     same_command_attempt = completion_command_id is not None and (
         container_ctx.get("recovery_attempt_command_id") == completion_command_id

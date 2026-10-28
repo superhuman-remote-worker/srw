@@ -75,6 +75,18 @@ def _scan_for_error_patterns(output: str) -> Optional[str]:
     return None
 
 
+def _with_disk_full_notice(sm: Any, result: str) -> str:
+    """Lead a shell result with the backend's one-time full-disk notice.
+
+    The workspace backend leaves it when this claim could start its shell
+    only by spending the disk reserve: the agent can still free space itself.
+    knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
+    """
+    take = getattr(sm, "take_disk_full_notice", None)
+    notice = take() if callable(take) else None
+    return f"{notice}\n{result}" if isinstance(notice, str) and notice else result
+
+
 def _cloud_scan_guard_decision(
     command: str, context: ToolContext
 ) -> tuple[Optional[str], bool]:
@@ -429,6 +441,16 @@ def create_shell_tools(
         Returns:
             Exit code + stdout output (last `tail` lines), or error message.
         """
+        return _with_disk_full_notice(
+            sm, _run_command(command, timeout, tail, working_dir)
+        )
+
+    def _run_command(
+        command: str,
+        timeout: Optional[int],
+        tail: int,
+        working_dir: Optional[str],
+    ) -> str:
         try:
             sm.ensure_tab("default")
 
@@ -597,6 +619,20 @@ def create_shell_tools(
         Returns:
             [Shells: tab1 | tab2 | ...] header + command output.
         """
+        return _with_disk_full_notice(
+            sm,
+            _shell_execute(command, name, tail, is_async, keys, timeout, working_dir),
+        )
+
+    def _shell_execute(
+        command: str,
+        name: str,
+        tail: int,
+        is_async: bool,
+        keys: bool,
+        timeout: Optional[int],
+        working_dir: Optional[str],
+    ) -> str:
         try:
             # Ensure tab exists (auto-create if needed)
             sm.ensure_tab(name)

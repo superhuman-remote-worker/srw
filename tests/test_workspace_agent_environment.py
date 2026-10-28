@@ -177,6 +177,63 @@ def test_container_writes_the_environment_after_its_env_and_links_before_the_gat
     assert linker < DOCKERFILE.index("RUN /usr/local/bin/assert-browser-stack")
 
 
+def test_container_keeps_package_caches_off_the_workspace_volume():
+    """workspace_disk_full_pauses_job_as_transport_lost.md, option C."""
+    caches = {
+        "PIP_CACHE_DIR": "/var/cache/agent-host/pip",
+        "UV_CACHE_DIR": "/var/cache/agent-host/uv",
+        "npm_config_cache": "/var/cache/agent-host/npm",
+    }
+    step = DOCKERFILE.split(
+        "RUN install -d -o agent-host -g agent-host -m 0700 /var/cache/agent-host", 1
+    )[1].split("\n\n", 1)[0]
+    for name, value in caches.items():
+        assert f"{name}={value}" in step
+        # Image ENV would send root's build-time installs into the agent's
+        # cache and leave root-owned entries there.
+        assert (
+            f"ENV {name}" not in DOCKERFILE
+            and f"    {name}="
+            not in (
+                DOCKERFILE.split("ENV PIP_BREAK_SYSTEM_PACKAGES=1", 1)[1].split(
+                    "\nCOPY", 1
+                )[0]
+            )
+        )
+    assert "UV_LINK_MODE=copy" in step
+    assert (
+        "/usr/local/bin/write-agent-environment \\\n"
+        "        PIP_CACHE_DIR UV_CACHE_DIR UV_LINK_MODE npm_config_cache"
+    ) in step
+    # Playwright finds its browsers in ~/.cache/ms-playwright.
+    assert "XDG_CACHE_HOME=" not in DOCKERFILE
+    assert DOCKERFILE.index("RUN install -d -o agent-host") < DOCKERFILE.index(
+        "RUN /usr/local/bin/assert-workspace-contract"
+    )
+
+
+def test_writer_keeps_the_cache_lines_when_a_derived_image_runs_it_again(tmp_path):
+    caches = {
+        "PIP_CACHE_DIR": "/var/cache/agent-host/pip",
+        "npm_config_cache": "/var/cache/agent-host/npm",
+    }
+    result, target, _ = _write(tmp_path, *caches, **caches)
+    assert result.returncode == 0, result.stderr
+    result, target, env = _write(tmp_path, existing=target.read_text())
+    assert result.returncode == 0, result.stderr
+    lines = target.read_text().splitlines()
+    for name, value in caches.items():
+        assert f'{name}="{value}"' in lines
+    assert f'PATH="{env["PATH"]}"' in lines
+
+
+def test_contract_checks_the_agents_caches_and_df():
+    contract = (REPO / "docker/assert-workspace-contract.sh").read_text()
+    assert '"awk" "sed" "df"; do' in contract
+    assert "for name in PIP_CACHE_DIR UV_CACHE_DIR npm_config_cache; do" in contract
+    assert "/home/agent-host | /home/agent-host/*)" in contract
+
+
 def test_entrypoint_links_the_browsers_as_agent_host_after_seeding_home():
     link = ENTRYPOINT.index(
         "su -s /bin/sh agent-host -c /usr/local/bin/link-playwright-browsers"

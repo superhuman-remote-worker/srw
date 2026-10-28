@@ -232,6 +232,23 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
 COPY --chmod=0755 docker/write-agent-environment /usr/local/bin/write-agent-environment
 RUN /usr/local/bin/write-agent-environment
 
+# The agent's package caches live on the container's own disk, not on the
+# workspace volume: pip's cache alone took a third of a 10 Gi job volume
+# (knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md).
+# They are rebuilt on demand, so losing them with the Pod costs a download.
+# Only the agent's environment gets them, never image ENV: root build steps
+# keep their own caches and leave no root-owned files in the agent's. All of
+# XDG_CACHE_HOME stays put, because Playwright finds its browsers in
+# ~/.cache/ms-playwright. uv cannot hardlink across the two filesystems, so it
+# copies without warning about it on every install.
+RUN install -d -o agent-host -g agent-host -m 0700 /var/cache/agent-host \
+    && env PIP_CACHE_DIR=/var/cache/agent-host/pip \
+        UV_CACHE_DIR=/var/cache/agent-host/uv \
+        UV_LINK_MODE=copy \
+        npm_config_cache=/var/cache/agent-host/npm \
+        /usr/local/bin/write-agent-environment \
+        PIP_CACHE_DIR UV_CACHE_DIR UV_LINK_MODE npm_config_cache
+
 # ---------------------------------------------------------------------------
 # 5. SSH server config (mirrors provision.sh lines 141-155)
 # ---------------------------------------------------------------------------

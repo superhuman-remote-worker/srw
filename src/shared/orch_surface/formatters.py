@@ -328,6 +328,18 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
             "Workspace recovery hold: retries exhausted; workspace and checkpoints "
             "retained until an explicit Resume or Cancel"
         ]
+    if detail.get("source") == "workspace_disk_full":
+        from shared.workspace_disk import WorkspaceDiskUsage
+
+        attention = detail.get("attention")
+        usage = WorkspaceDiskUsage.from_dict(
+            attention.get("disk") if isinstance(attention, dict) else None
+        )
+        measured = f" ({usage.describe()})" if usage is not None else ""
+        return [
+            f"Workspace disk full hold{measured}: workspace and checkpoints "
+            "retained until an explicit Resume or Cancel"
+        ]
     return [
         "Operator pause hold: held until an explicit resume "
         f"(paused_by={detail.get('paused_by') or 'internal'}, "

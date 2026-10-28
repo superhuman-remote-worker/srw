@@ -37,6 +37,8 @@ from urllib3.exceptions import (
     ReadTimeoutError,
 )
 from shared.container_recovery import ContainerRecoveryCleanup
+from shared.kubernetes_quantities import normalize_byte_quantity
+from shared.workspace_disk import WorkspaceVolumeGrowth, format_bytes
 from shared.workspace_recovery import WorkspaceRecoveryCode
 from shared.tls_trust import TrustCaSource
 
@@ -782,6 +784,12 @@ def _pvc_name_for(owner: WorkspaceOwner) -> str:
     return f"{prefix}-{owner.id[:12]}"
 
 
+# A workspace PVC grown because its disk was full records the size it had. A
+# retried completion effect recognizes its own growth by this annotation.
+_PVC_GROWN_FROM_ANNOTATION = "srw.io/workspace-disk-grown-from"
+_PVC_GROW_POLL_SECONDS = 2.0
+
+
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
@@ -838,6 +846,15 @@ class ContainerProvisioner:
         # terminal. See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
         self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
         self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
+        # A job whose volume fills grows it once, to this size, and resumes
+        # (empty or 0 turns growth off). The online resize is awaited inside
+        # the completion effect, so the wait stays well under its 90 s lease.
+        self._pvc_grow_size: str = os.environ.get(
+            "WORKSPACE_PVC_GROW_SIZE", "20Gi"
+        ).strip()
+        self._pvc_grow_wait_seconds: float = float(
+            os.environ.get("WORKSPACE_PVC_GROW_WAIT_SECONDS", "40")
+        )
         # Single-replica node-loss fallback (Phase 3b). A REATTACH gets this
         # longer ready-wait so a transient node reboot (the replica's node coming
         # back) recovers without discarding data; past it, a still-wedged reattach
@@ -7340,6 +7357,178 @@ class ContainerProvisioner:
             )
 
         return str(seed_name)
+
+    async def grow_job_workspace_volume(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> WorkspaceVolumeGrowth:
+        """Grow the exact runtime's full workspace PVC to the growth size.
+
+        The Pod must still carry the reported runtime UID, so a replacement's
+        volume is never touched; its storage plan names the claim. The JSON
+        Patch tests the claim's UID, resourceVersion and current request, and
+        records the old size in an annotation. The wait for the filesystem to
+        show the new size is bounded: Longhorn grows a mounted volume online.
+        A claim already at or above the size is left alone, unless that
+        annotation says this growth put it there (a retried effect).
+        knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
+        """
+        if self._pvc_grow_size in {"", "0"}:
+            return WorkspaceVolumeGrowth("unsupported", detail="volume growth is off")
+        try:
+            target = normalize_byte_quantity(
+                self._pvc_grow_size, resource="storage"
+            ).normalized_value
+        except ValueError:
+            return WorkspaceVolumeGrowth(
+                "unsupported", detail="WORKSPACE_PVC_GROW_SIZE is invalid"
+            )
+
+        async def read_claim(name: str) -> Any:
+            return await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=self._namespace,
+            )
+
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+            observed_uid = str(getattr(pod.metadata, "uid", "") or "").lower()
+            if observed_uid != expected_runtime_incarnation.lower():
+                return WorkspaceVolumeGrowth(
+                    "unsupported", target, "the workspace Pod was replaced"
+                )
+            pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+            if pvc_name is None:
+                return WorkspaceVolumeGrowth(
+                    "unsupported", target, "the workspace has no volume to grow"
+                )
+            claim = await read_claim(pvc_name)
+            self._require_stateless_pvc_identity(
+                claim, owner=owner, pvc_name=pvc_name, allow_any_storage_class=True
+            )
+            requested_text = str(
+                (getattr(claim.spec.resources, "requests", None) or {}).get(
+                    "storage", ""
+                )
+            )
+            requested = normalize_byte_quantity(
+                requested_text, resource="storage"
+            ).normalized_value
+        except WorkspaceRuntimeAuthorityError as exc:
+            return WorkspaceVolumeGrowth("unsupported", target, str(exc))
+        except ValueError:
+            return WorkspaceVolumeGrowth(
+                "unsupported", target, "the volume's size is unreadable"
+            )
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status is None:
+                raise
+            return WorkspaceVolumeGrowth(
+                "refused", target, f"reading the workspace failed (HTTP {status})"
+            )
+
+        annotations = dict(getattr(claim.metadata, "annotations", None) or {})
+        if requested < target:
+            annotation = {_PVC_GROWN_FROM_ANNOTATION: requested_text}
+            patch: list[dict[str, Any]] = [
+                {"op": "test", "path": "/metadata/uid", "value": claim.metadata.uid},
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": claim.metadata.resource_version,
+                },
+                {
+                    "op": "test",
+                    "path": "/spec/resources/requests/storage",
+                    "value": requested_text,
+                },
+                (
+                    {
+                        "op": "add",
+                        "path": "/metadata/annotations/"
+                        + _PVC_GROWN_FROM_ANNOTATION.replace("/", "~1"),
+                        "value": requested_text,
+                    }
+                    if annotations
+                    else {
+                        "op": "add",
+                        "path": "/metadata/annotations",
+                        "value": annotation,
+                    }
+                ),
+                {
+                    "op": "replace",
+                    "path": "/spec/resources/requests/storage",
+                    "value": self._pvc_grow_size,
+                },
+            ]
+            try:
+                await self._bounded_kubernetes_mutation(
+                    self._core_api.patch_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                    body=patch,
+                )
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                if status is None:
+                    raise
+                reason = str(getattr(exc, "reason", "") or "")[:80]
+                return WorkspaceVolumeGrowth(
+                    "refused",
+                    target,
+                    f"the cluster refused it (HTTP {status}"
+                    + (f" {reason}" if reason else "")
+                    + ")",
+                )
+            logger.warning(
+                "Workspace volume %s of %s %s was full: growing it from %s to %s",
+                pvc_name,
+                owner.kind,
+                owner.id,
+                requested_text,
+                self._pvc_grow_size,
+            )
+        elif _PVC_GROWN_FROM_ANNOTATION not in annotations:
+            return WorkspaceVolumeGrowth(
+                "unsupported",
+                target,
+                f"the volume already requests {format_bytes(requested)}",
+            )
+
+        deadline = asyncio.get_running_loop().time() + self._pvc_grow_wait_seconds
+        while True:
+            try:
+                claim = await read_claim(pvc_name)
+                capacity_text = (getattr(claim.status, "capacity", None) or {}).get(
+                    "storage"
+                )
+                capacity = (
+                    normalize_byte_quantity(
+                        capacity_text, resource="storage"
+                    ).normalized_value
+                    if capacity_text
+                    else 0
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) is None and not isinstance(
+                    exc, ValueError
+                ):
+                    raise
+                capacity = 0
+            if capacity >= target:
+                return WorkspaceVolumeGrowth("resized", target)
+            if asyncio.get_running_loop().time() >= deadline:
+                return WorkspaceVolumeGrowth("pending", target)
+            await asyncio.sleep(_PVC_GROW_POLL_SECONDS)
 
     def _workspace_pvc_name_from_pod(
         self,

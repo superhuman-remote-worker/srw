@@ -56,8 +56,10 @@ from shared.runtime.core.workspace_backend import (
     RemoteCommandTimeoutError,
     WorkspaceAuthenticationError,
     WorkspaceBackend,
+    WorkspaceDiskFullError,
     WorkspaceUnavailableError,
 )
+from shared.workspace_disk import WorkspaceDiskUsage
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +297,20 @@ _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TMUX_STATE_VERSION = "1"
 _TMUX_LEGACY_INCARNATION_STATE_VERSION = "2"
 _TMUX_INCARNATION_STATE_VERSION = "3"
+# The ownership-record write failed, even after spending the disk reserve.
+# Never 78: that is the fencing refusal for a malformed or foreign record, and
+# a full volume is neither. Like every other nonzero exit it authorizes
+# nothing. The script prints the volume's usage after the marker.
+_TMUX_STATE_WRITE_FAILED_EXIT = 82
+_STATE_WRITE_FAILED_MARKER = "srw-state-write-failed"
+# A record write succeeded only by spending the reserve: the volume is full.
+_DISK_RESERVE_RELEASED_MARKER = "srw-disk-reserve-released"
+# Room for one ownership-record write on a full volume, so the shell still
+# starts and the agent can free space itself. A spent reserve is recreated
+# only once the volume has room for it many times over.
+_DISK_RESERVE_FILENAME = "disk.reserve"
+_DISK_RESERVE_BYTES = 8 * 1024 * 1024
+_DISK_RESERVE_RECREATE_FREE_KIB = 256 * 1024
 _WORKSPACE_PROCESS_TAG_ENV = "SRW_WORKSPACE_PROCESS_TAG"
 _SHELL_PROCESS_TAG_ENV = "SRW_SHELL_PROCESS_TAG"
 
@@ -598,6 +614,9 @@ class RemoteBackend(WorkspaceBackend):
         # A pane pruned while reattaching must be reported to the agent once,
         # before the usual ensure-tab path is allowed to recreate it.
         self._lost_tab_notices: set[str] = set()
+        # A claim that could start its shell only by spending the disk
+        # reserve leaves this for the next shell tool result, once.
+        self._disk_full_notice: Optional[str] = None
         # Synchronous commands must serialize per pane, not per backend.  A
         # shared-tree child can wait on its own tmux tab while the parent uses
         # another tab (notably ``git`` during turn finalization).  A backend-
@@ -1386,10 +1405,13 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     retain_tail=True,
                 )
             if exit_code != 0:
-                raise WorkspaceUnavailableError(
-                    f"Terminal-fenced {operation} failed with exit code {exit_code}"
+                raise self._tmux_exit_error(
+                    f"Terminal-fenced {operation} failed with exit code {exit_code}",
+                    exit_code,
+                    output,
+                    command_in_flight=True,
                 )
-            return output
+            return self._take_disk_reserve_notice(output)
 
     def verify_terminal_claim_resources_retired(
         self,
@@ -2862,16 +2884,10 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 '  printf "%s" "$_srw_generation" | '
                 "grep -Eq '^[0-9a-f]{32}$' || exit 78\n"
                 "}\n"
-                "_srw_write_state() {\n"
-                '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || exit 78\n'
-                "  trap 'rm -f \"$_srw_tmp\"' EXIT HUP INT TERM\n"
-                f"  printf '{_TMUX_INCARNATION_STATE_VERSION}|{owner}|"
-                f"{workspace_generation}|{runtime_incarnation}|%s|%s|%s\\n' "
-                '"$1" "$2" "$3" > "$_srw_tmp" || exit 78\n'
-                '  chmod 600 "$_srw_tmp" || exit 78\n'
-                '  mv -f "$_srw_tmp" "$_srw_state" || exit 78\n'
-                "  trap - EXIT HUP INT TERM\n"
-                "}\n"
+                + self._tmux_state_write_shell(
+                    f"'{_TMUX_INCARNATION_STATE_VERSION}|{owner}|"
+                    f"{workspace_generation}|{runtime_incarnation}|%s|%s|%s\\n'"
+                )
             )
         return (
             '_srw_state_dir="$HOME/.srw/tmux"\n'
@@ -2890,14 +2906,71 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             '  printf "%s" "$_srw_generation" | '
             "grep -Eq '^[0-9a-f]{32}$' || exit 78\n"
             "}\n"
-            "_srw_write_state() {\n"
-            '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || exit 78\n'
+            + self._tmux_state_write_shell(
+                f"'{_TMUX_STATE_VERSION}|{owner}|%s|%s|%s\\n'"
+            )
+        )
+
+    @staticmethod
+    def _tmux_state_write_shell(record_format: str) -> str:
+        """Write the ownership record; spend the disk reserve once on a full volume.
+
+        ``record_format`` is the quoted ``printf`` format of one record line.
+        A write that fails even after spending the reserve exits 82 with the
+        volume's usage. A write that succeeds only by spending it reports the
+        same usage and returns, so the shell starts on a full volume and the
+        agent can free space itself. The reserve is recreated after a later
+        write once the volume has room again.
+        """
+        usage = (
+            '  _srw_blocks=$(df -Pk "$_srw_state_dir" 2>/dev/null '
+            "| awk 'NR == 2 { print $2, $3, $4 }')\n"
+            '  _srw_inodes=$(df -Pi "$_srw_state_dir" 2>/dev/null '
+            "| awk 'NR == 2 { print $2, $3, $4 }')\n"
+            '  printf \'%s %s %s\\n\' "$1" "$_srw_blocks" "$_srw_inodes"\n'
+        )
+        return (
+            f'_srw_reserve="$HOME/.srw/{_DISK_RESERVE_FILENAME}"\n'
+            "_srw_disk_usage() {\n" + usage + "}\n"
+            "_srw_try_write_state() {\n"
+            '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || return 1\n'
             "  trap 'rm -f \"$_srw_tmp\"' EXIT HUP INT TERM\n"
-            f"  printf '{_TMUX_STATE_VERSION}|{owner}|%s|%s|%s\\n' "
-            '"$1" "$2" "$3" > "$_srw_tmp" || exit 78\n'
-            '  chmod 600 "$_srw_tmp" || exit 78\n'
-            '  mv -f "$_srw_tmp" "$_srw_state" || exit 78\n'
+            f'  if printf {record_format} "$1" "$2" "$3" > "$_srw_tmp" \\\n'
+            '    && chmod 600 "$_srw_tmp" && mv -f "$_srw_tmp" "$_srw_state"; then\n'
+            "    trap - EXIT HUP INT TERM\n"
+            "    return 0\n"
+            "  fi\n"
+            '  rm -f "$_srw_tmp"\n'
             "  trap - EXIT HUP INT TERM\n"
+            "  return 1\n"
+            "}\n"
+            "_srw_keep_reserve() {\n"
+            '  [ ! -e "$_srw_reserve" ] || return 0\n'
+            '  _srw_free=$(df -Pk "$_srw_state_dir" 2>/dev/null '
+            "| awk 'NR == 2 { print $4 }')\n"
+            '  case "$_srw_free" in ""|*[!0-9]*) return 0 ;; esac\n'
+            f'  [ "$_srw_free" -ge {_DISK_RESERVE_RECREATE_FREE_KIB} ] || return 0\n'
+            '  _srw_reserve_tmp="$_srw_reserve.$$"\n'
+            f'  if fallocate -l {_DISK_RESERVE_BYTES} "$_srw_reserve_tmp" '
+            "2>/dev/null \\\n"
+            f"    || head -c {_DISK_RESERVE_BYTES} /dev/zero "
+            '> "$_srw_reserve_tmp" 2>/dev/null; then\n'
+            '    mv -f "$_srw_reserve_tmp" "$_srw_reserve" 2>/dev/null && return 0\n'
+            "  fi\n"
+            '  rm -f "$_srw_reserve_tmp"\n'
+            "}\n"
+            "_srw_write_state() {\n"
+            '  if _srw_try_write_state "$1" "$2" "$3"; then\n'
+            "    _srw_keep_reserve\n"
+            "    return 0\n"
+            "  fi\n"
+            '  if [ -f "$_srw_reserve" ] && rm -f "$_srw_reserve" \\\n'
+            '    && _srw_try_write_state "$1" "$2" "$3"; then\n'
+            f"    _srw_disk_usage {_DISK_RESERVE_RELEASED_MARKER}\n"
+            "    return 0\n"
+            "  fi\n"
+            f"  _srw_disk_usage {_STATE_WRITE_FAILED_MARKER}\n"
+            f"  exit {_TMUX_STATE_WRITE_FAILED_EXIT}\n"
             "}\n"
         )
 
@@ -3113,6 +3186,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         allow_shell_retired: bool = False,
         close_sftp: bool = False,
         pane_context: Optional[tuple[str, str]] = None,
+        command_in_flight: bool = True,
     ) -> str:
         """Run a generated tmux command and prove its remote exit status.
 
@@ -3123,7 +3197,9 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         directly, without adding temp-file I/O to the 300 ms capture loop.
         Pane-scoped callers may supply their exact tab and pane identity;
         only a follow-up liveness proof can then downgrade the failure to an
-        ordinary missing-tab error.
+        ordinary missing-tab error. ``command_in_flight`` is False only for a
+        shell that is starting and has accepted no command yet; a full volume
+        reported from there may be resumed without the explicit-Resume hold.
         """
         with self._shell_io_lock:
             if self._shell_retired and not allow_shell_retired:
@@ -3154,10 +3230,84 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         raise KeyError(self._lost_tab_message(tab_name))
                 self._shell_initialized = False
                 self._tabs.clear()
-                raise WorkspaceUnavailableError(
-                    f"Remote tmux {operation} failed with exit code {exit_code}"
+                raise self._tmux_exit_error(
+                    f"Remote tmux {operation} failed with exit code {exit_code}",
+                    exit_code,
+                    output,
+                    command_in_flight=command_in_flight,
                 )
-            return output
+            return self._take_disk_reserve_notice(output)
+
+    @staticmethod
+    def _take_marker_line(
+        output: str, marker: str
+    ) -> tuple[str, bool, Optional[WorkspaceDiskUsage]]:
+        """Remove a state-script marker line; return the rest and its usage."""
+        kept: list[str] = []
+        found = False
+        usage = None
+        for line in output.split("\n"):
+            fields = line.split()
+            if fields and fields[0] == marker:
+                found = True
+                usage = WorkspaceDiskUsage.from_df(fields[1:])
+                continue
+            kept.append(line)
+        return "\n".join(kept), found, usage
+
+    def _tmux_exit_error(
+        self,
+        message: str,
+        exit_code: int,
+        output: str,
+        *,
+        command_in_flight: bool,
+    ) -> WorkspaceUnavailableError:
+        """Name a full volume behind a failed ownership-record write (exit 82)."""
+        if exit_code != _TMUX_STATE_WRITE_FAILED_EXIT:
+            return WorkspaceUnavailableError(message)
+        _, _, usage = self._take_marker_line(output, _STATE_WRITE_FAILED_MARKER)
+        if usage is None or not usage.full:
+            # df does not show a full volume (an unwritable state directory,
+            # a read-only filesystem): the workspace is unavailable, as before.
+            return WorkspaceUnavailableError(
+                f"{message}: could not write the shell ownership record"
+            )
+        logger.warning(
+            "workspace disk full: session=%s %s", self._session_name, usage.describe()
+        )
+        return WorkspaceDiskFullError(
+            f"{message}: workspace disk is full ({usage.describe()})",
+            usage=usage,
+            command_in_flight=command_in_flight,
+        )
+
+    def _take_disk_reserve_notice(self, output: str) -> str:
+        """Keep a spent-reserve report for the agent; return the script output."""
+        output, released, usage = self._take_marker_line(
+            output, _DISK_RESERVE_RELEASED_MARKER
+        )
+        if released and (usage is None or usage.full):
+            measured = f" ({usage.describe()})" if usage is not None else ""
+            logger.warning(
+                "workspace disk full, reserve spent: session=%s%s",
+                self._session_name,
+                measured,
+            )
+            self._disk_full_notice = (
+                f"⚠ Workspace disk is full{measured}. SRW spent a small emergency "
+                "reserve so this shell could start; if the disk stays full, the "
+                "job pauses at its next step. Free space now, for example "
+                "`pip cache purge`, `uv cache clean`, `npm cache clean --force`, "
+                "or remove build output and unused virtualenvs "
+                "(`du -xsh ~/* ~/.[!.]* 2>/dev/null | sort -h` shows what is large)."
+            )
+        return output
+
+    def take_disk_full_notice(self) -> Optional[str]:
+        """Return, once, the notice that this claim found the disk full."""
+        notice, self._disk_full_notice = self._disk_full_notice, None
+        return notice
 
     def _lost_tab_message(self, tab_name: str) -> str:
         return (
@@ -3610,6 +3760,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         output = self._tmux_exec_checked(
             self._tmux_lock_command(inner),
             operation="create or observe stateless session",
+            command_in_flight=False,
         ).strip()
         if output not in {"created", "existing"}:
             raise WorkspaceUnavailableError(
@@ -3768,6 +3919,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         output = self._tmux_exec_checked(
             self._tmux_lock_command(inner),
             operation="create or observe incarnation-fenced stateless session",
+            command_in_flight=False,
         ).strip()
         if output not in {"created", "existing"}:
             raise WorkspaceUnavailableError(

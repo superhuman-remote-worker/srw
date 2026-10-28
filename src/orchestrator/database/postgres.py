@@ -210,6 +210,11 @@ from shared.operator_pause_hold import (
     operator_pause_hold_merged_feedback_sql,
     operator_pause_hold_present_sql,
 )
+from shared.workspace_disk import (
+    WorkspaceDiskFullReport,
+    WorkspaceVolumeGrowth,
+    workspace_disk_full_action,
+)
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
 
@@ -7597,6 +7602,41 @@ class PostgresDB:
             interrupted_command=True,
         )
 
+    async def hold_full_workspace_disk(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        error_detail: str,
+        disk_full: WorkspaceDiskFullReport,
+        growth: WorkspaceVolumeGrowth | None = None,
+        resume: bool = False,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Hold a job whose workspace disk is full, or resume it on a grown volume.
+
+        The same fences as the unknown-outcome hold, with a reason that names
+        the full disk. ``resume`` (only after the volume grew and while no
+        command was running) parks the job in the runnable paused shape
+        instead, so admission picks it up again on the same, larger volume.
+        Neither counts as a recovery attempt: the transport works.
+        """
+        return await self._hold_workspace_recovery_attention(
+            job_id,
+            expected_workspace=expected_workspace,
+            expected_agent_id=expected_agent_id,
+            recovery_cap=0,
+            error_detail=error_detail,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            interrupted_command=True,
+            disk_full=disk_full,
+            disk_growth=growth,
+            requeue=resume,
+        )
+
     async def _hold_workspace_recovery_attention(
         self,
         job_id: str,
@@ -7609,6 +7649,9 @@ class PostgresDB:
         completion_finalizing_by: str | None = None,
         worker_queue_exhausted: bool = False,
         interrupted_command: bool = False,
+        disk_full: WorkspaceDiskFullReport | None = None,
+        disk_growth: WorkspaceVolumeGrowth | None = None,
+        requeue: bool = False,
     ) -> Dict[str, Any] | None:
         """Retain uncertain container work behind the existing explicit-resume fence.
 
@@ -7616,9 +7659,19 @@ class PostgresDB:
         proof. This write grants no cleanup authority and never changes runtime
         coordinates. Queue-first serialization also covers stateless reports;
         their exact accepted queue term must already be terminalized.
+
+        ``requeue`` is the one exception to the hold: a full disk whose volume
+        grew while no command was running resumes without an explicit Resume.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
+        if requeue and (
+            disk_full is None
+            or disk_full.command_in_flight
+            or disk_growth is None
+            or disk_growth.outcome != "resized"
+        ):
+            raise ValueError("only a grown full volume with no command resumes")
         try:
             job_uuid = UUID(job_id)
             runtime_uid = str(UUID(str(expected_workspace.get("_runtime_incarnation"))))
@@ -7762,6 +7815,7 @@ class PostgresDB:
                 attempts = int(workspace.get("recovery_attempts") or 0) + (
                     0
                     if worker_queue_exhausted
+                    or disk_full is not None
                     or (
                         command_uuid is not None
                         and workspace.get("recovery_attempt_command_id")
@@ -7779,9 +7833,13 @@ class PostgresDB:
                     "job_id": job_id,
                     "new_status": "paused",
                     "paused": True,
-                    "held_for_resume": True,
+                    "held_for_resume": not requeue,
                     "actions": [
-                        (
+                        workspace_disk_full_action(
+                            disk_full, disk_growth, resumed=requeue
+                        )
+                        if disk_full is not None
+                        else (
                             "workspace transport lost; interrupted command outcome is unknown; "
                             if interrupted_command
                             else "worker reported exhausted workspace retries; "
@@ -7793,6 +7851,9 @@ class PostgresDB:
                     **({"cleanup_pending": False} if interrupted_command else {}),
                 }
                 updates = {"recovery_attempts": attempts}
+                if disk_growth is not None and disk_growth.grown:
+                    # The volume grows once per job; a later full disk holds.
+                    updates["disk_growth"] = disk_growth.as_dict()
                 if command_uuid is not None:
                     updates.update(
                         recovery_attempt_command_id=str(command_uuid),
@@ -7808,7 +7869,20 @@ class PostgresDB:
                     "detail": str(error_detail)[:1000],
                     **(
                         {"reason": "interrupted_command_outcome_unknown"}
-                        if interrupted_command
+                        if interrupted_command and disk_full is None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "reason": disk_full.error_fields()["reason"],
+                            "disk": disk_full.error_fields()["disk"],
+                            **(
+                                {"growth": disk_growth.as_dict()}
+                                if disk_growth is not None
+                                else {}
+                            ),
+                        }
+                        if disk_full is not None
                         else {}
                     ),
                 }
@@ -7822,15 +7896,20 @@ class PostgresDB:
                 # reply/Resume stashes that column and must not overwrite the
                 # original checkpoint freeze with an infrastructure diagnosis.
                 hold = f"({hold} || jsonb_build_object('attention',$3::jsonb))"
+                # A requeue ($10) is the runnable paused shape admission picks
+                # up: no hold, and the job's error message stays as it was.
                 changed = await conn.fetchval(
                     f"""UPDATE jobs SET status='paused', assigned_agent_id=NULL,
                         context=jsonb_set(
                             COALESCE(context,'{{}}'::jsonb)
                             || CASE WHEN freeze_data IS NULL THEN '{{}}'::jsonb
                                ELSE jsonb_build_object('last_freeze_data',freeze_data) END
-                            || jsonb_build_object('{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}',{hold}),
+                            || CASE WHEN $10::boolean THEN '{{}}'::jsonb
+                               ELSE jsonb_build_object('{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}',{hold}) END,
                             '{{workspace_container}}',context->'workspace_container'||$2::jsonb),
-                        freeze_data=NULL,error_message=$4,updated_at=clock_timestamp()
+                        freeze_data=NULL,
+                        error_message=CASE WHEN $10::boolean THEN error_message ELSE $4::text END,
+                        updated_at=clock_timestamp()
                         WHERE id=$1 AND ($8::uuid IS NULL OR EXISTS (
                             SELECT 1 FROM job_completion_commands command
                             WHERE command.id=$8 AND command.job_id=jobs.id
@@ -7843,12 +7922,15 @@ class PostgresDB:
                     json.dumps(freeze),
                     outcome["actions"][0],
                     str(uuid4()),
-                    "workspace_recovery_unavailable"
+                    "workspace_disk_full"
+                    if disk_full is not None
+                    else "workspace_recovery_unavailable"
                     if interrupted_command
                     else "workspace_recovery_exhausted",
                     None,
                     command_uuid,
                     completion_finalizing_by,
+                    requeue,
                 )
                 return outcome if changed is not None else None
 

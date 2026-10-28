@@ -83,6 +83,22 @@ _agent_has_image_value() {
     fi
 }
 
+_agent_cache_off_volume() {
+    # _agent_cache_off_volume NAME: set for the agent, outside its home volume
+    local value
+    value=$(_agent_environment | sed -n "s/^$1=//p")
+    case "$value" in
+        "")
+            echo "$1 is not set for the agent"
+            return 1
+            ;;
+        /home/agent-host | /home/agent-host/*)
+            echo "$1=$value is on the workspace volume"
+            return 1
+            ;;
+    esac
+}
+
 _agent_has_image_path() {
     # Every directory the image adds to the standard PATH is on the agent's.
     local agent_path dir missing=""
@@ -121,8 +137,9 @@ _check "agent-host shell is bash"  test "$(getent passwd agent-host | cut -d: -f
 _check "home skeleton"             test -d /etc/skel.agent-host
 _check "entrypoint"                test -x /usr/local/bin/entrypoint.sh
 
-# Shell sessions, attach and bounded mutations.
-for binary in "tmux" "bash" "flock" "timeout" "mktemp" "grep" "awk" "sed"; do
+# Shell sessions, attach and bounded mutations. df names a full volume when the
+# shell's ownership record cannot be written.
+for binary in "tmux" "bash" "flock" "timeout" "mktemp" "grep" "awk" "sed" "df"; do
     _check "$binary"               _on_path "$binary"
 done
 
@@ -161,6 +178,11 @@ _check "no sudo binary"            _no_sudo
 _check "agent shell: PATH"         _agent_has_image_path
 _check "agent shell: PIP_BREAK_SYSTEM_PACKAGES" _agent_has_image_value PIP_BREAK_SYSTEM_PACKAGES
 _check "agent shell: npm_config_prefix" _agent_has_image_value npm_config_prefix
+# Rebuildable package caches stay off the workspace volume, so they cannot
+# fill it.
+for name in PIP_CACHE_DIR UV_CACHE_DIR npm_config_cache; do
+    _check "agent shell: $name off the volume" _agent_cache_off_volume "$name"
+done
 
 if [ "$fail" -ne 0 ]; then
     cat >&2 <<'EOF'
