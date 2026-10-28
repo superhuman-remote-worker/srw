@@ -59,7 +59,7 @@ env:
   # Update this if the repo is renamed.
   REPO_LOWER: superhuman-remote-worker/srw
   SRW_SOURCE_URL: https://github.com/superhuman-remote-worker/srw
-  SRW_DOCUMENTATION_URL: https://github.com/superhuman-remote-worker/srw
+  SRW_DOCUMENTATION_URL: https://docs.superhuman-remote-worker.com
 
 jobs:
   # Match each runtime role's Python/dependencies independently of the unit union.
