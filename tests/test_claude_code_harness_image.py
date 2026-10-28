@@ -88,16 +88,34 @@ def test_develop_runs_the_python_tests_for_harness_only_changes():
         assert path in python_filter
 
 
-def test_example_job_validates_against_the_manifest_schema():
-    text = (ROOT / "examples/manifests/claude-code-harness-job.yaml").read_text()
-    documents = parse_documents(text)
+def test_example_manifests_validate_against_the_manifest_schema():
+    from orchestrator.services.manifest_approved_images import IMAGE_REFERENCE
+
     validator = Draft202012Validator(load_schema())
-    for document in documents:
-        assert list(validator.iter_errors(document)) == []
-    (job,) = documents
+    docs = {}
+    for name in ("claude-code-harness-expert.yaml", "claude-code-harness-job.yaml"):
+        text = (ROOT / "examples/manifests" / name).read_text()
+        documents = parse_documents(text)
+        for document in documents:
+            assert list(validator.iter_errors(document)) == [], name
+        (docs[name],) = documents
+    expert = docs["claude-code-harness-expert.yaml"]
+    assert expert["kind"] == "Expert"
+    runtime = expert["spec"]["runtime"]
+    assert runtime["adapter"] == "srw/v1"
+    assert IMAGE_REFERENCE.fullmatch(runtime["image"])
+    assert runtime["image"].startswith(
+        "ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:"
+    )
+    assert runtime["image"].endswith("0" * 64)
+    assert runtime["config"]["config_name"] == "worker_base"
+    for launch_field in ("command", "args", "env", "probes"):
+        assert launch_field not in runtime
+    job = docs["claude-code-harness-job.yaml"]
     assert job["kind"] == "Job"
-    assert job["spec"]["execution"]["expert"]["inline"]["runtime"]["image"].endswith(
-        "@sha256:" + "0" * 64
+    assert (
+        job["spec"]["execution"]["expert"]["ref"]["name"]
+        == (expert["metadata"]["name"])
     )
 
 

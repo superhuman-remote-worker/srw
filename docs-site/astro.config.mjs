@@ -81,6 +81,7 @@ export default defineConfig({
 						'cloud-folders',
 						'voice-gateway',
 						'workspace-images',
+						'harness-images',
 						{
 							label: 'SSH access',
 							link: `${REPO_URL}/blob/${LINK_BRANCH}/ssh-access.md`,

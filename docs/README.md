@@ -40,6 +40,8 @@ the site; edit it on GitHub and the site follows.
   system with SRW's voice gateway and Asterisk addon.
 - [Build your own workspace image](workspace-images.md) — add your tools and
   run jobs and sessions on them.
+- [Build a harness image](harness-images.md) — replace SRW's agent with your
+  own image that takes Jobs over the v1 harness API.
 - [SSH access](../ssh-access.md) — connect a terminal or IDE to a live session
   workspace.
 - [VM capacity diagnostics](vm-capacity.md) — resource inventory, retained

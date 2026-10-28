@@ -570,6 +570,14 @@ manifestHosting:
       description: Claude Code harness
 ```
 
+An Expert with `adapter: srw/v1` can name an approved image as its runtime. The
+Job then runs as an ordinary SRW agent pod of that image: no `command`, `args`,
+`env` or probes, one cold pod per Job, no warm pool, Jobs only. The image must
+speak the v1 harness API, described in
+[Build a harness image](../../docs/harness-images.md). The pair
+[`claude-code-harness-expert.yaml`](claude-code-harness-expert.yaml) and
+[`claude-code-harness-job.yaml`](claude-code-harness-job.yaml) shows it.
+
 Any other image is refused with `422`: "Generic hosting runs only images on the
 installation's approved list (manifestHosting.approvedImages)."
 
