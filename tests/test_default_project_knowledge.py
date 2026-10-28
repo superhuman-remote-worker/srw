@@ -87,12 +87,16 @@ class _Store:
 
 
 class _Vector:
+    """Answers the pathless-user-note probe; the SQL is proven on a real server."""
+
     def __init__(self, pathless: set[str] | None = None) -> None:
         self.pathless = pathless or set()
         self.queries: list[str] = []
+        self.args: list[tuple] = []
 
-    async def fetchval(self, query, project_id):
+    async def fetchval(self, query, project_id, *args):
         self.queries.append(query)
+        self.args.append(args)
         return str(project_id) in self.pathless
 
 
@@ -178,6 +182,23 @@ class TestEnsure:
         theirs = inspect.getsource(KnowledgeStore.reconcile_orphans)
         for clause in ("project_id = $1", "path IS NULL", "status = 'active'"):
             assert clause in ours and clause in theirs, clause
+
+    @pytest.mark.asyncio
+    async def test_connector_notes_are_not_user_notes(self, provision):
+        # Every project a connector reaches holds a pathless ``ds-*`` note, so
+        # the probe leaves the generated types out (real rows: the
+        # real-Postgres test).
+        from shared.runtime.services.knowledge_store import (
+            GENERATED_PATHLESS_NOTE_TYPES,
+        )
+
+        vector = _Vector()
+        await dpk.ensure_default_project_knowledge(
+            _user(), dependencies=_deps(vector=vector)
+        )
+        assert "datasource" in GENERATED_PATHLESS_NOTE_TYPES
+        assert vector.args == [(list(GENERATED_PATHLESS_NOTE_TYPES),)]
+        assert "note_type <> ALL($2::text[])" in vector.queries[0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

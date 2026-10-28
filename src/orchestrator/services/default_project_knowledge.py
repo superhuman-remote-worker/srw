@@ -21,10 +21,12 @@ Two entry points share one idempotent, best-effort ensure,
 The ensure is a no-op for a project that already has a vault (a
 ``knowledge``- or legacy ``jobs``-role repository, the same rule
 ``kb_reindex.resolve_kb_repo`` resolves). It skips, and logs, a project whose
-``knowledge_index`` still holds active pathless rows: once a vault exists, the
-first reindex sweep's ``reconcile_orphans`` archives every such row whose slug
-is not in the (new, empty) tree. Those notes need an operator's decision, not
-an automatic vault.
+``knowledge_index`` still holds active pathless user notes: once a vault
+exists, the first reindex sweep's ``reconcile_orphans`` archives every such
+row whose slug is not in the (new, empty) tree. Those notes need an
+operator's decision, not an automatic vault. The connector notes the
+knowledge projection writes (``datasource``, pathless by design) are not user
+notes and never block.
 """
 
 from __future__ import annotations
@@ -79,13 +81,19 @@ async def project_has_knowledge_vault(store: Any, project_id: str) -> bool:
 
 
 async def project_has_unadopted_legacy_rows(vector_db: Any, project_id: str) -> bool:
-    """Whether the project's index holds rows a new vault would archive.
+    """Whether the project's index holds user notes a new vault would archive.
 
-    The predicate is ``KnowledgeStore.reconcile_orphans``' own, without its
-    tree and grace: active rows with no ``path``. It is keyed on ``project_id``
-    because an un-adopted row has no ``kb_id``. Served by the
-    ``(project_id, status)`` index.
+    ``KnowledgeStore.reconcile_orphans``' predicate, without its tree and
+    grace: active rows with no ``path``, keyed on ``project_id`` because an
+    un-adopted row has no ``kb_id``. Rows of a generated type are not user
+    notes and never block: every project a connector reaches holds a pathless
+    ``datasource`` note by design. Served by the ``(project_id, status)``
+    index.
     """
+    from shared.runtime.services.knowledge_store import (
+        GENERATED_PATHLESS_NOTE_TYPES,
+    )
+
     return bool(
         await vector_db.fetchval(
             """
@@ -95,9 +103,11 @@ async def project_has_unadopted_legacy_rows(vector_db: Any, project_id: str) -> 
                  WHERE project_id = $1
                    AND path IS NULL
                    AND status = 'active'
+                   AND note_type <> ALL($2::text[])
             )
             """,
             UUID(str(project_id)),
+            list(GENERATED_PATHLESS_NOTE_TYPES),
         )
     )
 

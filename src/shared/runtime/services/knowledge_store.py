@@ -65,6 +65,13 @@ NOTE_ID_MAX = 100
 # set_watermark_status UPSERT.
 WEDGE_STREAK_THRESHOLD = 4
 
+# Note types the system projects into knowledge_index itself, with no file in
+# any vault and so never a path: ``datasource`` is the per-connector note the
+# orchestrator's knowledge projection writes (``ds-<id8>``) for every
+# connector a project can reach. A pathless row of one of these is never a
+# legacy or orphaned *user* note.
+GENERATED_PATHLESS_NOTE_TYPES: Tuple[str, ...] = ("datasource",)
+
 
 # TTL (in loop cycles) by note_type for KB convergence — see
 # knowledge-base/knowledge/features/kb_convergence_ttl_reverification.md. ``None`` = no TTL (durable

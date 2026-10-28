@@ -6,7 +6,11 @@ Three properties only a real server can show:
   ``knowledge``/``jobs`` repository, one row per project (its oldest user), and
   never a pending user's or an orphan default project nobody points at;
 * the pathless-row gate runs against the real ``knowledge_index`` (a separate
-  database, as in production): only *active* pathless rows skip a project;
+  database, as in production): only an *active* pathless *user* note skips a
+  project. The ``datasource`` notes the knowledge projection writes for every
+  connector a project reaches are pathless by design and never block, at
+  signup (where the user's cloud-root connector lands one in the default
+  project) or in the backfill;
 * a retry after Gitea refused a creation resumes that creation's durable
   intent. Without the resume, the retry's fresh authority id is refused as
   another scope's intent, so the project would stay vault-less for good.
@@ -14,6 +18,7 @@ Three properties only a real server can show:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -141,19 +146,41 @@ async def _repository(app: PostgresDB, project_id: str, role: str) -> None:
     )
 
 
-async def _note(vector: PostgresDB, project_id: str, *, path, status) -> None:
+async def _note(
+    vector: PostgresDB, project_id: str, *, path, status, note_type="learning"
+) -> None:
     await vector.execute(
         """
         INSERT INTO knowledge_index
             (id, project_id, kb_id, note_id, title, note_type, status, content, path)
         VALUES ($1, $2::uuid,
                 CASE WHEN $3::text IS NULL THEN NULL ELSE $2::uuid END,
-                $4, 'Title', 'learning', $5, 'body', $3::text)
+                $4, 'Title', $6, $5, 'body', $3::text)
         """,
         uuid.uuid4(),
         uuid.UUID(project_id),
         path,
         f"note-{uuid.uuid4().hex[:6]}",
+        status,
+        note_type,
+    )
+
+
+async def _connector_note(
+    vector: PostgresDB, project_id: str, *, status: str = "active"
+) -> None:
+    """A ``ds-*`` row as ``knowledge_projection.sync_datasource_knowledge``
+    writes it: no ``kb_id``, no ``path``, type ``datasource``."""
+    await vector.execute(
+        """
+        INSERT INTO knowledge_index
+            (note_id, project_id, title, note_type, status, confidence, tags,
+             content)
+        VALUES ($1, $2::uuid, 'Connector: My cloud (cloud_folder)', 'datasource',
+                $3, 'high', ARRAY['datasource', 'cloud_folder'], 'body')
+        """,
+        f"ds-{uuid.uuid4().hex[:8]}",
+        uuid.UUID(project_id),
         status,
     )
 
@@ -197,6 +224,16 @@ async def test_the_backfill_selects_exactly_the_eligible_projects(stores, monkey
     await _user(app, settled)
     await _note(vector, settled, path=None, status="archived")
     await _note(vector, settled, path="knowledge/a.md", status="active")
+    # Every project a connector reaches: pathless by design, not user notes.
+    connectors_only = await _project(app, "connectors only")
+    await _user(app, connectors_only)
+    await _connector_note(vector, connectors_only)
+    await _connector_note(vector, connectors_only)
+    await _connector_note(vector, connectors_only, status="archived")
+    legacy_and_connector = await _project(app, "legacy and connector")
+    await _user(app, legacy_and_connector)
+    await _connector_note(vector, legacy_and_connector)
+    await _note(vector, legacy_and_connector, path=None, status="active")
 
     provisioned: dict[str, str] = {}
 
@@ -215,14 +252,53 @@ async def test_the_backfill_selects_exactly_the_eligible_projects(stores, monkey
         source_only: provisioned[source_only],
         shared: shared_oldest,
         settled: provisioned[settled],
+        connectors_only: provisioned[connectors_only],
     }
-    assert {with_knowledge, with_jobs, pending, orphan, legacy}.isdisjoint(provisioned)
-    assert counts["provisioned"] == 4 and counts["legacy_rows"] == 1
+    assert {
+        with_knowledge,
+        with_jobs,
+        pending,
+        orphan,
+        legacy,
+        legacy_and_connector,
+    }.isdisjoint(provisioned)
+    assert counts["provisioned"] == 5 and counts["legacy_rows"] == 2
 
-    # Idempotent: the second pass only meets the project it must skip.
+    # Idempotent: the second pass only meets the projects it must skip.
     again = await dpk.backfill_default_project_knowledge(dependencies=deps)
-    assert again["provisioned"] == 0 and again["legacy_rows"] == 1
-    assert sum(again.values()) == 1
+    assert again["provisioned"] == 0 and again["legacy_rows"] == 2
+    assert sum(again.values()) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_signup_ensure_provisions_past_connector_notes(stores, monkeypatch):
+    # Admission creates the user's cloud-root connector, linked to the default
+    # project, before the vault ensure runs; the datasource reconciler may
+    # have projected its ds-* note by then.
+    app, vector = stores.app, stores.vector
+    fresh = await _project(app, "fresh")
+    fresh_user = await app.get_user(await _user(app, fresh))
+    await _connector_note(vector, fresh)
+    returning = await _project(app, "returning")
+    returning_user = await app.get_user(await _user(app, returning))
+    await _connector_note(vector, returning)
+    await _note(vector, returning, path=None, status="active")
+
+    async def _provision(project, owner_id, *, dependencies):
+        return {"id": "datasource"}
+
+    monkeypatch.setattr(dpk, "provision_project_knowledge_repo", _provision)
+    deps = _deps(stores, SimpleNamespace(is_initialized=True))
+
+    async def _admit(user) -> str:
+        before = set(deps.repair.bg_repair_tasks)
+        assert dpk.schedule_default_project_knowledge(user, dependencies=deps)
+        (task,) = set(deps.repair.bg_repair_tasks) - before
+        return await asyncio.wait_for(task, timeout=10)
+
+    assert await _admit(fresh_user) == "provisioned"
+    # A real pathless user note still blocks, connector notes or not.
+    assert await _admit(returning_user) == "legacy_rows"
 
 
 @pytest.mark.asyncio
