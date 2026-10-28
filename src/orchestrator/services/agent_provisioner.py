@@ -15,6 +15,7 @@ Docker Compose mode is unaffected — agents use the static container pool.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -350,6 +351,15 @@ def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
     return "unknown"
 
 
+def image_key(image: str) -> str:
+    """Label-safe key for an image reference (``srw/image-key`` pod label).
+
+    Label values are capped at 63 characters and a restricted charset, so the
+    reference is hashed.
+    """
+    return hashlib.sha256(image.encode()).hexdigest()[:32]
+
+
 def _env_flag(name: str, default: bool) -> bool:
     """Parse a boolean env var exactly the way ContainerProvisioner does.
 
@@ -636,6 +646,7 @@ class AgentProvisioner:
         cpu_limit: str = "1000m",
         memory_limit: str = "2Gi",
         expected_runtime_generation: str | None = None,
+        image: str | None = None,
     ) -> Optional[str]:
         """Create an on-demand agent pod.
 
@@ -645,6 +656,8 @@ class AgentProvisioner:
             config_name: Agent config to use.
             cpu_request/memory_request: Resource requests.
             cpu_limit/memory_limit: Resource limits.
+            image: A custom harness image to run on its own entrypoint;
+                ``None`` runs the installed default agent image.
 
         Returns:
             Pod name if created, None if at capacity or on error.
@@ -869,6 +882,7 @@ class AgentProvisioner:
             provision_attempt=provision_attempt,
             namespace=intent_namespace,
             startup_allowance_s=startup_allowance_s,
+            image=image,
         )
 
         if purpose == "session" and not await self._same_session_runtime_authority(
@@ -2337,6 +2351,39 @@ class AgentProvisioner:
         counts = await self.active_counts_by_purpose()
         return counts["total"]
 
+    def _pod_counts_as_live(self, pod) -> bool:
+        """Liveness rules shared by every active-pod count."""
+        if pod.status.phase in ("Succeeded", "Failed"):
+            return False
+        # With restartPolicy: Never and a tailscale sidecar, a crashed
+        # agent container leaves the pod in phase=Running indefinitely
+        # (the sidecar is still up). Skip these so they don't pin the
+        # MAX_AGENTS ceiling — the reaper will delete them.
+        if self._has_dead_agent_container(pod):
+            return False
+        # A live agent with a kubelet-killed tailscale sidecar is a
+        # tunnel_dark zombie awaiting reap — don't pin the ceiling.
+        if self._has_dead_tunnel_sidecar(pod):
+            return False
+        return True
+
+    async def active_count_for_image(self, image: str) -> int:
+        """Count live managed agent pods running ``image``."""
+        if not self._k8s_available:
+            return 0
+        try:
+            pods = await asyncio.to_thread(
+                self._core_api.list_namespaced_pod,
+                namespace=self._namespace,
+                label_selector=(
+                    f"{self._label_selector},srw/image-key={image_key(image)}"
+                ),
+            )
+            return sum(1 for pod in pods.items if self._pod_counts_as_live(pod))
+        except Exception as e:
+            logger.error("Failed to count agent pods for image: %s", e)
+            return 0
+
     async def active_counts_by_purpose(self) -> dict[str, int]:
         """Count managed agent pods by purpose (job/session).
 
@@ -2354,17 +2401,7 @@ class AgentProvisioner:
                 label_selector=self._label_selector,
             )
             for pod in pods.items:
-                if pod.status.phase in ("Succeeded", "Failed"):
-                    continue
-                # With restartPolicy: Never and a tailscale sidecar, a crashed
-                # agent container leaves the pod in phase=Running indefinitely
-                # (the sidecar is still up). Skip these so they don't pin the
-                # MAX_AGENTS ceiling — the reaper will delete them.
-                if self._has_dead_agent_container(pod):
-                    continue
-                # A live agent with a kubelet-killed tailscale sidecar is a
-                # tunnel_dark zombie awaiting reap — don't pin the ceiling.
-                if self._has_dead_tunnel_sidecar(pod):
+                if not self._pod_counts_as_live(pod):
                     continue
                 purpose = (pod.metadata.labels or {}).get("srw/purpose", "job")
                 if purpose in result:
@@ -2971,8 +3008,13 @@ class AgentProvisioner:
         provision_attempt: Optional[str] = None,
         namespace: Optional[str] = None,
         startup_allowance_s: int = AGENT_POD_STARTUP_ALLOWANCE_S,
+        image: str | None = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
+
+        ``image`` names a custom harness image: it replaces only the container
+        image and drops ``command`` (the image starts on its own entrypoint).
+        ``None`` or the installed default keeps today's command.
 
         Uses ``envFrom`` to inject all keys from the shared ConfigMap and
         Secret, avoiding duplication of the 60+ env vars.
@@ -3029,13 +3071,16 @@ class AgentProvisioner:
         # the image tag follows the `:sha-XXXXXXX` convention; absent for
         # `:latest` or semver-style tags (local dev — drift detection
         # is a no-op there anyway).
-        if ":sha-" in self._agent_image:
+        effective_image = image or self._agent_image
+        is_default_image = effective_image == self._agent_image
+        if is_default_image and ":sha-" in self._agent_image:
             labels["srw/build-sha"] = self._agent_image.rsplit(":sha-", 1)[-1]
+        labels["srw/image-key"] = image_key(effective_image)
 
         containers: list[dict] = [
             {
                 "name": "agent",
-                "image": self._agent_image,
+                "image": effective_image,
                 "imagePullPolicy": "IfNotPresent",
                 # The shell is needed to keep the command construction shared
                 # with older manifests, but it must not remain PID 1.  Without
@@ -3043,7 +3088,11 @@ class AgentProvisioner:
                 # drain handler never runs; the pod survives until SIGKILL at
                 # the end of its termination grace period.  Every argv word is
                 # shell-quoted, so the shell only ever sees the one command.
-                "command": agent_exec_command(agent_argv),
+                **(
+                    {"command": agent_exec_command(agent_argv)}
+                    if is_default_image
+                    else {}
+                ),
                 "ports": [{"containerPort": 8001}],
                 # Inject all env from shared ConfigMap + Secret
                 "envFrom": [
@@ -3054,6 +3103,9 @@ class AgentProvisioner:
                 "env": [
                     {"name": "AGENT_CONFIG", "value": config_name},
                     {"name": "AGENT_PORT", "value": "8001"},
+                    # Overrides the ConfigMap's AGENT_IMAGE (envFrom) so the
+                    # pod reports the image it actually runs.
+                    {"name": "AGENT_IMAGE", "value": effective_image},
                     {
                         "name": "MCP_INTERNAL_KEY",
                         "valueFrom": {
