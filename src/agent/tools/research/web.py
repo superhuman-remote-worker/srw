@@ -16,6 +16,7 @@ from agent.tools.research.search import (
 from shared.tool_catalog.definitions import (
     RESEARCH_TOOLS_METADATA as RESEARCH_TOOLS_METADATA,
 )
+from shared.untrusted_content import fence_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,13 @@ def _bounded_inline_excerpt(
     if available_chars == 0:
         return cap_note.strip(), 0
     return excerpt[:available_chars].rstrip() + cap_note, 0
+
+
+def _fence_page(text: str) -> str:
+    """Fence page-derived text for the model (N50): a page can carry a prompt
+    injection like a mail body can. Braces stay: page text is often code or
+    JSON, and the citation and workspace copies keep the raw content."""
+    return fence_untrusted(text, origin="web", strip_braces=False)
 
 
 def _saved_content_line(saved_path: str) -> str:
@@ -484,7 +492,7 @@ def _direct_web_search(
             elif source_id:
                 result += f"   Source ID: {source_id} (archived)\n"
 
-            result += f"   Snippet: {_truncate_snippet(snippet)}\n"
+            result += f"   Snippet:\n{_fence_page(_truncate_snippet(snippet))}\n"
             if saved_path and not is_inaccessible:
                 result += _saved_content_line(saved_path)
             elif (
@@ -498,7 +506,7 @@ def _direct_web_search(
                     remaining_fallback_chars,
                     max_words=NO_WORKSPACE_MAX_WORDS,
                 )
-                result += f"   Content excerpt (not saved):\n{excerpt}\n"
+                result += f"   Content excerpt (not saved):\n{_fence_page(excerpt)}\n"
             result += "\n"
 
         if inaccessible_sources:
@@ -628,10 +636,12 @@ def _extract_webpage(
             inline_content = _truncate_content(raw_content)
             if saved_path and len(inline_content) <= remaining_inline_chars:
                 remaining_inline_chars -= len(inline_content)
-                output += f"   Content:\n{inline_content}\n\n"
+                output += f"   Content:\n{_fence_page(inline_content)}\n\n"
             elif saved_path:
                 remaining_inline_chars = 0
-                output += f"   Snippet:\n{_truncate_snippet(raw_content)}\n"
+                output += (
+                    f"   Snippet:\n{_fence_page(_truncate_snippet(raw_content))}\n"
+                )
                 output += _saved_content_line(saved_path)
                 output += "\n"
             else:
@@ -640,7 +650,7 @@ def _extract_webpage(
                     remaining_inline_chars,
                     max_words=NO_WORKSPACE_MAX_WORDS,
                 )
-                output += f"   Content excerpt (not saved):\n{excerpt}\n\n"
+                output += f"   Content excerpt (not saved):\n{_fence_page(excerpt)}\n\n"
 
         if failed:
             output += "Failed URLs:\n"
@@ -774,7 +784,9 @@ def _crawl_website(
                 output += f"   Source ID: {source_id} (archived)\n"
             output += f"   Words: {word_count:,}\n"
             if saved_path:
-                output += f"   Snippet:\n{_truncate_snippet(raw_content, 500)}\n"
+                output += (
+                    f"   Snippet:\n{_fence_page(_truncate_snippet(raw_content, 500))}\n"
+                )
                 output += _saved_content_line(saved_path)
                 output += "\n"
             else:
@@ -783,7 +795,7 @@ def _crawl_website(
                     remaining_fallback_chars,
                     max_words=NO_WORKSPACE_MAX_WORDS,
                 )
-                output += f"   Content excerpt (not saved):\n{excerpt}\n\n"
+                output += f"   Content excerpt (not saved):\n{_fence_page(excerpt)}\n\n"
 
         if registered:
             output += "To cite: use cite_web(text, url) - sources are already archived."
