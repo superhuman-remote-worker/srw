@@ -148,7 +148,7 @@ class Connection:
             return deepcopy(self.execution)
         if "INSERT INTO jobs" in query:
             assert self.in_transaction
-            row = {"id": args[-1], "status": args[5]}
+            row = {"id": args[22], "status": args[5]}
             self.jobs.append(row)
             return row
         if "INSERT INTO threads" in query:

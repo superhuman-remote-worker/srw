@@ -434,8 +434,8 @@ async def test_create_job_sql_inherits_omitted_parent_lane(monkeypatch):
     assert "SELECT parent.execution_lane FROM jobs parent" in normalized
     assert "FOR SHARE" in normalized
     assert "COALESCE(" in sql
-    assert args[-2] is None
-    assert isinstance(args[-1], UUID)
+    assert args[-3] is None
+    assert isinstance(args[-2], UUID)
     assert result["execution_lane"] == "stateless"
 
 
@@ -451,8 +451,8 @@ async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected(monke
     db = _db_with_conn(conn)
 
     await db.create_job(description="root", execution_lane="stateless")
-    assert conn.fetchrow.await_args.args[-2] == "stateless"
-    assert isinstance(conn.fetchrow.await_args.args[-1], UUID)
+    assert conn.fetchrow.await_args.args[-3] == "stateless"
+    assert isinstance(conn.fetchrow.await_args.args[-2], UUID)
 
     with pytest.raises(ValueError):
         await db.create_job(description="bad", execution_lane="future")
