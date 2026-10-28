@@ -2336,9 +2336,9 @@ class TestDispatchCredentialComposition:
             context_window=424242,
             max_output_tokens=None,
             transport_kind=None,
+            subscription_sources=None,
             served_model_id=None,
             client_protocol=None,
-            served_model_id=None,
         )
         resolve = AsyncMock(return_value=meta)
         monkeypatch.setattr(model_registry_module, "resolve_model", resolve)
