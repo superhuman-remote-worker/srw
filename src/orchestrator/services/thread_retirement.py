@@ -620,11 +620,18 @@ async def reconcile_stateless_thread_retirement(
             runtime_incarnation = closure.get("runtime_incarnation")
             if "unpublished_creation" in closure:
                 # Soft End kept the refused creation's PVC. No Pod ever ran, so
-                # its exact storage goes without a stop proof.
-                if not await container_provisioner.reclaim_unpublished_creation_storage(
-                    WorkspaceOwner.session(thread_id),
-                    closure["unpublished_creation"],
-                ):
+                # its exact storage goes without a stop proof. A PVC just
+                # deleted can stay Terminating for a moment.
+                for attempt in range(3):
+                    if attempt:
+                        await asyncio.sleep(2)
+                    reclaimed = await container_provisioner.reclaim_unpublished_creation_storage(
+                        WorkspaceOwner.session(thread_id),
+                        closure["unpublished_creation"],
+                    )
+                    if reclaimed:
+                        break
+                if not reclaimed:
                     raise HTTPException(
                         status_code=503,
                         detail="Refused workspace creation storage cleanup is incomplete",

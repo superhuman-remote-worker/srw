@@ -333,6 +333,26 @@ async def test_permanent_end_waits_out_a_terminating_volume(
 
 
 @pytest.mark.asyncio
+async def test_permanent_end_after_soft_end_waits_out_a_terminating_volume(
+    database, actor, monkeypatch
+):
+    """Seen live on k3d: the kept PVC stays Terminating for a moment."""
+    sleep = AsyncMock()
+    monkeypatch.setattr(thread_retirement.asyncio, "sleep", sleep)
+    case = await refused_attempt(
+        database, actor, monkeypatch, cluster=LingeringPvcCluster()
+    )
+    assert await end_case(database, case) == {"status": "ended"}
+    assert "pvc" in case.cluster.objects
+
+    assert await end_case(database, case, permanent=True) == {"status": "deleted"}
+
+    sleep.assert_awaited_once_with(2)
+    assert case.cluster.objects == {}
+    assert await database.get_thread(case.thread_id) is None
+
+
+@pytest.mark.asyncio
 async def test_a_refusal_from_before_its_record_ends_once_its_window_expired(
     database, actor, monkeypatch
 ):
