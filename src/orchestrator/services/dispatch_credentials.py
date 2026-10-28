@@ -62,7 +62,10 @@ from shared.runtime.core.loader import (
     ROSTER_INHERIT_MARKER,
     canonical_config_name,
 )
-from shared.runtime.core.model_registry import UnknownModelError
+from shared.runtime.core.model_registry import (
+    UnknownModelError,
+    effective_client_protocol,
+)
 from shared.runtime.core.transport_resolution import (
     env_endpoint_names,
     provider_base_url,
@@ -342,6 +345,10 @@ async def inject_model_credentials(
     # id, so a caller-chosen name could run one model at another row's rate.
     # `None` clears it on a session hot swap, like `extra_headers` above.
     section["served_model"] = meta.served_model_id if meta is not None else None
+    # The API shape the model is called with; `None` clears it on a swap.
+    section["client_protocol"] = (
+        effective_client_protocol(meta) if meta is not None else None
+    )
 
     if transport_complete and not (meta is not None and meta.endpoint_id):
         return None

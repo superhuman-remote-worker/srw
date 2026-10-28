@@ -36,7 +36,10 @@ from orchestrator.services.model_availability import (
     unresolved_model_reason,
 )
 from shared.runtime.core.loader import INHERIT_MODEL, ROSTER_INHERIT_MARKER
-from shared.runtime.core.model_registry import UnknownModelError
+from shared.runtime.core.model_registry import (
+    UnknownModelError,
+    effective_client_protocol,
+)
 from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
 
@@ -285,6 +288,11 @@ async def inject_dispatch_credentials(
     # (`inject_model_credentials`): always the catalog row's, `None` when it
     # has none, so a caller cannot pick it and a re-dispatch cannot keep it.
     llm_over["served_model"] = meta.served_model_id if meta is not None else None
+    # The API shape the model is called with, for a harness that speaks only
+    # one (e.g. Anthropic Messages). Same `None` sentinel as `served_model`.
+    llm_over["client_protocol"] = (
+        effective_client_protocol(meta) if meta is not None else None
+    )
 
     if resolved_keys:
         # The stored vision key belongs to the vision provider's own endpoint:

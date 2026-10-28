@@ -631,6 +631,18 @@ class TestResolutionPrecedence:
         assert section["provider"] == "openrouter"
 
     @pytest.mark.asyncio
+    async def test_session_section_carries_the_client_protocol(self, patched_main):
+        section: dict = {}
+        await dc.inject_model_credentials(
+            section=section,
+            model_id="router-chat",
+            user_id="u",
+            resolved_keys=dict(USER_KEYS),
+            dependencies=_deps(),
+        )
+        assert section["client_protocol"] == "openai-chat"
+
+    @pytest.mark.asyncio
     async def test_no_key_map_entry_means_no_key(self, patched_main):
         """A provider absent from the map leaves the section keyless, not guessed."""
         section: dict = {}
