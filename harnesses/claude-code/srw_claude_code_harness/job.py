@@ -9,7 +9,7 @@ Standard library only.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .orchestrator import PinnedEcho
@@ -29,7 +29,7 @@ class ModelRoute:
     provider: str | None
     client_protocol: str | None
     base_url: str | None
-    api_key: str | None
+    api_key: str | None = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class JobSpec:
     model: ModelRoute
     workspace: WorkspaceAccess
     pinned: PinnedEcho | None
-    recipient: dict | None
+    recipient: dict | None = field(repr=False)
     limits: Limits
     effort: str | None
 

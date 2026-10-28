@@ -7,7 +7,7 @@ httpx; the harness image contains no SRW code, so nothing is imported from it.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -29,7 +29,7 @@ class PinnedEcho:
 
     delivery_id: str | None
     projection_digest: str | None
-    delivery_proof: str | None
+    delivery_proof: str | None = field(repr=False)
 
 
 @dataclass

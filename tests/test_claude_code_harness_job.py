@@ -127,3 +127,15 @@ def test_require_anthropic_route_needs_a_credential_or_base_url():
     require_anthropic_route(
         ModelRoute("m", "anthropic", "anthropic-messages", None, "k")
     )
+
+
+def test_secrets_stay_out_of_the_repr():
+    body = copy.deepcopy(START_BODY)
+    body["resolved_config"]["agent"]["llm"]["api_key"] = "sk-secret-key"
+    body["pinned_delivery_proof"] = "proof-secret"
+    body["recipient"] = {"email": "someone-secret@example.com"}
+    spec = parse_job_start(body)
+    text = repr(spec) + repr(spec.model) + repr(spec.pinned)
+    for secret in ("sk-secret-key", "proof-secret", "someone-secret"):
+        assert secret not in text
+    assert spec.model.api_key == "sk-secret-key"
