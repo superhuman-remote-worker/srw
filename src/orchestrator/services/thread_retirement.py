@@ -23,6 +23,7 @@ from orchestrator.services import (
     officer_post_lifecycle as officer_post_lifecycle_service,
 )
 from orchestrator.services.cloud import SessionFolderHandle
+from orchestrator.services.cloud.errors import FeatureNotAvailable
 from orchestrator.services.cloud_stage_authority import (
     _capture_cloud_stage_authority,
     _retirement_stage_event_from_receipt as retirement_stage_event_from_receipt,
@@ -1391,6 +1392,50 @@ async def reconcile_stateless_thread_retirement(
 SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S = 30.0
 
 
+async def delete_main_cloud_session_folder(
+    thread: dict[str, Any], *, main_cloud_router: Any, logger: logging.Logger
+) -> None:
+    """Delete a permanently ended session's main-cloud folder, best effort.
+
+    The folder lives on the installation that created it. When this replica
+    cannot resolve that installation (the cloud was not answering at startup
+    and its authority is not established yet), the delete answers a typed
+    503 before the thread row goes, so End stays retryable instead of a 500
+    that leaves the folder behind. A failed remote delete only logs.
+    """
+    session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if not session_handle_str:
+        return
+    try:
+        backend = main_cloud_router.for_thread(thread)
+    except FeatureNotAvailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "main_cloud_unavailable",
+                "message": (
+                    "This session's cloud folder is on a cloud installation "
+                    "that is not reachable yet; retry the delete."
+                ),
+            },
+        ) from exc
+    if not backend.is_initialized:
+        return
+    try:
+        session_handle = SessionFolderHandle.from_db(
+            session_handle_str, backend=backend.backend_id
+        )
+        await backend.delete_session_folder(session_handle)
+    except Exception as exc:
+        logger.warning(
+            "Failed to delete main-cloud session folder for thread %s: %s",
+            thread.get("id"),
+            exc,
+        )
+
+
 @asynccontextmanager
 async def _end_workspace_ownership(store, thread_id: str, *, lane: str, held: bool):
     if held:
@@ -1747,23 +1792,9 @@ async def _end_thread_flow_owned(
             ):
                 raise RuntimeError("Repository credential revocation is retryable")
 
-        session_handle_str = authoritative_thread.get(
-            "main_cloud_session_handle"
-        ) or authoritative_thread.get("nc_session_folder")
-        if session_handle_str:
-            backend = main_cloud_router.for_thread(authoritative_thread)
-            if backend.is_initialized:
-                try:
-                    session_handle = SessionFolderHandle.from_db(
-                        session_handle_str, backend=backend.backend_id
-                    )
-                    await backend.delete_session_folder(session_handle)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to delete main-cloud session folder for thread %s: %s",
-                        thread_id,
-                        exc,
-                    )
+        await delete_main_cloud_session_folder(
+            authoritative_thread, main_cloud_router=main_cloud_router, logger=logger
+        )
 
     if not stateless:
         if (
