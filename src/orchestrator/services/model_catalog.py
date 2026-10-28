@@ -34,6 +34,7 @@ from orchestrator.schemas.provider_catalog import (
 from orchestrator.services.provider_catalog import EndpointProbe
 from orchestrator.services.readiness import try_auto_pin_required_defaults
 from shared.runtime.core.model_registry import served_model_problem
+from shared.subscription_routing import validate_routing_params
 from typing import Protocol
 
 if TYPE_CHECKING:
@@ -460,6 +461,20 @@ class ModelCatalogService:
             existing = await self.store.get_model(catalog_id)
             if existing is None:
                 raise HTTPException(status_code=404, detail="Catalog row not found")
+        if fields.get("params_json") is not None:
+            if existing is None:
+                existing = await self.store.get_model(catalog_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Catalog row not found")
+            try:
+                validate_routing_params(
+                    fields["params_json"],
+                    provider_kind=fields.get(
+                        "provider_kind", existing["provider_kind"]
+                    ),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
         if "provider_kind" in fields or "provider_ref" in fields:
             if existing is None:
                 existing = await self.store.get_model(catalog_id)

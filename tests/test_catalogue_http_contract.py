@@ -566,6 +566,91 @@ async def test_model_subscription_routing_metadata_survives_projection(catalogue
     assert row["routing_needs_review"] is True
 
 
+def _create_body(**updates):
+    return {
+        "provider_kind": "endpoint",
+        "provider_ref": ROW_ID,
+        "model_id": "test-model",
+        "display_label": "Test model",
+        "capabilities": ["chat"],
+        "family": "default",
+        **updates,
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_refuses_an_unknown_client_protocol(catalogue):
+    response = await catalogue.request(
+        "POST",
+        "/api/admin/providers/models",
+        json=_create_body(params_json={"routing": {"client_protocol": "grpc"}}),
+    )
+    assert response.status_code == 422
+    assert "client_protocol" in response.text
+    catalogue.store.create_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_refuses_a_protocol_on_a_provider_anchored_row(catalogue):
+    response = await catalogue.request(
+        "POST",
+        "/api/admin/providers/models",
+        json=_create_body(
+            provider_kind="system",
+            provider_ref="openai",
+            params_json={"routing": {"client_protocol": "anthropic-messages"}},
+        ),
+    )
+    assert response.status_code == 422
+    assert "endpoint" in response.text
+    catalogue.store.create_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_patch_refuses_a_protocol_on_a_provider_anchored_row(
+    catalogue,
+):
+    catalogue.store.get_model.return_value = model_row(
+        provider_kind="system", provider_ref="openai"
+    )
+    response = await catalogue.request(
+        "PATCH",
+        f"/api/admin/providers/models/{ROW_ID}",
+        json={"params_json": {"routing": {"client_protocol": "anthropic-messages"}}},
+    )
+    assert response.status_code == 422
+    assert "endpoint" in response.text
+    catalogue.store.update_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_patch_refuses_an_unknown_client_protocol(catalogue):
+    response = await catalogue.request(
+        "PATCH",
+        f"/api/admin/providers/models/{ROW_ID}",
+        json={"params_json": {"routing": {"client_protocol": "grpc"}}},
+    )
+    assert response.status_code == 422
+    assert "client_protocol" in response.text
+    catalogue.store.update_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_patch_accepts_anthropic_messages_on_an_endpoint_row(
+    catalogue,
+):
+    params = {"routing": {"client_protocol": "anthropic-messages"}}
+    catalogue.store.get_model.return_value = model_row()
+    catalogue.store.update_model.return_value = model_row(params_json=params)
+    response = await catalogue.request(
+        "PATCH",
+        f"/api/admin/providers/models/{ROW_ID}",
+        json={"params_json": params},
+    )
+    assert response.status_code == 200
+    assert response.json()["client_protocol"] == "anthropic-messages"
+
+
 @pytest.mark.asyncio
 async def test_subscription_import_passes_selection_and_keeps_partial_outcome(
     catalogue,
