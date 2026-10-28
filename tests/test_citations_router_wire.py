@@ -227,30 +227,75 @@ def test_snapshot_without_a_stored_blob_is_404_after_authorization():
     assert response.json()["detail"] == "No snapshot stored for this citation"
 
 
-def test_snapshot_serves_the_stored_bytes_inline():
+def _snapshot_response(source_name, content_type="application/pdf"):
     conn = _conn(
         fetchrow=AsyncMock(
             return_value={
                 "job_id": JOB_ID,
-                "source_name": 'we"ird.pdf',
+                "source_name": source_name,
                 "metadata": {
                     "cloud": {
                         "snapshot_blob_key": "citations/ab/abcd",
-                        "content_type": "application/pdf",
+                        "content_type": content_type,
                     }
                 },
             }
         )
     )
-    wired = _wire(conn=conn)
+    return _wire(conn=conn).client.get("/api/citations/7/snapshot")
 
-    response = wired.client.get("/api/citations/7/snapshot")
+
+def test_snapshot_serves_the_stored_bytes_as_an_attachment():
+    response = _snapshot_response('we"ird.pdf')
 
     assert response.status_code == 200
     assert response.content == b"bytes"
     assert response.headers["content-type"] == "application/pdf"
-    # The quote is stripped so it cannot break out of the header value.
-    assert response.headers["content-disposition"] == 'inline; filename="weird.pdf"'
+    assert response.headers["x-content-type-options"] == "nosniff"
+    # The quote cannot break out of the header value.
+    assert response.headers["content-disposition"] == (
+        "attachment; filename=\"we_ird.pdf\"; filename*=UTF-8''we%22ird.pdf"
+    )
+
+
+def test_an_html_snapshot_is_never_rendered_on_the_api_origin():
+    """N51: a cited ``text/html`` file came back inline and sniffable."""
+    response = _snapshot_response("page.html", content_type="text/html")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-disposition"].startswith("attachment;")
+
+
+@pytest.mark.parametrize(
+    "source_name,expected",
+    [
+        (
+            "Bericht März 报告.pdf",
+            'attachment; filename="Bericht M_rz __.pdf"; '
+            "filename*=UTF-8''Bericht%20M%C3%A4rz%20%E6%8A%A5%E5%91%8A.pdf",
+        ),
+        (
+            "a\r\nSet-Cookie: x=1.html",
+            'attachment; filename="aSet-Cookie: x=1.html"; '
+            "filename*=UTF-8''aSet-Cookie%3A%20x%3D1.html",
+        ),
+        (
+            "../../etc\\passwd",
+            "attachment; filename=\"passwd\"; filename*=UTF-8''passwd",
+        ),
+        (
+            None,
+            "attachment; filename=\"citation-7\"; filename*=UTF-8''citation-7",
+        ),
+    ],
+)
+def test_the_snapshot_filename_is_safe_for_any_source_name(source_name, expected):
+    response = _snapshot_response(source_name)
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == expected
 
 
 def test_drift_on_a_non_cloud_citation_is_400():

@@ -18,6 +18,7 @@ import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import HTTPException, Response
 
@@ -54,6 +55,29 @@ def _source_cloud_meta(metadata: Any) -> dict[str, Any]:
         return {}
     cloud = metadata.get("cloud")
     return cloud if isinstance(cloud, dict) else {}
+
+
+#: Longest snapshot download name kept, before encoding.
+_SNAPSHOT_FILENAME_MAX = 200
+
+
+def _snapshot_content_disposition(source_name: Any, citation_id: int) -> str:
+    """``attachment`` naming the cited file, safe for any stored source name.
+
+    The source name is agent-written. Only its last path segment is kept,
+    without control characters. The quoted ``filename`` is an ASCII fallback
+    (``"``, backslash and non-ASCII become ``_``) and ``filename*`` carries
+    the exact name percent-encoded (RFC 6266), so no name can end the header
+    value or fail its latin-1 encoding.
+    """
+    name = str(source_name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    name = name[:_SNAPSHOT_FILENAME_MAX] or f"citation-{citation_id}"
+    fallback = "".join(
+        ch if " " <= ch <= "~" and ch not in '"\\' else "_" for ch in name
+    )
+    encoded = quote(name, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def _home_relative_path(anchor_webdav_url: str, home_webdav_url: str) -> Optional[str]:
@@ -388,12 +412,19 @@ async def get_citation_snapshot(
         if data is None:
             raise HTTPException(status_code=404, detail="Snapshot blob not found")
 
+        # The stored type is the cited file's and may be ``text/html``: the
+        # bytes are always a download, never rendered or sniffed on the API
+        # origin (N51).
         media_type = cloud.get("content_type") or "application/octet-stream"
-        filename = (row["source_name"] or f"citation-{citation_id}").replace('"', "")
         return Response(
             content=data,
             media_type=media_type,
-            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            headers={
+                "Content-Disposition": _snapshot_content_disposition(
+                    row["source_name"], citation_id
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
         )
     except HTTPException:
         raise
