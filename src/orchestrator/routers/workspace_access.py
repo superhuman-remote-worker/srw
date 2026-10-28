@@ -219,8 +219,14 @@ async def ensure_workspace_access(
     # while authenticating must still surface as a logged 500, exactly as it
     # did in ``main``. Kept as a comment, not docstring text — FastAPI
     # publishes a route's docstring as its OpenAPI description.
+    # The grant makes the caller a Gitea collaborator on the job's repo, so
+    # the gate is job visibility (owner, project member or admin), not just
+    # an approved account (N36).
     async def approve_caller() -> dict[str, Any]:
-        return await dependencies.require_approved_user(request, dependencies.store)
+        user, _job = await dependencies.require_job_access(
+            request, dependencies.store, job_id
+        )
+        return user
 
     return await workspace_access.ensure_workspace_access(
         job_id=job_id,

@@ -299,7 +299,7 @@ GET    /api/jobs/{job_id}/completion-report                                     
 GET    /api/jobs/{job_id}/datasources                                                   pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/diff                                                          pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/diff/{file_path:path}                                         pat=jobs:read       gated:require_job_access
-POST   /api/jobs/{job_id}/ensure-workspace-access                                       pat=jobs:write      gated:require_approved_user
+POST   /api/jobs/{job_id}/ensure-workspace-access                                       pat=jobs:write      gated:require_job_access
 GET    /api/jobs/{job_id}/evidence                                                      pat=jobs:read       gated:require_job_access
 GET    /api/jobs/{job_id}/evidence/{evidence_id}                                        pat=jobs:read       gated:require_job_access
 POST   /api/jobs/{job_id}/export-to-shared-folder                                       pat=jobs:write      gated:require_job_access
