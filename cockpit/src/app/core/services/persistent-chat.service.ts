@@ -366,6 +366,13 @@ const WORKSPACE_UPGRADE_FAILURE_KEYS: Record<string, string> = {
   upgrade_already_running: 'chat.workspaceUpgrade.failed.upgradeAlreadyRunning',
 };
 
+/** Container upgrade failures that End, then Resume, can retry (C1). */
+const RETRYABLE_UPGRADE_FAILURES: ReadonlySet<string> = new Set([
+  'pull_deadline',
+  'readiness_deadline',
+  'ssh_deadline',
+]);
+
 /** Owner rejection codes with a specific explanation (the fallback is the
  *  generic `chat.control.ownerRejected`). */
 const CONTROL_REJECTION_KEYS: Record<string, string> = {
@@ -7631,12 +7638,19 @@ export class PersistentChatService {
     }
     const creation = this.workspaceCreation();
     const reasonKey = creation ? workspaceCreationMessageKey(creation) : 'workspaceCreation.unknown';
-    return this.transloco.translate('chat.workspaceUpgrade.failedStartup', {
-      reason: this.transloco.translate(
-        reasonKey,
-        creation ? workspaceCreationMessageParams(creation) : {},
-      ),
-    });
+    // A deadline can pass for a transient reason, and Resume after End starts
+    // the upgrade's container again. A bad image or configuration would only
+    // fail again.
+    const retryable = RETRYABLE_UPGRADE_FAILURES.has(creation?.reason_code ?? '');
+    return this.transloco.translate(
+      retryable ? 'chat.workspaceUpgrade.failedStartupRetry' : 'chat.workspaceUpgrade.failedStartup',
+      {
+        reason: this.transloco.translate(
+          reasonKey,
+          creation ? workspaceCreationMessageParams(creation) : {},
+        ),
+      },
+    );
   }
 
   /** One Session read's upgrade phase (C1, C2): shows, moves on or ends the card. */

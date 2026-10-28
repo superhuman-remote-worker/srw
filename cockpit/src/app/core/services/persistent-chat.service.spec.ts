@@ -12595,6 +12595,33 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
   });
 
+  it.each([
+    ['pull_deadline', 'chat.workspaceUpgrade.failedStartupRetry'],
+    ['readiness_deadline', 'chat.workspaceUpgrade.failedStartupRetry'],
+    ['ssh_deadline', 'chat.workspaceUpgrade.failedStartupRetry'],
+    ['invalid_image', 'chat.workspaceUpgrade.failedStartup'],
+    ['invalid_configuration', 'chat.workspaceUpgrade.failedStartup'],
+    ['container_exited', 'chat.workspaceUpgrade.failedStartup'],
+  ])('a container upgrade that failed on %s says how to go on', async (reason, key) => {
+    const ctx = await socketlessSession(upgradeable);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'sandbox' });
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(upgradeable, {
+        workspace_upgrade: { target_tier: 'sandbox', phase: 'failed', reason_code: reason },
+        workspace_creation: { ...failedUpgrade.workspace_creation, reason_code: reason },
+      }),
+    );
+
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+
+    expect(stamps).toHaveBeenCalledWith(key);
+  });
+
   it('a failure that appears on a later lifecycle read is announced live', async () => {
     const ctx = await socketlessSession(upgradeable);
     const stamps = vi.spyOn(ctx.service as any, '_systemMessage');

@@ -2416,6 +2416,7 @@
       "upgradeBusy": "The session is still finishing background work (for example a cloud sync), so the workspace upgrade didn't start. Try again in a minute."
     },
     "workspaceUpgrade": {
+      "failedStartupRetry": "Workspace upgrade failed. {{reason}} To try again, End this session and then resume it; your files are kept.",
       "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept.",
       "notPossible": "This Session's workspace can't be upgraded in place. Start a new Session with a container workspace.",
       "movingToVm": "Moving this session to a VM workspace (the session reconnects first)…",

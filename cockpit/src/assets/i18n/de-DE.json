@@ -2416,6 +2416,7 @@
       "upgradeBusy": "Die Sitzung erledigt noch Hintergrundarbeit (zum Beispiel eine Cloud-Synchronisierung), daher hat das Workspace-Upgrade nicht begonnen. Versuche es in einer Minute erneut."
     },
     "workspaceUpgrade": {
+      "failedStartupRetry": "Workspace-Upgrade fehlgeschlagen. {{reason}} Um es erneut zu versuchen, beende diese Sitzung und setze sie dann fort; deine Dateien bleiben erhalten.",
       "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten.",
       "notPossible": "Der Workspace dieser Sitzung lässt sich nicht direkt aufrüsten. Starte stattdessen eine neue Sitzung mit einem Container-Workspace.",
       "movingToVm": "Diese Sitzung wird auf einen VM-Workspace verschoben (die Sitzung verbindet sich zuerst neu)…",
