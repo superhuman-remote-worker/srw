@@ -4674,6 +4674,73 @@ class TestStreamedResponseNormalization:
         assert not any(isinstance(m, AIMessage) for m in messages)
 
 
+class TestUsageRecordsTheCatalogModel:
+    """Usage and llm_requests name the catalog row the call was made with.
+
+    OpenAI-compatible gateways (OpenRouter, MiniMax) send ``model_name`` on
+    more than one streamed chunk, and LangChain's chunk merge concatenates
+    response_metadata strings, so the echo arrived as ``MiniMax-M3MiniMax-M3``.
+    That matched no catalog row and the call went unpriced. A job records
+    ``config.llm.model``; a session does too now.
+    """
+
+    @staticmethod
+    def _chunks(*parts: AIMessageChunk):
+        llm = AsyncMock()
+        llm.reasoning = None
+
+        async def _astream(messages, **kw):
+            for part in parts:
+                yield part
+
+        llm.astream = _astream
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_a_doubled_streamed_echo_is_not_recorded(self):
+        echo = {"model_name": "MiniMax-M3"}
+        llm = self._chunks(
+            AIMessageChunk(content="Hel", response_metadata=dict(echo)),
+            AIMessageChunk(
+                content="lo",
+                response_metadata={**echo, "finish_reason": "stop"},
+                usage_metadata={
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "total_tokens": 15,
+                },
+            ),
+        )
+        config = _make_config()
+        config.llm.model = "openrouter/minimax/minimax-m3"
+        config.llm.served_model = None
+        usage = AsyncMock()
+        archive = MagicMock()
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=_make_callbacks(on_usage=usage, archive_llm_call=archive),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=config,
+        )
+
+        # The premise: the merged stream really does carry the doubled echo.
+        ai = [m for m in messages if isinstance(m, AIMessage)]
+        assert ai[-1].response_metadata["model_name"] == "MiniMax-M3MiniMax-M3"
+
+        usage.assert_awaited_once()
+        assert usage.await_args.args[0]["model"] == "openrouter/minimax/minimax-m3"
+        archive.assert_called_once()
+        assert archive.call_args.args[2]["model"] == "openrouter/minimax/minimax-m3"
+
+
 class TestHardInterruptHelpers:
     """Phase-3 immediate hard-interrupt cancellation primitives.
 

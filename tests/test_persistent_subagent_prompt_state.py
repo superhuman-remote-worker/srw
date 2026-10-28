@@ -315,16 +315,21 @@ async def test_empty_retry_archives_each_response_with_its_provider_input():
     assert retry_response is retried
     assert first_input == provider_inputs[0]
     assert retry_input == provider_inputs[1]
-    assert first_metrics["model"] == "empty-attempt"
-    assert retry_metrics["model"] == "retry-attempt"
+    # Each attempt keeps its own numbers. The model is the catalog row the call
+    # was made with, never the provider's echo (a streamed echo can arrive
+    # doubled; see TestUsageRecordsTheCatalogModel).
+    assert first_metrics["input_tokens"] == 11
+    assert retry_metrics["input_tokens"] == 13
+    assert first_metrics["model"] == retry_metrics["model"] == "test-model"
     assert [
         call.args[0] for call in context_manager.record_provider_usage.call_args_list
     ] == [11, 13]
-    assert [call.args[0]["model"] for call in usage.await_args_list] == [
-        "empty-attempt",
-        "retry-attempt",
-    ]
-    assert result.metrics["model"] == "retry-attempt"
+    assert [
+        (call.args[0]["input_tokens"], call.args[0]["model"])
+        for call in usage.await_args_list
+    ] == [(11, "test-model"), (13, "test-model")]
+    assert result.metrics["input_tokens"] == 13
+    assert result.metrics["model"] == "test-model"
     assert retry_input == first_input
     assert first_input[-1].additional_kwargs[FOLDED_KEY] == ["subagents"]
     assert first_block in first_input[-1].content

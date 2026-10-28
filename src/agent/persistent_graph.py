@@ -3070,10 +3070,19 @@ async def _execute_turn(
                         or ""
                     ),
                 )
-                # Usage and the llm_requests row name the catalog row, not the
-                # served string the provider echoes back (rule 9).
-                usage_model = recorded_model_name(
-                    getattr(config, "llm", None), attempt_metrics.get("model")
+                # Usage and the llm_requests row name the catalog row the call
+                # was made with (config.llm.model), as a job records it -- not
+                # the string the provider echoes back. That echo is the served
+                # string where the row has one (rule 9), and a streamed echo can
+                # arrive doubled ("MiniMax-M3MiniMax-M3"): LangChain's chunk
+                # merge concatenates response_metadata strings, and a gateway
+                # that sends model_name on several chunks priced nothing.
+                llm_config = getattr(config, "llm", None)
+                catalog_model = getattr(llm_config, "model", None)
+                usage_model = (
+                    catalog_model
+                    if isinstance(catalog_model, str) and catalog_model
+                    else recorded_model_name(llm_config, attempt_metrics.get("model"))
                 )
                 if usage_model:
                     attempt_metrics["model"] = usage_model
