@@ -334,7 +334,15 @@ jobs:
           uv pip install --system torch
           --index-url https://download.pytorch.org/whl/cpu
       - name: Install Python dependencies
-        run: uv pip install --system -r requirements.txt
+        # Every shipped component's runtime set, not only the agent's:
+        # pip-audit reads the installed environment, so a requirements file
+        # nobody installed here is never audited.
+        run: >-
+          uv pip install --system
+          -r requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
+          -r src/vm_controller/requirements.txt
       - name: Audit Python dependencies
         # CVE-2026-4539: pygments ReDoS in AdlLexer — local-only, no fix released
         # CVE-2026-25645: requests extract_zipped_paths() temp path — we don't call it;
@@ -1287,9 +1295,9 @@ jobs:
           id
           python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
         if: steps.base.outputs.reuse != 'true'
-      - uses: hashicorp/setup-packer@main
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
         with:
-          version: latest
+          version: 1.16.1
         if: steps.base.outputs.reuse != 'true'
       - name: Compute cloud image cache key
         id: img-key
@@ -1455,9 +1463,9 @@ jobs:
           ls -la /dev/kvm
           id
           python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
-      - uses: hashicorp/setup-packer@main
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
         with:
-          version: latest
+          version: 1.16.1
       # Login is unconditional here — needed to PULL the stage1 containerDisk
       # from GHCR even on validation runs. Push of the final image still
       # gates on a resolved release version below.
@@ -2289,6 +2297,7 @@ jobs:
       - name: Install yq
         run: |
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          echo "a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7  /usr/local/bin/yq" | sha256sum -c -
           sudo chmod +x /usr/local/bin/yq
       - name: Log in to GHCR
         uses: docker/login-action@v3
