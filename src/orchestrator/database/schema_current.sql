@@ -27015,6 +27015,7 @@ CREATE TABLE public.agents (
     intents jsonb DEFAULT '{}'::jsonb NOT NULL,
     pod_uid text,
     aux_degraded boolean DEFAULT false NOT NULL,
+    image text,
     CONSTRAINT valid_agent_status CHECK (((status)::text = ANY ((ARRAY['booting'::character varying, 'ready'::character varying, 'working'::character varying, 'session'::character varying, 'draining'::character varying, 'completed'::character varying, 'failed'::character varying, 'offline'::character varying])::text[])))
 );
 
@@ -29185,6 +29186,7 @@ CREATE TABLE public.jobs (
     completion_outcome_kind text,
     workspace_idle_revision bigint DEFAULT 0 NOT NULL,
     workspace_idle_episode jsonb,
+    harness_image text,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),

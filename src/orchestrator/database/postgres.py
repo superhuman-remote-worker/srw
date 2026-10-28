@@ -4471,6 +4471,7 @@ class PostgresDB:
                        j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
                        j.freeze_data,
                        j.workspace_idle_episode, j.workspace_idle_revision,
+                       j.harness_image,
                        j.cloud_diff_baseline_commit, j.diff_status,
                        j.exported_folder_handle, j.exported_at,
                        j.creation_order, j.worktree_path, j.delegation_context,
@@ -4574,6 +4575,7 @@ class PostgresDB:
         workspace_selection: Mapping[str, Any] | None = None,
         expert_row: Mapping[str, Any] | None = None,
         conn: Any = None,
+        harness_image: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -4846,7 +4848,7 @@ class PostgresDB:
             )
             written = await active_conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, origin, execution_lane, id)
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, origin, execution_lane, id, harness_image)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
                         COALESCE(
                             $22::text,
@@ -4856,7 +4858,7 @@ class PostgresDB:
                               FOR SHARE),
                             'pinned'
                         ),
-                        $23)
+                        $23, NULLIF($24, ''))
                 RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, origin, execution_lane
                 """,
                 description,
@@ -4882,6 +4884,7 @@ class PostgresDB:
                 origin,
                 execution_lane,
                 job_uuid,
+                harness_image,
             )
             if datasource_uuids:
                 await active_conn.executemany(
@@ -28087,6 +28090,7 @@ class PostgresDB:
         expected_agent_id: str | None = None,
         insert_only: bool = False,
         completion_commands_enabled: bool = False,
+        image: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -28193,7 +28197,8 @@ class PostgresDB:
                         agent_mode    = $6,
                         thread_id     = $7,
                         metadata = COALESCE(metadata, '{}') || $8::jsonb,
-                        pod_uid       = COALESCE(NULLIF($9, ''), pod_uid)
+                        pod_uid       = COALESCE(NULLIF($9, ''), pod_uid),
+                        image         = COALESCE(NULLIF($10, ''), image)
                     WHERE id = $5
                     """,
                     pod_ip,
@@ -28205,6 +28210,7 @@ class PostgresDB:
                     thread_id,
                     registration_metadata,
                     pod_uid,
+                    image,
                 )
                 if expected_agent_id is not None and update_result != "UPDATE 1":
                     raise RuntimeError(
@@ -28219,8 +28225,8 @@ class PostgresDB:
             # Create new agent
             row = await conn.fetchrow(
                 """
-                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata, pod_uid)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NULLIF($9, ''))
+                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata, pod_uid, image)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NULLIF($9, ''), NULLIF($10, ''))
                 RETURNING id
                 """,
                 config_name,
@@ -28232,6 +28238,7 @@ class PostgresDB:
                 thread_id,
                 registration_metadata,
                 pod_uid,
+                image,
             )
 
             return {
@@ -37507,7 +37514,7 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, registered_at, last_heartbeat,
-                       last_completed_at, metadata, pod_uid
+                       last_completed_at, metadata, pod_uid, image
                 FROM agents
                 WHERE status = 'ready'
                   AND COALESCE(agent_mode, 'worker') IN ('worker', 'dual')

@@ -230,6 +230,28 @@ async def test_registered_agent_provenance_ignores_legacy_short_sha_and_self_ver
 
 
 @pytest.mark.asyncio
+async def test_agent_registration_persists_the_image():
+    with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+        database = PostgresDB()
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value={"id": _AGENT_REVISION})
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    database.acquire = acquire
+    image = "example.invalid/h@sha256:" + "a" * 64
+
+    await database.register_agent(
+        config_name="worker_base", pod_ip="10.0.0.1", image=image
+    )
+
+    args = connection.fetchrow.call_args.args
+    assert image in args
+
+
+@pytest.mark.asyncio
 async def test_agent_registration_persists_full_provenance_beside_legacy_short_sha():
     with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
         database = PostgresDB()

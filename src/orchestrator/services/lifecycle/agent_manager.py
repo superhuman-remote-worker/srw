@@ -275,7 +275,7 @@ class AgentInstanceManager:
                 rows = await conn.fetch(
                     """
                     SELECT id, hostname, status, current_job_id, thread_id,
-                           metadata, agent_mode, last_heartbeat
+                           metadata, agent_mode, last_heartbeat, image
                     FROM agents
                     WHERE hostname IS NOT NULL
                     """
