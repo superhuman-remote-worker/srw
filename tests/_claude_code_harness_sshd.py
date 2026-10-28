@@ -14,7 +14,9 @@ fails (SIGPIPE) and its stdin ends.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import os
 import shutil
 import socket
@@ -67,6 +69,7 @@ class LocalSshd:
         self.access: WorkspaceAccess | None = None
         self.commands: list[str] = []
         self.prefix: str | None = None
+        self.fingerprint: str = ""
 
     @classmethod
     async def start(cls, root: Path, *, listen: bool = True) -> LocalSshd:
@@ -89,6 +92,9 @@ class LocalSshd:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
+        instance.fingerprint = "SHA256:" + base64.b64encode(
+            hashlib.sha256(host_key.public_data).digest()
+        ).decode().rstrip("=")
         algorithm, blob = host_key.export_public_key().decode().split()[:2]
         known_hosts_file = os.path.join(key_dir, "known_hosts")
         with open(known_hosts_file, "w") as handle:

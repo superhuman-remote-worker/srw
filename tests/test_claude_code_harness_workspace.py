@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -394,3 +395,37 @@ async def test_write_stream_stops_feeding_once_the_remote_has_exited(workspace):
 
     with pytest.raises(WorkspaceError, match="not a regular file"):
         await asyncio.wait_for(workspace.write_stream("pipe", slow()), 10)
+
+
+@pytest.mark.asyncio
+async def test_connect_accepts_the_matching_fingerprint(sshd):
+    access = replace(
+        sshd.access, known_hosts_file=None, host_key_fingerprint=sshd.fingerprint
+    )
+    ws = await Workspace.connect(access)
+    await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_refuses_a_wrong_fingerprint(sshd):
+    access = replace(
+        sshd.access, known_hosts_file=None, host_key_fingerprint="SHA256:" + "A" * 43
+    )
+    with pytest.raises(WorkspaceError, match="host key mismatch"):
+        await Workspace.connect(access)
+
+
+@pytest.mark.asyncio
+async def test_connect_refuses_a_malformed_fingerprint(sshd):
+    access = replace(
+        sshd.access, known_hosts_file=None, host_key_fingerprint="SHA256:short"
+    )
+    with pytest.raises(WorkspaceError, match="malformed"):
+        await Workspace.connect(access)
+
+
+@pytest.mark.asyncio
+async def test_connect_refuses_without_any_host_key_material(sshd):
+    access = replace(sshd.access, known_hosts_file=None, host_key_fingerprint=None)
+    with pytest.raises(WorkspaceError, match="no host key"):
+        await Workspace.connect(access)

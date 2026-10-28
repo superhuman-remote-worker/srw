@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import math
 import posixpath
 import re
@@ -336,6 +337,9 @@ def _count(stdout: bytes) -> int:
         raise WorkspaceError("unexpected output from the workspace") from None
 
 
+_FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+
+
 class Workspace:
     def __init__(self, connection: asyncssh.SSHClientConnection, root: str):
         self._connection = connection
@@ -361,6 +365,15 @@ class Workspace:
         root = posixpath.normpath(access.root)
         if not posixpath.isabs(root):
             raise WorkspaceError("workspace root must be an absolute path")
+        # SRW's agent pins an attested workspace by an exact OpenSSH SHA256
+        # fingerprint (RemoteBackend): a malformed one is refused, and a
+        # Kubernetes worker without one is refused before connecting.
+        expected = access.host_key_fingerprint
+        if access.known_hosts_file is None:
+            if not expected:
+                raise WorkspaceError("no host key to verify the workspace against")
+            if not _FINGERPRINT.fullmatch(expected):
+                raise WorkspaceError("workspace host key fingerprint is malformed")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + deadline_seconds
         wait = CONNECT_RETRY_INITIAL_SECONDS
@@ -393,6 +406,12 @@ class Workspace:
                 continue
             except asyncssh.Error as exc:
                 raise WorkspaceError(f"cannot connect to the workspace: {exc}") from exc
+            if access.known_hosts_file is None:
+                observed = connection.get_server_host_key().get_fingerprint()
+                if not hmac.compare_digest(observed, expected):
+                    connection.close()
+                    await connection.wait_closed()
+                    raise WorkspaceError("workspace host key mismatch")
             return cls(connection, root)
 
     async def close(self) -> None:
