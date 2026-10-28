@@ -30,6 +30,7 @@ from orchestrator.application import (
     connectors as connectors_composition,
     http,
     lifecycle,
+    projects as projects_composition,
     routes,
 )
 from orchestrator.application.resources import ApplicationResources
@@ -303,12 +304,15 @@ def create_app(*, settings: DeploymentSettings | None = None) -> FastAPI:
 
     # The JIT/approval paths in ``security.auth`` run as detached tasks with no
     # request scope, so they take the optional provisioning backends through
-    # two named callables (R1.B02). Process-wide: the most recently built
+    # named callables (R1.B02). Process-wide: the most recently built
     # application's collaborators answer. Resolved per call, so a later rebind
     # of the cloud router is visible.
     set_provisioning_backends(
         cloud_router=lambda: resources.main_cloud_router,
         forge=lambda: resources.gitea_client,
+        default_project_vault=lambda user: (
+            projects_composition.schedule_default_project_knowledge(resources, user)
+        ),
     )
 
     app = FastAPI(

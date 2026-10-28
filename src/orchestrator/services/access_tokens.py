@@ -18,8 +18,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
 import secrets
 from dataclasses import dataclass
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -32,6 +34,8 @@ from orchestrator.schemas.tokens import (
     McpTokenVerifyRequest,
     VALID_PAT_SCOPES,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AccessTokenStore(Protocol):
@@ -93,6 +97,10 @@ class AccessTokenStore(Protocol):
 @dataclass(frozen=True)
 class AccessTokenDependencies:
     store: AccessTokenStore
+    #: Schedules the knowledge vault of an approved user's default project, in
+    #: the background (``default_project_knowledge``); unset, nothing is
+    #: scheduled. Returns at once; a failure is logged, never raised.
+    schedule_default_project_knowledge: Callable[[Mapping[str, Any]], Any] | None = None
 
 
 def serialize_token_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -221,6 +229,21 @@ async def create_internal_mcp_token(
             if body.user_email
             else "OAuth User",
         )
+        # A new row is pending, but one linked by email to an approved account
+        # arrives approved: its default project needs its vault like any other
+        # admission (the later cockpit login finds the row by sub and never
+        # takes the first-login branch).
+        schedule = dependencies.schedule_default_project_knowledge
+        if user and user.get("is_approved") and schedule is not None:
+            try:
+                schedule(user)
+            except Exception as exc:
+                # Best-effort: never fails the token; the backfill retries.
+                logger.warning(
+                    "Knowledge vault for user %s's default project not scheduled: %s",
+                    user.get("id"),
+                    exc,
+                )
     if not user:
         raise HTTPException(status_code=400, detail="Could not resolve user")
 

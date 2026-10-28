@@ -286,6 +286,7 @@ _OWNER_SINGLETONS = (
     # pointing at it.
     ("orchestrator.security.auth", "_cloud_router_provider"),
     ("orchestrator.security.auth", "_forge_provider"),
+    ("orchestrator.security.auth", "_default_project_vault_provider"),
     ("orchestrator.routers.vm_workspace_cleanup_authority", "_store_factory"),
     ("orchestrator.routers.vm_creation_retry_authority", "_store_factory"),
     ("orchestrator.routers.vm_resource_inventory", "_configuration"),

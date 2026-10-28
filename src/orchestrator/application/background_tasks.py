@@ -38,6 +38,7 @@ from orchestrator.services import (
     connector_service_hosting,
     container_provisioner as container_provisioner_module,
     cron_dispatcher,
+    default_project_knowledge,
     ide_session,
     ide_settings,
     imap_poller as imap_poller_module,
@@ -146,6 +147,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "project_loop_sweeper",
     "stale_verification_sweeper",
     "session_wake_sweeper",
+    "default_project_knowledge_backfill",
     "kb_reindex_sweeper",
     "pricing_sync",
     "cloud_pricing_sync",
@@ -876,6 +878,20 @@ async def start_background_tasks(
         "session_wake_sweeper",
         session_wake.session_wake_sweeper_loop(
             resources.postgres_db, resources.shutdown_event
+        ),
+    )
+
+    # Every approved user's default project has its knowledge vault (a bare
+    # kb_write lands there): one pass per leadership tenure once the forge
+    # answers, then the loop parks. Leader-gated so only one replica creates.
+    # Before the KB sweep, which indexes whatever vaults this pass creates.
+    tasks.start_leader_gated(
+        "default_project_knowledge_backfill",
+        lambda stop: default_project_knowledge.default_project_knowledge_backfill_loop(
+            stop,
+            dependencies=projects_composition.project_provisioning_dependencies(
+                resources
+            ),
         ),
     )
 
