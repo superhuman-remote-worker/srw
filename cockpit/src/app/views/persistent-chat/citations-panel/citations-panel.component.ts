@@ -1,6 +1,23 @@
-import {ChangeDetectionStrategy, Component, computed, inject, output, signal} from '@angular/core';
+import {
+    ChangeDetectionStrategy,
+    Component,
+    DOCUMENT,
+    computed,
+    effect,
+    inject,
+    output,
+    signal,
+    untracked,
+} from '@angular/core';
 import {TranslocoPipe} from '@jsverse/transloco';
 
+import {openCitationSnapshot, snapshotViewType} from '../../../core/markdown/citation-snapshot';
+import {
+    CitationState,
+    citationReasonLabel,
+    citationState,
+    citationStateLabel,
+} from '../../../core/markdown/citation-status';
 import {
     CitationDrift,
     PersistentChatService,
@@ -14,49 +31,22 @@ interface CitationRow extends ThreadCitation {
     index: number;
     /** Source is reachable by URL → render the name as a link. */
     isWebLink: boolean;
+    state: CitationState;
+    /** i18n key of the reason a citation is not verified, or null. */
+    reasonKey: string | null;
 }
+
+// Kept for the spec and callers that imported it from here.
+export {snapshotViewType};
 
 /** Per-citation drift state: undefined = not checked, 'loading' = in flight. */
 type DriftState = CitationDrift | 'loading' | undefined;
 
-/** Snapshot types that render without script when opened in a tab. */
-const SNAPSHOT_VIEW_TYPES: ReadonlySet<string> = new Set([
-    'application/pdf',
-    'image/png',
-    'image/jpeg',
-    'image/gif',
-    'image/webp',
-]);
-
-/**
- * The type a cited snapshot may be opened as, or null when it must be
- * downloaded instead.
- *
- * A `blob:` URL inherits the Cockpit origin, so a stored `text/html` or
- * `image/svg+xml` snapshot opened under its own type would run its script with
- * the reader's session. Only the allowlisted types open as themselves; every
- * `text/*` type, HTML included, opens as plain text so it shows as source.
- * SVG and everything else is not on the list.
- */
-export function snapshotViewType(type: string): string | null {
-    const [essence, ...params] = type.split(';');
-    const mime = essence.trim().toLowerCase();
-    if (SNAPSHOT_VIEW_TYPES.has(mime)) {
-        return mime;
-    }
-    if (mime.startsWith('text/')) {
-        const charset = params
-            .map((p) => p.trim().match(/^charset=([A-Za-z0-9_.:-]+)$/i)?.[1])
-            .find((c) => !!c);
-        return `text/plain;charset=${charset ?? 'utf-8'}`;
-    }
-    return null;
-}
-
 /**
  * Session citations panel (Phase 4 Half-B v2). Lists the engine-backed citations
- * for the open session — the same `citationsByCid` the inline `[N]` markers
- * resolve against — with verification status, and for cloud-document citations a
+ * for the open session — the same `citationsByCid` the inline chips resolve
+ * against — with their state and, when not verified, the reason; withdrawn
+ * ones stay listed, struck through (D7). For cloud-document citations a
  * "view original" link (streams the cite-time snapshot) and an on-demand drift
  * check. Both reuse the by-citation Phase-3 endpoints, which now authorize
  * session citations by thread ownership.
@@ -81,7 +71,7 @@ export function snapshotViewType(type: string): string | null {
       } @else {
         <ul class="cp-list">
           @for (c of rows(); track c.id) {
-            <li class="cp-item">
+            <li class="cp-item" [class.cp-item--focus]="focusedId() === c.id" [attr.data-cid]="c.id">
               <div class="cp-item-head">
                 <span class="cp-index">{{ c.index }}</span>
                 @if (c.isWebLink) {
@@ -89,12 +79,24 @@ export function snapshotViewType(type: string): string | null {
                 } @else {
                   <span class="cp-source">{{ c.source_name }}</span>
                 }
-                <app-badge [tone]="statusTone(c.verification_status)" size="xs">
-                  {{ statusLabel(c.verification_status) | transloco }}
+                <app-badge [tone]="stateTone(c.state)" size="xs">
+                  {{ stateLabel(c.state) | transloco }}
                 </app-badge>
               </div>
 
-              <div class="cp-claim">{{ c.claim }}</div>
+              <div class="cp-claim" [class.cp-claim--withdrawn]="c.state === 'withdrawn'">{{ c.claim }}</div>
+              @if (c.state === 'withdrawn' && c.withdrawn_reason) {
+                <div class="cp-reason">{{ c.withdrawn_reason }}</div>
+              } @else if (c.reasonKey || ((c.state === 'failed' || c.state === 'unchecked') && c.verification_notes)) {
+                <div class="cp-reason">
+                  @if (c.reasonKey) {
+                    <strong>{{ c.reasonKey | transloco }}</strong>
+                  }
+                  @if (c.verification_notes) {
+                    <span>{{ c.reasonKey ? ' — ' : '' }}{{ c.verification_notes }}</span>
+                  }
+                </div>
+              }
 
               @if (c.has_cloud_anchor || c.has_snapshot) {
                 <div class="cp-cloud">
@@ -171,6 +173,15 @@ export function snapshotViewType(type: string): string | null {
     .cp-claim {
       margin-top: 0.25rem; font-size: 0.8rem; opacity: 0.82; line-height: 1.35;
     }
+    .cp-claim--withdrawn { text-decoration: line-through; }
+    .cp-reason {
+      margin-top: 0.2rem; font-size: 0.75rem; line-height: 1.35;
+      color: var(--text-secondary);
+    }
+    .cp-item--focus {
+      background: color-mix(in srgb, var(--accent-color) 10%, transparent);
+      border-radius: var(--radius-tag);
+    }
     .cp-cloud {
       margin-top: 0.4rem; display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
     }
@@ -186,6 +197,25 @@ export function snapshotViewType(type: string): string | null {
 })
 export class CitationsPanelComponent {
     private readonly chat = inject(PersistentChatService);
+    private readonly doc = inject(DOCUMENT);
+
+    /** The citation a chip's "show in citations list" asked for. */
+    readonly focusedId = this.chat.citationFocus.asReadonly();
+
+    constructor() {
+        // Scroll the focused citation into view once its row has rendered.
+        effect(() => {
+            const cid = this.focusedId();
+            this.rows();
+            if (cid === null) return;
+            untracked(() =>
+                queueMicrotask(() => {
+                    const row = this.doc.querySelector(`.cp-item[data-cid="${cid}"]`);
+                    row?.scrollIntoView?.({block: 'nearest'});
+                }),
+            );
+        });
+    }
 
     /** Emitted when the user closes the panel. */
     readonly close = output<void>();
@@ -198,6 +228,8 @@ export class CitationsPanelComponent {
             ...c,
             index: i + 1,
             isWebLink: !!c.source_identifier && /^https?:\/\//i.test(c.source_identifier),
+            state: citationState(c),
+            reasonKey: citationReasonLabel(c.verification_reason),
         }));
     });
 
@@ -218,59 +250,22 @@ export class CitationsPanelComponent {
     }
 
     async viewOriginal(cid: number): Promise<void> {
-        const blob = await this.chat.fetchCitationSnapshotBlob(cid);
-        if (!blob) {
-            return;
-        }
-        // Never open the blob under the type the server stored: see
-        // snapshotViewType. A type that cannot be opened safely is downloaded,
-        // re-wrapped as octet-stream so it cannot render even if navigated to.
-        const viewType = snapshotViewType(blob.type);
-        const url = URL.createObjectURL(
-            new Blob([blob], {type: viewType ?? 'application/octet-stream'}),
-        );
-        if (viewType) {
-            window.open(url, '_blank');
-        } else {
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = this.snapshotFilename(cid);
-            a.click();
-        }
-        // Let the new tab or the download read it, then release the object URL.
-        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        await openCitationSnapshot(this.chat, cid);
     }
 
-    /** Download name for a snapshot: the cited source's base name. */
-    private snapshotFilename(cid: number): string {
-        const name = this.chat.citationsByCid().get(cid)?.source_name ?? '';
-        return name.split('/').pop()?.trim() || `citation-${cid}`;
-    }
-
-    statusTone(status: string): BadgeTone {
-        switch (status) {
+    stateTone(state: CitationState): BadgeTone {
+        switch (state) {
             case 'verified':
                 return 'success';
             case 'failed':
-                return 'danger';
-            case 'pending':
                 return 'warning';
             default:
                 return 'neutral';
         }
     }
 
-    statusLabel(status: string): string {
-        switch (status) {
-            case 'verified':
-                return 'chat.citations.statusVerified';
-            case 'pending':
-                return 'chat.citations.statusPending';
-            case 'failed':
-                return 'chat.citations.statusFailed';
-            default:
-                return 'chat.citations.statusUnknown';
-        }
+    stateLabel(state: CitationState): string {
+        return citationStateLabel(state);
     }
 
     driftTone(state: CitationDrift['live_state']): BadgeTone {

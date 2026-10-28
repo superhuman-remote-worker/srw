@@ -710,8 +710,11 @@ interface SessionStateSnapshot extends Record<string, unknown> {
  *
  * All state is exposed as Angular signals for reactive UI updates.
  */
-/** A citation created during a persistent session (engine-backed). The marker
- *  the agent emits inline — `[<id>]` — is `id`; the chat resolves it to this. */
+/** A citation created during a persistent session (engine-backed). The handle
+ *  the agent writes inline — `[^c<id>]`, or `[<id>]` in sessions from before
+ *  2026-10-28 — names `id`; the chat resolves it to this. Same shape from
+ *  `GET /threads/{id}/citations` and the live `citation.*` frames
+ *  (`CitationEngine.wire_row`). */
 export interface ThreadCitation {
   id: number;
   claim: string;
@@ -719,9 +722,22 @@ export interface ThreadCitation {
   source_name: string;
   source_type: string;
   source_identifier: string | null;
+  /** pending | verified | failed (shown "Unverified") | unverified (shown "Not checked"). */
   verification_status: string;
   confidence: string;
   created_at: string;
+  /** The quoted evidence (verbatim quote, else the agent's context text). */
+  quote?: string | null;
+  locator?: Record<string, unknown> | null;
+  extraction_method?: string | null;
+  /** quote_not_found | not_supported | source_unavailable | not_checked. */
+  verification_reason?: string | null;
+  verification_notes?: string | null;
+  /** The passage the check found in the source. */
+  matched_text?: string | null;
+  /** Set when the agent withdrew the citation; the record stays. */
+  withdrawn_at?: string | null;
+  withdrawn_reason?: string | null;
   /** Cloud-document citation (cite_document w/ snapshot-anchor): can drift-check. */
   has_cloud_anchor?: boolean;
   /** A backed-up original copy exists → "view original" can stream it. */
@@ -1114,10 +1130,14 @@ export class PersistentChatService {
     if (!u || u.threadId == null) return null;
     return u.threadId === this.threadId() ? u : null;
   });
-  /** Engine citations for this session, keyed by citation id (the agent emits
-   *  the id as the inline `[N]` marker). Drives inline resolution +
-   *  source popover (see CitationRefDirective). Loaded on connect + per turn. */
+  /** Engine citations for this session, keyed by citation id (the agent writes
+   *  a handle inline; the chat numbers each answer's chips and resolves them
+   *  to a row for the popover, see CitationRefDirective). Loaded on connect and
+   *  at each turn's end, and upserted live from `citation.*` frames, which
+   *  arrive before the agent can write the handle. */
   readonly citationsByCid = signal<Map<number, ThreadCitation>>(new Map());
+  /** A citation the popover asked the citations panel to show. */
+  readonly citationFocus = signal<number | null>(null);
   readonly citationsLoaded = signal(false);
 
   /**
@@ -2531,6 +2551,7 @@ export class PersistentChatService {
       this.runningTools.set([]);
       this.citationsByCid.set(new Map());
       this.citationsLoaded.set(false);
+      this.citationFocus.set(null);
       if (!preserveReviewPlane) {
         this._protectedCloud.set(false);
         this.cloudFolderProblems.set([]);
@@ -2859,22 +2880,38 @@ export class PersistentChatService {
    */
   /**
    * Fetch the engine citations for this session (job_id == thread_id) and
-   * index them by citation id for inline [N] resolution. Best-effort — a
-   * failure just leaves markers unresolved (restored to literal text).
+   * index them by citation id for inline handle resolution. Reads every page:
+   * a session's citations are not capped at the endpoint's page size. Rows a
+   * live frame upserted while the fetch ran are kept. Best-effort — a failure
+   * just leaves handles unresolved.
    */
   private async loadCitations(threadId: string): Promise<void> {
+    const pageSize = 500;
     try {
-      const resp = await firstValueFrom(
-        this.http.get<{ citations: ThreadCitation[] }>(
-          `${environment.apiUrl}/persistent/threads/${threadId}/citations`,
-        ),
-      );
       const map = new Map<number, ThreadCitation>();
-      for (const c of resp?.citations ?? []) {
-        map.set(c.id, c);
+      for (let offset = 0; ; offset += pageSize) {
+        const resp = await firstValueFrom(
+          this.http.get<{ citations: ThreadCitation[]; total?: number }>(
+            `${environment.apiUrl}/persistent/threads/${threadId}/citations`,
+            { params: { limit: pageSize, offset } },
+          ),
+        );
+        const page = resp?.citations ?? [];
+        for (const c of page) {
+          map.set(c.id, c);
+        }
+        const total = typeof resp?.total === 'number' ? resp.total : 0;
+        if (page.length < pageSize || offset + page.length >= total) break;
+        if (this.threadId() !== threadId) return;
       }
       if (this.threadId() === threadId) {
-        this.citationsByCid.set(map);
+        this.citationsByCid.update((live) => {
+          // A frame can land between the fetch and here; it is newer.
+          for (const [cid, c] of live) {
+            if (!map.has(cid)) map.set(cid, c);
+          }
+          return map;
+        });
         this.citationsLoaded.set(true);
       }
     } catch {
@@ -2884,6 +2921,20 @@ export class PersistentChatService {
         this.citationsLoaded.set(true);
       }
     }
+  }
+
+  /** Upsert one live citation row; false when `raw` is not a row. */
+  private _upsertCitation(raw: unknown): boolean {
+    if (!raw || typeof raw !== 'object') return false;
+    const row = raw as ThreadCitation;
+    const cid = Number(row.id);
+    if (!Number.isSafeInteger(cid) || cid <= 0) return false;
+    this.citationsByCid.update((m) => {
+      const next = new Map(m);
+      next.set(cid, { ...m.get(cid), ...row, id: cid });
+      return next;
+    });
+    return true;
   }
 
   /**
@@ -8001,12 +8052,20 @@ export class PersistentChatService {
         break;
       }
 
+      case 'citation.created':
+      case 'citation.updated': {
+        // A cite tool wrote a row (before it returned, so before the agent
+        // can write the handle), or an edit/withdrawal changed one. Upsert it
+        // so the chip resolves while the text streams.
+        this._upsertCitation(params['citation']);
+        break;
+      }
+
       case 'citation.verdict': {
-        // The aux verifier flipped a citation pending→verified/failed.
-        // Patch it in place so the citations panel + inline [N] popover
-        // update live, instead of waiting for the next per-turn
-        // loadCitations(). No-op if the citation isn't loaded yet — the
-        // turn-boundary refresh will pick up its already-final status.
+        // A check landed. Newer agents send the whole row; older ones only
+        // the status, which patches a citation already loaded (the
+        // turn-boundary refresh picks up the rest).
+        if (this._upsertCitation(params['citation'])) break;
         const cid = Number(params['citation_id']);
         const status =
           typeof params['verification_status'] === 'string'

@@ -27,6 +27,7 @@ describe('CitationsPanelComponent', () => {
     let citationsByCid: ReturnType<typeof signal<Map<number, ThreadCitation>>>;
     let mockChat: {
         citationsByCid: typeof citationsByCid;
+        citationFocus: ReturnType<typeof signal<number | null>>;
         fetchCitationDrift: ReturnType<typeof vi.fn>;
         fetchCitationSnapshotBlob: ReturnType<typeof vi.fn>;
     };
@@ -35,6 +36,7 @@ describe('CitationsPanelComponent', () => {
         citationsByCid = signal(new Map<number, ThreadCitation>());
         mockChat = {
             citationsByCid,
+            citationFocus: signal<number | null>(null),
             fetchCitationDrift: vi.fn(),
             fetchCitationSnapshotBlob: vi.fn(),
         };
@@ -82,14 +84,30 @@ describe('CitationsPanelComponent', () => {
         expect(rows.find((r) => r.id === 3)!.isWebLink).toBe(false);
     });
 
-    it('maps verification status to badge tones + labels', () => {
+    it('maps citation states to badge tones + labels; pending never looks verified', () => {
         const c = make();
-        expect(c.statusTone('verified')).toBe('success');
-        expect(c.statusTone('failed')).toBe('danger');
-        expect(c.statusTone('pending')).toBe('warning');
-        expect(c.statusTone('weird')).toBe('neutral');
-        expect(c.statusLabel('verified')).toBe('chat.citations.statusVerified');
-        expect(c.statusLabel('failed')).toBe('chat.citations.statusFailed');
+        expect(c.stateTone('verified')).toBe('success');
+        expect(c.stateTone('failed')).toBe('warning');
+        expect(c.stateTone('pending')).toBe('neutral');
+        expect(c.stateTone('unchecked')).toBe('neutral');
+        expect(c.stateLabel('failed')).toBe('chat.citations.state.failed');
+        expect(c.stateLabel('unchecked')).toBe('chat.citations.state.unchecked');
+    });
+
+    it('derives state and reason per row; withdrawn wins and stays listed', () => {
+        citationsByCid.set(
+            new Map([
+                [1, citation({id: 1, verification_status: 'failed', verification_reason: 'quote_not_found'})],
+                [2, citation({id: 2, verification_status: 'unverified', verification_reason: 'not_checked'})],
+                [3, citation({id: 3, verification_status: 'failed', withdrawn_at: '2026-10-28T00:00:00Z'})],
+                [4, citation({id: 4, verification_status: 'pending'})],
+            ]),
+        );
+        const rows = make().rows();
+        expect(rows.map((r) => r.state)).toEqual(['failed', 'unchecked', 'withdrawn', 'pending']);
+        expect(rows[0].reasonKey).toBe('chat.citations.reason.quote_not_found');
+        expect(rows[1].reasonKey).toBe('chat.citations.reason.not_checked');
+        expect(rows[3].reasonKey).toBeNull();
     });
 
     it('maps drift state to badge tones + labels', () => {

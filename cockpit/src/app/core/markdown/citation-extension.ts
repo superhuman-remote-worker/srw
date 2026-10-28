@@ -1,26 +1,28 @@
 import {MarkedExtension} from 'marked';
 
 /**
- * Marked extension that turns the agent's inline citation markers into
- * superscript reference elements the chat component resolves into a source
- * popover.
+ * Marked extension that marks the agent's citation handles for
+ * `CitationRefDirective`, which turns them into numbered chips with a popover.
  *
- * The citation tools (`cite_web` / `cite_document`) return `[<id>]` and the
- * agent is instructed to place that marker on the claim it supports, so the
- * marker IS the citation id:
+ * The cite tools return a handle, `[^c<id>]` (Markdown footnote form), and the
+ * agent writes it right after the claim; `<id>` is the citation record's id,
+ * not a display number. Sessions from before 2026-10-28 carry the bare id,
+ * `[<id>]` (owner ruling D5), so that form is marked too, as `legacy`:
  *
- *   [21]  ->  <sup class="citation-ref" data-cid="21">21</sup>
+ *   [^c21]  ->  <span class="citation-ref cid-21 handle" data-cid="21">[^c21]</span>
+ *   [21]    ->  <span class="citation-ref cid-21 legacy" data-cid="21">[21]</span>
  *
- * This stage is stateless — it only marks candidates. The chat component then
- * post-processes each `.citation-ref` against the citations it fetched for the
- * thread (keyed by `data-cid`): real ids get renumbered 1..k in order of
- * appearance, made clickable, and given a source popover; ids with no matching
- * citation are restored to their literal `[N]` text, so a stray `[5]` in normal
- * prose is never hijacked.
+ * This stage is stateless. Its output keeps the literal text, so wherever the
+ * directive does not run (the inbox, a KB note) the reader sees the handle as
+ * plain text rather than an empty superscript. The directive numbers resolved
+ * handles per answer; an unresolved new-form handle is flagged, and an
+ * unresolved legacy `[N]` stays plain text, since a stray `[5]` in prose is
+ * not a citation.
  *
- * A `[N]` immediately followed by `(`, `[`, or `:` is left untouched so real
- * markdown links and reference definitions (`[1](url)`, `[1][ref]`, `[1]: url`)
- * still parse normally.
+ * `[c21]` (the caret dropped, as models sometimes write it) counts as a
+ * handle. A marker immediately followed by `(`, `[` or `:` is left alone, so
+ * Markdown links and definitions (`[1](url)`, `[1][ref]`, `[^c1]: …`) still
+ * parse as before.
  */
 export function citationExtension(): MarkedExtension {
     return {
@@ -33,7 +35,7 @@ export function citationExtension(): MarkedExtension {
                     return i < 0 ? undefined : i;
                 },
                 tokenizer(src: string) {
-                    const match = src.match(/^\[(\d+)\]/);
+                    const match = src.match(/^\[(\^?c)?(\d+)\]/);
                     if (!match) {
                         return undefined;
                     }
@@ -45,15 +47,18 @@ export function citationExtension(): MarkedExtension {
                     return {
                         type: 'citationRef',
                         raw: match[0],
-                        cid: match[1],
+                        cid: match[2],
+                        legacy: !match[1],
                     };
                 },
                 renderer(token: any) {
                     // The id rides a class (`cid-N`) as well as data-cid: class
                     // survives the markdown HTML sanitizer for sure, so the
-                    // component can always recover the id even after it renumbers
-                    // the visible text.
-                    return `<sup class="citation-ref cid-${token.cid}" data-cid="${token.cid}">${token.cid}</sup>`;
+                    // directive can always recover the id after it replaces
+                    // the visible text. The raw text is digits and brackets
+                    // only, so it needs no escaping.
+                    const kind = token.legacy ? 'legacy' : 'handle';
+                    return `<span class="citation-ref cid-${token.cid} ${kind}" data-cid="${token.cid}">${token.raw}</span>`;
                 },
             },
         ],

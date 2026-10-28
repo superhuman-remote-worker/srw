@@ -2014,10 +2014,32 @@
       "driftChanged": "Source changed since cited",
       "driftUnreachable": "Live source not reachable",
       "driftUnknown": "Drift unknown",
-      "statusVerified": "Verified",
-      "statusPending": "Verifying…",
-      "statusFailed": "Unverified",
-      "statusUnknown": "Unknown"
+      "state": {
+        "pending": "Being checked",
+        "verified": "Verified",
+        "failed": "Unverified",
+        "unchecked": "Not checked",
+        "withdrawn": "Withdrawn"
+      },
+      "reason": {
+        "quote_not_found": "The quoted words are not in the source",
+        "not_supported": "The passage does not support the claim",
+        "source_unavailable": "The source could not be found to check against",
+        "not_checked": "No check ran"
+      },
+      "popover": {
+        "label": "Citation {{n}}",
+        "unknownSource": "Unnamed source",
+        "pendingNote": "The source is still being checked.",
+        "withdrawn": "The agent withdrew this citation: {{reason}}",
+        "noReason": "no reason given",
+        "claim": "Claim",
+        "passage": "Passage",
+        "openSource": "Open source",
+        "showInList": "Show in citations list"
+      },
+      "chipLabel": "Citation {{n}}: {{source}}, {{state}}",
+      "notFound": "Citation {{handle}} is not in this session"
     },
     "status": {
       "agentQuiet": "Working — no output for {{seconds}}s",

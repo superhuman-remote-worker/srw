@@ -2014,10 +2014,32 @@
       "driftChanged": "Quelle seit Zitat geändert",
       "driftUnreachable": "Live-Quelle nicht erreichbar",
       "driftUnknown": "Änderung unbekannt",
-      "statusVerified": "Verifiziert",
-      "statusPending": "Wird verifiziert…",
-      "statusFailed": "Nicht verifiziert",
-      "statusUnknown": "Unbekannt"
+      "state": {
+        "pending": "Wird geprüft",
+        "verified": "Verifiziert",
+        "failed": "Nicht verifiziert",
+        "unchecked": "Nicht geprüft",
+        "withdrawn": "Zurückgezogen"
+      },
+      "reason": {
+        "quote_not_found": "Die zitierten Worte stehen nicht in der Quelle",
+        "not_supported": "Die Passage stützt die Aussage nicht",
+        "source_unavailable": "Die Quelle war zum Prüfen nicht auffindbar",
+        "not_checked": "Es lief keine Prüfung"
+      },
+      "popover": {
+        "label": "Quelle {{n}}",
+        "unknownSource": "Unbenannte Quelle",
+        "pendingNote": "Die Quelle wird noch geprüft.",
+        "withdrawn": "Der Agent hat diese Quelle zurückgezogen: {{reason}}",
+        "noReason": "ohne Begründung",
+        "claim": "Aussage",
+        "passage": "Passage",
+        "openSource": "Quelle öffnen",
+        "showInList": "In der Quellenliste zeigen"
+      },
+      "chipLabel": "Quelle {{n}}: {{source}}, {{state}}",
+      "notFound": "Die Quelle {{handle}} gehört nicht zu dieser Sitzung"
     },
     "status": {
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",

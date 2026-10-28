@@ -25,6 +25,11 @@ import {Router} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
+import {
+    citationScopeFor,
+    citationScopeForText,
+    holdBackPartialHandle,
+} from '../../core/markdown/citation-scope';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {PERMISSION_MODE_LABEL_KEYS} from '../../core/models/permission-mode';
@@ -1316,7 +1321,7 @@ export function clearDraft(threadId: string | null): void {
       <!-- Citations panel (Half-B v2): session citations + view-original/drift -->
       @if (showCitations()) {
         <div class="settings-panel citations-panel-wrap">
-          <app-citations-panel (close)="showCitations.set(false)" />
+          <app-citations-panel (close)="showCitations.set(false); chat.citationFocus.set(null)" />
         </div>
       }
 
@@ -1412,17 +1417,18 @@ export function clearDraft(threadId: string | null): void {
         formatting, status icons, decision badges, etc. should only happen
         here.
       -->
-      <ng-template #toolDetails let-tools>
+      <ng-template #toolDetails let-tools let-turn="turn">
         <div class="tool-detail-list">
           @for (tc of tools; track tc.id) {
             <app-tool-card [view]="toolView(tc)" (actionRequested)="canvasRequested.emit()"
+                           [citationScope]="turn ? citationScopeFor(turn) : null"
                            (jobDiffRequested)="openJobDiff($event)" />
           }
         </div>
       </ng-template>
 
       <!-- Per-event card templates (referenced by the turn loop below). -->
-      <ng-template #thoughtCard let-event>
+      <ng-template #thoughtCard let-event let-turn="turn">
         <details class="thinking-block event-thought" [attr.open]="chatPrefs.reasoningExpanded() ? '' : null">
           <summary class="thinking-header">
             <app-icon size="sm" class="thinking-icon">psychology</app-icon>
@@ -1431,7 +1437,9 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </summary>
           <div class="thinking-content" [class.streaming-block]="event.status === 'streaming'">
-            <markdown appCitationRef appKatex appWorkspaceFileLink [data]="event.content"
+            <markdown appCitationRef appKatex appWorkspaceFileLink
+                      [data]="holdBackPartialHandle(event.content, event.status === 'streaming')"
+                      [citationScope]="turn ? citationScopeFor(turn) : null"
                       [katexDefer]="event.status === 'streaming'"
                       (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
           </div>
@@ -1541,7 +1549,8 @@ export function clearDraft(threadId: string | null): void {
                        class (its base styles are benign; the bubble styling is gated on
                        .message-user/.message-assistant, which this isn't). -->
                   <div class="compaction-summary-body message-body">
-                    <markdown appKatex appWorkspaceFileLink [data]="turn.summary"
+                    <markdown appCitationRef appKatex appWorkspaceFileLink [data]="turn.summary"
+                              [citationScope]="citationScopeForText(turn.summary)"
                               (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                   </div>
                 </details>
@@ -1720,7 +1729,7 @@ export function clearDraft(threadId: string | null): void {
                          the closing prose. -->
                     @for (nc of collapsedNotifyCalls(turn); track nc.id) {
                       <div class="event-tool">
-                        <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [nc] }"></ng-container>
+                        <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [nc], turn: turn }"></ng-container>
                       </div>
                     }
                     @let answer = finalAnswer(turn);
@@ -1730,7 +1739,9 @@ export function clearDraft(threadId: string | null): void {
                            renders growing text too — gate its DOM post-processing
                            + KaTeX off the turn's streaming status. -->
                       <div class="event-text turn-final-answer" [class.streaming-block]="streaming">
-                        <markdown appCitationRef appKatex appWorkspaceFileLink [data]="answer" [katexDefer]="streaming"
+                        <markdown appCitationRef appKatex appWorkspaceFileLink
+                                  [data]="holdBackPartialHandle(answer, streaming)" [katexDefer]="streaming"
+                                  [citationScope]="citationScopeFor(turn)"
                                   (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                       </div>
                     } @else {
@@ -1759,9 +1770,9 @@ export function clearDraft(threadId: string | null): void {
                             <div class="tool-group-body">
                               @for (event of group.events; track event.id) {
                                 @if (event.kind === 'tool_call') {
-                                  <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                                  <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event], turn: turn }"></ng-container>
                                 } @else if (chat.narrationMode() !== 'silent') {
-                                  <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                                  <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event, turn: turn }"></ng-container>
                                 }
                               }
                             </div>
@@ -1771,10 +1782,10 @@ export function clearDraft(threadId: string | null): void {
                           @for (event of group.events; track event.id) {
                             @if (event.kind === 'tool_call') {
                               <div class="event-tool">
-                                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event], turn: turn }"></ng-container>
                               </div>
                             } @else if (chat.narrationMode() !== 'silent') {
-                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event, turn: turn }"></ng-container>
                             }
                           }
                         }
@@ -1801,17 +1812,19 @@ export function clearDraft(threadId: string | null): void {
                           @case ('tool_call') {
                             <!-- Pinned: in flight, or the turn's latest call. -->
                             <div class="event-tool">
-                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [group.event] }"></ng-container>
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [group.event], turn: turn }"></ng-container>
                             </div>
                           }
                           @case ('thought') {
                             @if (chat.narrationMode() !== 'silent') {
-                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event }"></ng-container>
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event, turn: turn }"></ng-container>
                             }
                           }
                           @case ('text') {
                             <div class="event-text" [class.streaming-block]="group.event.status === 'streaming'">
-                              <markdown appCitationRef appKatex appWorkspaceFileLink [data]="group.event.content"
+                              <markdown appCitationRef appKatex appWorkspaceFileLink
+                                        [data]="holdBackPartialHandle(group.event.content, group.event.status === 'streaming')"
+                                        [citationScope]="citationScopeFor(turn)"
                                         [katexDefer]="group.event.status === 'streaming'"
                                         (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                             </div>
@@ -1829,7 +1842,8 @@ export function clearDraft(threadId: string | null): void {
                               <details class="compaction-summary">
                                 <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
                                 <div class="compaction-summary-body message-body">
-                                  <markdown appKatex appWorkspaceFileLink [data]="group.event.summary"
+                                  <markdown appCitationRef appKatex appWorkspaceFileLink [data]="group.event.summary"
+                                            [citationScope]="citationScopeForText(group.event.summary)"
                                             (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                                 </div>
                               </details>
@@ -2797,6 +2811,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Settings panel
     readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
+    /** Citation chips: numbering per answer, and no half-written handle while streaming. */
+    protected readonly citationScopeFor = citationScopeFor;
+    protected readonly citationScopeForText = citationScopeForText;
+    protected readonly holdBackPartialHandle = holdBackPartialHandle;
     readonly showSshPanel = signal(false);
 
     /** Disconnect is a ~5s round trip (DELETE + agent/workspace teardown). The
@@ -3075,6 +3093,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private isRestoringScroll = false;
 
     constructor() {
+        // A chip popover's "show in citations list" opens the panel on it.
+        effect(() => {
+            if (this.chat.citationFocus() !== null) this.showCitations.set(true);
+        });
+
         // Start/stop IDE polling when connection state changes
         effect(() => {
             const connected = this.chat.isConnected();

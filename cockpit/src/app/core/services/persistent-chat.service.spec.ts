@@ -11206,6 +11206,79 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       });
       expect(service.citationsByCid().get(5)?.verification_status).toBe('pending');
     });
+
+    it('upserts the full row a newer agent sends with the verdict', () => {
+      const { service } = createService();
+      service.citationsByCid.set(new Map());
+      (service as any)._handleEvent({
+        method: 'citation.verdict',
+        params: {
+          citation_id: 7,
+          verification_status: 'failed',
+          citation: { id: 7, verification_status: 'failed', verification_reason: 'not_supported' },
+        },
+      });
+      expect(service.citationsByCid().get(7)?.verification_reason).toBe('not_supported');
+    });
+  });
+
+  // The chip must resolve while the text streams: the engine announces a
+  // citation before the cite tool returns, so before the agent can write its
+  // handle (citation engine overhaul §6.2).
+  describe('citation.created / citation.updated live upsert', () => {
+    it('adds a created citation to the map at once', () => {
+      const { service } = createService();
+      service.citationsByCid.set(new Map());
+      (service as any)._handleEvent({
+        method: 'citation.created',
+        params: {
+          citation_id: 1241,
+          verification_status: 'pending',
+          citation: { id: 1241, claim: 'c', verification_status: 'pending', source_name: 'S' },
+        },
+      });
+      expect(service.citationsByCid().get(1241)?.source_name).toBe('S');
+    });
+
+    it('merges an update into the loaded row (withdrawal)', () => {
+      const { service } = createService();
+      service.citationsByCid.set(
+        new Map([[3, { id: 3, claim: 'kept', verification_status: 'failed' } as any]]),
+      );
+      (service as any)._handleEvent({
+        method: 'citation.updated',
+        params: { citation_id: 3, citation: { id: 3, withdrawn_at: '2026-10-28T00:00:00Z' } },
+      });
+      const row = service.citationsByCid().get(3)!;
+      expect(row.withdrawn_at).toBe('2026-10-28T00:00:00Z');
+      expect(row.claim).toBe('kept');
+    });
+
+    it('ignores a frame without a row', () => {
+      const { service } = createService();
+      service.citationsByCid.set(new Map());
+      (service as any)._handleEvent({ method: 'citation.created', params: { citation_id: 4 } });
+      expect(service.citationsByCid().size).toBe(0);
+    });
+  });
+
+  describe('loadCitations paging', () => {
+    it('reads every page and keeps rows a frame added meanwhile', async () => {
+      const { service, mockHttp } = createService();
+      service.threadId.set('t-1');
+      const page1 = Array.from({ length: 500 }, (_, i) => ({ id: i + 1 }));
+      const page2 = [{ id: 501 }];
+      mockHttp.get.mockImplementation((_url: string, opts?: { params?: { offset?: number } }) =>
+        of({ citations: opts?.params?.offset ? page2 : page1, total: 501 }),
+      );
+      service.citationsByCid.set(new Map([[900, { id: 900 } as any]]));
+      await (service as any).loadCitations('t-1');
+      const map = service.citationsByCid();
+      expect(map.size).toBe(502);
+      expect(map.has(501)).toBe(true);
+      expect(map.has(900)).toBe(true);
+      expect(service.citationsLoaded()).toBe(true);
+    });
   });
 });
 

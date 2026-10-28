@@ -15,6 +15,8 @@ import {toSignal} from '@angular/core/rxjs-interop';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
 import {KatexDirective} from '../../core/markdown/katex.directive';
+import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
+import type {CitationScope} from '../../core/markdown/citation-scope';
 import {toRenderableMarkdown} from '../../core/markdown/tool-result-source';
 import {AppIconComponent} from '../icon';
 import {AppIconButtonComponent} from '../icon-button';
@@ -65,6 +67,7 @@ export function canvasToolCardContext(
         TranslocoPipe,
         MarkdownComponent,
         KatexDirective,
+        CitationRefDirective,
         ExternalImageDirective,
         AppIconComponent,
         AppIconButtonComponent,
@@ -171,7 +174,7 @@ export function canvasToolCardContext(
               </div>
             } @else if (renders(r)) {
               <div #mdBody class="tc__md" [class.tc__md--capped]="!showFull()">
-                <markdown appKatex [data]="renderableSource(r)"></markdown>
+                <markdown appKatex appCitationRef [citationScope]="citationScope()" [data]="renderableSource(r)"></markdown>
               </div>
             } @else {
               <pre class="tc__result" [class.tc__result--terminal]="r.kind === 'terminal'">{{ visibleContent(r) }}</pre>
@@ -232,6 +235,8 @@ export function canvasToolCardContext(
 })
 export class AppToolCardComponent implements OnDestroy {
     readonly view = input.required<ToolCardView>();
+    /** The answer this card belongs to: its citation handles share the answer's chip numbers. */
+    readonly citationScope = input<CitationScope | null>(null);
     /** Force the card open regardless of status (e.g. the workbench surface). */
     readonly defaultOpen = input<boolean>(false);
     readonly actionRequested = output<ToolCardAction>();

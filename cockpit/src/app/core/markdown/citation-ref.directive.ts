@@ -1,67 +1,108 @@
-import {AfterViewInit, Directive, ElementRef, OnDestroy, effect, inject} from '@angular/core';
+import {AfterViewInit, Directive, ElementRef, Input, OnDestroy, effect, inject, signal} from '@angular/core';
+import {TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
 import {Subscription} from 'rxjs';
+
 import {PersistentChatService} from '../services/persistent-chat.service';
+import {CitationPopover} from './citation-popover';
+import {CitationScope, citationIdsIn} from './citation-scope';
+import {citationState, citationStateLabel} from './citation-status';
 
 /**
- * Resolves the inline citation markers produced by `citationExtension` into
- * live, source-linked references.
+ * Resolves the citation handles `citationExtension` marks into numbered chips
+ * with a popover (citation engine overhaul §6.2).
  *
- * The marked stage emits `<sup class="citation-ref cid-N">N</sup>` for each
- * `[N]` (N == citation id). Applied to every `<markdown>` that renders agent
- * text, this directive runs after render — and again when the thread's
- * citations arrive (they're fetched async) — and, per marker:
+ * The marked stage emits `<span class="citation-ref cid-N handle|legacy">` with
+ * the literal handle as its text. After render — and again whenever the
+ * session's citations change (they arrive live, before the agent writes the
+ * handle) — each marker becomes:
  *
- *   - resolved id  → renumbers it 1..k in order of appearance, attaches a source
- *                    popover (native title: name / url / claim / verification),
- *                    and makes web sources click-to-open;
- *   - unresolved id (once citations are loaded) → rendered as the literal `[N]`
- *                    text it was, so a stray `[5]` in prose is never shown as a
- *                    citation. Non-destructive (the `cid-N` class is kept) so it
- *                    still upgrades to a real citation if one loads later.
+ *   - a known citation → a chip numbered by first mention across the answer
+ *     (`citationScope`; without one, across this block), styled by state
+ *     (being checked, verified, unverified, not checked, withdrawn), opening
+ *     the popover on click or Enter;
+ *   - an unknown `[^c…]` handle in an answer → a flagged chip, never hidden: a
+ *     hidden one can't be told apart from a real bug. Outside an answer it
+ *     stays plain text;
+ *   - an unknown legacy `[N]` → its literal text, since a stray `[5]` in prose
+ *     is no citation. Legacy markers resolve only with a scope, i.e. inside
+ *     the session chat whose citations they name.
  *
- * The id is read from the `cid-N` class (survives the HTML sanitizer) rather
- * than the visible text, which the renumber step overwrites.
+ * Non-destructive: the `cid-N` class stays, so a marker upgrades when its
+ * citation loads later. The display number never reaches the model's history.
  */
 @Directive({
     selector: 'markdown[appCitationRef]',
     standalone: true,
 })
 export class CitationRefDirective implements AfterViewInit, OnDestroy {
+    /**
+     * The answer this block belongs to; numbers chips across all its blocks.
+     * A decorator input, not `input()`: an initializer input on a directive
+     * does not bind under the specs' JIT compile.
+     */
+    @Input() set citationScope(value: CitationScope | null | undefined) {
+        this.scope.set(value ?? null);
+    }
+    private readonly scope = signal<CitationScope | null>(null);
+
     private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
     private readonly markdown = inject(MarkdownComponent, {self: true});
     private readonly chat = inject(PersistentChatService);
+    private readonly popover = inject(CitationPopover);
+    private readonly i18n = inject(TranslocoService);
     private sub?: Subscription;
 
     constructor() {
-        // Re-resolve when the thread's citations load/refresh after render.
+        // Re-resolve when the thread's citations change after render.
         effect(() => {
             this.chat.citationsByCid();
             this.chat.citationsLoaded();
+            this.scope();
             this.resolve();
         });
     }
 
     ngAfterViewInit(): void {
         this.resolve();
-        this.sub = this.markdown.ready.subscribe(() => this.resolve());
+        this.sub = this.markdown.ready.subscribe(() => {
+            this.popover.closeWithin(this.host.nativeElement);
+            this.resolve();
+        });
         this.host.nativeElement.addEventListener('click', this.onClick);
+        this.host.nativeElement.addEventListener('keydown', this.onKeydown);
     }
 
     ngOnDestroy(): void {
         this.sub?.unsubscribe();
+        this.popover.closeWithin(this.host.nativeElement);
         this.host.nativeElement.removeEventListener('click', this.onClick);
+        this.host.nativeElement.removeEventListener('keydown', this.onKeydown);
     }
 
     private readonly onClick = (ev: Event): void => {
-        const target = ev.target as HTMLElement | null;
-        const ref = target?.closest('sup.citation-ref') as HTMLElement | null;
-        const url = ref?.getAttribute('data-url');
-        if (url) {
-            ev.preventDefault();
-            window.open(url, '_blank', 'noopener');
-        }
+        const chip = (ev.target as HTMLElement | null)?.closest('.citation-ref.resolved') as HTMLElement | null;
+        if (!chip) return;
+        ev.preventDefault();
+        this.toggle(chip);
     };
+
+    private readonly onKeydown = (ev: KeyboardEvent): void => {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return;
+        const chip = (ev.target as HTMLElement | null)?.closest('.citation-ref.resolved') as HTMLElement | null;
+        if (!chip) return;
+        ev.preventDefault();
+        this.toggle(chip);
+    };
+
+    private toggle(chip: HTMLElement): void {
+        if (this.popover.isOpenOn(chip)) {
+            this.popover.close();
+            return;
+        }
+        const cit = this.chat.citationsByCid().get(this.cidOf(chip));
+        if (cit) this.popover.open(chip, cit, chip.textContent ?? '');
+    }
 
     private cidOf(el: HTMLElement): number {
         const m = el.className.match(/\bcid-(\d+)\b/);
@@ -69,59 +110,67 @@ export class CitationRefDirective implements AfterViewInit, OnDestroy {
     }
 
     private resolve(): void {
-        const refs =
-            this.host.nativeElement.querySelectorAll<HTMLElement>('sup.citation-ref');
+        const refs = this.host.nativeElement.querySelectorAll<HTMLElement>('.citation-ref');
         if (refs.length === 0) {
             return;
         }
         const byCid = this.chat.citationsByCid();
         const loaded = this.chat.citationsLoaded();
-        const display = new Map<number, number>();
-        let next = 1;
-        refs.forEach((sup) => {
-            const cid = this.cidOf(sup);
+        const scope = this.scope();
+        // Without an answer scope, number across this block alone.
+        const numbering = scope ?? new CitationScope(citationIdsIn(this.markdown.data ?? ''));
+        refs.forEach((el) => {
+            const cid = this.cidOf(el);
             if (!Number.isFinite(cid)) {
                 return;
             }
-            const cit = byCid.get(cid);
+            const legacy = el.classList.contains('legacy');
+            const kind = legacy ? 'legacy' : 'handle';
+            const cit = legacy && !scope ? undefined : byCid.get(cid);
             if (cit) {
-                let n = display.get(cid);
-                if (n === undefined) {
-                    n = next++;
-                    display.set(cid, n);
-                }
-                sup.textContent = String(n);
-                sup.classList.remove('unresolved');
-                sup.classList.add('resolved');
-                const lines = [cit.source_name || `source #${cit.source_id}`];
-                if (cit.source_identifier) {
-                    lines.push(cit.source_identifier);
-                }
-                if (cit.claim) {
-                    lines.push(`“${cit.claim}”`);
-                }
-                lines.push(`[${cit.verification_status}]`);
-                sup.setAttribute('title', lines.join('\n'));
-                // Clickable when the source is reachable by URL (web citations);
-                // document citations have a path identifier, not a link.
-                if (cit.source_identifier && /^https?:\/\//i.test(cit.source_identifier)) {
-                    sup.setAttribute('data-url', cit.source_identifier);
-                    sup.classList.add('clickable');
-                } else {
-                    sup.removeAttribute('data-url');
-                    sup.classList.remove('clickable');
-                }
-            } else if (loaded) {
-                // Citations are loaded and this id isn't one of them — it was
-                // ordinary text. Render it as the literal `[N]` (kept as a <sup>
-                // styled flat so it can still upgrade if a citation loads later).
-                sup.textContent = `[${cid}]`;
-                sup.classList.remove('resolved', 'clickable');
-                sup.classList.add('unresolved');
-                sup.removeAttribute('data-url');
-                sup.removeAttribute('title');
+                const n = String(numbering.numberOf(cid, byCid) ?? '?');
+                const state = citationState(cit);
+                el.textContent = n;
+                el.className = `citation-ref cid-${cid} ${kind} resolved state-${state}`;
+                el.setAttribute('role', 'button');
+                el.setAttribute('tabindex', '0');
+                el.setAttribute('aria-haspopup', 'dialog');
+                el.setAttribute(
+                    'aria-label',
+                    this.i18n.translate('chat.citations.chipLabel', {
+                        n,
+                        source: cit.source_name || '',
+                        state: this.i18n.translate(citationStateLabel(state)),
+                    }),
+                );
+                el.removeAttribute('title');
+                return;
             }
-            // else: not loaded yet — leave as-is; the effect re-runs on load.
+            this.clearChip(el);
+            if (legacy || !scope) {
+                // Not a citation this view knows: the literal text it was.
+                // Outside an answer (a job's tool card) an unknown handle is
+                // not flagged: this chat's citations are not that job's.
+                el.textContent = legacy ? `[${cid}]` : `[^c${cid}]`;
+                el.className = `citation-ref cid-${cid} ${kind} unresolved`;
+            } else if (loaded) {
+                el.textContent = '?';
+                el.className = `citation-ref cid-${cid} handle flagged`;
+                el.setAttribute('title', this.i18n.translate('chat.citations.notFound', {handle: `[^c${cid}]`}));
+            } else {
+                // Citations still loading: a quiet placeholder, not the raw handle.
+                el.textContent = '…';
+                el.className = `citation-ref cid-${cid} handle loading`;
+            }
         });
+    }
+
+    private clearChip(el: HTMLElement): void {
+        el.removeAttribute('role');
+        el.removeAttribute('tabindex');
+        el.removeAttribute('aria-haspopup');
+        el.removeAttribute('aria-label');
+        el.removeAttribute('aria-expanded');
+        el.removeAttribute('title');
     }
 }
