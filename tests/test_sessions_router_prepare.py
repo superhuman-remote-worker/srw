@@ -482,6 +482,43 @@ async def test_provision_helper_suppresses_pod_fallback_after_lane_transition(
     fake_main.agent_provisioner.provision_agent.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_provision_helper_pool_attach_carries_the_config_name():
+    """A pool pod boots as a worker, so the attach must name the session's
+    config, exactly as the fresh-pod branch boots ``--config <name>``."""
+
+    from orchestrator.routers import sessions as sessions_mod
+
+    thread = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "execution_lane": "pinned",
+        "status": "created",
+        "agent_id": None,
+        "runtime_generation": "22222222-2222-4222-8222-222222222222",
+        "runtime_retirement_token": None,
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    fake_main = _fake_main(db)
+    idle = {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001}
+    fake_main.find_idle_persistent_agent = AsyncMock(return_value=idle)
+    fake_main.send_session_attach = AsyncMock(return_value=True)
+    fake_main.agent_provisioner.provision_agent = AsyncMock()
+
+    await sessions_mod._provision_agent_for_thread(
+        thread_id=thread["id"],
+        config_name="scholar",
+        config_override={"llm": {"model": "m"}},
+        dependencies=fake_main.dependencies,
+    )
+
+    fake_main.send_session_attach.assert_awaited_once()
+    call = fake_main.send_session_attach.await_args
+    assert call.args[:2] == (idle, thread["id"])
+    assert call.kwargs["config_name"] == "scholar"
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
 @pytest.mark.parametrize("metadata", [{}, "{}", '{"protected_cloud": false}'])
 @pytest.mark.asyncio
 async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):

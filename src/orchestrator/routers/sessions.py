@@ -873,8 +873,15 @@ async def _provision_agent_for_thread(
     if not same_thread_runtime_authority(thread, runtime_authority):
         raise RuntimeError("Session lifecycle changed during preparation")
     if idle_agent:
+        # A pool pod boots as a worker; the attach names the session's config
+        # so the agent re-resolves it, as the fresh-pod branch's --config does.
         ok = await dependencies.send_session_attach(
-            idle_agent, thread_id, config_override or {}, [], datasources=None
+            idle_agent,
+            thread_id,
+            config_override or {},
+            [],
+            datasources=None,
+            config_name=config_name,
         )
         if ok:
             return
