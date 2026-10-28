@@ -504,3 +504,42 @@ async def test_forced_end_retires_a_refused_upgrade_create(
         ]
         assert workspace["seed_from"]["backend"] == "virtual"
         assert "_runtime_creation" not in workspace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purged", [True, False])
+async def test_permanent_end_of_an_upgraded_session_purges_its_old_virtual_files(
+    database, actor, monkeypatch, purged
+):
+    """Roadmap item 11: the upgrade kept threads/<id>/ as its fallback; nothing
+    reads it once the row goes, so permanent End purges it first."""
+    from unittest.mock import MagicMock
+
+    from orchestrator.services import thread_uploads, workspace_binding
+
+    case = await refused_upgrade(database, actor, monkeypatch)
+    monkeypatch.setattr(
+        workspace_binding,
+        "virtual_workspace_rclone_spec",
+        lambda: {"type": "s3", "root": "srw-workspaces", "config": {}},
+    )
+    monkeypatch.setattr(workspace_binding.shutil, "which", lambda _name: "/rclone")
+    monkeypatch.setattr(
+        thread_uploads, "virtual_thread_backing_id", lambda *_: upgrade.VIRTUAL_BACKING
+    )
+    purge = MagicMock(return_value=purged)
+    monkeypatch.setattr(thread_uploads, "_virtual_purge_prefix", purge)
+
+    if purged:
+        assert await upgrade.end(database, case, force=True, permanent=True) == {
+            "status": "deleted"
+        }
+        assert await database.get_thread(case.thread_id) is None
+    else:
+        with pytest.raises(HTTPException) as held:
+            await upgrade.end(database, case, force=True, permanent=True)
+        assert held.value.status_code == 503
+        assert await database.get_thread(case.thread_id) is not None
+
+    (target,), _ = purge.call_args
+    assert target.prefix == f"threads/{case.thread_id}/"

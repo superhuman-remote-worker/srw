@@ -234,6 +234,47 @@ async def test_owner_retry_settles_the_same_durable_state(db, monkeypatch, backe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("purged", [True, False])
+async def test_a_permanent_delete_purges_an_old_virtual_workspace_first(
+    db, monkeypatch, purged
+):
+    """Roadmap item 11: a Session upgraded from Virtual kept threads/<id>/ as
+    the upgrade's fallback; the row goes only once that prefix is gone."""
+    from orchestrator.services import workspace_binding
+
+    ids = await _owner_session(db, monkeypatch, backend="none")
+    await _soft_end(db, ids)
+    monkeypatch.setattr(
+        workspace_binding,
+        "virtual_workspace_rclone_spec",
+        lambda: {"type": "s3", "root": "srw-workspaces", "config": {}},
+    )
+    monkeypatch.setattr(workspace_binding.shutil, "which", lambda _name: "/rclone")
+    purge = MagicMock(return_value=purged)
+    monkeypatch.setattr(thread_uploads, "_virtual_purge_prefix", purge)
+    thread = await db.get_thread(ids["thread"])
+    end_thread_flow = controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow
+
+    if purged:
+        assert await end_thread_flow(
+            ids["thread"], dict(thread), permanent=True, force=False
+        ) == {"status": "deleted"}
+        assert await db.get_thread(ids["thread"]) is None
+    else:
+        with pytest.raises(fastapi_module.HTTPException) as held:
+            await end_thread_flow(
+                ids["thread"], dict(thread), permanent=True, force=False
+            )
+        assert held.value.status_code == 503
+        assert await db.get_thread(ids["thread"]) is not None
+
+    (target,), _ = purge.call_args
+    assert target.prefix == f"threads/{ids['thread']}/"
+
+
+@pytest.mark.asyncio
 async def test_durable_retry_keeps_refusing_a_live_permanent_delete_without_proof(
     db, monkeypatch, caplog
 ):

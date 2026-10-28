@@ -2586,6 +2586,27 @@ async def _end_thread_flow_owned(
                 if agent_workspace_exit_handoff:
                     return _ending_response(retiring_agent_exit_authorized=True)
                 if permanent:
+                    from orchestrator.services.thread_uploads import (
+                        purge_virtual_workspace_leftover,
+                        recorded_virtual_upgrade_bindings,
+                    )
+
+                    # A VM upgrade from a virtual Session kept its old files as
+                    # the upgrade's fallback. The retirement captured the VM
+                    # record; the row's own copy may already be cleared.
+                    retired_vm = (
+                        context.get("vm") if isinstance(context, Mapping) else None
+                    )
+                    if not await purge_virtual_workspace_leftover(
+                        authoritative_thread,
+                        recorded_bindings=recorded_virtual_upgrade_bindings(
+                            thread_metadata_object(authoritative_thread),
+                            vm=retired_vm if isinstance(retired_vm, dict) else None,
+                        ),
+                    ):
+                        raise RuntimeError(
+                            "The old virtual workspace's cleanup remains retryable"
+                        )
                     await _delete_auxiliary_state(authoritative_thread)
                     await postgres_db.delete_thread(
                         thread_id,
@@ -2848,6 +2869,27 @@ async def _end_thread_flow_owned(
                         raise HTTPException(
                             status_code=503,
                             detail=("Terminal virtual workspace cleanup is incomplete"),
+                        )
+                else:
+                    from orchestrator.services.thread_uploads import (
+                        purge_virtual_workspace_leftover,
+                        recorded_virtual_upgrade_bindings,
+                    )
+
+                    # An upgraded Session's old virtual files stayed behind as
+                    # the upgrade's fallback; nothing reads them once the row
+                    # goes.
+                    if not await purge_virtual_workspace_leftover(
+                        terminal_thread,
+                        recorded_bindings=recorded_virtual_upgrade_bindings(
+                            terminal_metadata
+                        ),
+                    ):
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "The old virtual workspace's cleanup is incomplete"
+                            ),
                         )
                 from orchestrator.services.stateless_workspace_history_cleanup import (
                     reclaim_stateless_workspace_history,
