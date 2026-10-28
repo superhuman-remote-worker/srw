@@ -36,6 +36,7 @@ import {PERMISSION_MODE_LABEL_KEYS} from '../../core/models/permission-mode';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo, workspaceTierLabel,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
+import {upgradeCardTitle, upgradeProgressRows} from '../../core/services/workspace-upgrade-progress';
 import {
     AssistantTurn,
     collapsedAnswer,
@@ -2082,42 +2083,54 @@ export function clearDraft(threadId: string | null): void {
              gated on streaming — request_workspace_upgrade doesn't stop the
              turn, so this appears while the agent is still talking. -->
         @if (workspaceOfferCard(); as woc) {
-          <div class="mile">
-            @switch (woc.state) {
-              @case ('offer') {
-                <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
-                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: tierLabel(woc.tier) } }}</div>
-                <div class="mile-detail">
-                  <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
-                  <span class="mile-args">{{ woc.reason }}</span>
-                </div>
-                <div class="mile-actions">
-                  <app-button variant="success" size="sm" (clicked)="upgradeAndContinue(woc.tier)">
-                    {{ 'chat.workspaceOffer.upgradeAndContinue' | transloco }}
-                  </app-button>
-                  <app-button variant="info" size="sm" (clicked)="upgradeOnly(woc.tier)">
-                    {{ 'chat.workspaceOffer.upgrade' | transloco }}
-                  </app-button>
-                  <app-button variant="danger" size="sm" (clicked)="denyOffer()">
-                    {{ 'chat.workspaceOffer.deny' | transloco }}
-                  </app-button>
-                </div>
-              }
-              @case ('provisioning') {
-                <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
-                <div class="mile-detail">
-                  <span class="action-spinner-sm" aria-hidden="true"></span>
-                  <span class="mile-args">
-                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: tierLabel(woc.tier) } }}
-                    @if (woc.elapsed) { ({{ woc.elapsed }}s) }
-                  </span>
-                </div>
-                @if (woc.willContinue) {
-                  <div class="mile-title">{{ 'chat.workspaceOffer.willContinue' | transloco }}</div>
+          @if (woc.state === 'offer') {
+            <div class="mile">
+              <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
+              <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: tierLabel(woc.tier) } }}</div>
+              <div class="mile-detail">
+                <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
+                <span class="mile-args">{{ woc.reason }}</span>
+              </div>
+              <div class="mile-actions">
+                <app-button variant="success" size="sm" (clicked)="upgradeAndContinue(woc.tier)">
+                  {{ 'chat.workspaceOffer.upgradeAndContinue' | transloco }}
+                </app-button>
+                <app-button variant="info" size="sm" (clicked)="upgradeOnly(woc.tier)">
+                  {{ 'chat.workspaceOffer.upgrade' | transloco }}
+                </app-button>
+                <app-button variant="danger" size="sm" (clicked)="denyOffer()">
+                  {{ 'chat.workspaceOffer.deny' | transloco }}
+                </app-button>
+              </div>
+            </div>
+          } @else if (upgradeCard(); as card) {
+            <!-- The "Starting session" card's look, with the upgrade's own steps. -->
+            <div class="startup-card" role="status">
+              <div class="startup-card-head">
+                <span class="startup-card-spinner"></span>
+                <span class="startup-card-title">{{ card.title.key | transloco: (card.title.params ?? {}) }}</span>
+              </div>
+              <div class="startup-steps">
+                @for (step of card.rows; track step.key) {
+                  <div class="startup-step" [class]="'state-' + step.state">
+                    @if (step.state === 'active') {
+                      <span class="step-spinner" aria-hidden="true"></span>
+                    } @else {
+                      <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
+                    }
+                    <span class="step-label">{{ step.labelKey | transloco }}</span>
+                    <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+                  </div>
                 }
-              }
-            }
-          </div>
+                @if (woc.willContinue) {
+                  <div class="startup-step state-todo">
+                    <app-icon size="lg" class="step-icon">play_arrow</app-icon>
+                    <span class="step-label">{{ 'chat.workspaceOffer.willContinue' | transloco }}</span>
+                  </div>
+                }
+              </div>
+            </div>
+          }
         }
 
         <!-- Live context-compaction progress (compaction.started/progress
@@ -3031,6 +3044,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly phaseRevision = signal(0);
     private readonly nowTick = signal<number>(Date.now());
     private startupTickInterval: ReturnType<typeof setInterval> | null = null;
+    private upgradeTickInterval: ReturnType<typeof setInterval> | null = null;
+
+    /** The workspace-upgrade card: the startup card's look, the upgrade's steps. */
+    readonly upgradeCard = computed(() => {
+        const progress = this.chat.workspaceUpgradeProgress();
+        if (!progress) return null;
+        return {title: upgradeCardTitle(progress), rows: upgradeProgressRows(progress, this.nowTick())};
+    });
     private prevActivePhase: string | null = null;
     private prevReadyForTiming = false;
     private prevThreadIdForTiming: string | null = null;
@@ -3421,6 +3442,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 this.startupTickInterval = null;
             }
         });
+
+        // The upgrade card's active step counts every second, like startup's.
+        effect(() => {
+            const upgrading = this.chat.workspaceUpgradeProgress() !== null;
+            if (upgrading && !this.upgradeTickInterval) {
+                this.nowTick.set(Date.now());
+                this.upgradeTickInterval = setInterval(() => this.nowTick.set(Date.now()), 1000);
+            } else if (!upgrading && this.upgradeTickInterval) {
+                clearInterval(this.upgradeTickInterval);
+                this.upgradeTickInterval = null;
+            }
+        });
     }
 
     readonly completedTaskCount = computed(() =>
@@ -3598,6 +3631,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
             this.startupTickInterval = null;
+        }
+        if (this.upgradeTickInterval) {
+            clearInterval(this.upgradeTickInterval);
+            this.upgradeTickInterval = null;
         }
         if (this.compactionTimer) {
             clearInterval(this.compactionTimer);

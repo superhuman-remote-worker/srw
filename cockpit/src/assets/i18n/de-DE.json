@@ -2414,7 +2414,19 @@
       "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten.",
       "notPossible": "Der Workspace dieser Sitzung lässt sich nicht direkt aufrüsten. Starte stattdessen eine neue Sitzung mit einem Container-Workspace.",
       "movingToVm": "Diese Sitzung wird auf einen VM-Workspace verschoben (die Sitzung verbindet sich zuerst neu)…",
-      "provisioningTemplate": "Der Workspace {{template}} wird bereitgestellt…",
+      "card": {
+        "title": "Workspace-Upgrade",
+        "titleContainer": "Upgrade auf einen Container",
+        "titleVm": "Upgrade auf eine VM",
+        "titleTemplate": "Upgrade auf {{template}}"
+      },
+      "steps": {
+        "requested": "Upgrade angefordert",
+        "startingContainer": "Container wird gestartet",
+        "startingVm": "VM wird gestartet (das kann einige Minuten dauern)",
+        "startingWorkspace": "Workspace wird gestartet",
+        "copying": "Deine Dateien werden kopiert"
+      },
       "skippedFiles": "Diese Dateien waren größer als das Kopierlimit von 100 MB und wurden nicht kopiert; sie liegen weiter im alten Speicher: {{files}}",
       "failed": {
         "upgradeCancelled": "Das VM-Upgrade wurde abgebrochen, als diese Sitzung beendet wurde.",
@@ -2432,7 +2444,6 @@
       "deny": "Ablehnen",
       "denyStarter": "Kein Workspace-Upgrade — ",
       "continueMessage": "Der Workspace ist bereit — Shell-, Git- und Datei-Tools sind jetzt verfügbar. Bitte mach dort weiter, wo du aufgehört hast.",
-      "provisioning": "{{tier}} wird bereitgestellt…",
       "willContinue": "Wird automatisch fortgesetzt, sobald bereit."
     },
     "approval": {

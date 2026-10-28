@@ -9627,7 +9627,7 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     expect(lines.some((l) => l.includes('/upgrade-workspace'))).toBe(false);
   });
 
-  it('workspace_upgrade.progress surfaces a live heartbeat during a slow provision', async () => {
+  it('workspace_upgrade.progress keeps the elapsed time for the card, not as chat lines', async () => {
     const { service, es } = await setup();
     fireSseMessage(
       es,
@@ -9637,7 +9637,8 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
       },
       '1:1',
     );
-    expect(sysLines(service).some((l) => l.includes('120s'))).toBe(true);
+    expect(service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm', elapsed: 120 });
+    expect(sysLines(service).some((l) => l.includes('120s'))).toBe(false);
   });
 
   it('workspace_upgrade.complete mentions sudo for a vm target only', async () => {
@@ -9886,6 +9887,25 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
       .filter((t: any) => t.kind === 'system')
       .map((t: any) => String(t.content));
     expect(lines).toContain('The agent requested a VM workspace: need a shell');
+  });
+
+  it('.started moves the upgrade card to its starting step without a chat line', async () => {
+    const ctx = await readySession();
+    ctx.service.upgradeWorkspace(null);
+    TestBed.tick();
+    const lines = ctx.service.turns().filter((t: any) => t.kind === 'system').length;
+
+    fireSseMessage(
+      ctx.es,
+      { method: 'workspace_upgrade.started', params: { target_tier: 'vm' } },
+      '1:9',
+    );
+    TestBed.tick();
+
+    expect(ctx.service.turns().filter((t: any) => t.kind === 'system')).toHaveLength(lines);
+    expect(ctx.service.workspaceUpgradeProgress()).toEqual(
+      expect.objectContaining({ tier: 'vm', active: 'starting' }),
+    );
   });
 
   it('a bare upgrade then .started replaces the "next" placeholder with the target tier', async () => {
@@ -12432,9 +12452,104 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
     expect(ctx.service.continueAfterUpgrade()).toBe(true);
     expect(ctx.service.error()).toBeNull();
-    expect(
-      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceOffer.provisioning'),
-    ).toHaveLength(2);
+    // The upgrade card is already showing; neither try adds a chat line.
+    expect(stamps).not.toHaveBeenCalled();
+  });
+
+  const reread = async (ctx: any, threadMeta: Record<string, unknown>) => {
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, threadMeta));
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+  };
+
+  it('an accepted stateless upgrade shows its steps instead of a provisioning line', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeProgress()).toEqual(
+      expect.objectContaining({ tier: 'sandbox', active: 'starting' }),
+    );
+    expect(stamps).not.toHaveBeenCalled();
+  });
+
+  it('a read before the server reports the upgrade does not end its card', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+
+    await reread(ctx, {});
+
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.workspaceUpgradeProgress()?.active).toBe('starting');
+  });
+
+  it('the upgrade card follows the server phases and ends when the server is done', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'provisioning' } });
+    expect(ctx.service.workspaceUpgradeProgress()?.active).toBe('starting');
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'copying' } });
+    expect(ctx.service.workspaceUpgradeProgress()?.active).toBe('copying');
+
+    await reread(ctx, { workspace_upgrade: null });
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.workspaceUpgradeProgress()).toBeNull();
+    expect(ctx.service.workspaceTier()).toBe('sandbox');
+  });
+
+  it('after the done frame, a read that still says copying does not bring the card back', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'copying' } });
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'sandbox', seeded_files: 3 } },
+      '1:30',
+    );
+    TestBed.tick();
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'copying' } });
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.workspaceUpgradeProgress()).toBeNull();
+  });
+
+  it('a reload shows a container upgrade in progress, counting from its request', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(upgradeable, {
+        workspace_upgrade: {
+          target_tier: 'sandbox',
+          phase: 'provisioning',
+          started_at: '2026-01-01T09:30:00+00:00',
+        },
+      }),
+    );
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.workspaceUpgradeProgress()).toEqual(
+      expect.objectContaining({
+        active: 'starting',
+        starts: { starting: Date.parse('2026-01-01T09:30:00Z') },
+      }),
+    );
   });
 
   it('an accepted upgrade re-reads the session for its startup line', async () => {
@@ -12591,14 +12706,15 @@ describe('PersistentChatService — control transport is declared, never inferre
   it('a VM template on a stateless session says which template it provisions', async () => {
     const ctx = await socketlessSession(upgradeableVm);
     ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
-    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
 
     await ctx.service.sendMessage('/upgrade-workspace vm-big');
+    TestBed.tick();
 
     expect(ctx.mockHttp.post.mock.calls[0][1]).toEqual(
       expect.objectContaining({ method: 'upgrade-to-workspace', template: 'vm-big' }),
     );
-    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.provisioningTemplate');
+    // The upgrade card's title names it.
+    expect(ctx.service.workspaceUpgradeProgress()?.template).toBe('vm-big');
   });
 
   it('the 202 transport_changed flag moves the session to the pinned transport and holds the composer', async () => {

@@ -81,6 +81,14 @@ import {
   cloudFolderStateFromEvent,
   cloudFolderStateFromStatus,
 } from '../util/cloud-mount-status';
+import {
+  advanceUpgradeProgress,
+  resumeUpgradeProgress,
+  startUpgradeProgress,
+  UpgradeProgress,
+  UpgradeStep,
+  upgradeStepForPhase,
+} from './workspace-upgrade-progress';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -966,12 +974,32 @@ export class PersistentChatService {
       untracked(() => this._announceWorkspaceUpgradeFailure(threadId));
     });
 
-    // A VM upgrade in flight on load (C2): requested, provisioning or copying.
+    // The Session read's upgrade phases (C1 and C2): on load an upgrade still
+    // running shows its card, and each read moves the card on.
     effect(() => {
       const view = this.workspaceUpgrade();
-      if (!view || view.target_tier !== 'vm' || view.phase === 'failed') return;
+      untracked(() => this._followWorkspaceUpgradeView(view));
+    });
+
+    // The upgrade card lives exactly as long as the upgrade is in progress.
+    effect(() => {
+      const inProgress = this.workspaceUpgradeInProgress();
       untracked(() => {
-        if (!this.workspaceUpgradeInProgress()) this.workspaceUpgradeInProgress.set({tier: 'vm'});
+        const progress = this.workspaceUpgradeProgress();
+        if (!inProgress) {
+          if (progress) this.workspaceUpgradeProgress.set(null);
+          return;
+        }
+        if (!progress) {
+          const now = Date.now();
+          this.workspaceUpgradeProgress.set(
+            resumeUpgradeProgress(this.workspaceUpgrade(), now) ??
+              startUpgradeProgress(inProgress.tier, inProgress.template ?? null, now),
+          );
+        } else if (inProgress.tier !== 'next' && inProgress.tier !== progress.tier) {
+          // A bare upgrade's tier is the server's: .started names it.
+          this.workspaceUpgradeProgress.set({...progress, tier: inProgress.tier});
+        }
       });
     });
 
@@ -1252,8 +1280,16 @@ export class PersistentChatService {
    *  `_poll_workspace_ready` takes no progress_cb — so on the sandbox path
    *  (the only tier request_workspace_upgrade asks for) `elapsed` stays
    *  undefined and the spinner is silent. Fine: a sandbox is a container
-   *  spawn, not a VM cold-import. */
-  readonly workspaceUpgradeInProgress = signal<{ tier: string; elapsed?: number } | null>(null);
+   *  spawn, not a VM cold-import. `template` is a named template's, for the
+   *  upgrade card's title. */
+  readonly workspaceUpgradeInProgress = signal<{
+    tier: string;
+    elapsed?: number;
+    template?: string;
+  } | null>(null);
+  /** The upgrade card's steps and their times; set exactly while
+   *  `workspaceUpgradeInProgress` is. */
+  readonly workspaceUpgradeProgress = signal<UpgradeProgress | null>(null);
   /** A live agent-initiated upgrade offer (workspace_upgrade.needed), or null.
    *  Drives the inline offer card. Live-only: nothing replays it after a
    *  reload, and re-offering then would be wrong anyway — the agent's turn is
@@ -1393,8 +1429,15 @@ export class PersistentChatService {
   readonly workspaceUpgrade = signal<WorkspaceUpgradeView | null>(null);
   readonly workspaceUpgradeFailed = computed(() => this.workspaceUpgrade()?.phase === 'failed');
   private workspaceUpgradeFailureAnnounced: string | null = null;
-  /** The provisioning line owed for the upgrade being admitted: posted on
-   *  its 202, dropped on a refusal (a refused try used to leave its line). */
+  /** A read has shown this upgrade running, so a read without one means the
+   *  server finished it. Before that (a pinned container upgrade has no
+   *  phases) only the agent's frames end the card. */
+  private workspaceUpgradeSeenOnServer = false;
+  /** workspace_upgrade.complete ended the card; a read older than the copy's
+   *  end must not bring it back. Cleared by the first read without it. */
+  private workspaceUpgradeEndedByFrame = false;
+  /** The VM line owed for the upgrade being admitted: posted on its 202,
+   *  dropped on a refusal (a refused try used to leave its line). */
   private pendingUpgradeAnnouncement: {template?: string} | null = null;
   /** An upgrade asked for mid-response, sent when the session is idle. */
   private deferredWorkspaceUpgrade: {
@@ -2328,6 +2371,8 @@ export class PersistentChatService {
     this.pendingPermissions.set([]);
     this.permissionResolutionFailures.clear();
     this.workspaceUpgradeInProgress.set(null);
+    this.workspaceUpgradeSeenOnServer = false;
+    this.workspaceUpgradeEndedByFrame = false;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(false);
     this.pendingRewindRequestId = null;
@@ -5031,7 +5076,10 @@ export class PersistentChatService {
     if (item.request.method === 'upgrade-to-workspace' && this.pendingUpgradeAnnouncement) {
       const announcement = this.pendingUpgradeAnnouncement;
       this.pendingUpgradeAnnouncement = null;
-      if (item.threadId === this.threadId()) this._announceWorkspaceUpgradeProvisioning(announcement);
+      if (item.threadId === this.threadId()) {
+        this._announceWorkspaceUpgradeProvisioning(announcement);
+        this._advanceWorkspaceUpgrade('starting');
+      }
     }
     if (item.request.method === 'upgrade-to-workspace' && item.threadId === this.threadId()) {
       // The create starts now: show its startup line without waiting 5 s.
@@ -5483,6 +5531,8 @@ export class PersistentChatService {
     // frames only ever arrive over that socket (_ws_send, not _broadcast),
     // so leaving it set would spin forever against the wrong thread.
     this.workspaceUpgradeInProgress.set(null);
+    this.workspaceUpgradeSeenOnServer = false;
+    this.workspaceUpgradeEndedByFrame = false;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(false);
     this.pendingUpgradeAnnouncement = null;
@@ -7517,13 +7567,11 @@ export class PersistentChatService {
       // refused (409, or the agent's "already running"), and on the socket
       // arming it would cancel the running upgrade's progress and continue —
       // after a stateless lane switch the running upgrade is a VM one.
-      // Repeat its line instead.
+      // Its card is showing; a VM repeats its line.
       if (this.controlTransport('upgrade-to-workspace') === 'websocket') {
-        this._systemMessage(
-          inFlight.tier === 'vm'
-            ? 'Provisioning a VM workspace (requires approval), please wait...'
-            : 'Provisioning workspace, please wait...',
-        );
+        if (inFlight.tier === 'vm') {
+          this._systemMessage('Provisioning a VM workspace (requires approval), please wait...');
+        }
       } else {
         this._announceWorkspaceUpgradeProvisioning();
       }
@@ -7547,12 +7595,14 @@ export class PersistentChatService {
     if (!this._sendControl(control)) return;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
-    this.workspaceUpgradeInProgress.set({tier: tier ?? (opts.template ? 'vm' : 'next')});
-    this._systemMessage(
-      tier === 'vm' || opts.template
-        ? 'Provisioning a VM workspace (requires approval), please wait...'
-        : 'Provisioning workspace, please wait...',
-    );
+    this.workspaceUpgradeInProgress.set({
+      tier: tier ?? (opts.template ? 'vm' : 'next'),
+      ...(opts.template ? {template: opts.template} : {}),
+    });
+    // The upgrade card shows the progress; a VM also needs an approval.
+    if (tier === 'vm' || opts.template) {
+      this._systemMessage('Provisioning a VM workspace (requires approval), please wait...');
+    }
   }
 
   /** Whether this session can carry an upgrade to `tier` right now.
@@ -7589,6 +7639,46 @@ export class PersistentChatService {
     });
   }
 
+  /** One Session read's upgrade phase (C1, C2): shows, moves on or ends the card. */
+  private _followWorkspaceUpgradeView(view: WorkspaceUpgradeView | null): void {
+    const step = view ? upgradeStepForPhase(view.phase) : null;
+    if (!view || !step) {
+      // A failure has its own announcer. No upgrade at all after one was seen
+      // running means the server finished it: on the stateless lane the done
+      // frame goes out on the agent's socket, which this tab never holds.
+      this.workspaceUpgradeEndedByFrame = false;
+      if (!view && this.workspaceUpgradeSeenOnServer) {
+        this.workspaceUpgradeSeenOnServer = false;
+        const inProgress = this.workspaceUpgradeInProgress();
+        if (inProgress) {
+          if (inProgress.tier === 'sandbox' || inProgress.tier === 'vm') {
+            this.workspaceTier.set(inProgress.tier);
+          }
+          this.workspaceUpgradeInProgress.set(null);
+        }
+      }
+      return;
+    }
+    if (this.workspaceUpgradeEndedByFrame) return;
+    this.workspaceUpgradeSeenOnServer = true;
+    if (!this.workspaceUpgradeInProgress()) {
+      // On load, or another tab's upgrade: the card resumes from this read.
+      this.workspaceUpgradeInProgress.set({tier: view.target_tier});
+      return;
+    }
+    this._advanceWorkspaceUpgrade(step);
+  }
+
+  private _advanceWorkspaceUpgrade(step: UpgradeStep): void {
+    const inProgress = this.workspaceUpgradeInProgress();
+    if (!inProgress) return;
+    const now = Date.now();
+    const progress =
+      this.workspaceUpgradeProgress() ??
+      startUpgradeProgress(inProgress.tier, inProgress.template ?? null, now);
+    this.workspaceUpgradeProgress.set(advanceUpgradeProgress(progress, step, now));
+  }
+
   private _announceWorkspaceUpgradeFailure(threadId: string): void {
     if (this.workspaceUpgradeFailureAnnounced === threadId) return;
     this.workspaceUpgradeFailureAnnounced = threadId;
@@ -7606,7 +7696,7 @@ export class PersistentChatService {
     if (!threadId || !this._controlPlaneAllowed(threadId)) return;
     if (this.workspaceUpgradeInProgress()) {
       // A second control would come back 409, and that failure clears the
-      // first upgrade's progress and auto-continue. Repeat its line instead.
+      // first upgrade's progress and auto-continue. Its card is showing.
       this._announceWorkspaceUpgradeProvisioning();
       return;
     }
@@ -7646,7 +7736,7 @@ export class PersistentChatService {
       this.workspaceUpgradeInProgress.set({tier: 'vm'});
     } else if (!tier && template) {
       // A named template's tier is the server's call.
-      this.workspaceUpgradeInProgress.set({tier: 'next'});
+      this.workspaceUpgradeInProgress.set({tier: 'next', template});
       this.pendingUpgradeAnnouncement = {template};
     } else {
       this.workspaceUpgradeInProgress.set({tier: 'sandbox'});
@@ -7658,26 +7748,13 @@ export class PersistentChatService {
     }
   }
 
-  /** The provisioning line for the upgrade in flight (or being dispatched):
-   *  a VM says nothing here (the lane switch announces it), a named template
-   *  names itself, anything else is a container. */
+  /** The line for the upgrade in flight (or being dispatched): only a VM's,
+   *  which says the session reconnects first. The upgrade card (title and
+   *  steps) shows everything else. */
   private _announceWorkspaceUpgradeProvisioning(opts: {template?: string} = {}): void {
-    const inFlight = this.workspaceUpgradeInProgress();
-    if (!opts.template && inFlight?.tier === 'vm') {
+    if (!opts.template && this.workspaceUpgradeInProgress()?.tier === 'vm') {
       this._systemMessage(this.transloco.translate('chat.workspaceUpgrade.movingToVm'));
-      return;
     }
-    if (opts.template) {
-      this._systemMessage(
-        this.transloco.translate('chat.workspaceUpgrade.provisioningTemplate', {
-          template: opts.template,
-        }),
-      );
-      return;
-    }
-    this._systemMessage(
-      this.transloco.translate('chat.workspaceOffer.provisioning', {tier: 'container'}),
-    );
   }
 
   private _flushDeferredWorkspaceUpgrade(): void {
@@ -8649,26 +8726,31 @@ export class PersistentChatService {
               ? { ...p, tier: (params['target_tier'] as string) || 'sandbox' }
               : p,
         );
-        this._systemMessage('Provisioning workspace, please wait...');
+        // The upgrade card shows it; no chat line.
+        this._advanceWorkspaceUpgrade('starting');
         break;
 
       case 'workspace_upgrade.progress': {
         // Heartbeat during a slow (cold) VM provision so a multi-minute
         // wait isn't a silent black box (workspace_tier_upgrade.md Q7).
-        // The agent emits this ~once a minute while polling readiness.
+        // The agent emits this ~once a minute while polling readiness; the
+        // upgrade card's own clock shows the wait.
         const elapsed = params['elapsed_s'] as number | undefined;
         const tier = (params['target_tier'] as string) || 'workspace';
-        this.workspaceUpgradeInProgress.set({ tier, elapsed });
-        this._systemMessage(
-          typeof elapsed === 'number'
-            ? `Still provisioning the ${tier} workspace (${elapsed}s elapsed)…`
-            : `Still provisioning the ${tier} workspace…`,
-        );
+        this.workspaceUpgradeInProgress.update((p) => ({
+          ...(p?.template ? { template: p.template } : {}),
+          tier,
+          elapsed,
+        }));
+        this._advanceWorkspaceUpgrade('starting');
         break;
       }
 
       case 'workspace_upgrade.complete': {
         this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'upgrade-to-workspace'));
+        // A read from before the copy ended may still say "copying".
+        this.workspaceUpgradeEndedByFrame = true;
+        this.workspaceUpgradeSeenOnServer = false;
         const seeded = params['seeded_files'] as number | undefined;
         const seededNote = typeof seeded === 'number' ? ` ${seeded} file(s) carried over.` : '';
         const tier = (params['target_tier'] as string) || '';

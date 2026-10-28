@@ -2414,7 +2414,19 @@
       "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept.",
       "notPossible": "This Session's workspace can't be upgraded in place. Start a new Session with a container workspace.",
       "movingToVm": "Moving this session to a VM workspace (the session reconnects first)…",
-      "provisioningTemplate": "Provisioning the {{template}} workspace…",
+      "card": {
+        "title": "Upgrading the workspace",
+        "titleContainer": "Upgrading to a Container",
+        "titleVm": "Upgrading to a VM",
+        "titleTemplate": "Upgrading to {{template}}"
+      },
+      "steps": {
+        "requested": "Upgrade requested",
+        "startingContainer": "Starting the Container",
+        "startingVm": "Starting the VM (this can take a few minutes)",
+        "startingWorkspace": "Starting the workspace",
+        "copying": "Copying your files"
+      },
       "skippedFiles": "These files were over the 100 MB copy limit and weren't copied; they're still in the old storage: {{files}}",
       "failed": {
         "upgradeCancelled": "The VM upgrade was cancelled when this session ended.",
@@ -2432,7 +2444,6 @@
       "deny": "Deny",
       "denyStarter": "Don't upgrade the workspace — ",
       "continueMessage": "The workspace is ready — shell, git, and file tools are now available. Please continue where you left off.",
-      "provisioning": "Provisioning {{tier}}…",
       "willContinue": "Will continue automatically when ready."
     },
     "approval": {

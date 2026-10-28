@@ -48,7 +48,7 @@ function sessionState() {
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'pendingWorkspaceOffer',
     'currentUsage', 'queueState', 'verifiedProjectFolder', 'cloudSessionUrl', 'ncSessionFolder',
     'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError',
-    'workspaceCreation']) state[key] = signal(null);
+    'workspaceCreation', 'workspaceUpgradeProgress']) state[key] = signal(null);
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
     modelName: signal('Test model'), permissionMode: signal('read_only'), narrationMode: signal('off'),
