@@ -6,6 +6,7 @@ Compatibility callers receive a projection of the reference harness's private
 settings; arbitrary harness settings never enter that projection or its loader.
 """
 
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 import json
 import os
@@ -16,6 +17,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from orchestrator.services.manifest_approved_images import approved_image_entry
 from orchestrator.services.manifest_store import ManifestStore, decoded
 from shared.manifests import parse_documents, preview_documents
 from shared.manifests.resolution import content_revision
@@ -55,6 +57,35 @@ def trusted_srw_image(store: Any) -> str:
     if isinstance(image, str) and image.strip():
         return image
     return installed_srw_image()
+
+
+def approved_srw_images(store: Any) -> tuple[dict[str, Any], ...]:
+    """The installation's approved harness images the application bound to its
+    store at startup (validated MANIFEST_APPROVED_IMAGES); ``()`` when unset."""
+    images = getattr(store, "manifest_approved_images", None)
+    if isinstance(images, (tuple, list)):
+        return tuple(images)
+    return ()
+
+
+def custom_agent_image(
+    image: str | None,
+    *,
+    approved: Iterable[Mapping[str, Any]],
+    installed: str,
+) -> str | None:
+    """The custom harness image an agent pod runs, or ``None`` for a default pod.
+
+    A pod is custom only when it reports an image other than the installed one
+    that is on the approved list. Every other pod is a default pod, including
+    one of an earlier release that reports its old tag after an upgrade: the
+    stale-build skip and drain keep applying to it.
+    """
+    if not image or image == installed:
+        return None
+    if approved_image_entry(approved, image) is None:
+        return None
+    return image
 
 
 def _object(value: Any) -> dict[str, Any]:

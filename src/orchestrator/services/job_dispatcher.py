@@ -60,6 +60,12 @@ from orchestrator.services.job_workspace_runtime import stateless_worker_workspa
 from orchestrator.services.job_workspace_runtime import (
     scholar_provision_parent_id as _scholar_provision_parent_id,
 )
+from orchestrator.services.manifest_approved_images import approved_image_entry
+from orchestrator.services.manifest_experts import (
+    approved_srw_images,
+    custom_agent_image,
+    trusted_srw_image,
+)
 from orchestrator.services.model_availability import WHERE_JOB
 from orchestrator.services.session_runtime_identity import (
     agent_sha_is_current as _agent_sha_is_current,
@@ -1342,6 +1348,104 @@ async def _preflight_job(
     return job
 
 
+def _job_harness_image(job: dict[str, Any]) -> str | None:
+    """The harness image a job runs on; ``None`` is the installed default."""
+    return job.get("harness_image") or None
+
+
+async def _available_agents_by_image(
+    dependencies: JobDispatchDependencies,
+    *,
+    installed: str,
+    approved: tuple[dict[str, Any], ...],
+) -> dict[str | None, list[dict[str, Any]]]:
+    """Ready agents (cooldown passed) grouped by harness image, each group in
+    heartbeat order; ``None`` groups the default pods.
+
+    A default pod of a stale build is skipped; the lifecycle reconciler drains
+    it. A custom-image pod is identified by its approved image, never by the
+    SRW build SHA its image happens to bake in.
+    """
+    groups: dict[str | None, list[dict[str, Any]]] = {}
+    for ag in await dependencies.store.get_available_agents(limit=50):
+        image = custom_agent_image(
+            ag.get("image"), approved=approved, installed=installed
+        )
+        if image is None:
+            meta = ag.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, ValueError):
+                    meta = {}
+            if not _agent_sha_is_current(meta):
+                logger.debug(
+                    "Skipping stale worker agent %s (build_sha=%s)",
+                    ag["id"],
+                    meta.get("build_sha", ""),
+                )
+                continue
+        groups.setdefault(image, []).append(ag)
+    return groups
+
+
+async def _provision_job_pods(
+    remaining: list[dict[str, Any]],
+    *,
+    approved: tuple[dict[str, Any], ...],
+    dependencies: JobDispatchDependencies,
+) -> None:
+    """Phase 1.5: start a pod of its harness image for each unclaimed job.
+
+    A default job gets today's pod. A custom image has no warm pool: it gets at
+    most one pod per pending job of that image in this pass, less the pods of
+    that image already live, so an image that never registers cannot eat the
+    agent capacity. A job whose image left the approved list starts nothing
+    and stays pending.
+    """
+    provisioner = dependencies.agent_provisioner
+    # Pods each custom image may still start in this pass.
+    budgets: dict[str, int] = {}
+    for job in remaining:
+        job_id = str(job["id"])
+        image = _job_harness_image(job)
+        if image is not None:
+            if approved_image_entry(approved, image) is None:
+                logger.warning(
+                    "Dispatcher: job %s runs harness image %s, which is not on "
+                    "the approved list; no pod is started for it",
+                    job_id,
+                    image,
+                )
+                continue
+            if image not in budgets:
+                pending = sum(1 for j in remaining if _job_harness_image(j) == image)
+                budgets[image] = pending - await provisioner.active_count_for_image(
+                    image
+                )
+            if budgets[image] <= 0:
+                continue
+        if await provisioner.active_count() >= provisioner.max_agents:
+            break
+        if image is None:
+            pod_name = await provisioner.provision_agent(purpose="job")
+        else:
+            pod_name = await provisioner.provision_agent(purpose="job", image=image)
+        if not pod_name:
+            break  # At capacity or error
+        if image is not None:
+            budgets[image] -= 1
+        logger.info(
+            "Provisioned agent %s for pending job %s (harness image: %s)",
+            pod_name,
+            job_id,
+            image or "installed",
+        )
+        # Don't assign yet — pod needs to register first.
+        # Agent heartbeats "ready" → _trigger_dispatch() → next
+        # cycle matches it.
+
+
 async def _match_jobs(
     prepared: list[_PreparedCandidate], *, dependencies: JobDispatchDependencies
 ) -> None:
@@ -1350,26 +1454,13 @@ async def _match_jobs(
     if not dispatchable_jobs:
         return
 
-    # Get available agents (ready, cooldown passed), skip stale images
-    all_agents = await dependencies.store.get_available_agents(limit=50)
-    available_agents = []
-    for ag in all_agents:
-        meta = ag.get("metadata") or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except (json.JSONDecodeError, ValueError):
-                meta = {}
-        if _agent_sha_is_current(meta):
-            available_agents.append(ag)
-        else:
-            # Stale-SHA agents are skipped here; the lifecycle
-            # reconciler is responsible for draining them.
-            logger.debug(
-                "Skipping stale worker agent %s (build_sha=%s)",
-                ag["id"],
-                meta.get("build_sha", ""),
-            )
+    # A job runs only on a pod of its harness image (None: the installed one).
+    approved = approved_srw_images(dependencies.store)
+    agents_by_image = await _available_agents_by_image(
+        dependencies,
+        installed=trusted_srw_image(dependencies.store),
+        approved=approved,
+    )
 
     # Phase 1: Direct assignment
     matched_agent_ids = set()
@@ -1384,11 +1475,11 @@ async def _match_jobs(
     # regression and none was found (connector drivers decision 34 review).
     claimed_job_ids = set()
 
-    agents_iter = iter(available_agents)
     for job in dispatchable_jobs:
-        agent = next(agents_iter, None)
-        if agent is None:
-            break  # No more free agents
+        free_agents = agents_by_image.get(_job_harness_image(job))
+        if not free_agents:
+            continue  # No free agent of this job's image
+        agent = free_agents.pop(0)
 
         job_id = str(job["id"])
         if not await _current_candidate(candidates_by_id[job_id], dependencies):
@@ -1432,32 +1523,21 @@ async def _match_jobs(
     # Phase 1.5: Provision agent pods for unclaimed jobs (K8s only)
     remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
     if remaining and dependencies.agent_provisioner.is_available:
-        for job in remaining:
-            if (
-                await dependencies.agent_provisioner.active_count()
-                >= dependencies.agent_provisioner.max_agents
-            ):
-                break
-            pod_name = await dependencies.agent_provisioner.provision_agent(
-                purpose="job"
-            )
-            if pod_name:
-                logger.info(
-                    "Provisioned agent %s for pending job %s",
-                    pod_name,
-                    str(job["id"]),
-                )
-            else:
-                break  # At capacity or error
-            # Don't assign yet — pod needs to register first.
-            # Agent heartbeats "ready" → _trigger_dispatch() → next
-            # cycle matches it.
+        await _provision_job_pods(
+            remaining, approved=approved, dependencies=dependencies
+        )
 
     # Phase 2: Preemption (non-blocking). D1 placeability guard: only
     # workspace-ready jobs (dispatchable_jobs, not the full pending set)
     # may drive preemption — pausing a running job to free an agent is
-    # pointless for a job that has no workspace to run in.
-    remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
+    # pointless for a job that has no workspace to run in. Default-image
+    # jobs only: preempting frees a default pod, which a custom-image job
+    # cannot run on.
+    remaining = [
+        j
+        for j in dispatchable_jobs
+        if str(j["id"]) not in claimed_job_ids and _job_harness_image(j) is None
+    ]
     if not remaining:
         return
 

@@ -647,6 +647,7 @@ class _AgentPool:
         self.is_available = True
         self.max_agents = 5
         self.active_count = AsyncMock(return_value=0)
+        self.active_count_for_image = AsyncMock(return_value=0)
         self.provision_agent = AsyncMock(return_value="srw-agent-j-1")
 
 
@@ -940,6 +941,209 @@ class TestClaimedJobsAreNotPending:
         await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
 
         pool.provision_agent.assert_awaited_once_with(purpose="job")
+
+
+CUSTOM = "example.invalid/h@sha256:" + "b" * 64
+APPROVED = ({"name": "cc", "image": CUSTOM},)
+
+
+def _approved_store(**kwargs: Any) -> FakeStore:
+    store = FakeStore(**kwargs)
+    store.manifest_approved_images = APPROVED
+    return store
+
+
+class TestHarnessImagePairing:
+    """A job runs only on a pod of its harness image: NULL ``harness_image``
+    is the installed default; a custom image is one on the approved list,
+    cold-started for its job (swappable harness image, Task 8)."""
+
+    @pytest.mark.asyncio
+    async def test_a_custom_job_never_takes_a_default_pod(self, no_dispatcher_error):
+        job = _job("j1", harness_image=CUSTOM)
+        store = _approved_store(
+            pinned=[job], agents=[{"id": "a1", "metadata": {}, "image": None}]
+        )
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+        pool.provision_agent.assert_awaited_once_with(purpose="job", image=CUSTOM)
+
+    @pytest.mark.asyncio
+    async def test_a_default_job_never_takes_a_custom_pod(self, no_dispatcher_error):
+        job = _job("j1")
+        store = _approved_store(
+            pinned=[job], agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+
+    @pytest.mark.asyncio
+    async def test_an_agent_without_an_image_column_serves_default_jobs(
+        self, no_dispatcher_error
+    ):
+        job, agent = _job("j1"), {"id": "a1", "metadata": {}}
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_each_job_lands_on_a_pod_of_its_image(self, no_dispatcher_error):
+        j1, j2 = _job("j1"), _job("j2", harness_image=CUSTOM)
+        a2 = {"id": "a2", "metadata": {}, "image": CUSTOM}
+        a1 = {"id": "a1", "metadata": {}, "image": None}
+        store = _approved_store(pinned=[j1, j2], agents=[a2, a1])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        assert [c.args for c in delivery.dispatch.await_args_list] == [
+            (j1, a1),
+            (j2, a2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_custom_pod_skips_the_stale_sha_check(
+        self, monkeypatch, no_dispatcher_error
+    ):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-new")
+        job = _job("j1", harness_image=CUSTOM)
+        agent = {"id": "a2", "metadata": {"build_sha": "whatever"}, "image": CUSTOM}
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_an_old_default_pod_is_still_skipped_as_stale(
+        self, monkeypatch, no_dispatcher_error
+    ):
+        """After an upgrade the previous release's pods report their old tag.
+        Not on the approved list, they stay default-class: skipped as stale,
+        never mistaken for a custom image."""
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-new")
+        j1, j2 = _job("j1"), _job("j2", harness_image=CUSTOM)
+        old = {
+            "id": "a0",
+            "metadata": {"build_sha": "old"},
+            "image": "srw-agent:sha-old",
+        }
+        store = _approved_store(pinned=[j1, j2], agents=[old])
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job"},
+            {"purpose": "job", "image": CUSTOM},
+        ]
+        assert any(
+            "Skipping stale worker agent a0" in r.getMessage()
+            for r in no_dispatcher_error.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_starting_custom_pod_is_not_provisioned_twice(
+        self, no_dispatcher_error
+    ):
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM)])
+        pool = _AgentPool()
+        pool.active_count_for_image = AsyncMock(return_value=1)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.active_count_for_image.assert_awaited_once_with(CUSTOM)
+        pool.provision_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("live", "started"), [(0, 2), (1, 1), (2, 0), (3, 0)])
+    async def test_a_custom_image_gets_one_pod_per_pending_job_less_its_live_pods(
+        self, live, started, no_dispatcher_error
+    ):
+        jobs = [_job(f"j{i}", harness_image=CUSTOM) for i in (1, 2)]
+        store = _approved_store(pinned=jobs)
+        pool = _AgentPool()
+        pool.active_count_for_image = AsyncMock(return_value=live)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.active_count_for_image.assert_awaited_once_with(CUSTOM)
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM}
+        ] * started
+
+    @pytest.mark.asyncio
+    async def test_a_custom_pod_respects_the_agent_ceiling(self, no_dispatcher_error):
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM)])
+        pool = _AgentPool()
+        pool.active_count = AsyncMock(return_value=pool.max_agents)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_image_off_the_approved_list_provisions_nothing(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1", harness_image=CUSTOM)
+        store = FakeStore(
+            pinned=[job], agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        pool.provision_agent.assert_not_awaited()
+        assert store.called("update_job_status") == []
+        assert any(
+            r.levelno == logging.WARNING
+            and "j1" in r.getMessage()
+            and CUSTOM in r.getMessage()
+            for r in no_dispatcher_error.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_custom_job_preempts_nothing(self, no_dispatcher_error):
+        """Pausing a running job frees a default pod, which cannot serve a
+        custom job."""
+        candidate = {"id": "running", "priority": 1, "assigned_agent_id": "a9"}
+        store = _approved_store(
+            pinned=[_job("pending", priority=9, harness_image=CUSTOM)],
+            candidates=[candidate],
+        )
+        state, delivery = JobDispatchState(), FakeDelivery()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, state=state, delivery=delivery)
+        )
+        await _drain_tasks()
+
+        delivery.initiate_pause.assert_not_awaited()
+        assert state.pause_pending_job_ids == set()
 
 
 # =============================================================================
