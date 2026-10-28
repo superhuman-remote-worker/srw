@@ -1,10 +1,9 @@
 import {APP_INITIALIZER, ApplicationConfig, isDevMode, provideBrowserGlobalErrorListeners} from '@angular/core';
 import {provideRouter, withViewTransitions} from '@angular/router';
 import {provideServiceWorker} from '@angular/service-worker';
-import {HttpClient, provideHttpClient, withInterceptors} from '@angular/common/http';
+import {provideHttpClient, withInterceptors} from '@angular/common/http';
 import {registerLocaleData} from '@angular/common';
 import localeDe from '@angular/common/locales/de';
-import {firstValueFrom} from 'rxjs';
 import {authInterceptor} from './core/interceptors/auth.interceptor';
 import {viewAsInterceptor} from './core/interceptors/view-as.interceptor';
 import {MARKED_EXTENSIONS, MARKED_OPTIONS, SANITIZE, provideMarkdown} from 'ngx-markdown';
@@ -13,14 +12,12 @@ import {mathExtension} from './core/markdown/math-extension';
 import {externalImageExtension} from './core/markdown/external-image-extension';
 import {markdownLinkExtension} from './core/markdown/link-extension';
 import {sanitizeMarkdownHtml} from './core/markdown/markdown-sanitizer';
-import {SessionService} from './core/services/session.service';
 import {UserService} from './core/services/user.service';
 import {SettingsService} from './core/services/settings.service';
 import {I18nService, SUPPORTED_LANGS, DEFAULT_LANG} from './core/services/i18n.service';
 import {TranslocoHttpLoader} from './core/services/transloco-loader';
 import {provideTransloco} from '@jsverse/transloco';
 import {provideTranslocoLocale} from '@jsverse/transloco-locale';
-import {User} from './core/models/api.model';
 import {environment} from './core/environment';
 
 import {routes} from './app.routes';
@@ -42,27 +39,18 @@ registerLocaleData(localeDe, 'de-DE');
  * route via /auth/callback's `return_to` redirect.
  */
 function authBootstrap(
-  http: HttpClient,
-  session: SessionService,
   userService: UserService,
   i18n: I18nService,
   settings: SettingsService,
 ): () => Promise<void> {
   return async () => {
     i18n.applyInitialLanguage();
-    try {
-      const resp = await firstValueFrom(
-        http.get<{ user: User }>(`${environment.apiUrl}/auth/me`),
-      );
-      if (resp?.user) {
-        userService.currentUser.set(resp.user);
-        session.authenticated.set(true);
-        userService.loadUsers();
-        settings.loadPreferences();
-      }
-    } catch {
-      // 401 — interceptor already kicked off the BFF login redirect. Swallow
-      // so app bootstrap resolves (the page is about to unload anyway).
+    // Never rejects: on a 401 the interceptor already kicked off the BFF
+    // login redirect (the page is about to unload); any other failure sets
+    // loadState 'failed' and the shell shows a Retry / Log out card.
+    if (await userService.loadCurrentUser()) {
+      userService.loadUsers();
+      settings.loadPreferences();
     }
   };
 }
@@ -107,7 +95,7 @@ export const appConfig: ApplicationConfig = {
     {
       provide: APP_INITIALIZER,
       useFactory: authBootstrap,
-      deps: [HttpClient, SessionService, UserService, I18nService, SettingsService],
+      deps: [UserService, I18nService, SettingsService],
       multi: true,
     },
     provideMarkdown({
