@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
 
-TOOL_NAMES = ("Bash", "Read", "Write", "Edit")
+from .tools import TOOL_NAMES
+
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 _CREDENTIAL_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")

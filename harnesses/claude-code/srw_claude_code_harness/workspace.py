@@ -53,7 +53,18 @@ from dataclasses import dataclass
 
 import asyncssh
 
-from .bindings import WorkspaceAccess
+
+@dataclass(frozen=True)
+class WorkspaceAccess:
+    host: str
+    port: int
+    user: str
+    root: str
+    private_key_file: str
+    known_hosts_file: str | None = None
+    # SHA256 fingerprint the job pins for the workspace host key (checked on connect).
+    host_key_fingerprint: str | None = None
+
 
 # Tool-facing file operations (stat, read, write, exists) end within this long.
 FILE_OP_TIMEOUT_SECONDS = 120.0

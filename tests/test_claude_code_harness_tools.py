@@ -301,3 +301,32 @@ async def test_edit_refuses_a_file_that_grew_past_the_limit_after_the_stat(
     assert out["is_error"] is True and "too large" in out["content"][0]["text"]
     limit = EDIT_MAX_BYTES + 1
     assert (limit, limit) in reads  # the content read was bounded
+
+
+@pytest.mark.asyncio
+async def test_write_and_edit_record_the_resolved_paths(workspace):
+    handlers = ToolHandlers(workspace)
+    assert handlers.written_paths == set()
+    await handlers.write({"file_path": "a.txt", "content": "x"})
+    await handlers.edit({"file_path": "a.txt", "old_string": "x", "new_string": "y"})
+    await handlers.write({"file_path": "sub/b.txt", "content": "z"})
+    await handlers.read({"file_path": "a.txt"})
+    await handlers.edit({"file_path": "missing", "old_string": "x", "new_string": "y"})
+    assert handlers.written_paths == {
+        workspace.resolve("a.txt"),
+        workspace.resolve("sub/b.txt"),
+    }
+
+
+def test_make_tools_uses_the_given_handlers(workspace):
+    pytest.importorskip("claude_agent_sdk")
+    handlers = ToolHandlers(workspace)
+    tools = make_tools(workspace, ["Write"], handlers=handlers)
+    assert [t.name for t in tools] == ["Write"] and tools[0].handler == handlers.write
+
+
+def test_tool_names_live_in_tools_and_config_reexports_them():
+    from srw_claude_code_harness import config, tools
+
+    assert tools.TOOL_NAMES == ("Bash", "Read", "Write", "Edit")
+    assert config.TOOL_NAMES is tools.TOOL_NAMES

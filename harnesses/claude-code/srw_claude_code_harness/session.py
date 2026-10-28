@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import _CREDENTIAL_ENV, HarnessConfig, SystemPrompt
+from .job import JobSpec, ModelRoute
 from .transcript import Transcript
 
 if TYPE_CHECKING:
@@ -79,6 +80,17 @@ def cli_env(
     name, value = credential
     if name not in _CREDENTIAL_ENV:
         raise ValueError(f"credential must be one of {list(_CREDENTIAL_ENV)}")
+    env = _fixed_env(run_dir, path)
+    if not config.auto_compact:
+        env["DISABLE_AUTO_COMPACT"] = "1"
+    env[name] = value
+    if config.api_base_url:
+        env["ANTHROPIC_BASE_URL"] = config.api_base_url
+    return env
+
+
+def _fixed_env(run_dir: Path, path: str) -> dict[str, str]:
+    """Fixed CLI values plus the per-run ``home``, ``claude`` and ``tmp`` dirs."""
     dirs = {
         "HOME": run_dir / "home",
         "CLAUDE_CONFIG_DIR": run_dir / "claude",
@@ -89,11 +101,20 @@ def cli_env(
     env = dict(CLI_FIXED_ENV)
     env["PATH"] = path
     env.update({key: str(directory) for key, directory in dirs.items()})
-    if not config.auto_compact:
-        env["DISABLE_AUTO_COMPACT"] = "1"
-    env[name] = value
-    if config.api_base_url:
-        env["ANTHROPIC_BASE_URL"] = config.api_base_url
+    return env
+
+
+def route_env(route: ModelRoute, *, run_dir: Path, path: str) -> dict[str, str]:
+    """The CLI's environment for a job: fixed values plus the job's model route.
+
+    A route without a key (a keyless gateway) gets a placeholder, since the CLI
+    refuses to start without one. One trailing ``/v1`` is stripped from the base
+    URL because the CLI appends its own path.
+    """
+    env = _fixed_env(run_dir, path)
+    env["ANTHROPIC_API_KEY"] = route.api_key or "not-needed"
+    if route.base_url:
+        env["ANTHROPIC_BASE_URL"] = route.base_url.removesuffix("/v1")
     return env
 
 
@@ -131,6 +152,35 @@ def build_options(
         max_budget_usd=config.limits.max_budget_usd,
         effort=config.effort,
         thinking=dict(config.thinking) if config.thinking is not None else None,
+        env=dict(env),
+        cwd=cwd,
+        include_partial_messages=False,
+    )
+
+
+def job_options(
+    spec: JobSpec, *, tools: list, env: dict[str, str], cwd: Path
+) -> ClaudeAgentOptions:
+    """SDK options for a job: the same lockdown as ``build_options``, fed by the spec."""
+    from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server
+
+    prompt: dict[str, str] = {"type": "preset", "preset": "claude_code"}
+    if spec.instructions:
+        prompt["append"] = spec.instructions
+    return ClaudeAgentOptions(
+        tools=[],
+        mcp_servers={
+            MCP_SERVER_NAME: create_sdk_mcp_server(MCP_SERVER_NAME, "1.0.0", tools)
+        },
+        allowed_tools=[f"mcp__{MCP_SERVER_NAME}__{t.name}" for t in tools],
+        strict_mcp_config=True,
+        permission_mode="default",
+        setting_sources=[],
+        system_prompt=prompt,
+        model=spec.model.model,
+        max_turns=spec.limits.max_turns,
+        max_budget_usd=spec.limits.max_budget_usd,
+        effort=spec.effort,
         env=dict(env),
         cwd=cwd,
         include_partial_messages=False,

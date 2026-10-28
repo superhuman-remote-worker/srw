@@ -14,6 +14,8 @@ from srw_claude_code_harness.session import (
     MCP_SERVER_NAME,
     build_options,
     cli_env,
+    job_options,
+    route_env,
     run_session,
     scrub_process_environment,
 )
@@ -672,3 +674,73 @@ def test_transcript_survives_payloads_that_cannot_be_serialised(tmp_path):
     lines = _lines(tmp_path / "t.jsonl")
     assert [line["kind"] for line in lines] == ["cyclic", "tuple-keys"]
     assert all(isinstance(line["payload"], str) for line in lines)
+
+
+def test_route_env_strips_v1_and_fills_a_placeholder_key(tmp_path):
+    from srw_claude_code_harness.job import ModelRoute
+
+    env = route_env(
+        ModelRoute(
+            "m",
+            "anthropic",
+            "anthropic-messages",
+            "http://srw-codex-proxy:8317/v1",
+            None,
+        ),
+        run_dir=tmp_path,
+        path="/usr/bin",
+    )
+    assert env["ANTHROPIC_BASE_URL"] == "http://srw-codex-proxy:8317"
+    assert env["ANTHROPIC_API_KEY"] == "not-needed" and env["PATH"] == "/usr/bin"
+    assert env["HOME"] == str(tmp_path / "home") and (tmp_path / "tmp").is_dir()
+    assert env["DISABLE_TELEMETRY"] == "1"
+
+
+def test_route_env_without_base_url_keeps_the_key_only(tmp_path):
+    from srw_claude_code_harness.job import ModelRoute
+
+    env = route_env(
+        ModelRoute("m", "anthropic", "anthropic-messages", None, "sk"),
+        run_dir=tmp_path,
+        path="/usr/bin",
+    )
+    assert "ANTHROPIC_BASE_URL" not in env and env["ANTHROPIC_API_KEY"] == "sk"
+
+
+def _job_spec(instructions):
+    from srw_claude_code_harness.job import JobSpec, Limits, ModelRoute
+    from srw_claude_code_harness.workspace import WorkspaceAccess
+
+    return JobSpec(
+        job_id="j",
+        prompt="p",
+        instructions=instructions,
+        model=ModelRoute("m", "anthropic", "anthropic-messages", None, "k"),
+        workspace=WorkspaceAccess("h", 22, "u", "/w", "/k"),
+        pinned=None,
+        recipient=None,
+        limits=Limits(7, 3.0, 60),
+        effort="high",
+    )
+
+
+def test_job_options_use_the_spec():
+    pytest.importorskip("claude_agent_sdk")
+    from srw_claude_code_harness.tools import make_tools
+
+    tools = make_tools(_stub_workspace(), ["Bash", "Read"])
+    options = job_options(
+        _job_spec("Be terse."), tools=tools, env={"PATH": "/usr/bin"}, cwd=Path("/tmp")
+    )
+    assert options.system_prompt == {
+        "type": "preset",
+        "preset": "claude_code",
+        "append": "Be terse.",
+    }
+    assert (options.model, options.max_turns, options.max_budget_usd) == ("m", 7, 3.0)
+    assert options.effort == "high" and options.tools == []
+    assert options.allowed_tools == ["mcp__ws__Bash", "mcp__ws__Read"]
+    assert options.setting_sources == [] and options.strict_mcp_config is True
+    assert options.env == {"PATH": "/usr/bin"} and options.cwd == Path("/tmp")
+    plain = job_options(_job_spec(None), tools=tools, env={}, cwd=Path("/tmp"))
+    assert plain.system_prompt == {"type": "preset", "preset": "claude_code"}

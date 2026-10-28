@@ -14,6 +14,7 @@ from typing import Any
 
 from .workspace import Workspace, WorkspaceError, _failure
 
+TOOL_NAMES = ("Bash", "Read", "Write", "Edit")
 OUTPUT_LIMIT_CHARS = 30_000
 READ_DEFAULT_LIMIT = 2000
 READ_MAX_LINE_CHARS = 2000
@@ -66,6 +67,8 @@ class ToolHandlers:
         self.workspace = workspace
         self._bash_lock = asyncio.Lock()
         self._saved = 0
+        # Resolved absolute workspace paths that Write or Edit changed.
+        self.written_paths: set[str] = set()
 
     async def bash(self, args: dict) -> dict:
         try:
@@ -173,6 +176,7 @@ class ToolHandlers:
             # An existing target that is not a regular file is refused remotely
             # ("<path> is not a regular file"), so a FIFO cannot block the write.
             await self.workspace.write_bytes(resolved, data)
+            self.written_paths.add(resolved)
             return _ok(f"Wrote {len(data)} bytes to {resolved}")
         except WorkspaceError as exc:
             return _err(str(exc))
@@ -218,6 +222,7 @@ class ToolHandlers:
                 )
             text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
             await self.workspace.write_bytes(resolved, text.encode("utf-8"))
+            self.written_paths.add(resolved)
             n = count if replace_all else 1
             return _ok(f"Replaced {n} occurrence(s) in {resolved}")
         except WorkspaceError as exc:
@@ -288,7 +293,11 @@ _SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
 }
 
 
-def make_tools(workspace: Workspace, names: Sequence[str]) -> list:
+def make_tools(
+    workspace: Workspace,
+    names: Sequence[str],
+    handlers: ToolHandlers | None = None,
+) -> list:
     from claude_agent_sdk import tool
 
     annotations = None
@@ -299,7 +308,8 @@ def make_tools(workspace: Workspace, names: Sequence[str]) -> list:
     except Exception:  # noqa: BLE001 - optional hint only
         annotations = None
 
-    handlers = ToolHandlers(workspace)
+    if handlers is None:
+        handlers = ToolHandlers(workspace)
     methods = {
         "Bash": handlers.bash,
         "Read": handlers.read,

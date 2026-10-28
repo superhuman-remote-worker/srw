@@ -2,19 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from .config import ConfigError, _is_int, _object
+from .workspace import WorkspaceAccess
 
-
-@dataclass(frozen=True)
-class WorkspaceAccess:
-    host: str
-    port: int
-    user: str
-    root: str
-    private_key_file: str
-    known_hosts_file: str
+__all__ = ["WorkspaceAccess", "parse_bindings"]
 
 
 def _text(workspace: dict, key: str) -> str:
