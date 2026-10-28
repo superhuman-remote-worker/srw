@@ -33,8 +33,8 @@ viewer.
 For a user asking the agent to open a site, click through a page, or use an
 online service, explain the setup path if browser tools are missing:
 
-1. Open the chat header's **Settings** (sliders icon), or on a narrow screen
-   choose **Settings** from the header's three-dot menu.
+1. Open **Session settings** from the chat header's **More actions** (⋮)
+   menu, or click the model or permission-mode badge in the header.
 2. In the **Settings** tab, check **Workspace**. A Virtual or None session
    served by the shared executors can upgrade to a **Container** in place
    (choose **Container** and wait for it to finish); a session whose Container

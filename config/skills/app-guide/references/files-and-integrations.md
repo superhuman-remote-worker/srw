@@ -17,17 +17,27 @@ cloud storage.
 
 Jobs and sessions with file tools commonly use a structure with `documents/`
 (inputs you provided), `notes/` (the agent's working notes), and `output/`
-(deliverables), though an expert/task may add other files. Virtual workspaces
-keep durable cloud-backed files but do not have git. Container and VM
-workspaces can be git-versioned. None workspaces have no workspace files.
+(deliverables), though an expert/task may add other files. A session's
+workspace files, `notes/` included, belong to that session: other sessions
+and jobs do not see them, and they are not in your cloud storage or the
+project's knowledge.
+
+Virtual workspaces keep their own files in SRW's storage between turns and
+resumes. That storage is not your cloud storage, and a Virtual session has no
+shell, git, or IDE: its workspace files show only through the session, for
+example when the agent presents one on Canvas. A cloud folder attached to a
+Virtual session is different: it is reached at `cloud/<name>` like on any other
+tier (see Cloud storage below). Container and VM workspaces can be
+git-versioned. None workspaces have no workspace files.
 
 ## Git
 
 The built-in git server hosts repositories for git-capable workspaces:
 
-- **Workspace / Git buttons** (on job rows, in the chat header, in reviews)
-  appear when that record actually has a repository and open its files,
-  commits, phase tags, and branches.
+- **Workspace / Git buttons** (on job rows and in reviews; in a session, the
+  **Git** entry of the chat header's **More actions** (⋮) menu) appear when
+  that record actually has a repository and open its files, commits, phase
+  tags, and branches.
 - Standalone and project jobs can use different repository/branch layouts;
   delegated work may share a parent workspace. Use the links shown on the
   current record rather than assuming one repository per job.
@@ -41,12 +51,41 @@ sign-on).
 ## Cloud storage
 
 Shared cloud file storage (WebDAV-based) connects agent work to files humans
-can open:
+can open. A cloud folder reaches an agent as a connector and appears in its
+workspace at `cloud/<name>`. Only a file written there can reach the cloud
+(directly at **Read-write**, after the user's review at **Protected**, never
+at **Read-only**); a file written anywhere else in the workspace does not.
 
-- **Projects** can have a cloud folder (see project settings) — agents read
-  from and, if allowed, write to it; **Open folder** takes you there.
-- **Sessions** can have a files folder — the **Files** button in the chat
-  header opens it.
+- **Projects** can have their own cloud folder: **Open Project Folder** on the
+  project's Overview opens it. What agents may do in it is the folder's
+  **Default access** (**Read-only**, **Protected**, or **Read-write**, as far
+  as the cloud offers each), set on the project's **Connectors** tab under
+  **Cloud folders**; a session can choose another level when it is created.
+- A **personal project** has no folder of its own. Its cloud is its owner's
+  **My cloud** (connected once on the **Connectors** page), which only the
+  owner's own sessions mount; adding a member to a personal project shares no
+  files.
+- **Sessions** can have a session folder in the cloud (the **Session outbox**
+  connector). While one is attached, **Files** in the chat header's **More
+  actions** (⋮) menu opens it, and an ended session keeps a **Files** button
+  in the header. A session without a session folder has no **Files** entry,
+  and the chat offers no other download of its workspace files. With the
+  outbox attached, the agent hands you a file by writing it into
+  `cloud/outbox`.
+- **Virtual** sessions reach attached cloud folders too, at the same
+  `cloud/<name>` path, with the agent's file tools and no shell: there is no
+  workspace Pod, and each file operation goes to the cloud directly. Listings
+  and searches under `cloud/` are bounded and say when they stopped (a search
+  considers at most 200 files), a search across the whole workspace is refused
+  while folders are attached (name a folder instead), reads above 50 MiB are
+  refused, and a write to a **Read-only** folder fails as a tool error.
+- On Virtual today that covers **Nextcloud**: a project folder at
+  **Read-only** or **Read-write**, **My cloud**, and the session outbox. A
+  folder at **Protected**, or on a cloud that has no Virtual delivery yet (a
+  cloud that signs in with a token, such as OpenCloud), needs a Container. A
+  new session whose default connectors include such a folder starts on a
+  Container when Containers are allowed; a session that stays Virtual lists
+  the folder it left out and why.
 - **Jobs** can **Export to Cloud** — copy deliverables into the shared
   folder — and some project-job reviews happen directly in a cloud folder.
 
@@ -56,16 +95,18 @@ Workspaces on a custom image (not one of SRW's) run unprivileged, so they have n
 mount unless your operator sets the Helm value `workspace.customImages.privileged`.
 
 A normal writable session mount is live. On deployments that enable it,
-**Protected Cloud** is a separate creation-time session mode: an eligible
-Nextcloud project folder is exposed through a private staging layer, and the
-user applies or rejects the whole diff from the session's **Cloud changes**
-review panel. It currently requires a Container workspace; route setup,
-review, and failure questions to the focused protected-cloud guide.
+**Protected** is a project cloud folder's access level chosen when a session
+is created: an eligible Nextcloud project folder is exposed through a private
+staging layer, and the user applies or rejects the whole diff from the review
+banner above the conversation (**Review changes**). It currently requires a
+Container workspace; route setup, review, and failure questions to the focused
+protected-cloud guide.
 
 ## The in-browser IDE
 
-When a full workspace supports it, **IDE** buttons (jobs list, chat header,
-job review) open the agent's workspace in a browser-based code editor—the
+When a full workspace supports it, **IDE** buttons (jobs list, job review,
+and the chat header's **More actions** (⋮) menu) open the agent's workspace in
+a browser-based code editor—the
 fastest way to inspect what an agent produced or make a quick edit. It starts
 on demand, so give it a moment on first open. Virtual and None sessions do not
 provide this workspace IDE.

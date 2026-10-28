@@ -47,14 +47,18 @@ The project page has tabs:
   interactive session wearing his identity — while it is open his background
   loop holds), or retire him. He supervises jobs, owns the backlog, and pages
   only when something genuinely needs the user.
-- **Settings** — rename, default agent config, memory sharing across jobs,
-  cloud storage folder and its read-only toggle, archive/delete. Workspace
-  network access is admin-controlled.
+- **Settings** — rename, default agent config, memory sharing across jobs, a
+  link to the project's cloud folder under **Cloud Storage**, archive/delete.
+  Workspace network access is admin-controlled.
 
-The Settings **read-only** cloud toggle prevents project work from writing to
-that folder. It is not Protected Cloud review: Protected Cloud is an eligible
-persistent session's creation-time staging workflow and has its own focused
-guide.
+There is no read-only switch in Settings. What agents may do in the project's
+cloud folder is the folder's **Default access** on the **Connectors** tab under
+**Cloud folders**: **Read-only**, **Protected**, or **Read-write**, as far as
+the cloud offers each. A session can choose another level when it is created,
+within what your role allows. **Protected** stages a session's writes for the
+user's review and has its own focused guide. A personal project has no folder
+of its own: its cloud is the owner's **My cloud**, and adding a member shares
+no files.
 
 ## Practical guidance
 

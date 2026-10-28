@@ -20,9 +20,10 @@ personal default, or operator-chosen application default can replace it.
 Start one from **Sessions → New Session**: pick a title, a **Project** (a
 session has one project or none; choose **No project** for none), an expert,
 and adjust the agent settings (model, permission mode, tools, connectors) if
-the defaults don't fit. Eligible deployments also offer a
-creation-time **Protected cloud** checkbox for staging changes to a
-non-default Nextcloud project; use its focused guide before relying on it.
+the defaults don't fit. On eligible deployments a non-default Nextcloud
+project's cloud folder can be attached at the **Protected** access level,
+which stages the agent's changes to it for review; the level is chosen at
+creation. Use the focused protected-cloud guide before relying on it.
 
 ## What the session agent can do
 
@@ -39,7 +40,11 @@ tool-specific; do not infer that it re-fetched every upstream policy merely
 because an earlier capability snapshot said `can_execute`.
 
 - **Work with files** when the session uses a Virtual or full workspace.
-  Container and VM workspaces add git; None is chat-only.
+  Container and VM workspaces add git; None is chat-only. These files,
+  `notes/` included, belong to this session: other sessions do not see them,
+  and they are not in your cloud storage or the project's knowledge. Work
+  that must reach later sessions or other people goes to project knowledge,
+  a cloud folder, or a pushed repository.
 - **Run shell commands** when a shell-capable Container or VM workspace, the
   expert configuration, and the user's grants all allow it.
 - **Research the web** — search, read pages, crawl sites, find and download
@@ -108,16 +113,20 @@ deployment authorization.
 - **Progress**: a collapsible checklist shows the agent's current todos; a
   token-usage panel shows context fill; reasoning and tool calls can be
   expanded or collapsed.
-- **Header buttons**: **Settings** (including the live workspace and tool
-  controls), **Citations** (once anything is cited), **Files** (when a cloud
-  folder is available), and workspace-dependent **Git**, **IDE**, **Canvas**,
-  or shared-browser actions.
+- **Header**: the model and permission-mode badges (each opens **Session
+  settings**), the **Canvas** and shared-browser buttons when the session
+  offers them, **Disconnect**, and a **More actions** (⋮) menu. That menu
+  always holds **Copy session ID**, **Session settings** (including the live
+  workspace and tool controls), and **View options**; it adds **Citations**
+  once anything is cited, **Files** only when the session has a session folder
+  in the cloud, and **Git**, **IDE**, or **SSH** when the workspace provides
+  them. A session without a session folder has no **Files** entry anywhere.
 
 ## Change this session while keeping the conversation
 
-1. While connected, open **Settings** using the sliders icon in the chat
-   header. On a narrow screen, open the header's three-dot menu and choose
-   **Settings**. This opens **Session settings** beside the conversation.
+1. While connected, open the chat header's **More actions** (⋮) menu and
+   choose **Session settings**, or click the model or permission-mode badge
+   in the header. **Session settings** opens beside the conversation.
 2. In its **Settings** tab, change **Workspace**, permission mode, narration,
    model, temperature, or the model's supported reasoning level. The **Tools**
    and **Connectors** sections are in the same tab. The live pane has no

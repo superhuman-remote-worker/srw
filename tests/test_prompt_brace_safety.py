@@ -162,6 +162,29 @@ def test_interactive_prompt_protected_cloud_block_renders(prompt_path: Path):
     assert "{%" not in off, f"{prompt_path}: Jinja residue when OFF"
 
 
+@pytest.mark.parametrize(
+    "prompt_path",
+    _INTERACTIVE_PROMPTS,
+    ids=lambda p: str(p.relative_to(_REPO_ROOT)),
+)
+def test_interactive_prompt_says_where_a_save_lands(prompt_path: Path):
+    """Session fa2a9885 (agent_claims_lasting_memory_for_session_local_files):
+    every scaffold offered notes/ as an equal kind of persistence and called
+    the workspace a place files are "saved", so the agent told its user
+    "Gespeichert" and "from now on" for files only that session could see.
+    The review panel it named ("Cloud changes" in the session header) is now
+    a banner whose button is "Review changes"."""
+    text = " ".join(prompt_path.read_text().split())
+    assert "Files you create or modify are saved there" not in text
+    assert "kb_write or notes/." not in text
+    assert "other sessions do not see them" in text
+    assert "notes/ files keep context for this session" in text
+    assert "unless a durable write (kb_write, a cloud folder) succeeded" in text
+    assert 'starts with "Error:" saved nothing' in text
+    assert '"Cloud changes" in the session header' not in text
+    assert '"Review changes" on the banner above the conversation' in text
+
+
 def test_protected_cloud_sweep_covers_all_interactive_variants():
     """Guards the glob: all four shipped interactive variants must be swept."""
     names = {p.name for p in _INTERACTIVE_PROMPTS}

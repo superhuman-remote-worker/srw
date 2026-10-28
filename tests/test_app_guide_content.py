@@ -512,6 +512,53 @@ def test_project_loop_guide_covers_current_parallel_roles_and_campaign_defaults(
     )
 
 
+def test_guide_names_only_session_controls_and_cloud_settings_that_exist():
+    """Session fa2a9885 (app_guide_describes_ui_and_cloud_that_no_longer_exist):
+    the agent sent its user to a Files button, a sliders icon, a narrow-screen
+    three-dot menu and a project read-only toggle, none of which exist, and
+    called Virtual files "cloud-backed". Every secondary header control is in
+    the More actions (⋮) menu (persistent-chat.component.ts), Files only with
+    a session folder, and a cloud folder's access is its Default access level
+    on the Connectors tab (project-detail.component.ts)."""
+    for path in sorted((_GUIDE / "references").glob("*.md")):
+        body = " ".join(path.read_text(encoding="utf-8").lower().split())
+        for stale in (
+            "sliders icon",
+            "narrow screen",
+            "three-dot",
+            "read-only toggle",
+            "read-only** cloud",
+            "cloud-backed",
+            "**files** button in the chat header",
+            "cloud changes (n)",
+        ):
+            assert stale not in body, (path.name, stale)
+
+    _, sessions = _focused_topic("sessions")
+    assert "a **more actions** (⋮) menu" in sessions
+    assert "**files** only when the session has a session folder in the cloud" in (
+        sessions
+    )
+    assert "other sessions do not see them" in sessions
+    _, files = _focused_topic("files-and-integrations")
+    assert "a session without a session folder has no **files** entry" in files
+    assert "that storage is not your cloud storage" in files
+    # Cloud folders on Virtual (8eb8c88e1, the cloud_remote form): a Virtual
+    # Session reaches Nextcloud folders at cloud/<name> with its file tools;
+    # only a protected folder or a provider without the Virtual delivery
+    # still needs a Container (thread_admission._cloud_rows_a_container_gets).
+    assert "do not mount cloud folders" not in files
+    assert "**virtual** sessions reach attached cloud folders too" in files
+    assert "with the agent's file tools and no shell" in files
+    assert "a folder at **protected**, or on a cloud that has no virtual" in files
+    _, tiers = _focused_topic("permissions-and-availability")
+    assert "cloud-folder mount" not in tiers
+    assert "attached nextcloud folders" in tiers
+    _, projects = _focused_topic("projects-and-loops")
+    assert "there is no read-only switch in settings" in projects
+    assert "**default access** on the **connectors** tab" in projects
+
+
 def test_protected_cloud_guide_keeps_current_eligibility_review_and_safety_boundaries():
     _, body = _focused_topic("protected-cloud")
 
@@ -531,8 +578,14 @@ def test_protected_cloud_guide_keeps_current_eligibility_review_and_safety_bound
         assert unsupported in body
     assert "creation-time choice" in body
     assert "cannot be switched during a session" in body
-    assert "cloud changes (n)" in body
-    assert "**apply to cloud**" in body and "**reject all**" in body
+    # Protected is a cloud folder's access level now, not a session checkbox;
+    # the review opens from a banner, not a "Cloud changes (N)" badge
+    # (cloud-review-banner.component.ts).
+    assert "checkbox" not in body and "cloud changes (n)" not in body
+    assert "set the project's cloud folder to" in body
+    assert "**protected**, then create the session" in body
+    assert "says how many cloud changes are waiting for your review" in body
+    assert "**apply to cloud**" in body and "or **reject staged" in body
     assert "whole-diff in v1" in body
     assert "agent cannot apply or reject" in body
     assert "reject is permanent" in body
@@ -541,7 +594,7 @@ def test_protected_cloud_guide_keeps_current_eligibility_review_and_safety_bound
     assert "exact staged epoch" in body
     assert "changed a touched cloud path externally" in body
     assert "partial apply" in body and "safe to repeat" in body
-    assert "badge appears only when the staged count is greater than zero" in body
+    assert "banner appears only when the staged count is" in body
     assert "do not look for a force button" in body
 
 

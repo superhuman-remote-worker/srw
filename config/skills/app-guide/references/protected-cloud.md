@@ -11,55 +11,62 @@ journey_ids:
 # Protected Cloud — stage session changes before they reach the cloud
 
 An ordinary writable cloud mount is **live**: an agent's write or delete can
-reach the real folder immediately. **Protected Cloud** gives one persistent
-session a read-only view of a project folder plus a private staging layer.
-Files under `cloud/` look writable to the agent, but additions,
-edits, and deletions remain staged until the user explicitly applies the
-whole diff.
+reach the real folder immediately. **Protected** is a project cloud folder's
+access level that gives one persistent session a read-only view of that folder
+plus a private staging layer. Files under `cloud/` look writable to the agent,
+but additions, edits, and deletions remain staged until the user explicitly
+applies the whole diff.
 
-This is different from a project's **read-only** cloud setting. Read-only
-prevents writes; Protected Cloud lets the agent prepare writes for review.
-It is also different from a project job's pending-review diff, which uses the
-job workflow and retains git history.
+This is different from the folder's **Read-only** level, which prevents
+writes; Protected lets the agent prepare writes for review. There is no
+read-only switch in project Settings: a folder's levels are set on the
+project's **Connectors** tab under **Cloud folders** (**Default access**). It
+is also different from a project job's pending-review diff, which uses the job
+workflow and retains git history.
 
 ## In this guide
 
-- [When the checkbox is available](#when-the-checkbox-is-available)
+- [When Protected is available](#when-protected-is-available)
 - [Create and use a protected session](#create-and-use-a-protected-session)
 - [Safety and failure behavior](#safety-and-failure-behavior)
 - [If it seems unavailable](#if-it-seems-unavailable)
 
-## When the checkbox is available
+## When Protected is available
 
-Protected Cloud is deployment-dependent and currently requires all of:
+Protected is deployment-dependent and currently requires all of:
 
 - the deployment's Protected Cloud feature flag is enabled;
-- at least one selected project is a **non-default Nextcloud** project with a
-  cloud folder; and
+- the session attaches the cloud folder of a **non-default Nextcloud**
+  project; and
 - the new session uses the **Container** workspace.
 
-It is not the current path for the personal/default project, OpenCloud,
-Google Drive, Microsoft 365, Virtual, None, or VM workspaces. If several
-project mounts are attached, v1 protects the **first eligible Nextcloud
-project mount**; the Cloud changes tooltip names the protected mount.
+It is not the current path for the personal/default project (its **My cloud**
+has full access only), OpenCloud, Google Drive, Microsoft 365, Virtual, None,
+or VM workspaces. Where Protected cannot be used, the folder's access choice
+shows it as not offered. Only one folder can be protected, and a protected
+session mounts no other cloud folder beside it. Among a session's mounts, v1
+protects the **first eligible Nextcloud project mount**; the review banner
+names the protected folder.
 
-The checkbox is a creation-time choice and cannot be switched during a
-session. The static guide cannot tell whether this deployment enabled it:
-the presence of the checkbox and the session's actual cloud state are the
-authority.
+The level is a creation-time choice and cannot be switched during a session.
+The static guide cannot tell whether this deployment enabled it: the levels
+the New Session form offers for the folder and the session's actual cloud
+state are the authority.
 
 ## Create and use a protected session
 
 1. Go to **Sessions → New Session** and select the eligible project.
-2. Enable **Protected cloud — agent writes are staged for your review**.
-3. In the **Workspace** field, choose a **Container** template (for example
-   `container-full`), then create the session.
+2. In the **Workspace** field, choose a **Container** template (for example
+   `container-full`).
+3. Under the session's connectors, set the project's cloud folder to
+   **Protected**, then create the session.
 4. Ask the agent to work in `cloud/`. It should describe completed
    cloud writes as “staged for your review,” not saved or shared.
-5. After a turn stages at least one change, click **Cloud changes (N)** in the
-   session status bar. Inspect each added, modified, or deleted path.
-6. Choose **Apply to cloud** to write every staged change, or **Reject all** to
-   discard every staged change.
+5. After a turn stages at least one change, a banner above the conversation
+   says how many cloud changes are waiting for your review. Click **Review
+   changes** and inspect each added, modified, or deleted path.
+6. Choose **Apply to cloud** to write every staged change, or **Reject staged
+   changes** to discard every staged change. Each asks you to confirm.
 
 Review is file-by-file, but the decision is whole-diff in v1: there is no
 per-file apply/reject. Text files get an old/new diff. Binary files are
@@ -77,8 +84,8 @@ Cockpit, so use the cloud provider's own history or trash if recovery matters.
   mount. Start a new Container session or ask an administrator to inspect the
   recorded protected-cloud error.
 - Staging runs after turns and is best-effort. A failed stage does not fail the
-  chat turn; the previous staged epoch remains. The badge tooltip's
-  **last staged** time helps identify stale review data.
+  chat turn; the previous staged epoch remains. The banner's **staged** time
+  helps identify stale review data.
 - Apply is pinned to the exact staged epoch the panel loaded. If a newer turn
   staged changes meanwhile, Cockpit reloads the latest diff instead of applying
   stale content.
@@ -98,13 +105,15 @@ already-resolved, identical content after resume; reject that duplicate diff.
 
 ## If it seems unavailable
 
-- **No checkbox:** verify that a non-default Nextcloud project is selected;
+- **Protected is not offered for the folder:** verify that a non-default
+  Nextcloud project is selected and that the workspace is a Container;
   otherwise the deployment flag may be off.
-- **Checkbox selected but no `cloud/`:** Protected Cloud requires a
-  Container, or the read-only engage failed. It will not silently mount live
-  storage.
-- **No Cloud changes badge:** the badge appears only when the staged count is
-  greater than zero. Finish a turn that changes `cloud/`; if repeated
+- **Protected chosen but no `cloud/`:** the read-only engage failed; the
+  session says **Protected cloud unavailable** and runs without a cloud
+  folder. It will not silently mount live storage.
+- **No review banner:** the banner appears only when the staged count is
+  greater than zero, or, when the count could not be checked, it says so and
+  offers **Check again**. Finish a turn that changes `cloud/`; if repeated
   turns never stage, ask an administrator to check the staging transport and
   service health.
 - **Apply says the diff changed:** review the automatically reloaded epoch.

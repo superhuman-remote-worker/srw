@@ -13,7 +13,7 @@ journey_ids:
 
 **Superhuman Remote Worker (SRW)** runs AI agents that do real work for you:
 research, writing, analysis, design, and software development. Agents work in
-isolated environments ranging from instant cloud-backed files to full
+isolated environments ranging from instant file-only workspaces to full
 git-versioned containers and VMs. They can be given scoped access to your data,
 check in with you as much or as little as you choose, and get smarter over time
 through explicit project knowledge and, when enabled and healthy, shared

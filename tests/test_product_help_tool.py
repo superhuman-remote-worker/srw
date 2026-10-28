@@ -117,7 +117,7 @@ def test_reader_serves_project_loop_and_protected_cloud_topics_independently():
 
     assert "close the campaign, not the overall project loop" in loop
     assert "Reject is permanent" not in loop
-    assert "Cloud changes (N)" in protected
+    assert "Only one folder can be protected" in protected
     assert "Reject is permanent" in protected
     assert "close the campaign, not the overall project loop" not in protected
 
