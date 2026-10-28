@@ -362,12 +362,15 @@ async def update_user(
     body: UserUpdate,
     dependencies: UserAdministrationDependencies,
 ) -> dict[str, str]:
-    """Update a user."""
+    """Update a user's display name and avatar colour.
+
+    The route has authorised the edit (the caller's own profile, or an
+    admin's edit); e-mail is not part of the body (``UserUpdate``).
+    """
     success = await dependencies.store.update_user(
         user_id=user_id,
         display_name=body.display_name,
         avatar_color=body.avatar_color,
-        email=body.email,
     )
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")

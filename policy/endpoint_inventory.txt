@@ -581,7 +581,7 @@ GET    /api/users/me/capabilities                                               
 GET    /api/users/me/product-capabilities                                               pat=admin           gated:require_thread_owner
 DELETE /api/users/{user_id}                                                             pat=admin           admin:_require_admin
 GET    /api/users/{user_id}                                                             pat=admin           gated:require_approved_user
-PUT    /api/users/{user_id}                                                             pat=admin           gated:require_approved_user
+PUT    /api/users/{user_id}                                                             pat=admin           admin:_require_admin
 GET    /api/vms                                                                         pat=admin           admin:_require_admin
 POST   /api/vms                                                                         pat=jobs:write      gated:require_job_access
 DELETE /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access
