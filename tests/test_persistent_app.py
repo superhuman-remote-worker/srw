@@ -6155,7 +6155,7 @@ class TestAttachSessionEventJournalFailure:
             shell_owner_token=61,
             stateless_warm_reuse_safe=False,
             tool_context=SimpleNamespace(
-                citation_verdict_callback=MagicMock(),
+                citation_event_callback=MagicMock(),
                 canvas_event_callback=MagicMock(),
             ),
             cleanup=AsyncMock(),
@@ -6188,7 +6188,7 @@ class TestAttachSessionEventJournalFailure:
             def __init__(self, *args, **kwargs):
                 self.postgres_conn = fake_db
                 self.tool_context = SimpleNamespace(
-                    citation_verdict_callback=None,
+                    citation_event_callback=None,
                 )
                 self.cleanup = AsyncMock()
                 instances.append(self)
@@ -6247,7 +6247,7 @@ class TestAttachSessionEventJournalFailure:
             preserve_shell=True,
             preserve_workspace_daemons=False,
         )
-        assert instances[0].tool_context.citation_verdict_callback is None
+        assert instances[0].tool_context.citation_event_callback is None
         writer_cls.assert_not_called()
         broadcast.assert_not_called()
         assert mod._session is None

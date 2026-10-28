@@ -196,8 +196,16 @@ _POST_SPLIT_TOOL_ADDITIONS: dict[str, dict[str, tuple[str, ...]]] = {
     # root's knowledge category, so every expert that inherits it gained it.
     # kb_retrieval_hardening T7: kb_grep (literal/regex enumeration) joined
     # the shared root's knowledge category alongside kb_search.
-    "worker": {"knowledge": ("kb_delete", "kb_grep")},
-    "session": {"knowledge": ("kb_delete", "kb_grep")},
+    # Citation engine overhaul (D7): withdraw_citation joined the shared root's
+    # citation category next to edit_citation (flag, never delete).
+    "worker": {
+        "knowledge": ("kb_delete", "kb_grep"),
+        "citation": ("withdraw_citation",),
+    },
+    "session": {
+        "knowledge": ("kb_delete", "kb_grep"),
+        "citation": ("withdraw_citation",),
+    },
 }
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->
 #: skill names). The list replaces wholesale on merge, so a dotted path cannot

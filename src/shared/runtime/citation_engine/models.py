@@ -22,12 +22,29 @@ class SourceType(str, Enum):
 
 
 class VerificationStatus(str, Enum):
-    """Status of citation verification."""
+    """Status of citation verification.
+
+    ``failed`` means the check ran and the citation does not hold (the reader
+    sees "Unverified"); ``unverified`` means no check could run (the reader
+    sees "Not checked"). Neither deletes anything: a citation is flagged, and
+    the agent re-points or withdraws it (owner ruling D7).
+    """
 
     PENDING = "pending"
     VERIFIED = "verified"
     FAILED = "failed"
-    UNVERIFIED = "unverified"  # Skipped verification (optional)
+    UNVERIFIED = "unverified"  # No check ran: verifier off, down, or no source
+
+
+class VerificationReason(str, Enum):
+    """Why a citation is not verified (``citations.verification_reason``)."""
+
+    QUOTE_NOT_FOUND = "quote_not_found"  # the verbatim quote is not in the source
+    NOT_SUPPORTED = (
+        "not_supported"  # the verifier says the passage doesn't back the claim
+    )
+    SOURCE_UNAVAILABLE = "source_unavailable"  # the source row or its text is missing
+    NOT_CHECKED = "not_checked"  # the verifier is off or failed
 
 
 class ExtractionMethod(str, Enum):
@@ -172,6 +189,9 @@ class Citation:
         similarity_score: How closely quote matched source (0-1)
         matched_location: Where the quote was found during verification
         created_by: Agent/session identifier for audit trails
+        verification_reason: A ``VerificationReason`` code when not verified
+        withdrawn_at: When the agent withdrew the citation (None = in use)
+        withdrawn_reason: The agent's reason for withdrawing it
     """
 
     id: int
@@ -190,6 +210,9 @@ class Citation:
     similarity_score: float | None = None
     matched_location: dict[str, Any] | None = None
     created_by: str | None = None
+    verification_reason: str | None = None
+    withdrawn_at: datetime | None = None
+    withdrawn_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert citation to dictionary for JSON serialization."""
@@ -212,6 +235,11 @@ class Citation:
             "matched_location": self.matched_location,
             "created_at": self.created_at.isoformat(),
             "created_by": self.created_by,
+            "verification_reason": self.verification_reason,
+            "withdrawn_at": (
+                self.withdrawn_at.isoformat() if self.withdrawn_at else None
+            ),
+            "withdrawn_reason": self.withdrawn_reason,
         }
 
 
@@ -224,7 +252,7 @@ class CitationResult:
     Contains the citation ID to embed in prose and verification results.
 
     Attributes:
-        citation_id: The ID to embed in prose, e.g., [1], [2]
+        citation_id: The record id; the agent writes it as the handle [^c<id>]
         verification_status: verified | unverified | failed | pending
         similarity_score: How closely quote matched source (0-1)
         matched_location: Where the quote was found (if verified)
@@ -244,8 +272,10 @@ class CitationResult:
     verification_notes: str | None = None
 
     def __str__(self) -> str:
-        """Return citation reference for embedding in prose."""
-        return f"[{self.citation_id}]"
+        """Return the handle the agent writes in prose (``[^c1241]``)."""
+        from shared.citation_handles import format_handle
+
+        return format_handle(self.citation_id)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert result to dictionary for JSON serialization."""

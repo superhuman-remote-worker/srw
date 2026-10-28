@@ -818,7 +818,7 @@ class TestAppendOnlyLayout:
 
         # Citation feedback and the live children: read for this request.
         env["ctx"].citation_engine.list_citations.assert_awaited_with(
-            verification_status="failed"
+            verification_status="failed", include_withdrawn=False
         )
         assert "quote not found in source" in entries[2].content
         env["ctx"].subagent_runtime.active_subagents_block.assert_called_once_with()

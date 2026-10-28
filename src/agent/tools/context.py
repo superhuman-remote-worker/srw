@@ -230,11 +230,11 @@ class ToolContext:
     verify_citation_prompt: Optional[str] = (
         None  # Matrix-resolved citation-verification system prompt.
     )
-    citation_verdict_callback: Optional[Callable[[int, str], None]] = (
-        None  # (citation_id, status) listener fired when a background
-        # verification lands a verdict. Persistent sessions wire this to a
-        # WS/SSE broadcast (live citations-panel update); worker jobs leave it
-        # None. Threaded to CitationEngine(on_verdict=...).
+    citation_event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = (
+        None  # (method, params) listener for citation.created / .updated /
+        # .verdict. Persistent sessions wire this to their WS/SSE broadcast so
+        # chips resolve live; worker jobs leave it None. Threaded to
+        # CitationEngine(on_event=...).
     )
     canvas_event_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = (
         None  # (method, params) post-commit Canvas invalidation hook. Persistent
@@ -723,7 +723,7 @@ class ToolContext:
                 context=ctx,
                 verify_aux=self.verify_aux,
                 verify_prompt=self.verify_citation_prompt,
-                on_verdict=self.citation_verdict_callback,
+                on_event=self.citation_event_callback,
             )
 
         return self.citation_engine
@@ -893,6 +893,8 @@ class ToolContext:
                     str(local_path),
                     name=name or posixpath.basename(source_key),
                     metadata=metadata,
+                    # The workspace path, not the temporary copy's (D2).
+                    identifier=source_key,
                 )
         else:
             source = await engine.add_doc_source(

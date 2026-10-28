@@ -576,6 +576,7 @@ def thread_retirement_operations(
             snapshot_service=snapshot_service_module.snapshot_service,
             gitea_client=resources.gitea_client,
             main_cloud_router=resources.main_cloud_router,
+            vector_db=resources.vector_db,
             pinned_retirement=pinned_retirement_operations(resources),
             build_agent_cloud_mount=lambda *args, **kwargs: (
                 agent_cloud_mounts._build_agent_cloud_mount(

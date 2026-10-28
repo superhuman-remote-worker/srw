@@ -1,22 +1,33 @@
 """Helper functions for citation-verification feedback injection (Phase 2b / D4).
 
 Citation verification runs asynchronously on the auxiliary model: ``cite_*``
-returns ``pending`` and a background task writes ``verification_status`` back.
-This module renders still-**failed** citations so the agent can correct them.
+returns at once and a background task writes ``verification_status`` back; a
+verbatim quote that is not in the source fails at once. This module renders
+still-**failed** citations, with the reason, so the agent can correct them.
+A failed citation is flagged, never deleted (owner ruling D7): the agent
+re-points it with ``edit_citation`` or withdraws it with ``withdraw_citation``.
 
 It is **DB-driven**: the execute node re-computes the failed set from
-``verification_status`` every turn, and the set is appended as a context
-entry when it changes (append-only context injection, D21). So it
-self-resolves — when the agent edits a citation (which resets it to
-``pending`` → re-verifies) or removes it, the next entry no longer lists it,
-and an emptied set appends the resolved notice (O6).
+``verification_status`` every turn (withdrawn citations left out), and the set
+is appended as a context entry when it changes (append-only context injection,
+D21). So it self-resolves — when the agent edits a citation (which checks it
+again) or withdraws it, the next entry no longer lists it, and an emptied set
+appends the resolved notice (O6).
 """
 
 from typing import Any, List, Optional
 
+from shared.citation_handles import format_handle
+
 #: Cap how many failed citations are listed in one injection (the rest are
 #: summarized as a count) to bound the injected token cost.
 MAX_FAILED_CITATIONS_SHOWN = 5
+
+#: ``citations.verification_reason`` codes as the agent reads them.
+_REASON_TEXT = {
+    "quote_not_found": "the quoted words are not in the source",
+    "not_supported": "the passage does not support the claim",
+}
 
 
 def format_failed_citations(
@@ -29,29 +40,33 @@ def format_failed_citations(
         limit: Max citations listed before collapsing the rest into a count.
 
     Returns:
-        A human-readable block instructing the agent to fix/remove each one.
+        A human-readable block asking the agent to fix or withdraw each one.
     """
     n = len(citations)
     lines = [
-        "Automatic verification FAILED for the citation(s) below — the quoted "
-        "text could not be confirmed against the source, or it does not support "
-        "the claim. Fix each one with the edit_citation tool (correct the quote, "
-        "quote_context, or claim), or remove the citation if it cannot be "
-        "supported. Edited citations are automatically re-verified.",
+        "These citations are UNVERIFIED: the check found the quoted text is not "
+        "in the source, or that it does not support the claim. Readers see them "
+        "flagged. Fix each one with edit_citation (quote the source exactly, "
+        "point it at a better passage, or correct the claim; it is checked "
+        "again), or withdraw it with withdraw_citation and take its handle out "
+        "of your text.",
         "",
     ]
     for c in citations[:limit]:
         claim = c.claim if len(c.claim) <= 140 else c.claim[:140].rstrip() + "…"
-        reason = c.verification_notes or "no reason recorded"
-        if len(reason) > 200:
-            reason = reason[:200].rstrip() + "…"
+        reason = _REASON_TEXT.get(getattr(c, "verification_reason", None) or "")
+        detail = c.verification_notes or "no reason recorded"
+        if len(detail) > 200:
+            detail = detail[:200].rstrip() + "…"
         score = (
             f" (similarity {c.similarity_score:.2f})"
             if c.similarity_score is not None
             else ""
         )
-        lines.append(f'- [{c.id}]{score} claim: "{claim}"')
-        lines.append(f"    reason: {reason}")
+        lines.append(f'- {format_handle(c.id)}{score} claim: "{claim}"')
+        lines.append(
+            f"    reason: {reason}: {detail}" if reason else f"    reason: {detail}"
+        )
     if n > limit:
         lines.append(f"- … and {n - limit} more failed citation(s).")
     return "\n".join(lines)

@@ -84,7 +84,7 @@ async def _pg_fts_content(
     ``$1`` = query (reused), ``$2`` = job_id (reused for tag subqueries).
     """
     sql = """
-        SELECT s.id AS source_id, s.name AS source_name, s.type::text AS source_type,
+        SELECT s.id AS source_id, COALESCE(js.name, s.name) AS source_name, s.type::text AS source_type,
                substring(s.content, 1, 1000) AS chunk_text,
                ts_rank(to_tsvector('simple', s.content), plainto_tsquery('simple', $1)) AS rank
         FROM sources s
@@ -138,7 +138,7 @@ async def _pg_fts_annotations(
 ) -> list[_RankedHit]:
     """PostgreSQL full-text search on annotation content (job-scoped)."""
     sql = """
-        SELECT sa.source_id, s.name AS source_name, s.type::text AS source_type,
+        SELECT sa.source_id, COALESCE(js.name, s.name) AS source_name, s.type::text AS source_type,
                sa.content AS chunk_text, sa.page_reference,
                ts_rank(to_tsvector('simple', sa.content), plainto_tsquery('simple', $1)) AS rank
         FROM source_annotations sa
@@ -188,7 +188,7 @@ async def semantic_search(
     reused in ORDER BY), ``$2`` = job_id (reused for tag subqueries).
     """
     sql = """
-        SELECT se.source_id, s.name AS source_name, s.type::text AS source_type,
+        SELECT se.source_id, COALESCE(js.name, s.name) AS source_name, s.type::text AS source_type,
                se.chunk_text,
                1 - (se.embedding <=> $1) AS similarity
         FROM source_embeddings se

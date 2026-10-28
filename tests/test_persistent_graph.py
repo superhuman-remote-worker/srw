@@ -2347,11 +2347,13 @@ class TestExecuteTurnCitationFeedback:
             tool_context=tool_ctx,
         )
 
-        engine.list_citations.assert_called_once_with(verification_status="failed")
+        engine.list_citations.assert_called_once_with(
+            verification_status="failed", include_withdrawn=False
+        )
         assert captured, "LLM was never called"
         entries = [m for m in messages if is_context_entry(m)]
         assert [entry_kind(m) for m in entries] == ["citation"]
-        assert "Automatic verification FAILED" in entry_body(entries[0])
+        assert "These citations are UNVERIFIED" in entry_body(entries[0])
         assert "The sky is green" in entry_body(entries[0])
         # Durable: persisted as a context row, before the response.
         assert persisted[0] is entries[0]
@@ -2419,7 +2421,9 @@ class TestExecuteTurnCitationFeedback:
             tool_context=tool_ctx,
         )
 
-        engine.list_citations.assert_called_once_with(verification_status="failed")
+        engine.list_citations.assert_called_once_with(
+            verification_status="failed", include_withdrawn=False
+        )
         assert not any(is_context_entry(m) for m in messages)
         assert captured[0][-1].content == "hi"
         assert FOLDED_KEY not in captured[0][-1].additional_kwargs

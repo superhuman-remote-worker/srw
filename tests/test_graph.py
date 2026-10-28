@@ -2131,9 +2131,21 @@ class TestEditCitationTool:
 
     @pytest.fixture
     def mock_engine(self):
-        """CitationEngine mock with an async edit_citation."""
+        """CitationEngine mock with an async edit_citation.
+
+        After a content edit the tool reads the citation back to report the
+        new check's state (pending here).
+        """
+        from types import SimpleNamespace
+
         engine = MagicMock()
         engine.edit_citation = AsyncMock(return_value=None)
+        engine.get_citation = AsyncMock(
+            return_value=SimpleNamespace(
+                verification_status=SimpleNamespace(value="pending"),
+                verification_notes=None,
+            )
+        )
         return engine
 
     @pytest.fixture
@@ -2165,8 +2177,8 @@ class TestEditCitationTool:
             }
         )
 
-        assert "ok: edited citation [1]" in result
-        assert "verification_status reset" in result
+        assert "ok: edited citation [^c1]" in result
+        assert "(verification pending)" in result
         mock_engine.edit_citation.assert_called_once()
         assert (
             mock_engine.edit_citation.call_args.kwargs["claim"] == "Updated claim text"
@@ -2199,7 +2211,30 @@ class TestEditCitationTool:
             }
         )
 
-        assert "verification_status reset to 'pending'" in result
+        assert "(verification pending)" in result
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_handle_the_cite_tool_returned(
+        self, edit_tool, mock_engine
+    ):
+        result = await edit_tool.ainvoke({"citation_id": "[^c42]", "confidence": "low"})
+        assert "ok: edited citation [^c42]" in result
+        assert mock_engine.edit_citation.call_args.kwargs["citation_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_reports_a_quote_still_not_found(self, edit_tool, mock_engine):
+        from types import SimpleNamespace
+
+        mock_engine.get_citation = AsyncMock(
+            return_value=SimpleNamespace(
+                verification_status=SimpleNamespace(value="failed"),
+                verification_notes="The quoted words do not appear.",
+            )
+        )
+        result = await edit_tool.ainvoke(
+            {"citation_id": 1, "verbatim_quote": "made up"}
+        )
+        assert "still UNVERIFIED: The quoted words do not appear." in result
 
     @pytest.mark.asyncio
     async def test_non_content_edit_preserves_verification(
@@ -2213,8 +2248,7 @@ class TestEditCitationTool:
             }
         )
 
-        assert "ok: edited citation [1]" in result
-        assert "verification_status reset" not in result
+        assert result == "ok: edited citation [^c1]"
 
     @pytest.mark.asyncio
     async def test_edit_no_fields(self, edit_tool):

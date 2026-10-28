@@ -125,6 +125,16 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Edit citation fields (claim, quote, confidence, etc.).",
         "phases": ["strategic", "tactical"],
     },
+    "withdraw_citation": {
+        "module": "citation.sources",
+        "function": "withdraw_citation",
+        "description": "Withdraw a citation you no longer use, keeping its record",
+        "category": "citation",
+        "effect": "write",
+        "defer_to_workspace": True,
+        "short_description": "Withdraw an unused or unfixable citation; the record stays.",
+        "phases": ["strategic", "tactical"],
+    },
     "annotate_source": {
         "module": "citation.sources",
         "function": "annotate_source",

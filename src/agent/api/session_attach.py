@@ -437,7 +437,7 @@ class SessionAttachPorts:
     loop_running: Callable[[], bool]
     ensure_loop_started: Callable[[str], bool]
     wire_aux_archiver: Callable[[], None]
-    emit_citation_verdict: Callable[..., Any]
+    emit_citation_event: Callable[..., Any]
     emit_canvas_event: Callable[..., Any]
     # Workspace and configuration collaborators.
     poll_workspace_ready: Callable[..., Awaitable[Optional[Dict[str, Any]]]]
@@ -1829,13 +1829,14 @@ class SessionAttachCoordinator:
         # call the same idempotent wiring helper again for rebuilt instances.
         self._ports.wire_aux_archiver()
 
-        # Live citation-verdict push: let the engine's background verifier broadcast
-        # pending→verified/failed so the cockpit citations panel updates in place
-        # rather than only at the next per-turn refresh. Set before the first turn
-        # (so it's wired before the lazily-built CitationEngine is first used).
+        # Live citation push: the engine announces each new citation before
+        # the cite tool returns, and every edit, withdrawal and verdict after,
+        # so the chat's chips resolve while the text streams rather than at
+        # the turn's end. Set before the first turn (so it's wired before the
+        # lazily-built CitationEngine is first used).
         if self._session is not None and self._session.tool_context is not None:
-            self._session.tool_context.citation_verdict_callback = (
-                self._ports.emit_citation_verdict
+            self._session.tool_context.citation_event_callback = (
+                self._ports.emit_citation_event
             )
             self._session.tool_context.canvas_event_callback = (
                 self._ports.emit_canvas_event
@@ -2330,7 +2331,7 @@ class SessionAttachCoordinator:
         if failed_session is not None:
             tool_context = getattr(failed_session, "tool_context", None)
             if tool_context is not None:
-                tool_context.citation_verdict_callback = None
+                tool_context.citation_event_callback = None
                 tool_context.canvas_event_callback = None
             try:
                 # An exact delivered attach is about to rotate its G and therefore

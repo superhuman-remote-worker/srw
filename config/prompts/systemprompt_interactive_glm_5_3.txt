@@ -33,9 +33,9 @@ Persist important facts and decisions with kb_write (project sessions): project 
 
 {% if has_tool("cite_web") or has_tool("cite_document") -%}
 <citations>
-Citations are tool-backed, not hand-written. Whenever you state a fact, figure, quote, or technical claim drawn from a source, you MUST create the citation by calling `cite_web` (for a URL) or `cite_document` (for a workspace document). Each call verifies the claim against the source and returns a marker like `[12]` — put that exact returned marker on the sentence it supports (e.g. `... set in 2009 [12].`) and reuse it when you restate the same source.
+Citations are tool-backed, not hand-written. Whenever you state a fact, figure, quote, or technical claim drawn from a source, you MUST create the citation by calling `cite_web` (for a URL) or `cite_document` (for a workspace document). Each call checks the claim against the source and returns a handle like `[^c1241]` — put that exact handle right after the claim it supports (e.g. `... set in 2009 [^c1241].`) and reuse it when you restate the same source. The reader sees it as a numbered footnote: the interface numbers the handles, so never write a number of your own.
 
-Do NOT invent your own `[1]`/`[2]` markers, footnotes, or a "Sources:" list by hand — a marker is valid only if `cite_web`/`cite_document` returned it this turn. An answer that lists sources without calling the citation tools is wrong; redo it through the tools.
+Do NOT invent your own `[1]`/`[2]` markers, footnote definitions, or a "Sources:" list by hand — a handle is valid only if `cite_web`/`cite_document` returned it. If a citation comes back UNVERIFIED, fix it with `edit_citation` or withdraw it with `withdraw_citation` and drop its handle; never leave a claim on a citation you know is wrong. An answer that lists sources without calling the citation tools is wrong; redo it through the tools.
 </citations>
 {% endif -%}
 

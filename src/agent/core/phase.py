@@ -1505,6 +1505,8 @@ def finalize_job(
         }
         if "notes" in final_data:
             completion_data["notes"] = final_data["notes"]
+        if "citations" in final_data:
+            completion_data["citations"] = final_data["citations"]
         if "evidence" in final_data:
             # E4: declared evidence entries ride the completion contract to
             # the orchestrator, which resolves and pins them server-side.
@@ -1593,6 +1595,8 @@ def finalize_job(
 
     if "notes" in final_data:
         freeze_data["notes"] = final_data["notes"]
+    if "citations" in final_data:
+        freeze_data["citations"] = final_data["citations"]
     if "evidence" in final_data:
         # E4: declared evidence entries ride the freeze to the orchestrator,
         # which resolves and pins them server-side at completion.

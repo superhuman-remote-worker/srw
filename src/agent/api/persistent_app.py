@@ -539,7 +539,7 @@ _session_attach = SessionAttachCoordinator(
         loop_running=lambda: _loop_task is not None and not _loop_task.done(),
         ensure_loop_started=lambda source: _ensure_persistent_loop_started(source),
         wire_aux_archiver=lambda: _wire_session_aux_archiver(),
-        emit_citation_verdict=lambda *args, **kwargs: _emit_citation_verdict(
+        emit_citation_event=lambda *args, **kwargs: _emit_citation_event(
             *args, **kwargs
         ),
         emit_canvas_event=lambda *args, **kwargs: _emit_canvas_event(*args, **kwargs),
@@ -5705,30 +5705,35 @@ async def _stop_thread_interrupt_watcher_locked() -> None:
             _interrupt_owner_turn_id = None
 
 
-def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
-    """Broadcast a citation verification verdict to the live session.
+#: Live citation frames the engine may send (``CitationEngine(on_event=...)``).
+_CITATION_EVENT_METHODS = frozenset(
+    {"citation.created", "citation.updated", "citation.verdict"}
+)
 
-    Wired onto the session's ``ToolContext`` (``citation_verdict_callback``) so
-    the CitationEngine's background verifier can push a ``pending`` →
-    ``verified``/``failed`` transition the moment it lands, instead of the
-    cockpit waiting for the next per-turn ``/citations`` refresh. The cockpit
-    patches the one citation in place (see ``citation.verdict`` in
+
+def _emit_citation_event(method: str, params: Dict[str, Any]) -> None:
+    """Broadcast a live citation change to the session.
+
+    Wired onto the session's ``ToolContext`` (``citation_event_callback``).
+    ``citation.created`` goes out before the cite tool returns, so the chip for
+    the handle the agent is about to write resolves while the text streams
+    (overhaul §6.2) instead of at the turn's end; ``citation.updated`` follows
+    an edit or a withdrawal and ``citation.verdict`` a check. Each carries
+    ``citation_id``, ``verification_status`` and the full row under
+    ``citation``; the cockpit upserts it into the thread's citation map (see
     persistent-chat.service). Worker jobs never set this, so the engine no-ops.
 
     Goes through ``_broadcast`` (WS subscribers + ``thread_events`` SSE replay).
     Not in ``_NOTIFICATION_METHODS`` — it's an in-session UI update, not a
-    cross-session notification. Fire-and-forget; never raises into the verifier.
+    cross-session notification. Fire-and-forget; never raises into the engine.
     """
+    if method not in _CITATION_EVENT_METHODS:
+        logger.warning("Ignored unsupported citation event method: %s", method)
+        return
     try:
-        _broadcast(
-            "citation.verdict",
-            {
-                "citation_id": int(citation_id),
-                "verification_status": str(verification_status),
-            },
-        )
+        _broadcast(method, params)
     except Exception as e:
-        logger.debug("citation.verdict broadcast failed (non-fatal): %s", e)
+        logger.debug("%s broadcast failed (non-fatal): %s", method, e)
 
 
 def _emit_canvas_event(method: str, params: Dict[str, Any]) -> None:

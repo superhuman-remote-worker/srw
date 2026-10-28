@@ -234,6 +234,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             )
 
             validation_warnings = []
+            found_paths: List[str] = []
 
             # Check that listed deliverables exist and are non-empty
             for deliverable in deliverables:
@@ -247,6 +248,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                         f"Deliverable '{deliverable}' does not exist"
                     )
                 else:
+                    found_paths.append(resolved)
                     try:
                         content = workspace.read_file(resolved)
                         if len(content.strip()) < 50:
@@ -274,6 +276,13 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     "the issues. Re-call job_complete after addressing these problems."
                 )
 
+            # Delivery: Markdown deliverables get footnote definitions for the
+            # citation handles they use, and the report states which citations
+            # are still unverified (citation engine overhaul WP4).
+            citation_delivery = await _deliver_citations(
+                context, workspace, found_paths
+            )
+
             # Build the decision record. tool_call_id is the idempotency
             # discriminator; ToolNode injects the real one, direct invocations
             # (tests, scripts) get a synthesized local id.
@@ -287,6 +296,8 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             }
             if notes:
                 final_data["notes"] = notes
+            if citation_delivery and citation_delivery["citations"]["total"]:
+                final_data["citations"] = citation_delivery["citations"]
             # E4: declared evidence rides the freeze into the completion
             # contract; the ORCHESTRATOR resolves/pins/measures each entry —
             # nothing here is trusted beyond being a declaration.
@@ -349,19 +360,20 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                 pending = context.todo_manager.list_pending()
                 pending_count = len(pending)
 
+            citation_line = _citation_delivery_line(citation_delivery)
             if pending_count == 0:
                 return (
                     "Phase marked as final. No remaining todos - job will complete now.\n\n"
                     f"Summary: {summary}\n"
                     f"Deliverables: {len(deliverables)} files\n"
-                    f"Confidence: {confidence:.0%}"
+                    f"Confidence: {confidence:.0%}" + citation_line
                 )
             else:
                 return (
                     f"Phase marked as final. Complete your {pending_count} remaining todo(s) to finish the job.\n\n"
                     f"Summary: {summary}\n"
                     f"Deliverables: {len(deliverables)} files\n"
-                    f"Confidence: {confidence:.0%}\n\n"
+                    f"Confidence: {confidence:.0%}" + citation_line + "\n\n"
                     "Once all todos are complete, the job will be frozen for human review."
                 )
 
@@ -378,6 +390,54 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             return f"Error marking job as final: {str(e)}"
 
     return [mark_complete, job_complete]
+
+
+async def _deliver_citations(
+    context: ToolContext, workspace: Any, paths: List[str]
+) -> Optional[Dict[str, Any]]:
+    """Footnotes for the Markdown deliverables; None when the job cites nothing.
+
+    Best-effort: a citation problem never blocks completion. A dead workspace
+    still propagates (Defect 8).
+    """
+    from agent.citation_engine.delivery import MARKDOWN_SUFFIXES, deliver_documents
+    from shared.citation_handles import handles_in
+
+    markdown = [p for p in paths if p.lower().endswith(MARKDOWN_SUFFIXES)]
+    try:
+        engine = getattr(context, "citation_engine", None)
+        if engine is None:
+            # The engine is built on first use; after a restart a job can have
+            # citations in its documents without having cited in this process.
+            if not any(handles_in(workspace.read_file(p)) for p in markdown):
+                return None
+            engine = context.get_citation_engine()
+        return await deliver_documents(engine, workspace, markdown)
+    except WorkspaceUnavailableError:
+        raise
+    except Exception as e:
+        logger.warning(f"Citation footnotes at completion skipped: {e}")
+        return None
+
+
+def _citation_delivery_line(delivery: Optional[Dict[str, Any]]) -> str:
+    """What job_complete tells the agent about its citations."""
+    if not delivery:
+        return ""
+    report = delivery["citations"]
+    files = delivery["files"]
+    line = ""
+    if files:
+        names = ", ".join(sorted(files))
+        line += f"\nCitations: footnotes for {sum(files.values())} handle(s) appended to {names}."
+    if report["unverified_count"]:
+        handles = ", ".join(u["handle"] for u in report["unverified"])
+        line += (
+            f"\n{report['unverified_count']} citation(s) are UNVERIFIED and are "
+            f"listed in the completion report: {handles}. Fix them with "
+            "edit_citation or withdraw them with withdraw_citation if you can."
+        )
+    return line
 
 
 def get_final_phase_data(job_id: str) -> Optional[Dict[str, Any]]:

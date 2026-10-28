@@ -506,6 +506,7 @@ tools:
     - get_citation
     - list_citations
     - edit_citation
+    - withdraw_citation
     - annotate_source
     - get_annotations
     - tag_source

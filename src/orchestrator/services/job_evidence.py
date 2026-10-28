@@ -213,7 +213,7 @@ def _declared_evidence(result: dict[str, Any], job: dict[str, Any]) -> list[Any]
 def _completion_report_payload(
     result: dict[str, Any], job: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """The worker's completion claim (summary/deliverables/confidence/notes)."""
+    """The worker's completion claim (summary/deliverables/confidence/notes/citations)."""
     for candidate in (result.get("freeze_data"), job.get("freeze_data")):
         if isinstance(candidate, str):
             try:
@@ -229,6 +229,9 @@ def _completion_report_payload(
                 "confidence": candidate.get("confidence"),
                 "notes": candidate.get("notes"),
                 "reported_at": candidate.get("timestamp"),
+                # Citation state at completion (unverified ones by handle), so
+                # a reviewer sees them before approving.
+                "citations": candidate.get("citations"),
             }
     return None
 

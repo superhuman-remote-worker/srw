@@ -114,12 +114,16 @@ provide this workspace IDE.
 ## Citations
 
 When agents research, they cite. Sources are captured at cite time (with a
-snapshot of what the page/document said), referenced inline as clickable
-`[N]` markers, and collected in a **Citations panel** (in sessions) or on
-the job's citation views. Citations are verified in the background — each
-carries a verification status, a **view original** link, and for cloud
-documents an on-demand check for whether the source drifted since it was
-cited. Bibliographies can be generated from the collected sources.
+snapshot of what the page/document said), shown inline as numbered chips
+(¹ ² ³, numbered per answer) that open the source, and collected in a
+**Citations panel** (in sessions) or on the job's citation views. A quoted
+passage is checked against the source at once and its support for the claim
+in the background; each citation shows whether it is being checked, verified,
+unverified (with the reason) or not checked, plus a **view original** link,
+and for cloud documents an on-demand check for whether the source drifted
+since it was cited. Nothing is deleted: a citation the agent stops using is
+shown as withdrawn. A delivered Markdown document ends with footnotes for the
+sources it cites. Bibliographies can be generated from the collected sources.
 
 ## Uploading files
 

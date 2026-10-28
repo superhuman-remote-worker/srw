@@ -171,7 +171,7 @@ Use research tools when you need external information:
 
 ### Citations
 
-Cite sources when making factual or technical claims using the `cite_web` and `cite_document` tools — they verify your claim against the source content and return a citation ID you can reference inline as `[N]`. See the tool descriptions for the exact wire format.
+Cite sources when making factual or technical claims using the `cite_web` and `cite_document` tools — they check your claim against the source content and return a handle like `[^c1241]` that you write right after the claim, copied exactly. Readers see it as a numbered footnote; never write a number of your own. See the tool descriptions for the exact wire format.
 
 ## Delivering Results
 

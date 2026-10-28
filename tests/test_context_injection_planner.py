@@ -93,7 +93,7 @@ def note(note_id: str, content: str, title: str = "", kb=KB) -> KnowledgeRecord:
     )
 
 
-def citation(cid: str, claim: str = "The sky is green.") -> SimpleNamespace:
+def citation(cid: int, claim: str = "The sky is green.") -> SimpleNamespace:
     return SimpleNamespace(
         id=cid,
         claim=claim,
@@ -430,23 +430,22 @@ class TestCitationState:
     def test_change_then_clear_then_quiet(self):
         history = base_history()
 
-        first = plan(history, ContextSources(failed_citations=[citation("c1")]))
+        first = plan(history, ContextSources(failed_citations=[citation(1)]))
         entry = only(first, "citation")
-        assert entry_body(entry) == format_failed_citations([citation("c1")])
+        assert entry_body(entry) == format_failed_citations([citation(1)])
         assert entry_meta(entry)["hash"] == digest(entry_body(entry))
         history += first.entries
 
         # Same failed set: nothing.
         assert (
-            plan(history, ContextSources(failed_citations=[citation("c1")])).entries
-            == []
+            plan(history, ContextSources(failed_citations=[citation(1)])).entries == []
         )
 
         # Changed set: the new full rendering.
         changed = plan(
-            history, ContextSources(failed_citations=[citation("c1"), citation("c2")])
+            history, ContextSources(failed_citations=[citation(1), citation(2)])
         )
-        assert "[c2]" in only(changed, "citation").content
+        assert "[^c2]" in only(changed, "citation").content
         history += changed.entries
 
         # Cleared: the cleared rendering, once.
@@ -458,8 +457,8 @@ class TestCitationState:
         assert plan(history, ContextSources(failed_citations=[])).entries == []
 
         # Failing again: the full rendering again.
-        again = plan(history, ContextSources(failed_citations=[citation("c3")]))
-        assert "[c3]" in only(again, "citation").content
+        again = plan(history, ContextSources(failed_citations=[citation(3)]))
+        assert "[^c3]" in only(again, "citation").content
 
 
 class TestSubagentState:
@@ -740,7 +739,7 @@ def _all_sources(turn: int = 4) -> ContextSources:
         memory_summary=SUMMARY,
         memory_records=[mem(1), mem(2)],
         knowledge_records=[note("n1", "kb body")],
-        failed_citations=[citation("c1")],
+        failed_citations=[citation(1)],
         guidance=[guidance("g1", "Steer.")],
         subagents=SUBAGENTS,
         permission_mode="read_only",

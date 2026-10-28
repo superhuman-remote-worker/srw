@@ -62,6 +62,7 @@
     "tag_source",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "bughunter": [
@@ -542,6 +543,7 @@
     "tag_source",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "general-worker": [
@@ -611,6 +613,7 @@
     "todo_list",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "interactive": [
@@ -773,6 +776,7 @@
     "use_skill",
     "wait_agent",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "session_base": [
@@ -838,6 +842,7 @@
     "tag_source",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "subagent_base": [
@@ -1218,6 +1223,7 @@
     "todo_list",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "writer": [
@@ -1287,6 +1293,7 @@
     "todo_list",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ]
 }

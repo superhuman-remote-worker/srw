@@ -54,8 +54,8 @@ because an earlier capability snapshot said `can_execute`.
 - **Present files on Canvas** and, on deployments that enable it, share the
   workspace browser. Those are persistent-session capabilities with their own
   workspace and deployment requirements.
-- **Cite as it writes** — sources are tracked and referenced inline as `[N]`
-  markers you can click.
+- **Cite as it writes** — sources are tracked and shown inline as numbered
+  chips you can click; each says whether its source checked out.
 - **Read and write project knowledge** when the project and Knowledge tools are
   attached; read git history only on a git-capable workspace.
 - **Create and manage jobs for you when Job Control is enabled** — the

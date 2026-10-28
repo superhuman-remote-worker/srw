@@ -81,6 +81,8 @@ class ThreadRetirementDependencies:
     decommission_officer_post: Callable[..., Awaitable[Any]]
     conclude_conference_if_any: Callable[..., Awaitable[None]]
     logger: logging.Logger
+    #: The vector store, for the deleted session's citation layer.
+    vector_db: Any = None
 
 
 async def thread_turn_in_flight(
@@ -1795,6 +1797,24 @@ async def _end_thread_flow_owned(
         await delete_main_cloud_session_folder(
             authoritative_thread, main_cloud_router=main_cloud_router, logger=logger
         )
+
+        # The session's citations, annotations, tags and source links, and any
+        # source nothing else uses (citation engine overhaul WP5). Its
+        # memories stay: they belong to the project. Best-effort like the log
+        # archives: rows of a deleted thread are unreachable through the API.
+        vector_db = dependencies.vector_db
+        if vector_db is not None:
+            try:
+                async with vector_db.acquire() as conn:
+                    await conn.execute(
+                        "SELECT retire_session_citations($1::uuid)", thread_id
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Citation cleanup failed for deleted thread %s: %s",
+                    thread_id,
+                    exc,
+                )
 
     if not stateless:
         if (

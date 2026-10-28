@@ -751,6 +751,26 @@ $$;
 
 
 --
+-- Name: remove_unlinked_sources(integer[]); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.remove_unlinked_sources(candidate_ids integer[]) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    removed INTEGER;
+BEGIN
+    DELETE FROM public.sources s
+     WHERE s.id = ANY(candidate_ids)
+       AND NOT EXISTS (SELECT 1 FROM public.job_sources js WHERE js.source_id = s.id)
+       AND NOT EXISTS (SELECT 1 FROM public.citations c WHERE c.source_id = s.id);
+    GET DIAGNOSTICS removed = ROW_COUNT;
+    RETURN removed;
+END;
+$$;
+
+
+--
 -- Name: require_active_job_vector_scope(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -782,12 +802,20 @@ $$;
 CREATE FUNCTION public.retire_job_vector_scope(requested_job uuid) RETURNS void
     LANGUAGE plpgsql
     AS $$
+DECLARE
+    linked INTEGER[];
 BEGIN
     INSERT INTO public.job_vector_scopes (job_id) VALUES (requested_job)
         ON CONFLICT (job_id) DO NOTHING;
     PERFORM 1 FROM public.job_vector_scopes WHERE job_id=requested_job FOR UPDATE;
     UPDATE public.job_vector_scopes SET retired_at=clock_timestamp()
      WHERE job_id=requested_job AND retired_at IS NULL;
+
+    linked := ARRAY(
+        SELECT source_id FROM public.job_sources WHERE job_id = requested_job
+        UNION
+        SELECT source_id FROM public.citations WHERE job_id = requested_job
+    );
 
     -- One vector transaction commits the fence and the whole existing API
     -- cleanup set. Retrieval messages cascade. Shared sources, project/session
@@ -798,6 +826,32 @@ BEGIN
     DELETE FROM public.source_tags WHERE job_id=requested_job;
     DELETE FROM public.source_embeddings WHERE job_id=requested_job;
     DELETE FROM public.job_sources WHERE job_id=requested_job;
+    PERFORM public.remove_unlinked_sources(linked);
+END;
+$$;
+
+
+--
+-- Name: retire_session_citations(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.retire_session_citations(requested_thread uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    linked INTEGER[];
+BEGIN
+    linked := ARRAY(
+        SELECT source_id FROM public.job_sources WHERE job_id = requested_thread
+        UNION
+        SELECT source_id FROM public.citations WHERE job_id = requested_thread
+    );
+    DELETE FROM public.citations WHERE job_id = requested_thread;
+    DELETE FROM public.source_annotations WHERE job_id = requested_thread;
+    DELETE FROM public.source_tags WHERE job_id = requested_thread;
+    DELETE FROM public.source_embeddings WHERE job_id = requested_thread;
+    DELETE FROM public.job_sources WHERE job_id = requested_thread;
+    PERFORM public.remove_unlinked_sources(linked);
 END;
 $$;
 
@@ -823,7 +877,10 @@ CREATE TABLE public.citations (
     similarity_score real,
     matched_location jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    created_by text
+    created_by text,
+    verification_reason text,
+    withdrawn_at timestamp with time zone,
+    withdrawn_reason text
 );
 
 
@@ -854,7 +911,10 @@ ALTER SEQUENCE public.citations_id_seq OWNED BY public.citations.id;
 CREATE TABLE public.job_sources (
     job_id uuid NOT NULL,
     source_id integer NOT NULL,
-    added_at timestamp with time zone DEFAULT now() NOT NULL
+    added_at timestamp with time zone DEFAULT now() NOT NULL,
+    name text,
+    identifier text,
+    metadata jsonb
 );
 
 

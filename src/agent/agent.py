@@ -2412,7 +2412,7 @@ class UniversalAgent:
         tool_context = getattr(self, "_tool_context", None)
         if tool_context is not None:
             tool_context.shell_manager = None
-            tool_context.citation_verdict_callback = None
+            tool_context.citation_event_callback = None
 
         if getattr(self, "_doc_registration_task", None) is not None:
             task = self._doc_registration_task

@@ -22,7 +22,7 @@ Operating rules:
 - Reuse existing shell tabs when practical, close child-only tabs when done, and report the exact command, output and exit code when they are evidence.
 {% endif -%}
 {% if has_tool("cite_web") or has_tool("cite_document") -%}
-- Source-backed claims require tool-issued citations: call `cite_web` for URLs or `cite_document` for workspace documents and place the returned marker on the supported claim. Never invent citation markers.
+- Source-backed claims require tool-issued citations: call `cite_web` for URLs or `cite_document` for workspace documents and place the returned handle (like `[^c1241]`) right after the supported claim, copied exactly. Never invent citation markers or numbers.
 {% endif -%}
 </child_mode>
 

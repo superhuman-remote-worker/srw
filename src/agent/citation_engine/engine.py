@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,9 +49,11 @@ from shared.runtime.citation_engine.models import (
     SearchResults,
     Source,
     SourceType,
+    VerificationReason,
     VerificationResult,
     VerificationStatus,
 )
+from shared.citation_handles import format_handle
 from shared.url_safety import UnsafeURLError, check_public_http_url
 
 # Set up logging
@@ -58,6 +61,94 @@ log = logging.getLogger(__name__)
 
 #: Redirect hops a web-source fetch follows, each re-checked by address.
 MAX_WEB_FETCH_REDIRECTS = 5
+
+#: Quotes shorter than this (letters and digits only) are too short for the
+#: instant existence check to say anything; they go to the verifier as they are.
+MIN_CHECKABLE_QUOTE_CHARS = 12
+
+#: An ellipsis in a quote: the fragments around it are checked in order.
+_ELLIPSIS_RE = re.compile(r"\s*(?:\[\s*(?:\.\s*){3}\]|\[\s*…\s*\]|(?:\.\s*){3}|…)\s*")
+
+#: Characters a quote may differ in without changing what it says: punctuation,
+#: spacing, line breaks and hyphenation are skipped by the existence check.
+_SKIPPABLE = r"[\W_]*"
+
+#: Markup a scraped page carries between the words a reader sees: images,
+#: Markdown links (kept as their text; URLs and titles dropped), HTML tags, and
+#: reference markers such as Wikipedia's ``[[9]](#cite_note-9)`` → ``[9]``.
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((?:[^()]|\([^)]*\))*\)")
+_MD_LINK_RE = re.compile(
+    r"\[([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]\((?:[^()\s]|\([^)]*\))*(?:\s+\"[^\"]*\")?\)"
+)
+_HTML_TAG_RE = re.compile(r"<[^>\n]{1,200}>")
+_REFERENCE_MARK_RE = re.compile(
+    r"\[\s*(?:\d{1,4}|[a-z]|(?:note|nb|n)\s*\d{1,4}|citation needed|"
+    r"clarification needed|when\?|who\?|which\?|by whom\?)\s*\]",
+    re.IGNORECASE,
+)
+
+
+def readable_text(text: str) -> str:
+    """``text`` as a reader sees it, for comparing a quote with its source."""
+    text = _MD_IMAGE_RE.sub(" ", text)
+    # Twice: a link's text may itself be a link (``[[9]](#cite_note-9)``).
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _HTML_TAG_RE.sub(" ", text)
+    return _REFERENCE_MARK_RE.sub(" ", text)
+
+
+#: Popover and wire fields are capped so one long passage can't bloat a frame.
+_WIRE_TEXT_MAX = 500
+
+
+def find_quote_in_source(quote: str, content: str) -> str | None:
+    """Find ``quote`` in ``content`` the way a reader would, or return None.
+
+    The instant half of verification (overhaul §6.3): before any LLM looks at
+    a ``direct_quote`` citation, check that the quoted words exist at all.
+    Letters and digits must match in order, ignoring case; everything else
+    (spacing, line breaks, punctuation, curly vs straight quotes, a hyphen
+    split across a PDF line) may differ. An ellipsis splits the quote into
+    fragments that must appear in that order. Both sides are NFKC-normalised
+    first, so ligatures and full-width forms compare equal, and both are read
+    as text (``readable_text``): a scraped page's links, footnote markers and
+    tags are not words of the quote.
+
+    Returns the matching passage of ``content`` (NFKC-normalised), or None
+    when the words are not there. A quote with fewer than
+    ``MIN_CHECKABLE_QUOTE_CHARS`` letters and digits is returned unchanged:
+    too short to check, it is left to the verifier.
+    """
+    quote = readable_text(unicodedata.normalize("NFKC", quote or ""))
+    if len(re.sub(r"[\W_]+", "", quote)) < MIN_CHECKABLE_QUOTE_CHARS:
+        return quote
+    text = readable_text(unicodedata.normalize("NFKC", content or ""))
+    start = 0
+    first: int | None = None
+    end = 0
+    for fragment in _ELLIPSIS_RE.split(quote):
+        chars = re.sub(r"[\W_]+", "", fragment)
+        if not chars:
+            continue
+        pattern = re.compile(
+            _SKIPPABLE.join(re.escape(c) for c in chars), re.IGNORECASE
+        )
+        match = pattern.search(text, start)
+        if match is None:
+            return None
+        if first is None:
+            first = match.start()
+        start = end = match.end()
+    if first is None:
+        return quote
+    return text[first:end]
+
+
+def _clip(value: str | None, limit: int = _WIRE_TEXT_MAX) -> str | None:
+    if value is None:
+        return None
+    return value if len(value) <= limit else value[:limit].rstrip() + "…"
 
 
 def _get_public_url(url: str, *, headers: dict[str, str], timeout: float):
@@ -139,7 +230,7 @@ class CitationEngine:
         context: CitationContext | None = None,
         verify_aux: Any | None = None,
         verify_prompt: str | None = None,
-        on_verdict: Callable[[int, str], None] | None = None,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         """
         Initialize the Citation Engine.
@@ -157,12 +248,15 @@ class CitationEngine:
                 unverified (verification disabled / unavailable).
             verify_prompt: The matrix-resolved citation-verification system
                 prompt handed to ``VerifyCitationTask``.
-            on_verdict: Optional ``(citation_id, status)`` callback fired once a
-                background verification writes a real verdict (``status`` is
-                ``"verified"`` / ``"failed"``). Persistent sessions wire this to
-                a WS/SSE broadcast so the cockpit citations panel updates in
-                place; worker jobs leave it ``None`` (no live listener). Never
-                fired on an aux outage (the row stays ``pending``).
+            on_event: Optional ``(method, params)`` listener for live citation
+                changes: ``citation.created`` when a cite tool writes a row
+                (before the tool returns, so the chip can render as soon as
+                the agent writes its handle), ``citation.updated`` after an
+                edit or a withdrawal, and ``citation.verdict`` when a check
+                lands. ``params`` carries ``citation_id``,
+                ``verification_status`` and the full wire row under
+                ``citation`` (see ``wire_row``). Persistent sessions wire this
+                to their WS/SSE broadcast; worker jobs leave it ``None``.
         """
         log.debug("Initializing CitationEngine (SRW-native async)...")
 
@@ -175,26 +269,13 @@ class CitationEngine:
         self.db = db
         self.context = context
 
-        # Whether the agent must supply relevance_reasoning for low/medium-
-        # confidence citations — a citation-quality gate, independent of the
-        # verifier. Default 'low' = required only for low-confidence claims.
-        reasoning_config = os.getenv("CITATION_REASONING_REQUIRED", "low")
-        if reasoning_config not in ("none", "low", "medium", "high"):
-            log.warning(
-                "Invalid CITATION_REASONING_REQUIRED value: %s. Using 'low'.",
-                reasoning_config,
-            )
-            reasoning_config = "low"
-        self.reasoning_required = reasoning_config
-
         # Verification runs on SRW's auxiliary-LLM service (Phase 2). The engine
         # holds no LLM client; cite_* schedules a background VerifyCitationTask.
         self._verify_aux = verify_aux
         self._verify_prompt = verify_prompt or ""
-        #: Optional live verdict listener (persistent sessions only). See the
-        #: ``on_verdict`` arg; fired from ``_run_verification`` after a real
-        #: verdict lands.
-        self._on_verdict = on_verdict
+        #: Optional live citation listener (persistent sessions only). See the
+        #: ``on_event`` arg.
+        self._on_event = on_event
         #: In-flight verification tasks — kept referenced so the event loop
         #: doesn't GC them mid-flight; discarded on completion.
         self._verify_tasks: set[asyncio.Task] = set()
@@ -252,11 +333,15 @@ class CitationEngine:
         name: str | None = None,
         version: str | None = None,
         metadata: Metadata | None = None,
+        identifier: str | None = None,
     ) -> Source:
         """
         Register a document source (PDF, markdown, txt, json, csv, images, etc.).
 
         Extracts text content (pypdf for PDFs) and stores it for verification.
+        ``identifier`` names the document as the reader knows it (its
+        workspace path); ``file_path`` may be a temporary local copy that is
+        gone once the call returns, so it is only the fallback (D2).
 
         Raises:
             FileNotFoundError: If file doesn't exist
@@ -280,7 +365,7 @@ class CitationEngine:
 
         source = await self._register_source(
             source_type=SourceType.DOCUMENT,
-            identifier=file_path,
+            identifier=identifier or file_path,
             name=name,
             content=content,
             content_hash=content_hash,
@@ -350,39 +435,6 @@ class CitationEngine:
         log.info(f"Registered web source [{source.id}]: {name or url}")
         return source
 
-    async def add_db_source(
-        self,
-        identifier: str,
-        name: str,
-        content: str,
-        query: str | None = None,
-        result_description: str | None = None,
-        metadata: Metadata | None = None,
-    ) -> Source:
-        """Register a database source (SQL, NoSQL, graph DB)."""
-        log.debug(f"Registering database source: {identifier}")
-
-        db_metadata = {
-            "query": query,
-            "result_description": result_description,
-        }
-        if metadata:
-            db_metadata.update(metadata)
-
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-
-        source = await self._register_source(
-            source_type=SourceType.DATABASE,
-            identifier=identifier,
-            name=name,
-            content=content,
-            content_hash=content_hash,
-            metadata=db_metadata,
-        )
-
-        log.info(f"Registered database source [{source.id}]: {name}")
-        return source
-
     async def add_custom_source(
         self,
         name: str,
@@ -428,7 +480,10 @@ class CitationEngine:
         Register a source in the database.
 
         Uses content_hash for deduplication: if a source with the same hash
-        already exists, reuses it and creates a job_sources link only.
+        already exists, reuses it and creates a job_sources link only. The
+        name, identifier and metadata this work unit registered it under go
+        on that link, so two jobs citing the same bytes each keep their own
+        file name and cloud anchor, and neither sees the other's (WP5, D1).
         """
         metadata_json = json.dumps(metadata) if metadata else None
         job_uuid = self._job_uuid()
@@ -457,7 +512,13 @@ class CitationEngine:
             )
 
         if job_uuid:
-            await self._link_source_to_job(source_id, job_uuid)
+            await self._link_source_to_job(
+                source_id,
+                job_uuid,
+                name=name,
+                identifier=identifier,
+                metadata_json=metadata_json,
+            )
 
         source = Source(
             id=source_id,
@@ -486,12 +547,30 @@ class CitationEngine:
             return self._row_to_source(dict(row))
         return None
 
-    async def _link_source_to_job(self, source_id: int, job_uuid: uuid.UUID) -> None:
-        """Create a job_sources link (idempotent)."""
+    async def _link_source_to_job(
+        self,
+        source_id: int,
+        job_uuid: uuid.UUID,
+        *,
+        name: str | None = None,
+        identifier: str | None = None,
+        metadata_json: str | None = None,
+    ) -> None:
+        """Create or refresh a job_sources link with this unit's view of the source."""
         await self.db.execute(
-            "INSERT INTO job_sources (job_id, source_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            """
+            INSERT INTO job_sources (job_id, source_id, name, identifier, metadata)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            ON CONFLICT (job_id, source_id) DO UPDATE
+               SET name = EXCLUDED.name,
+                   identifier = EXCLUDED.identifier,
+                   metadata = EXCLUDED.metadata
+            """,
             job_uuid,
             source_id,
+            name,
+            identifier,
+            metadata_json,
         )
         log.debug(f"Linked source [{source_id}] to job {job_uuid}")
 
@@ -787,29 +866,6 @@ class CitationEngine:
             extraction_method=extraction_method,
         )
 
-    async def cite_db(
-        self,
-        claim: str,
-        source_id: int,
-        quote_context: str,
-        locator: Locator,
-        relevance_reasoning: str | None = None,
-        confidence: str = "high",
-        extraction_method: str = "aggregation",
-    ) -> CitationResult:
-        """Create a citation from a database source."""
-        log.debug(f"Creating database citation for source [{source_id}]")
-        return await self._create_citation(
-            claim=claim,
-            source_id=source_id,
-            quote_context=quote_context,
-            locator=locator,
-            verbatim_quote=None,
-            relevance_reasoning=relevance_reasoning,
-            confidence=confidence,
-            extraction_method=extraction_method,
-        )
-
     async def cite_custom(
         self,
         claim: str,
@@ -852,10 +908,10 @@ class CitationEngine:
             log.error(f"Source not found: {source_id}")
             raise ValueError(f"Source not found: {source_id}")
 
-        conf = self._validate_confidence(confidence)
+        self._validate_confidence(confidence)
         self._validate_extraction_method(extraction_method)
 
-        self._validate_reasoning_requirement(conf, relevance_reasoning)
+        status, reason, notes, matched = self._first_check(source, verbatim_quote)
 
         job_uuid = self._job_uuid()
         created_by = None
@@ -873,10 +929,11 @@ class CitationEngine:
             INSERT INTO citations (
                 job_id, claim, verbatim_quote, quote_context, quote_language,
                 relevance_reasoning, confidence, extraction_method,
-                source_id, locator, verification_status, created_by
+                source_id, locator, verification_status, created_by,
+                verification_reason, verification_notes, matched_location
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7::confidence_level, $8::extraction_method,
-                $9, $10::jsonb, 'pending'::verification_status, $11
+                $9, $10::jsonb, $12::verification_status, $11, $13, $14, $15::jsonb
             )
             RETURNING id
             """,
@@ -891,31 +948,145 @@ class CitationEngine:
             source_id,
             locator_json,
             created_by,
+            status.value,
+            reason.value if reason else None,
+            notes,
+            json.dumps(matched) if matched else None,
         )
         log.info(
-            f"Created citation [{citation_id}] for source [{source_id}], pending verification"
+            "Created citation [%s] for source [%s] (%s)",
+            citation_id,
+            source_id,
+            status.value,
         )
 
-        # D2: return immediately with status=pending and schedule background
-        # verification on the auxiliary model. The verdict is written back to the
-        # row asynchronously (eventually-consistent). When no verifier is wired,
-        # the citation simply stays 'pending'.
-        self._schedule_verification(citation_id)
+        # Announce the row before the tool returns: the agent can only write
+        # the handle after it has the tool result, so the cockpit's chip
+        # resolves while the text streams (overhaul §6.2).
+        await self._emit("citation.created", citation_id)
+
+        # D2: a pending citation returns at once and is checked in the
+        # background on the auxiliary model; the verdict is written back to the
+        # row later. A quote the first check could not find is already failed
+        # and is not sent to the LLM.
+        if status is VerificationStatus.PENDING:
+            self._schedule_verification(citation_id)
 
         source_snippet = (
             source.name[:30] + "..." if len(source.name) > 30 else source.name
         )
-        result = CitationResult(
+        return CitationResult(
             citation_id=citation_id,
-            verification_status=VerificationStatus.PENDING,
-            summary_note=f"Cited {source_snippet} ({locator}) - pending verification",
+            verification_status=status,
+            summary_note=f"Cited {source_snippet} ({locator}) - {status.value}",
+            verification_notes=notes,
+            matched_location=matched,
         )
-        log.info(
-            "Citation [%s] created (pending); verification %s",
-            citation_id,
-            "scheduled" if self._verify_aux is not None else "disabled",
-        )
-        return result
+
+    def _first_check(
+        self, source: Source, verbatim_quote: str | None
+    ) -> tuple[VerificationStatus, VerificationReason | None, str | None, dict | None]:
+        """The status a citation starts with: ``(status, reason, notes, matched)``.
+
+        Existence before support (overhaul §6.3): a verbatim quote is looked
+        up in the stored source text at once, without an LLM. Not found →
+        ``failed`` with ``quote_not_found``, and no LLM check follows. Found or
+        not a quote → ``pending`` for the LLM's support check, or, with no
+        verifier wired, ``unverified`` with ``not_checked`` (never a pending
+        state that nothing will end, C2).
+        """
+        matched = None
+        if verbatim_quote and (source.content or "").strip():
+            passage = find_quote_in_source(verbatim_quote, source.content)
+            if passage is None:
+                return (
+                    VerificationStatus.FAILED,
+                    VerificationReason.QUOTE_NOT_FOUND,
+                    "The quoted words do not appear in the stored source text. "
+                    "Quote the source exactly, or set extraction_method to "
+                    "'paraphrase' if you reworded it.",
+                    None,
+                )
+            matched = {"matched_text": _clip(passage), "method": "exact"}
+        if self._verify_aux is None:
+            notes = "Citation checking is turned off for this agent."
+            if matched:
+                notes = (
+                    "The quote was found in the source; whether it supports the "
+                    "claim was not checked (citation checking is turned off)."
+                )
+            return (
+                VerificationStatus.UNVERIFIED,
+                VerificationReason.NOT_CHECKED,
+                notes,
+                matched,
+            )
+        return VerificationStatus.PENDING, None, None, matched
+
+    async def _emit(self, method: str, citation_id: int) -> None:
+        """Send a live citation change to the session, if one listens.
+
+        Best-effort: reads the row back so every frame carries the same shape
+        as ``GET /threads/{id}/citations``, and never raises into the tool or
+        the verifier.
+        """
+        if self._on_event is None:
+            return
+        try:
+            citation = await self.get_citation(citation_id)
+            if citation is None:
+                return
+            source = await self.get_source(citation.source_id)
+            row = self.wire_row(citation, source)
+            self._on_event(
+                method,
+                {
+                    "citation_id": citation.id,
+                    "verification_status": citation.verification_status.value,
+                    "citation": row,
+                },
+            )
+        except Exception as e:
+            log.debug("%s event for citation [%s] failed: %s", method, citation_id, e)
+
+    @staticmethod
+    def wire_row(citation: Citation, source: Source | None) -> dict[str, Any]:
+        """One citation as the cockpit reads it (list endpoint and live frames).
+
+        Keep in step with ``GET /api/persistent/threads/{id}/citations``
+        (``orchestrator/routers/thread_history.py``): the chat upserts frames
+        into the same map the endpoint fills.
+        """
+        metadata = (source.metadata if source else None) or {}
+        cloud = metadata.get("cloud") if isinstance(metadata, dict) else None
+        cloud = cloud if isinstance(cloud, dict) else {}
+        matched = citation.matched_location or {}
+        created = citation.created_at
+        return {
+            "id": citation.id,
+            "claim": _clip(citation.claim, 300),
+            "quote": _clip(citation.verbatim_quote or citation.quote_context),
+            "locator": citation.locator or {},
+            "extraction_method": citation.extraction_method.value,
+            "source_id": citation.source_id,
+            "source_name": source.name if source else None,
+            "source_type": source.type.value if source else None,
+            "source_identifier": source.identifier if source else None,
+            "verification_status": citation.verification_status.value,
+            "verification_reason": citation.verification_reason,
+            "verification_notes": _clip(citation.verification_notes),
+            "matched_text": _clip(matched.get("matched_text"))
+            if isinstance(matched, dict)
+            else None,
+            "confidence": citation.confidence.value,
+            "created_at": created.isoformat() if created else None,
+            "withdrawn_at": citation.withdrawn_at.isoformat()
+            if citation.withdrawn_at
+            else None,
+            "withdrawn_reason": citation.withdrawn_reason,
+            "has_cloud_anchor": bool(cloud),
+            "has_snapshot": bool(cloud.get("snapshot_blob_key")),
+        }
 
     def _schedule_verification(self, citation_id: int) -> None:
         """Schedule background verification for a freshly-created citation.
@@ -936,25 +1107,21 @@ class CitationEngine:
         task.add_done_callback(self._verify_tasks.discard)
 
     async def _run_verification(self, citation_id: int) -> None:
-        """Run one citation's verification via the auxiliary-LLM service."""
+        """Run one citation's verification via the auxiliary-LLM service.
+
+        ``verify_and_store_citation`` always ends the pending state: a verdict,
+        or ``unverified`` with a reason when no check could run. The session
+        hears about it either way.
+        """
         from shared.runtime.services.auxiliary import verify_and_store_citation
 
-        verdict = await verify_and_store_citation(
+        await verify_and_store_citation(
             self._verify_aux, self, citation_id, self._verify_prompt
         )
-        # Push the verdict to any live listener (persistent sessions wire this
-        # to a WS/SSE broadcast; worker jobs leave it unset). Only fires on a
-        # real verdict — an aux outage returns None and leaves the row
-        # 'pending', so we don't signal a non-existent state change.
-        if verdict is not None and self._on_verdict is not None:
-            status = "verified" if verdict.verified else "failed"
-            try:
-                self._on_verdict(citation_id, status)
-            except Exception as e:
-                log.debug("on_verdict callback failed (non-fatal): %s", e)
+        await self._emit("citation.verdict", citation_id)
 
     async def await_pending_verifications(self, timeout: float = 30.0) -> None:
-        """Await any in-flight verification tasks (used by the boundary reconcile).
+        """Await any in-flight verification tasks (phase boundary, delivery).
 
         Best-effort: returns when all scheduled verifications have written their
         verdict back, or after ``timeout`` seconds, whichever comes first.
@@ -968,14 +1135,14 @@ class CitationEngine:
         """Disarm verdict delivery and terminally join verifier tasks.
 
         Persistent agent processes are reused across threads.  Merely clearing
-        ``ToolContext.citation_verdict_callback`` does not affect the callback
+        ``ToolContext.citation_event_callback`` does not affect the callback
         copied into this engine, so an old verifier could otherwise broadcast
         into the next thread.  Disarm first, reject new schedules, then cancel
         and join every current verifier before claimant ownership is released.
         """
 
         self._verification_closed = True
-        self._on_verdict = None
+        self._on_event = None
         pending = {task for task in self._verify_tasks if not task.done()}
         if not pending:
             return
@@ -1029,43 +1196,14 @@ class CitationEngine:
                 "Use 'direct_quote', 'paraphrase', 'inference', 'aggregation', or 'negative'."
             ) from e
 
-    def _validate_reasoning_requirement(
-        self,
-        confidence: Confidence,
-        relevance_reasoning: str | None,
-    ) -> None:
-        """Validate that relevance_reasoning is provided when required."""
-        if self.reasoning_required == "none":
-            return
-
-        needs_reasoning = False
-        if self.reasoning_required == "low" and confidence == Confidence.LOW:
-            needs_reasoning = True
-        elif self.reasoning_required == "medium" and confidence in (
-            Confidence.LOW,
-            Confidence.MEDIUM,
-        ):
-            needs_reasoning = True
-        elif self.reasoning_required == "high":
-            needs_reasoning = True
-
-        if needs_reasoning and not relevance_reasoning:
-            log.warning(
-                f"relevance_reasoning required for confidence={confidence.value} "
-                f"but not provided (config: {self.reasoning_required})"
-            )
-            raise ValueError(
-                f"relevance_reasoning is required for confidence='{confidence.value}' "
-                f"when CITATION_REASONING_REQUIRED='{self.reasoning_required}'"
-            )
-
     async def _update_verification_status(
         self,
         citation_id: int,
         verification: VerificationResult,
     ) -> None:
-        """Update citation with verification results."""
+        """Write the LLM verdict. A missing passage keeps the first check's."""
         status = "verified" if verification.is_verified else "failed"
+        reason = None if verification.is_verified else VerificationReason.NOT_SUPPORTED
 
         matched_location_json = None
         if isinstance(verification.matched_location, dict):
@@ -1080,7 +1218,8 @@ class CitationEngine:
             SET verification_status = $1::verification_status,
                 verification_notes = $2,
                 similarity_score = $3,
-                matched_location = $4::jsonb
+                matched_location = COALESCE($4::jsonb, matched_location),
+                verification_reason = $6
             WHERE id = $5
             """,
             status,
@@ -1088,8 +1227,32 @@ class CitationEngine:
             verification.similarity_score,
             matched_location_json,
             citation_id,
+            reason.value if reason else None,
         )
         log.debug(f"Updated verification status for citation [{citation_id}]: {status}")
+
+    async def _mark_unchecked(
+        self, citation_id: int, reason: VerificationReason, notes: str
+    ) -> None:
+        """End a pending citation that no check could decide (``unverified``).
+
+        Used when the source is gone or the verifier failed. Before this, an
+        outage left the row ``pending`` for a retry that was never built, and
+        the chip said "Verifying…" forever (C2). Only a pending row changes,
+        so a verdict that landed meanwhile is kept.
+        """
+        await self.db.execute(
+            """
+            UPDATE citations
+            SET verification_status = 'unverified'::verification_status,
+                verification_reason = $2,
+                verification_notes = $3
+            WHERE id = $1 AND verification_status = 'pending'::verification_status
+            """,
+            citation_id,
+            reason.value,
+            notes,
+        )
 
     async def edit_citation(
         self,
@@ -1106,12 +1269,14 @@ class CitationEngine:
         Edit fields of a citation belonging to the current job.
 
         When content fields (claim, verbatim_quote, quote_context) change,
-        verification_status resets to 'pending' and prior verification results
-        are cleared. Scoped to ``context.session_id`` (job_id).
+        the old verdict no longer applies: the citation is checked again from
+        the start (the instant quote check, then the LLM), and the session is
+        told. Before this, an edit reset the row to ``pending`` and nothing
+        ever checked it again (C1). Scoped to ``context.session_id`` (job_id).
 
         Raises:
             ValueError: If an enum-backed field is invalid, the citation is not
-                found / not owned, or no fields given.
+                found / not owned / withdrawn, or no fields given.
         """
         # Validate before touching the DB. Without this the bad value reaches
         # the ``::confidence_level`` / ``::extraction_method`` casts below and
@@ -1124,21 +1289,15 @@ class CitationEngine:
         if extraction_method is not None:
             self._validate_extraction_method(extraction_method)
 
-        job_uuid = self._job_uuid()
-
         # Ownership guard (job-scoped).
-        if job_uuid is not None:
-            row = await self.db.fetchrow(
-                "SELECT id FROM citations WHERE id = $1 AND job_id = $2",
-                citation_id,
-                job_uuid,
-            )
-        else:
-            row = await self.db.fetchrow(
-                "SELECT id FROM citations WHERE id = $1", citation_id
-            )
-        if not row:
+        current = await self.get_citation(citation_id)
+        if current is None:
             raise ValueError(f"Citation {citation_id} not found")
+        if current.withdrawn_at is not None:
+            raise ValueError(
+                f"Citation {citation_id} was withdrawn; create a new citation "
+                "instead of editing it"
+            )
 
         content_fields_changed = any(
             v is not None for v in [claim, verbatim_quote, quote_context]
@@ -1168,16 +1327,69 @@ class CitationEngine:
         if not updates:
             raise ValueError("No fields provided to edit")
 
+        status = None
         if content_fields_changed:
-            updates.append("verification_status = 'pending'::verification_status")
-            updates.append("verification_notes = NULL")
+            source = await self.get_source(current.source_id)
+            quote = (
+                verbatim_quote if verbatim_quote is not None else current.verbatim_quote
+            )
+            if source is None:
+                status, reason, notes, matched = (
+                    VerificationStatus.UNVERIFIED,
+                    VerificationReason.SOURCE_UNAVAILABLE,
+                    "The cited source is no longer available to check against.",
+                    None,
+                )
+            else:
+                status, reason, notes, matched = self._first_check(source, quote)
+            for col, val, cast in (
+                ("verification_status", status.value, "verification_status"),
+                ("verification_reason", reason.value if reason else None, None),
+                ("verification_notes", notes, None),
+                ("matched_location", json.dumps(matched) if matched else None, "jsonb"),
+            ):
+                updates.append(f"{col} = ${idx}" + (f"::{cast}" if cast else ""))
+                values.append(val)
+                idx += 1
             updates.append("similarity_score = NULL")
-            updates.append("matched_location = NULL")
 
         values.append(citation_id)
         query = f"UPDATE citations SET {', '.join(updates)} WHERE id = ${idx}"
         await self.db.execute(query, *values)
         log.debug(f"Edited citation {citation_id}")
+        await self._emit("citation.updated", citation_id)
+        if status is VerificationStatus.PENDING:
+            self._schedule_verification(citation_id)
+
+    async def withdraw_citation(self, citation_id: int, reason: str) -> Citation:
+        """Mark a citation as no longer used, keeping the record (D7).
+
+        Nothing is deleted: the claim, quote and verdict stay for the audit
+        trail and the citations panel, which shows the citation struck
+        through. Idempotent; a second call keeps the first reason.
+
+        Raises:
+            ValueError: The citation is not found or not owned, or no reason.
+        """
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("Give a reason for withdrawing the citation")
+        current = await self.get_citation(citation_id)
+        if current is None:
+            raise ValueError(f"Citation {citation_id} not found")
+        if current.withdrawn_at is None:
+            await self.db.execute(
+                """
+                UPDATE citations
+                SET withdrawn_at = NOW(), withdrawn_reason = $2
+                WHERE id = $1 AND withdrawn_at IS NULL
+                """,
+                citation_id,
+                reason[:1000],
+            )
+            await self._emit("citation.updated", citation_id)
+        updated = await self.get_citation(citation_id)
+        return updated or current
 
     # =========================================================================
     # VERIFICATION HELPERS (verification itself runs on the auxiliary-LLM
@@ -1240,7 +1452,7 @@ class CitationEngine:
 
         if job_uuid is not None:
             row = await self.db.fetchrow(
-                """SELECT s.* FROM sources s
+                f"""SELECT s.*, {self._LINK_COLUMNS} FROM sources s
                     JOIN job_sources js ON s.id = js.source_id
                     WHERE s.id = $1 AND js.job_id = $2""",
                 source_id,
@@ -1279,40 +1491,6 @@ class CitationEngine:
             return None
         return self._row_to_citation(dict(row))
 
-    async def get_citations_for_source(
-        self, source_id: int, job_id: str | None = None
-    ) -> list[Citation]:
-        """Get all citations referencing a source within a job."""
-        job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
-        log.debug(f"Retrieving citations for source [{source_id}], job_id={job_uuid}")
-
-        if job_uuid is not None:
-            rows = await self.db.fetch(
-                "SELECT * FROM citations WHERE source_id = $1 AND job_id = $2 ORDER BY created_at DESC",
-                source_id,
-                job_uuid,
-            )
-        else:
-            rows = await self.db.fetch(
-                "SELECT * FROM citations WHERE source_id = $1 ORDER BY created_at DESC",
-                source_id,
-            )
-
-        citations = [self._row_to_citation(dict(r)) for r in rows]
-        log.debug(f"Found {len(citations)} citations for source [{source_id}]")
-        return citations
-
-    async def get_citations_by_session(self, session_id: str) -> list[Citation]:
-        """Get all citations created in a session (created_by prefix match)."""
-        log.debug(f"Retrieving citations for session: {session_id}")
-        rows = await self.db.fetch(
-            "SELECT * FROM citations WHERE created_by LIKE $1 ORDER BY created_at DESC",
-            f"{session_id}%",
-        )
-        citations = [self._row_to_citation(dict(r)) for r in rows]
-        log.debug(f"Found {len(citations)} citations for session: {session_id}")
-        return citations
-
     async def list_sources(
         self,
         source_type: str | None = None,
@@ -1329,7 +1507,8 @@ class CitationEngine:
 
         if job_uuid is not None:
             query = (
-                "SELECT s.* FROM sources s JOIN job_sources js ON s.id = js.source_id"
+                f"SELECT s.*, {self._LINK_COLUMNS} FROM sources s "
+                "JOIN job_sources js ON s.id = js.source_id"
             )
             params.append(job_uuid)
             conditions.append(f"js.job_id = ${len(params)}")
@@ -1355,8 +1534,14 @@ class CitationEngine:
         session_id: str | None = None,
         verification_status: str | None = None,
         job_id: str | None = None,
+        include_withdrawn: bool = True,
     ) -> list[Citation]:
-        """List citations with optional filters (job-scoped by default)."""
+        """List citations with optional filters (job-scoped by default).
+
+        ``include_withdrawn=False`` leaves out citations the agent withdrew,
+        which is what the failed-citation feedback wants: a withdrawn citation
+        needs no more fixing.
+        """
         # Validate before the ::verification_status cast below, which would
         # otherwise reject a bad label in Postgres with an unactionable error.
         if verification_status is not None:
@@ -1391,6 +1576,8 @@ class CitationEngine:
             conditions.append(
                 f"verification_status = ${len(params)}::verification_status"
             )
+        if not include_withdrawn:
+            conditions.append("withdrawn_at IS NULL")
 
         query = "SELECT * FROM citations"
         if conditions:
@@ -1402,9 +1589,22 @@ class CitationEngine:
         log.debug(f"Found {len(citations)} citations for job_id={job_uuid}")
         return citations
 
+    #: The work unit's own view of a source, read with a job-scoped join.
+    _LINK_COLUMNS = (
+        "js.name AS link_name, js.identifier AS link_identifier, "
+        "js.metadata AS link_metadata"
+    )
+
     def _row_to_source(self, row: dict[str, Any]) -> Source:
-        """Convert a database row to a Source object."""
-        metadata = self._loads(row.get("metadata"))
+        """Convert a database row to a Source object.
+
+        A job-scoped read carries the link's name, identifier and metadata;
+        they win over the source row's, which belong to whoever registered
+        the content first. Links written before 0029 have none.
+        """
+        metadata = self._loads(row.get("link_metadata"))
+        if metadata is None:
+            metadata = self._loads(row.get("metadata"))
 
         created_at = row.get("created_at")
         if isinstance(created_at, str):
@@ -1413,8 +1613,8 @@ class CitationEngine:
         return Source(
             id=row["id"],
             type=SourceType(row["type"]),
-            identifier=row["identifier"],
-            name=row["name"],
+            identifier=row.get("link_identifier") or row["identifier"],
+            name=row.get("link_name") or row["name"],
             version=row.get("version"),
             content=row["content"],
             content_hash=row.get("content_hash"),
@@ -1430,6 +1630,9 @@ class CitationEngine:
         created_at = row.get("created_at")
         if isinstance(created_at, str):
             created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        withdrawn_at = row.get("withdrawn_at")
+        if isinstance(withdrawn_at, str):
+            withdrawn_at = datetime.fromisoformat(withdrawn_at.replace("Z", "+00:00"))
 
         return Citation(
             id=row["id"],
@@ -1452,6 +1655,9 @@ class CitationEngine:
             matched_location=matched_location,
             created_at=created_at,
             created_by=row.get("created_by"),
+            verification_reason=row.get("verification_reason"),
+            withdrawn_at=withdrawn_at,
+            withdrawn_reason=row.get("withdrawn_reason"),
         )
 
     # =========================================================================
@@ -1635,30 +1841,6 @@ class CitationEngine:
         log.info(f"Embedded source [{source_id}]: {len(chunks)} chunks")
         await self._set_embedding_state(source_id, "complete", chunks=len(chunks))
         return len(chunks)
-
-    async def reindex_source(self, source_id: int) -> int:
-        """Force re-chunk and re-embed a source for the current job."""
-        service = self._get_embedding_service()
-        if not service:
-            raise RuntimeError(
-                "Embedding service not configured (EMBEDDING_* env / SRW service)."
-            )
-
-        job_uuid = self._job_uuid()
-        source = await self.get_source(
-            source_id, job_id=str(job_uuid) if job_uuid else None
-        )
-        if not source:
-            raise ValueError(f"Source [{source_id}] not found")
-
-        await self.db.execute(
-            "DELETE FROM source_embeddings WHERE source_id = $1 AND job_id = $2",
-            source_id,
-            job_uuid,
-        )
-        return await self._embed_source_content(
-            source_id, source.content, job_uuid, service
-        )
 
     # =========================================================================
     # SEARCH METHODS
@@ -1960,12 +2142,13 @@ class CitationEngine:
         if source is None:
             raise ValueError(f"Source not found for citation {citation_id}")
 
+        handle = format_handle(citation.id)
         if style == "inline":
-            return f"[{citation.id}]"
+            return handle
         elif style == "harvard":
             return f"{source.name} ({source.version or 'n.d.'})"
         elif style == "ieee":
-            return f"[{citation.id}] {source.name}, {source.version or 'n.d.'}"
+            return f"{handle} {source.name}, {source.version or 'n.d.'}"
         elif style == "bibtex":
             entry_type = "misc"
             if source.type == SourceType.DOCUMENT:
@@ -1984,88 +2167,6 @@ class CitationEngine:
                 f"Unknown citation style: {style}. Supported: inline, harvard, ieee, bibtex, apa"
             )
 
-    async def export_bibliography(
-        self,
-        session_id: str | None = None,
-        style: str = "harvard",
-    ) -> str:
-        """Export all citations (or session citations) as bibliography."""
-        log.debug(f"Exporting bibliography in {style} style, session_id={session_id}")
-
-        citations = await self.list_citations(session_id=session_id)
-        if not citations:
-            return "No citations found."
-
-        lines = []
-        for citation in citations:
-            formatted = await self.format_citation(citation.id, style)
-            lines.append(formatted)
-
-        bibliography = "\n\n".join(lines)
-        log.info(f"Exported {len(citations)} citations as bibliography")
-        return bibliography
-
     # =========================================================================
     # STATISTICS & REPORTING
     # =========================================================================
-
-    async def get_statistics(self) -> dict[str, Any]:
-        """Get statistics about sources and citations."""
-        log.debug("Calculating statistics")
-
-        stats = {"sources": {}, "citations": {}}
-
-        rows = await self.db.fetch(
-            "SELECT type::text AS type, COUNT(*) AS count FROM sources GROUP BY type"
-        )
-        stats["sources"]["by_type"] = {r["type"]: r["count"] for r in rows}
-        stats["sources"]["total"] = sum(stats["sources"]["by_type"].values())
-
-        rows = await self.db.fetch(
-            "SELECT verification_status::text AS verification_status, COUNT(*) AS count "
-            "FROM citations GROUP BY verification_status"
-        )
-        stats["citations"]["by_status"] = {
-            r["verification_status"]: r["count"] for r in rows
-        }
-        stats["citations"]["total"] = sum(stats["citations"]["by_status"].values())
-
-        # Embedding index coverage (fix 5): a source count alone says nothing
-        # about whether semantic search can actually see those sources.
-        try:
-            missing = await self.db.fetchval(
-                """
-                SELECT COUNT(*) FROM job_sources js
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM source_embeddings se
-                    WHERE se.source_id = js.source_id AND se.job_id = js.job_id
-                )
-                """
-            )
-            embedded_sources = await self.db.fetchval(
-                "SELECT COUNT(DISTINCT source_id) FROM source_embeddings"
-            )
-            failed_rows = await self.db.fetch(
-                """
-                SELECT metadata->'embedding_state'->>'reason_type' AS reason_type,
-                       COUNT(*) AS count
-                FROM sources
-                WHERE metadata->'embedding_state'->>'status' = 'failed'
-                GROUP BY 1
-                """
-            )
-            stats["sources"]["embedding_coverage"] = {
-                "embedded_sources": embedded_sources or 0,
-                "job_source_pairs_missing_embeddings": missing or 0,
-                "failed_by_reason": {
-                    (r["reason_type"] or "error"): r["count"] for r in failed_rows
-                },
-            }
-        except Exception as e:  # noqa: BLE001 — stats must not fail the caller
-            log.warning(f"Embedding coverage stats unavailable: {e}")
-
-        log.debug(
-            f"Statistics: {stats['sources']['total']} sources, "
-            f"{stats['citations']['total']} citations"
-        )
-        return stats

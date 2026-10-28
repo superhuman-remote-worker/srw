@@ -33,7 +33,7 @@ wasted work when priorities shift.
 
 Specific enough that you know *exactly* when it's done:
 
-1. **Names the artifact** — file path, section number, page range, citation IDs.
+1. **Names the artifact** — file path, section number, page range, citation handles.
 2. **Names the tool** — "use `read_file`," "use `web_search`," "use `write_file`."
 3. **Has a measurable outcome** — "produces X," "updates Y to contain Z," "verifies N items."
 4. **Fits in 1–3 tool calls** — if it needs more, split it.

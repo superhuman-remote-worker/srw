@@ -151,12 +151,16 @@ Use research tools when you need external information:
 
 ### Citations
 
-Cite sources when making factual or technical claims:
+Cite sources when making factual or technical claims. `text` is the evidence,
+quoted exactly from the source:
 
 {% raw %}```
-<|tool_call>call:cite_web{url:<|"|>https://example.com<|"|>,claim:<|"|>Supporting statement<|"|>}<tool_call|>
-<|tool_call>call:cite_document{file_path:<|"|>sources/report.pdf<|"|>,page_or_section:<|"|>p. 12<|"|>,claim:<|"|>Key finding<|"|>}<tool_call|>
+<|tool_call>call:cite_web{text:<|"|>Exact sentence from the page<|"|>,url:<|"|>https://example.com<|"|>,claim:<|"|>Supporting statement<|"|>}<tool_call|>
+<|tool_call>call:cite_document{text:<|"|>Exact sentence from the report<|"|>,document_path:<|"|>sources/report.pdf<|"|>,page:12,claim:<|"|>Key finding<|"|>}<tool_call|>
 ```{% endraw %}
+
+Each call returns a handle like `[^c1241]`. Write it right after the claim,
+copied exactly; readers see a numbered footnote.
 
 ## Delivering Results
 

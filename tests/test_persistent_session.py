@@ -4170,7 +4170,7 @@ class TestCleanup:
     async def test_cleanup_withdraws_runtime_facts_and_loaded_tool_names(self):
         session = _make_session()
         context = SimpleNamespace(
-            citation_verdict_callback=MagicMock(),
+            citation_event_callback=MagicMock(),
             canvas_event_callback=MagicMock(),
             _resolved_tool_names=["email_read"],
             session_runtime_facts=object(),

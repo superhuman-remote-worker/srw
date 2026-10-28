@@ -1922,9 +1922,11 @@ async def verify_and_store_citation(
 
     Eventually-consistent (D2): the citation was already written ``pending`` by
     ``cite_*``; this runs in the background and flips it to ``verified`` /
-    ``failed``. **An aux *outage* leaves the row ``pending``** (so the Phase-2b
-    boundary reconcile / a retry can pick it up) — only a real negative verdict
-    sets ``failed``. Non-fatal: never raises into the (fire-and-forget) caller.
+    ``failed``. When no verdict can be had (the source is gone, or the
+    verifier failed after its own retries) the row becomes ``unverified`` with
+    a reason, so the reader sees "Not checked" instead of a pending state
+    that nothing will end. Only a real negative verdict sets ``failed``.
+    Non-fatal: never raises into the (fire-and-forget) caller.
 
     Args:
         verify_aux: AuxiliaryLLM wrapping the citation-verification model
@@ -1936,6 +1938,8 @@ async def verify_and_store_citation(
     Returns:
         The CitationVerdict on a successful verdict, else None.
     """
+    from shared.runtime.citation_engine.models import VerificationReason
+
     try:
         citation = await engine.get_citation(citation_id)
         if citation is None:
@@ -1946,6 +1950,11 @@ async def verify_and_store_citation(
                 "Citation verification: source [%s] for citation [%s] not found",
                 citation.source_id,
                 citation_id,
+            )
+            await engine._mark_unchecked(
+                citation_id,
+                VerificationReason.SOURCE_UNAVAILABLE,
+                "The cited source could not be found to check against.",
             )
             return None
 
@@ -1990,14 +1999,26 @@ async def verify_and_store_citation(
 
     except Exception as e:
         verify_aux.health.record_failure("citation_verification", e)
-        # Leave verification_status='pending' — an aux outage is transient; the
-        # Phase-2b boundary reconcile (or a re-read) can retry. Non-fatal.
+        # The verifier already ran its own retries; nothing retries after
+        # this, so end the pending state honestly. Editing the citation asks
+        # for a new check.
         logger.warning(
             "Citation verification failed for [%s] (non-fatal): %s: %s",
             citation_id,
             type(e).__name__,
             e,
         )
+        try:
+            await engine._mark_unchecked(
+                citation_id,
+                VerificationReason.NOT_CHECKED,
+                f"The citation checker failed ({type(e).__name__}); edit the "
+                "citation to have it checked again.",
+            )
+        except Exception as mark_error:
+            logger.debug(
+                "Could not mark citation [%s] unchecked: %s", citation_id, mark_error
+            )
         return None
 
 

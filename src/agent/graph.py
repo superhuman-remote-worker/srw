@@ -1499,7 +1499,7 @@ def create_execute_node(
         if _cit_engine is not None:
             try:
                 _failed_cites = await _cit_engine.list_citations(
-                    verification_status="failed"
+                    verification_status="failed", include_withdrawn=False
                 )
                 _failed_citations = list(_failed_cites or [])
                 if _failed_cites:

@@ -2723,7 +2723,9 @@ async def _execute_turn(
             if _provider_admission_closed():
                 return _closed_result()
             _failed_cites = await asyncio.wait_for(
-                _cit_engine.list_citations(verification_status="failed"),
+                _cit_engine.list_citations(
+                    verification_status="failed", include_withdrawn=False
+                ),
                 timeout=_RETRIEVAL_TIMEOUT,
             )
             failed_citations = list(_failed_cites or [])

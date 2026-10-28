@@ -29,9 +29,16 @@ class TestFormatFailedCitations:
             [_cit(3, "Records retained for 10 years", notes="not in source")]
         )
         assert "edit_citation" in block
-        assert "[3]" in block
+        assert "withdraw_citation" in block
+        assert "[^c3]" in block
         assert "Records retained for 10 years" in block
         assert "not in source" in block
+
+    def test_names_the_reason_code_in_words(self):
+        cit = _cit(4, "claim", notes="checked against page 2")
+        cit.verification_reason = "quote_not_found"
+        block = format_failed_citations([cit])
+        assert "the quoted words are not in the source: checked against page 2" in block
 
     def test_truncates_long_claim_and_reason(self):
         block = format_failed_citations([_cit(1, "C" * 300, notes="R" * 400)])
@@ -45,7 +52,7 @@ class TestFormatFailedCitations:
         block = format_failed_citations(cits, limit=5)
         assert "and 3 more" in block
         # Only the first 5 are listed explicitly.
-        assert "[5]" not in block
+        assert "[^c5]" not in block
 
     def test_missing_score_omits_similarity(self):
         block = format_failed_citations([_cit(2, "claim", score=None)])

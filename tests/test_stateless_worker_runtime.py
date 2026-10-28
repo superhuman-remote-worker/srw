@@ -2272,7 +2272,7 @@ async def test_agent_finalization_hold_retires_admission_then_disposes_shell_onc
     )
     tool_context = SimpleNamespace(
         shell_manager=shell,
-        citation_verdict_callback=object(),
+        citation_event_callback=object(),
     )
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._current_job_id = "job-a"
@@ -2311,7 +2311,7 @@ async def test_agent_finalization_hold_retires_admission_then_disposes_shell_onc
     assert agent._worker_terminal_shell_cleanup is terminal_cleanup
     assert agent._worker_finalization_held is True
     assert tool_context.shell_manager is None
-    assert tool_context.citation_verdict_callback is None
+    assert tool_context.citation_event_callback is None
     assert agent._tool_context is None
     assert agent._job_metadata is None
     assert agent._checkpointer is None

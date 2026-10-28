@@ -63,7 +63,7 @@ spec:
         # stays role-neutral for the other session experts that extend it.
 
         # Bind the citation skill to the citation tools inherited from session_base,
-        # so the assistant references sources inline as [N] instead of citing-and-forgetting.
+        # so the assistant references sources inline by handle instead of citing-and-forgetting.
         # session_base omits instruction_files by convention, so persistent experts
         # opt in here; before_tool + enforce is the only binding that fires in a session
         # (no phase loop). See knowledge-history/done/citation_engine_integration.md Phase 4.

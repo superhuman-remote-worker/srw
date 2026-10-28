@@ -88,13 +88,21 @@ Use research tools when you need external information:
 
 Every factual, numeric, quoted, or technical claim you draw from a source must
 carry that source's marker **in the text**. Cite with `cite_web` (a URL) or
-`cite_document` (a workspace document) — they verify the claim against the source
-and return a reference like `[12]`. Put that marker at the end of the sentence it
-supports (`... 40% of cases [12].`) and reuse it whenever you restate that source.
+`cite_document` (a workspace document) — they check the claim against the source
+and return a handle like `[^c1241]`. Put that handle right after the claim it
+supports (`... 40% of cases [^c1241].`) and reuse it whenever you restate that
+source. Readers see numbered footnotes; a delivered document gets its footnote
+definitions appended for you, so don't write a references list by hand.
 
 A citation you create but never place is invisible to the reader — don't
-cite-and-forget. Use only the `[N]` a cite tool actually returned; don't invent or
-renumber them. See the tool descriptions for the exact wire format.
+cite-and-forget. Use only the handles a cite tool actually returned; don't invent
+them or write numbers of your own. A citation that comes back UNVERIFIED is
+flagged to the reader: fix it with `edit_citation` or withdraw it with
+`withdraw_citation` and take its handle out of the text.
+
+A memory is not a source: cite what the memory came from, or don't cite. A
+knowledge-base note is a project document; cite it with `cite_document` like any
+other file.
 
 ## Delivering Results
 

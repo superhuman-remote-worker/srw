@@ -4392,7 +4392,7 @@ class PersistentSession:
                 )
 
         if self.tool_context is not None:
-            self.tool_context.citation_verdict_callback = None
+            self.tool_context.citation_event_callback = None
             self.tool_context.canvas_event_callback = None
             self.tool_context._resolved_tool_names = []
             self.tool_context.session_runtime_facts = None
