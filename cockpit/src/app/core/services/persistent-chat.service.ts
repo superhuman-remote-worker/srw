@@ -9104,6 +9104,19 @@ export function parseRunningTools(params: Record<string, unknown>): RunningToolI
   return single ? [single] : [];
 }
 
+/**
+ * Whether a tool result read back from history is the tool's own failure
+ * report. History rows carry no `is_error` (only the live `tool.completed`
+ * frame does), so the replay applies the agent's rule (`_is_returned_error`
+ * in persistent_graph.py): the result starts with `Error:`, or it is the
+ * runtime's `Tool execution error:` for a tool that raised. Only the leading
+ * prefix counts, so a log that mentions an error stays a success.
+ */
+export function isReturnedToolError(result: string): boolean {
+  const head = result.trimStart();
+  return head.startsWith('Error:') || head.startsWith('Tool execution error:');
+}
+
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
   const turns: Turn[] = [];
   const turnByNumber = new Map<number, AssistantTurn>();
@@ -9227,7 +9240,8 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       const tc = toolCallById.get(callId);
       if (!tc) continue;
       tc.result = m.content ?? '';
-      tc.resultStatus = 'ok';
+      const failed = isReturnedToolError(tc.result);
+      tc.resultStatus = failed ? 'error' : 'ok';
       // That recovery's marker says what became of the child; the result
       // text is for the model and is never parsed. Each result row decides
       // afresh, like the text it carries: a later unmarked result for the
@@ -9238,7 +9252,7 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       // Don't clobber a 'denied' decision recorded on the AI side. A
       // recovered declined call is that same refusal.
       const refused = tc.decision === 'denied' || recovery?.class === 'declined';
-      tc.status = refused ? 'denied' : 'completed';
+      tc.status = refused ? 'denied' : failed ? 'error' : 'completed';
       continue;
     }
 

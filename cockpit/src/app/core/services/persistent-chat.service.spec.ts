@@ -8,6 +8,7 @@ import { TranslocoService } from '@jsverse/transloco';
 import {
   PersistentChatService,
   historyToTurns,
+  isReturnedToolError,
   cloudCountFromSummary,
   describeAppliedConfig,
   parseRunningTools,
@@ -10486,6 +10487,53 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     const u = service.usage()!;
     expect(u.turn).toBe(2);
     expect(u.reasoningEstimated).toBe(true);
+  });
+
+  describe('historyToTurns — a returned tool error stays an error after replay', () => {
+    // The live `tool.completed` frame carries is_error; history rows do not.
+    // Without the replay rule a reloaded "Error: File not found" showed as a
+    // completed call (seen on k3d 2026-10-28).
+    const turnWith = (toolName: string, result: string) =>
+      historyToTurns([
+        {
+          id: 'a1',
+          role: 'ai',
+          content: null,
+          tool_calls: [{ name: toolName, args: {}, id: 'tc1' }],
+          turn_number: 1,
+          created_at: '2026-10-28T22:00:00Z',
+        },
+        {
+          id: 't1',
+          role: 'tool',
+          content: result,
+          tool_calls: null,
+          turn_number: 1,
+          tool_call_id: 'tc1',
+          created_at: '2026-10-28T22:00:01Z',
+        },
+      ] as never);
+
+    it('marks an "Error:" result as a failed call', () => {
+      const [tool] = (turnWith('read_file', 'Error: File not found: x.txt')[0] as AssistantTurn).events.filter(isToolCall);
+      expect(tool).toMatchObject({ status: 'error', resultStatus: 'error' });
+    });
+
+    it('marks a raised tool ("Tool execution error:") as a failed call', () => {
+      const [tool] = (turnWith('run_command', 'Tool execution error: boom')[0] as AssistantTurn).events.filter(isToolCall);
+      expect(tool).toMatchObject({ status: 'error', resultStatus: 'error' });
+    });
+
+    it('keeps a result that only mentions an error a success', () => {
+      const [tool] = (turnWith('read_file', 'line 3: Error: retrying\nok')[0] as AssistantTurn).events.filter(isToolCall);
+      expect(tool).toMatchObject({ status: 'completed', resultStatus: 'ok' });
+    });
+
+    it('applies the leading-prefix rule only', () => {
+      expect(isReturnedToolError('  Error: x')).toBe(true);
+      expect(isReturnedToolError('error: lowercase is not the tool contract')).toBe(false);
+      expect(isReturnedToolError('All good')).toBe(false);
+    });
   });
 
   describe('historyToTurns — tool categories survive the replay', () => {
