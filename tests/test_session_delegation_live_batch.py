@@ -450,6 +450,39 @@ async def test_a_child_failure_is_its_own_result_and_the_turn_goes_on():
     assert llm.calls == 2
 
 
+async def test_a_returned_error_string_is_reported_as_an_error():
+    """``delegate_agent`` refuses a call by returning ``Error: ...`` (no prompt,
+    one child per turn); that result is a failure in the Cockpit, not a
+    success. A report that only mentions an error is still a success."""
+
+    async def _delegate(call: dict):
+        if call["id"] == "c1":
+            return "Error: prompt is required."
+        return "report c2: the build had one error: a missing import"
+
+    callbacks = _callbacks()
+    llm = _Parent([_batch("c1", "c2"), AIMessage(content="done")])
+    messages: List[Any] = []
+
+    await _turn(
+        llm,
+        {"delegate_agent": _tool("delegate_agent", _delegate)},
+        callbacks,
+        _session_context(),
+        messages,
+    )
+
+    callbacks.on_tool_result.assert_any_await(
+        "delegate_agent", "Error: prompt is required.", "c1", is_error=True
+    )
+    callbacks.on_tool_result.assert_any_await(
+        "delegate_agent",
+        "report c2: the build had one error: a missing import",
+        "c2",
+        is_error=False,
+    )
+
+
 async def test_a_call_refused_at_its_effect_boundary_leaves_siblings_running():
     """The effect boundary is a safety fence: the turn must not continue past
     it. The siblings already running finish, every call gets its result, and

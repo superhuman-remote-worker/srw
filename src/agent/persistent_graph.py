@@ -139,6 +139,17 @@ def _unavailable_tool_message(tool_name: str) -> str:
     )
 
 
+def _is_returned_error(result: str) -> bool:
+    """Whether a tool's returned string is its own failure report.
+
+    Tools report most failures by returning ``Error: ...`` instead of raising,
+    and the Cockpit renders a call as failed only from ``on_tool_result``'s
+    ``is_error``. Only the leading prefix counts: a result that merely contains
+    "error:" (a log file, grep output, a child's report) is a success.
+    """
+    return result.lstrip().startswith("Error:")
+
+
 def _charter_injection_enabled(config: Any) -> bool:
     """Whether this session gets the pinned charter block (centurion.md §5).
 
@@ -4151,7 +4162,8 @@ async def _execute_turn(
                         )
                         if isinstance(result, ToolMessage):
                             result = result.content
-                        return (str(result) if result is not None else "", False)
+                        text = str(result) if result is not None else ""
+                        return (text, _is_returned_error(text))
                     except WorkspaceUnavailableError:
                         raise
                     except Exception as exc:
@@ -4430,6 +4442,7 @@ async def _execute_turn(
             try:
                 result = await tool.ainvoke(tool_args)
                 result_str = str(result) if result is not None else ""
+                is_error = _is_returned_error(result_str)
             except WorkspaceUnavailableError:
                 # Dead workspace mid-turn: propagate so the turn handler surfaces
                 # a clean recovery message via on_error, instead of flattening it

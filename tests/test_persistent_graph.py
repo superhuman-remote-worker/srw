@@ -4067,6 +4067,67 @@ class TestToolExecutionLoop:
         assert "error" in callbacks.on_tool_result.call_args[0][1].lower()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "returned,is_error",
+        [
+            ("Error: File not found: notes.md", True),
+            ("  Error: offset must be >= 0", True),
+            # Only the leading prefix is the tool's own failure report: a read
+            # of a log that contains "error:" succeeded.
+            ("build.log\nerror: linker failed", False),
+            ("No errors found.", False),
+        ],
+    )
+    async def test_a_returned_error_string_is_reported_as_an_error(
+        self, returned, is_error
+    ):
+        """Tools report most failures by returning ``Error: ...`` rather than
+        raising. The Cockpit renders a call as failed only from the
+        ``is_error`` flag on ``tool.completed``, so without it every such call
+        showed as a success."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "read_file", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("ok")
+        call_count = 0
+
+        async def _astream(msgs, **kw):
+            nonlocal call_count
+            call_count += 1
+            yield response_with_tool if call_count == 1 else final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        tool = _make_tool("read_file", returned)
+        tool_ctx = MagicMock()
+        tool_ctx.consume_freeze_request.return_value = None
+        callbacks = _make_callbacks()
+        messages = [SystemMessage(content="sys"), HumanMessage(content="go")]
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={"read_file": tool},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=_make_config(),
+            tool_context=tool_ctx,
+        )
+
+        callbacks.on_tool_result.assert_called_once_with(
+            "read_file", returned, "tc1", is_error=is_error
+        )
+        # The model still reads the tool's own words.
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        assert [m.content for m in tool_messages] == [returned]
+
+    @pytest.mark.asyncio
     async def test_tool_none_result_becomes_empty_string(self):
         """Tool returning None produces empty string ToolMessage."""
         response_with_tool = AIMessage(
