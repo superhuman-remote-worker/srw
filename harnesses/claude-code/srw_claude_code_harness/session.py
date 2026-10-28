@@ -1,12 +1,12 @@
 """Run one Claude Code session through the Agent SDK (spec B3 steps 2, 3, 5; B5).
 
-- ``build_options`` turns every built-in tool off and exposes only the harness's
-  own in-process MCP tools; nothing from the configuration reaches an option that
-  starts a program or loads code (hooks, settings files, plugins, ``cli_path``,
+- ``job_options`` turns every built-in tool off and exposes only the harness's
+  own in-process MCP tools; nothing from the job reaches an option that starts a
+  program or loads code (hooks, settings files, plugins, ``cli_path``,
   ``extra_args``, stdio MCP servers).
-- ``cli_env`` builds the CLI's whole environment from fixed values plus the
-  credential. The SDK merges ``ClaudeAgentOptions.env`` over ``os.environ``, so
-  the entrypoint calls ``scrub_process_environment`` before the session.
+- ``route_env`` builds the CLI's whole environment from fixed values plus the
+  job's model route. The SDK merges ``ClaudeAgentOptions.env`` over
+  ``os.environ``, so the entrypoint calls ``scrub_process_environment`` first.
 - ``run_session`` streams every message to the transcript and enforces the
   wall-clock deadline and the stop request by interrupting the CLI.
 
@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .config import _CREDENTIAL_ENV, HarnessConfig, SystemPrompt
 from .job import JobSpec, ModelRoute
 from .transcript import Transcript
 
@@ -53,7 +52,7 @@ CLI_FIXED_ENV = {
 INTERRUPT_GRACE_SECONDS = 15.0
 DISCONNECT_WAIT_SECONDS = 25.0
 # Stop path (SIGTERM / SRW cancel; the pod has ~30 s before SIGKILL and still has
-# to write the partial result and upload). Once ``stop`` fires — before or during
+# to copy the transcript and deregister). Once ``stop`` fires — before or during
 # the session, or during a deadline's grace — waiting for the ResultMessage and
 # unwinding the conversation end at most this long after it fired ...
 STOP_INTERRUPT_GRACE_SECONDS = 5.0
@@ -63,30 +62,6 @@ STOP_DISCONNECT_WAIT_SECONDS = 2.0
 # so a cooperative task gets to finish even when the stop budget is spent).
 SETTLE_WAIT_SECONDS = 5.0
 SETTLE_MIN_SECONDS = 0.1
-
-
-def cli_env(
-    config: HarnessConfig,
-    credential: tuple[str, str],
-    *,
-    run_dir: Path,
-    path: str,
-) -> dict[str, str]:
-    """The CLI's complete environment: fixed values, per-run dirs, the credential.
-
-    Creates the per-run ``home``, ``claude`` (config) and ``tmp`` directories
-    under ``run_dir`` so the variables naming them point at real directories.
-    """
-    name, value = credential
-    if name not in _CREDENTIAL_ENV:
-        raise ValueError(f"credential must be one of {list(_CREDENTIAL_ENV)}")
-    env = _fixed_env(run_dir, path)
-    if not config.auto_compact:
-        env["DISABLE_AUTO_COMPACT"] = "1"
-    env[name] = value
-    if config.api_base_url:
-        env["ANTHROPIC_BASE_URL"] = config.api_base_url
-    return env
 
 
 def _fixed_env(run_dir: Path, path: str) -> dict[str, str]:
@@ -118,50 +93,15 @@ def route_env(route: ModelRoute, *, run_dir: Path, path: str) -> dict[str, str]:
     return env
 
 
-def _system_prompt(prompt: SystemPrompt) -> dict[str, str] | str:
-    if prompt.kind == "preset":
-        return {"type": "preset", "preset": "claude_code"}
-    if prompt.kind == "preset_append":
-        return {"type": "preset", "preset": "claude_code", "append": prompt.text or ""}
-    return prompt.text or ""
-
-
-def build_options(
-    config: HarnessConfig, *, tools: list, env: dict[str, str], cwd: Path
-) -> ClaudeAgentOptions:
-    """SDK options with built-ins off and only ``mcp__ws__<tool>`` allowed.
-
-    ``fallback_model``, ``hooks``, ``settings``, ``plugins``, ``extra_args``,
-    ``cli_path``, ``add_dirs``, ``agents`` and ``skills`` keep the SDK defaults;
-    no configuration value ever reaches them (spec B5).
-    """
-    from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server
-
-    return ClaudeAgentOptions(
-        tools=[],
-        mcp_servers={
-            MCP_SERVER_NAME: create_sdk_mcp_server(MCP_SERVER_NAME, "1.0.0", tools)
-        },
-        allowed_tools=[f"mcp__{MCP_SERVER_NAME}__{t.name}" for t in tools],
-        strict_mcp_config=True,
-        permission_mode="default",
-        setting_sources=[],
-        system_prompt=_system_prompt(config.system_prompt),
-        model=config.model,
-        max_turns=config.limits.max_turns,
-        max_budget_usd=config.limits.max_budget_usd,
-        effort=config.effort,
-        thinking=dict(config.thinking) if config.thinking is not None else None,
-        env=dict(env),
-        cwd=cwd,
-        include_partial_messages=False,
-    )
-
-
 def job_options(
     spec: JobSpec, *, tools: list, env: dict[str, str], cwd: Path
 ) -> ClaudeAgentOptions:
-    """SDK options for a job: the same lockdown as ``build_options``, fed by the spec."""
+    """SDK options for a job, built-ins off and only ``mcp__ws__<tool>`` allowed.
+
+    ``fallback_model``, ``hooks``, ``settings``, ``plugins``, ``extra_args``,
+    ``cli_path``, ``add_dirs``, ``agents`` and ``skills`` keep the SDK defaults;
+    no value from the job ever reaches them (spec B5).
+    """
     from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server
 
     prompt: dict[str, str] = {"type": "preset", "preset": "claude_code"}
@@ -309,7 +249,7 @@ async def run_session(
     a deadline's grace): everything up to the disconnect ends at most
     ``STOP_INTERRUPT_GRACE_SECONDS`` after stop fired, and the disconnect is
     waited for at most ``STOP_DISCONNECT_WAIT_SECONDS``, so the entrypoint keeps
-    most of the pod's grace period for the partial result and the upload.
+    most of the pod's grace period for the transcript copy and the deregistration.
     """
     outcome = SessionOutcome(
         result=None, timed_out=False, interrupted=False, error=None

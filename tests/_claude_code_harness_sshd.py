@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 
 import asyncssh
-from srw_claude_code_harness.bindings import WorkspaceAccess
+from srw_claude_code_harness.workspace import WorkspaceAccess
 
 _CHUNK = 65536
 

@@ -2381,7 +2381,7 @@ jobs:
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       # Smoke test before anything is published: the SDK the image pins (the
       # test venv may run another version) must import the harness, parse a
-      # config and build the session options. No session, no network.
+      # start request and build the session options. No session, no network.
       # Loaded into the local daemon only; the push below reuses the layers.
       - name: Build the image for the smoke test
         run: >-
@@ -2394,11 +2394,14 @@ jobs:
           docker run --rm --network none --entrypoint python3 srw-harness-claude-code:smoke -I -c '
           from pathlib import Path
           from srw_claude_code_harness.__main__ import _versions
-          from srw_claude_code_harness.config import parse_config
-          from srw_claude_code_harness.session import build_options
-          from srw_claude_code_harness.tools import make_tools
-          config = parse_config({"version": 1, "model": "claude-smoke"})
-          options = build_options(config, tools=make_tools(None, config.tools), env={"PATH": "/usr/bin"}, cwd=Path("/home/agent-host/workspace"))
+          from srw_claude_code_harness.job import parse_job_start, require_anthropic_route
+          from srw_claude_code_harness.session import job_options
+          from srw_claude_code_harness.tools import TOOL_NAMES, make_tools
+          llm = {"model": "claude-smoke", "provider": "anthropic", "client_protocol": "anthropic-messages", "api_key": "smoke"}
+          remote = {"host": "127.0.0.1", "port": 22, "username": "agent-host", "key_path": "/nonexistent/key", "workspace_path": "/home/agent-host/workspace"}
+          spec = parse_job_start({"job_id": "smoke", "description": "smoke", "resolved_config": {"agent": {"llm": llm, "workspace": {"remote": remote}}}})
+          require_anthropic_route(spec.model)
+          options = job_options(spec, tools=make_tools(None, TOOL_NAMES), env={"PATH": "/usr/bin"}, cwd=Path("/home/agent-host/workspace"))
           assert options.model == "claude-smoke" and len(options.allowed_tools) == 4, options
           versions = _versions()
           assert versions["sdk"] and versions["cli"], versions
@@ -2407,10 +2410,10 @@ jobs:
           # The local user resolves with the USER variables cleared (passwd entry for uid 10001).
           docker run --rm --network none --entrypoint python3 -e USER= -e LOGNAME= srw-harness-claude-code:smoke -I -c 'import getpass, os; print("local user", getpass.getuser(), "uid", os.getuid())'
           # The real start command (python3 -I -u -m srw_claude_code_harness):
-          # with no config file delivered it must reach the harness and exit 2.
+          # with no ORCHESTRATOR_URL it must reach the harness and exit 2.
           rc=0
           docker run --rm --network none srw-harness-claude-code:smoke || rc=$?
-          test "$rc" -eq 2 || { echo "start command exited $rc; expected 2 (no config file)"; exit 1; }
+          test "$rc" -eq 2 || { echo "start command exited $rc; expected 2 (no ORCHESTRATOR_URL)"; exit 1; }
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:

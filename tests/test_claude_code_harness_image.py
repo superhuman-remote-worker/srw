@@ -103,8 +103,8 @@ def test_example_job_validates_against_the_manifest_schema():
 
 def test_ci_smoke_tests_the_image_before_it_is_published():
     """M5: tests run against the venv's SDK; the image pins its own. Both CI
-    jobs run the built image (no network) through build_options before the
-    step that pushes."""
+    jobs run the built image (no network) from a start request through
+    job_options before the step that pushes."""
     for workflow in ("develop.yml", "main.yml"):
         jobs = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())[
             "jobs"
@@ -128,9 +128,9 @@ def test_ci_smoke_tests_the_image_before_it_is_published():
             "--network none --entrypoint python3 srw-harness-claude-code:smoke -I -c"
             in command
         )
-        for needle in ("parse_config(", "build_options(", "make_tools("):
+        for needle in ("parse_job_start(", "job_options(", "make_tools("):
             assert needle in command, (workflow, needle)
-        # The real start command runs too: without a config file it exits 2.
+        # The real start command runs too: without ORCHESTRATOR_URL it exits 2.
         assert "docker run --rm --network none srw-harness-claude-code:smoke" in command
         assert 'test "$rc" -eq 2' in command
         # The local user resolves with the USER variables cleared (passwd entry)

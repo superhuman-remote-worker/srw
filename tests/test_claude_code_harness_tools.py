@@ -325,8 +325,7 @@ def test_make_tools_uses_the_given_handlers(workspace):
     assert [t.name for t in tools] == ["Write"] and tools[0].handler == handlers.write
 
 
-def test_tool_names_live_in_tools_and_config_reexports_them():
-    from srw_claude_code_harness import config, tools
+def test_tool_names_are_the_four_claude_code_tools():
+    from srw_claude_code_harness import tools
 
     assert tools.TOOL_NAMES == ("Bash", "Read", "Write", "Edit")
-    assert config.TOOL_NAMES is tools.TOOL_NAMES

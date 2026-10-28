@@ -8,12 +8,9 @@ from pathlib import Path
 
 import pytest
 from srw_claude_code_harness import session as session_module
-from srw_claude_code_harness.config import FIXED_SETTINGS, parse_config
 from srw_claude_code_harness.session import (
     CLI_FIXED_ENV,
     MCP_SERVER_NAME,
-    build_options,
-    cli_env,
     job_options,
     route_env,
     run_session,
@@ -444,77 +441,6 @@ async def test_run_session_propagates_cancellation_after_cleaning_up(tmp_path):
     assert clients[0].disconnected
 
 
-def test_cli_env_contains_only_the_fixed_set_and_the_credential(tmp_path):
-    env = cli_env(
-        parse_config({"version": 1, "model": "m", "autoCompact": False}),
-        ("ANTHROPIC_API_KEY", "k"),
-        run_dir=tmp_path,
-        path="/usr/bin",
-    )
-    assert set(env) == set(CLI_FIXED_ENV) | {
-        "PATH",
-        "HOME",
-        "CLAUDE_CONFIG_DIR",
-        "TMPDIR",
-        "DISABLE_AUTO_COMPACT",
-        "ANTHROPIC_API_KEY",
-    }
-    assert env["ANTHROPIC_API_KEY"] == "k" and env["PATH"] == "/usr/bin"
-    assert env["HOME"] == str(tmp_path / "home")
-    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude")
-    assert env["TMPDIR"] == str(tmp_path / "tmp")
-    assert env["DISABLE_AUTO_COMPACT"] == "1"
-    assert all(env[name] == value for name, value in CLI_FIXED_ENV.items())
-    assert all((tmp_path / d).is_dir() for d in ("home", "claude", "tmp"))
-    assert "ANTHROPIC_BASE_URL" not in env
-
-
-def test_cli_env_sets_the_base_url_only_when_configured(tmp_path):
-    """apiBaseUrl is the one setting that decides where the credential goes:
-    it reaches the CLI as ANTHROPIC_BASE_URL and nothing else changes."""
-    without = cli_env(
-        parse_config({"version": 1, "model": "muse-spark-1.3"}),
-        ("ANTHROPIC_API_KEY", "k"),
-        run_dir=tmp_path / "a",
-        path="/bin",
-    )
-    with_url = cli_env(
-        parse_config(
-            {
-                "version": 1,
-                "model": "muse-spark-1.3",
-                "apiBaseUrl": "https://api.meta.ai",
-            }
-        ),
-        ("ANTHROPIC_API_KEY", "k"),
-        run_dir=tmp_path / "b",
-        path="/bin",
-    )
-    assert with_url["ANTHROPIC_BASE_URL"] == "https://api.meta.ai"
-    assert set(with_url) == set(without) | {"ANTHROPIC_BASE_URL"}
-
-
-def test_cli_env_with_oauth_token_and_auto_compact_on(tmp_path):
-    env = cli_env(
-        parse_config({"version": 1, "model": "m"}),
-        ("CLAUDE_CODE_OAUTH_TOKEN", "t"),
-        run_dir=tmp_path,
-        path="/bin",
-    )
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "t"
-    assert "DISABLE_AUTO_COMPACT" not in env and "ANTHROPIC_API_KEY" not in env
-
-
-def test_cli_env_refuses_other_credential_names(tmp_path):
-    with pytest.raises(ValueError):
-        cli_env(
-            parse_config({"version": 1, "model": "m"}),
-            ("LD_PRELOAD", "/x.so"),
-            run_dir=tmp_path,
-            path="/bin",
-        )
-
-
 def test_cli_fixed_env_values():
     assert CLI_FIXED_ENV == {
         "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
@@ -554,76 +480,8 @@ def _stub_workspace():
     return ws
 
 
-def test_build_options_disables_builtins_and_allows_only_the_mcp_tools():
-    pytest.importorskip("claude_agent_sdk")
-    from srw_claude_code_harness.tools import make_tools
-
-    options = build_options(
-        parse_config(
-            {
-                "version": 1,
-                "model": "m",
-                "systemPrompt": {"type": "preset", "append": "A"},
-                "effort": "high",
-                "thinking": {"type": "adaptive"},
-                "limits": {"maxTurns": 7, "maxBudgetUsd": 3},
-            }
-        ),
-        tools=make_tools(_stub_workspace(), ["Bash", "Read"]),
-        env={"PATH": "/usr/bin"},
-        cwd=Path("/tmp"),
-    )
-    assert options.tools == [] and options.allowed_tools == [
-        "mcp__ws__Bash",
-        "mcp__ws__Read",
-    ]
-    assert (
-        options.permission_mode == "default"
-        and options.setting_sources == []
-        and options.strict_mcp_config is True
-    )
-    assert (
-        options.system_prompt
-        == {"type": "preset", "preset": "claude_code", "append": "A"}
-        and options.effort == "high"
-    )
-    assert (
-        options.hooks is None
-        and options.settings is None
-        and options.plugins == []
-        and options.extra_args == {}
-        and options.fallback_model is None
-    )
-    assert options.cli_path is None and options.add_dirs == []
-    assert options.agents is None and options.skills is None
-    assert list(options.mcp_servers) == [MCP_SERVER_NAME]
-    assert options.mcp_servers[MCP_SERVER_NAME]["type"] == "sdk"
-    assert (options.model, options.max_turns, options.max_budget_usd) == ("m", 7, 3.0)
-    assert options.thinking == {"type": "adaptive"}
-    assert options.env == {"PATH": "/usr/bin"} and options.cwd == Path("/tmp")
-    assert options.include_partial_messages is False
-
-
-def test_build_options_system_prompt_variants():
-    pytest.importorskip("claude_agent_sdk")
-    from srw_claude_code_harness.tools import make_tools
-
-    tools = make_tools(_stub_workspace(), ["Bash"])
-
-    def prompt(system_prompt):
-        data = {"version": 1, "model": "m"}
-        if system_prompt is not None:
-            data["systemPrompt"] = system_prompt
-        return build_options(
-            parse_config(data), tools=tools, env={}, cwd=Path("/tmp")
-        ).system_prompt
-
-    assert prompt(None) == {"type": "preset", "preset": "claude_code"}
-    assert prompt({"type": "custom", "text": "Be terse."}) == "Be terse."
-
-
-def test_mcp_server_name_matches_the_recorded_fixed_setting():
-    assert MCP_SERVER_NAME == "ws" == FIXED_SETTINGS["mcpServerName"]
+def test_mcp_server_name():
+    assert MCP_SERVER_NAME == "ws"
 
 
 @dataclass
@@ -741,6 +599,20 @@ def test_job_options_use_the_spec():
     assert options.effort == "high" and options.tools == []
     assert options.allowed_tools == ["mcp__ws__Bash", "mcp__ws__Read"]
     assert options.setting_sources == [] and options.strict_mcp_config is True
+    assert options.permission_mode == "default"
     assert options.env == {"PATH": "/usr/bin"} and options.cwd == Path("/tmp")
+    # Nothing from the job reaches an option that starts a program or loads code.
+    assert (
+        options.hooks is None
+        and options.settings is None
+        and options.plugins == []
+        and options.extra_args == {}
+        and options.fallback_model is None
+    )
+    assert options.cli_path is None and options.add_dirs == []
+    assert options.agents is None and options.skills is None
+    assert list(options.mcp_servers) == [MCP_SERVER_NAME]
+    assert options.mcp_servers[MCP_SERVER_NAME]["type"] == "sdk"
+    assert options.include_partial_messages is False
     plain = job_options(_job_spec(None), tools=tools, env={}, cwd=Path("/tmp"))
     assert plain.system_prompt == {"type": "preset", "preset": "claude_code"}

@@ -1,9 +1,10 @@
 # =============================================================================
 # srw-harness-claude-code — the Claude Code harness image
 # =============================================================================
-# A generic-Job harness: reads the delivered config/task files, drives the
-# Claude Code CLI (bundled in the claude-agent-sdk wheel; needs glibc, which
-# slim Debian has) and operates the Job's workspace over SSH. No Node, no git.
+# A drop-in SRW agent image: registers with the orchestrator, takes one job over
+# the v1 harness API, drives the Claude Code CLI (bundled in the
+# claude-agent-sdk wheel; needs glibc, which slim Debian has) against the job's
+# workspace over SSH, reports and exits. No Node, no git.
 # See harnesses/claude-code/README.md.
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
