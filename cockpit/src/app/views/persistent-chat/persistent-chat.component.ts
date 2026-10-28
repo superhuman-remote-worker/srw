@@ -4231,10 +4231,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /** Approve every pending card, then stay in Auto-accept. Auto-accept still
      *  asks before commands and irreversible or outbound actions, so the
-     *  button's copy never promises that nothing will ask again. */
-    approveAndAutoAccept(): void {
+     *  button's copy never promises that nothing will ask again.
+     *
+     *  The switch waits for the approvals. Sent first, the new mode reached
+     *  the agent's next gate, which retires every announced card that
+     *  auto_accept runs freely; the approvals still in flight for those cards
+     *  then answered 409 and the chat said "already decided". In this order
+     *  each card is decided once, by its approval. */
+    async approveAndAutoAccept(): Promise<void> {
+        await this.chat.approveAll();
         this.chat.setMode('auto_accept');
-        this.chat.approveAll();
     }
 
     /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */

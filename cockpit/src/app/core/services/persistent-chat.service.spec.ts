@@ -4584,6 +4584,30 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.service.pendingPermissions()).toEqual([]);
   });
 
+  it('approveAll() settles only after every REST decision answered, failures included', async () => {
+    const ctx = await readySession();
+    const first = new Subject<Record<string, unknown>>();
+    const second = new Subject<Record<string, unknown>>();
+    ctx.mockHttp.post
+      .mockReturnValueOnce(first.asObservable())
+      .mockReturnValueOnce(second.asObservable());
+    (ctx.service as any).pendingPermissions.set([
+      { id: 'tc-a', approvalId: 'approval-a', tool: 'run_command', args: {} },
+      { id: 'tc-b', approvalId: 'approval-b', tool: 'write_file', args: {} },
+    ]);
+
+    let settled = false;
+    const done = ctx.service.approveAll().then(() => (settled = true));
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+    first.next({});
+    first.complete();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    second.error({ status: 0 });
+    await done;
+    expect(settled).toBe(true);
+  });
+
   it('does not resurrect a durable card when journal resolution beats a masked POST error', async () => {
     const ctx = await readySession();
     const response = new Subject<Record<string, unknown>>();

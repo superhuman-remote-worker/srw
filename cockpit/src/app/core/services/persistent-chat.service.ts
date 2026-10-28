@@ -6676,15 +6676,17 @@ export class PersistentChatService {
 
   /** Approve every pending gate. Each decision carries its own approval_id:
    *  the no-id REST fallback resolves "most-recent-pending", which is the
-   *  wrong gate when a batch is open. */
-  approveAll(): void {
+   *  wrong gate when a batch is open. Settles once every decision has been
+   *  answered (accepted, refused or failed); it never rejects. */
+  approveAll(): Promise<void> {
     const pending = this.pendingPermissions();
+    const decisions: Promise<void>[] = [];
     for (const req of pending) {
       if (req.approvalId) {
         // Durable REST decisions are ack-driven: keep the card until
         // permission.resolved proves which decision won (another tab
         // may race us, or a committed response may be masked).
-        this._resolvePermission(req, 'approve');
+        decisions.push(this._resolvePermission(req, 'approve'));
         continue;
       }
       this.pendingPermissions.update((list) => list.filter((item) => item.id !== req.id));
@@ -6694,8 +6696,9 @@ export class PersistentChatService {
         decision: 'approved',
         timestamp: Date.now(),
       });
-      this._resolvePermission(req, 'approve');
+      decisions.push(this._resolvePermission(req, 'approve'));
     }
+    return Promise.all(decisions).then(() => undefined);
   }
 
   /** Deny every pending gate. */
@@ -6717,17 +6720,23 @@ export class PersistentChatService {
     }
   }
 
+  /** Send one decision. Settles when its REST answer arrives (at once on the
+   *  socket path); it never rejects. */
   private _resolvePermission(
     pending: PermissionRequest | null,
     decision: 'approve' | 'deny',
-  ): void {
+  ): Promise<void> {
     const threadId = this.threadId();
     if (threadId && pending?.approvalId) {
       this._clearPermissionResolutionFailure(pending.id);
       const url =
         `${environment.apiUrl}/persistent/threads/${threadId}` + `/approve/${pending.approvalId}`;
+      let settle: () => void = () => undefined;
+      const answered = new Promise<void>((resolve) => (settle = resolve));
       this.http.post(url, { decision }).subscribe({
+        complete: () => settle(),
         error: (err: unknown) => {
+          settle();
           const status = (err as { status?: number })?.status;
           if (status === 404 || status === 409) {
             // Gone/already decided — a stale card from replay or a
@@ -6766,9 +6775,10 @@ export class PersistentChatService {
           );
         },
       });
-      return;
+      return answered;
     }
     this._sendControl({ method: decision });
+    return Promise.resolve();
   }
 
   private _clearPermissionResolutionFailure(toolCallId: string): void {

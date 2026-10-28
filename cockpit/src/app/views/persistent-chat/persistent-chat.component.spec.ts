@@ -554,24 +554,35 @@ describe('formatPermissionArgs', () => {
 });
 
 /**
- * approveAndAutoAccept() sets the mode BEFORE approving so a call that
- * immediately follows the just-approved batch (the agent continuing its
- * turn) lands under auto_accept instead of re-prompting. Invoked via
- * .call() against a bare `{chat}` stand-in rather than a constructed
- * component — the class is never mounted in specs (see test-setup.ts),
- * but this method only ever touches `this.chat`, so no other
+ * approveAndAutoAccept() approves the batch once, and switches to
+ * auto_accept only after every approval has been answered. Switching first
+ * let the agent's next gate retire the cards auto_accept runs freely, so the
+ * approvals still in flight for them answered 409 ("already decided").
+ * Invoked via .call() against a bare `{chat}` stand-in rather than a
+ * constructed component — the class is never mounted in specs (see
+ * test-setup.ts), but this method only ever touches `this.chat`, so no other
  * constructor/DI surface is needed to exercise the real, shipped method.
  */
 describe('approveAndAutoAccept', () => {
-    it('sets auto_accept mode before approving the batch', () => {
+    it('approves once, then switches the mode after the approvals answered', async () => {
         const calls: string[] = [];
+        let answer: () => void = () => undefined;
         const chat = {
             setMode: vi.fn((mode: string) => calls.push(`setMode:${mode}`)),
-            approveAll: vi.fn(() => calls.push('approveAll')),
+            approveAll: vi.fn(() => {
+                calls.push('approveAll');
+                return new Promise<void>((resolve) => (answer = resolve));
+            }),
         };
         const host = {chat} as unknown as PersistentChatComponent;
-        PersistentChatComponent.prototype.approveAndAutoAccept.call(host);
-        expect(calls).toEqual(['setMode:auto_accept', 'approveAll']);
+        const done = PersistentChatComponent.prototype.approveAndAutoAccept.call(host);
+        await Promise.resolve();
+        // The mode must not reach the agent while an approval is in flight.
+        expect(calls).toEqual(['approveAll']);
+        answer();
+        await done;
+        expect(calls).toEqual(['approveAll', 'setMode:auto_accept']);
+        expect(chat.approveAll).toHaveBeenCalledTimes(1);
     });
 });
 
