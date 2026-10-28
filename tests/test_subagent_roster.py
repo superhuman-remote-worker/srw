@@ -881,6 +881,51 @@ def test_public_bases_carry_no_roster_and_the_rostered_experts_resolve_the_libra
                 )
 
 
+@pytest.mark.parametrize("shell_mode", ["stateless", "persistent"])
+def test_a_shell_granting_library_entry_gets_a_command_executor(shell_mode):
+    """A library child that is granted a shell can run a command in either
+    shell mode of its parent.
+
+    The child's tools are ``entry ∩ parent``. ``get_all_tool_names`` keeps one
+    executor name per parent: ``run_command`` when stateless, ``shell_execute``
+    when persistent — what every capable model family's ``shell_mode`` sets.
+    Tester, implementer, reviewer and verifier named only ``run_command``, so on
+    a persistent parent they got ``shell_read`` and ``cancel_command`` and
+    nothing to run a command with. The test above resolves its parents without
+    the matrix, i.e. stateless, and passed.
+    """
+    executors = {"run_command", "shell_execute"}
+    checked: set[str] = set()
+    for expert in ("developer", "critic", "bughunter", "product-qa", "assistant"):
+        cfg = load_agent_config(*resolve_config_path(expert))
+        shell_cfg = cfg.extra.get("shell")
+        cfg.extra["shell"] = {
+            **(shell_cfg if isinstance(shell_cfg, dict) else {}),
+            "mode": shell_mode,
+        }
+        parent_names = get_all_tool_names(cfg)
+        if not executors & set(parent_names):
+            continue  # a parent without a shell cannot lend one
+        for name, entry in cfg.subagents.roster.items():
+            declared = set(entry_tool_names(entry))
+            if not any(
+                (TOOL_REGISTRY.get(n) or {}).get("category") == "shell"
+                for n in declared
+            ):
+                continue
+            selected, dropped = select_child_tool_names(
+                entry_tool_names(entry),
+                parent_names,
+                write_policy=str(entry.get("write_policy") or "none"),
+            )
+            assert executors & set(selected), (
+                f"{expert}/{name} on a {shell_mode} parent binds no command "
+                f"executor: selected={selected}, dropped={dropped}"
+            )
+            checked.add(name)
+    assert {"implementer", "tester", "reviewer", "verifier", "probe"} <= checked
+
+
 # --- the live voice entry (live_session_jobs §6.3) ---------------------------
 
 
