@@ -4482,7 +4482,7 @@ ide:
   sessionIdleTimeout: "30"
   sessionMaxLifetime: "240"
   maxConcurrentPerUser: "2"
-  codeServerImage: "codercom/code-server:latest"
+  codeServerImage: "codercom/code-server:4.143.1"
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
