@@ -238,6 +238,7 @@ class _Harness:
         )
         self.app = create_app(self.state)
         self.accepted = asyncio.Event()
+        self.intake_closed = False
         self.code = EXIT_OK
 
     # -- the job ---------------------------------------------------------------
@@ -245,7 +246,29 @@ class _Harness:
     def _close_intake(self) -> None:
         """Single-use pod: from now on ``/job/start`` is refused and ``/ready``
         says not ready."""
+        self.intake_closed = True
         self.state.agent_id = None
+
+    def _adopt_registration(self) -> None:
+        """Answer to the client's current registration.
+
+        A heartbeat answered 404 makes the client register again under a new
+        agent id and process generation, and the orchestrator addresses the
+        next ``/job/start`` to those. Adopted only while no job has been
+        accepted: the accepted job's cancel still names the identity it was
+        dispatched to, and a closed intake stays closed.
+        """
+        registration = self.client.registration
+        if (
+            registration is None
+            or self.intake_closed
+            or self.state.current_job_id is not None
+        ):
+            return
+        if registration.agent_id != self.state.agent_id:
+            progress(f"registered again as agent {registration.agent_id}")
+        self.state.process_generation = registration.dispatch_process_generation
+        self.state.agent_id = registration.agent_id
 
     async def _run_job(self, spec: JobSpec) -> None:
         self.accepted.set()
@@ -356,6 +379,7 @@ class _Harness:
             status = "working" if job_id is not None else "ready"
             if status != sent or loop.time() >= next_beat:
                 intents = await self.client.heartbeat(status, current_job_id=job_id)
+                self._adopt_registration()
                 sent, next_beat = status, loop.time() + interval
                 if idle_deadline is None:
                     idle_deadline = loop.time() + IDLE_EXIT_SECONDS

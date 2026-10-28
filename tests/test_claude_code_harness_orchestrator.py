@@ -82,10 +82,14 @@ async def test_heartbeat_returns_intents_and_reregisters_on_404():
 
     orch = Orch(responder)
     client = orch.client()
+    assert client.registration is None
     await client.register(**REG)
+    assert client.registration == Registration("agent-1", 60, "gen-1")
     intents = await client.heartbeat("working", current_job_id="j")
     assert intents == {"stop": True}
     assert orch.registers == 2
+    # The re-registration is the client's current one.
+    assert client.registration == Registration("agent-2", 60, "gen-2")
     beats = [r for r in orch.requests if r[1].endswith("/heartbeat")]
     assert beats[0][1] == "/api/agents/agent-1/heartbeat"
     assert beats[1][1] == "/api/agents/agent-2/heartbeat"

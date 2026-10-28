@@ -89,6 +89,12 @@ class OrchestratorClient:
         )
         return self._registration
 
+    @property
+    def registration(self) -> Registration | None:
+        """The current registration (the latest one after a heartbeat 404 made
+        the client register again); ``None`` before the first."""
+        return self._registration
+
     def _agent_id(self) -> str:
         if self._registration is None:
             raise RuntimeError("not registered")

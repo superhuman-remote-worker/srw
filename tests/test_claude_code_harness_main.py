@@ -57,11 +57,21 @@ SETTINGS = entry.Settings(
 class Orch:
     """MockTransport handler standing in for the orchestrator; records every call."""
 
-    def __init__(self, *, intents=None, complete_status=200, register_failures=0):
+    def __init__(
+        self,
+        *,
+        intents=None,
+        complete_status=200,
+        register_failures=0,
+        forget_heartbeats=0,
+    ):
         self.requests = []
         self.intents = intents or (lambda body: {})
         self.complete_status = complete_status
         self.register_failures = register_failures
+        # Answer this many heartbeats 404, as an orchestrator that lost the agent.
+        self.forget_heartbeats = forget_heartbeats
+        self.registrations = 0
         self.ready = asyncio.Event()
         self.working = asyncio.Event()
 
@@ -74,15 +84,20 @@ class Orch:
             if self.register_failures:
                 self.register_failures -= 1
                 return httpx.Response(503, json={"detail": "starting"})
+            # agent-1 / gen-1 first (AGENT_ID, GENERATION), then agent-2 / gen-2, ...
+            self.registrations += 1
             return httpx.Response(
                 200,
                 json={
-                    "agent_id": AGENT_ID,
+                    "agent_id": f"agent-{self.registrations}",
                     "heartbeat_interval_seconds": 60,
-                    "dispatch_process_generation": GENERATION,
+                    "dispatch_process_generation": f"gen-{self.registrations}",
                 },
             )
         if path.endswith("/heartbeat"):
+            if self.forget_heartbeats:
+                self.forget_heartbeats -= 1
+                return httpx.Response(404, json={"detail": "Agent not found"})
             if body["status"] == "ready":
                 self.ready.set()
             if body["status"] == "working":
@@ -323,6 +338,39 @@ async def test_cancel_stops_the_session_and_sends_no_completion(tmp_path, sshd):
         ("POST", f"/api/agents/{AGENT_ID}/heartbeat", "draining"),
         ("DELETE", f"/api/agents/{AGENT_ID}", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_reregistration_takes_jobs_addressed_to_the_new_agent_id(tmp_path):
+    # The orchestrator lost the agent: the ready heartbeat is answered 404, the
+    # client registers again as agent-2 / gen-2 and the heartbeat goes through.
+    orch = Orch(forget_heartbeats=1)
+    running = await _launch(tmp_path, orch)
+    assert orch.calls()[:4] == [
+        ("POST", "/api/agents/register", None),
+        ("POST", f"/api/agents/{AGENT_ID}/heartbeat", "ready"),
+        ("POST", "/api/agents/register", None),
+        ("POST", "/api/agents/agent-2/heartbeat", "ready"),
+    ]
+    new_recipient = {
+        **recipient(),
+        "expected_agent_id": "agent-2",
+        "expected_process_generation": "gen-2",
+    }
+    old = await running.harness.post(
+        "/job/start", json=start_body(protocol="openai-chat")
+    )
+    assert old.status_code == 409
+    new = await running.harness.post(
+        "/job/start",
+        json={**start_body(protocol="openai-chat"), "recipient": new_recipient},
+    )
+    assert new.status_code == 202, new.text
+    assert await running.exit_code() == entry.EXIT_OK
+    [complete] = orch.completions()
+    assert complete["agent_id"] == "agent-2"
+    assert complete["pinned_process_generation"] == "gen-2"
+    assert orch.calls()[-1] == ("DELETE", "/api/agents/agent-2", None)
 
 
 @pytest.mark.asyncio
