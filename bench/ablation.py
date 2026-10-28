@@ -2,13 +2,16 @@
 
 Answers "is the memory system worth it?" with the instrument we already have:
 the same pinned task set, one variable per arm, replicates, server-computed
-report. Four arms over the memory pipeline (everything else identical):
+report. Five arms over the memory pipeline (everything else identical):
 
   off          no auto-injection at all, no extraction. KB tools stay callable
                (the agent can still kb_search on its own — pull, not push).
   kb-only      KB notes auto-injected (top-5), no memory retrieval/extraction.
   memory-only  memory retrieval + extraction (current stack), no KB injection.
   current      the defaults — memory + KB, reranker/gate/bounded, ingestion.
+  skip-own     the defaults, but a job's own memory is not injected while its
+               source turns are still in context
+               (memory.retrieval.same_conversation: skip_in_context).
 
 Why one project (and one bench run) PER ARM: memory and KB notes are
 project-scoped — every job in a project reads what earlier jobs wrote — so
@@ -54,7 +57,7 @@ from submit import load_tasks  # noqa: E402
 BENCH_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BENCH_DIR / "runs"
 
-# The default writer list from config/worker_base.yaml `memory.pipeline`.
+# The default writer list from config/overlays/worker.yaml `memory.pipeline`.
 # deep_merge replaces lists wholesale, so an arm that keeps extraction must
 # restate it. Keep in sync with the YAML when the default pipeline changes.
 DEFAULT_WRITERS = [
@@ -104,6 +107,7 @@ ARMS: dict[str, dict] = {
         }
     },
     "current": {},
+    "skip-own": {"memory": {"retrieval": {"same_conversation": "skip_in_context"}}},
 }
 
 AUX_CALL_TYPES = ("memory_extraction", "memory_assembly", "auxiliary", "summarization")
