@@ -801,3 +801,102 @@ async def test_virtual_purge_refuses_backing_drift_before_blocking_effect(
 
     assert await purge_attested_stateless_virtual_workspace(thread) is False
     blocking.assert_not_called()
+
+
+def _leftover_store(monkeypatch, spec, *, rclone="/rclone"):
+    from orchestrator.services import thread_uploads, workspace_binding
+
+    monkeypatch.setattr(
+        workspace_binding, "virtual_workspace_rclone_spec", lambda: spec
+    )
+    monkeypatch.setattr(workspace_binding.shutil, "which", lambda _name: rclone)
+    purge = MagicMock(return_value=True)
+    monkeypatch.setattr(thread_uploads, "_virtual_purge_prefix", purge)
+    return purge
+
+
+@pytest.mark.asyncio
+async def test_an_upgraded_sessions_old_virtual_prefix_is_purged_by_its_id(
+    monkeypatch,
+):
+    from orchestrator.services.thread_uploads import purge_virtual_workspace_leftover
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+
+    spec = {"type": "s3", "root": "bucket", "config": {}}
+    purge = _leftover_store(monkeypatch, spec)
+    recorded = {
+        "kind": "virtual",
+        "backing_id": virtual_thread_backing_id(THREAD_ID, spec),
+    }
+
+    assert await purge_virtual_workspace_leftover(
+        {"id": THREAD_ID}, recorded_bindings=[recorded]
+    )
+
+    (target,), _ = purge.call_args
+    assert (target.spec, target.prefix) == (spec, f"threads/{THREAD_ID}/")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [None, {"type": "memory", "root": "", "config": {}}])
+async def test_without_a_durable_virtual_store_nothing_is_left(monkeypatch, spec):
+    from orchestrator.services.thread_uploads import purge_virtual_workspace_leftover
+
+    purge = _leftover_store(monkeypatch, spec)
+
+    assert await purge_virtual_workspace_leftover({"id": THREAD_ID})
+    purge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_binding_on_another_store_fails_closed(monkeypatch):
+    from orchestrator.services.thread_uploads import purge_virtual_workspace_leftover
+
+    purge = _leftover_store(monkeypatch, {"type": "s3", "root": "bucket", "config": {}})
+
+    assert not await purge_virtual_workspace_leftover(
+        {"id": THREAD_ID},
+        recorded_bindings=[{"kind": "virtual", "backing_id": "rclone:elsewhere"}],
+    )
+    purge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_purge_without_rclone_or_with_residue_reports_false(
+    monkeypatch,
+):
+    from orchestrator.services.thread_uploads import purge_virtual_workspace_leftover
+
+    spec = {"type": "s3", "root": "bucket", "config": {}}
+    purge = _leftover_store(monkeypatch, spec, rclone=None)
+    assert not await purge_virtual_workspace_leftover({"id": THREAD_ID})
+    purge.assert_not_called()
+
+    purge = _leftover_store(monkeypatch, spec)
+    purge.return_value = False
+    assert not await purge_virtual_workspace_leftover({"id": THREAD_ID})
+    purge.side_effect = RuntimeError("store down")
+    assert not await purge_virtual_workspace_leftover({"id": THREAD_ID})
+
+
+def test_the_recorded_virtual_bindings_of_an_upgrade_are_collected():
+    from orchestrator.services.thread_uploads import recorded_virtual_upgrade_bindings
+
+    c1 = {"kind": "virtual", "backing_id": "rclone:c1"}
+    c2 = {"kind": "virtual", "backing_id": "rclone:c2"}
+    pinned = {"kind": "virtual", "backing_id": "rclone:pinned"}
+    legacy = {"kind": "virtual", "backing_id": "rclone:legacy"}
+    metadata = {
+        "workspace_container": {"seed_from": {"backend": "virtual", "binding": c1}},
+        "vm": {
+            "upgrade_seed": {"source": {"backend": "virtual", "binding": c2}},
+            "upgrade_source": {"binding": {"kind": "remote", "backing_id": "x"}},
+        },
+        "_workspace_binding": legacy,
+    }
+
+    assert recorded_virtual_upgrade_bindings(metadata) == [c1, c2, legacy]
+    assert recorded_virtual_upgrade_bindings(
+        {}, vm={"upgrade_source": {"binding": pinned}}
+    ) == [pinned]
+    assert recorded_virtual_upgrade_bindings({"workspace_container": "junk"}) == []
