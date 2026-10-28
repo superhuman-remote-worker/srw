@@ -11,6 +11,7 @@ and let the row go.
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -145,6 +146,47 @@ async def test_a_refused_job_can_be_deleted_right_after_it_failed(db, monkeypatc
         "reservations": 0,
         "intents": 0,
     }
+    async with db.acquire() as conn:
+        assert await conn.execute("DELETE FROM jobs WHERE id=$1", job) == "DELETE 1"
+
+
+class LingeringPvcCluster(RefusingCluster):
+    """A deleted PVC stays Terminating for one more read, as on a real cluster."""
+
+    def __init__(self):
+        super().__init__()
+        self.lingering = False
+
+    def delete_namespaced_persistent_volume_claim(self, *, name, body=None, **_):
+        pvc = self._read("pvc", name)
+        if fixtures._precondition(body) not in {None, pvc.metadata.uid}:
+            raise fixtures.ApiException(status=409, reason="Conflict")
+        pvc.metadata.deletion_timestamp = "now"
+        self.lingering = True
+
+    def read_namespaced_persistent_volume_claim(self, *, name, **_):
+        pvc = self._read("pvc", name)
+        if self.lingering:
+            self.lingering = False
+        elif pvc.metadata.deletion_timestamp is not None:
+            del self.objects["pvc"]
+            raise fixtures._missing()
+        return pvc
+
+
+@pytest.mark.asyncio
+async def test_a_refused_job_delete_waits_out_a_terminating_pvc(db, monkeypatch):
+    from orchestrator.services import thread_retirement
+
+    monkeypatch.setattr(thread_retirement.asyncio, "sleep", AsyncMock())
+    cluster = LingeringPvcCluster()
+    job, _ = await _refused_job(db, monkeypatch, cluster)
+    await fixtures._fail_like_the_dispatcher(db, job)
+
+    assert await control_seams.archive_and_cleanup_workspace(str(job)) == [
+        "refused k8s workspace creation settled"
+    ]
+    assert cluster.objects == {}
     async with db.acquire() as conn:
         assert await conn.execute("DELETE FROM jobs WHERE id=$1", job) == "DELETE 1"
 

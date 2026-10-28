@@ -3191,14 +3191,23 @@ async def archive_and_cleanup_workspace(
         ):
             # The cluster refused the Pod, so the Job holds only that error and
             # its creation (with any PVC) waits for the sweep. Settle it here;
-            # the reconciliation proves the Pod absent first.
-            cancelled = (
-                await container_provisioner.request_workspace_creation_cancellation(
-                    WorkspaceOwner.job(entity_id),
-                    target_disposition="deleted",
-                    reclaim_shared_resources=True,
+            # the reconciliation proves the Pod absent first. A PVC it just
+            # deleted can stay Terminating for a moment, so try a few times.
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2)
+                cancelled = (
+                    await container_provisioner.request_workspace_creation_cancellation(
+                        WorkspaceOwner.job(entity_id),
+                        target_disposition="deleted",
+                        reclaim_shared_resources=True,
+                    )
                 )
-            )
+                if (
+                    cancelled is None
+                    or cancelled.get("reconciliation_outcome") == "aborted"
+                ):
+                    break
             if cancelled is not None:
                 if cancelled.get("reconciliation_outcome") != "aborted":
                     raise RuntimeError(
