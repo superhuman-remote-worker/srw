@@ -33,6 +33,8 @@ USER = "11111111-1111-4111-8111-111111111111"
 PROJECT = "22222222-2222-4222-8222-222222222222"
 EXPERT = "33333333-3333-4333-8333-333333333333"
 PARENT = "44444444-4444-4444-8444-444444444444"
+CUSTOM = "example.invalid/h@sha256:" + "b" * 64
+APPROVED = ({"name": "cc", "image": CUSTOM},)
 
 
 @pytest.fixture
@@ -48,6 +50,7 @@ def deps():
             get_project=AsyncMock(return_value={"id": PROJECT}),
             # No project_workspace_defaults row: the installation decides.
             fetchrow=AsyncMock(return_value=None),
+            user_can_run_custom_harness_images=AsyncMock(return_value=True),
         ),
         require_project_access=AsyncMock(),
         bundled_expert_exists=Mock(return_value=True),
@@ -58,6 +61,7 @@ def deps():
         ),
         preview_expert_refusals=AsyncMock(return_value=[]),
         srw_image=Mock(return_value="installed:1"),
+        approved_images=Mock(return_value=APPROVED),
     )
 
 
@@ -647,3 +651,85 @@ async def test_inline_tool_vocabulary_smuggling_is_refused(deps, scope):
     with pytest.raises(HTTPException) as refused:
         await prepare(deps, scope, expert=expert)
     assert 400 <= refused.value.status_code < 500
+
+
+def saved_expert(**runtime):
+    """A saved SRW Expert as the resolver projects it, with its manifest."""
+    return {
+        "id": EXPERT,
+        "harness_adapter": "srw/v1",
+        "config": {},
+        "manifest": {"spec": {"runtime": {"adapter": "srw/v1", **runtime}}},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["explicit", "project", "user"])
+async def test_a_saved_expert_on_an_approved_image_needs_the_grant(deps, scope, source):
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        saved_expert(image=CUSTOM), source
+    )
+    deps.store.user_can_run_custom_harness_images.return_value = False
+    with pytest.raises(HTTPException) as denied:
+        await prepare(deps, scope, expert_id=EXPERT if source == "explicit" else None)
+    assert denied.value.status_code == 403
+    assert denied.value.detail == (
+        "Running approved harness images requires the 'custom_harness_images' "
+        "capability grant. Ask an administrator to grant it (Admin → Grants)."
+    )
+    deps.store.user_can_run_custom_harness_images.assert_awaited_once_with(
+        scope.principal, PROJECT
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_saved_expert_on_an_approved_image_sets_harness_image(deps, scope):
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        saved_expert(image=CUSTOM), "explicit"
+    )
+    config = await prepare(deps, scope, expert_id=EXPERT)
+    assert config.harness_image == CUSTOM
+    assert config.expert_id == EXPERT
+    deps.store.user_can_run_custom_harness_images.assert_awaited_once_with(
+        scope.principal, PROJECT
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_saved_expert_on_an_unapproved_image_is_refused(deps, scope):
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        saved_expert(image=CUSTOM), "explicit"
+    )
+    deps.approved_images.return_value = ()
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert_id=EXPERT)
+    assert refused.value.status_code == 422
+    assert "approved list" in refused.value.detail
+    deps.store.user_can_run_custom_harness_images.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expert",
+    [
+        saved_expert(image="installed:1"),
+        saved_expert(),
+        {"id": EXPERT},
+    ],
+    ids=["installed", "omitted", "no-manifest"],
+)
+async def test_the_installed_image_sets_no_harness_image(deps, scope, expert):
+    deps.resolve_worker_expert.return_value = ExpertSelection(expert, "explicit")
+    config = await prepare(deps, scope, expert_id=EXPERT)
+    assert config.harness_image is None
+    deps.store.user_can_run_custom_harness_images.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_inline_expert_still_cannot_name_an_approved_image(deps, scope):
+    """Approval admits saved Experts; a request body's inline Expert keeps
+    naming the installed harness or nothing."""
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert=inline_expert(image=CUSTOM))
+    assert refused.value.status_code == 422
+    assert "installed harness" in refused.value.detail

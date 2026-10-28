@@ -210,12 +210,19 @@ async def prepare_srw_snapshot(
     runner_kind: str = "user",
     expert_row: dict | None = None,
     workspace_selection: dict | None = None,
+    harness_image: str | None = None,
 ) -> dict:
     """Render the complete SRW configuration while the insertion is locked.
 
     The caller binds ``db`` to its active transaction before entering. Account
     defaults, the selected Expert and roster references are captured once. Live
     connector credentials and workspace endpoints are deliberately absent.
+
+    ``harness_image`` is the approved image job admission selected for the
+    Expert (``None``: the installed harness). Every job creation path reaches
+    this funnel, so an Expert's custom image is recorded only when admission
+    chose it; a path that bypassed admission is refused, never run on the
+    installed image instead.
     """
     from orchestrator.services import session_config_resolution as session_config
     from orchestrator.services.config_resolver import resolve_config
@@ -227,7 +234,10 @@ async def prepare_srw_snapshot(
         resolve_runner_grants,
         user_experts_enabled,
     )
-    from orchestrator.services.manifest_experts import installed_srw_image
+    from orchestrator.services.manifest_experts import (
+        approved_srw_images,
+        trusted_srw_image,
+    )
     from orchestrator.services.manifest_projects import project_expert_for_execution
     from orchestrator.services.config_overrides import validated_config_name
     from shared.runtime.core.capability_grants import evaluate
@@ -265,13 +275,31 @@ async def prepare_srw_snapshot(
     if expert_id and expert is None:
         raise HTTPException(409, "The selected Expert is no longer available.")
     from orchestrator.services.manifest_runtime_ownership import (
+        custom_srw_image,
         require_srw_expert_configuration,
     )
 
-    trusted_image = getattr(db, "manifest_runtime_image", None) or installed_srw_image()
+    trusted_image = trusted_srw_image(db)
     require_srw_expert_configuration(
-        expert, interactive=role == "session", trusted_image=trusted_image
+        expert,
+        interactive=role == "session",
+        trusted_image=trusted_image,
+        approved_images=approved_srw_images(db),
     )
+    custom_image = (
+        custom_srw_image(
+            expert["manifest"]["spec"]["runtime"], trusted_image=trusted_image
+        )
+        if expert is not None and expert.get("manifest")
+        else None
+    )
+    if harness_image != custom_image:
+        raise HTTPException(
+            422,
+            "This Expert's harness image runs only through job admission."
+            if custom_image is not None
+            else "The selected Expert does not name this harness image.",
+        )
     if expert is not None:
         expert = deepcopy(expert)
         expert["config"] = validate_srw_authored_fragment(expert.get("config"))
@@ -410,7 +438,7 @@ async def prepare_srw_snapshot(
         description=description,
         datasource_ids=datasource_ids,
         policy_revisions=policy_revisions,
-        image=trusted_image,
+        image=custom_image or trusted_image,
         dependencies=dependencies,
         asset_name=(expert or {}).get("harness_asset_name"),
     )

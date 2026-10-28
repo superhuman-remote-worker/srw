@@ -49,6 +49,10 @@ class JobConfigStore(Protocol):
 
     async def get_project(self, project_id: str) -> dict[str, Any] | None: ...
 
+    async def user_can_run_custom_harness_images(
+        self, user: dict[str, Any], project_id: str | None
+    ) -> bool: ...
+
 
 class RequireJobProjectAccess(Protocol):
     async def __call__(
@@ -96,6 +100,9 @@ class JobAdmissionConfigDependencies:
     # The installed SRW harness image an inline expert's explicit image must
     # equal: the one the execution snapshot records.
     srw_image: Callable[[], str]
+    # The installation's approved harness images a saved Expert may name
+    # (manifestHosting.approvedImages). Inline Experts never consult it.
+    approved_images: Callable[[], tuple[dict[str, Any], ...]]
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,9 @@ class JobAdmissionConfig:
     # execution snapshot freezes. It has no catalogue identity: expert_id is
     # None and config_name is the worker base whenever this is set.
     expert_row: dict[str, Any] | None = None
+    # The approved image a saved Expert names; None for the installed harness.
+    # The job runs on its own pinned pod started from this image.
+    harness_image: str | None = None
 
 
 async def prepare_job_admission_config(
@@ -310,6 +320,7 @@ async def prepare_job_admission_config(
     )
     selection = None
     unselected_config_override: dict[str, Any] | None = None
+    harness_image: str | None = None
     try:
         if should_resolve_default or should_validate_explicit:
             principal = scope.principal
@@ -320,10 +331,34 @@ async def prepare_job_admission_config(
                 is_admin=bool((principal or {}).get("is_admin")),
             )
             from orchestrator.services.manifest_runtime_ownership import (
+                custom_srw_image,
                 require_srw_expert_configuration,
             )
 
-            require_srw_expert_configuration(selection.expert)
+            trusted_image = dependencies.srw_image()
+            require_srw_expert_configuration(
+                selection.expert,
+                trusted_image=trusted_image,
+                approved_images=dependencies.approved_images(),
+            )
+            if selection.expert.get("manifest"):
+                harness_image = custom_srw_image(
+                    selection.expert["manifest"]["spec"]["runtime"],
+                    trusted_image=trusted_image,
+                )
+            if harness_image is not None and not (
+                await dependencies.store.user_can_run_custom_harness_images(
+                    principal or {"id": str(effective_user_id)}, project_id
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Running approved harness images requires the "
+                        "'custom_harness_images' capability grant. Ask an "
+                        "administrator to grant it (Admin → Grants)."
+                    ),
+                )
             resolved_expert_id = str(selection.expert["id"])
             config_name = "worker_base"
             if selection.project_override and not (project or {}).get(
@@ -432,4 +467,5 @@ async def prepare_job_admission_config(
         expert_source=expert_source,
         unselected_config_override=unselected_config_override,
         expert_row=expert_row,
+        harness_image=harness_image,
     )

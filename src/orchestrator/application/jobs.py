@@ -439,6 +439,9 @@ def job_admission_config_dependencies(
         ),
         preview_expert_refusals=partial(preview_expert_refusals, resources.postgres_db),
         srw_image=partial(manifest_experts.trusted_srw_image, resources.postgres_db),
+        approved_images=partial(
+            manifest_experts.approved_srw_images, resources.postgres_db
+        ),
     )
 
 

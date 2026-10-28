@@ -1064,7 +1064,15 @@ async def resolve_thread_creation_plan(
                 is_admin=bool(user.get("is_admin")),
             )
             selected_expert_row = selection.expert
-            require_srw_expert_configuration(selected_expert_row, interactive=True)
+            from orchestrator.services.manifest_experts import approved_srw_images
+
+            # A saved Expert on an approved custom image runs jobs only.
+            require_srw_expert_configuration(
+                selected_expert_row,
+                interactive=True,
+                trusted_image=dependencies.srw_image(),
+                approved_images=approved_srw_images(dependencies.store),
+            )
             selected_expert_id = str(selection.expert["id"])
             project_expert_override = selection.project_override
             config_name = "session_base"

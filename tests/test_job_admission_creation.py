@@ -710,3 +710,38 @@ async def test_an_officer_ticket_gets_no_outbox_and_a_subjob_nothing(
         command=JobCreate(description="child", parent_job_id=JOB),
     )
     stamp.assert_not_awaited()
+
+
+CUSTOM_IMAGE = "example.invalid/h@sha256:" + "b" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_lane", ["stateless", "pinned", None])
+async def test_a_custom_harness_image_runs_pinned_on_both_funnels(
+    inputs, officer, deps, requested_lane
+):
+    """A custom image's pod is started for its job; the stateless lane's
+    shared installed-image workers can never serve it."""
+    await create(
+        replace(inputs, harness_image=CUSTOM_IMAGE, execution_lane=requested_lane),
+        deps,
+    )
+    kwargs = deps.store.create_job.await_args.kwargs
+    assert kwargs["harness_image"] == CUSTOM_IMAGE
+    assert kwargs["execution_lane"] == "pinned"
+
+    await create(
+        replace(officer, harness_image=CUSTOM_IMAGE, execution_lane=requested_lane),
+        deps,
+    )
+    job_kwargs = deps.admit_officer.await_args.kwargs["job_kwargs"]
+    assert job_kwargs["harness_image"] == CUSTOM_IMAGE
+    assert job_kwargs["execution_lane"] == "pinned"
+
+
+@pytest.mark.asyncio
+async def test_the_installed_harness_adds_no_image_and_keeps_the_lane(inputs, deps):
+    await create(inputs, deps)
+    kwargs = deps.store.create_job.await_args.kwargs
+    assert "harness_image" not in kwargs
+    assert kwargs["execution_lane"] == "stateless"

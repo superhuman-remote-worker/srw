@@ -1063,6 +1063,40 @@ class TestExpertSelection:
         assert resolver.await_args.kwargs["explicit_expert_id"] == DB_EXPERT
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("approved", [True, False])
+    async def test_a_saved_expert_on_a_custom_image_is_jobs_only(
+        self, monkeypatch, approved
+    ):
+        custom = "example.invalid/h@sha256:" + "b" * 64
+        deps, _ = _experts_on(
+            monkeypatch,
+            store={
+                "manifest_approved_images": (
+                    ({"name": "cc", "image": custom},) if approved else ()
+                )
+            },
+        )
+        ta.resolve_root_expert.return_value = ExpertSelection(
+            expert={
+                "id": DB_EXPERT,
+                "harness_adapter": "srw/v1",
+                "config": {},
+                "manifest": {
+                    "spec": {"runtime": {"adapter": "srw/v1", "image": custom}}
+                },
+            },
+            source="explicit",
+        )
+        resolve = MagicMock(side_effect=AssertionError("resolved a jobs-only expert"))
+        monkeypatch.setattr(ta, "resolve_config", resolve)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=DB_EXPERT), deps)
+        assert exc.value.status_code == 422
+        assert "jobs only" in exc.value.detail
+        resolve.assert_not_called()
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_commit_hands_the_inline_definition_to_the_insert(self):
         deps = _deps()
         body = ThreadCreateRequest(expert=_inline())

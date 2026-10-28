@@ -51,18 +51,22 @@ APPLICATION_EXPERT = "44444444-4444-4444-8444-444444444444"
 PARENT = "55555555-5555-4555-8555-555555555555"
 DB_EXPERT = "66666666-6666-4666-8666-666666666666"
 GRANTED = ("shell_tools", "delegation")
+CUSTOM = "example.invalid/h@sha256:" + "b" * 64
+APPROVED = ({"name": "cc", "image": CUSTOM},)
 
 
 def _selection(
     source: str = "application",
     expert_id: str = APPLICATION_EXPERT,
     project_override: dict | None = None,
+    image: str | None = None,
 ) -> ExpertSelection:
-    return ExpertSelection(
-        {"id": expert_id, "expert_type": "worker"},
-        source,
-        project_override=project_override,
-    )
+    expert = {"id": expert_id, "expert_type": "worker"}
+    if image is not None:
+        expert["manifest"] = {
+            "spec": {"runtime": {"adapter": "srw/v1", "image": image}}
+        }
+    return ExpertSelection(expert, source, project_override=project_override)
 
 
 def _preparation(
@@ -156,6 +160,7 @@ def harness(monkeypatch):
                 get_project=AsyncMock(return_value={"id": PROJECT}),
                 # No project_workspace_defaults row: the installation decides.
                 fetchrow=AsyncMock(return_value=None),
+                user_can_run_custom_harness_images=AsyncMock(return_value=True),
             ),
             require_project_access=AsyncMock(),
             bundled_expert_exists=state.bundled,
@@ -164,6 +169,7 @@ def harness(monkeypatch):
             resolve_worker_expert=AsyncMock(return_value=state.selection),
             preview_expert_refusals=preview,
             srw_image=Mock(return_value="installed:1"),
+            approved_images=Mock(return_value=APPROVED),
         )
 
     def officer_deps():
@@ -389,6 +395,31 @@ async def test_a_displaced_project_default_takes_its_project_overlay_with_it(
     assert inputs.config_name == "designer"
     assert inputs.config_override["llm"] == {"reasoning_level": "low"}
     assert inputs.config_override["workspace"]["backend"] == "sandbox"
+
+
+@pytest.mark.asyncio
+async def test_a_scoped_default_on_a_custom_image_reaches_creation(harness):
+    harness.selection = _selection("project", image=CUSTOM)
+
+    inputs = await harness.admit()
+
+    assert inputs.expert_id == APPLICATION_EXPERT
+    assert inputs.harness_image == CUSTOM
+
+
+@pytest.mark.asyncio
+async def test_a_displaced_custom_image_default_takes_its_image_with_it(harness):
+    """The pinned worker runs on the installed harness, not on the image of
+    the default it displaced."""
+    harness.officer = True
+    harness.slot_category = EXECUTOR
+    harness.ticket_tags = ["ready", "category:executor", "expert:designer"]
+    harness.selection = _selection("project", image=CUSTOM)
+
+    inputs = await harness.admit(thread_id=THREAD, ticket="build-the-ui")
+
+    assert (inputs.config_name, inputs.expert_id) == ("designer", None)
+    assert inputs.harness_image is None
 
 
 @pytest.mark.asyncio

@@ -4947,6 +4947,9 @@ class PostgresDB:
                     str(key): value for key, value in policy_snapshot.items()
                 },
                 runner_kind=runner_kind,
+                # The snapshot re-derives the Expert's image and refuses a
+                # custom-image Expert that job admission did not select.
+                harness_image=harness_image,
             )
             return written
 

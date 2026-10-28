@@ -148,6 +148,8 @@ async def apply_work_expert_default(
                 expert_id=None,
                 expert_source="caller",
                 unselected_config_override=None,
+                # The displaced Expert's approved image goes with it.
+                harness_image=None,
             ),
             replace(officer, config_override=config_override),
         )

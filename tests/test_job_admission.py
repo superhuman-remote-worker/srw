@@ -435,3 +435,36 @@ async def test_redaction_waits_for_creation_owner_to_complete(flow):
     assert flow.deps.redact_result.call_args.args[0]["provisioning_preflight"] == {
         "state": "ready"
     }
+
+
+@pytest.mark.asyncio
+async def test_a_live_session_job_cannot_run_on_a_custom_harness_image(
+    flow, monkeypatch
+):
+    """Its voice subagent is SRW's: a call is never handed to a custom image,
+    and the refusal comes before the live session row is written."""
+    custom = "example.invalid/h@sha256:" + "b" * 64
+    flow.stages["config"].return_value = replace(flow.config, harness_image=custom)
+    prepare_live = AsyncMock(side_effect=AssertionError("live session prepared"))
+    monkeypatch.setattr(admission, "prepare_live_session", prepare_live)
+    live_factory = Mock()
+    command = JobCreate(
+        description="Answer the phone",
+        live_session=True,
+        execution={
+            "connectors": {"tel": {"ref": {"name": "line"}}},
+            "session": {"connector": "tel", "id": "rtc_1"},
+        },
+    )
+    with pytest.raises(HTTPException) as refused:
+        await admission.admit_job(
+            command=command,
+            actor=flow.actor,
+            origin="internal_rest",
+            dependencies=replace(flow.deps, live=live_factory),
+        )
+    assert refused.value.status_code == 422
+    assert "custom harness image" in refused.value.detail
+    live_factory.assert_not_called()
+    prepare_live.assert_not_awaited()
+    flow.stages["creation"].assert_not_awaited()

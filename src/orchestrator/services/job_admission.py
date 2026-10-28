@@ -166,6 +166,17 @@ async def admit_job(
         live = None
         context = officer.context
         if dependencies.live is not None:
+            if (
+                config.harness_image is not None
+                and refuse_session_contradictions(command) is not None
+            ):
+                # Refused before prepare_live_session writes the session row.
+                raise HTTPException(
+                    422,
+                    "A live-session job runs the SRW harness (its voice subagent "
+                    "is SRW's); this Expert's custom harness image cannot take a "
+                    "live session.",
+                )
             live_dependencies = dependencies.live()
             live = await prepare_live_session(
                 command=command,
@@ -200,6 +211,7 @@ async def admit_job(
                 config_name=config.config_name,
                 expert_id=config.expert_id,
                 expert_row=config.expert_row,
+                harness_image=config.harness_image,
                 config_override=officer.config_override,
                 requested_workspace_backend=config.requested_workspace_backend,
                 workspace_selection=workspace_selection,

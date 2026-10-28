@@ -164,7 +164,19 @@ async def agent_create_thread(
                     detail="No application session expert default is configured",
                 )
 
-        require_srw_expert_configuration(selected_expert, interactive=True)
+        from orchestrator.services.manifest_experts import (
+            approved_srw_images,
+            trusted_srw_image,
+        )
+
+        # An application session default on an approved custom image is
+        # refused as jobs-only, as the user-facing funnel refuses it.
+        require_srw_expert_configuration(
+            selected_expert,
+            interactive=True,
+            trusted_image=trusted_srw_image(postgres_db),
+            approved_images=approved_srw_images(postgres_db),
+        )
         create_capture: dict[str, Any] = {}
         dependencies.resolve_config(
             base_config_name=config_name,
