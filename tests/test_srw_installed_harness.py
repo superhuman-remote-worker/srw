@@ -9,6 +9,8 @@ import pytest
 
 from orchestrator.services.manifest_experts import expert_manifest
 from orchestrator.services.manifest_runtime_ownership import (
+    custom_srw_image,
+    require_srw_expert_configuration,
     require_srw_launch_configuration,
 )
 from orchestrator.services.manifest_session_delivery import prepare_delivery_snapshot
@@ -249,3 +251,49 @@ async def test_saved_expert_admission_survives_rollout(
         )
         == 1
     )
+
+
+CUSTOM = "registry.example/cc@sha256:" + "a" * 64
+APPROVED = ({"name": "cc", "image": CUSTOM},)
+
+
+def test_an_approved_image_passes_the_launch_rule():
+    private = require_srw_launch_configuration(
+        {"adapter": "srw/v1", "image": CUSTOM},
+        trusted_image="installed:1",
+        approved_images=APPROVED,
+    )
+    assert private == {}
+
+
+def test_an_unapproved_image_is_still_refused():
+    with pytest.raises(HTTPException) as denied:
+        require_srw_launch_configuration(
+            {"adapter": "srw/v1", "image": CUSTOM}, trusted_image="installed:1"
+        )
+    assert (
+        denied.value.status_code == 422 and "installed harness" in denied.value.detail
+    )
+
+
+def test_a_session_on_a_custom_image_expert_is_refused_as_jobs_only():
+    expert = {
+        "harness_adapter": "srw/v1",
+        "manifest": {"spec": {"runtime": {"adapter": "srw/v1", "image": CUSTOM}}},
+    }
+    with pytest.raises(HTTPException) as denied:
+        require_srw_expert_configuration(
+            expert,
+            interactive=True,
+            trusted_image="installed:1",
+            approved_images=APPROVED,
+        )
+    assert denied.value.status_code == 422 and "jobs only" in denied.value.detail
+
+
+def test_custom_srw_image_is_none_for_the_installed_or_omitted_image():
+    assert custom_srw_image({"adapter": "srw/v1"}, trusted_image="installed:1") is None
+    assert (
+        custom_srw_image({"image": "installed:1"}, trusted_image="installed:1") is None
+    )
+    assert custom_srw_image({"image": CUSTOM}, trusted_image="installed:1") == CUSTOM
