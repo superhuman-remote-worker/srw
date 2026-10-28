@@ -90,9 +90,9 @@ Helm will run a one-shot seed Job (`{{ include "srw.fullname" . }}-llm-seed`)
 post-install and post-upgrade. It inserts provider keys, endpoints and
 catalog rows, and pins default models (llm.seed.defaults), only where they
 are absent — existing rows and pins, whether previously seeded or set via
-Admin → Models, are never overwritten. Entries declared with
-`reconcile: true` are the exception: those are re-applied on every upgrade
-and shown with a "Helm" badge in Admin → Models.
+Settings → Administration → Models, are never overwritten. Entries declared
+with `reconcile: true` are the exception: those are re-applied on every
+upgrade and shown with a "Helm" badge in Settings → Administration → Models.
 
 Inspect the run:
 
@@ -151,7 +151,7 @@ The gateway serves {{ len .Values.voiceGateway.lines }} line(s) with the profile
 Its live_voice endpoint is {{ include "srw.voiceGatewayBaseUrl" . }}
 {{- if include "srw.voiceCatalogSeeded" . }} (seeded by the
 llm-seed Job with the key from Secret {{ include "srw.voiceSecretName" . }}).
-{{- else }}; add it in Admin -> Models
+{{- else }}; add it in Settings -> Administration -> Models
 with the `api-key` of Secret {{ include "srw.voiceSecretName" . }} and import the profiles.
 {{- end }}
 Each line's phone-line connector names one profile as its model and holds

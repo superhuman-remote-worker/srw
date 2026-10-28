@@ -273,8 +273,8 @@ After install, follow the printed `NOTES.txt` to back up the encryption key.
 
 Jobs and sessions are refused until chat, auxiliary, embedding (4096-dim) and
 rerank models are configured. One OpenRouter API key covers all four: seed it
-with `llm.seed` or add it under **Settings → Models** after login. See
-[Models](../docs/models.md).
+with `llm.seed` or add it under **Settings → Administration → Models** after
+login. See [Models](../docs/models.md).
 
 ---
 
@@ -415,7 +415,8 @@ Edit at minimum:
   Postgres and pgvector (user and password come from the Secret);
   `databases.keycloak.externalUrl` only with the bundled Keycloak
 - `llm.seed` → the Secret holding your OpenRouter key (or set
-  `llm.seed.enabled: false` and add models in Admin → Models)
+  `llm.seed.enabled: false` and add models in Settings → Administration →
+  Models)
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
@@ -842,8 +843,9 @@ empty. SearXNG cannot serve `fetch` at all, so on a keyless install this is
 what gives experts a provider-backed way to read the pages they find. A keyed
 provider that already holds `fetch` (Tavily, Firecrawl) keeps it — there is no
 fetch fallback slot — and Crawl4AI stays in the catalog for an admin to select
-under Admin → Providers. If the token key is missing the hook logs a warning
-and registers nothing rather than failing the release. Like the SearXNG and
+on the **Defaults** tab of **Settings → Administration → Models**. If the
+token key is missing the hook logs a warning and registers nothing rather than
+failing the release. Like the SearXNG and
 Tavily seeds, catalog and default writes are insert-only: later admin changes
 are never repaired or overwritten at boot.
 
@@ -855,7 +857,8 @@ without this policy.
 **Model provider keys** are not read from this Secret by the chart. A key
 here only reaches the pods' environment and registers no model. Seed it with
 `llm.seed.systemApiKeys` (which can reference any Secret, this one included)
-or add it under **Settings → Models**; see [Models](../docs/models.md). A
+or add it under **Settings → Administration → Models**; see
+[Models](../docs/models.md). A
 dedicated Secret such as `srw-llm-seed` keeps the key out of the application
 Secret that agent pods load.
 
@@ -938,8 +941,8 @@ The certificates reach the orchestrator (model discovery, the catalog
 **Test** action, the knowledge-base indexer), every agent pod (inference,
 embeddings, rerank, vision) and every container workspace, whose entrypoint
 adds them to the system store for `curl`, `git` and OpenSSL. VM workspaces do
-not receive them. Then add the API under **Admin → Models** with its `https://`
-address.
+not receive them. Then add the API under **Settings → Administration →
+Models** with its `https://` address.
 
 ---
 
