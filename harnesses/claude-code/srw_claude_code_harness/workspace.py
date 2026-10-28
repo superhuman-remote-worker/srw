@@ -340,6 +340,21 @@ def _count(stdout: bytes) -> int:
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 
 
+class _PinnedHostKey(asyncssh.SSHClient):
+    """Accepts exactly one SSH host key, by its OpenSSH SHA256 fingerprint, as
+    SRW's ``_ExactSHA256HostKeyPolicy`` does: judged during the handshake."""
+
+    def __init__(self, expected: str):
+        self._expected = expected
+        self.mismatched = False
+
+    def validate_host_public_key(self, host, addr, port, key) -> bool:
+        if hmac.compare_digest(key.get_fingerprint(), self._expected):
+            return True
+        self.mismatched = True
+        return False
+
+
 class Workspace:
     def __init__(self, connection: asyncssh.SSHClientConnection, root: str):
         self._connection = connection
@@ -381,13 +396,17 @@ class Workspace:
         while True:
             attempts += 1
             remaining = deadline - loop.time()
+            pinned = None if access.known_hosts_file else _PinnedHostKey(expected)
             try:
                 connection = await asyncssh.connect(
                     access.host,
                     access.port,
                     username=access.user,
                     client_keys=[access.private_key_file],
-                    known_hosts=access.known_hosts_file,
+                    # known_hosts=() trusts no key by file, so asyncssh asks
+                    # ``_PinnedHostKey`` during the handshake, before any auth.
+                    known_hosts=access.known_hosts_file or (),
+                    client_factory=(lambda: pinned) if pinned else None,
                     server_host_key_algs=["ssh-ed25519"],
                     # Only the delivered files count: no ~/.ssh/config, no ssh-agent.
                     config=None,
@@ -405,13 +424,9 @@ class Workspace:
                 wait = min(wait * 2, CONNECT_RETRY_MAX_SECONDS)
                 continue
             except asyncssh.Error as exc:
+                if pinned is not None and pinned.mismatched:
+                    raise WorkspaceError("workspace host key mismatch") from exc
                 raise WorkspaceError(f"cannot connect to the workspace: {exc}") from exc
-            if access.known_hosts_file is None:
-                observed = connection.get_server_host_key().get_fingerprint()
-                if not hmac.compare_digest(observed, expected):
-                    connection.close()
-                    await connection.wait_closed()
-                    raise WorkspaceError("workspace host key mismatch")
             return cls(connection, root)
 
     async def close(self) -> None:

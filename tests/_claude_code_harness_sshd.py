@@ -31,7 +31,11 @@ _CHUNK = 65536
 
 
 class _Server(asyncssh.SSHServer):
-    def begin_auth(self, _username: str) -> bool:
+    def __init__(self, auth_attempts: list[str]):
+        self._auth_attempts = auth_attempts
+
+    def begin_auth(self, username: str) -> bool:
+        self._auth_attempts.append(username)
         return False
 
 
@@ -69,6 +73,7 @@ class LocalSshd:
         self.access: WorkspaceAccess | None = None
         self.commands: list[str] = []
         self.prefix: str | None = None
+        self.auth_attempts: list[str] = []
         self.fingerprint: str = ""
 
     @classmethod
@@ -112,7 +117,7 @@ class LocalSshd:
     async def listen(self, port: int | None = None) -> int:
         """Start accepting on ``port`` (default: the reserved one); returns it."""
         self._server = await asyncssh.create_server(
-            _Server,
+            lambda: _Server(self.auth_attempts),
             "127.0.0.1",
             self.access.port if port is None else port,
             server_host_keys=[self._host_key],

@@ -429,3 +429,23 @@ async def test_connect_refuses_without_any_host_key_material(sshd):
     access = replace(sshd.access, known_hosts_file=None, host_key_fingerprint=None)
     with pytest.raises(WorkspaceError, match="no host key"):
         await Workspace.connect(access)
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_fingerprint_is_refused_before_any_authentication(sshd):
+    access = replace(
+        sshd.access, known_hosts_file=None, host_key_fingerprint="SHA256:" + "A" * 43
+    )
+    with pytest.raises(WorkspaceError, match="host key mismatch"):
+        await Workspace.connect(access, deadline_seconds=5)
+    assert sshd.auth_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_the_matching_fingerprint_does_reach_authentication(sshd):
+    access = replace(
+        sshd.access, known_hosts_file=None, host_key_fingerprint=sshd.fingerprint
+    )
+    ws = await Workspace.connect(access)
+    await ws.close()
+    assert sshd.auth_attempts == ["tester"]
