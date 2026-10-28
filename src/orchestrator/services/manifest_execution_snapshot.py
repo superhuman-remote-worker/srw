@@ -533,6 +533,71 @@ def rendered_srw_snapshot(
     }
 
 
+# Settings-matrix keys `_apply_settings_matrix` routes outside `llm` (or never
+# applies there); it re-derives or removes those itself on every pass.
+_MATRIX_KEYS_OUTSIDE_LLM = frozenset(
+    {
+        "limits",
+        "image_tokens",
+        "pdf_render_dpi",
+        "shell_mode",
+        "session_max_concurrent",
+        "summarization_sampling",
+    }
+)
+
+
+def previous_family_llm_resets(
+    frozen_llm: dict,
+    override_llm: dict,
+    *,
+    pinned: set[str],
+    deployment_dir: str | None = None,
+) -> dict[str, None]:
+    """``llm`` keys a model swap must clear so the old family's values go.
+
+    The frozen ``llm`` block already carries the previous family's matrix
+    values. A swap merges onto it and the new family's matrix then overwrites
+    only the keys that family defines, so a key only the old family defines
+    (MiniMax's ``extra_body.reasoning_split``, a ``top_p`` Claude refuses next
+    to ``temperature``) survived into every later turn.
+
+    A key is cleared when the old family's matrix defines it, the new
+    family's does not, and its frozen value is still the matrix value. A
+    value that differs was authored by the Expert or the user and stays, as
+    do keys this request sets and keys the thread's persisted override pins.
+    Clearing is an explicit ``None``: the merge drops the key and the loader
+    default applies, as on a fresh resolve for the new model.
+    """
+    from shared.runtime.core.loader import resolve_model_settings
+
+    old_model = frozen_llm.get("model")
+    new_model = override_llm.get("model")
+    if not old_model or not new_model or new_model == old_model:
+        return {}
+    old_settings = resolve_model_settings(old_model, deployment_dir)
+    new_settings = resolve_model_settings(new_model, deployment_dir)
+    return {
+        key: None
+        for key, value in old_settings.items()
+        if key not in _MATRIX_KEYS_OUTSIDE_LLM
+        and key not in new_settings
+        and key not in override_llm
+        and key not in pinned
+        and value is not None
+        and frozen_llm.get(key) == value
+    }
+
+
+def _persisted_llm_pins(metadata: dict) -> set[str]:
+    """``llm`` keys the thread's own persisted override sets to a value."""
+    persisted = metadata.get("config_override") if isinstance(metadata, dict) else None
+    llm = persisted.get("llm") if isinstance(persisted, dict) else None
+    if not isinstance(llm, dict):
+        return set()
+    return {key for key, value in llm.items() if value is not None}
+
+
 async def prepare_srw_session_patch(
     db: Any,
     current: dict,
@@ -557,6 +622,19 @@ async def prepare_srw_session_patch(
     _, deployment_dir = resolve_config_path(
         private.get("asset_name") or private["config_name"]
     )
+    override_llm = config_override.get("llm")
+    if isinstance(override_llm, dict):
+        resets = previous_family_llm_resets(
+            blob["agent"].get("llm") or {},
+            override_llm,
+            pinned=_persisted_llm_pins(metadata),
+            deployment_dir=deployment_dir,
+        )
+        if resets:
+            config_override = {
+                **config_override,
+                "llm": {**override_llm, **resets},
+            }
     updated, policy, delivery_override = patch_frozen_session(
         blob, policy, config_override, deployment_dir=deployment_dir
     )

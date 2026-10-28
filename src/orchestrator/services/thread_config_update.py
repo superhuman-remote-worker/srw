@@ -781,7 +781,10 @@ async def apply_thread_config_update_locked(
             # resolution didn't set becomes an explicit None so the
             # agent-side deep_merge CLEARS the previous model's value
             # instead of inheriting it (e.g. swapping off an
-            # endpoint-backed model must not keep its base_url).
+            # endpoint-backed model must not keep its base_url). The old
+            # family's matrix values (extra_body, top_p, ...) are cleared
+            # where the frozen llm block is patched, which knows the old
+            # model: manifest_execution_snapshot.previous_family_llm_resets.
             for transport_key in ("provider", "base_url", "api_key"):
                 llm_section.setdefault(transport_key, None)
             config_override["llm"] = llm_section
