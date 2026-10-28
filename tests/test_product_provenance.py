@@ -537,11 +537,12 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 7
     assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
-    # Fourteen build identities; the workspace job labels two images (the
-    # full one and the minimal one it is built on), and so does the in-pod
-    # plane's (the FUSE opener and the cloud mount supervisor).
-    assert _count_full_revision(main, "org.opencontainers.image.revision") == 16
-    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 16
+    # Fifteen build identities (the Claude Code harness image included); the
+    # workspace job labels two images (the full one and the minimal one it is
+    # built on), and so does the in-pod plane's (the FUSE opener and the cloud
+    # mount supervisor).
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 17
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 17
     for component in (
         "agent",
         "orchestrator",
@@ -558,6 +559,7 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
         "asterisk",
         "fuse-opener",
         "cloud-mount",
+        "harness-claude-code",
     ):
         assert f"io.srw.component={component}" in main
         assert f"io.srw.component={component}" in develop
@@ -577,16 +579,18 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     # ...and it must stay *derived* from the full sha, so the two cannot drift
     # apart into an image tagged with one commit and labeled with another.
-    # Fourteen build identities: the five services, controller, disk builder,
+    # Fifteen build identities: the five services, controller, disk builder,
     # the connector driver shim, the managed MCP front, the git swap driver,
-    # the phone-line driver, the voice gateway, its Asterisk addon and the
-    # in-pod plane (opener and supervisor, one identity).
-    assert develop.count("short=${FULL::7}") == 14
+    # the phone-line driver, the voice gateway, its Asterisk addon, the
+    # in-pod plane (opener and supervisor, one identity) and the Claude Code
+    # harness image.
+    assert develop.count("short=${FULL::7}") == 15
     # The chart-stamping step derives every baked tag from the same identity
     # sha whose full form ships as that component's provenance revision —
     # fourteen including the ephemeral preparation builder, the driver shim,
     # the managed MCP front, the git swap driver, the phone-line driver, the
-    # voice gateway, the Asterisk addon and the in-pod plane.
+    # voice gateway, the Asterisk addon and the in-pod plane (the harness
+    # image is not baked into the chart).
     assert len(re.findall(r'="sha-\$\{SHA_[A-Z]+::7\}"', develop)) == 14
 
     assert (
