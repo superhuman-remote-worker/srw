@@ -19,6 +19,40 @@ interface CitationRow extends ThreadCitation {
 /** Per-citation drift state: undefined = not checked, 'loading' = in flight. */
 type DriftState = CitationDrift | 'loading' | undefined;
 
+/** Snapshot types that render without script when opened in a tab. */
+const SNAPSHOT_VIEW_TYPES: ReadonlySet<string> = new Set([
+    'application/pdf',
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+]);
+
+/**
+ * The type a cited snapshot may be opened as, or null when it must be
+ * downloaded instead.
+ *
+ * A `blob:` URL inherits the Cockpit origin, so a stored `text/html` or
+ * `image/svg+xml` snapshot opened under its own type would run its script with
+ * the reader's session. Only the allowlisted types open as themselves; every
+ * `text/*` type, HTML included, opens as plain text so it shows as source.
+ * SVG and everything else is not on the list.
+ */
+export function snapshotViewType(type: string): string | null {
+    const [essence, ...params] = type.split(';');
+    const mime = essence.trim().toLowerCase();
+    if (SNAPSHOT_VIEW_TYPES.has(mime)) {
+        return mime;
+    }
+    if (mime.startsWith('text/')) {
+        const charset = params
+            .map((p) => p.trim().match(/^charset=([A-Za-z0-9_.:-]+)$/i)?.[1])
+            .find((c) => !!c);
+        return `text/plain;charset=${charset ?? 'utf-8'}`;
+    }
+    return null;
+}
+
 /**
  * Session citations panel (Phase 4 Half-B v2). Lists the engine-backed citations
  * for the open session — the same `citationsByCid` the inline `[N]` markers
@@ -188,10 +222,29 @@ export class CitationsPanelComponent {
         if (!blob) {
             return;
         }
-        const url = URL.createObjectURL(blob);
-        window.open(url, '_blank');
-        // Let the new tab read it, then release the object URL.
+        // Never open the blob under the type the server stored: see
+        // snapshotViewType. A type that cannot be opened safely is downloaded,
+        // re-wrapped as octet-stream so it cannot render even if navigated to.
+        const viewType = snapshotViewType(blob.type);
+        const url = URL.createObjectURL(
+            new Blob([blob], {type: viewType ?? 'application/octet-stream'}),
+        );
+        if (viewType) {
+            window.open(url, '_blank');
+        } else {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = this.snapshotFilename(cid);
+            a.click();
+        }
+        // Let the new tab or the download read it, then release the object URL.
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    }
+
+    /** Download name for a snapshot: the cited source's base name. */
+    private snapshotFilename(cid: number): string {
+        const name = this.chat.citationsByCid().get(cid)?.source_name ?? '';
+        return name.split('/').pop()?.trim() || `citation-${cid}`;
     }
 
     statusTone(status: string): BadgeTone {
