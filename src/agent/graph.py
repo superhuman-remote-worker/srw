@@ -122,6 +122,7 @@ from shared.runtime.core.llm_retry import (  # noqa: F401
     _summarize_llm_error,
     _describe_llm_rejection,
     _TEXT_INPUT_REJECTION_STATUS,
+    _api_rejection,
     _classify_llm_error,
     initial_error_freeze_fields,
 )
@@ -350,6 +351,40 @@ def _handle_tool_errors_reraise_workspace(e: Exception) -> str:
 # outer graph loop re-enter execute forever (the deferred "Fix 3" from
 # knowledge-history/done/agent_infinite_retry_on_permanent_llm_errors.md).
 _LLM_ERROR_STREAK_CAP = 5
+
+
+def _as_context_overflow(error: Exception) -> Optional[ContextOverflowError]:
+    """The typed overflow behind a ``context_overflow`` verdict, else ``None``.
+
+    The capture client answers a pre-flight overflow with a synthetic HTTP 413
+    (``reasoning_chat._overflow_response_413``) so the SDK does not retry it,
+    and a provider answers an oversized body with its own 413. Both reach the
+    execute node as an SDK status error, which the ``ContextOverflowError``
+    handler (emergency compaction) never saw: the 413 was retried unchanged
+    and the job froze as an outage. Re-typing it here routes it to that
+    handler. Counts come from the synthetic body; a provider 413 has none (0).
+    """
+    if _classify_llm_error(error) != "context_overflow":
+        return None
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ContextOverflowError):
+            return current
+        current = current.__cause__
+    rejection = _api_rejection(error)
+    err_obj = rejection[1] if rejection else {}
+
+    def _count(name: str) -> int:
+        value = err_obj.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    return ContextOverflowError(
+        token_count=_count("token_count"),
+        limit=_count("limit"),
+        message=str(err_obj.get("message") or error),
+    )
 
 
 def _extract_tool_use_failed(error: Exception) -> Optional[str]:
@@ -1737,10 +1772,18 @@ def create_execute_node(
         while True:
             try:
                 start_time = time.time()
-                response = await asyncio.wait_for(
-                    llm_with_tools.ainvoke(prepared_messages),
-                    timeout=llm_timeout,
-                )
+                try:
+                    response = await asyncio.wait_for(
+                        llm_with_tools.ainvoke(prepared_messages),
+                        timeout=llm_timeout,
+                    )
+                except Exception as invoke_error:
+                    # A 413 "request too big" is deterministic: hand it to
+                    # the emergency compaction below, not the retry ladder.
+                    overflow = _as_context_overflow(invoke_error)
+                    if overflow is None or overflow is invoke_error:
+                        raise
+                    raise overflow from invoke_error
                 latency_ms = int((time.time() - start_time) * 1000)
 
                 # Reset failure streaks on a successful LLM response.
@@ -2386,10 +2429,7 @@ def create_execute_node(
 
             except ContextOverflowError as e:
                 # Layer 0 (HTTP layer) caught context overflow
-                logger.warning(
-                    f"[{job_id}] HTTP layer context overflow: "
-                    f"{e.token_count:,} tokens exceeds limit of {e.limit:,}"
-                )
+                logger.warning(f"[{job_id}] HTTP layer context overflow: {e}")
 
                 # Try emergency compaction once (on first attempt only)
                 if attempt == 0:
@@ -2456,8 +2496,7 @@ def create_execute_node(
 
                 # Compaction didn't help - this is unrecoverable
                 logger.error(
-                    f"[{job_id}] Context overflow persists after compaction: "
-                    f"{e.token_count:,} tokens (limit: {e.limit:,})"
+                    f"[{job_id}] Context overflow persists after compaction: {e}"
                 )
 
                 # Audit error
