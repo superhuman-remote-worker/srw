@@ -2104,30 +2104,32 @@ export function clearDraft(threadId: string | null): void {
               </div>
             </div>
           } @else if (upgradeCard(); as card) {
-            <!-- The "Starting session" card's look, with the upgrade's own steps. -->
-            <div class="startup-card" role="status">
-              <div class="startup-card-head">
-                <span class="startup-card-spinner"></span>
-                <span class="startup-card-title">{{ card.title.key | transloco: (card.title.params ?? {}) }}</span>
-              </div>
-              <div class="startup-steps">
-                @for (step of card.rows; track step.key) {
-                  <div class="startup-step" [class]="'state-' + step.state">
-                    @if (step.state === 'active') {
-                      <span class="step-spinner" aria-hidden="true"></span>
-                    } @else {
-                      <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
-                    }
-                    <span class="step-label">{{ step.labelKey | transloco }}</span>
-                    <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
-                  </div>
-                }
-                @if (woc.willContinue) {
-                  <div class="startup-step state-todo">
-                    <app-icon size="lg" class="step-icon">play_arrow</app-icon>
-                    <span class="step-label">{{ 'chat.workspaceOffer.willContinue' | transloco }}</span>
-                  </div>
-                }
+            <!-- The "Starting session" card's look and place, with the upgrade's own steps. -->
+            <div class="startup-wrapper">
+              <div class="startup-card" role="status">
+                <div class="startup-card-head">
+                  <span class="startup-card-spinner"></span>
+                  <span class="startup-card-title">{{ card.title.key | transloco: (card.title.params ?? {}) }}</span>
+                </div>
+                <div class="startup-steps">
+                  @for (step of card.rows; track step.key) {
+                    <div class="startup-step" [class]="'state-' + step.state">
+                      @if (step.state === 'active') {
+                        <span class="step-spinner" aria-hidden="true"></span>
+                      } @else {
+                        <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
+                      }
+                      <span class="step-label">{{ step.labelKey | transloco }}</span>
+                      <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+                    </div>
+                  }
+                  @if (woc.willContinue) {
+                    <div class="startup-step state-todo">
+                      <app-icon size="lg" class="step-icon">play_arrow</app-icon>
+                      <span class="step-label">{{ 'chat.workspaceOffer.willContinue' | transloco }}</span>
+                    </div>
+                  }
+                </div>
               </div>
             </div>
           }
