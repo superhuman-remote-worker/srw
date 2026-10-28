@@ -2521,6 +2521,9 @@ def create_execute_node(
                         phase_number=phase_number,
                     )
 
+                # Stop: routing never reads ``error``, so without should_stop
+                # the graph re-entered execute and ran another forced
+                # compaction against the same oversized request, forever.
                 return {
                     "error": {
                         "message": str(e),
@@ -2530,6 +2533,7 @@ def create_execute_node(
                         "limit": e.limit,
                     },
                     "iteration": iteration + 1,
+                    "should_stop": True,
                 }
 
             except Exception as e:

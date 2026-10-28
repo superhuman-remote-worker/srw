@@ -904,16 +904,12 @@ async def test_model_the_proxy_never_routes_still_fails_at_the_outer_layer(
     assert "unknown provider for model" in message
 
 
-@pytest.mark.asyncio
-async def test_preflight_overflow_runs_emergency_compaction_not_the_retry_ladder(
-    request, tmp_path, monkeypatch
+async def _execute_preflight_overflow(
+    request, tmp_path, monkeypatch, *, compaction_shrinks: bool
 ):
-    """The capture client's synthetic 413 reaches the worker's emergency
-    compaction once; the compacted request then goes out and succeeds.
-
-    Before: the 413 classified ``transient``, so the in-process ladder re-sent
-    the identical oversized request six times and froze the job as an outage.
-    """
+    """One worker execute whose request overflows the pre-flight count, so the
+    capture client answers with its synthetic 413. Returns (result, wire,
+    forced compactions)."""
     wire = []
 
     def respond(http_request):
@@ -935,7 +931,7 @@ async def test_preflight_overflow_runs_emergency_compaction_not_the_retry_ladder
     async def ensure_within_limits(messages, *args, **kwargs):
         if kwargs.get("force"):
             forced.append(len(messages))
-            oversized[0] = False
+            oversized[0] = not compaction_shrinks
         return await original_ensure(messages, *args, **kwargs)
 
     env_["context"].ensure_within_limits = ensure_within_limits
@@ -951,6 +947,22 @@ async def test_preflight_overflow_runs_emergency_compaction_not_the_retry_ladder
     finally:
         llm.http_client.close()
         await llm.http_async_client.aclose()
+    return result, wire, forced
+
+
+@pytest.mark.asyncio
+async def test_preflight_overflow_runs_emergency_compaction_not_the_retry_ladder(
+    request, tmp_path, monkeypatch
+):
+    """The capture client's synthetic 413 reaches the worker's emergency
+    compaction once; the compacted request then goes out and succeeds.
+
+    Before: the 413 classified ``transient``, so the in-process ladder re-sent
+    the identical oversized request six times and froze the job as an outage.
+    """
+    result, wire, forced = await _execute_preflight_overflow(
+        request, tmp_path, monkeypatch, compaction_shrinks=True
+    )
 
     assert len(forced) == 1
     assert len(wire) == 1
@@ -958,6 +970,29 @@ async def test_preflight_overflow_runs_emergency_compaction_not_the_retry_ladder
     assert result.get("freeze_data") is None
     assert not result.get("should_stop")
     assert "Recovered." in [m.content for m in result["messages"]]
+
+
+@pytest.mark.asyncio
+async def test_overflow_that_compaction_cannot_shrink_stops_the_job(
+    request, tmp_path, monkeypatch
+):
+    """One forced compaction, then a stop: routing never reads ``error``, so
+    an unstopped result re-entered execute and compacted again, forever."""
+    result, wire, forced = await _execute_preflight_overflow(
+        request, tmp_path, monkeypatch, compaction_shrinks=False
+    )
+
+    assert len(forced) == 1
+    assert wire == []
+    assert result["should_stop"] is True
+    assert result.get("freeze_data") is None
+    assert result["error"]["type"] == "context_overflow"
+    assert result["error"]["recoverable"] is False
+    assert result["error"]["token_count"] == 10**9
+    status, _ = determine_job_status(
+        {"id": "job", "status": "processing", "context": {}}, result
+    )
+    assert status == "failed"
 
 
 # ---------------------------------------------------------------------------
