@@ -298,6 +298,9 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               in sessions and jobs.
             </p>
           } @else {
+            @if (protocolError()) {
+              <p class="protocol-error" role="alert">{{ protocolError() }}</p>
+            }
             @for (group of groupedModels(); track group.key) {
               <div class="provider-group">
                 <h3 class="group-title">{{ group.label }}</h3>
@@ -349,15 +352,19 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                       </span>
                       <span class="col-protocol">
                         @if (m.provider_kind === 'endpoint') {
-                          <app-select
-                            [value]="m.client_protocol ?? 'openai-chat'"
-                            [ariaLabel]="'API shape for ' + m.display_label"
-                            (changed)="setProtocol(m, $event)"
-                          >
-                            @for (p of clientProtocols; track p.value) {
-                              <option [value]="p.value">{{ p.label }}</option>
-                            }
-                          </app-select>
+                          <!-- app-select keeps its own value after a pick; re-creating it
+                               on a resync snaps it back to the stored shape. -->
+                          @for (epoch of [protocolResync()]; track epoch) {
+                            <app-select
+                              [value]="m.client_protocol ?? 'openai-chat'"
+                              [ariaLabel]="'API shape for ' + m.display_label"
+                              (changed)="setProtocol(m, $event)"
+                            >
+                              @for (p of clientProtocols; track p.value) {
+                                <option [value]="p.value">{{ p.label }}</option>
+                              }
+                            </app-select>
+                          }
                         } @else {
                           <span class="muted" title="Set by the provider, not editable here">—</span>
                         }
@@ -981,6 +988,11 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       letter-spacing: 0.06em;
       margin: 12px 0 6px 0;
     }
+    .protocol-error {
+      color: var(--danger, #c0392b);
+      font-size: 13px;
+      margin: 0 0 8px;
+    }
     .model-table {
       display: flex;
       flex-direction: column;
@@ -1419,6 +1431,10 @@ export class AdminCatalogComponent implements OnInit {
   readonly clientProtocols = CLIENT_PROTOCOLS;
   /** API shape for a new endpoint-backed model (ignored for provider rows). */
   readonly formClientProtocol = signal('openai-chat');
+  /** Last failed API-shape edit on a row; cleared by the next attempt. */
+  readonly protocolError = signal('');
+  /** Bumped to re-create the row selects so they show the stored shape again. */
+  readonly protocolResync = signal(0);
   // True when the operator picked "Custom…" (or the backend is unrecognized);
   // then formVoice is a free-text voice id rather than a catalog selection.
   readonly formVoiceCustom = signal(false);
@@ -1903,11 +1919,23 @@ export class AdminCatalogComponent implements OnInit {
     this.models.updateModel(model.id, {enabled: checked}).subscribe();
   }
 
-  setProtocol(model: CatalogModel, protocol: string): void {
-    if (!this.confirmHelmOverride(model)) return;
+  setProtocol(model: CatalogModel, protocol: string | null): void {
+    this.protocolError.set('');
+    if (protocol === null || !this.confirmHelmOverride(model)) {
+      this.protocolResync.update((n) => n + 1);
+      return;
+    }
     this.models
       .updateModel(model.id, {params_json: mergeRoutingProtocol(model.params_json, protocol)})
-      .subscribe();
+      .subscribe({
+        error: (err) => {
+          this.protocolError.set(
+            `${model.display_label}: ${catalogErrorDetail(err, 'Failed to change the API shape.')}`,
+          );
+          this.models.loadModels();
+          this.protocolResync.update((n) => n + 1);
+        },
+      });
   }
 
   /** Hover/title text spelling out what the cell's shorthand actually means. */

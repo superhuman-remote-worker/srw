@@ -2,7 +2,7 @@ import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angu
 import {TestBed} from '@angular/core/testing';
 import {TranslocoService} from '@jsverse/transloco';
 import {beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
-import {of, Subject} from 'rxjs';
+import {of, Subject, throwError} from 'rxjs';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
@@ -181,5 +181,56 @@ describe('API shape', () => {
     fixture.detectChanges();
     expect(fixture.nativeElement.querySelector('.model-row .col-protocol app-select')).toBeNull();
     expect(fixture.nativeElement.querySelector('.model-row .col-protocol')).not.toBeNull();
+  });
+
+  it('drives the row select through the template and patches the row', () => {
+    models.models.set([row()]);
+    const fixture = setup(makeProviders([ENDPOINT]));
+    fixture.detectChanges();
+    const select = fixture.nativeElement.querySelector('.model-row .col-protocol app-select');
+    // app-select is a stub element here; Angular listens to its `changed` output
+    // as a DOM event, so a CustomEvent reaches (changed)="setProtocol(m, $event)".
+    const spy = vi.spyOn(fixture.componentInstance, 'setProtocol');
+    select.dispatchEvent(new CustomEvent('changed'));
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0].id).toBe('row-1');
+  });
+
+  it('reloads, resyncs and surfaces the error when the PATCH fails', () => {
+    models.updateModel.mockReturnValueOnce(
+      throwError(() => ({error: {detail: 'client_protocol not allowed'}})) as never,
+    );
+    const fixture = setup(makeProviders([ENDPOINT]));
+    const component = fixture.componentInstance;
+    const before = component.protocolResync();
+    component.setProtocol(row(), 'anthropic-messages');
+    expect(models.loadModels).toHaveBeenCalled();
+    expect(component.protocolResync()).toBe(before + 1);
+    expect(component.protocolError()).toContain('client_protocol not allowed');
+  });
+
+  it('resyncs the select without a PATCH when the Helm override is cancelled', () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const component = setup(makeProviders([ENDPOINT])).componentInstance;
+    const before = component.protocolResync();
+    component.setProtocol(row({managed_by_helm: true}), 'anthropic-messages');
+    expect(models.updateModel).not.toHaveBeenCalled();
+    expect(component.protocolResync()).toBe(before + 1);
+  });
+
+  it('shows the add-form API shape for a plain endpoint but not the subscription proxy', () => {
+    const proxy: LlmEndpoint = {...ENDPOINT, id: 'ep-subs', label: 'x', transport_kind: 'subscription-proxy'};
+    const fixture = setup(makeProviders([ENDPOINT, proxy]));
+    const el = fixture.nativeElement as HTMLElement;
+    const hasField = () =>
+      Array.from(el.querySelectorAll('app-form-field')).some((f) => f.getAttribute('label') === 'API shape');
+
+    fixture.componentInstance.formProviderKey.set('endpoint:ep-vllm');
+    fixture.detectChanges();
+    expect(hasField()).toBe(true);
+
+    fixture.componentInstance.formProviderKey.set('endpoint:ep-subs');
+    fixture.detectChanges();
+    expect(hasField()).toBe(false);
   });
 });
