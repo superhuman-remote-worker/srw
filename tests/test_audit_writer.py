@@ -206,6 +206,47 @@ def test_thread_safety_from_worker_thread(audit_dsn):
         w.close()
 
 
+def test_nul_in_tool_output_still_writes_llm_request_and_chat_rows(audit_dsn):
+    """N62: Postgres jsonb rejects ``\\u0000``; the row must land anyway."""
+    w = _make_writer(audit_dsn)
+    try:
+        job = str(uuid4())
+        tool_output = "PK\x03\x04\x00\x00binary\x00tail"
+        rid = w.insert_llm_request(
+            {
+                "job_id": job,
+                "model": "m",
+                "timestamp": datetime.now(timezone.utc),
+                "request": {
+                    "messages": [{"type": "ToolMessage", "content": tool_output}],
+                    "key\x00": "literal \\u0000 stays text",
+                },
+                "response": {"type": "AIMessage", "content": "read it"},
+            }
+        )
+        assert isinstance(rid, int)
+        w.insert_chat_entry(
+            {
+                "job_id": job,
+                "timestamp": datetime.now(timezone.utc),
+                "request_id": rid,
+                "inputs": [{"type": "ToolMessage", "content": tool_output}],
+                "response": {"type": "AIMessage", "content": "read it"},
+            }
+        )
+        req = _fetchrow(audit_dsn, "SELECT request FROM llm_requests WHERE id=$1", rid)
+        chat = _fetchrow(
+            audit_dsn, "SELECT inputs FROM chat_history WHERE request_id=$1", rid
+        )
+        assert chat is not None
+        request = json.loads(req["request"])
+        assert request["messages"][0]["content"] == ("PK\x03\x04��binary�tail")
+        assert request["key�"] == "literal \\u0000 stays text"
+        assert json.loads(chat["inputs"])[0]["content"] == ("PK\x03\x04��binary�tail")
+    finally:
+        w.close()
+
+
 def test_from_env_unconfigured_returns_none(monkeypatch):
     for k in (
         "AUDIT_POSTGRES_USER",

@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -89,11 +90,32 @@ def _json_default(obj):
     return str(obj)
 
 
+# A JSON ``\u0000`` escape that is not itself an escaped backslash: an odd run
+# of backslashes before ``u0000``.
+_JSON_NUL_ESCAPE = re.compile(r"(?<!\\)((?:\\\\)*)\\u0000")
+
+
+def _encode_jsonb(value) -> str:
+    r"""``json.dumps`` for a JSONB param, with every U+0000 made U+FFFD.
+
+    Postgres ``jsonb`` rejects the ``\u0000`` escape ``json.dumps`` writes for a
+    NUL character, and tool output (a binary file read, a terminal capture)
+    carries them. The failed INSERT was swallowed by the facade, so the whole
+    ``llm_requests`` / ``chat_history`` row was silently lost (N62). Replacing
+    on the encoded text also covers keys and ``_json_default``'s ``str()``
+    fallbacks; the substring check keeps the common case a single scan.
+    """
+    text = json.dumps(value, default=_json_default)
+    if "\\u0000" in text:
+        text = _JSON_NUL_ESCAPE.sub(r"\1\\ufffd", text)
+    return text
+
+
 async def _init_connection(conn: asyncpg.Connection) -> None:
     """Register a text JSONB codec so dicts go in and come back out as dicts."""
     await conn.set_type_codec(
         "jsonb",
-        encoder=lambda v: json.dumps(v, default=_json_default),
+        encoder=_encode_jsonb,
         decoder=json.loads,
         schema="pg_catalog",
         format="text",
