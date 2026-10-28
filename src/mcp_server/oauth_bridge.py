@@ -11,8 +11,10 @@ Design: knowledge-base/knowledge/features/mcp_oauth_bridge.md
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -39,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Template directory
 _TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
+_PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
 
 def _load_template() -> str:
@@ -57,20 +60,27 @@ def _render_consent(
     user_roles: list[str],
     is_admin: bool,
 ) -> str:
-    """Render the consent template with placeholders replaced."""
-    html = _load_template()
+    """Render the consent template with placeholders replaced.
+
+    ``client_name`` comes from unauthenticated Dynamic Client Registration
+    and ``user_email`` from IdP claims, so every caller-derived value is
+    HTML-escaped (quotes too: two of them land in attribute values). Only
+    the ``admin_option`` literal is markup. The substitution is one pass, so
+    a value that contains a placeholder is never expanded a second time.
+    """
+    template = _load_template()
     replacements = {
-        "{{session_id}}": session_id,
-        "{{csrf_token}}": csrf_token,
-        "{{client_name}}": client_name,
-        "{{user_email}}": user_email,
-        "{{admin_option}}": (
+        "session_id": html.escape(session_id, quote=True),
+        "csrf_token": html.escape(csrf_token, quote=True),
+        "client_name": html.escape(client_name, quote=True),
+        "user_email": html.escape(user_email, quote=True),
+        "admin_option": (
             '<option value="all">Full Access (Admin)</option>' if is_admin else ""
         ),
     }
-    for key, value in replacements.items():
-        html = html.replace(key, value)
-    return html
+    return _PLACEHOLDER.sub(
+        lambda match: replacements.get(match.group(1), match.group(0)), template
+    )
 
 
 class PendingAuth:
@@ -292,7 +302,7 @@ class SRWOAuthProxy(OIDCProxy):
             await self._transaction_store.delete(key=txn_id)
 
             # Show scope/expiry selection page
-            html = _render_consent(
+            consent_html = _render_consent(
                 session_id=session_id,
                 csrf_token=csrf_token,
                 client_name=client_name,
@@ -300,7 +310,7 @@ class SRWOAuthProxy(OIDCProxy):
                 user_roles=roles,
                 is_admin=is_admin,
             )
-            return HTMLResponse(content=html)
+            return HTMLResponse(content=consent_html)
 
         except Exception as e:
             logger.error("Error in IdP callback: %s", e, exc_info=True)
