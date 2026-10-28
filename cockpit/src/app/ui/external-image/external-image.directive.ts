@@ -17,6 +17,29 @@ const COPY_CONFIRMATION_MS = 2_500;
 
 type CardState = 'idle' | 'loading' | 'loaded' | 'error' | 'unsupported';
 
+/** Raster types a fetched image may be shown as. */
+const RASTER_IMAGE_TYPES: ReadonlySet<string> = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+]);
+
+/**
+ * The type a fetched image is shown as, or null when it must not be shown.
+ *
+ * A `blob:` URL inherits the Cockpit origin, so an `image/svg+xml` response
+ * opened through "Open image in new tab" would run its script with the
+ * reader's session. Only raster types are shown, re-wrapped under their bare
+ * type; every other `image/*` type, SVG included, is refused. Same rule as the
+ * citations panel's `snapshotViewType`.
+ */
+export function rasterImageType(type: string): string | null {
+  const mime = type.split(';')[0].trim().toLowerCase();
+  return RASTER_IMAGE_TYPES.has(mime) ? mime : null;
+}
+
 export interface ExternalImageReview {
   loadable: boolean;
   host: string;
@@ -254,12 +277,13 @@ export class ExternalImageDirective implements AfterViewInit, OnDestroy {
       {responseType: 'blob'},
     ).subscribe({
       next: (blob) => {
-        if (!card.isConnected || !blob.type.startsWith('image/') || blob.size === 0) {
+        const rasterType = rasterImageType(blob.type);
+        if (!card.isConnected || !rasterType || blob.size === 0) {
           if (card.isConnected) this.setError(card);
           return;
         }
         try {
-          const objectUrl = URL.createObjectURL(blob);
+          const objectUrl = URL.createObjectURL(new Blob([blob], {type: rasterType}));
           const preview = card.querySelector<HTMLElement>(
             '[data-external-image-slot="preview"], .external-image-card__preview',
           );
