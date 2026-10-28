@@ -50,6 +50,9 @@ class AgentRegistration(BaseModel):
     build_sha: str | None = Field(
         None, description="Build commit SHA baked into the agent image"
     )
+    image: str | None = Field(
+        None, description="Image reference the pod runs, from AGENT_IMAGE"
+    )
     product_provenance: ComponentProvenance = Field(
         default_factory=lambda: ComponentProvenance(
             provenance_status=ProvenanceStatus.UNAVAILABLE

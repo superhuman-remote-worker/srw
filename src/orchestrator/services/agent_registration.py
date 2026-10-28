@@ -218,6 +218,7 @@ async def register_agent(
             agent_mode=registration.agent_mode,
             thread_id=registration.thread_id,
             build_sha=registration.build_sha,
+            image=registration.image,
             product_provenance=registration.product_provenance.model_dump(mode="json"),
             pod_uid=registration.pod_uid,
             completion_commands_enabled=dependencies.completion_commands_enabled(),

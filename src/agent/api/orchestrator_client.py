@@ -793,6 +793,7 @@ class OrchestratorClient:
             "thread_id": thread_id,
             "session_runtime_generation": provisioned_generation,
             "build_sha": os.environ.get("BUILD_SHA", ""),
+            "image": os.environ.get("AGENT_IMAGE", ""),
             "product_provenance": product_provenance.model_dump(mode="json"),
             # Injected via Kubernetes downward API by agent_provisioner; empty
             # outside of K8s (local dev). The orchestrator persists this on

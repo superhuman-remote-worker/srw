@@ -191,6 +191,25 @@ def test_worker_registration_never_takes_the_thread_lane_path():
     deps.bind_registered_persistent_agent.assert_not_awaited()
 
 
+def test_registration_stores_the_image():
+    store = _store()
+    image = "example.invalid/h@sha256:" + "a" * 64
+    resp = _client(_deps(store=store)).post(
+        "/api/agents/register", json=_registration(image=image)
+    )
+    assert resp.status_code == 200
+    assert store.register_agent.await_args.kwargs["image"] == image
+
+
+def test_registration_without_an_image_stores_none():
+    store = _store()
+    resp = _client(_deps(store=store)).post(
+        "/api/agents/register", json=_registration()
+    )
+    assert resp.status_code == 200
+    assert store.register_agent.await_args.kwargs["image"] is None
+
+
 def test_registration_may_not_self_assert_verified_provenance():
     deps = _deps()
     resp = _client(deps).post(
