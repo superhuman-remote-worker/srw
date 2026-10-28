@@ -1390,6 +1390,18 @@ class TestPublicJobIngress:
         assert public.context == {"kept": True}
         assert body.context == {"kept": True}
 
+    def test_ide_session_cannot_be_seeded_at_creation(self):
+        seeded = {
+            "ide_session": {"status": "active", "pod_ip": "169.254.169.254"},
+            "kept": True,
+        }
+        internal = SimpleNamespace(context=dict(seeded))
+        ingress.strip_raw_officer_claim_context(internal)
+        body = JobCreate(description="seeded ide", context=dict(seeded))
+
+        assert internal.context == {"kept": True}
+        assert body.context == {"kept": True}
+
     def test_non_dict_context_is_left_alone(self):
         job = self._job(context=None, config_override=None)
         ingress.strip_public_job_reserved_markers(job)
