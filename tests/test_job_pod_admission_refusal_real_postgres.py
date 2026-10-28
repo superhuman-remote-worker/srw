@@ -105,7 +105,13 @@ async def test_a_refused_pod_create_ends_the_wait_for_a_late_create(db, monkeypa
     }
     effect = await _pod_effect(db, job)
     assert effect["observed_uid"] is None
-    assert effect["refused_status"] == 403
+    assert set(effect) == {
+        "issued_at",
+        "ambiguity_until",
+        "claim_token",
+        "observed_uid",
+        "observed_at",
+    }
     assert await _effects_quiescent(db, job)
 
 
@@ -124,8 +130,6 @@ async def test_an_answer_that_may_have_persisted_keeps_the_wait(db, monkeypatch,
     cluster = RefusingCluster(error)
     job, _ = await _refused_job(db, monkeypatch, cluster)
 
-    effect = await _pod_effect(db, job)
-    assert "refused_status" not in effect
     assert not await _effects_quiescent(db, job)
 
 

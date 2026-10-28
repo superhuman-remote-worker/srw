@@ -20134,7 +20134,8 @@ class PostgresDB:
         The API server answered this claim's Pod create with a 403/422 Status,
         so that request persisted nothing and no later answer can land for it.
         Cleanup still reads the Pod by name before it settles anything; only
-        the ambiguity window for an unobserved create closes now.
+        the ambiguity window for an unobserved create closes now. The effect
+        gains no diagnostic keys (container startup stage design).
         """
 
         if (
@@ -20156,11 +20157,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             updated = await conn.execute(
                 "UPDATE managed_repository_workspace_creation_reservations "
-                "SET external_effects = jsonb_set(external_effects, '{pod}', "
-                "(external_effects -> 'pod') || jsonb_build_object("
-                "'ambiguity_until', LEAST(now(), "
-                "(external_effects #>> '{pod,ambiguity_until}')::timestamptz), "
-                "'refused_at', now(), 'refused_status', $7::int)) "
+                "SET external_effects = jsonb_set(external_effects, "
+                "'{pod,ambiguity_until}', to_jsonb(LEAST(now(), "
+                "(external_effects #>> '{pod,ambiguity_until}')::timestamptz))) "
                 "WHERE owner_kind = $1 AND owner_id = $2 AND scope = $3 "
                 "AND reservation_generation = $4 AND claimed_by = $5 "
                 "AND claim_token = $6 AND settled_at IS NULL "
@@ -20174,7 +20173,6 @@ class PostgresDB:
                 reservation_generation,
                 claimant,
                 claim_token,
-                refused_status,
             )
         return updated == "UPDATE 1"
 
