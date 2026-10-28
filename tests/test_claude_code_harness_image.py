@@ -28,9 +28,16 @@ def test_dockerfile_is_pinned_non_root_isolated_and_has_no_cmd():
     assert "pip install --no-cache-dir --no-deps" in text
     assert "\nCMD" not in text
     assert "harnesses/claude-code/requirements.txt" in text
+    # uid 10001 is a real account and the environment names it: asyncssh asks
+    # getpass.getuser() for the local user before every connection, and Node
+    # tools ask os.userInfo(); an unknown uid with no USER fails both.
+    assert "useradd --uid 10001" in text
+    assert "USER=harness" in text and "LOGNAME=harness" in text
     # The CLI's local cwd mirrors the workspace root the model sees (R16).
     assert "mkdir -p /home/agent-host/workspace" in text
-    assert text.index("chown -R 10001:10001 /home/agent-host") < text.index("USER ")
+    assert text.index("chown -R 10001:10001 /home/agent-host") < text.index(
+        "\nUSER 10001:10001"
+    )
 
 
 def test_harness_package_declares_itself_without_dependencies():
@@ -126,3 +133,6 @@ def test_ci_smoke_tests_the_image_before_it_is_published():
         # The real start command runs too: without a config file it exits 2.
         assert "docker run --rm --network none srw-harness-claude-code:smoke" in command
         assert 'test "$rc" -eq 2' in command
+        # The local user resolves with the USER variables cleared (passwd entry)
+        # and under the image's own environment.
+        assert "-e USER= -e LOGNAME=" in command and "getpass.getuser()" in command
