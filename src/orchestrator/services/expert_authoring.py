@@ -776,6 +776,19 @@ class ExpertAuthoringService:
             raise HTTPException(
                 status_code=403, detail="Only an admin may publish a skill globally"
             )
+        if (
+            existing.get("is_global")
+            and fields.get("is_global") is not False
+            and (body.files is not None or fields)
+            and not user.get("is_admin")
+        ):
+            # What an admin published is what every user's menu serves, so
+            # while the skill stays global its files and metadata are the
+            # admin's to change. Un-publishing (and editing with it) is open.
+            raise HTTPException(
+                status_code=403,
+                detail="Only an admin may edit a global skill; un-publish it first",
+            )
         files = body.files
         if files is not None:
             name, description, files = parse_skill_bundle(files)
