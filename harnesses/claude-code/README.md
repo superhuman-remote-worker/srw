@@ -277,3 +277,8 @@ describes the setting in full.
 `limits.timeoutSeconds` bounds the Claude Code session. A Job's own
 `timeoutSeconds` includes queue time, workspace start and the upload, so set it
 generously (the example uses three days around a one-hour session).
+
+Connecting to the workspace is retried for up to 90 seconds (10 seconds per
+attempt, backing off from 0.5 to 5 seconds): a fresh Pod's sshd and the network
+policy admitting the harness both lag behind the Pod's readiness. An SSH-level
+error such as a rejected host key fails at once.

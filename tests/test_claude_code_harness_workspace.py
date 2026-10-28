@@ -23,6 +23,57 @@ async def workspace(sshd):
 
 
 @pytest.mark.asyncio
+async def test_connect_retries_refused_connections_until_sshd_listens(tmp_path):
+    """A fresh workspace Pod's sshd and the network policy admitting the harness
+    both lag behind the Pod's readiness: a refused connection is retried."""
+    server = await LocalSshd.start(tmp_path / "workspace", listen=False)
+    loop = asyncio.get_running_loop()
+    before = loop.time()
+    connecting = asyncio.create_task(
+        Workspace.connect(server.access, deadline_seconds=15)
+    )
+    await asyncio.sleep(1.0)
+    assert not connecting.done()  # still retrying against the closed port
+    await server.listen()
+    ws = await connecting
+    try:
+        assert (await ws.run("echo ok")).stdout == "ok\n"
+        assert 1.0 <= loop.time() - before < 10
+    finally:
+        await ws.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_gives_up_after_the_deadline_on_refused_connections(tmp_path):
+    server = await LocalSshd.start(tmp_path / "workspace", listen=False)
+    before = asyncio.get_running_loop().time()
+    with pytest.raises(WorkspaceError, match="cannot connect to the workspace"):
+        await Workspace.connect(server.access, deadline_seconds=1.0)
+    assert asyncio.get_running_loop().time() - before < 5
+    await server.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_does_not_retry_a_rejected_host_key(tmp_path, sshd):
+    """A permanent SSH error (another server's host key in known_hosts) fails at
+    once instead of burning the deadline."""
+    import asyncssh
+
+    other = asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode()
+    algorithm, blob = other.split()[:2]
+    known_hosts = tmp_path / "wrong_known_hosts"
+    known_hosts.write_text(f"[127.0.0.1]:{sshd.access.port} {algorithm} {blob}\n")
+    access = sshd.access.__class__(
+        **{**sshd.access.__dict__, "known_hosts_file": str(known_hosts)}
+    )
+    before = asyncio.get_running_loop().time()
+    with pytest.raises(WorkspaceError, match="cannot connect to the workspace"):
+        await Workspace.connect(access, deadline_seconds=30)
+    assert asyncio.get_running_loop().time() - before < 5
+
+
+@pytest.mark.asyncio
 async def test_cwd_persists_between_calls_but_shell_variables_do_not(workspace):
     await workspace.run("mkdir -p sub && cd sub && X=1")
     second = await workspace.run('pwd; echo "X=${X:-unset}"')

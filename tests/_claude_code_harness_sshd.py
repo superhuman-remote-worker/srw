@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import os
 import shutil
+import socket
 import signal
 import tempfile
 from pathlib import Path
@@ -68,7 +69,9 @@ class LocalSshd:
         self.prefix: str | None = None
 
     @classmethod
-    async def start(cls, root: Path) -> LocalSshd:
+    async def start(cls, root: Path, *, listen: bool = True) -> LocalSshd:
+        """Create the keys and the access descriptor; with ``listen=False`` the
+        port is reserved but nothing accepts until :meth:`listen`."""
         root.mkdir(parents=True, exist_ok=True)
         key_dir = tempfile.mkdtemp(prefix="srw-harness-sshd-")
         host_key = asyncssh.generate_private_key("ssh-ed25519")
@@ -79,15 +82,13 @@ class LocalSshd:
         # SRW delivers the key root-owned with mode 0444; keep the same mode here.
         os.chmod(key_file, 0o444)
         instance = cls(root, key_dir)
-        instance._server = server = await asyncssh.create_server(
-            _Server,
-            "127.0.0.1",
-            0,
-            server_host_keys=[host_key],
-            process_factory=instance._handle,
-            encoding=None,
-        )
-        port = server.get_port()
+        instance._host_key = host_key
+        if listen:
+            port = await instance.listen(0)
+        else:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
         algorithm, blob = host_key.export_public_key().decode().split()[:2]
         known_hosts_file = os.path.join(key_dir, "known_hosts")
         with open(known_hosts_file, "w") as handle:
@@ -101,6 +102,18 @@ class LocalSshd:
             known_hosts_file=known_hosts_file,
         )
         return instance
+
+    async def listen(self, port: int | None = None) -> int:
+        """Start accepting on ``port`` (default: the reserved one); returns it."""
+        self._server = await asyncssh.create_server(
+            _Server,
+            "127.0.0.1",
+            self.access.port if port is None else port,
+            server_host_keys=[self._host_key],
+            process_factory=self._handle,
+            encoding=None,
+        )
+        return self._server.get_port()
 
     async def _handle(self, process: asyncssh.SSHServerProcess) -> None:
         self.commands.append(process.command)
@@ -141,8 +154,9 @@ class LocalSshd:
             await asyncio.wait_for(closed, 5)
 
     async def close(self) -> None:
-        self._server.close()
-        await self._server.wait_closed()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
         # Background jobs outlive their call (as on a real workspace); end them here.
         _kill_sessions(self._sessions)
         shutil.rmtree(self._key_dir, ignore_errors=True)

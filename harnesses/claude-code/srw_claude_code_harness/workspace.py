@@ -152,6 +152,13 @@ class CommandResult:
     spilled_to: str | None = None
 
 
+# Connecting to a fresh workspace: total budget, per-attempt cap and backoff.
+CONNECT_DEADLINE_SECONDS = 90.0
+CONNECT_ATTEMPT_SECONDS = 10.0
+CONNECT_RETRY_INITIAL_SECONDS = 0.5
+CONNECT_RETRY_MAX_SECONDS = 5.0
+
+
 class WorkspaceError(RuntimeError):
     pass
 
@@ -325,25 +332,57 @@ class Workspace:
         self.cwd = root
 
     @classmethod
-    async def connect(cls, access: WorkspaceAccess) -> Workspace:
+    async def connect(
+        cls,
+        access: WorkspaceAccess,
+        *,
+        deadline_seconds: float = CONNECT_DEADLINE_SECONDS,
+    ) -> Workspace:
+        """Connect, retrying a refused, unreachable or dropped connection until
+        ``deadline_seconds`` have passed.
+
+        A fresh workspace Pod's sshd and the cluster's network policy admitting
+        this harness Pod both lag behind the Pod's readiness, and on some CNIs a
+        not-yet-admitted connection is refused rather than dropped. SSH-level
+        errors (a rejected host key, a refused client key) are permanent and
+        fail at once.
+        """
         root = posixpath.normpath(access.root)
         if not posixpath.isabs(root):
             raise WorkspaceError("workspace root must be an absolute path")
-        try:
-            connection = await asyncssh.connect(
-                access.host,
-                access.port,
-                username=access.user,
-                client_keys=[access.private_key_file],
-                known_hosts=access.known_hosts_file,
-                server_host_key_algs=["ssh-ed25519"],
-                # Only the delivered files count: no ~/.ssh/config, no ssh-agent.
-                config=None,
-                agent_path=None,
-            )
-        except (OSError, asyncssh.Error) as exc:
-            raise WorkspaceError(f"cannot connect to the workspace: {exc}") from exc
-        return cls(connection, root)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + deadline_seconds
+        wait = CONNECT_RETRY_INITIAL_SECONDS
+        attempts = 0
+        while True:
+            attempts += 1
+            remaining = deadline - loop.time()
+            try:
+                connection = await asyncssh.connect(
+                    access.host,
+                    access.port,
+                    username=access.user,
+                    client_keys=[access.private_key_file],
+                    known_hosts=access.known_hosts_file,
+                    server_host_key_algs=["ssh-ed25519"],
+                    # Only the delivered files count: no ~/.ssh/config, no ssh-agent.
+                    config=None,
+                    agent_path=None,
+                    connect_timeout=max(1.0, min(CONNECT_ATTEMPT_SECONDS, remaining)),
+                )
+            except (OSError, asyncssh.ConnectionLost, asyncio.TimeoutError) as exc:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise WorkspaceError(
+                        f"cannot connect to the workspace: {exc} "
+                        f"({attempts} attempts in {deadline_seconds:g} s)"
+                    ) from exc
+                await asyncio.sleep(min(wait, remaining))
+                wait = min(wait * 2, CONNECT_RETRY_MAX_SECONDS)
+                continue
+            except asyncssh.Error as exc:
+                raise WorkspaceError(f"cannot connect to the workspace: {exc}") from exc
+            return cls(connection, root)
 
     async def close(self) -> None:
         self._connection.close()
