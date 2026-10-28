@@ -31,6 +31,11 @@ from orchestrator.services.agent_pod_entrypoint import (
     agent_exec_command,
     validate_config_name,
 )
+from orchestrator.services.manifest_experts import (
+    approved_srw_images,
+    harness_image_class,
+    trusted_srw_image,
+)
 from orchestrator.services.runtime_actor import (
     issue_runtime_actor_bootstrap,
     issue_runtime_actor_pod_bootstrap,
@@ -2466,18 +2471,27 @@ class AgentProvisioner:
                 return True
         return False
 
+    def _is_custom_image(self, row: Any) -> bool:
+        image_class, _ = harness_image_class(
+            row.get("image"),
+            approved=approved_srw_images(self._db),
+            installed=trusted_srw_image(self._db),
+        )
+        return image_class == "custom"
+
     async def _count_idle_agents(self) -> int:
         """Count agents registered as ready (idle, waiting for work) in the DB."""
         if not self._db:
             return 0
         try:
             async with self._db.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT COUNT(*) AS cnt FROM agents "
+                rows = await conn.fetch(
+                    "SELECT image FROM agents "
                     "WHERE status = 'ready' "
                     "AND COALESCE(agent_mode, 'worker') IN ('worker', 'dual')"
                 )
-                return row["cnt"] if row else 0
+            # Custom-image pods are single-use job inventory, never warm pool.
+            return sum(1 for row in rows if not self._is_custom_image(row))
         except Exception as e:
             logger.error("Failed to count idle agents: %s", e)
             return 0
@@ -2870,16 +2884,16 @@ class AgentProvisioner:
             async with self._db.acquire() as conn:
                 idle_rows = await conn.fetch(
                     """
-                    SELECT id, hostname, pod_uid FROM agents
+                    SELECT id, hostname, pod_uid, image FROM agents
                     WHERE status = 'ready'
                       AND current_job_id IS NULL
                       AND thread_id IS NULL
                       AND hostname IS NOT NULL
                     ORDER BY last_heartbeat ASC
-                    LIMIT $1
-                    """,
-                    max_terminate + 5,  # fetch a few extra for filtering
+                    """
                 )
+            # Custom-image pods hold a job that has not been handed over yet.
+            idle_rows = [r for r in idle_rows if not self._is_custom_image(r)]
         except Exception:
             logger.exception("Failed to query idle agents for scale-down")
             return 0

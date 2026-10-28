@@ -902,6 +902,43 @@ class TestScaleDownIdle:
         p._core_api.delete_namespaced_pod.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_custom_idle_agent_is_not_deleted_but_ineligible_is(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-current")
+        p, conn = _make_provisioner(min_agents=1)
+        p._db.manifest_approved_images = ({"image": "reg/custom:1"},)
+        pods_result = MagicMock()
+        pods_result.items = [_make_pod(f"pod-{i}") for i in range(3)]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        conn.fetch.return_value = [
+            {"id": "c", "hostname": "pod-0", "pod_uid": "u0", "image": "reg/custom:1"},
+            {"id": "i", "hostname": "pod-1", "pod_uid": "u1", "image": "reg/other:1"},
+        ]
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.scale_down_idle(max_terminate=2)
+        assert result == 1
+        (call,) = p._core_api.delete_namespaced_pod.call_args_list
+        assert "pod-1" in (*call.args, *call.kwargs.values())
+        assert "pod-0" not in (*call.args, *call.kwargs.values())
+
+    @pytest.mark.asyncio
+    async def test_count_idle_agents_ignores_custom(self, monkeypatch):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-current")
+        p, conn = _make_provisioner()
+        p._db.manifest_approved_images = ({"image": "reg/custom:1"},)
+        conn.fetch.return_value = [
+            {"image": None},
+            {"image": "srw-agent:sha-old"},
+            {"image": "reg/custom:1"},
+            {"image": "reg/other:1"},
+        ]
+        assert await p._count_idle_agents() == 3
+
+    @pytest.mark.asyncio
     async def test_noop_when_no_idle_agents(self):
         p, conn = _make_provisioner(min_agents=2)
 
