@@ -50,11 +50,14 @@ def tables_api(monkeypatch, user_admin):
         record_security_event=AsyncMock(),
     )
     identity = AsyncMock(return_value=user_admin)
-    monkeypatch.setattr(
-        main.app.state, "tables_dependencies", TablesDependencies(db=db)
-    )
+    # Not monkeypatch: Starlette's State keeps attributes outside its
+    # ``__dict__``, so pytest >= 9.2 records them as unset and its undo deletes
+    # the application's real dependency.
+    original = main.app.state.tables_dependencies
+    main.app.state.tables_dependencies = TablesDependencies(db=db)
     monkeypatch.setattr(auth, "get_current_user", identity)
-    return SimpleNamespace(app=main.app, db=db, identity=identity)
+    yield SimpleNamespace(app=main.app, db=db, identity=identity)
+    main.app.state.tables_dependencies = original
 
 
 async def _get(api, path, **kwargs):

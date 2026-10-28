@@ -67,10 +67,12 @@ def preferences_api(monkeypatch, user_a):
     )
     identity = AsyncMock(return_value=user_a)
     roles = Mock(side_effect=lambda role: deepcopy(ROLE_BASES[role]))
-    monkeypatch.setattr(
-        main.app.state,
-        "preferences_dependencies",
-        PreferencesDependencies(db=db, role_base=roles, environ=os.environ),
+    # Not monkeypatch: Starlette's State keeps attributes outside its
+    # ``__dict__``, so pytest >= 9.2 records them as unset and its undo deletes
+    # the application's real dependency.
+    original = main.app.state.preferences_dependencies
+    main.app.state.preferences_dependencies = PreferencesDependencies(
+        db=db, role_base=roles, environ=os.environ
     )
     monkeypatch.setattr(auth, "get_current_user", identity)
     for key, value in {
@@ -81,9 +83,10 @@ def preferences_api(monkeypatch, user_a):
         "EMBEDDING_PROVIDER": "env-provider",
     }.items():
         monkeypatch.setenv(key, value)
-    return SimpleNamespace(
+    yield SimpleNamespace(
         main=main, app=main.app, db=db, identity=identity, roles=roles, user=user_a
     )
+    main.app.state.preferences_dependencies = original
 
 
 async def request(api, method, body=None):
