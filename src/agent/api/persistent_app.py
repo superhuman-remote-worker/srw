@@ -6886,14 +6886,18 @@ async def _resolve_pending_permission(
     try:
         async with _session.postgres_conn.acquire() as conn:
             if approval_id is not None:
+                # Scoped to this session's thread like the fallback below and
+                # the orchestrator's decide_permission_request: a caller-
+                # supplied id from another thread must not resolve its gate.
                 row = await conn.fetchrow(
                     "UPDATE thread_permission_requests "
                     "SET status = $2, decided_at = now(), decided_by = $3 "
-                    "WHERE id = $1 AND status = 'pending' "
+                    "WHERE id = $1 AND thread_id = $4 AND status = 'pending' "
                     "RETURNING id, status, tool_call_id, thread_id",
                     approval_id,
                     decision,
                     decided_by,
+                    _session_identity.thread_id,
                 )
             else:
                 row = await conn.fetchrow(

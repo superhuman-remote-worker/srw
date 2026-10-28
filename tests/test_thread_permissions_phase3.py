@@ -266,9 +266,13 @@ class TestResolvePendingPermission:
         assert result is not None
         assert result["status"] == "approved"
         # UPDATE issued via fetchrow with the explicit id.
-        sql = postgres._fake_conn.fetchrow.await_args.args[0]
+        call = postgres._fake_conn.fetchrow.await_args
+        sql = call.args[0]
         assert "UPDATE thread_permission_requests" in sql
         assert "WHERE id = $1" in sql
+        # N29: the explicit id is scoped to this session's thread.
+        assert "AND thread_id = $4" in sql
+        assert call.args[4] == "thread-test"
 
     @pytest.mark.asyncio
     async def test_resolves_most_recent_when_no_id(self):
