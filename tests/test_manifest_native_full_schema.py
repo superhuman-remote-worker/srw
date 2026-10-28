@@ -19,6 +19,7 @@ from testcontainers.postgres import PostgresContainer
 from tests import _b09_control_seams as control_seams
 
 from orchestrator.database.postgres import PostgresDB
+from shared.manifests import ManifestError
 from orchestrator.services.generic_harness_runtime import GenericPodObservation
 from orchestrator.services.manifest_execution import ManifestExecutionService
 from orchestrator.services.connector_drivers import builtin_connector_drivers
@@ -560,12 +561,16 @@ async def test_empty_approved_list_runs_nothing_even_for_admins(database, actor)
 async def test_launch_overrides_are_refused_for_generic_jobs(
     database, actor, field, value
 ):
+    """The runtime has no launch fields at all: refusal is a schema violation
+    in validation, before admission, and nothing is recorded."""
     document = assignment()
     document["spec"]["execution"]["expert"]["inline"]["runtime"][field] = value
-    with pytest.raises(HTTPException) as refused:
+    with pytest.raises(ManifestError) as refused:
         await admit(database, actor, document)
-    assert refused.value.status_code == 422
-    assert "entrypoint" in refused.value.detail
+    assert refused.value.issue.code == "UnknownField"
+    assert refused.value.issue.path == "/spec/execution/expert/inline/runtime"
+    for table in ("jobs", "srw_resources", "srw_execution_specs"):
+        assert await database.fetchval(f"SELECT count(*) FROM {table}") == 0
 
 
 @pytest.mark.asyncio

@@ -1791,7 +1791,7 @@ jobs:
           --tag srw-harness-claude-code:smoke .
       - name: Smoke-test the image
         run: |
-          docker run --rm --network none --entrypoint python3 srw-harness-claude-code:smoke -c '
+          docker run --rm --network none --entrypoint python3 srw-harness-claude-code:smoke -I -c '
           from pathlib import Path
           from srw_claude_code_harness.__main__ import _versions
           from srw_claude_code_harness.config import parse_config
@@ -1804,6 +1804,11 @@ jobs:
           assert versions["sdk"] and versions["cli"], versions
           print("harness smoke ok", versions)
           '
+          # The real start command (python3 -I -u -m srw_claude_code_harness):
+          # with no config file delivered it must reach the harness and exit 2.
+          rc=0
+          docker run --rm --network none srw-harness-claude-code:smoke || rc=$?
+          test "$rc" -eq 2 || { echo "start command exited $rc; expected 2 (no config file)"; exit 1; }
       - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
         uses: docker/build-push-action@v5
         with:

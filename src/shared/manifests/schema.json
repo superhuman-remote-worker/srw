@@ -249,71 +249,6 @@
         }
       }
     },
-    "Probe": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "httpGet": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "path",
-            "port"
-          ],
-          "properties": {
-            "path": {
-              "type": "string",
-              "pattern": "^/"
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535
-            }
-          }
-        },
-        "exec": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "command"
-          ],
-          "properties": {
-            "command": {
-              "$ref": "#/$defs/Command"
-            }
-          }
-        },
-        "initialDelaySeconds": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "periodSeconds": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "timeoutSeconds": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "failureThreshold": {
-          "type": "integer",
-          "minimum": 1
-        }
-      },
-      "oneOf": [
-        {
-          "required": [
-            "httpGet"
-          ]
-        },
-        {
-          "required": [
-            "exec"
-          ]
-        }
-      ]
-    },
     "Runtime": {
       "type": "object",
       "additionalProperties": false,
@@ -333,15 +268,6 @@
         },
         "pullPolicy": {
           "$ref": "#/$defs/PullPolicy"
-        },
-        "command": {
-          "$ref": "#/$defs/Command"
-        },
-        "args": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
         },
         "env": {
           "type": "object",
@@ -372,18 +298,6 @@
         },
         "resources": {
           "$ref": "#/$defs/RuntimeResources"
-        },
-        "probes": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "readiness": {
-              "$ref": "#/$defs/Probe"
-            },
-            "liveness": {
-              "$ref": "#/$defs/Probe"
-            }
-          }
         },
         "adapter": {
           "enum": [

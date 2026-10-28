@@ -1,6 +1,7 @@
 """Static checks for the Claude Code harness image, its CI jobs and example Job."""
 
 from pathlib import Path
+import tomllib
 
 import yaml
 from jsonschema import Draft202012Validator
@@ -14,16 +15,36 @@ BASE = (
 )
 
 
-def test_dockerfile_is_pinned_non_root_and_has_no_cmd():
+def test_dockerfile_is_pinned_non_root_isolated_and_has_no_cmd():
     text = (ROOT / "docker/Dockerfile.harness-claude-code").read_text()
     assert BASE in text
     assert "USER 10001:10001" in text
-    assert 'ENTRYPOINT ["python3", "-m", "srw_claude_code_harness"]' in text
+    # Isolated mode: a Job's env (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME) can
+    # never make the interpreter load code before the harness does (C1), and
+    # the package is installed where the interpreter looks on its own.
+    assert 'ENTRYPOINT ["python3", "-I", "-u", "-m", "srw_claude_code_harness"]' in text
+    assert "PYTHONPATH=" not in text
+    assert "harnesses/claude-code/pyproject.toml" in text
+    assert "pip install --no-cache-dir --no-deps" in text
     assert "\nCMD" not in text
     assert "harnesses/claude-code/requirements.txt" in text
     # The CLI's local cwd mirrors the workspace root the model sees (R16).
     assert "mkdir -p /home/agent-host/workspace" in text
     assert text.index("chown -R 10001:10001 /home/agent-host") < text.index("USER ")
+
+
+def test_harness_package_declares_itself_without_dependencies():
+    """The image installs this package; its dependencies are pinned by
+    requirements.txt and installed first."""
+    pyproject = tomllib.loads(
+        (ROOT / "harnesses/claude-code/pyproject.toml").read_text()
+    )
+    assert pyproject["project"]["name"] == "srw-claude-code-harness"
+    assert pyproject["project"].get("dependencies", []) == []
+    assert pyproject["tool"]["setuptools"]["packages"]["find"]["include"] == [
+        "srw_claude_code_harness",
+        "srw_claude_code_harness.*",
+    ]
 
 
 def test_requirements_pin_the_sdk_and_asyncssh():
@@ -94,9 +115,14 @@ def test_ci_smoke_tests_the_image_before_it_is_published():
         assert "--file ./docker/Dockerfile.harness-claude-code" in built
         assert "--tag srw-harness-claude-code:smoke" in built and "--push" not in built
         command = steps[smoke]["run"]
+        # The imports run under -I, so they prove the installed package is
+        # found without PYTHONPATH.
         assert (
-            "--network none --entrypoint python3 srw-harness-claude-code:smoke -c"
+            "--network none --entrypoint python3 srw-harness-claude-code:smoke -I -c"
             in command
         )
         for needle in ("parse_config(", "build_options(", "make_tools("):
             assert needle in command, (workflow, needle)
+        # The real start command runs too: without a config file it exits 2.
+        assert "docker run --rm --network none srw-harness-claude-code:smoke" in command
+        assert 'test "$rc" -eq 2' in command

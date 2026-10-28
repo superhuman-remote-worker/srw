@@ -668,10 +668,11 @@ API and persists execution/attempt state in PostgreSQL. The Cilium service gate
 below exercises that complete path with real pods and retained storage. Runtime
 configuration never passes through the SRW reference harness loader.
 
-The image's own `ENTRYPOINT` and `CMD` run. `command`, `args` and `probes` are
-refused at admission with "Approved harness images start with their own entrypoint;
-command, args and probes are not accepted." `config`, `env`, `resources` and
-connectors work as before. SRW adds no shell wrapper.
+The image's own `ENTRYPOINT` and `CMD` run. The runtime has no `command`, `args`
+or `probes` fields: a manifest that sets one fails validation (`UnknownField` at
+the runtime path) before admission, and the pod builder refuses them too.
+`config`, `env`, `resources` and connectors work as before. SRW adds no shell
+wrapper.
 
 When supplied, opaque config, task and binding descriptors are mounted read-only
 at `/run/srw/config.json`, `/run/srw/task.json` and `/run/srw/bindings.json`, with

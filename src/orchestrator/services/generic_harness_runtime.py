@@ -253,9 +253,11 @@ def build_generic_launch(
     runtime = deepcopy(selection["inline"]["runtime"])
     if runtime.get("adapter") is not None:
         raise ValueError("Reference-harness adapters require their dedicated runtime.")
-    if runtime.get("args") == [] and "command" not in runtime:
+    if any(key in runtime for key in ("command", "args", "probes")):
+        # The schema has no launch fields. Reaching here means validation was
+        # skipped; never translate an authored launch into a container spec.
         raise ValueError(
-            "Clearing image arguments requires an explicit command on this backend."
+            "Images start with their own entrypoint; command, args and probes are not launch fields."
         )
     if "timeoutSeconds" in resolved_job and remaining_timeout_seconds is None:
         raise ValueError("The caller must supply the remaining whole-job deadline.")
@@ -401,16 +403,9 @@ def build_generic_launch(
             "readOnlyRootFilesystem": policy.read_only_root_filesystem,
         },
     }
-    # Both omitted preserves ENTRYPOINT/CMD. Supplying command follows native
-    # Kubernetes command replacement, with only explicitly supplied arguments.
-    # Never add an implicit shell wrapper.
-    for key in ("command", "args"):
-        if key in runtime:
-            container[key] = deepcopy(runtime[key])
-    for key, value in runtime.get("probes", {}).items():
-        if key not in {"readiness", "liveness"}:
-            raise ValueError("Unsupported runtime probe.")
-        container[key + "Probe"] = deepcopy(value)
+    # The image's own ENTRYPOINT and CMD always run: no command, no args, no
+    # probes and no shell wrapper. Readiness observed later belongs to probes
+    # the workspace runtime declares on the pods it builds itself.
     if env:
         container["env"] = env
     if mounts:

@@ -1,0 +1,22 @@
+[build-system]
+# 77 is the first setuptools with PEP 639 license expressions.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srw-claude-code-harness"
+description = "SRW Claude Code harness: runs Claude Code against an SRW workspace over SSH"
+license = "FSL-1.1-ALv2"
+requires-python = ">=3.12"
+dynamic = ["version"]
+# The image installs the pinned requirements.txt first and this package with
+# --no-deps. Nothing is declared here, so the two can never disagree.
+dependencies = []
+
+[tool.setuptools.dynamic]
+version = {attr = "srw_claude_code_harness.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["srw_claude_code_harness", "srw_claude_code_harness.*"]
+namespaces = false

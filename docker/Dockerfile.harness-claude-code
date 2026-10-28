@@ -7,11 +7,19 @@
 # See harnesses/claude-code/README.md.
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/harness HOME=/tmp
-COPY harnesses/claude-code/requirements.txt /harness/requirements.txt
-RUN pip install --no-cache-dir -r /harness/requirements.txt
-COPY harnesses/claude-code/srw_claude_code_harness /harness/srw_claude_code_harness
+ENV HOME=/tmp
+COPY harnesses/claude-code/requirements.txt /tmp/harness/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/harness/requirements.txt
+# The harness is an ordinary package in site-packages, found by the interpreter
+# on its own: the image needs no PYTHONPATH.
+COPY harnesses/claude-code/pyproject.toml /tmp/harness/pyproject.toml
+COPY harnesses/claude-code/srw_claude_code_harness /tmp/harness/srw_claude_code_harness
+RUN pip install --no-cache-dir --no-deps /tmp/harness && rm -rf /tmp/harness
 # The CLI's local cwd mirrors the workspace root path the model sees.
 RUN mkdir -p /home/agent-host/workspace && chown -R 10001:10001 /home/agent-host
 USER 10001:10001
-ENTRYPOINT ["python3", "-m", "srw_claude_code_harness"]
+# Isolated mode (-I): PYTHON* environment variables are ignored and the working
+# directory never joins sys.path, so a Job's env and delivered files cannot make
+# Python load code before the harness. -u keeps output unbuffered, which -I
+# would otherwise leave to the ignored PYTHONUNBUFFERED.
+ENTRYPOINT ["python3", "-I", "-u", "-m", "srw_claude_code_harness"]

@@ -59,6 +59,13 @@ settings sources, hooks, plugins, skills, CLAUDE.md files or extra MCP servers
 are loaded; the only tools are the four harness tools below, served by an
 in-process MCP server named `ws`. The CLI runs with a frozen environment.
 
+The image holds itself to the same rule. Python starts in isolated mode
+(`python3 -I`), so the environment a Job sets (`PYTHONPATH`, `PYTHONSTARTUP`,
+`PYTHONHOME`) and the files it delivers cannot make the interpreter load code
+before the harness runs. The package is installed into the image's
+site-packages; the image sets no `PYTHONPATH` and the Job cannot set a start
+command, arguments or probes (the manifest runtime has no such fields).
+
 ## task.json
 
 ```json

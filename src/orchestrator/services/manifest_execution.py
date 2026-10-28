@@ -101,13 +101,6 @@ class ManifestExecutionService:
             )
         return entry
 
-    def _require_fixed_launch(self, runtime: dict) -> None:
-        if any(key in runtime for key in ("command", "args", "probes")):
-            raise HTTPException(
-                422,
-                "Approved harness images start with their own entrypoint; command, args and probes are not accepted.",
-            )
-
     async def admit(self, prepared, resource, user, *, request=None):
         resolved = prepared["resolved"]
         spec = resolved["spec"]
@@ -132,7 +125,6 @@ class ManifestExecutionService:
         if adapter == "generic":
             self._require_hosting_configuration()
             self._approved_runtime(runtime)
-            self._require_fixed_launch(runtime)
         if scope["kind"] == "Account" and scope["name"] != str(user["id"]):
             # Publishing into another account never lends the administrator's
             # runtime credentials, grants or model defaults to that account.
