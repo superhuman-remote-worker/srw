@@ -187,6 +187,8 @@ class AudioHelper:
             wire_model_id,
         )
 
+        self.env_signature = _whisper_env_signature()
+
         # OPENAI_API_KEY is the fallback only when the endpoint IS OpenAI (a
         # key follows its endpoint).
         self.api_base = os.getenv("WHISPER_BASE_URL", self.OPENAI_API_URL)
@@ -626,6 +628,22 @@ class AudioHelper:
             logger.warning(f"Failed to archive transcription call: {e}")
 
 
+# The environment an AudioHelper reads its transport from.
+_WHISPER_ENV_NAMES = (
+    "WHISPER_BASE_URL",
+    "WHISPER_API_KEY",
+    "WHISPER_MODEL",
+    "WHISPER_SERVED_MODEL",
+    "WHISPER_TIMEOUT",
+    "WHISPER_LANGUAGE",
+    "OPENAI_API_KEY",
+)
+
+
+def _whisper_env_signature() -> tuple:
+    return tuple(os.environ.get(name) for name in _WHISPER_ENV_NAMES)
+
+
 # Module-level singleton instance (lazy-loaded)
 _audio_helper: Optional[AudioHelper] = None
 
@@ -634,12 +652,17 @@ def get_audio_helper() -> AudioHelper:
     """Get or create the AudioHelper singleton instance.
 
     Use this to get a shared AudioHelper instance rather than
-    creating new instances.
+    creating new instances. An agent pod serves one job or Session after
+    another, each exporting its own WHISPER_* block, so the instance is
+    rebuilt whenever that environment changed: a cached client would keep
+    the first caller's endpoint and key (or none) for every later one.
 
     Returns:
         Shared AudioHelper instance
     """
     global _audio_helper
-    if _audio_helper is None:
+    if _audio_helper is None or _audio_helper.env_signature != (
+        _whisper_env_signature()
+    ):
         _audio_helper = AudioHelper()
     return _audio_helper

@@ -939,6 +939,26 @@ async def inject_thread_dispatch_credentials(
             capability="rerank",
             dependencies=dependencies,
         )
+    # Speech-to-text for read_file on audio (WHISPER_MODEL / _BASE_URL /
+    # _API_KEY), resolved like the job dispatch: the persisted block, then the
+    # user's pin, then the admin default for the ``whisper`` capability.
+    whisper_model = env_keys_block.get("WHISPER_MODEL") or user_settings.get(
+        "default_whisper_model"
+    )
+    if not whisper_model:
+        whisper_model = await dependencies.store.resolve_default_for_capability(
+            "whisper"
+        )
+    if whisper_model:
+        await inject_env_key_credentials(
+            env_keys=env_keys_block,
+            prefix="WHISPER",
+            model_id=whisper_model,
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            capability="whisper",
+            dependencies=dependencies,
+        )
     if include_kb_profile:
         await inject_system_kb_embedding_profile(
             env_keys_block, dependencies=dependencies

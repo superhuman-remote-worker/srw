@@ -3116,6 +3116,29 @@ class TestScrubOnClaim:
         assert emb._embedding_service is None
         session_attach.apply_session_embedding_env(None)  # cleanup
 
+    def test_whisper_transport_is_replaced_per_attach(self):
+        session_attach.apply_session_whisper_env(
+            {
+                "WHISPER_MODEL": "a-whisper",
+                "WHISPER_BASE_URL": "https://a.example/v1",
+                "WHISPER_API_KEY": "sk-a",
+                "WHISPER_LANGUAGE": "de",
+                "SOME_SDK_VARIABLE": "never exported",
+            }
+        )
+        assert os.environ.get("WHISPER_API_KEY") == "sk-a"
+        assert os.environ.get("WHISPER_LANGUAGE") == "de"
+        assert "SOME_SDK_VARIABLE" not in os.environ
+
+        # Tenant B delivers only a model: none of A's transport survives.
+        session_attach.apply_session_whisper_env({"WHISPER_MODEL": "b-whisper"})
+        assert os.environ.get("WHISPER_MODEL") == "b-whisper"
+        for key in ("WHISPER_BASE_URL", "WHISPER_API_KEY", "WHISPER_LANGUAGE"):
+            assert key not in os.environ, key
+
+        session_attach.apply_session_whisper_env(None)
+        assert "WHISPER_MODEL" not in os.environ
+
     def test_executor_scrub_clears_dual_inboxes(self, harness):
         import agent.api.dual_app as dual_app
 

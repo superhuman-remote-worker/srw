@@ -141,6 +141,29 @@ class TestAudioHelperSingleton:
         # Cleanup
         mod._audio_helper = None
 
+    def test_singleton_follows_the_exported_transport(
+        self, mock_env, mock_openai_client, monkeypatch
+    ):
+        """A pod serves one job or Session after another, each exporting its
+        own WHISPER_* block: the cached client must not keep the first one's
+        endpoint and key (or the empty key of a caller that had none)."""
+        import agent.services.audio_helper as mod
+
+        mod._audio_helper = None
+        monkeypatch.setenv("WHISPER_BASE_URL", "https://a.example/v1")
+        monkeypatch.setenv("WHISPER_API_KEY", "sk-a")
+        first = mod.get_audio_helper()
+        assert first.api_key == "sk-a"
+
+        monkeypatch.setenv("WHISPER_BASE_URL", "https://b.example/v1")
+        monkeypatch.setenv("WHISPER_API_KEY", "sk-b")
+        second = mod.get_audio_helper()
+        assert second is not first
+        assert (second.api_base, second.api_key) == ("https://b.example/v1", "sk-b")
+        assert mod.get_audio_helper() is second
+
+        mod._audio_helper = None
+
 
 # =============================================================================
 # Transcription (small files, single chunk)
