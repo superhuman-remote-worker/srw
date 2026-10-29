@@ -16,6 +16,11 @@ describe('queueParkReasonKey', () => {
     expect(queueParkReasonKey('model_unavailable')).toBe('chat.parked.reason.modelUnavailable');
   });
 
+  it('names the cut-off tool result an operator still has to repair', () => {
+    // Shown only when the Continue / Stop card cannot list the calls.
+    expect(queueParkReasonKey('loop_died_after_tool_effect')).toBe('chat.parked.reason.toolResultUnknown');
+  });
+
   it('falls back to the generic line for unknown or missing reasons', () => {
     expect(queueParkReasonKey('something_new')).toBe('chat.parked.reason.generic');
     expect(queueParkReasonKey(null)).toBe('chat.parked.reason.generic');

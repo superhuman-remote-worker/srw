@@ -50,7 +50,7 @@ import {
 } from '../models/permission-mode';
 import { choiceBackend, choiceRequestFields } from '../../views/workspaces/workspace-template-utils';
 import { ApiService } from './api.service';
-import type { SessionQueueState } from '../models/api.model';
+import type { SessionQueueState, SessionUnknownToolResultDecision } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
@@ -1620,6 +1620,31 @@ export class PersistentChatService {
     // A refusal can mean the block is stale (another tab or an operator
     // already retried and the unit settled): re-read it rather than leave a
     // parked bubble that nothing else will ever refresh.
+    void this._pollQueueState();
+    return 'refused';
+  }
+
+  /**
+   * The owner's answer to a parked unit's unknown tool results
+   * (session_unknown_tool_result_needs_admin.md): POST the decision, then
+   * reload the transcript, which now holds a result row per call and, for
+   * Continue with nothing else waiting, the server-admitted "Continue." turn.
+   * A refusal is toasted with the server's code and the block re-read.
+   */
+  async decideUnknownToolResult(decision: SessionUnknownToolResultDecision): Promise<'ok' | 'refused'> {
+    const tid = this.threadId();
+    if (!tid) return 'refused';
+    const outcome = await firstValueFrom(this.api.decideUnknownToolResult(tid, decision));
+    if (this.threadId() !== tid) return 'refused';
+    if (outcome.kind === 'ok') {
+      if (outcome.queue) this._applyQueueState(tid, outcome.queue);
+      if (outcome.continued || outcome.queue?.state === 'queued') {
+        this.pendingTurnCount.update((c) => Math.max(c, 1));
+      }
+      void this._reloadAfterRewind();
+      return 'ok';
+    }
+    this.toast.danger(this.transloco.translate('chat.unknownResult.failed', { code: outcome.code }));
     void this._pollQueueState();
     return 'refused';
   }

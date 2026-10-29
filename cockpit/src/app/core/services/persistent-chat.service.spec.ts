@@ -13240,6 +13240,38 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
     expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
   });
 
+  it('decideUnknownToolResult applies the returned block and reloads the transcript', async () => {
+    const ctx = await readyOn('thread-u');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    expect(ctx.service.isParked()).toBe(true);
+    const settled = { ...parkedBlock, state: 'done', park_reason: null, pending_input: false };
+    (ctx.mockApi as any).decideUnknownToolResult = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'ok', queue: settled, continued: true }));
+    const reload = vi.spyOn(ctx.service as any, '_reloadAfterRewind').mockResolvedValue(undefined);
+    expect(await ctx.service.decideUnknownToolResult('continue')).toBe('ok');
+    expect((ctx.mockApi as any).decideUnknownToolResult).toHaveBeenCalledWith('thread-u', 'continue');
+    expect(ctx.service.isParked()).toBe(false);
+    // Continue admitted a "Continue." turn server-side: wait for it.
+    expect(ctx.service.pendingTurnCount()).toBeGreaterThan(0);
+    expect(reload).toHaveBeenCalled();
+  });
+
+  it('decideUnknownToolResult keeps the card and toasts the code on refusal', async () => {
+    const ctx = await readyOn('thread-uf');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    (ctx.mockApi as any).decideUnknownToolResult = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'refused', status: 409, code: 'tool_history_ambiguous' }));
+    expect(await ctx.service.decideUnknownToolResult('stop')).toBe('refused');
+    expect(ctx.service.isParked()).toBe(true);
+    expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
+  });
+
   it('retryParked on a unit with no pending input opens no awaiting stretch', async () => {
     // A unit parked with nothing to run (e.g. a push remainder) settles to
     // `done` on retry without ever starting a turn; counting a turn here

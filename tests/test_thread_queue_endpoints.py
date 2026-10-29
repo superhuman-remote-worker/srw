@@ -131,6 +131,8 @@ async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
         "retryable": True,
         "attempts": 3,
         "pending_input": True,
+        # The fake connection lists no unanswered tool calls.
+        "unknown_tool_calls": [],
         "cloud_push": None,
     }
     owner.assert_awaited_once()
@@ -326,6 +328,95 @@ def test_queue_routes_are_mounted():
     routes = mounted_routes(main.app)
     assert ("GET", "/api/persistent/threads/{thread_id}/queue") in routes
     assert ("POST", "/api/persistent/threads/{thread_id}/queue/retry") in routes
+    assert (
+        "POST",
+        "/api/persistent/threads/{thread_id}/queue/unknown-tool-result",
+    ) in routes
+
+
+# ---------------------------------------------------------------------------
+# POST …/queue/unknown-tool-result (session_unknown_tool_result_needs_admin.md)
+# ---------------------------------------------------------------------------
+
+
+def _decision(decision):
+    from orchestrator.schemas.thread_transport import (
+        UnknownToolResultDecisionRequest,
+    )
+
+    return UnknownToolResultDecisionRequest(decision=decision)
+
+
+def _wire_decision(monkeypatch, outcome=None, refused=None):
+    from orchestrator.services import session_unknown_tool_results as utr
+
+    decide = AsyncMock(
+        return_value=outcome,
+        side_effect=(
+            utr.UnknownToolResultRefused(*refused) if refused is not None else None
+        ),
+    )
+    monkeypatch.setattr(utr, "decide_unknown_tool_results", decide)
+    monkeypatch.setattr(sqs, "queue_state_for", AsyncMock(return_value=None))
+    admit = AsyncMock(return_value={"accepted": True, "turn_id": 9})
+    monkeypatch.setattr(thread_transport, "admit_stateless_input", admit)
+    load = AsyncMock(return_value={"id": THREAD, "execution_lane": "stateless"})
+    monkeypatch.setattr(
+        thread_transport.pinned_forwarding, "load_thread_for_owner", load
+    )
+    return decide, admit
+
+
+@pytest.mark.asyncio
+async def test_continue_with_nothing_waiting_resumes_with_a_continue_input(
+    owner, monkeypatch
+):
+    from orchestrator.services import session_unknown_tool_results as utr
+
+    decide, admit = _wire_decision(
+        monkeypatch,
+        outcome=utr.UnknownToolResultOutcome(
+            state="done", call_ids=["call_a"], needs_continue_input=True
+        ),
+    )
+    body = await thread_transport.thread_queue_unknown_tool_result(
+        THREAD, _decision("continue"), request=object(), dependencies=_deps(owner)
+    )
+    assert decide.await_args.kwargs == {"thread_id": THREAD, "decision": "continue"}
+    assert admit.await_args.args[1] == utr.CONTINUE_INPUT
+    assert body["answered_calls"] == ["call_a"]
+    assert body["continue_input"] == {"accepted": True, "turn_id": 9}
+    thread_transport.log_security_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_or_waiting_input_admits_nothing(owner, monkeypatch):
+    from orchestrator.services import session_unknown_tool_results as utr
+
+    _, admit = _wire_decision(
+        monkeypatch,
+        outcome=utr.UnknownToolResultOutcome(
+            state="queued", call_ids=["call_a"], needs_continue_input=False
+        ),
+    )
+    body = await thread_transport.thread_queue_unknown_tool_result(
+        THREAD, _decision("stop"), request=object(), dependencies=_deps(owner)
+    )
+    admit.assert_not_awaited()
+    assert body["continue_input"] is None
+
+
+@pytest.mark.asyncio
+async def test_refused_decision_maps_to_its_status_and_code(owner, monkeypatch):
+    _, admit = _wire_decision(monkeypatch, refused=(409, "tool_history_ambiguous"))
+    with pytest.raises(HTTPException) as err:
+        await thread_transport.thread_queue_unknown_tool_result(
+            THREAD, _decision("continue"), request=object(), dependencies=_deps(owner)
+        )
+    assert err.value.status_code == 409
+    assert err.value.detail == {"code": "tool_history_ambiguous"}
+    admit.assert_not_awaited()
+    thread_transport.log_security_event.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -14,6 +14,14 @@ class ThreadInputRequest(BaseModel):
     content: str
     turn_id: Optional[int] = None
     expected_conversation_revision: int | None = Field(default=None, ge=0)
+
+
+class UnknownToolResultDecisionRequest(BaseModel):
+    """Body for POST /api/persistent/threads/{thread_id}/queue/unknown-tool-result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["continue", "stop"]
 
 
 class ThreadInterruptRequest(BaseModel):

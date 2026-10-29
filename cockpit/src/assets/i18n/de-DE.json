@@ -2144,8 +2144,18 @@
         "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
         "retryExhausted": "Diese Nachricht ist wiederholt auf dieselbe Weise fehlgeschlagen und wurde zurückgestellt.",
         "modelUnavailable": "Das Modell dieser Sitzung ist nicht mehr verfügbar. Wählen Sie in den Einstellungen dieser Sitzung ein anderes Modell und versuchen Sie es dann erneut.",
+        "toolResultUnknown": "Ein Befehl wurde unterbrochen, bevor sein Ergebnis gespeichert wurde, und der Verlauf darum lässt sich nicht sicher lesen — ein Administrator muss ihn reparieren, bevor diese Nachricht ausgeführt werden kann.",
         "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
       }
+    },
+    "unknownResult": {
+      "label": "Ergebnis unbekannt",
+      "singleTitle": "Ein Werkzeugaufruf wurde unterbrochen, bevor sein Ergebnis gespeichert wurde",
+      "batchTitle": "{{count}} Werkzeugaufrufe wurden unterbrochen, bevor ihre Ergebnisse gespeichert wurden",
+      "hint": "Ein unterbrochener Aufruf ist vielleicht fertig gelaufen, vielleicht nicht. „Fortsetzen“ teilt dem Agenten mit, dass das Ergebnis unbekannt ist, und lässt ihn dort weitermachen; „Hier anhalten“ beendet diese Anfrage. Was Sie danach gesendet haben, wird in beiden Fällen ausgeführt.",
+      "continue": "Fortsetzen",
+      "stop": "Hier anhalten",
+      "failed": "Die Entscheidung wurde abgelehnt ({{code}})"
     },
     "queued": {
       "notSent": "Nicht gesendet",
@@ -2432,6 +2442,7 @@
       "queued": "Warten auf einen verfügbaren Agenten…",
       "parked": "Diese Nachricht muss erneut gesendet werden",
       "parkedBlocked": "Blockiert, bis ein Administrator sie freigibt",
+      "parkedDecide": "Wählen Sie oben „Fortsetzen“ oder „Hier anhalten“, um weiterzumachen",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",

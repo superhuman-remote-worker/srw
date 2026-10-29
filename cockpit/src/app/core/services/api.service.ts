@@ -115,6 +115,8 @@ import type {
   CloudRootStatus,
   SessionQueueState,
   SessionQueueRetryOutcome,
+  SessionUnknownToolResultDecision,
+  SessionUnknownToolResultOutcome,
   RunQueueUnparkResult,
   WorkspaceLifecycleView,
 } from '../models/api.model';
@@ -3607,6 +3609,41 @@ export class ApiService {
                 : err.status === 404
                   ? 'not_parked'
                   : 'retry_failed';
+          return of({ kind: 'refused', status: err.status ?? 0, code });
+        }),
+      );
+  }
+
+  /**
+   * Owner verb: answer a parked unit's unknown tool results. `continue` lets
+   * the session go on with the result unknown; `stop` ends the interrupted
+   * request. 409 carries a `{code}` detail, 404 means "not parked".
+   */
+  decideUnknownToolResult(
+    threadId: string,
+    decision: SessionUnknownToolResultDecision,
+  ): Observable<SessionUnknownToolResultOutcome> {
+    return this.http
+      .post<{ queue?: SessionQueueState | null; continue_input?: unknown }>(
+        `${this.baseUrl}/persistent/threads/${threadId}/queue/unknown-tool-result`,
+        { decision },
+      )
+      .pipe(
+        map(
+          (data): SessionUnknownToolResultOutcome => ({
+            kind: 'ok',
+            queue: data?.queue ?? null,
+            continued: data?.continue_input != null,
+          }),
+        ),
+        catchError((err: HttpErrorResponse): Observable<SessionUnknownToolResultOutcome> => {
+          const detail = err.error?.detail;
+          const code =
+            detail && typeof detail === 'object' && typeof detail.code === 'string'
+              ? detail.code
+              : err.status === 404
+                ? 'not_parked'
+                : 'decision_failed';
           return of({ kind: 'refused', status: err.status ?? 0, code });
         }),
       );

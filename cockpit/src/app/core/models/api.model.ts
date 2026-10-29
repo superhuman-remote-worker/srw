@@ -3317,6 +3317,17 @@ export interface SessionQueueState {
   retryable: boolean;
   attempts: number;
   pending_input: boolean;
+  /** Tool calls whose result is unknown (a parked unit only): the owner's
+   * Continue / Stop decision answers them. Empty or absent otherwise. */
+  unknown_tool_calls?: SessionUnknownToolCall[];
+}
+
+/** A tool call that started but has no recorded result. `args` is null when
+ * the payload is too large to show. */
+export interface SessionUnknownToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown> | null;
 }
 
 /** One parked unit as listed on GET /api/admin/capacity. */
@@ -3412,4 +3423,11 @@ export interface RunQueueUnparkResult {
 /** POST /api/persistent/threads/{id}/queue/retry, folded to a discriminated outcome. */
 export type SessionQueueRetryOutcome =
   | { kind: 'ok'; state: string }
+  | { kind: 'refused'; status: number; code: string };
+
+/** The owner's answer to a parked unit's unknown tool results. */
+export type SessionUnknownToolResultDecision = 'continue' | 'stop';
+
+export type SessionUnknownToolResultOutcome =
+  | { kind: 'ok'; queue: SessionQueueState | null; continued: boolean }
   | { kind: 'refused'; status: number; code: string };

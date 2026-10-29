@@ -106,6 +106,7 @@ import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
 import {copyText} from '../../ui/copy-field';
 import {queueParkReasonKey} from '../../core/models/queue-park-reason';
+import type {SessionUnknownToolCall, SessionUnknownToolResultDecision} from '../../core/models/api.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
 import {SessionListService} from '../../core/services/session-list.service';
@@ -1935,7 +1936,33 @@ export function clearDraft(threadId: string | null): void {
              settlement failure). Rendered from the durable queue block, so a
              reload shows it too. Never the waiting/busy copy: this is a
              failure with a way out, not a queue. -->
-        @if (chat.isParked()) {
+        @if (chat.isParked() && unknownToolCalls().length > 0) {
+          <!-- Parked over tool calls whose result is unknown: the owner
+               decides, on the same card as a tool approval
+               (session_unknown_tool_result_needs_admin.md). -->
+          <div class="mile mile-permission" role="alert" data-testid="chat-unknown-result">
+            <div class="mile-label">{{ 'chat.unknownResult.label' | transloco }}</div>
+            <div class="mile-title">{{ (unknownToolCalls().length === 1 ? 'chat.unknownResult.singleTitle' : 'chat.unknownResult.batchTitle') | transloco: {count: unknownToolCalls().length} }}</div>
+            <ul class="permission-list">
+              @for (call of unknownToolCalls(); track call.id) {
+                <li class="permission-row">
+                  <app-icon size="sm">{{ toolIcon(call.name) }}</app-icon>
+                  <code class="permission-tool">{{ call.name }}</code>
+                  <code class="permission-args">{{ unknownCallArgs(call) }}</code>
+                </li>
+              }
+              <li class="permission-note">{{ 'chat.unknownResult.hint' | transloco }}</li>
+            </ul>
+            <div class="mile-actions">
+              <app-button variant="success" size="sm" data-testid="chat-unknown-continue"
+                          [disabled]="decidingUnknown()"
+                          (clicked)="decideUnknownToolResult('continue')">{{ 'chat.unknownResult.continue' | transloco }}</app-button>
+              <app-button variant="danger" size="sm" data-testid="chat-unknown-stop"
+                          [disabled]="decidingUnknown()"
+                          (clicked)="decideUnknownToolResult('stop')">{{ 'chat.unknownResult.stop' | transloco }}</app-button>
+            </div>
+          </div>
+        } @else if (chat.isParked()) {
           <div class="message message-assistant turn-bubble parked-turn" role="alert" data-testid="chat-parked">
             <div class="avatar">
               <app-icon size="sm" class="avatar-icon parked-icon">error_outline</app-icon>
@@ -2738,6 +2765,25 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /** Calls a parked unit's Continue / Stop card decides (empty: plain bubble). */
+    readonly unknownToolCalls = computed(() => this.chat.queueState()?.unknown_tool_calls ?? []);
+    readonly decidingUnknown = signal(false);
+
+    /** The cut-off call's arguments, shown in full like an approval row's. */
+    unknownCallArgs(call: SessionUnknownToolCall): string {
+        return formatPermissionArgs(call.args);
+    }
+
+    async decideUnknownToolResult(decision: SessionUnknownToolResultDecision): Promise<void> {
+        if (this.decidingUnknown()) return;
+        this.decidingUnknown.set(true);
+        try {
+            await this.chat.decideUnknownToolResult(decision);
+        } finally {
+            this.decidingUnknown.set(false);
+        }
+    }
+
     private readonly compactionNow = signal(Date.now());
     private compactionTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -3448,6 +3494,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // since a park is no readiness evidence — because the composer is
         // closed while parked (canComposeDuringSession) and this line says why.
         if (this.chat.isParked()) {
+            // Parked over cut-off tool calls: the owner's Continue / Stop
+            // card above is the way out, not an administrator.
+            if (this.unknownToolCalls().length > 0) {
+                return this.transloco.translate('chat.input.parkedDecide');
+            }
             return this.transloco.translate(
                 this.chat.queueState()?.retryable ? 'chat.input.parked' : 'chat.input.parkedBlocked',
             );

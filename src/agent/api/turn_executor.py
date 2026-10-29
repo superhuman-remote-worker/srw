@@ -131,6 +131,7 @@ from shared.run_queue import (
     transient_release_backoff_seconds,
 )
 from shared.session_permission_retirement import retire_stale_stateless_permissions
+from shared.session_tool_debt import SESSION_TOOL_DEBT_SQL
 from shared.session_pending_memory import (
     SESSION_PENDING_MEMORY_KEY,
     valid_pending_memory,
@@ -469,72 +470,9 @@ SELECT NOT EXISTS (
 )
 """
 
-# Consumption is an input watermark, not proof that an external command
-# finished. A successor must inspect all live debt before restore can repair
-# an unanswered call out of model context. Delegation-only batches retain
-# their existing child-ledger recovery; mixed batches remain ambiguous.
-_SESSION_TOOL_DEBT_SQL = """
-SELECT EXISTS (
-    SELECT 1 FROM thread_messages AS malformed_row
-     WHERE malformed_row.thread_id = $1::uuid
-       AND malformed_row.role = 'ai'
-       AND malformed_row.rewound_at IS NULL
-       AND malformed_row.tool_calls IS NOT NULL
-       AND jsonb_typeof(malformed_row.tool_calls) IS DISTINCT FROM 'array'
-) OR EXISTS (
-    -- A result identifies a call by turn/id, not an occurrence. Duplicate
-    -- same-turn IDs cannot prove which physical effect that result settled.
-    SELECT 1
-      FROM thread_messages AS duplicate_row
-     CROSS JOIN LATERAL jsonb_array_elements(
-         CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
-              THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
-     ) AS duplicate_call
-     WHERE duplicate_row.thread_id = $1::uuid
-       AND duplicate_row.role = 'ai'
-       AND duplicate_row.rewound_at IS NULL
-     GROUP BY duplicate_row.turn_number, duplicate_call ->> 'id'
-    HAVING COUNT(*) > 1 AND BOOL_OR(EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-            CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
-                 THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
-        ) AS sibling
-        WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
-    ))
-) OR EXISTS (
-    SELECT 1
-      FROM thread_messages AS call_row
-     CROSS JOIN LATERAL jsonb_array_elements(
-         CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
-              THEN call_row.tool_calls ELSE '[]'::jsonb END
-     ) AS tool_call
-     WHERE call_row.thread_id = $1::uuid
-       AND call_row.role = 'ai'
-       AND call_row.rewound_at IS NULL
-       AND (
-           jsonb_typeof(tool_call -> 'id') IS DISTINCT FROM 'string'
-           OR BTRIM(COALESCE(tool_call ->> 'id', '')) = ''
-           OR NOT EXISTS (
-               SELECT 1 FROM thread_messages AS result_row
-                WHERE result_row.thread_id = call_row.thread_id
-                  AND result_row.role = 'tool'
-                  AND result_row.rewound_at IS NULL
-                  AND result_row.seq > call_row.seq
-                  AND result_row.turn_number IS NOT DISTINCT FROM call_row.turn_number
-                  AND result_row.tool_call_id = tool_call ->> 'id'
-           )
-       )
-       AND EXISTS (
-           SELECT 1 FROM jsonb_array_elements(
-               CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
-                    THEN call_row.tool_calls ELSE '[]'::jsonb END
-           ) AS sibling
-            WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
-               OR jsonb_typeof(sibling -> 'id') IS DISTINCT FROM 'string'
-               OR BTRIM(COALESCE(sibling ->> 'id', '')) = ''
-       )
-)
-"""
+# The transcript-side tool-debt definition lives in shared.session_tool_debt
+# (the orchestrator's owner decision reads the same rows).
+_SESSION_TOOL_DEBT_SQL = SESSION_TOOL_DEBT_SQL
 
 _SESSION_TOOL_DEBT_AUTHORITY_SQL = (
     """
@@ -5675,6 +5613,15 @@ class StatelessTurnExecutor:
             # A previous cached owner may still be resident. No validated
             # bundle/attach will retire it on this refusal, so do not accept
             # another owner after an unproven claim or predecessor authority.
+            # The executor stays stopped (pod unready) until it is replaced;
+            # say so, or the pod just goes quiet.
+            logger.error(
+                "session tool-history admission refused: unit=%s token=%d — "
+                "this claim's authority or the predecessor's claim record is "
+                "unproven; stopping this executor until the pod is replaced",
+                claim.unit_id,
+                claim.lease_token,
+            )
             self.request_stop()
             return False
         if not row["unresolved"]:
@@ -5724,6 +5671,12 @@ class StatelessTurnExecutor:
             release_reason="unresolved_predecessor_tool",
         )
         if outcome is None and not clear:
+            logger.error(
+                "session tool-debt park lost its authority: unit=%s token=%d; "
+                "stopping this executor until the pod is replaced",
+                claim.unit_id,
+                claim.lease_token,
+            )
             self.request_stop()
         # A real late result may clear the debt under the same locked claim.
         # A lost commit response is the existing idempotent parked outcome,

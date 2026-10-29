@@ -255,6 +255,39 @@ describe('parked unit composer', () => {
     }
   });
 
+  // A park over cut-off tool calls is the owner's decision, not an operator's:
+  // the approval-style card replaces the "an administrator has to release it"
+  // bubble (session_unknown_tool_result_needs_admin.md).
+  it('shows the Continue / Stop card for a park over unknown tool results', async () => {
+    const chat = sessionState() as any;
+    chat.isParked.set(true);
+    chat.queueState.set({
+      state: 'parked', park_reason: 'loop_died_after_tool_effect', parked_at: null,
+      retryable: false, attempts: 2, pending_input: true,
+      unknown_tool_calls: [{id: 'call_sleep', name: 'shell_execute', args: {command: 'sleep 570'}}],
+    });
+    chat.decideUnknownToolResult = vi.fn(async () => 'ok');
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      const card = el.querySelector('[data-testid="chat-unknown-result"]');
+      expect(card).not.toBeNull();
+      expect(card!.textContent).toContain('shell_execute');
+      expect(card!.textContent).toContain('sleep 570');
+      expect(el.querySelector('[data-testid="chat-unknown-continue"]')).not.toBeNull();
+      expect(el.querySelector('[data-testid="chat-unknown-stop"]')).not.toBeNull();
+      expect(el.querySelector('[data-testid="chat-parked"]')).toBeNull();
+      const composer = el.querySelector<HTMLTextAreaElement>('[data-testid="chat-composer"]')!;
+      expect(composer.placeholder).toBe('chat.input.parkedDecide');
+
+      await fixture.componentInstance.decideUnknownToolResult('continue');
+      expect(chat.decideUnknownToolResult).toHaveBeenCalledWith('continue');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
   // End and suspension settle the unit (the End funnel closes a parked one to
   // `done`), so a parked block that outlived an in-tab End is stale: the box
   // stays the resume path it always was.

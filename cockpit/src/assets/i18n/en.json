@@ -2144,8 +2144,18 @@
         "stopped": "The session stopped before this message was handled.",
         "retryExhausted": "This message kept failing the same way, so it was set aside.",
         "modelUnavailable": "This session's model is no longer available. Choose another model in this session's settings, then retry.",
+        "toolResultUnknown": "A command was cut off before its result was recorded, and the history around it can't be read safely — an administrator has to repair it before this message can run.",
         "generic": "The session hit a problem it can't clear on its own — an administrator has to release it before this message can run."
       }
+    },
+    "unknownResult": {
+      "label": "Result unknown",
+      "singleTitle": "A tool call was cut off before its result was recorded",
+      "batchTitle": "{{count}} tool calls were cut off before their results were recorded",
+      "hint": "A cut-off call may or may not have finished. Continue tells the agent the result is unknown and lets it pick up from there; Stop here ends that request. Anything you sent afterwards runs either way.",
+      "continue": "Continue",
+      "stop": "Stop here",
+      "failed": "The decision was refused ({{code}})"
     },
     "queued": {
       "notSent": "Not sent",
@@ -2432,6 +2442,7 @@
       "queued": "Waiting for an available agent…",
       "parked": "This message needs a retry",
       "parkedBlocked": "Blocked until an administrator clears it",
+      "parkedDecide": "Choose Continue or Stop here above to go on",
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)",

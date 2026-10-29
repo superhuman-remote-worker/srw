@@ -171,6 +171,8 @@ def test_queue_block_shapes_parked_and_idle():
         "retryable": True,
         "attempts": 3,
         "pending_input": True,
+        # Filled by queue_block_for_thread from the transcript.
+        "unknown_tool_calls": [],
     }
     refused = sqs.queue_block(
         {
