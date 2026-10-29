@@ -102,6 +102,10 @@ _TERMINAL_PROOF_SETTLE_SECONDS = 5.0
 _CHANNEL_OPEN_RETRIES = 3
 _CHANNEL_OPEN_BACKOFF_SECONDS = 0.25
 
+# shell_run: how many transport losses one wait for a running command rides
+# out by reconnecting (each reconnect is bounded by connect()'s own budget).
+_SHELL_WAIT_RESUMES = 3
+
 # shell_cancel: seconds to wait after a Ctrl+C before re-checking whether the
 # tab returned to a prompt. Two attempts, then fall back to a tab reset.
 _CANCEL_SETTLE_SECONDS = 0.5
@@ -115,6 +119,18 @@ _TCP_KEEPALIVE_IDLE_SECONDS = 10
 _TCP_KEEPALIVE_COUNT = 3
 _TCP_KEEPALIVE_INTERVAL_SECONDS = 5
 _TCP_USER_TIMEOUT_MILLIS = 10_000
+
+# Client-side rekey limits. paramiko starts a rekey itself after 512 MiB; a
+# CHANNEL_CLOSE the server sent before our KEXINIT then reaches the transport
+# thread, whose reply waits on the key exchange only that thread can finish,
+# and the whole transport dies 30 s later ("Key-exchange timed out waiting for
+# key negotiation"). Shell polling closes a channel every 0.3 s, so a long
+# turn hits it. Server-initiated rekeys cannot (the server sends only kex after
+# its KEXINIT), so stay above OpenSSH's own default (64 GiB for AES) within
+# RFC 4344's bounds and let the server rekey first.
+# knowledge-base/knowledge/issues/session_unknown_tool_result_needs_admin.md
+_CLIENT_REKEY_BYTES = 2**36
+_CLIENT_REKEY_PACKETS = 2**31
 
 # Explicit deadlines for heavy/recursive remote ops. Now that _exec's
 # deadline actually binds (drain-loop fix), these need generous budgets or
@@ -180,6 +196,19 @@ def _validate_private_key(key_path: Optional[str]) -> str:
         ) from exc
 
     return _sha256_public_key_fingerprint(private_key)
+
+
+def _defer_rekey_to_server(transport: Any) -> None:
+    """Raise this transport's own rekey limits (see ``_CLIENT_REKEY_BYTES``).
+
+    paramiko reads the limits through ``self`` on its packetizer, so instance
+    attributes override the class defaults for this one connection.
+    """
+    packetizer = getattr(transport, "packetizer", None)
+    if packetizer is None:
+        return
+    packetizer.REKEY_BYTES = _CLIENT_REKEY_BYTES
+    packetizer.REKEY_PACKETS = _CLIENT_REKEY_PACKETS
 
 
 def _sha256_public_key_fingerprint(key: Any) -> str:
@@ -1900,6 +1929,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         transport = self._ssh.get_transport()
         if transport is not None:
             transport.set_keepalive(_TRANSPORT_KEEPALIVE_SECONDS)
+            _defer_rekey_to_server(transport)
             try:
                 sock = transport.get_socket()
             except Exception:
@@ -4455,6 +4485,34 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         if not self._shell_initialized:
             self._init_shell()
 
+    def _resume_wait_after_transport_loss(
+        self, tab_name: str, sentinel: str
+    ) -> Optional[_RemoteTab]:
+        """Re-adopt the tab a running command owns after the SSH transport died.
+
+        Reading the pane is idempotent and the command keeps running in tmux,
+        so a dropped transport is no reason to fail the wait. Reconnect,
+        re-adopt the tmux session (which re-attests ownership and restores the
+        durable pending guards) and return the tab when this exact command
+        still owns it. ``None`` when the failure was not a transport loss or
+        the command no longer owns the tab: the caller fails as before.
+        """
+        if self._retired or (self.is_connected() and self._shell_initialized):
+            return None
+        logger.warning(
+            "SSH transport to %s lost while waiting on tab %r; reconnecting "
+            "to keep waiting on the running command",
+            self._host,
+            tab_name,
+        )
+        self._ensure_connected()
+        self._ensure_shell()
+        tab = self._tabs.get(tab_name)
+        if tab is None or tab.pending_sentinel != sentinel:
+            return None
+        logger.info("Resumed waiting on tab %r after reconnect", tab_name)
+        return tab
+
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
         if len(text.encode("utf-8")) > _SEND_KEYS_INLINE_LIMIT:
@@ -4724,13 +4782,23 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             resolved_cwd = None
             last_content_hash = None
             stall_start = None
+            resumes = 0
 
             while time.monotonic() - start_time < timeout:
                 time.sleep(0.3)  # Slightly longer poll interval for SSH latency
                 try:
                     all_lines = self._tmux_capture(tab_name)
                 except WorkspaceUnavailableError:
-                    raise
+                    resumed_tab = (
+                        self._resume_wait_after_transport_loss(tab_name, sentinel)
+                        if resumes < _SHELL_WAIT_RESUMES
+                        else None
+                    )
+                    if resumed_tab is None:
+                        raise
+                    resumes += 1
+                    tab = resumed_tab
+                    continue
 
                 # Find sentinel output line
                 sentinel_line_idx = None

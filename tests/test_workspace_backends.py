@@ -15,7 +15,7 @@ import stat as stat_module
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -4516,6 +4516,115 @@ class TestRemoteBackendShellRun:
         assert lifecycle.mock_calls[-1] == call.clear("default", self._SENTINEL)
         assert "Exit code: 0" in result
 
+    def _drop_transport_once(self, stack, backend, mock_ssh, *, same_owner):
+        """Enter patches for one transport loss mid-wait and the reattach.
+
+        The second capture fails as a dead transport does. Reconnecting resets
+        the shell state like ``_ensure_connected``; re-adoption restores the
+        tab with the pending guard tmux holds: this command's when
+        ``same_owner``, another one's otherwise. Returns the reconnect and
+        re-adoption mocks.
+        """
+        transport = mock_ssh.get_transport.return_value
+        sent = {}
+        captures = iter(
+            [
+                [f"agent@host:{self._ROOT}$"],
+                WorkspaceUnavailableError("SSH command failed on 10.0.0.42"),
+                [f"agent@host:{self._ROOT}$", f"{self._SENTINEL} 0 {self._ROOT}"],
+            ]
+        )
+
+        def capture(_tab_name):
+            item = next(captures)
+            if isinstance(item, Exception):
+                transport.is_active.return_value = False
+                raise item
+            return item
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            sent["sentinel"] = sentinel
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        def reconnect():
+            transport.is_active.return_value = True
+            backend._shell_initialized = False
+            backend._tabs.clear()
+
+        def readopt():
+            tab = _RemoteTab("default", pane_id="%1")
+            tab.pending_sentinel = sent["sentinel"] if same_owner else "__DONE_x__"
+            backend._tabs["default"] = tab
+            backend._shell_initialized = True
+
+        backend._ssh = mock_ssh
+        self._uuid(
+            stack.enter_context(patch("shared.runtime.core.backends.remote.uuid.uuid4"))
+        )
+        stack.enter_context(patch("shared.runtime.core.backends.remote.time.sleep"))
+        stack.enter_context(patch.object(backend, "_tmux_capture", side_effect=capture))
+        stack.enter_context(
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            )
+        )
+        stack.enter_context(patch.object(backend, "_clear_tab_pending_if_current"))
+        reconnect_mock = stack.enter_context(
+            patch.object(backend, "_ensure_connected", side_effect=reconnect)
+        )
+        readopt_mock = stack.enter_context(
+            patch.object(backend, "_init_shell", side_effect=readopt)
+        )
+        return reconnect_mock, readopt_mock
+
+    def test_transport_loss_mid_wait_reconnects_and_keeps_waiting(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        with ExitStack() as stack:
+            reconnect, readopt = self._drop_transport_once(
+                stack, backend, mock_ssh, same_owner=True
+            )
+            result = backend.shell_run("sleep 570", tab_name="default")
+
+        reconnect.assert_called_once_with()
+        readopt.assert_called_once_with()
+        assert "Exit code: 0" in result
+
+    def test_transport_loss_after_the_tab_changed_owner_fails_as_before(
+        self, remote_backend
+    ):
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        with ExitStack() as stack:
+            self._drop_transport_once(stack, backend, mock_ssh, same_owner=False)
+            with pytest.raises(WorkspaceUnavailableError, match="SSH command failed"):
+                backend.shell_run("sleep 570", tab_name="default")
+
+    def test_unavailable_on_a_live_transport_is_not_retried(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        backend._ssh = mock_ssh
+        captures = [
+            [f"agent@host:{self._ROOT}$"],
+            WorkspaceUnavailableError("tmux pane vanished"),
+        ]
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        with (
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ),
+            patch.object(backend, "_ensure_connected") as reconnect,
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="pane vanished"):
+                backend.shell_run("sleep 570", tab_name="default")
+
+        reconnect.assert_not_called()
+
     def test_commands_on_distinct_tabs_do_not_serialize(self, remote_backend):
         backend, _, _ = remote_backend
         self._ready(backend)
@@ -5459,6 +5568,26 @@ class TestConnectionHardening:
         backend.connect()
         mock_ssh.get_transport.return_value.set_keepalive.assert_called_with(15)
         mock_sftp.get_channel.return_value.settimeout.assert_called_with(60.0)
+
+    def test_connect_leaves_rekeys_to_the_server(self, remote_backend):
+        """A client-initiated rekey can deadlock paramiko's transport thread on
+        a CHANNEL_CLOSE already in flight; the limits defer rekeys to sshd."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        packetizer = mock_ssh.get_transport.return_value.packetizer
+        assert packetizer.REKEY_BYTES == 2**36
+        assert packetizer.REKEY_PACKETS == 2**31
+
+    def test_paramiko_reads_rekey_limits_per_instance(self):
+        """The override works only while paramiko compares against
+        ``self.REKEY_*``; a class-constant comparison would ignore it."""
+        import inspect
+
+        from paramiko.packet import Packetizer
+
+        source = inspect.getsource(Packetizer)
+        assert "self.REKEY_BYTES" in source
+        assert "self.REKEY_PACKETS" in source
 
     def test_connect_sets_transport_socket_options(self, remote_backend):
         """Connect applies kernel socket options for long-halt recovery."""
