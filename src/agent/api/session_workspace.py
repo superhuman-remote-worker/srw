@@ -53,6 +53,27 @@ PROTECTED_CLOUD_SAFE_ERROR_CODES = frozenset(
 )
 
 
+def remote_cloud_mounts(payload: Any) -> list[Dict[str, Any]]:
+    """The cloud folders a workspace payload hands a Virtual Session as
+    remote descriptors (``cloud_remote.mounts``, the cloud_remote form of
+    features/cloud_folders_on_virtual_sessions.md), or ``[]``.
+
+    While any arrive, the session's backend serves them itself at
+    ``cloud/<name>``, the outbox included: the legacy ``nc_session_folder``
+    shim must not mirror the workspace root into that same session folder
+    beside them (seen on dev 2026-10-29: the skills tree, README.md and
+    ``.srw/`` pushed into ``sessions/<id>``)."""
+    if not isinstance(payload, dict):
+        return []
+    remote = payload.get("cloud_remote")
+    if not isinstance(remote, dict):
+        return []
+    mounts = remote.get("mounts")
+    if not isinstance(mounts, list):
+        return []
+    return [mount for mount in mounts if isinstance(mount, dict)]
+
+
 def protected_workspace_marker(payload: Dict[str, Any]) -> str:
     """Classify the additive workspace marker without truthiness coercion."""
 

@@ -6484,6 +6484,73 @@ class TestAttachSessionProtectedCloudFailClose:
         assert "Sessions/thread-1" in kwargs["cloud_cfg"]["webdav_url"]
 
 
+class TestAttachSessionRemoteCloudFolders:
+    """A Virtual Session's cloud folders arrive as remote descriptors (the
+    cloud_remote form) and its outbox is cloud/outbox itself: the legacy
+    nc_session_folder shim must not mirror the workspace root into that same
+    folder beside them (dev, 2026-10-29: the shim pushed skills/, README.md
+    and .srw/ into sessions/<id>)."""
+
+    @pytest.mark.asyncio
+    async def test_remote_folders_turn_the_legacy_shim_off(self):
+        import agent.api.persistent_app as mod
+
+        workspace_override = {
+            "remote": {"host": "10.42.0.10"},
+            "nc_session_folder": "Sessions/thread-1",
+            "cloud_mount": None,
+            "cloud_sync": None,
+            "protected_cloud": False,
+            "cloud_remote": {
+                "mounts": [
+                    {
+                        "name": "outbox",
+                        "path": "cloud/outbox",
+                        "mount_kind": "cloud_outbox",
+                        "access": "read_write",
+                    }
+                ],
+                "plan": {"fingerprint": "f" * 64, "incarnation": "c" * 32},
+            },
+        }
+        fake_agent = SimpleNamespace(
+            config=object(),
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=None,
+            vector_conn=None,
+        )
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+        fake_session_cls = TestAttachSessionProtectedCloudFailClose._fake_session_cls()
+
+        mod._session = None
+        mod._session_identity._thread_id = None
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(mod, "PersistentSession", fake_session_cls),
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(mod, "_build_sync_coordinator") as build_sync,
+            patch.object(mod, "_restore_session_messages", new=AsyncMock()),
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod._session_termination, "start_watchdogs"),
+        ):
+            try:
+                await mod._session_attach.attach("thread-1")
+            finally:
+                mod._session = None
+                mod._session_identity._thread_id = None
+
+        build_sync.assert_not_called()
+
+
 class TestAttachSessionProtectedCloudSingletonIsolation:
     """Task 15 review fix: the protected_cloud honesty flag must never be
     written into the pool-mode singleton ``_agent.config``.

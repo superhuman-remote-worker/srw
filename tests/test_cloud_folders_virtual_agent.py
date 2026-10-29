@@ -370,3 +370,25 @@ def test_listing_through_the_tools_shows_the_folders(tmp_path):
     assert "Written: cloud/outbox/new.md" in tools["write_file"].invoke(
         {"path": "cloud/outbox/new.md", "content": "n"}
     )
+
+
+def test_remote_mounts_are_read_off_a_workspace_payload():
+    """The attach and the turn-start retry both ask the same question of a
+    workspace payload: does it hand this session remote descriptors? Only a
+    well-formed ``cloud_remote.mounts`` list counts, and only its dict rows."""
+    from agent.api.session_workspace import remote_cloud_mounts
+
+    assert remote_cloud_mounts(None) == []
+    assert remote_cloud_mounts({}) == []
+    assert remote_cloud_mounts({"cloud_remote": "junk"}) == []
+    assert remote_cloud_mounts({"cloud_remote": {"mounts": []}}) == []
+    assert remote_cloud_mounts({"cloud_remote": {"mounts": "cloud/outbox"}}) == []
+    rows = remote_cloud_mounts(
+        {
+            "cloud_remote": {
+                "mounts": [{"name": "outbox", "path": "cloud/outbox"}, "junk"],
+                "plan": {"fingerprint": "f" * 64, "incarnation": "c" * 32},
+            }
+        }
+    )
+    assert rows == [{"name": "outbox", "path": "cloud/outbox"}]

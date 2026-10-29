@@ -1773,12 +1773,16 @@ async def agent_get_thread_workspace_locked(
         # Raw project repository payload for internal session tools. Public
         # repository routes intentionally redact clone credentials.
         "repositories": repositories_payload,
-        # Nextcloud session folder (legacy; preserved one release for back-compat)
+        # Nextcloud session folder (legacy; preserved one release for back-compat).
+        # Withheld beside remote descriptors too: a Virtual Session's outbox
+        # is cloud/outbox itself, and the agent's legacy shim would mirror the
+        # workspace root into that same folder.
         "nc_session_folder": (
             None
             if suppress_disposable_cloud
             or final_protected_marker != "off"
             or cloud_mount_sidecar_cfg is not None
+            or cloud_remote_cfg is not None
             else final_thread.get("nc_session_folder")
         ),
         # Structured cloud-sync config (backend + webdav URL + auth).

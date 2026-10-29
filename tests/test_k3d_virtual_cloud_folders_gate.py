@@ -117,5 +117,6 @@ def test_the_nextcloud_scripts_parse():
     for script in (
         gate._NEXTCLOUD_PUT_GROUP_FILE,
         gate._NEXTCLOUD_SESSION_DIR,
+        gate._NEXTCLOUD_SESSION_LS,
     ):
         subprocess.run(["sh", "-n"], input=script, text=True, check=True)

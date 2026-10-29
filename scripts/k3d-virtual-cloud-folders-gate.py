@@ -30,7 +30,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               cloud/outbox/<file> is in agent-service's sessions/<id> when the
               turn is over; a file placed in the project folder is listed by
               the agent's next call with no restart; a root-wide search is
-              refused with the guidance; per-turn wall time is recorded
+              refused with the guidance; the outbox folder holds only the
+              agent's file (no workspace mirror beside the remote); per-turn
+              wall time is recorded
   empty       (case 12) ``datasource_ids: []``: Virtual, nothing attached, no
               session folder, no remote record, and a turn answers
   readonly    (case 4) the project folder at read_only: a write under it is
@@ -120,6 +122,7 @@ AGENT_SERVED = {
     "src/agent/core/backends/factory.py": "def cloud_remote_from_entry(",
     "src/agent/api/persistent_session.py": "def _remote_cloud_folders(",
     "src/agent/api/session_attach.py": "_probe_and_report_remote_cloud_folders",
+    "src/agent/api/session_workspace.py": "def remote_cloud_mounts(",
     "src/shared/runtime/core/backends/rclone.py": "def cloud_object_store_from_spec(",
 }
 
@@ -140,6 +143,15 @@ _NEXTCLOUD_SESSION_FILE = cfc._NEXTCLOUD_SESSION_FILE
 _NEXTCLOUD_SESSION_DIR = r"""
 data=$(php /var/www/html/occ config:system:get datadirectory)
 ls -d "$data"/*/files/sessions/"$1" 2>/dev/null | head -1
+"""
+
+#: The top-level names in a session folder on disk: ``$1`` the folder id.
+#: What the legacy mirror would push beside the agent's file (README.md,
+#: skills/, .srw/) shows here; dev 2026-10-29.
+_NEXTCLOUD_SESSION_LS = r"""
+data=$(php /var/www/html/occ config:system:get datadirectory)
+dir=$(ls -d "$data"/*/files/sessions/"$1" 2>/dev/null | head -1)
+[ -n "$dir" ] && ls -A "$dir" || true
 """
 
 WRITE_PROMPT = (
@@ -182,7 +194,8 @@ PLAN = [
     "says delivery remote and both folders mounted; the prompt block names "
     "cloud/<project> and cloud/outbox; a write lands in sessions/<id>; a file "
     "placed in the project folder is listed next call; a root-wide search is "
-    "refused; turn wall times recorded",
+    "refused; the outbox folder holds only the agent's file; turn wall times "
+    "recorded",
     "empty: datasource_ids [] -> Virtual, nothing attached, no session folder, "
     "no remote record, a turn answers",
     "readonly: the project folder at read_only -> a write under it is refused "
@@ -572,6 +585,17 @@ class VirtualCloudFoldersGate(cfc.CloudFolderConnectorGate):
             "folders: still no workspace Pod after three turns",
             not any(p.startswith("ws-thread-") for p in pods_after),
             json.dumps(pods_after),
+        )
+        names = [
+            n
+            for n in self.nextcloud(_NEXTCLOUD_SESSION_LS, folder_id).splitlines()
+            if n
+        ]
+        self.report.check(
+            "folders: the outbox folder holds only what the agent wrote through "
+            "cloud/outbox (no workspace mirror beside the remote)",
+            set(names) <= {report_name},
+            json.dumps(sorted(names)),
         )
         self.report.note(
             "latency (seconds from input to the turn's LLM request): "

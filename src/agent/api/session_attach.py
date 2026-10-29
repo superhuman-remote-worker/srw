@@ -65,6 +65,7 @@ from agent.api.session_workspace import (
     protected_workspace_identity,
     protected_workspace_marker,
     protected_mount_payload,
+    remote_cloud_mounts,
 )
 from shared.runtime.core.loader import (
     normalize_delegation_block,
@@ -261,6 +262,33 @@ def apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
                 os.environ.get("EMBEDDING_MODEL"),
                 os.environ.get("KB_EMBEDDING_MODEL"),
             )
+
+
+def apply_session_whisper_env(env_keys: Optional[Dict[str, Any]]) -> None:
+    """Replace the process speech-to-text transport with this attach's snapshot.
+
+    ``read_file`` transcribes audio with the ``WHISPER_*`` transport it reads
+    from ``os.environ`` (``agent.services.audio_helper``). Same scrub-on-claim
+    rule as the embedding profile: a pod serves one tenant after another, so
+    every ``WHISPER_*`` name is popped before this attach's block is applied.
+    """
+    from shared.runtime.core.transport_resolution import (
+        DISPATCH_ENV_KEY_NAMES,
+        exportable_env_keys,
+    )
+
+    for name in DISPATCH_ENV_KEY_NAMES:
+        if name.startswith("WHISPER_"):
+            os.environ.pop(name, None)
+    exportable, _dropped = exportable_env_keys(env_keys)
+    applied = sorted(name for name in exportable if name.startswith("WHISPER_"))
+    for name in applied:
+        os.environ[name] = exportable[name]
+    if applied:
+        logger.info(
+            "Speech-to-text override applied: model=%s",
+            os.environ.get("WHISPER_MODEL"),
+        )
 
 
 async def strict_cleanup_partial_attach_local_resources(
@@ -1676,6 +1704,7 @@ class SessionAttachCoordinator:
             else (config_override.get("env_keys") if config_override else None)
         )
         apply_session_embedding_env(_env_keys_src)
+        apply_session_whisper_env(_env_keys_src)
 
         knowledge_bindings = connector_registry().knowledge_bindings(
             connector_deliveries,
@@ -1929,6 +1958,13 @@ class SessionAttachCoordinator:
             if workspace_override
             else None
         )
+        if remote_cloud_mounts(workspace_override):
+            # A Virtual Session's cloud folders are served by its own backend
+            # at cloud/<name>, the outbox included: no mirror of the workspace
+            # root into the session folder beside them (the legacy shim would
+            # push the skills tree and README.md into sessions/<id>).
+            cloud_cfg = None
+            nc_folder = None
         cloud_degraded_hint = False
         if not suppress_disposable_cloud and (
             not cloud_mount_active
@@ -1976,6 +2012,12 @@ class SessionAttachCoordinator:
                     if not protected_cloud:
                         cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
                         nc_folder = nc_folder or ws_info.get("nc_session_folder")
+                        if remote_cloud_mounts(ws_info):
+                            # Served as cloud/<name> by the backend itself (the
+                            # cloud_remote form): the flat session-folder field
+                            # beside the descriptors is not a mirror to build.
+                            cloud_cfg = None
+                            nc_folder = None
                     cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
             except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
                 raise

@@ -7890,6 +7890,14 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
         _cloud_sync_retry_pending = False
         return
 
+    if _session_workspace.remote_cloud_mounts(ws_info):
+        # A Virtual Session's cloud folders, the outbox included, are served
+        # by its own backend at cloud/<name> (the cloud_remote form): there is
+        # no mirror of the workspace root to build beside them, and that
+        # verdict does not change mid-session.
+        _cloud_sync_retry_pending = False
+        return
+
     cloud_cfg = ws_info.get("cloud_sync")
     if not cloud_cfg and ws_info.get("nc_session_folder"):
         cloud_cfg = _legacy_nc_cloud_cfg(ws_info["nc_session_folder"])

@@ -32,7 +32,9 @@ from shared.cloud_sync_generations import (
     CloudSyncRequirement,
 )
 from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import workspace as workspace_composition_module
 from orchestrator.services import agent_cloud_mounts as agent_cloud_mounts_module
+from orchestrator.services import cloud_mount_status as cloud_mount_status_module
 from orchestrator.services import container_provisioner as container_provisioner_module
 from orchestrator.services import dispatch_credentials as dispatch_credentials_module
 from orchestrator.services import (
@@ -644,9 +646,14 @@ async def _internal_workspace_response_for_lite_thread(
     cloud_mount=None,
     cloud_sync=None,
     thread_reads=None,
+    remote_plan=None,
 ):
+    """``remote_plan`` switches the cloud driver to ``rclone_mount`` and makes
+    the Virtual planner answer with that plan (its record write is a no-op)."""
     import orchestrator.main as orch_main
     from orchestrator.services import thread_workspace_delivery
+
+    driver = "rclone_mount" if remote_plan is not None else "sync"
 
     def _with_live_runtime(row):
         normalized = dict(row)
@@ -722,8 +729,14 @@ async def _internal_workspace_response_for_lite_thread(
             return_value=cloud_sync,
         ),
         patch.object(
-            preparation_composition, "cloud_workspace_driver", return_value="sync"
+            preparation_composition, "cloud_workspace_driver", return_value=driver
         ),
+        patch.object(
+            workspace_composition_module,
+            "cloud_remote_planner",
+            return_value=AsyncMock(return_value=remote_plan),
+        ),
+        patch.object(cloud_mount_status_module, "record_remote_plan", AsyncMock()),
         patch.object(
             orch_main.app.state.resources,
             "main_cloud_router",
@@ -1500,3 +1513,77 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
     assert instances[0].workspace_sync is None
     assert instances[0].cloud_sync_workspace_generation == WORKSPACE_GENERATION
     build_sync.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stateless_virtual_remote_folders_withhold_the_legacy_session_folder():
+    """A Virtual Session served its cloud folders as remote descriptors gets
+    neither the structured mirror nor the legacy ``nc_session_folder``: its
+    outbox is cloud/outbox itself, and the agent's legacy shim would mirror
+    the workspace root (skills tree, README.md) into that same folder beside
+    it (dev check 2026-10-29). With nothing to serve, the session folder
+    mirror stays what it was."""
+    from orchestrator.services.cloud_remote_plan import CloudRemotePlan
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+
+    current_spec = {
+        "type": "s3",
+        "root": "current-bucket",
+        "config": {"endpoint": "https://current.example.test"},
+    }
+    thread = {
+        "id": THREAD_ID,
+        "user_id": None,
+        "project_id": None,
+        "execution_lane": "stateless",
+        "nc_session_folder": "Sessions/thread",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "virtual"}},
+            "_workspace_binding": {
+                "kind": "virtual",
+                "generation": WORKSPACE_GENERATION,
+                "backing_id": virtual_thread_backing_id(THREAD_ID, current_spec),
+            },
+        },
+    }
+    mirror = {"backend": "nextcloud", "webdav_url": "http://cloud"}
+    outbox = {
+        "name": "outbox",
+        "path": "cloud/outbox",
+        "mount_kind": "cloud_outbox",
+        "access": "read_write",
+        "mount_id": MOUNT_ID,
+        "store": {"type": "memory"},
+    }
+
+    with patch.object(
+        virtual_workspace_module,
+        "virtual_workspace_rclone_spec",
+        return_value=current_spec,
+    ):
+        served = await _internal_workspace_response_for_lite_thread(
+            thread,
+            cloud_sync=mirror,
+            remote_plan=CloudRemotePlan(
+                entries=(outbox,),
+                excluded=(),
+                fingerprint="f" * 64,
+                incarnation="c" * 32,
+            ),
+        )
+        bare = await _internal_workspace_response_for_lite_thread(
+            thread,
+            cloud_sync=mirror,
+            remote_plan=CloudRemotePlan(
+                entries=(), excluded=(), fingerprint="e" * 64, incarnation="d" * 32
+            ),
+        )
+
+    assert [m["name"] for m in served["cloud_remote"]["mounts"]] == ["outbox"]
+    assert served["cloud_sync"] is None
+    assert served["cloud_mount"] is None
+    assert served["nc_session_folder"] is None
+
+    assert bare["cloud_remote"] is None
+    assert bare["cloud_sync"] == mirror
+    assert bare["nc_session_folder"] == "Sessions/thread"
