@@ -34,12 +34,17 @@ rotations, so time of day does not line up with order. The server's bench
 sweeper shuffles a run's tasks, so the order is kept here: every step is its
 own single-task run in the chain's project, and `chain-tick` submits the next
 step when the previous run is done. Run `chain-tick` periodically (it is
-idempotent); a paused job holds its lane until it is resumed.
+idempotent); a paused job holds its lane until it is resumed. A job that cannot
+be resumed (e.g. held after a lost executor) is cancelled by hand, and
+`chain-restart` reruns its chain from step 1 in a fresh project, so nothing
+the broken job left in memory or the knowledge base reaches the rerun.
 
     python bench/ablation.py chain-submit --name xjob-01 --tasks-file F \
         --order L1,L2,L3 --arms off,kb-only,current --model M
     python bench/ablation.py chain-tick --name xjob-01
     python bench/ablation.py chain-status --name xjob-01
+    python bench/ablation.py chain-restart --name xjob-01 --arm current --chain 2 \
+        --reason "executor lost in a rollout"
 
 Metrics (per task x arm, medians across clean replicates): completion
 (deliverable gate), wall minutes, main-call count, median prompt tokens,
@@ -609,9 +614,10 @@ def _run_outcome(run_id: str) -> tuple[str | None, dict]:
 def _submit_step(state: dict, arm: str, chain_index: int, chain: dict) -> None:
     task_id = chain["order"][len(chain["steps"])]
     if not chain["project_id"]:
+        attempt = len(chain.get("abandoned") or [])
         chain["project_id"] = create_project(
             state["name"],
-            f"{arm}-c{chain_index + 1}",
+            f"{arm}-c{chain_index + 1}" + (f"r{attempt}" if attempt else ""),
             state["user_id"],
             f"Cross-job chain '{state['name']}', arm '{arm}', chain "
             f"{chain_index + 1}: {', '.join(chain['order'])}. Throwaway bench project.",
@@ -684,6 +690,35 @@ def cmd_chain_tick(args: argparse.Namespace) -> None:
     state = load_state(args.name)
     if chain_tick(state):
         print("all chains finished")
+
+
+def cmd_chain_restart(args: argparse.Namespace) -> None:
+    state = load_state(args.name)
+    lane = state["arms"].get(args.arm)
+    if lane is None or not 1 <= args.chain <= len(lane["chains"]):
+        raise SystemExit(f"no chain {args.chain} in arm {args.arm!r}")
+    chain = lane["chains"][args.chain - 1]
+    if chain["steps"] and not chain["steps"][-1].get("final_status"):
+        status, entry = _run_outcome(chain["steps"][-1]["run_id"])
+        if status not in {"done", "cancelled"}:
+            raise SystemExit(
+                f"step {len(chain['steps'])} run is still {status}; cancel its job first"
+            )
+        chain["steps"][-1]["final_status"] = entry.get("final_status") or status
+    chain.setdefault("abandoned", []).append(
+        {
+            "project_id": chain["project_id"],
+            "steps": chain["steps"],
+            "reason": args.reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    chain["project_id"] = None
+    chain["steps"] = []
+    save_state(args.name, state)
+    print(
+        f"{args.arm} chain {args.chain}: set aside, restarts from step 1 on the next tick"
+    )
 
 
 def cmd_chain_status(args: argparse.Namespace) -> None:
@@ -773,6 +808,15 @@ def main() -> None:
         p = sub.add_parser(name, help=help_)
         p.add_argument("--name", required=True)
         p.set_defaults(fn=fn)
+
+    cr = sub.add_parser(
+        "chain-restart", help="set a chain's steps aside and rerun it in a new project"
+    )
+    cr.add_argument("--name", required=True)
+    cr.add_argument("--arm", required=True)
+    cr.add_argument("--chain", type=int, required=True, help="1-based chain number")
+    cr.add_argument("--reason", required=True)
+    cr.set_defaults(fn=cmd_chain_restart)
 
     r = sub.add_parser("report", help="joined per-task x arm report")
     r.add_argument("--name", required=True)
