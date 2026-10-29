@@ -132,5 +132,64 @@
     "registry tags srw-harness-claude-code:t20 and :t20-uid999-workaround; podman images of the same",
     "the 2026-10-28 CoreDNS forward, dev-user-1's custom_harness_images grant and its claude-code personal secret (untouched)"
   ],
-  "notCovered": "the success path and the cancel on the final-tree image (D1) and on a real Anthropic-compatible model (credential); the dev run (owner's go)"
+  "notCovered": "the success path and the cancel on the final-tree image (D1) and on a real Anthropic-compatible model (credential); the dev run (owner's go)",
+  "re-check after fixes c942108c7..25c2754f5": {
+    "date": "2026-10-29",
+    "code": "develop 25c2754f5 (c942108c7 D1: image account uid/gid 999 and USER/LOGNAME kept through the scrub; a70c35955 D2: no temperature/top_p/top_k for a non-Claude model on the Anthropic shape; 25c2754f5 D3: goal_achieved true only for full autonomy, workspace-relative deliverables); HEAD did not move during the re-check",
+    "outcome": "PASS for every re-run check on the final image with no workaround image (6, 7, 8, 9, 12 as far as the D2 proof goes, 13). New finding D5 in SRW's own agent loop (not part of the fixes).",
+    "stack": {
+      "helmRevision": 19484,
+      "deploy": "one tilt ci --timeout 40m at 00:24-00:27Z (log task-20-tilt-ci-r1.log in the plan workspace), HEAD 25c2754f5",
+      "images": {
+        "orchestrator": "srw-registry:5000/srw-orchestrator:tilt-7c78299f2c6a10b8",
+        "agent": "srw-registry:5000/srw-agent:tilt-b7b3e4d31ac64ff9",
+        "cockpit": "srw-registry:5000/srw-cockpit:tilt-cbeec54e05a8653f",
+        "harness": "srw-registry:5000/srw-harness-claude-code@sha256:82bd27aa20d5c72d2b5ff79a9c01a80aab218f1ec6cdc24c83459c519389514c"
+      },
+      "harnessImageBuilt": "podman build of docker/Dockerfile.harness-claude-code at 25c2754f5 (id: uid=999(harness) gid=999(harness)), pushed with --digestfile; registry Docker-Content-Digest matches",
+      "values": "the single approved entry in the marked manifestHosting block replaced: 0ef0a5d0... -> 82bd27aa... (no second entry); MANIFEST_APPROVED_IMAGES in the orchestrator showed only the new digest",
+      "preparation": "deleted the idle default pod srw-agent-j-d6031b56 (previous build's agent image tilt-5d8a...) before the runs so the default jobs could not land on a pre-fix agent; local tags are not sha- tags, so SRW's stale-SHA drain does not apply on k3d",
+      "model": "scripted Anthropic Messages fixture (Pod/Service t20-fake-anthropic on the new harness image's python). It answers 400 with Meta's message ('`temperature` is removed in API version 2026-10-21. Remove `temperature` from the request.') to any request carrying temperature, top_p or top_k and logs each request's sampling keys (no headers or keys). Temporary endpoint rows 'T20r scripted Anthropic fixture (temporary)' and 'T20r unreachable (temporary)' (http://127.0.0.1:9/v1), model rows t20r-scripted and t20r-unreachable (non-Claude names, so family_of is not claude) flipped to anthropic-messages by PATCH /api/admin/providers/models/{id}, and gemma-4-moe on the existing Local endpoint for check 13",
+      "experts": "dev-user-1: cc-harness-t20r (new digest, t20r-scripted), cc-harness-t20r-cancel (new digest, t20r-unreachable), srw-default-t20r (no image, t20r-scripted); scholar disabled"
+    },
+    "checks": {
+      "6 jobRunsAndCompletesOnFinalImage": {
+        "result": "PASS",
+        "job": "4d68f156-4e1d-44f9-bef4-e1e85fa1151c",
+        "observed": "Provisioned agent srw-agent-j-f5b3547e (harness image = new digest) 00:28:34.49Z; registered as agent 24a475c5 00:28:36.04 (agents row: status working, image = new digest, current_job_id set); GET /ready 200; attestable after 6 retries; POST /job/start 202 00:28:37.85; 'connecting to the workspace' then 'starting Claude Code (model t20r-scripted)' 00:28:38.95 (D1 gone); fixture: 2 streaming POST /v1/messages?beta=true, 4 tools, sampling_keys [] both; 'session ended: success' 00:28:39.91; workspace hello.txt = 'hello from the swappable harness'; POST /api/jobs/{id}/complete 200 00:28:39.998; 'Freeze notification recorded (job_complete -> review_queue)'; harness exit 0 00:28:40.02; DELETE /api/agents/24a475c5 200"
+      },
+      "7 summaryInReview": {
+        "result": "PASS",
+        "observed": "jobs.status pending_review (D3 fixed); GET /api/jobs/{id}/frozen: summary 'Created hello.txt in the workspace root containing ...', deliverables ['hello.txt'] (workspace-relative), confidence 1.0; Cockpit /jobs/review signed in as dev-user-1 lists the job under PENDING REVIEW and shows JOB, SUMMARY, CONFIDENCE 100%, DELIVERABLES hello.txt, Approve / Continue with Feedback (screenshot .playwright-mcp/t20r-review-custom-job.png, gitignored)"
+      },
+      "8 podGoneAfterReport": {
+        "result": "PASS",
+        "observed": "srw-agent-j-f5b3547e exited 0 at 00:28:40, 'Exact claimant pod deletion requested' 00:29:34.37, NotFound by 00:30:00; the cancel run's srw-agent-j-bc65ef94 exited 00:29:54, deletion requested 00:30:34.39"
+      },
+      "9 cancelMidSession": {
+        "result": "PASS",
+        "job": "3dc6a69d-da7d-4a2b-a128-f0d6719b4e48",
+        "observed": "final image, model t20r-unreachable (the CLI retries its API call; transcript shows api_retry attempts 1-5); pod srw-agent-j-bc65ef94, agent f40441e6 (status working, image = new digest); 'starting Claude Code' 00:29:39.28Z; PUT /api/jobs/{id}/cancel as dev-user-1 00:29:54.506Z; orchestrator POST http://10.42.0.101:8001/job/cancel 200 00:29:54.749, 'Agent confirmed cancel'; transcript: harness stop, interrupt_sent, '[Request interrupted by user]', ResultMessage error_during_execution, session_end interrupted true; harness 'session stopped', 'stopped: no completion report', exit 0 00:29:54.78; DELETE /api/agents/f40441e6 200; no POST /api/jobs/{id}/complete; jobs.status cancelled, no error, no freeze_data"
+      },
+      "12 defaultImageOnAnthropicMessagesRow": {
+        "result": "PASS for D2 (the model is reached without the 400); the job cannot finish on the scripted reply",
+        "job": "7a320f31-c2bb-448d-912d-49fb1dac03c6",
+        "observed": "Expert srw-default-t20r (no image) on t20r-scripted; default pod srw-agent-j-5d3bebe7 (agent image tilt-b7b3...); agent 'HTTP Request: POST http://t20-fake-anthropic.srw.svc.cluster.local:8080/v1/messages' (the Anthropic route; the fixture serves no other model route); fixture log: 5080 requests from SRW's agent 00:30:51-00:33:13Z, each non-streaming, 55 tools, sampling_keys [] on every one, zero 400 answers (the same row and fixture answer 400 when temperature is present). How far it got: the fixture answers plain text 'ok' with no tool call, so the agent never left its first strategic todo (Todo state total=4, completed=0) and the job never reached job_complete; it was cancelled at 00:33:13 (job cancelled 00:33:38) and the requests stopped at once"
+      },
+      "13 ordinaryDefaultJob": {
+        "result": "PASS",
+        "job": "3cccdce9-b54a-4183-99ce-c9f4e6daf8d8",
+        "observed": "REST POST /api/jobs as dev-user-1, default Expert, config_override llm.model gemma-4-moe (temporary row on the Local endpoint, openai-chat); default pod with SRW's command; POST /complete 02:44:41Z; pending_review; frozen summary 'Created the file ordinary-recheck.txt containing the required text in the workspace root.', deliverables ['ordinary-recheck.txt']"
+      }
+    },
+    "newFindings": {
+      "D5": "SRW's own agent does not stop on its no-tool-call limit. With a model that answers text without tool calls (job 7a320f31), agent.graph logged 'No-tool-call streak N/3 (model=t20r-scripted, content_sample='ok')' (graph.py:2010) and 'No-tool-call streak exceeded (streak N, model=t20r-scripted): failing job' (graph.py:2040) on every iteration up to streak 4804 / [Iteration 4804], yet the job stayed processing and the agent kept calling the model at about 36 requests per second (5080 requests in 142 s) until the operator cancelled it. Not related to the harness swap; on a paid model this loop spends money quickly.",
+      "cancel503": "PUT /api/jobs/7a320f31.../cancel answered 503 'Workspace authority retirement is incomplete' at 00:33:13 while the job did become cancelled (00:33:38; the pod got POST /job/cancel 200 at 00:33:30), the same behaviour as job 16e8435a in the first run"
+    },
+    "cleanup": {
+      "removed": "fixture Pod/Service/ConfigMap t20-fake-anthropic; model rows t20r-scripted, t20r-unreachable, gemma-4-moe; endpoints 'T20r scripted Anthropic fixture (temporary)', 'T20r unreachable (temporary)'; Job resources t20r-c12-default and t20r-c9-cancel and Experts srw-default-t20r and cc-harness-t20r-cancel (DELETE /api/resources 200; the job rows remain)",
+      "kept": "deployment/values-local.yaml approves only the new digest 82bd27aa... (file sha256 117ee112...); the Meta row is unchanged (params_json null)",
+      "remaining": "Job resource t20r-c6-custom and Expert cc-harness-t20r (409 'Resource is referenced by unfinished work': job 4d68f156 is pending_review); REST job 3cccdce9 pending_review; workspace Pods workspace-4d68f156-4e1 and workspace-3cccdce9-b54 (plus workspace-4a5dfc50-841 and workspace-ec824a47-c79 from the first run); all first-run Experts and Jobs listed above; registry/podman tag srw-harness-claude-code:t20r"
+    }
+  }
 }
