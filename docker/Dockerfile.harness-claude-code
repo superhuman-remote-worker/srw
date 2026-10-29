@@ -8,11 +8,13 @@
 # See harnesses/claude-code/README.md.
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
-# uid 10001 is a real account and the environment names it: asyncssh asks
-# getpass.getuser() for the local user before every connection and Node tools
-# ask os.userInfo(); an unknown uid with no USER variable fails both.
-RUN groupadd --gid 10001 harness \
-    && useradd --uid 10001 --gid 10001 --home-dir /tmp --no-create-home --shell /usr/sbin/nologin harness
+# SRW's agent pod runs every image as uid/gid 999 on a read-only root, whatever
+# the image's USER says, so the account is built for 999. It is a real account
+# and the environment names it: asyncssh asks getpass.getuser() for the local
+# user before every connection and Node tools ask os.userInfo(); an unknown uid
+# with no USER variable fails both.
+RUN groupadd --gid 999 harness \
+    && useradd --uid 999 --gid 999 --home-dir /tmp --no-create-home --shell /usr/sbin/nologin harness
 ENV HOME=/tmp USER=harness LOGNAME=harness
 COPY harnesses/claude-code/requirements.txt /tmp/harness/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/harness/requirements.txt
@@ -22,8 +24,8 @@ COPY harnesses/claude-code/pyproject.toml /tmp/harness/pyproject.toml
 COPY harnesses/claude-code/srw_claude_code_harness /tmp/harness/srw_claude_code_harness
 RUN pip install --no-cache-dir --no-deps /tmp/harness && rm -rf /tmp/harness
 # The CLI's local cwd mirrors the workspace root path the model sees.
-RUN mkdir -p /home/agent-host/workspace && chown -R 10001:10001 /home/agent-host
-USER 10001:10001
+RUN mkdir -p /home/agent-host/workspace && chown -R 999:999 /home/agent-host
+USER 999:999
 # Isolated mode (-I): PYTHON* environment variables are ignored and the working
 # directory never joins sys.path, so a Job's env and delivered files cannot make
 # Python load code before the harness. -u keeps output unbuffered, which -I

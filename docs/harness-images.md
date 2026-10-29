@@ -105,6 +105,15 @@ finds this in its environment:
 | `POD_UID` | The pod's UID; send it back when you register and when you report |
 | `BUILD_SHA` | The build revision to report at registration, when the ConfigMap sets one |
 
+The pod's container runs as **uid 999 and gid 999**, which overrides the
+image's `USER`. It sets `runAsNonRoot`, a read-only root filesystem and drops
+all capabilities. The writable mounts are `/tmp`, `/run`, `/home/srw` and
+`/workspace`; everything else in the image is read-only. Give the image an
+account for uid 999 if its tools look the user up by uid (asyncssh calls
+`getpass.getuser()` and Node's `os.userInfo()` fails on an unknown uid), and
+set `USER` and `LOGNAME` to its name. Test the image under
+`--user 999:999 --read-only`.
+
 The ConfigMap and the Secret are injected whole (`envFrom`), so the pod also
 holds the rest of SRW's agent environment. Read only what you need. The
 workspace's SSH private key is a file in the pod; the start request names its

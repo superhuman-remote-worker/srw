@@ -466,6 +466,20 @@ def test_scrub_process_environment_keeps_only_the_named_variables(monkeypatch):
     assert "PATH" not in removed
 
 
+def test_scrub_process_environment_can_keep_the_local_user_names(monkeypatch):
+    # asyncssh asks getpass.getuser(), which reads USER/LOGNAME before the
+    # passwd database; the image sets them, so the entrypoint keeps them.
+    for name, value in list(os.environ.items()):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("USER", "harness")
+    monkeypatch.setenv("LOGNAME", "harness")
+    monkeypatch.setenv("SECRET_DB", "x")
+    scrub_process_environment(keep=["PATH", "USER", "LOGNAME"])
+    assert os.environ.get("USER") == "harness"
+    assert os.environ.get("LOGNAME") == "harness"
+    assert "SECRET_DB" not in os.environ
+
+
 def test_scrub_process_environment_refuses_a_bare_string():
     with pytest.raises(TypeError):
         scrub_process_environment(keep="PATH")

@@ -15,8 +15,8 @@ cold pod for the Job. An operator approves the image by digest in
 [`claude-code-harness-expert.yaml`](../../examples/manifests/claude-code-harness-expert.yaml)
 and [`claude-code-harness-job.yaml`](../../examples/manifests/claude-code-harness-job.yaml).
 
-The image is Python 3.12 (slim Debian, glibc) running as `10001:10001` with
-`HOME=/tmp`. It has no Node and no git. `/home/agent-host/workspace` exists
+The image is Python 3.12 (slim Debian, glibc) running as `999:999` (the identity SRW's agent pod gives every image, with a
+read-only root; the image has an account for it) with `HOME=/tmp`. It has no Node and no git. `/home/agent-host/workspace` exists
 inside the image because the CLI's local working directory mirrors the
 workspace root path the model sees.
 

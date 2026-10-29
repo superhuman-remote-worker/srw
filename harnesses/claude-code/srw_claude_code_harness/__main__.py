@@ -467,7 +467,9 @@ def main(argv: list[str] | None = None) -> int:
     """Run the harness from the pod environment; returns the exit code.
 
     Takes no arguments (``argv`` is accepted and ignored). The environment is
-    read once and then scrubbed down to ``PATH``: the SDK starts the CLI with
+    read once and then scrubbed down to ``PATH`` and the local user names the
+    image sets (``USER``, ``LOGNAME``; asyncssh needs them when the pod's uid
+    has no passwd entry, and they are not secrets): the SDK starts the CLI with
     ``os.environ`` overlaid by the options' env, and the pod's Secret must not
     reach it.
     """
@@ -479,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         warn(str(exc))
         return EXIT_CONFIG_ERROR
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    scrub_process_environment(keep=["PATH"])
+    scrub_process_environment(keep=["PATH", "USER", "LOGNAME"])
     run_dir = Path(tempfile.mkdtemp(prefix="srw-run-"))
     try:
         return asyncio.run(_main(settings, run_dir))

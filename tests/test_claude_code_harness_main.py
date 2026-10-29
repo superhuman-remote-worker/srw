@@ -608,7 +608,7 @@ def test_main_reads_the_pod_environment_scrubs_it_and_stops_on_sigterm(
     finally:
         signal.signal(signal.SIGTERM, previous)
     (scrub, keep), (name, settings, given_run_dir) = calls
-    assert (scrub, keep, name) == ("scrub", ["PATH"], "serve")
+    assert (scrub, keep, name) == ("scrub", ["PATH", "USER", "LOGNAME"], "serve")
     assert given_run_dir == run_dir
     assert settings.orchestrator_url == "http://orch:8000"
     assert settings.internal_key == INTERNAL_KEY

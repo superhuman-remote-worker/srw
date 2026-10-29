@@ -18,7 +18,7 @@ BASE = (
 def test_dockerfile_is_pinned_non_root_isolated_and_has_no_cmd():
     text = (ROOT / "docker/Dockerfile.harness-claude-code").read_text()
     assert BASE in text
-    assert "USER 10001:10001" in text
+    assert "USER 999:999" in text
     # Isolated mode: a Job's env (PYTHONPATH, PYTHONSTARTUP, PYTHONHOME) can
     # never make the interpreter load code before the harness does (C1), and
     # the package is installed where the interpreter looks on its own.
@@ -28,15 +28,15 @@ def test_dockerfile_is_pinned_non_root_isolated_and_has_no_cmd():
     assert "pip install --no-cache-dir --no-deps" in text
     assert "\nCMD" not in text
     assert "harnesses/claude-code/requirements.txt" in text
-    # uid 10001 is a real account and the environment names it: asyncssh asks
+    # uid 999 (the pod's runAsUser) is a real account and the environment names it: asyncssh asks
     # getpass.getuser() for the local user before every connection, and Node
     # tools ask os.userInfo(); an unknown uid with no USER fails both.
-    assert "useradd --uid 10001" in text
+    assert "useradd --uid 999" in text
     assert "USER=harness" in text and "LOGNAME=harness" in text
     # The CLI's local cwd mirrors the workspace root the model sees (R16).
     assert "mkdir -p /home/agent-host/workspace" in text
-    assert text.index("chown -R 10001:10001 /home/agent-host") < text.index(
-        "\nUSER 10001:10001"
+    assert text.index("chown -R 999:999 /home/agent-host") < text.index(
+        "\nUSER 999:999"
     )
 
 
@@ -154,3 +154,6 @@ def test_ci_smoke_tests_the_image_before_it_is_published():
         # The local user resolves with the USER variables cleared (passwd entry)
         # and under the image's own environment.
         assert "-e USER= -e LOGNAME=" in command and "getpass.getuser()" in command
+        # The pod runs every agent image as 999:999 on a read-only root: the
+        # smoke test runs under that identity too.
+        assert "--user 999:999" in command and "--read-only" in command

@@ -1807,8 +1807,9 @@ jobs:
           assert versions["sdk"] and versions["cli"], versions
           print("harness smoke ok", versions)
           '
-          # The local user resolves with the USER variables cleared (passwd entry for uid 10001).
-          docker run --rm --network none --entrypoint python3 -e USER= -e LOGNAME= srw-harness-claude-code:smoke -I -c 'import getpass, os; print("local user", getpass.getuser(), "uid", os.getuid())'
+          # The local user resolves with the USER variables cleared (passwd entry for uid 999),
+          # under the identity SRW's agent pod gives every image: 999:999, read-only root.
+          docker run --rm --network none --user 999:999 --read-only --tmpfs /tmp --entrypoint python3 -e USER= -e LOGNAME= srw-harness-claude-code:smoke -I -c 'import getpass, os; print("local user", getpass.getuser(), "uid", os.getuid())'
           # The real start command (python3 -I -u -m srw_claude_code_harness):
           # with no ORCHESTRATOR_URL it must reach the harness and exit 2.
           rc=0
