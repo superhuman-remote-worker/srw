@@ -44,9 +44,16 @@ _CONFIG_KEYS = {
     "transfer_target",
     "greeting_delay_ms",
     "greeting_retry_ms",
+    "idle_nudge_ms",
+    "idle_nudge_max",
 }
 #: Bounds the pod's own config parser enforces (drivers/gpt-live-sip/config.go).
-_GREETING_BOUNDS = {"greeting_delay_ms": 10000, "greeting_retry_ms": 30000}
+_GREETING_BOUNDS = {
+    "greeting_delay_ms": 10000,
+    "greeting_retry_ms": 30000,
+    "idle_nudge_ms": 30000,
+}
+_IDLE_NUDGE_MAX = 5
 
 
 def _webhook_secret_ok(secret: Any) -> bool:
@@ -113,6 +120,10 @@ class GptLiveSipDriver(DatasourceDriver):
             for key, high in _GREETING_BOUNDS.items():
                 if key in config and not _int_in(config[key], 0, high):
                     raise HTTPException(400, f"{key} is 0 to {high} milliseconds")
+            if "idle_nudge_max" in config and not _int_in(
+                config["idle_nudge_max"], 0, _IDLE_NUDGE_MAX
+            ):
+                raise HTTPException(400, f"idle_nudge_max is 0 to {_IDLE_NUDGE_MAX}")
             target = config.get("transfer_target")
             if target is not None and (
                 not isinstance(target, str) or not _TRANSFER.fullmatch(target)

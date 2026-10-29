@@ -28,6 +28,14 @@ const (
 	defaultGreetingStartWait = 4 * time.Second
 )
 
+// The quiet-line nudge (README, implementation choices): after this much
+// quiet with no request open, the handoff's idle instruction goes out, at most
+// defaultIdleNudgeMax times until the caller speaks again.
+const (
+	defaultIdleNudge    = 8 * time.Second
+	defaultIdleNudgeMax = 2
+)
+
 type limits struct {
 	MaxDuration int `json:"max_duration_s"`
 	Fallback    int `json:"no_job_fallback_s"`
@@ -41,6 +49,8 @@ type connectorConfig struct {
 	APIPort        int    `json:"api_port"`
 	GreetingDelay  *int   `json:"greeting_delay_ms"`
 	GreetingRetry  *int   `json:"greeting_retry_ms"`
+	IdleNudge      *int   `json:"idle_nudge_ms"`
+	IdleNudgeMax   *int   `json:"idle_nudge_max"`
 }
 type requestFile struct {
 	ProtocolVersion string `json:"protocol_version"`
@@ -67,6 +77,9 @@ type config struct {
 	// Zero values greet as soon as a sideband is attached, with no re-prompt.
 	// parseConfig always sets the defaults above.
 	greetingDelay, greetingRetry, greetingStartWait time.Duration
+	// Zero turns the quiet-line nudge off (the test default).
+	idleNudge    time.Duration
+	idleNudgeMax int
 }
 
 func loadConfig(getenv func(string) string) (*config, error) {
@@ -158,7 +171,20 @@ func parseConfig(r requestFile, identity string) (*config, error) {
 		}
 		retry = time.Duration(*v) * time.Millisecond
 	}
-	return &config{connectorID: r.Connector.ID, exchangeURL: strings.TrimRight(r.Exchange.URL, "/"), identity: identity, controlToken: r.Control.Token, port: strconv.Itoa(r.Service.Port), transferTarget: r.Connector.Config.TransferTarget, limits: l, greetingDelay: delay, greetingRetry: retry, greetingStartWait: defaultGreetingStartWait}, nil
+	idle, idleMax := defaultIdleNudge, defaultIdleNudgeMax
+	if v := r.Connector.Config.IdleNudge; v != nil {
+		if *v < 0 || *v > 30000 {
+			return nil, errors.New("idle_nudge_ms must be 0..30000")
+		}
+		idle = time.Duration(*v) * time.Millisecond
+	}
+	if v := r.Connector.Config.IdleNudgeMax; v != nil {
+		if *v < 0 || *v > 5 {
+			return nil, errors.New("idle_nudge_max must be 0..5")
+		}
+		idleMax = *v
+	}
+	return &config{connectorID: r.Connector.ID, exchangeURL: strings.TrimRight(r.Exchange.URL, "/"), identity: identity, controlToken: r.Control.Token, port: strconv.Itoa(r.Service.Port), transferTarget: r.Connector.Config.TransferTarget, limits: l, greetingDelay: delay, greetingRetry: retry, greetingStartWait: defaultGreetingStartWait, idleNudge: idle, idleNudgeMax: idleMax}, nil
 }
 func (l limits) valid() bool {
 	return l.MaxDuration >= 60 && l.MaxDuration <= 14400 && l.Fallback >= 1 && l.Fallback <= 120

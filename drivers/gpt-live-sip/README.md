@@ -51,6 +51,18 @@ ordinary TCP and verified TLS. Clipping fixtures were generated directly from
   events (without call text): `greeting_sent` (`after_accept_ms`, `started`),
   `greeting_retry_sent`, `greeting_retry_skipped` (`assistant_spoke` or
   `sideband_changed`), and `greeting_skipped` (`already_sent`).
+- The quiet-line nudge: once the voice has spoken, if nothing happens on the
+  line for `idle_nudge_ms` (default 8000; 0 turns it off) while no delegation
+  waits for its answer, the driver sends the handoff's `idle_instruction` as
+  an instructions append (`srw_idle_{session}_{n}`). GPT-Live may say that it
+  is checking without delegating, and the line then stays silent. "Something
+  happens" means a transcript delta of either side (GPT-Live streams both with
+  the audio), a delegation, or an append. A commentary or thinking append for a
+  delegation settles it, the no-job fallback included; an instructions append
+  does not. At most `idle_nudge_max` nudges (default 2, 0..5) go out until the
+  caller speaks again. Both are optional `connector.config` keys; an empty
+  `idle_instruction` (an older orchestrator) sends nothing. Log event:
+  `idle_nudge_sent` (`nudge`, the count since the caller last spoke).
 - The 8 MiB WebSocket limit and 1 MiB exchange limit conflict for oversized
   individual journal rows. Such a row becomes a `kind: error` row with code
   `journal_event_too_large`, original kind, serialized byte size, and SHA-256

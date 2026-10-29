@@ -33,9 +33,11 @@ from orchestrator.services.live.instructions import (
     LiveVoice,
     LiveVoiceError,
     catalog_voice,
+    idle_instruction,
     live_voice_of,
     with_call_time,
     with_default_voice,
+    with_engine_rules,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError
 from orchestrator.services.live.store import LiveSessionStore
@@ -253,19 +255,24 @@ def handoff_body(
     admission: LiveAdmission, job_id: str, *, now: datetime | None = None
 ) -> dict[str, Any]:
     """What the line's pod accepts the session with; the instructions end
-    with the call's date and time (``now``, the handoff by default)."""
+    with the engine's delegation rules and the call's date and time (``now``,
+    the handoff by default)."""
     config = admission.connector.get("config") or {}
     voice = admission.voice
+    model = str(config.get("model") or "")
     return {
         "session_id": str(admission.session["id"]),
         "provider_session_id": admission.session["provider_session_id"],
         "job_id": str(job_id),
-        "model": str(config.get("model") or ""),
+        "model": model,
         "accept": {
-            "instructions": with_call_time(voice.instructions, now),
+            "instructions": with_call_time(
+                with_engine_rules(voice.instructions, model), now
+            ),
             "voice": voice.voice,
         },
         "greeting_instruction": voice.greeting_instruction,
+        "idle_instruction": idle_instruction(model),
         "texts": {"fallback": voice.fallback},
         "limits": {
             "max_duration_s": int(config.get("max_duration_s") or 900),

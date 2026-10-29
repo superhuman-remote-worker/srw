@@ -1504,6 +1504,22 @@ GPT_LIVE_SIP_SPEC = DriverSpec(
                 "maximum": 30000,
                 "default": 2500,
             },
+            # After this much quiet (nobody speaking, no request open) the pod
+            # prompts the voice to start a check it announced or to ask
+            # whether the caller is still there; at most idle_nudge_max times
+            # until the caller speaks again (0: never).
+            "idle_nudge_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 30000,
+                "default": 8000,
+            },
+            "idle_nudge_max": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5,
+                "default": 2,
+            },
             # Server-derived from the model's endpoint: the pod's egress.
             "api_host": _MIRROR,
             "api_port": {"type": "integer", "readOnly": True},

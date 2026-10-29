@@ -182,11 +182,18 @@ class TestValidateConfig:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "key, high", [("greeting_delay_ms", 10000), ("greeting_retry_ms", 30000)]
+        "key, high",
+        [
+            ("greeting_delay_ms", 10000),
+            ("greeting_retry_ms", 30000),
+            ("idle_nudge_ms", 30000),
+            ("idle_nudge_max", 5),
+        ],
     )
     async def test_the_greeting_timing_the_pod_reads_is_offered(self, key, high):
-        """drivers/gpt-live-sip reads both (config.go); an engine that speaks
-        an exact greeting at once (SRW's voice gateway) takes 0."""
+        """drivers/gpt-live-sip reads these (config.go); an engine that speaks
+        an exact greeting at once (SRW's voice gateway) takes 0 for the
+        greeting, and 0 turns the quiet-line nudge off."""
         for value in (0, high):
             normalized = await _validate({"model": "gpt-live-1", key: value})
             assert normalized.config[key] == value

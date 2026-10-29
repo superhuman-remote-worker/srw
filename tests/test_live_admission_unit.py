@@ -46,6 +46,9 @@ from orchestrator.services.live.instructions import (
     CALL_TIME_CHARS,
     DEFAULT_FALLBACK,
     DEFAULT_VOICE,
+    GPT_LIVE_IDLE_INSTRUCTION,
+    GPT_LIVE_RULES,
+    IDLE_INSTRUCTION,
     LIVE_VOICE_RULES,
     MAX_GREETING_CHARS,
     MAX_INSTRUCTION_CHARS,
@@ -56,11 +59,14 @@ from orchestrator.services.live.instructions import (
     catalog_voice,
     find_live_entry,
     greeting_instruction,
+    idle_instruction,
+    is_gpt_live,
     live_timezone,
     live_voice_of,
     session_instructions,
     with_call_time,
     with_default_voice,
+    with_engine_rules,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError, pod_endpoint
 from shared.runtime.live.contract import MAX_APPEND_CHARS, SessionStatus
@@ -122,10 +128,12 @@ class TestSessionInstructions:
             logging.WARNING, logger="orchestrator.services.live.instructions"
         ):
             text = session_instructions(persona, "F" * MAX_INSTRUCTION_CHARS, entry="v")
-        # Room stays for the date section the handoff adds.
-        assert len(text) == MAX_INSTRUCTION_CHARS - CALL_TIME_CHARS
+        # Room stays for the engine's rules and the date the handoff adds.
+        reserve = len("\n\n") + len(GPT_LIVE_RULES) + CALL_TIME_CHARS
+        assert len(text) == MAX_INSTRUCTION_CHARS - reserve
         assert text.endswith(LIVE_VOICE_RULES)
-        assert len(with_call_time(text)) <= MAX_INSTRUCTION_CHARS
+        full = with_call_time(with_engine_rules(text, "gpt-live-1"))
+        assert len(full) <= MAX_INSTRUCTION_CHARS
         assert any("Truncating the facts" in r.getMessage() for r in caplog.records)
 
     def test_facts_within_the_budget_are_kept_whole(self, caplog):
@@ -137,6 +145,46 @@ class TestSessionInstructions:
     def test_a_persona_over_the_budget_is_refused(self):
         with pytest.raises(LiveVoiceError, match="instruction budget"):
             session_instructions("P" * MAX_INSTRUCTION_CHARS, "")
+
+
+class TestEngineRules:
+    """GPT-Live delegates only through ``<|SpawnThinking|>``; the gateway's
+    LLM would read the token as text (receptionist_expert T9/T10)."""
+
+    @pytest.mark.parametrize(
+        "model, gpt_live",
+        [
+            ("gpt-live-1", True),
+            (" GPT-Live-2 ", True),
+            ("cascade-gpu-rocm", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_which_lines_are_gpt_live(self, model, gpt_live):
+        assert is_gpt_live(model) is gpt_live
+
+    def test_a_gpt_live_line_gets_the_delegation_rules_after_srw_s(self):
+        text = with_engine_rules(f"P\n\n{LIVE_VOICE_RULES}", "gpt-live-1")
+        assert text.endswith(GPT_LIVE_RULES)
+        assert text.index("## Rules") < text.index("## Delegating")
+        assert "<|SpawnThinking|>" in GPT_LIVE_RULES
+
+    def test_another_engine_gets_none(self):
+        assert with_engine_rules("P", "cascade-gpu-rocm") == "P"
+        assert "SpawnThinking" not in IDLE_INSTRUCTION
+
+    def test_the_idle_instruction_per_engine(self):
+        assert idle_instruction("gpt-live-1") == GPT_LIVE_IDLE_INSTRUCTION
+        assert idle_instruction("cascade-gpu-rocm") == IDLE_INSTRUCTION
+        assert "<|SpawnThinking|>" in GPT_LIVE_IDLE_INSTRUCTION
+
+    def test_the_idle_instructions_are_steering_not_exact_words(self):
+        # An append with "exactly" and quotes is spoken verbatim by the
+        # gateway (prompt.exact_words); the pod clips appends.
+        for text in (IDLE_INSTRUCTION, GPT_LIVE_IDLE_INSTRUCTION):
+            assert "exactly" not in text.lower()
+            assert len(text) <= MAX_APPEND_CHARS
 
 
 #: A Thursday afternoon in Berlin (CEST, UTC+2), the week before the clocks
@@ -877,10 +925,13 @@ class TestHandoffBody:
             "job_id": JOB,
             "model": "gpt-live-1",
             "accept": {
-                "instructions": with_call_time("INSTRUCTIONS", CALL_START),
+                "instructions": with_call_time(
+                    with_engine_rules("INSTRUCTIONS", "gpt-live-1"), CALL_START
+                ),
                 "voice": "cedar",
             },
             "greeting_instruction": "GREET",
+            "idle_instruction": GPT_LIVE_IDLE_INSTRUCTION,
             "texts": {"fallback": "FALLBACK"},
             "limits": {"max_duration_s": 900, "no_job_fallback_s": 8},
             "transfer_target": None,
@@ -900,13 +951,24 @@ class TestHandoffBody:
         body = handoff_body(_admission_for(connector), JOB)
         assert body["model"] == ""
         assert body["limits"] == {"max_duration_s": 900, "no_job_fallback_s": 8}
+        assert body["idle_instruction"] == IDLE_INSTRUCTION
+        assert "SpawnThinking" not in body["accept"]["instructions"]
 
     def test_the_instructions_end_with_the_handoff_s_date(self):
         # The voice's facts and rules stay first: the date changes per call.
         body = handoff_body(_admission_for(), JOB)
         instructions = body["accept"]["instructions"]
-        assert instructions.startswith("INSTRUCTIONS\n\n## Date and time\n")
+        assert instructions.startswith(
+            f"INSTRUCTIONS\n\n{GPT_LIVE_RULES}\n\n## Date and time\n"
+        )
         assert "The next two weeks: " in instructions
+
+    def test_a_gateway_line_gets_no_gpt_live_rules(self):
+        connector = _connector(model="cascade-gpu-rocm")
+        body = handoff_body(_admission_for(connector), JOB)
+        instructions = body["accept"]["instructions"]
+        assert instructions.startswith("INSTRUCTIONS\n\n## Date and time\n")
+        assert body["idle_instruction"] == IDLE_INSTRUCTION
 
 
 def _sessions(transition_result=(True, {"status": "active"})) -> SimpleNamespace:
