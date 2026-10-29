@@ -5,6 +5,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
@@ -45,8 +46,19 @@ async def database(pg_dsn, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_jobs_and_agents_carry_the_image_columns(database):
-    job = await database.create_job(description="x", harness_image=IMAGE)
-    assert (await database.get_job(job["id"]))["harness_image"] == IMAGE
+    # A harness image no selected Expert names is refused by the snapshot
+    # funnel; admission's path through create_job is covered by
+    # test_manifest_native_full_schema. Insert the row as found instead.
+    with pytest.raises(HTTPException) as refused:
+        await database.create_job(description="x", harness_image=IMAGE)
+    assert refused.value.status_code == 422
+    async with database.acquire() as conn:
+        job_id = await conn.fetchval(
+            "INSERT INTO jobs (description, harness_image) VALUES ('x', $1) "
+            "RETURNING id",
+            IMAGE,
+        )
+    assert (await database.get_job(str(job_id)))["harness_image"] == IMAGE
 
     plain = await database.create_job(description="y")
     assert (await database.get_job(plain["id"]))["harness_image"] is None
