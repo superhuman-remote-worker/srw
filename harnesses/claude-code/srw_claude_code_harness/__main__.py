@@ -73,6 +73,9 @@ IDLE_EXIT_SECONDS = 600.0
 REGISTER_RETRY_SECONDS = 5.0
 # After SIGTERM, how long a running job gets to stop (the pod has ~30 s).
 TERMINATE_WAIT_SECONDS = 20.0
+# After SIGTERM, the limit on each of the two leave calls (the draining
+# heartbeat and the deregister), so the exit stays inside the pod's grace.
+LEAVE_TIMEOUT_SECONDS = 3.0
 SERVER_CLOSE_SECONDS = 5
 
 StartServer = Callable[[Any, int], Awaitable[Callable[[], Awaitable[None]]]]
@@ -221,7 +224,7 @@ class _Harness:
         self.settings = settings
         self.terminate = terminate
         self.client = OrchestratorClient(
-            settings.orchestrator_url, settings.internal_key, http=http
+            settings.orchestrator_url, settings.internal_key, http=http, warn=warn
         )
         self.state = HarnessState(pod_uid=settings.pod_uid)
         self.state.run_job = self._run_job
@@ -337,13 +340,16 @@ class _Harness:
             return registration
         return None
 
-    async def _leave(self, code: int, reason: str) -> int:
+    async def _leave(
+        self, code: int, reason: str, *, call_timeout: float | None = None
+    ) -> int:
         progress(reason)
         self._close_intake()
+        limit = {} if call_timeout is None else {"timeout": call_timeout}
         with contextlib.suppress(Exception):
-            await self.client.heartbeat("draining", current_job_id=None)
+            await self.client.heartbeat("draining", current_job_id=None, **limit)
         with contextlib.suppress(Exception):
-            await self.client.deregister()
+            await self.client.deregister(**limit)
         progress(f"exit {code}")
         return code
 
@@ -358,7 +364,11 @@ class _Harness:
                 await asyncio.wait_for(
                     self.state.job_finished.wait(), TERMINATE_WAIT_SECONDS
                 )
-        return await self._leave(EXIT_INTERRUPTED, "stopped by a signal")
+        return await self._leave(
+            EXIT_INTERRUPTED,
+            "stopped by a signal",
+            call_timeout=LEAVE_TIMEOUT_SECONDS,
+        )
 
     async def lifecycle(self) -> int:
         registration = await self._register()

@@ -64,8 +64,14 @@ class Orch:
         complete_status=200,
         register_failures=0,
         forget_heartbeats=0,
+        malformed_reregistrations=0,
     ):
         self.requests = []
+        # (method, path, httpx timeout) per request.
+        self.timeouts = []
+        # Answer this many registrations after the first with a 200 whose
+        # body is not JSON.
+        self.malformed_reregistrations = malformed_reregistrations
         self.intents = intents or (lambda body: {})
         self.complete_status = complete_status
         self.register_failures = register_failures
@@ -79,11 +85,15 @@ class Orch:
         body = json.loads(request.content) if request.content else None
         path = request.url.path
         self.requests.append((request.method, path, body))
+        self.timeouts.append((request.method, path, request.extensions["timeout"]))
         assert request.headers["X-Internal-Key"] == INTERNAL_KEY
         if path == "/api/agents/register":
             if self.register_failures:
                 self.register_failures -= 1
                 return httpx.Response(503, json={"detail": "starting"})
+            if self.registrations and self.malformed_reregistrations:
+                self.malformed_reregistrations -= 1
+                return httpx.Response(200, content=b"<html>proxy page</html>")
             # agent-1 / gen-1 first (AGENT_ID, GENERATION), then agent-2 / gen-2, ...
             self.registrations += 1
             return httpx.Response(
@@ -482,6 +492,50 @@ async def test_a_signal_during_a_job_stops_it_without_a_report_and_exits_4(
         ("POST", f"/api/agents/{AGENT_ID}/heartbeat", "draining"),
         ("DELETE", f"/api/agents/{AGENT_ID}", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_signal_leaves_with_short_calls_inside_the_pod_grace(tmp_path):
+    """After SIGTERM the pod has ~30 s before SIGKILL: the draining heartbeat
+    and the deregister must not each wait the default 30 s."""
+    orch = Orch()
+    running = await _launch(tmp_path, orch)
+    running.terminate.set()
+    assert await running.exit_code(timeout=10) == entry.EXIT_INTERRUPTED
+    short = entry.LEAVE_TIMEOUT_SECONDS
+    assert short == 3.0
+    assert orch.timeouts[-2:] == [
+        (
+            "POST",
+            f"/api/agents/{AGENT_ID}/heartbeat",
+            {"connect": short, "read": short, "write": short, "pool": short},
+        ),
+        (
+            "DELETE",
+            f"/api/agents/{AGENT_ID}",
+            {"connect": short, "read": short, "write": short, "pool": short},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_reregistration_keeps_the_pod_running(
+    tmp_path, monkeypatch, capsys
+):
+    """A heartbeat answered 404 makes the client register again; an answer
+    that is not the registration JSON is a warning, not a crash."""
+    monkeypatch.setattr(entry, "IDLE_EXIT_SECONDS", 0.3)
+    orch = Orch(forget_heartbeats=1, malformed_reregistrations=1)
+    running = await _launch(tmp_path, orch, wait_ready=False)
+    assert await running.exit_code(timeout=10) == entry.EXIT_OK
+    assert orch.calls() == [
+        ("POST", "/api/agents/register", None),
+        ("POST", f"/api/agents/{AGENT_ID}/heartbeat", "ready"),
+        ("POST", "/api/agents/register", None),
+        ("POST", f"/api/agents/{AGENT_ID}/heartbeat", "draining"),
+        ("DELETE", f"/api/agents/{AGENT_ID}", None),
+    ]
+    assert "re-registration" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio

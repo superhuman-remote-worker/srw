@@ -7,6 +7,7 @@ httpx; the harness image contains no SRW code, so nothing is imported from it.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,8 @@ import httpx
 
 _COMPLETE_TIMEOUT = 60.0
 _REQUEST_TIMEOUT = 30.0
+# What a registration answer that is not the expected JSON object raises.
+_MALFORMED_ANSWER = (KeyError, TypeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -41,10 +44,18 @@ class CompletionReport:
 
 
 class OrchestratorClient:
-    def __init__(self, base_url: str, internal_key: str, *, http: httpx.AsyncClient):
+    def __init__(
+        self,
+        base_url: str,
+        internal_key: str,
+        *,
+        http: httpx.AsyncClient,
+        warn: Callable[[str], None] = lambda message: None,
+    ):
         self._base = base_url.rstrip("/")
         self._headers = {"X-Internal-Key": internal_key}
         self._http = http
+        self._warn = warn
         self._registration: Registration | None = None
         self._register_args: dict[str, Any] | None = None
 
@@ -58,6 +69,7 @@ class OrchestratorClient:
         build_sha: str,
         pod_uid: str,
         image: str,
+        timeout: float = _REQUEST_TIMEOUT,
     ) -> Registration:
         self._register_args = {
             "config_name": config_name,
@@ -78,7 +90,7 @@ class OrchestratorClient:
                 "product_provenance": {"provenance_status": "unavailable"},
             },
             headers=self._headers,
-            timeout=_REQUEST_TIMEOUT,
+            timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
@@ -100,10 +112,20 @@ class OrchestratorClient:
             raise RuntimeError("not registered")
         return self._registration.agent_id
 
-    async def heartbeat(self, status: str, *, current_job_id: str | None) -> dict:
+    async def heartbeat(
+        self,
+        status: str,
+        *,
+        current_job_id: str | None,
+        timeout: float = _REQUEST_TIMEOUT,
+    ) -> dict:
         """Returns the ``intents`` object; ``{}`` on a non-200 or network error.
 
         A 404 means the orchestrator forgot this agent: re-register once and retry.
+        A re-registration answered with something other than the registration
+        JSON is handled like a network error, with a warning: the registration
+        the client had stays current and the next heartbeat tries again.
+        ``timeout`` bounds each request, the re-registration included.
         """
         for attempt in (0, 1):
             payload: dict[str, Any] = {"status": status}
@@ -114,12 +136,18 @@ class OrchestratorClient:
                     f"{self._base}/api/agents/{self._agent_id()}/heartbeat",
                     json=payload,
                     headers=self._headers,
-                    timeout=_REQUEST_TIMEOUT,
+                    timeout=timeout,
                 )
                 if response.status_code == 404 and attempt == 0 and self._register_args:
-                    await self.register(**self._register_args)
+                    await self.register(**self._register_args, timeout=timeout)
                     continue
             except httpx.HTTPError:
+                return {}
+            except _MALFORMED_ANSWER as exc:
+                self._warn(
+                    "re-registration after a heartbeat 404 got a malformed answer "
+                    f"({type(exc).__name__}); trying again at the next heartbeat"
+                )
                 return {}
             if response.status_code != 200:
                 return {}
@@ -129,14 +157,14 @@ class OrchestratorClient:
                 return {}
         return {}
 
-    async def deregister(self) -> None:
+    async def deregister(self, *, timeout: float = _REQUEST_TIMEOUT) -> None:
         if self._registration is None:
             return
         try:
             await self._http.delete(
                 f"{self._base}/api/agents/{self._registration.agent_id}",
                 headers=self._headers,
-                timeout=_REQUEST_TIMEOUT,
+                timeout=timeout,
             )
         except httpx.HTTPError:
             pass

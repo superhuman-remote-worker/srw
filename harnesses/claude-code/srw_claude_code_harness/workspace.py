@@ -403,9 +403,14 @@ class Workspace:
                     access.port,
                     username=access.user,
                     client_keys=[access.private_key_file],
-                    # known_hosts=() trusts no key by file, so asyncssh asks
+                    # An empty known-hosts list trusts no key, so asyncssh asks
                     # ``_PinnedHostKey`` during the handshake, before any auth.
-                    known_hosts=access.known_hosts_file or (),
+                    # It must be a loaded list: ``()`` (or any empty value)
+                    # makes asyncssh read ~/.ssh/known_hosts, whose keys would
+                    # be trusted without the pin; ``None`` disables checking.
+                    known_hosts=(
+                        access.known_hosts_file or asyncssh.import_known_hosts("")
+                    ),
                     client_factory=(lambda: pinned) if pinned else None,
                     server_host_key_algs=["ssh-ed25519"],
                     # Only the delivered files count: no ~/.ssh/config, no ssh-agent.

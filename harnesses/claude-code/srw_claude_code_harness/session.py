@@ -83,13 +83,13 @@ def route_env(route: ModelRoute, *, run_dir: Path, path: str) -> dict[str, str]:
     """The CLI's environment for a job: fixed values plus the job's model route.
 
     A route without a key (a keyless gateway) gets a placeholder, since the CLI
-    refuses to start without one. One trailing ``/v1`` is stripped from the base
-    URL because the CLI appends its own path.
+    refuses to start without one. Trailing slashes and then one ``/v1`` are
+    stripped from the base URL because the CLI appends its own path.
     """
     env = _fixed_env(run_dir, path)
     env["ANTHROPIC_API_KEY"] = route.api_key or "not-needed"
     if route.base_url:
-        env["ANTHROPIC_BASE_URL"] = route.base_url.removesuffix("/v1")
+        env["ANTHROPIC_BASE_URL"] = route.base_url.rstrip("/").removesuffix("/v1")
     return env
 
 

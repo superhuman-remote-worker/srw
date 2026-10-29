@@ -169,3 +169,83 @@ async def test_complete_returns_false_on_http_error_and_network_error():
     client2 = orch2.client()
     await client2.register(**REG)
     assert await client2.complete("j", report, pinned=None, pod_uid="u") is False
+
+
+def _registering(*register_answers):
+    """A handler whose heartbeats answer 404 once, then 200, and whose
+    registrations answer ``register_answers`` in turn; records each request's
+    timeout."""
+    state = {"registers": 0, "beats": 0}
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.extensions["timeout"]))
+        if request.url.path == "/api/agents/register":
+            answer = register_answers[state["registers"]]
+            state["registers"] += 1
+            return answer
+        if request.url.path.endswith("/heartbeat"):
+            state["beats"] += 1
+            if state["beats"] == 1:
+                return httpx.Response(404)
+        return httpx.Response(200, json={"intents": {}})
+
+    return handler, seen
+
+
+def _registered_answer(n):
+    return httpx.Response(
+        200,
+        json={
+            "agent_id": f"agent-{n}",
+            "heartbeat_interval_seconds": 60,
+            "dispatch_process_generation": f"gen-{n}",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_and_deregister_pass_a_given_timeout():
+    """The SIGTERM path leaves with short calls; the re-registration a 404
+    heartbeat triggers is held to the same limit."""
+    handler, seen = _registering(_registered_answer(1), _registered_answer(2))
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OrchestratorClient("http://orch:8000", KEY, http=http)
+    await client.register(**REG)
+    await client.heartbeat("draining", current_job_id=None, timeout=3.0)
+    await client.deregister(timeout=3.0)
+    short = {"connect": 3.0, "read": 3.0, "write": 3.0, "pool": 3.0}
+    assert [(method, path) for method, path, _ in seen[1:]] == [
+        ("POST", "/api/agents/agent-1/heartbeat"),
+        ("POST", "/api/agents/register"),
+        ("POST", "/api/agents/agent-2/heartbeat"),
+        ("DELETE", "/api/agents/agent-2"),
+    ]
+    assert all(timeout == short for _, _, timeout in seen[1:])
+    # Without one, the calls keep the default.
+    await client.heartbeat("ready", current_job_id=None)
+    assert seen[-1][2]["read"] == 30.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(200, json={"agent_id": "agent-2"}),
+        httpx.Response(200, content=b"<html>not json</html>"),
+        httpx.Response(200, json=["agent-2"]),
+    ],
+    ids=["missing-key", "not-json", "not-an-object"],
+)
+async def test_a_malformed_reregistration_is_a_warning_not_a_crash(answer):
+    handler, _seen = _registering(_registered_answer(1), answer)
+    warnings = []
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OrchestratorClient(
+        "http://orch:8000", KEY, http=http, warn=warnings.append
+    )
+    await client.register(**REG)
+    assert await client.heartbeat("ready", current_job_id=None) == {}
+    assert len(warnings) == 1 and "re-registration" in warnings[0]
+    # Handled like an HTTP error: the registration it had stays current.
+    assert client.registration == Registration("agent-1", 60, "gen-1")

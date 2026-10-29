@@ -568,6 +568,27 @@ def test_route_env_strips_v1_and_fills_a_placeholder_key(tmp_path):
     assert env["DISABLE_TELEMETRY"] == "1"
 
 
+@pytest.mark.parametrize(
+    "base_url,expected",
+    [
+        ("http://gw:8317/v1/", "http://gw:8317"),
+        ("http://gw:8317/", "http://gw:8317"),
+        ("http://gw:8317/anthropic/v1", "http://gw:8317/anthropic"),
+    ],
+)
+def test_route_env_strips_a_trailing_slash_and_v1(tmp_path, base_url, expected):
+    """The CLI appends /v1/messages itself; a catalog URL ending in /v1/ must
+    not become .../v1//v1/messages."""
+    from srw_claude_code_harness.job import ModelRoute
+
+    env = route_env(
+        ModelRoute("m", "anthropic", "anthropic-messages", base_url, "sk"),
+        run_dir=tmp_path,
+        path="/usr/bin",
+    )
+    assert env["ANTHROPIC_BASE_URL"] == expected
+
+
 def test_route_env_without_base_url_keeps_the_key_only(tmp_path):
     from srw_claude_code_harness.job import ModelRoute
 

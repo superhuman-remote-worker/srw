@@ -449,3 +449,29 @@ async def test_the_matching_fingerprint_does_reach_authentication(sshd):
     ws = await Workspace.connect(access)
     await ws.close()
     assert sshd.auth_attempts == ["tester"]
+
+
+@pytest.mark.asyncio
+async def test_a_key_in_the_home_known_hosts_cannot_override_the_pinned_fingerprint(
+    sshd, tmp_path, monkeypatch
+):
+    """The pinned fingerprint is the only judge: asyncssh must not also trust
+    ``~/.ssh/known_hosts``, which in the pod is a writable emptyDir."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    # The workspace's own key, listed where asyncssh looks by default.
+    (home / ".ssh" / "known_hosts").write_text(
+        Path(sshd.access.known_hosts_file).read_text()
+    )
+    monkeypatch.setenv("HOME", str(home))
+    access = replace(
+        sshd.access, known_hosts_file=None, host_key_fingerprint="SHA256:" + "A" * 43
+    )
+    try:
+        ws = await Workspace.connect(access, deadline_seconds=5)
+    except WorkspaceError as exc:
+        assert "host key mismatch" in str(exc)
+    else:
+        await ws.close()
+        pytest.fail("a key in ~/.ssh/known_hosts let a wrong fingerprint through")
+    assert sshd.auth_attempts == []
