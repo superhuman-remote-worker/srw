@@ -1263,3 +1263,94 @@ async def test_a_404_from_srw_agent_pause_keeps_its_handling(capabilities):
     assert client.post.await_args.args == ("http://10.0.0.9:8001/job/pause",)
     # Ambiguous quiescence retains the claim, as before.
     operations.dependencies.completion_control.abort.assert_not_awaited()
+
+
+CASCADE_CHILD = {
+    "id": "child-1",
+    "status": "processing",
+    "execution_lane": "pinned",
+    "assigned_agent_id": "agent-child",
+}
+
+
+def _cascade(capabilities, *, commands_on, answer):
+    store = SimpleNamespace(
+        get_descendant_jobs=AsyncMock(return_value=[dict(CASCADE_CHILD)]),
+        pause_job=AsyncMock(return_value=True),
+        pause_stateless_job=AsyncMock(return_value=True),
+    )
+    client, http_client_factory = _pod_answering(answer)
+    target = AsyncMock(return_value=_pause_target(capabilities))
+    operations = _controls(
+        store,
+        completion_commands_enabled=lambda: commands_on,
+        prepare_pinned_mutation_target=target,
+        http_client_factory=http_client_factory,
+    )
+    return operations, store, client, target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands_on", [True, False])
+@pytest.mark.parametrize(
+    "capabilities",
+    [CLAUDE_CODE_READY, {"pinned_recipient_binding": True, "pause": False}],
+    ids=["pause-undeclared", "pause-false"],
+)
+async def test_cascade_pause_skips_a_child_whose_harness_has_no_pause(
+    capabilities, commands_on, caplog
+):
+    """A parent's pause must not call a child paused while its pod, which has
+    no /job/pause, keeps running: a later resume would put a second pod on the
+    same workspace. The child keeps running and nothing is written."""
+    operations, store, client, target = _cascade(
+        capabilities, commands_on=commands_on, answer=404
+    )
+
+    with caplog.at_level(logging.INFO, logger=__name__):
+        await operations.cascade_pause_to_children("job-1")
+
+    target.assert_awaited_once_with(
+        agent_id="agent-child", job_id="child-1", require_idle=False
+    )
+    # Asked before anything is written, as the public pause is.
+    operations.dependencies.completion_control.claim_pause.assert_not_awaited()
+    store.pause_job.assert_not_awaited()
+    client.post.assert_not_awaited()
+    assert "child child-1 runs a harness without pause; not paused" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands_on", [True, False])
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        {"pinned_recipient_binding": True, "jobs": True, "pause": True},
+        # SRW's agent of the previous release declares neither key.
+        {"pinned_recipient_binding": True, "resolved_config_resume": True},
+    ],
+    ids=["srw-agent", "previous-release"],
+)
+async def test_cascade_pause_still_pauses_an_srw_or_legacy_child(
+    capabilities, commands_on
+):
+    operations, store, client, target = _cascade(
+        capabilities, commands_on=commands_on, answer=200
+    )
+    control = operations.dependencies.completion_control
+
+    await operations.cascade_pause_to_children("job-1")
+
+    client.post.assert_awaited_once()
+    assert client.post.await_args.args == ("http://10.0.0.9:8001/job/pause",)
+    # The one capability probe also names the pod the pause goes to.
+    target.assert_awaited_once()
+    if commands_on:
+        control.claim_pause.assert_awaited_once_with(
+            "child-1", source="cascade_pause", expected_agent_id="agent-child"
+        )
+        control.abort.assert_awaited_once()
+        store.pause_job.assert_not_awaited()
+    else:
+        control.claim_pause.assert_not_awaited()
+        store.pause_job.assert_awaited_once_with("child-1")

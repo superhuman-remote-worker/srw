@@ -1042,11 +1042,15 @@ async def resolve_thread_creation_plan(
     selection = None
     if inline_expert is not None:
         from orchestrator.services.inline_expert import admit_inline_expert
+        from orchestrator.services.manifest_experts import approved_srw_images
 
         # Validated before the create-time policy resolve below, so that view
         # and the INSERT's snapshot read the same gated definition.
         selected_expert_row = admit_inline_expert(
-            inline_expert, role="session", trusted_image=dependencies.srw_image()
+            inline_expert,
+            role="session",
+            trusted_image=dependencies.srw_image(),
+            approved_images=approved_srw_images(dependencies.store),
         )
     try:
         if (

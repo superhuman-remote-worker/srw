@@ -184,10 +184,14 @@ async def admit_expert_harness(
         approved_images=dependencies.approved_images(),
     )
     harness_image = expert_harness_image(expert, trusted_image=trusted_image)
-    if harness_image is not None and not (
-        await dependencies.store.user_can_run_custom_harness_images(
-            principal or {"id": str(user_id)}, project_id
-        )
+    if harness_image is None:
+        return None
+    owner = principal
+    if owner is None and user_id:
+        # The admin bypass reads is_admin, which only the user row carries.
+        owner = await dependencies.store.get_user(str(user_id))
+    if owner is None or not (
+        await dependencies.store.user_can_run_custom_harness_images(owner, project_id)
     ):
         raise HTTPException(status_code=403, detail=_CUSTOM_HARNESS_GRANT_REQUIRED)
     return harness_image
@@ -266,7 +270,10 @@ async def prepare_job_admission_config(
         from orchestrator.services.inline_expert import admit_inline_expert
 
         expert_row = admit_inline_expert(
-            inline_expert, role="worker", trusted_image=dependencies.srw_image()
+            inline_expert,
+            role="worker",
+            trusted_image=dependencies.srw_image(),
+            approved_images=dependencies.approved_images(),
         )
         context["expert_selection"] = {"source": "inline"}
         if job.expert_based_on:

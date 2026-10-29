@@ -28,6 +28,7 @@ from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
+from orchestrator.services.job_mutation_target import PinnedJobMutationTarget
 from orchestrator.services.vm_workspace_policy import vm_needs_release
 from orchestrator.services.completion_teardown_replay import (
     CancelledContainerCompletionReplay,
@@ -538,11 +539,13 @@ class JobControlOperations:
         *,
         reason: str | None = None,
         timeout_seconds: float = 130.0,
+        target: PinnedJobMutationTarget | None = None,
     ) -> tuple[bool, int | None]:
         d = self.dependencies
-        target = await d.prepare_pinned_mutation_target(
-            agent_id=agent_id, job_id=job_id, require_idle=False
-        )
+        if target is None:
+            target = await d.prepare_pinned_mutation_target(
+                agent_id=agent_id, job_id=job_id, require_idle=False
+            )
         if target is None:
             return False, -1
         payload: dict[str, Any] = {
@@ -669,14 +672,43 @@ class JobControlOperations:
         pinned = [c for c in processing if c.get("execution_lane") != "stateless"]
         stateless = [c for c in processing if c.get("execution_lane") == "stateless"]
 
+        async def probe(
+            child: dict[str, Any],
+        ) -> tuple[bool, PinnedJobMutationTarget | None]:
+            """Whether to pause the child, and its pod as the probe found it.
+
+            Asked before anything is written, as the public pause is: under
+            completion commands the claim itself publishes the pause, and a
+            harness without ``/job/pause`` would keep running a child its row
+            calls paused, so a later resume would start a second pod on the
+            same workspace. Such a child keeps running.
+            """
+            agent_id = child.get("assigned_agent_id")
+            if not agent_id:
+                return True, None
+            target = await d.prepare_pinned_mutation_target(
+                agent_id=str(agent_id), job_id=str(child["id"]), require_idle=False
+            )
+            if target is not None and _harness_lacks_pause(target.capabilities):
+                d.logger.warning(
+                    "child %s runs a harness without pause; not paused", child["id"]
+                )
+                return False, None
+            return True, target
+
         async def signal_pause(
-            child: dict[str, Any], *, require_positive_quiescence: bool
+            child: dict[str, Any],
+            target: PinnedJobMutationTarget | None,
+            *,
+            require_positive_quiescence: bool,
         ) -> bool:
             agent_id = child.get("assigned_agent_id")
             if not agent_id:
                 return not require_positive_quiescence
+            if target is None:
+                return False
             acknowledged, status = await self._signal(
-                str(child["id"]), str(agent_id), "pause"
+                str(child["id"]), str(agent_id), "pause", target=target
             )
             if status == -1:
                 return False
@@ -686,10 +718,19 @@ class JobControlOperations:
                 await d.store.pause_job(str(child["id"]))
             return True
 
+        async def probe_and_signal(child: dict[str, Any]) -> bool:
+            pause, target = await probe(child)
+            if not pause:
+                return True
+            return await signal_pause(child, target, require_positive_quiescence=False)
+
         if self.commands_enabled:
 
             async def claim_and_signal(child: dict[str, Any]) -> None:
                 child_id = str(child["id"])
+                pause, target = await probe(child)
+                if not pause:
+                    return
                 try:
                     claim = await d.completion_control.claim_pause(
                         child_id,
@@ -702,7 +743,7 @@ class JobControlOperations:
                     )
                 except HTTPException:
                     return
-                if await signal_pause(child, require_positive_quiescence=True):
+                if await signal_pause(child, target, require_positive_quiescence=True):
                     await d.completion_control.abort(claim)
 
             await asyncio.gather(
@@ -711,10 +752,7 @@ class JobControlOperations:
             )
         else:
             await asyncio.gather(
-                *(
-                    signal_pause(child, require_positive_quiescence=False)
-                    for child in pinned
-                ),
+                *(probe_and_signal(child) for child in pinned),
                 return_exceptions=True,
             )
         for child in stateless:

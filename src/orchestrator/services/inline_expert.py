@@ -18,11 +18,16 @@ snapshot re-runs the fragment gates inside the insert.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from fastapi import HTTPException
 
 from orchestrator.schemas.inline_expert import InlineExpertSpec
+
+INLINE_APPROVED_IMAGE_DETAIL = (
+    "Inline Experts run the installed harness; save the Expert as a manifest "
+    "resource to run an approved harness image."
+)
 
 
 def srw_expert_row(private: Mapping[str, Any], *, expert_type: str) -> dict[str, Any]:
@@ -41,6 +46,7 @@ def admit_inline_expert(
     *,
     role: Literal["worker", "session"],
     trusted_image: str | None,
+    approved_images: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Validate an inline Expert and return its resolver row.
 
@@ -48,6 +54,9 @@ def admit_inline_expert(
     Expert's projection does, so the snapshot resolves the same base whichever
     way the definition arrived. Callers persist the role base as the work's
     ``config_name``, as they do for a DB Expert selected by id.
+
+    ``approved_images`` only words the refusal: an inline Expert never runs an
+    approved image, and one that names it is told to save the Expert instead.
     """
     from orchestrator.schemas.expert_catalog import (
         validate_expert_prompt_source_or_422,
@@ -57,6 +66,7 @@ def admit_inline_expert(
         validate_srw_authored_fragment,
     )
     from orchestrator.services.manifest_experts import refuse_contradicting_extends
+    from orchestrator.services.manifest_approved_images import approved_image_entry
     from orchestrator.services.manifest_runtime_ownership import (
         require_srw_launch_configuration,
     )
@@ -66,6 +76,12 @@ def admit_inline_expert(
     # Unset keys stay absent: an omitted image follows the installation, an
     # explicit one (even null) must equal it.
     runtime = spec.runtime.model_dump(exclude_unset=True)
+    if (
+        "image" in runtime
+        and runtime["image"] != trusted_image
+        and approved_image_entry(approved_images, runtime["image"]) is not None
+    ):
+        raise HTTPException(422, INLINE_APPROVED_IMAGE_DETAIL)
     private = require_srw_launch_configuration(runtime, trusted_image=trusted_image)
 
     config_name = private.get("config_name")
@@ -106,4 +122,4 @@ def admit_inline_expert(
     return row
 
 
-__all__ = ["admit_inline_expert", "srw_expert_row"]
+__all__ = ["INLINE_APPROVED_IMAGE_DETAIL", "admit_inline_expert", "srw_expert_row"]

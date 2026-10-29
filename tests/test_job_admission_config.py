@@ -681,6 +681,60 @@ async def test_a_saved_expert_on_an_approved_image_needs_the_grant(deps, scope):
     )
 
 
+def _grant_read_without_grants():
+    """PostgresDB's own grant read (admin bypass included) over a store that
+    holds no custom_harness_images grant for anyone."""
+    from orchestrator.database.postgres import PostgresDB
+
+    no_grants = SimpleNamespace(
+        list_grants_for_scopes=AsyncMock(
+            return_value={"user": [], "project": [], "global": []}
+        )
+    )
+    return AsyncMock(
+        side_effect=partial(PostgresDB.user_can_run_custom_harness_images, no_grants)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_admin", [True, False], ids=["admin", "non-admin"])
+async def test_the_grant_check_without_a_principal_reads_the_owner_row(deps, is_admin):
+    """Without a principal the owner's row is loaded, so an admin without the
+    grant still passes, as on every other generic-hosting gate."""
+    scope = JobAdmissionScope({}, None, USER, PROJECT, False)
+    owner = {"id": USER, "is_admin": is_admin}
+    deps.store.get_user = AsyncMock(return_value=owner)
+    deps.store.user_can_run_custom_harness_images = _grant_read_without_grants()
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        saved_expert(image=CUSTOM), "explicit"
+    )
+    if is_admin:
+        config = await prepare(deps, scope, expert_id=EXPERT)
+        assert config.harness_image == CUSTOM
+    else:
+        with pytest.raises(HTTPException) as denied:
+            await prepare(deps, scope, expert_id=EXPERT)
+        assert denied.value.status_code == 403
+        assert "custom_harness_images" in denied.value.detail
+    deps.store.get_user.assert_any_await(USER)
+    deps.store.user_can_run_custom_harness_images.assert_awaited_once_with(
+        owner, PROJECT
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_grant_check_refuses_when_the_owner_row_is_missing(deps):
+    scope = JobAdmissionScope({}, None, USER, PROJECT, False)
+    deps.store.get_user = AsyncMock(return_value=None)
+    deps.resolve_worker_expert.return_value = ExpertSelection(
+        saved_expert(image=CUSTOM), "explicit"
+    )
+    with pytest.raises(HTTPException) as denied:
+        await prepare(deps, scope, expert_id=EXPERT)
+    assert denied.value.status_code == 403
+    deps.store.user_can_run_custom_harness_images.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_a_saved_expert_on_an_approved_image_sets_harness_image(deps, scope):
     deps.resolve_worker_expert.return_value = ExpertSelection(
@@ -724,14 +778,33 @@ async def test_the_installed_image_sets_no_harness_image(deps, scope, expert):
     deps.store.user_can_run_custom_harness_images.assert_not_awaited()
 
 
+INLINE_APPROVED_IMAGE = (
+    "Inline Experts run the installed harness; save the Expert as a manifest "
+    "resource to run an approved harness image."
+)
+
+
 @pytest.mark.asyncio
 async def test_an_inline_expert_still_cannot_name_an_approved_image(deps, scope):
     """Approval admits saved Experts; a request body's inline Expert keeps
-    naming the installed harness or nothing."""
+    naming the installed harness or nothing, and is told how to run the
+    approved image instead of that it may."""
     with pytest.raises(HTTPException) as refused:
         await prepare(deps, scope, expert=inline_expert(image=CUSTOM))
     assert refused.value.status_code == 422
+    assert refused.value.detail == INLINE_APPROVED_IMAGE
     assert "installed harness" in refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_an_inline_expert_on_an_unlisted_image_keeps_the_general_refusal(
+    deps, scope
+):
+    with pytest.raises(HTTPException) as refused:
+        await prepare(deps, scope, expert=inline_expert(image="example.invalid/x:1"))
+    assert refused.value.status_code == 422
+    assert refused.value.detail != INLINE_APPROVED_IMAGE
+    assert "approved list" in refused.value.detail
 
 
 @pytest.mark.asyncio

@@ -1008,6 +1008,26 @@ class TestExpertSelection:
         deps.store.create_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_an_inline_expert_on_an_approved_image_is_told_to_save_it(
+        self, monkeypatch
+    ):
+        approved = "example.invalid/h@sha256:" + "b" * 64
+        deps, _resolver = _experts_on(
+            monkeypatch,
+            store={"manifest_approved_images": ({"name": "cc", "image": approved},)},
+        )
+        expert = _inline()
+        expert["inline"]["runtime"]["image"] = approved
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=expert), deps)
+        assert exc.value.status_code == 422
+        assert exc.value.detail == (
+            "Inline Experts run the installed harness; save the Expert as a "
+            "manifest resource to run an approved harness image."
+        )
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_uuid_expert_selects_the_db_expert(self, monkeypatch):
         deps, resolver = _experts_on(monkeypatch)
         plan = await _plan(

@@ -305,9 +305,13 @@ async def preview_tool_groups(
                 ),
             )
         from orchestrator.services.inline_expert import admit_inline_expert
+        from orchestrator.services.manifest_experts import approved_srw_images
 
         expert_row = admit_inline_expert(
-            inline, role=body.expert_type, trusted_image=dependencies.srw_image()
+            inline,
+            role=body.expert_type,
+            trusted_image=dependencies.srw_image(),
+            approved_images=approved_srw_images(store),
         )
     legacy = (
         not is_experts_db_enabled() or not await dependencies.user_experts_enabled()
