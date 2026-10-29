@@ -5,13 +5,15 @@ The observer extracts memories from a conversation while it still runs, so
 other jobs in the project can use them. A retrieval can therefore find a
 memory whose source is the current job or session and inject it while the
 source messages are still in context. ``memory.retrieval.same_conversation``
-decides what happens to such a memory; it is the switch of a deferred test
-(vault knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md):
+decides what happens to such a memory. A test settled it (vault
+knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md):
 
-- ``allow`` (arm A, the default): it stays eligible, as before;
-- ``skip_in_context`` (arm B): it is skipped while its source turns are
+- ``skip_in_context`` (arm B, the default since 2026-10-29 via
+  ``config/expert_base.yaml``): it is skipped while its source turns are
   still in context, and eligible again once a compaction has removed them,
-  so a multi-day job still gets its own earlier memories back.
+  so a multi-day job still gets its own earlier memories back;
+- ``allow`` (arm A): it stays eligible. Also the fallback for a config
+  without the key, such as one frozen before the key existed.
 
 The rule runs in one place, where a finished retrieval is taken in
 (:meth:`MemoryManager.take_retrieval`): the request retrieval, the session's

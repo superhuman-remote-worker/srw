@@ -8,10 +8,13 @@ report. Five arms over the memory pipeline (everything else identical):
                (the agent can still kb_search on its own — pull, not push).
   kb-only      KB notes auto-injected (top-5), no memory retrieval/extraction.
   memory-only  memory retrieval + extraction (current stack), no KB injection.
-  current      the defaults — memory + KB, reranker/gate/bounded, ingestion.
-  skip-own     the defaults, but a job's own memory is not injected while its
-               source turns are still in context
-               (memory.retrieval.same_conversation: skip_in_context).
+  current      the defaults — memory + KB, reranker/gate/bounded, ingestion; a
+               job's own memory is not injected while its source turns are
+               still in context (same_conversation: skip_in_context, D38).
+  allow-own    the defaults, but a job's own memory stays eligible while its
+               source is in context (memory.retrieval.same_conversation:
+               allow, the default before 2026-10-29). Campaigns before then
+               ran the opposite pair: current = allow, skip-own = skip.
 
 Why one project (and one bench run) PER ARM: memory and KB notes are
 project-scoped — every job in a project reads what earlier jobs wrote — so
@@ -107,7 +110,7 @@ ARMS: dict[str, dict] = {
         }
     },
     "current": {},
-    "skip-own": {"memory": {"retrieval": {"same_conversation": "skip_in_context"}}},
+    "allow-own": {"memory": {"retrieval": {"same_conversation": "allow"}}},
 }
 
 AUX_CALL_TYPES = ("memory_extraction", "memory_assembly", "auxiliary", "summarization")

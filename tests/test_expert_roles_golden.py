@@ -102,8 +102,9 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # both roles (D34). Both differ from the dataclass defaults ([]), so the
     # effective compare strips them on both sides.
     # Append-only context injection P4: the shared root states
-    # memory.retrieval (same_conversation: allow, both roles; same value as
-    # the dataclass default, so the effective compare needs no exclusion).
+    # memory.retrieval (both roles). Since D38 (2026-10-29) its value,
+    # same_conversation: skip_in_context, differs from the dataclass default
+    # (allow, kept for configs frozen before the key).
     "worker": (
         "delegation.max_concurrent",
         "delegation.run_in_background_default",

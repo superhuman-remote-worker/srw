@@ -265,12 +265,13 @@ memory:
   retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
   project_scoped: true             # When true, memories are shared across all jobs in the same project
   # May a retrieval inject a memory the observer extracted from this same job
-  # or session? allow = yes (today, arm A); skip_in_context = not while its
-  # source turns are still in context, again once a compaction removed them
-  # (arm B). memory_search is never filtered. Append-only context injection
-  # P4, a deferred test: knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md
+  # or session? skip_in_context = not while its source turns are still in
+  # context, again once a compaction removed them (the default since
+  # 2026-10-29, D38); allow = always (the behaviour before). memory_search is
+  # never filtered. Append-only context injection P4, decided by the test in
+  # knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md
   retrieval:
-    same_conversation: allow
+    same_conversation: skip_in_context
   # NOTE: the observer runs on the auxiliary LLM (see `auxiliary:` below) and
   # the embedding model comes from the EMBEDDING_* env vars — neither is
   # configurable here (dead keys removed, knowledge-base/knowledge/issues/memory_bugs.md B9).

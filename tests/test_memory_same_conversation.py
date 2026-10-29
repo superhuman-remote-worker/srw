@@ -2,10 +2,11 @@
 
 Design: the deferred test in the vault,
 knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md.
-``memory.retrieval.same_conversation`` is its switch: ``allow`` (arm A, the
-default) keeps a memory the observer extracted from the current job or
-session eligible; ``skip_in_context`` (arm B) drops it while its source turns
-are still in context and lets it in again once a compaction removed them.
+``memory.retrieval.same_conversation`` is its switch: ``skip_in_context``
+(arm B, the shipped default since 2026-10-29) drops a memory the observer
+extracted from the current job or session while its source turns are still
+in context and lets it in again once a compaction removed them; ``allow``
+(arm A) keeps it eligible and is the fallback for a config without the key.
 
 Pinned here: the rule (``agent.services.memory.same_conversation``), the
 manager's take-in (every result passes there: request retrieval, idle
@@ -339,18 +340,19 @@ class TestTakeIn:
 
 
 class TestConfigKey:
-    def test_the_role_bases_default_to_allow(self):
+    def test_the_role_bases_default_to_skip_in_context(self):
         for name in ("worker_base", "session_base"):
             config = load_agent_config(str(REPO_ROOT / "config" / f"{name}.yaml"))
-            assert config.memory.retrieval.same_conversation == "allow"
+            assert config.memory.retrieval.same_conversation == "skip_in_context"
 
-    def test_an_override_selects_arm_b_and_survives_the_frozen_config(self):
+    @pytest.mark.parametrize("mode", ["allow", "skip_in_context"])
+    def test_the_mode_survives_the_frozen_config(self, mode):
         data = deep_merge(
             load_role_base("worker"),
-            {"memory": {"retrieval": {"same_conversation": "skip_in_context"}}},
+            {"memory": {"retrieval": {"same_conversation": mode}}},
         )
         config = load_agent_config_from_dict(data)
-        assert config.memory.retrieval.same_conversation == "skip_in_context"
+        assert config.memory.retrieval.same_conversation == mode
 
         # Dispatch round-trips a live config through asdict + re-parse.
         again = _parse_memory_config(dataclasses.asdict(config.memory))
@@ -364,11 +366,9 @@ class TestConfigKey:
             instr.return_value.load.return_value = "instruction"
             resolved = serialize_resolved_config(config, model="gpt-4o")
         resolved = json.loads(json.dumps(resolved, default=str))
-        assert resolved["agent"]["memory"]["retrieval"] == {
-            "same_conversation": "skip_in_context"
-        }
+        assert resolved["agent"]["memory"]["retrieval"] == {"same_conversation": mode}
         restored = load_config_from_resolved(resolved)
-        assert restored.memory.retrieval.same_conversation == "skip_in_context"
+        assert restored.memory.retrieval.same_conversation == mode
 
     def test_a_frozen_config_from_before_the_key_is_arm_a(self):
         assert _parse_memory_config({}).retrieval.same_conversation == "allow"

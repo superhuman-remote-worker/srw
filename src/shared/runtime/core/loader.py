@@ -2683,11 +2683,11 @@ class QueryConfig:
 
 
 #: ``memory.retrieval.same_conversation`` values (append-only context
-#: injection P4, a deferred test: vault
+#: injection P4, decided by the test in the vault,
 #: knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md).
-#: ``allow`` keeps a memory whose source is the current job or session
-#: eligible (arm A, today); ``skip_in_context`` skips it while its source
-#: turns are still in context (arm B).
+#: ``skip_in_context`` skips a memory whose source is the current job or
+#: session while its source turns are still in context (arm B, the shipped
+#: default since 2026-10-29); ``allow`` keeps it eligible (arm A, before).
 SAME_CONVERSATION_ALLOW = "allow"
 SAME_CONVERSATION_SKIP_IN_CONTEXT = "skip_in_context"
 SAME_CONVERSATION_MODES = (SAME_CONVERSATION_ALLOW, SAME_CONVERSATION_SKIP_IN_CONTEXT)
@@ -2698,11 +2698,16 @@ class MemoryRetrievalConfig:
     """memory.retrieval — what a finished retrieval may inject (P4).
 
     ``same_conversation`` decides the memories the observer extracted from
-    the conversation that is retrieving them. Default ``allow``: they stay
-    eligible, as before. ``skip_in_context`` drops one while its source
-    turns are still in context and lets it in again once a compaction has
-    removed them (``agent.services.memory.same_conversation``). The model's
-    own ``memory_search`` is never filtered.
+    the conversation that is retrieving them. ``skip_in_context`` drops one
+    while its source turns are still in context and lets it in again once a
+    compaction has removed them (``agent.services.memory.same_conversation``);
+    ``allow`` keeps them eligible. The model's own ``memory_search`` is never
+    filtered.
+
+    The shipped default is ``skip_in_context``, stated in
+    ``config/expert_base.yaml`` (D38). This dataclass default stays ``allow``
+    for a config without the key: a resolved config frozen before the key
+    existed keeps the behaviour its job was created with.
     """
 
     same_conversation: str = SAME_CONVERSATION_ALLOW
@@ -3250,7 +3255,8 @@ def _parse_memory_retrieval(value: Any) -> MemoryRetrievalConfig:
     """``memory.retrieval``: ``same_conversation`` is allow | skip_in_context (P4).
 
     Absent or null means ``allow``: a stored config written before the key
-    existed keeps today's behaviour.
+    existed keeps the behaviour it was created with. Every current config
+    states the key through ``config/expert_base.yaml`` (``skip_in_context``).
     """
     if value is None:
         return MemoryRetrievalConfig()
