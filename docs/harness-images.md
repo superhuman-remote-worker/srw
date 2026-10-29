@@ -234,6 +234,8 @@ catalog has an **API shape** select (Admin → Models), so one Anthropic-only
 harness can use an Anthropic-compatible server or the subscription proxy: set
 `anthropic-messages` on that endpoint's model. List the shapes your image
 speaks in `model_protocols` so SRW refuses a mismatch before the pod starts.
+SRW's own agent sends no sampling parameters (`temperature`, `top_p`, `top_k`)
+to a non-Claude model on this shape.
 
 ## Direct database access
 

@@ -117,6 +117,20 @@ class TestRequest:
         assert _sampling(payload, "temperature") == 0.0
         assert _sampling(payload, "top_p") == 0.9
 
+    def test_a_non_claude_model_on_the_anthropic_shape_sends_no_sampling(self):
+        # Meta's Anthropic-compatible API answers 400 "temperature is removed".
+        config = _config(
+            model="muse-spark-1.3-contributor",
+            provider="anthropic",
+            base_url="https://api.meta.ai",
+            top_k=40,
+        )
+        payload = _payload(loader._create_anthropic_llm(config))
+
+        assert "thinking" not in payload
+        for sampling in ("temperature", "top_p", "top_k"):
+            assert _sampling(payload, sampling) is None, sampling
+
 
 class TestReplayHygiene:
     def test_a_stripped_call_takes_its_tool_use_block_along(self):

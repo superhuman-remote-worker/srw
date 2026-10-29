@@ -5109,12 +5109,14 @@ def _create_anthropic_llm(
             reasoning_mode = f"adaptive(effort={level})"
         else:
             reasoning_mode = "adaptive"
-    else:
+    elif family_of(config.model).startswith("claude"):
         llm_kwargs["temperature"] = config.temperature
         if config.top_p is not None:
             llm_kwargs["top_p"] = config.top_p
         if config.top_k is not None:
             llm_kwargs["top_k"] = config.top_k
+    # else: a non-Claude model on this shape (Meta's Anthropic-compatible API
+    # answers 400 "temperature is removed") gets no sampling parameters.
 
     # Always a beta request: the beta client's stream events type the
     # `context_management` the API adds to `message_delta`, while the stable
