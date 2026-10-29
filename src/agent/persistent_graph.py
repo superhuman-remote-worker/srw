@@ -2508,6 +2508,61 @@ async def _execute_turn(
         messages.append(_adopt(_ensure_msg_id(event)))
         await _persist(event)
 
+    async def _close_batch_on_workspace_loss(
+        tool_name: str,
+        tool_call_id: str,
+        later_calls: Sequence[dict[str, Any]],
+        error: WorkspaceUnavailableError,
+    ) -> None:
+        """Record what a workspace loss did to the calls of this batch.
+
+        The running call did start, so its result is unknown: say exactly
+        that. The calls after it never started. Each gets a result row, so the
+        turn ends without tool debt and the user decides what happens next by
+        sending a message. Best effort: the loss is still raised either way.
+        """
+
+        closing = [
+            (
+                tool_name,
+                tool_call_id,
+                "Result unknown: the connection to the workspace was lost "
+                "while this call was running, so it may or may not have "
+                f"finished. ({error})",
+                True,
+            )
+        ]
+        for call in later_calls:
+            closing.append(
+                (
+                    str(call.get("name") or "unknown"),
+                    str(call.get("id") or ""),
+                    "Not run: the workspace became unavailable before this "
+                    "call started.",
+                    False,
+                )
+            )
+        for name, call_id, content, started in closing:
+            if not call_id:
+                continue
+            message = _adopt(
+                _ensure_msg_id(ToolMessage(content=content, tool_call_id=call_id))
+            )
+            messages.append(message)
+            try:
+                await _persist(message)
+                if started:
+                    await callbacks.on_tool_result(
+                        name, content, call_id, is_error=True
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not record the result of %s (%s) after workspace loss",
+                    name,
+                    call_id,
+                    exc_info=True,
+                )
+
     # --- Memory retrieval (once per turn, before the inner loop) ---
     charter_block = ""
     # The store records behind each kind, in rank order (the planner's
@@ -4454,10 +4509,16 @@ async def _execute_turn(
                 result = await tool.ainvoke(tool_args)
                 result_str = str(result) if result is not None else ""
                 is_error = _is_returned_error(result_str)
-            except WorkspaceUnavailableError:
+            except WorkspaceUnavailableError as e:
                 # Dead workspace mid-turn: propagate so the turn handler surfaces
                 # a clean recovery message via on_error, instead of flattening it
-                # into a retryable ToolMessage (the ~39-min spin).
+                # into a retryable ToolMessage (the ~39-min spin). First close
+                # this batch's calls: a call left without a result row is tool
+                # debt, which parks the Session's next message
+                # (session_unknown_tool_result_needs_admin.md).
+                await _close_batch_on_workspace_loss(
+                    tool_name, tool_call_id, response.tool_calls[i + 1 :], e
+                )
                 raise
             except Exception as e:
                 logger.warning(f"Tool {tool_name} failed: {e}")
