@@ -1391,6 +1391,19 @@ class TestDualCallableEndpoints:
         fake_db.get_user = AsyncMock(return_value=user_a)
         # No project_workspace_defaults row: the installation decides the tier.
         fake_db.fetchrow = AsyncMock(return_value=None)
+        # No user_experts kill-switch row: DB Experts are enabled.
+        fake_db.get_system_setting = AsyncMock(return_value=None)
+        # The project's default worker Expert, as a stored row: a plain dict
+        # on the installed harness (no manifest), not an AsyncMock whose
+        # attributes are coroutines.
+        fake_db.get_project_default_expert = AsyncMock(
+            return_value={
+                "id": "33333333-3333-4333-8333-333333333333",
+                "expert_type": "worker",
+                "config": {},
+                "manifest": None,
+            }
+        )
         body = JobCreate(
             description="private datasource attempt",
             thread_id=str(thread_a["id"]),

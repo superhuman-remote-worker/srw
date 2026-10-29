@@ -190,28 +190,17 @@ def test_setting_name_appears_in_the_error_prefix():
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCUMENTED = (
-    "harnesses/claude-code/README.md",
-    "examples/manifests/README.md",
-    "examples/manifests/claude-code-harness-job.yaml",
-)
+# Where the generic-hosting example for an image that calls public services
+# lives. SRW-adapter harness images (the Claude Code image) run under the agent
+# pod's network rules, so they document no harnessEgress.
+DOCUMENTED = ("examples/manifests/README.md",)
 
 
 def _documented_harness_egress(relative: str) -> list:
-    """The Claude Code harness's harnessEgress example in a doc or the Job's
-    comments: a `manifestHosting.harnessEgress` block with an HTTPS rule."""
+    """The generic-hosting harnessEgress example in a Markdown doc: a
+    `manifestHosting.harnessEgress` block with an HTTPS rule."""
     text = (ROOT / relative).read_text()
-    if relative.endswith(".md"):
-        blocks = re.findall(r"```yaml\n(.*?)```", text, re.S)
-    else:
-        lines = text.splitlines()
-        start = lines.index("# manifestHosting:")
-        comment = []
-        for line in lines[start:]:
-            if not line.startswith("#"):
-                break
-            comment.append(line[2:] if line.startswith("# ") else line[1:])
-        blocks = ["\n".join(comment)]
+    blocks = re.findall(r"```yaml\n(.*?)```", text, re.S)
     found = []
     for block in blocks:
         data = yaml.safe_load(block)
@@ -222,8 +211,9 @@ def _documented_harness_egress(relative: str) -> list:
     return found[0]
 
 
-def test_the_documented_claude_code_harness_egress_is_accepted():
-    # I3: DNS to kube-dns, HTTPS to public addresses; one example in three places.
+def test_the_documented_public_https_harness_egress_is_accepted():
+    # I3: DNS to kube-dns, HTTPS to public addresses, in the generic-hosting
+    # example of the manifest guide.
     examples = {path: _documented_harness_egress(path) for path in DOCUMENTED}
     first = examples[DOCUMENTED[0]]
     for path, rules in examples.items():

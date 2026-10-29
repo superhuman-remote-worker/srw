@@ -495,11 +495,12 @@ manifestHosting:
           port: 53
 ```
 
-An image that calls public services, such as the
-[Claude Code harness](../../harnesses/claude-code/README.md#network) (the
-Anthropic API, input downloads and the bundle upload), needs DNS and HTTPS.
-Without them it fails at its first request. This allows both, but no private,
-shared, link-local or reserved range:
+An image under generic hosting that calls public services (a model API,
+downloads) needs DNS and HTTPS. SRW-adapter harness images, such as the Claude
+Code image, run under the agent pod's network rules instead (see
+[Build a harness image](../../docs/harness-images.md)). Without DNS and HTTPS a
+generic image fails at its first request. The rules below allow both, but no
+private, shared, link-local or reserved range:
 
 ```yaml
 manifestHosting:
