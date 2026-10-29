@@ -255,8 +255,12 @@ def test_remaining_hostile_shapes_have_bounded_growth(case):
 
     The worker can be descheduled while CI runs other tests, which must not
     inflate one growth sample, so each size keeps the best of three runs. The
-    100ms floor absorbs timer noise on fast fixed implementations; ratios
-    still distinguish repeated scans.
+    100ms floor absorbs timer noise on fast fixed implementations.
+
+    Growth is judged across the whole range, as an exponent: linear is 1 and
+    a repeated scan 2, so the bound sits at 1.5. A per-doubling bound left a
+    linear parser only 1.5x of headroom, and a busy runner's per-character
+    cost can step by more than that between two sizes.
     """
     import json
     import subprocess
@@ -299,9 +303,9 @@ def test_remaining_hostile_shapes_have_bounded_growth(case):
     )
     samples = json.loads(result.stdout)
     assert samples[-1][0] >= 100000
-    for (size_before, before), (size_after, after) in zip(samples, samples[1:]):
-        assert after < 3.0, samples
-        assert after <= max(0.1, before * (size_after / size_before) * 1.5), samples
+    assert all(elapsed < 3.0 for _, elapsed in samples), samples
+    (first_size, first), (last_size, last) = samples[0], samples[-1]
+    assert last <= max(0.1, first * (last_size / first_size) ** 1.5), samples
 
 
 @pytest.mark.parametrize(
