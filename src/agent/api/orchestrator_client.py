@@ -8,7 +8,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, NoReturn, Optional
+from typing import Any, Awaitable, Callable, Mapping, NoReturn, Optional
 from uuid import UUID
 
 import httpx
@@ -2199,6 +2199,94 @@ class OrchestratorClient:
             logger.debug("Failed to report cloud mount status: %s", e)
             return False
         return response.status_code == 200
+
+    def cloud_remote_token_fetcher(
+        self,
+        thread_id: str,
+        *,
+        lease: Any,
+        plan: Mapping[str, Any] | None,
+    ) -> Callable[[str], tuple[str, float]]:
+        """How a Virtual Session's executor fetches the bearer of a cloud
+        folder delivered with the ``oauth_token`` auth kind
+        (features/cloud_folders_on_virtual_sessions.md § Provider neutrality):
+        ``fetch(mount_id) -> (token, expires_in)`` against
+        ``GET /internal/units/{unit_id}/cloud-token``, with the executor's
+        live lease read from ``lease`` (the executor's mutable
+        :class:`~agent.api.lease_context.LeaseHandle`, so a re-claim repoints
+        it) and the plan this delivery serves (``fingerprint``,
+        ``incarnation``). Synchronous on purpose: the rclone store spawns
+        from worker threads. Raises ``CloudTokenUnavailable`` with a closed
+        message (a status code, a transport error's name); the response body
+        is never logged, nor is the token.
+        """
+        from agent.core.backends.cloud_token import CloudTokenUnavailable
+
+        orchestrator_url = self.orchestrator_url
+        plan_body = dict(plan or {})
+
+        def fetch(mount_id: str) -> tuple[str, float]:
+            unit_id = getattr(lease, "unit_id", None)
+            lease_token = int(getattr(lease, "lease_token", 0) or 0)
+            if not unit_id or not lease_token:
+                raise CloudTokenUnavailable("no live claim lease for the token")
+            headers: dict[str, str] = {}
+            internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+            if internal_key:
+                headers["X-Internal-Key"] = internal_key
+            params = {
+                "lease_token": lease_token,
+                "pod_name": (
+                    getattr(lease, "executor_id", None)
+                    or os.environ.get("POD_NAME")
+                    or os.environ.get("HOSTNAME", "")
+                ),
+                "pod_uid": getattr(lease, "pod_uid", None)
+                or os.environ.get("POD_UID", ""),
+                "mount_id": str(mount_id),
+                "fingerprint": str(plan_body.get("fingerprint") or ""),
+                "incarnation": str(plan_body.get("incarnation") or ""),
+            }
+            try:
+                with httpx.Client(timeout=15.0, headers=headers) as client:
+                    response = client.get(
+                        f"{orchestrator_url}/internal/units/{unit_id}/cloud-token",
+                        params=params,
+                    )
+            except httpx.HTTPError as exc:
+                logger.debug(
+                    "Thread %s: the cloud token route was not reachable (%s)",
+                    thread_id,
+                    type(exc).__name__,
+                )
+                raise CloudTokenUnavailable(
+                    f"token route unreachable ({type(exc).__name__})"
+                ) from None
+            if response.status_code != 200:
+                logger.debug(
+                    "Thread %s: the cloud token route answered %s for folder %s",
+                    thread_id,
+                    response.status_code,
+                    mount_id,
+                )
+                raise CloudTokenUnavailable(
+                    f"token route answered {response.status_code}"
+                )
+            try:
+                body = response.json()
+            except ValueError:
+                raise CloudTokenUnavailable("token route answered no JSON") from None
+            token = body.get("token") if isinstance(body, dict) else None
+            expires_in = body.get("expires_in") if isinstance(body, dict) else None
+            if (
+                not isinstance(token, str)
+                or not token
+                or not isinstance(expires_in, (int, float))
+            ):
+                raise CloudTokenUnavailable("token route answered no token")
+            return token, float(expires_in)
+
+        return fetch
 
     async def report_workspace_recovery(
         self,

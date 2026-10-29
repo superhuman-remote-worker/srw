@@ -17,6 +17,7 @@ Phase 1.5 tightened the contract:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
@@ -412,6 +413,32 @@ class SupportsRcloneMount(Protocol):
         reach the internal service DNS (workspace_upgrade_drops_cloud_mount.md).
         Same-cluster workspace pods leave it ``False`` (no public-edge hairpin).
         """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DataPlaneToken:
+    """A short-lived bearer a provider mints for one data-plane remote (the
+    ``oauth_token`` auth kind of ``features/cloud_folders_on_virtual_sessions.md``
+    § Provider neutrality). ``expires_in`` is the life left in seconds, as the
+    token endpoint said it; the executor refreshes before it ends. Never
+    logged, never persisted."""
+
+    token: str
+    expires_in: float
+
+
+@runtime_checkable
+class SupportsDataPlaneToken(Protocol):
+    """Optional capability for backends whose data plane signs in with a
+    bearer (OpenCloud). The orchestrator mints the short-lived token for an
+    ``auth`` payload this backend's own ``build_rclone_mount_spec`` produced,
+    so a Virtual Session's executor fetches tokens through the internal route
+    under its claim lease and never holds the client secret (ruling 9)."""
+
+    async def mint_data_plane_token(self, *, auth: Mapping[str, Any]) -> DataPlaneToken:
+        """Raises ``CloudBackendError`` (``NOT_SUPPORTED``) for an auth kind
+        this backend does not mint for a pooled executor."""
         ...
 
 

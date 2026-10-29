@@ -38,6 +38,7 @@ from orchestrator.routers import (
     workspace_access as workspace_access_routes,
 )
 from orchestrator.schemas.thread_admission import ThreadCreateRequest, TrustedThreadSeed
+from orchestrator.security import access
 from orchestrator.services import (
     agent_cloud_mounts,
     agent_provisioner as agent_provisioner_module,
@@ -393,6 +394,23 @@ def cloud_remote_planner(
         )
 
     return plan
+
+
+def cloud_remote_token_dependencies(resources: ApplicationResources) -> Any:
+    """The token route of a Virtual Session's cloud folders
+    (features/cloud_folders_on_virtual_sessions.md § Provider neutrality):
+    the folder is bound again with the planner's own dependencies, on this
+    application's store and cloud router, under the router's internal
+    guard."""
+    from orchestrator.services import cloud_remote_token
+
+    return cloud_remote_token.CloudRemoteTokenDependencies(
+        db=resources.postgres_db,
+        require_internal=access.require_internal,
+        cloud_mount_dependencies=functools.partial(
+            agent_cloud_mount_dependencies, resources
+        ),
+    )
 
 
 def cloud_mount_planner(

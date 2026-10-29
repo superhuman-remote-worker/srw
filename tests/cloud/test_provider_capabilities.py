@@ -69,16 +69,19 @@ class TestTheDeclarations:
         ]
 
     def test_opencloud_is_the_design_table(self):
+        # The service account's levels reach Virtual through the token route
+        # since 2026-10-29 (S5 of features/cloud_folders_on_virtual_sessions.md):
+        # the executor fetches each short-lived bearer under its claim lease.
         assert [_cell(OPENCLOUD, row) for row in MATRIX_ROWS] == [
             ("unsupported", [], None),  # RO reader code exists, uncalled
-            ("offered", ["sandbox"], None),
+            ("offered", ["sandbox", "virtual"], None),  # project · read_write
             ("unsupported", [], None),
             ("unsupported", [], None),  # deprecated impersonation, not offered
             ("unsupported", [], None),
             ("unsupported", [], None),
             ("offered", ["sandbox", "vm"], None),
             ("offered", ["sandbox", "vm"], None),
-            ("offered", ["sandbox"], None),
+            ("offered", ["sandbox", "virtual"], None),  # outbox
         ]
 
     def test_every_cell_says_how_or_why(self):

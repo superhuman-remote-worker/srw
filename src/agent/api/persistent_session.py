@@ -20,7 +20,7 @@ from dataclasses import is_dataclass as _dc_is_dataclass
 from dataclasses import replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
@@ -297,6 +297,36 @@ def _config_with_cloud_folders(
     if status_tool is not None:
         extra["_cloud_status_tool"] = status_tool
     return _dc_replace(config, extra=extra)
+
+
+def cloud_token_source_factory(
+    client: Any, *, thread_id: str, plan: Optional[Dict[str, Any]]
+) -> Optional[Callable[[Mapping[str, Any]], Any]]:
+    """How a Virtual Session's executor fetches the bearer of a cloud folder
+    delivered with the ``oauth_token`` auth kind
+    (features/cloud_folders_on_virtual_sessions.md § Provider neutrality):
+    one :class:`~agent.core.backends.cloud_token.CloudTokenSource` per folder
+    over the orchestrator client's token fetcher, under the executor's live
+    claim lease (the mutable handle, read at each call). ``None`` without a
+    client or a lease (the pinned lane, tests): such a folder then binds as
+    failed, the workspace itself unaffected."""
+    from functools import partial
+
+    from agent.api.lease_context import current_lease
+
+    lease = current_lease.get()
+    fetcher = getattr(client, "cloud_remote_token_fetcher", None)
+    if client is None or lease is None or not callable(fetcher):
+        return None
+    from agent.core.backends.cloud_token import CloudTokenSource
+
+    fetch = fetcher(thread_id, lease=lease, plan=plan or {})
+
+    def source_for(entry: Mapping[str, Any]) -> CloudTokenSource:
+        mount_id = str(entry.get("mount_id") or entry.get("name") or "")
+        return CloudTokenSource(partial(fetch, mount_id))
+
+    return source_for
 
 
 @dataclass
@@ -929,13 +959,23 @@ class PersistentSession:
             )
             if mounts and effective_backend == "virtual":
                 mounts = [mounts[0], *(cloud_remote.get("mounts") or [])]
+            plan = cloud_remote.get("plan")
+            self.cloud_remote_plan = plan if isinstance(plan, dict) else None
             lite_cfg = SimpleNamespace(backend=effective_backend, mounts=mounts)
-            workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
+            workspace_backend = create_lite_backend(
+                lite_cfg,
+                job_id=self.thread_id,
+                # A folder delivered with the oauth_token auth kind fetches
+                # its bearer per call, under this claim's lease.
+                cloud_token_source_for=cloud_token_source_factory(
+                    self.orchestrator_client,
+                    thread_id=self.thread_id,
+                    plan=self.cloud_remote_plan,
+                ),
+            )
             self._workspace_backend_for_cleanup = workspace_backend
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, workspace_backend.connect)
-            plan = cloud_remote.get("plan")
-            self.cloud_remote_plan = plan if isinstance(plan, dict) else None
             self._refresh_cloud_remote_prompt(workspace_backend)
             # Setup asks the store "does this exist?" dozens of times about
             # one small tree (scaffolding, instruction files, skill files,

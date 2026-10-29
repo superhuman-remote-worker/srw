@@ -86,9 +86,10 @@
           },
           "opencloud": {
             "status": "offered",
-            "note": "the orchestrator's Keycloak service account, a member of every project Space; the workspace holds only its short-lived tokens, which reach every project Space while they last",
+            "note": "the orchestrator's Keycloak service account, a member of every project Space; the workspace holds only its short-lived tokens, which reach every project Space while they last; a Virtual Session's executor fetches each token from the orchestrator under its claim lease and never holds the client secret",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           }
@@ -241,9 +242,10 @@
           },
           "opencloud": {
             "status": "offered",
-            "note": "a folder SRW creates in its agent-home Space and shares with the execution's owner; a session's workspace holds short-lived tokens of the orchestrator's service account",
+            "note": "a folder SRW creates in its agent-home Space and shares with the execution's owner; a session's workspace holds short-lived tokens of the orchestrator's service account; a Virtual Session's executor fetches them from the orchestrator under its claim lease",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           }

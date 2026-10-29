@@ -36,7 +36,7 @@ import selectors
 import shutil
 import subprocess
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol
 
 from shared.runtime.core.backends.object_store import (
     ObjectInfo,
@@ -59,6 +59,9 @@ _NOT_FOUND_RE = re.compile(
 )
 
 _DEFAULT_REMOTE_NAME = "srw"
+# The remote refused the credential: with a live one, the next spawn carries
+# a fresh bearer and the operation is tried once more.
+_UNAUTHORIZED_RE = re.compile(r"\b401\b|unauthorized", re.IGNORECASE)
 
 
 class RcloneSizeLimitExceeded(ObjectStoreError):
@@ -68,6 +71,19 @@ class RcloneSizeLimitExceeded(ObjectStoreError):
         super().__init__(f"rclone object exceeded the {limit}-byte read limit")
         self.limit = limit
         self.observed = observed
+
+
+class LiveRemoteCredential(Protocol):
+    """A credential the store reads at every spawn instead of keeping it in
+    its environment overlay: the short-lived bearer a Virtual Session's
+    executor fetches per call for a cloud folder of the ``oauth_token`` auth
+    kind (``agent.core.backends.cloud_token``). ``config()`` is the rclone
+    options to add for this spawn; ``rejected()`` is told when the remote
+    refused them (a 401), so the next spawn fetches afresh."""
+
+    def config(self) -> Mapping[str, str]: ...
+
+    def rejected(self) -> None: ...
 
 
 def _env_key(remote_name: str, option: str) -> str:
@@ -89,6 +105,9 @@ class RcloneObjectStore(ObjectStore):
         remote_name: Internal rclone remote alias (cosmetic; default ``srw``).
         transfer_timeout / meta_timeout: Per-op subprocess timeouts.
         rclone_bin: rclone executable name/path.
+        live_credential: A credential read at every spawn (a per-call bearer),
+            merged over ``config`` for the child process only; None keeps the
+            remote static.
     """
 
     def __init__(
@@ -101,6 +120,7 @@ class RcloneObjectStore(ObjectStore):
         transfer_timeout: int = _DEFAULT_TRANSFER_TIMEOUT,
         meta_timeout: int = _DEFAULT_META_TIMEOUT,
         rclone_bin: str = "rclone",
+        live_credential: Optional[LiveRemoteCredential] = None,
     ):
         if not remote_type:
             raise ValueError("RcloneObjectStore requires a remote_type")
@@ -108,6 +128,7 @@ class RcloneObjectStore(ObjectStore):
         self._config = dict(config or {})
         self._root = root.strip("/")
         self._remote_name = remote_name
+        self._live_credential = live_credential
         self._transfer_timeout = transfer_timeout
         self._meta_timeout = meta_timeout
         self._rclone_bin = rclone_bin
@@ -136,6 +157,16 @@ class RcloneObjectStore(ObjectStore):
     # Subprocess plumbing
     # =========================================================================
 
+    def _spawn_env(self) -> Dict[str, str]:
+        """The child's environment: the parent's, the remote's overlay and,
+        with a live credential, its options for this spawn."""
+        env = os.environ.copy()
+        env.update(self._env_overlay)
+        if self._live_credential is not None:
+            for key, value in self._live_credential.config().items():
+                env[_env_key(self._remote_name, key)] = str(value)
+        return env
+
     def _run(
         self,
         args: List[str],
@@ -143,11 +174,27 @@ class RcloneObjectStore(ObjectStore):
         input_bytes: Optional[bytes] = None,
         timeout: Optional[int] = None,
     ) -> subprocess.CompletedProcess:
-        import os
+        proc = self._run_once(args, input_bytes=input_bytes, timeout=timeout)
+        if (
+            self._live_credential is not None
+            and proc.returncode != 0
+            and _UNAUTHORIZED_RE.search(self._stderr(proc))
+        ):
+            # The remote refused the bearer: fetch afresh and try once more.
+            self._live_credential.rejected()
+            proc = self._run_once(args, input_bytes=input_bytes, timeout=timeout)
+        return proc
+
+    def _run_once(
+        self,
+        args: List[str],
+        *,
+        input_bytes: Optional[bytes] = None,
+        timeout: Optional[int] = None,
+    ) -> subprocess.CompletedProcess:
         import time as _t
 
-        env = dict(os.environ)
-        env.update(self._env_overlay)
+        env = self._spawn_env()
         _t0 = _t.perf_counter()
         try:
             return subprocess.run(
@@ -203,8 +250,7 @@ class RcloneObjectStore(ObjectStore):
         """Read one metadata response without hiding cancellation or a child."""
 
         args = [self._rclone_bin, "lsjson", "--stat", self._remote_path(key)]
-        env = dict(os.environ)
-        env.update(self._env_overlay)
+        env = self._spawn_env()
         if cancelled():
             raise ObjectStoreError("rclone lsjson cancelled")
         started = time.perf_counter()
@@ -359,8 +405,7 @@ class RcloneObjectStore(ObjectStore):
             raise FileNotFoundError(key)
         if size > max_bytes:
             raise RcloneSizeLimitExceeded(max_bytes, size)
-        env = dict(os.environ)
-        env.update(self._env_overlay)
+        env = self._spawn_env()
         try:
             proc = subprocess.Popen(
                 [self._rclone_bin, "cat", self._remote_path(key)],
@@ -669,16 +714,21 @@ def rclone_remote_name(label: str, *, fallback: str = "cloud") -> str:
 
 
 def cloud_object_store_from_spec(
-    entry: Dict[str, Any], *, remote_name: str
+    entry: Dict[str, Any],
+    *,
+    remote_name: str,
+    live_credential: Optional[LiveRemoteCredential] = None,
 ) -> ObjectStore:
     """Build the store for one cloud folder entry of ``workspace.mounts``
     (``features/cloud_folders_on_virtual_sessions.md`` § The remote
     descriptor) under its own rclone alias, so several remotes in one
     process never share an ``RCLONE_CONFIG_<NAME>_*`` namespace.
 
-    The entry carries ``rclone_spec`` = ``{type, config, root}`` with the
-    credential folded in the way rclone wants it; ``memory`` builds an
-    in-memory store for tests and local smoke runs.
+    The entry carries ``rclone_spec`` = ``{type, config, root}`` with a
+    static credential folded in the way rclone wants it, or none when
+    ``live_credential`` supplies a per-call bearer (the ``oauth_token`` auth
+    kind); ``memory`` builds an in-memory store for tests and local smoke
+    runs.
     """
     rspec = (entry or {}).get("rclone_spec") or {}
     remote_type = rspec.get("type")
@@ -695,4 +745,5 @@ def cloud_object_store_from_spec(
         config=rspec.get("config") or {},
         root=rspec.get("root") or "",
         remote_name=remote_name,
+        live_credential=live_credential,
     )

@@ -290,9 +290,9 @@ class TestOfferedAccess:
         assert driver.offered_access(_row(), _session("vm", backend)) == ()
         # A Virtual Session holds it in the executor process (ruling 2 of
         # features/cloud_folders_on_virtual_sessions.md); OpenCloud's bearer
-        # token follows in the feature's second run.
+        # reaches it through the token route since S5 (2026-10-29).
         assert driver.offered_access(_row(), _session("virtual", backend)) == (
-            ("read_write",) if backend == "nextcloud" else ()
+            "read_write",
         )
 
     def test_a_jobs_copy_is_offered_on_any_tier(self):

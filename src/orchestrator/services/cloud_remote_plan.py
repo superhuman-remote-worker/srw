@@ -17,9 +17,12 @@ re-attaches on any executor), and records what it planned in
 ``threads.metadata.cloud_mount_status`` (``delivery: remote``), which the
 agent's probe then completes through the report route.
 
-What the sidecar cannot carry, this cannot either, for now: a bearer-token
-remote (OpenCloud) is left out with ``delivery_unsupported`` until the token
-route of the feature's second run (ruling 9).
+A remote whose provider signs in with a bearer (OpenCloud) travels without any
+credential, as the ``oauth_token`` auth kind: the executor fetches the folder's
+short-lived token from the internal token route under its claim lease
+(``services/cloud_remote_token.py``), so the provider's client secret never
+reaches the pooled executor (ruling 9). A bearer the route does not mint (an
+impersonated user) is still left out with ``delivery_unsupported``.
 """
 
 from __future__ import annotations
@@ -39,6 +42,21 @@ logger = logging.getLogger(__name__)
 
 #: The file-tools root folder every cloud folder lives under, on every tier.
 CLOUD_ROOT = "cloud"
+#: The auth kinds of a bound mount whose bearer the orchestrator mints per
+#: call for a Virtual Session's executor (the token route): the provider's
+#: service-account kind. Impersonation stays with the sidecar.
+TOKEN_ROUTE_AUTH_KINDS = frozenset({"keycloak_client_credentials"})
+#: The descriptor auth kind the executor answers through the token route.
+OAUTH_TOKEN = "oauth_token"
+#: rclone options that would carry a credential; never part of a token
+#: entry's config, whatever a provider's source config says.
+_CREDENTIAL_OPTIONS = (
+    "pass",
+    "password",
+    "bearer_token",
+    "bearer_token_command",
+    "token",
+)
 
 
 @dataclass(frozen=True)
@@ -87,17 +105,16 @@ class CloudRemotePlan:
 def remote_entry(built: Mapping[str, Any]) -> dict[str, Any] | None:
     """A bound mount (``_build_rclone_mount_from_row``) as the descriptor
     the Virtual backend's factory reads, or ``None`` when the executor
-    cannot serve it yet (anything but a static WebDAV password)."""
+    cannot serve it: anything but a static WebDAV password (``basic``) or a
+    bearer the orchestrator mints through the token route (``oauth_token``,
+    :data:`TOKEN_ROUTE_AUTH_KINDS`)."""
     source = built.get("source") or {}
     auth = built.get("auth") or {}
-    password = auth.get("password")
     config = source.get("config") or {}
     name = str(built.get("workspace_name") or "")
+    kind = auth.get("type")
     if (
         source.get("type") != "webdav"
-        or auth.get("type") != "basic"
-        or not isinstance(password, str)
-        or not password
         or not isinstance(config, Mapping)
         or not config.get("url")
         or not name
@@ -105,9 +122,23 @@ def remote_entry(built: Mapping[str, Any]) -> dict[str, Any] | None:
     ):
         return None
     rclone_config = {str(key): str(value) for key, value in config.items()}
-    # Obscuring is encoding, not encryption (rclone's own format): the entry
-    # travels in-flight only and is never persisted.
-    rclone_config["pass"] = rclone_obscure(password)
+    if kind == "basic":
+        password = auth.get("password")
+        if not isinstance(password, str) or not password:
+            return None
+        # Obscuring is encoding, not encryption (rclone's own format): the
+        # entry travels in-flight only and is never persisted.
+        rclone_config["pass"] = rclone_obscure(password)
+        entry_auth: dict[str, Any] = {"type": "basic"}
+    elif kind in TOKEN_ROUTE_AUTH_KINDS:
+        # The bearer is minted per call by the orchestrator under the
+        # executor's claim lease; nothing of the provider's own credential
+        # travels in the entry.
+        for option in _CREDENTIAL_OPTIONS:
+            rclone_config.pop(option, None)
+        entry_auth = {"type": OAUTH_TOKEN}
+    else:
+        return None
     access = "read_only" if built.get("access") == "read_only" else "read_write"
     return {
         "name": name,
@@ -122,13 +153,13 @@ def remote_entry(built: Mapping[str, Any]) -> dict[str, Any] | None:
             "config": rclone_config,
             "root": str(source.get("root") or ""),
         },
-        "auth": {"type": "basic"},
+        "auth": entry_auth,
     }
 
 
 def remote_refusal(built: Mapping[str, Any]) -> dict[str, str]:
-    """A bound mount the executor cannot serve (a bearer-token remote), named
-    instead of delivered."""
+    """A bound mount the executor cannot serve (a bearer the token route does
+    not mint, such as an impersonated user's), named instead of delivered."""
     refusal = {
         "source_ref": str(built.get("source_ref") or built.get("mount_id") or ""),
         "mount_kind": str(built.get("mount_kind") or "project"),
@@ -210,6 +241,8 @@ async def resolve_cloud_remote_plan(
 
 __all__ = [
     "CLOUD_ROOT",
+    "OAUTH_TOKEN",
+    "TOKEN_ROUTE_AUTH_KINDS",
     "CloudRemotePlan",
     "remote_entry",
     "remote_refusal",

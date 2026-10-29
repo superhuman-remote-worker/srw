@@ -19,7 +19,7 @@ call :func:`create_lite_backend` only for the new, shell-less tiers. Lite
 backends need no SSH, no readiness-wait, and no privileged/workspace pod.
 """
 
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from shared.runtime.core.workspace_backend import WorkspaceBackend
 
@@ -34,16 +34,29 @@ from shared.backend_kinds import (
 )
 
 
-def cloud_remote_from_entry(entry: Mapping[str, Any]) -> "CloudRemote":
+#: The descriptor auth kind whose bearer the executor fetches per call from
+#: the orchestrator's token route (``cloud_remote_plan.OAUTH_TOKEN``).
+OAUTH_TOKEN_AUTH = "oauth_token"
+
+
+def cloud_remote_from_entry(
+    entry: Mapping[str, Any],
+    *,
+    token_source_for: Callable[[Mapping[str, Any]], Any] | None = None,
+) -> "CloudRemote":
     """One cloud folder entry of ``workspace.mounts`` as a
     :class:`~agent.core.backends.virtual.CloudRemote`.
 
     The entry (§ The remote descriptor of the feature note) carries ``name``
     (``outbox``, the project's slug, ``my_cloud``; ``cloud/<name>`` is
     accepted too), ``access``, ``mount_kind``, ``mount_id``, ``shared`` for an
-    outbox, and ``rclone_spec`` = ``{type, config, root}``. Each folder gets
-    its own rclone alias so several remotes in one process never share an
-    environment namespace.
+    outbox, ``rclone_spec`` = ``{type, config, root}`` and ``auth``. Each
+    folder gets its own rclone alias so several remotes in one process never
+    share an environment namespace. An entry of the ``oauth_token`` auth kind
+    carries no credential: ``token_source_for(entry)`` supplies the live one
+    (``agent.core.backends.cloud_token``); without it the folder binds with a
+    source that refuses, so it reports as failed rather than failing the
+    workspace.
 
     Raises:
         ValueError: The entry has no name or no remote type.
@@ -60,11 +73,24 @@ def cloud_remote_from_entry(entry: Mapping[str, Any]) -> "CloudRemote":
     if not name or "/" in name:
         raise ValueError(f"cloud folder entry has no usable name: {name!r}")
     shared = entry.get("shared")
+    auth = entry.get("auth")
+    live_credential = None
+    if isinstance(auth, Mapping) and auth.get("type") == OAUTH_TOKEN_AUTH:
+        if callable(token_source_for):
+            live_credential = token_source_for(entry)
+        else:
+            from agent.core.backends.cloud_token import unavailable_token_source
+
+            live_credential = unavailable_token_source(
+                "this executor has no token route for the cloud folder"
+            )
     return CloudRemote(
         name=name,
         path=f"{CLOUD_ROOT}/{name}",
         store=cloud_object_store_from_spec(
-            dict(entry), remote_name=rclone_remote_name(f"cloud_{name}")
+            dict(entry),
+            remote_name=rclone_remote_name(f"cloud_{name}"),
+            live_credential=live_credential,
         ),
         access=str(entry.get("access") or "read_write"),
         kind=str(entry.get("mount_kind") or ""),
@@ -79,6 +105,7 @@ def create_lite_backend(
     job_id: str,
     max_read_bytes: int | None = None,
     cloud_folders: bool = True,
+    cloud_token_source_for: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> WorkspaceBackend:
     """Construct the lite backend for ``virtual``/``none``.
 
@@ -93,6 +120,10 @@ def create_lite_backend(
             are bound. The workspace upgrade's seed and the legacy mirror
             push pass False: they copy or push the workspace prefix, never a
             user's cloud.
+        cloud_token_source_for: How a cloud folder of the ``oauth_token``
+            auth kind gets its per-call bearer
+            (:func:`cloud_remote_from_entry`); None binds such a folder as
+            failed.
 
     Raises:
         ValueError: If called for a non-lite backend, or ``virtual`` has no
@@ -119,7 +150,10 @@ def create_lite_backend(
         store = object_store_from_spec(mount)
         prefix = mount.get("prefix") or f"jobs/{job_id}/"
         remotes = (
-            [cloud_remote_from_entry(entry) for entry in mounts[1:]]
+            [
+                cloud_remote_from_entry(entry, token_source_for=cloud_token_source_for)
+                for entry in mounts[1:]
+            ]
             if cloud_folders
             else []
         )

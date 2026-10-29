@@ -75,10 +75,37 @@ async def _plan(deps, **fields: Any):
 
 
 def _opencloud_folder_row() -> dict[str, Any]:
-    """A folder on a provider the Virtual delivery does not serve yet."""
+    """A folder on the provider :func:`_container_only_provider` narrows."""
     row = _folder_row()
     row["config"] = {**row["config"], "backend_id": "opencloud"}
     return row
+
+
+def _container_only_provider(monkeypatch) -> None:
+    """A provider whose folders a Container gets and Virtual does not: the
+    shape of any provider without the token route (OpenCloud's own table
+    until S5 of the feature, 2026-10-29). Admission reads the table through
+    ``orchestrator.services.cloud.provider_capabilities`` at each call, so
+    the narrowed OpenCloud table stands in for such a provider here."""
+    from dataclasses import replace
+
+    from orchestrator.services import cloud as cloud_package
+
+    real = cloud_package.provider_capabilities
+
+    def container_only(backend_id):
+        declared = real(backend_id)
+        if declared is None or str(backend_id) != "opencloud":
+            return declared
+        return replace(
+            declared,
+            capabilities=tuple(
+                replace(cap, supported_backends=cap.supported_backends - {"virtual"})
+                for cap in declared.capabilities
+            ),
+        )
+
+    monkeypatch.setattr(cloud_package, "provider_capabilities", container_only)
 
 
 @pytest.mark.asyncio
@@ -105,9 +132,11 @@ async def test_a_protected_request_for_its_cloud_folder_gets_a_container():
 
 
 @pytest.mark.asyncio
-async def test_a_provider_without_a_virtual_delivery_gets_a_container():
-    """OpenCloud's bearer token reaches a Virtual Session only in the feature's
-    second run: until then its folders take a Container as before."""
+async def test_a_provider_without_a_virtual_delivery_gets_a_container(monkeypatch):
+    """A provider whose table offers the folder on a Container only (any
+    provider without the token route): its folders take a Container as
+    before."""
+    _container_only_provider(monkeypatch)
     plan = await _plan(_deps_with([_opencloud_folder_row()]), datasource_ids=[FOLDER])
 
     assert _backend(plan) == "sandbox"
@@ -122,9 +151,10 @@ async def test_a_session_without_cloud_connectors_stays_virtual():
 
 
 @pytest.mark.asyncio
-async def test_an_explicit_virtual_choice_is_kept():
+async def test_an_explicit_virtual_choice_is_kept(monkeypatch):
     # The user chose the tier: their choice, even for a provider Virtual
-    # does not serve yet; the folder is selected and named at delivery.
+    # does not serve; the folder is selected and named at delivery.
+    _container_only_provider(monkeypatch)
     plan = await _plan(
         _deps_with([_opencloud_folder_row()]),
         datasource_ids=[FOLDER],
@@ -141,7 +171,10 @@ async def test_an_explicit_virtual_choice_is_kept():
     [{"containers": False}, {"container_granted": False}],
     ids=["no-container-provisioner", "container-not-granted"],
 )
-async def test_without_an_allowed_container_the_session_stays_virtual(unavailable):
+async def test_without_an_allowed_container_the_session_stays_virtual(
+    unavailable, monkeypatch
+):
+    _container_only_provider(monkeypatch)
     plan = await _plan(
         _deps_with([_opencloud_folder_row()], **unavailable), datasource_ids=[FOLDER]
     )
@@ -208,8 +241,8 @@ def _tier_refuses_the_outbox(deps):
 
 
 def _outbox_on_opencloud(deps):
-    """The owner's cloud is OpenCloud, whose outbox the Virtual delivery does
-    not serve yet (the bearer token follows in the feature's second run)."""
+    """The owner's cloud is the provider :func:`_container_only_provider`
+    narrows, whose outbox the Virtual delivery then does not serve."""
     from dataclasses import replace
 
     return replace(
@@ -251,10 +284,13 @@ async def test_a_virtual_session_records_the_cloud_folders_it_leaves_out():
     [({}, True), ({"containers": False}, False), ({"container_granted": False}, False)],
     ids=["container", "no-container-provisioner", "container-not-granted"],
 )
-async def test_the_new_session_form_predicts_the_container(unavailable, expected):
+async def test_the_new_session_form_predicts_the_container(
+    unavailable, expected, monkeypatch
+):
     """The form's preview asks admission's own rule for the defaults it
-    submits: an outbox on a provider Virtual does not serve yet still takes
-    a Container."""
+    submits: an outbox on a provider Virtual does not serve still takes a
+    Container."""
+    _container_only_provider(monkeypatch)
     deps = _outbox_on_opencloud(_defaults_deps(**unavailable))
 
     assert (
@@ -331,9 +367,10 @@ async def test_a_refused_project_predicts_no_container():
 
 
 @pytest.mark.asyncio
-async def test_the_form_predicts_from_the_connectors_it_submits():
+async def test_the_form_predicts_from_the_connectors_it_submits(monkeypatch):
     """Unticked in the form, the cloud folder takes no Container; ticked, a
     folder Virtual cannot serve does, even where it isn't a default."""
+    _container_only_provider(monkeypatch)
     deps = _deps_with([_opencloud_folder_row()])
     deps.store.list_default_datasource_candidates = AsyncMock(return_value=[_kb_row()])
     assert (
@@ -384,11 +421,14 @@ def _listing_deps(**over: Any):
 
 
 @pytest.mark.asyncio
-async def test_a_chosen_virtual_with_a_list_records_the_defaults_it_cannot_serve():
+async def test_a_chosen_virtual_with_a_list_records_the_defaults_it_cannot_serve(
+    monkeypatch,
+):
     """The cockpit always sends a list and greys out what a chosen Virtual
     can't serve: a default the Virtual tier refuses is still named as left
     out, so the notice, the agent and an upgrade know it (owner 2026-10-21).
     The owner's outbox is served on Virtual now, so it is not among them."""
+    _container_only_provider(monkeypatch)
     plan = await _plan(
         _listing_deps(),
         datasource_ids=[KB],

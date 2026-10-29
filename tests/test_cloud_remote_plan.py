@@ -2,7 +2,9 @@
 (features/cloud_folders_on_virtual_sessions.md § Orchestrator, § Status):
 
 * a bound Nextcloud mount becomes one descriptor with the password folded in
-  the way rclone wants it; a bearer-token mount is left out with a reason;
+  the way rclone wants it; a bearer mount of the service-account kind becomes
+  an ``oauth_token`` descriptor without any credential (the executor fetches
+  the token per call); an impersonated bearer is left out with a reason;
 * the planner reuses the Container's binding chain on the ``virtual`` tier and
   answers ``None`` where nothing is bound and nothing was left out;
 * the status record it writes is the one the agent's probe reports against,
@@ -76,10 +78,44 @@ class TestRemoteEntry:
         assert crp.remote_entry(_built(access="read_only"))["access"] == "read_only"
         assert crp.remote_entry(_built(access="weird"))["access"] == "read_write"
 
+    def test_a_service_account_bearer_becomes_a_token_route_entry(self):
+        built = _built(
+            "oc",
+            kind="project",
+            auth={
+                "type": "keycloak_client_credentials",
+                "issuer": "https://auth.example/realms/srw",
+                "client_id": "opencloud-orchestrator",
+                "client_secret": "very-secret",
+            },
+        )
+        built["backend"] = "opencloud"
+        built["source"]["config"] = {
+            "url": "https://cloud.example/dav/spaces/drive-1/",
+            "vendor": "infinitescale",
+            # Never part of a token entry, whatever a source config says.
+            "bearer_token": "stale",
+        }
+        entry = crp.remote_entry(built)
+        assert entry is not None
+        assert entry["auth"] == {"type": crp.OAUTH_TOKEN}
+        assert entry["rclone_spec"] == {
+            "type": "webdav",
+            "config": {
+                "url": "https://cloud.example/dav/spaces/drive-1/",
+                "vendor": "infinitescale",
+            },
+            "root": "sessions/oc",
+        }
+        assert entry["backend"] == "opencloud" and entry["mount_id"] == "m-oc"
+        text = str(entry)
+        assert "very-secret" not in text and "stale" not in text
+        assert "client_id" not in text and "issuer" not in text
+
     @pytest.mark.parametrize(
         "broken",
         [
-            {"auth": {"type": "keycloak_client_credentials"}},
+            {"auth": {"type": "keycloak_user_impersonation", "target_user_sub": "u"}},
             {"auth": {"type": "basic", "password": ""}},
         ],
     )
@@ -130,6 +166,14 @@ class TestResolvePlan:
                     _built(),
                     _built("atlas", kind="project", access="read_only"),
                     _built("oc", auth={"type": "keycloak_client_credentials"}),
+                    _built(
+                        "home",
+                        kind="user_root",
+                        auth={
+                            "type": "keycloak_user_impersonation",
+                            "target_user_sub": "u-1",
+                        },
+                    ),
                 ],
                 excluded=[
                     {
@@ -152,8 +196,13 @@ class TestResolvePlan:
         )
         assert seen == {"workspace_backend": "virtual", "runtime_is_vm": False}
         assert plan is not None
-        assert [e["path"] for e in plan.entries] == ["cloud/outbox", "cloud/atlas"]
+        assert [e["path"] for e in plan.entries] == [
+            "cloud/outbox",
+            "cloud/atlas",
+            "cloud/oc",
+        ]
         assert plan.entries[0]["shared"] is True and "shared" not in plan.entries[1]
+        assert plan.entries[2]["auth"] == {"type": "oauth_token"}
         assert [(e["reason"], e.get("detail")) for e in plan.excluded] == [
             ("not_eligible", None),
             ("delivery_unsupported", "bearer_token"),
@@ -165,6 +214,7 @@ class TestResolvePlan:
         ] == [
             ("outbox", "cloud/outbox", "read_write"),
             ("atlas", "cloud/atlas", "read_only"),
+            ("oc", "cloud/oc", "read_write"),
         ]
         assert "pass" not in str(record) and "s3cret" not in str(record)
         payload = plan.agent_payload()
@@ -172,7 +222,7 @@ class TestResolvePlan:
             "fingerprint": plan.fingerprint,
             "incarnation": plan.incarnation,
         }
-        assert len(payload["mounts"]) == 2
+        assert len(payload["mounts"]) == 3
         # The same body fingerprints the same; each delivery is its own claim.
         again = asyncio.run(
             crp.resolve_cloud_remote_plan(
