@@ -61,8 +61,9 @@ MCP servers; a limit of 200 turns, a budget of 20 USD and a wall-clock bound of
 3600 seconds. The harness image holds itself to the rule that nothing a Job
 supplies reaches code execution. Python starts in isolated mode (`python3 -I`),
 so environment variables such as `PYTHONPATH` cannot make the interpreter load
-code before the harness runs, and the process environment is cleared of everything but `PATH` before
-the CLI starts, so the pod's other variables (the internal key, the database
+code before the harness runs. The process environment is cleared of everything but `PATH`,
+`USER` and `LOGNAME` (the image's account name, which asyncssh needs under the pod's uid)
+before the CLI starts, so the pod's other variables (the internal key, the database
 credentials) never reach the CLI or the model.
 
 ## Tools
