@@ -245,6 +245,21 @@ class TestDetermineJobStatus:
         assert status is None
         assert err is None
 
+    def test_harness_completion_without_goal_achieved_waits_in_review(self):
+        """A custom harness's job_complete report (goal_achieved false, no
+        verification) lands in pending_review like SRW's own agent's."""
+        job = make_job(
+            verification_enabled=False,
+            freeze_data={
+                "status": "job_completed",
+                "freeze_type": "job_complete",
+                "summary": "done",
+                "deliverables": ["hello.txt"],
+            },
+        )
+        result = {"should_stop": True, "goal_achieved": False, "error": None}
+        assert determine_job_status(job, result) == ("pending_review", None)
+
     def test_critic_job_approved(self):
         """Critic jobs with approved verdict get status from freeze_data."""
         job = make_job(

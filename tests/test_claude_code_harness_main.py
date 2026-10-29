@@ -226,11 +226,11 @@ async def test_a_job_runs_end_to_end_and_reports_completion(tmp_path, sshd, caps
 
     [complete] = orch.completions()
     root = sshd.access.root
-    assert complete["should_stop"] is True and complete["goal_achieved"] is True
+    assert complete["should_stop"] is True and complete["goal_achieved"] is False
     assert complete["error"] is None and complete["agent_id"] == AGENT_ID
     freeze = complete["freeze_data"]
     assert freeze["summary"] == "All done."
-    assert freeze["deliverables"] == [f"{root}/out/report.md"]
+    assert freeze["deliverables"] == ["out/report.md"]
     assert freeze["status"] == "job_completed" and freeze["job_id"] == JOB_ID
     assert freeze["model"] == "claude-test"
     assert complete["pinned_delivery_id"] == "delivery-1"
@@ -410,7 +410,7 @@ async def test_should_drain_while_a_job_runs_is_ignored(tmp_path, sshd):
     assert response.status_code == 202
     assert await running.exit_code() == entry.EXIT_OK
     [complete] = orch.completions()
-    assert complete["goal_achieved"] is True
+    assert complete["goal_achieved"] is False
 
 
 @pytest.mark.asyncio

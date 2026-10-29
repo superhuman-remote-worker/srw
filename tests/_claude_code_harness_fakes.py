@@ -119,8 +119,10 @@ DUMMY_REMOTE = {
 }
 
 
-def start_body(remote=None, *, protocol="anthropic-messages", job_id=JOB_ID):
-    return {
+def start_body(
+    remote=None, *, protocol="anthropic-messages", job_id=JOB_ID, autonomy=None
+):
+    body = {
         "job_id": job_id,
         "description": "Write the report.",
         "instructions": "Be terse.",
@@ -142,6 +144,9 @@ def start_body(remote=None, *, protocol="anthropic-messages", job_id=JOB_ID):
         "pinned_delivery_proof": PROOF,
         "recipient": recipient(job_id),
     }
+    if autonomy is not None:
+        body["resolved_config"]["agent"]["autonomy"] = autonomy
+    return body
 
 
 def recipient(job_id=JOB_ID):

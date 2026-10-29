@@ -71,16 +71,17 @@ async def test_a_successful_session_becomes_a_reviewable_report(tmp_path, sshd):
     )
     report = await runner.run(_spec(remote_for(sshd.access)))
     root = sshd.access.root
+    # Default autonomy is "partial": the job waits in Review, as SRW's agent's does.
     assert (report.should_stop, report.goal_achieved, report.error) == (
         True,
-        True,
+        False,
         None,
     )
     freeze = report.freeze_data
     assert freeze["status"] == "job_completed"
     assert freeze["freeze_type"] == "job_complete"
     assert freeze["summary"] == "Report written."
-    assert freeze["deliverables"] == [f"{root}/a.md", f"{root}/b.md"]
+    assert freeze["deliverables"] == ["a.md", "b.md"]
     assert freeze["confidence"] == 1.0 and freeze["job_id"] == "job-1"
     assert freeze["model"] == "claude-test"
     assert datetime.fromisoformat(freeze["timestamp"]).tzinfo is not None
@@ -232,5 +233,33 @@ async def test_the_workspace_is_closed_after_the_run(tmp_path, sshd):
         connect=connect,
         client_factory=fake_client_factory([], [result_message()]),
     )
-    assert (await runner.run(_spec(remote_for(sshd.access)))).goal_achieved is True
+    report = await runner.run(_spec(remote_for(sshd.access)))
+    assert report.error is None and report.freeze_data is not None
     assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_full_autonomy_reports_the_goal_achieved(tmp_path, sshd):
+    sdk_or_skip()
+    runner = _runner(
+        tmp_path,
+        connect=connect_via(sshd, []),
+        client_factory=fake_client_factory([], [result_message()]),
+    )
+    spec = _spec(remote_for(sshd.access), autonomy="full")
+    report = await runner.run(spec)
+    assert report.goal_achieved is True and report.error is None
+
+
+@pytest.mark.asyncio
+async def test_partial_autonomy_leaves_the_job_for_review(tmp_path, sshd):
+    sdk_or_skip()
+    runner = _runner(
+        tmp_path,
+        connect=connect_via(sshd, []),
+        client_factory=fake_client_factory([], [result_message()]),
+    )
+    spec = _spec(remote_for(sshd.access), autonomy="partial")
+    report = await runner.run(spec)
+    assert report.goal_achieved is False
+    assert report.freeze_data["status"] == "job_completed"

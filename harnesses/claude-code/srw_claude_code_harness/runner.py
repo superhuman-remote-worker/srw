@@ -19,7 +19,7 @@ import posixpath
 import sys
 from collections.abc import Awaitable, Iterable
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .job import JobRejected, JobSpec, require_anthropic_route
@@ -47,6 +47,18 @@ def progress(message: str) -> None:
 
 def warn(message: str) -> None:
     print(f"[srw-harness] {message}", file=sys.stderr, flush=True)
+
+
+def _relative_to(root: str, paths) -> list[str]:
+    """Workspace-relative deliverables, as SRW's agent reports them."""
+    base = PurePosixPath(root)
+    relative = []
+    for path in paths:
+        try:
+            relative.append(str(PurePosixPath(path).relative_to(base)))
+        except ValueError:
+            relative.append(str(path))
+    return sorted(relative)
 
 
 def error_report(message: str, *, kind: str = "job_error") -> CompletionReport:
@@ -196,15 +208,19 @@ class JobRunner:
                 progress(f"session ended: {failure}")
                 return error_report(failure)
             progress("session ended: success")
+            # Like SRW's agent: the goal counts as achieved only under full
+            # autonomy; otherwise the finished job waits in Review.
             return CompletionReport(
                 True,
-                True,
+                spec.autonomy == "full",
                 None,
                 {
                     "status": "job_completed",
                     "freeze_type": "job_complete",
                     "summary": getattr(outcome.result, "result", None) or "",
-                    "deliverables": sorted(handlers.written_paths),
+                    "deliverables": _relative_to(
+                        workspace.root, handlers.written_paths
+                    ),
                     "confidence": 1.0,
                     "job_id": spec.job_id,
                     "timestamp": datetime.now(timezone.utc).isoformat(),

@@ -139,3 +139,27 @@ def test_secrets_stay_out_of_the_repr():
     for secret in ("sk-secret-key", "proof-secret", "someone-secret"):
         assert secret not in text
     assert spec.model.api_key == "sk-secret-key"
+
+
+def test_autonomy_defaults_to_partial_and_reads_the_agent_config():
+    assert parse_job_start(START_BODY).autonomy == "partial"
+    body = copy.deepcopy(START_BODY)
+    body["resolved_config"]["agent"]["autonomy"] = "full"
+    assert parse_job_start(body).autonomy == "full"
+
+
+def test_an_unknown_autonomy_is_partial():
+    body = copy.deepcopy(START_BODY)
+    body["resolved_config"]["agent"]["autonomy"] = "bogus"
+    assert parse_job_start(body).autonomy == "partial"
+
+
+def test_autonomy_falls_back_to_config_override():
+    body = copy.deepcopy(START_BODY)
+    body["resolved_config"] = None
+    body["config_override"] = {
+        "llm": LLM,
+        "workspace": {"remote": REMOTE},
+        "autonomy": "full",
+    }
+    assert parse_job_start(body).autonomy == "full"

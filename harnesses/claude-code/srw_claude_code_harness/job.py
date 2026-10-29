@@ -39,6 +39,11 @@ class Limits:
     timeout_seconds: int = 3600
 
 
+# The levels SRW's agent accepts (loader.VALID_AUTONOMY_LEVELS); anything else
+# reads as the default, "partial".
+AUTONOMY_LEVELS = frozenset({"full", "review", "partial", "guided", "dependent"})
+
+
 @dataclass(frozen=True)
 class JobSpec:
     job_id: str
@@ -50,6 +55,9 @@ class JobSpec:
     recipient: dict | None = field(repr=False)
     limits: Limits
     effort: str | None
+    # The job's autonomy level (SRW's agent defaults to "partial"); only "full"
+    # reports the goal as achieved, the rest waits in Review.
+    autonomy: str = "partial"
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -84,6 +92,7 @@ def parse_job_start(
         raise JobRejected("the job carries no model")
 
     effort = llm.get("reasoning_level")
+    autonomy = agent.get("autonomy") or override.get("autonomy")
     pin_fields = (
         body.get("pinned_delivery_id"),
         body.get("pinned_projection_digest"),
@@ -113,6 +122,7 @@ def parse_job_start(
         recipient=dict(recipient) if isinstance(recipient, Mapping) else None,
         limits=Limits(),
         effort=effort if effort in EFFORT_LEVELS else None,
+        autonomy=autonomy if autonomy in AUTONOMY_LEVELS else "partial",
     )
 
 

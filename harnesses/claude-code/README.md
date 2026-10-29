@@ -106,8 +106,10 @@ The workspace image needs `bash`, coreutils (`timeout`), `tar` and `find`.
 
 On success the report carries `freeze_data` with `status: "job_completed"`,
 `freeze_type: "job_complete"`, the model's final message as `summary`,
-`deliverables` (the paths the `Write` and `Edit` tools touched, sorted) and
-`confidence`. The Review page shows these.
+`deliverables` (the paths the `Write` and `Edit` tools touched, relative to the workspace
+root, sorted) and `confidence`. The Review page shows these. `goal_achieved` is
+`true` only when the Job's autonomy is `full`, as for SRW's own agent; otherwise
+the finished Job waits in Review.
 
 The session transcript is copied to `.srw/claude-code/transcript.jsonl` in the
 workspace, on a best-effort basis, so the result can be reviewed with the

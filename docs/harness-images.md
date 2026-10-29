@@ -196,6 +196,7 @@ What you read from the request:
 | `resolved_config.agent.llm` | `model`, `provider`, `client_protocol`, `base_url`, `api_key` for the model to call |
 | `resolved_config.agent.workspace.remote` | `host`, `port`, `username`, `key_path`, `workspace_path` of the workspace to work in over SSH |
 | `workspace_ssh_host_key_fingerprint` | The workspace's host key as `SHA256:<base64>` |
+| `resolved_config.agent.autonomy` | The Job's autonomy level; `full` or another (`partial` when absent) |
 | `recipient`, `pinned_*` | The check above and the fields to echo |
 
 `config_override` is `None` whenever `resolved_config` is sent. Check the
@@ -213,13 +214,16 @@ answer. Do not call `complete`; the cancellation is the outcome.
 
 `POST /api/jobs/{job_id}/complete` with:
 
-- `agent_id`, and `should_stop`, `goal_achieved`, `error` (`null` on success);
+- `agent_id`, and `should_stop`, `goal_achieved`, `error` (`null` on success).
+  `goal_achieved` is `true` only when the Job's autonomy (`resolved_config.agent.autonomy`,
+  default `partial`) is `full`, as for SRW's own agent. Otherwise send `false`: the
+  finished Job then waits in Review;
 - the pinned fields you echoed, `pinned_delivery_proof` as received, plus
   `pinned_process_generation` (the `dispatch_process_generation` from
   registration) and `pinned_pod_uid`;
 - `freeze_data`, which the Review page reads: `status: "job_completed"`,
   `freeze_type: "job_complete"`, `summary`, `deliverables` (a list of
-  workspace paths) and `confidence` (a number; the Claude Code image sends `1.0`) for a reviewable
+  paths relative to the workspace root, such as `hello.txt`) and `confidence` (a number; the Claude Code image sends `1.0`) for a reviewable
   result.
 
 Report a failure as `error: {"message": ..., "type": ..., "recoverable": ...}`.
