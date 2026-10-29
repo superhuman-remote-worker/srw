@@ -194,7 +194,9 @@ class VoiceLLM(OpenAILLMService):
     """Streaming chat completions with the delegate tool, thinking off.
 
     ``prepare`` sees the context before each request; returning False skips
-    the request (the engine's bookkeeping, see ``engine.CascadeEngine``)."""
+    the request (the engine's bookkeeping, see ``engine.CascadeEngine``).
+    ``on_reply(spoke, called)`` hears how each request that ran to its end
+    went (not one an interruption cancelled)."""
 
     def __init__(
         self,
@@ -203,6 +205,7 @@ class VoiceLLM(OpenAILLMService):
         system: str,
         timings: Timings,
         prepare: Callable[[object], bool] | None = None,
+        on_reply: Callable[[bool, bool], None] | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -219,11 +222,17 @@ class VoiceLLM(OpenAILLMService):
         self._stage = settings
         self._timings = timings
         self._prepare = prepare
+        self._on_reply = on_reply
         self._first_token = False
         #: Whether the response in flight said anything before a tool call.
         self.spoke = False
+        #: Whether the response in flight called a tool.
+        self.called = False
         #: Whether a request is in flight.
         self.generating = False
+        #: Requests sent so far; one runs at a time, so a finished one is
+        #: the latest.
+        self.started = 0
         self._held = ""
         self._markup = 0
 
@@ -257,12 +266,14 @@ class VoiceLLM(OpenAILLMService):
 
     async def _process_context(self, context):
         self.spoke = False
+        self.called = False
         self._first_token = False
         self._held = ""  # a lone "<" at a reply's end is no speech either
         self._markup = 0
         if self._prepare is not None and not self._prepare(context):
             return
         self.generating = True
+        self.started += 1
         self._timings.llm_started()
         try:
             await super()._process_context(context)
@@ -270,6 +281,8 @@ class VoiceLLM(OpenAILLMService):
             pass  # what was speakable went out already
         finally:
             self.generating = False
+        if self._on_reply is not None:
+            self._on_reply(self.spoke, self.called)
 
     def _token(self):
         if not self._first_token:
@@ -293,6 +306,7 @@ class VoiceLLM(OpenAILLMService):
 
     async def run_function_calls(self, function_calls):
         self._token()
+        self.called = self.called or bool(function_calls)
         await super().run_function_calls(function_calls)
 
 

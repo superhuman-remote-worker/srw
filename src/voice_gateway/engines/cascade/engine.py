@@ -43,6 +43,13 @@ one of ``hold_phrases`` (never the same twice in a row), at most
 ``hold_max`` holding sentences, the filler and the back office's lines
 included, each later one needs ``hold_later_secs`` of quiet: a caller who
 has heard them knows the voice is still there.
+
+An answer must be said. When the first reply after it says nothing and
+calls no tool (Gemma 4 sometimes reasons after an answer and stops there,
+§9.14), the LLM is asked once more with the answer as a note; when that
+says nothing either, the voice speaks the answer as it came. An answer to
+an earlier request while a later one is open may rightly be left unsaid for
+now, so it gets no such net.
 """
 
 from __future__ import annotations
@@ -197,6 +204,11 @@ class CascadeEngine:
         self._random = random.Random()
         #: When the voice last started a sentence, and the sentence.
         self._last_said: tuple[float, str] | None = None
+        #: The answer the caller has not heard yet, and the LLM request after
+        #: which a reply counts for it; whether the LLM was asked again.
+        self._answer_owed: str | None = None
+        self._owed_after = 0
+        self._asked_again = False
         self._llm: VoiceLLM | None = None
         self._audioless = False
         self._stopped = False
@@ -411,7 +423,11 @@ class CascadeEngine:
             heard_tail=output.take_heard_tail,
         )
         self._llm = llm = VoiceLLM(
-            settings.llm, system=system, timings=self.timings, prepare=self._prepare
+            settings.llm,
+            system=system,
+            timings=self.timings,
+            prepare=self._prepare,
+            on_reply=self._replied,
         )
         llm.register_function(
             DELEGATE_TOOL, self._delegate, cancel_on_interruption=False
@@ -495,6 +511,9 @@ class CascadeEngine:
         later = order[at + 1 :]
         self._hold_reset()
         self._touch()
+        if not later and self._llm is not None:
+            self._answer_owed, self._asked_again = content, False
+            self._owed_after = self._llm.started
         await self._settle(
             delegation_id, f"{content}\n{ADDITION_OPEN}" if later else content
         )
@@ -534,6 +553,37 @@ class CascadeEngine:
         if run:
             self._owed = False
         return run
+
+    def _replied(self, spoke: bool, called: bool) -> None:
+        """An LLM request ran to its end: the net under an unsaid answer.
+
+        Only a request sent after the answer counts (a reply already
+        running when it came is about something else). The retry and the
+        answer itself wait for the line like any speech of the voice's own."""
+        owed = self._answer_owed
+        if owed is None or self._llm is None or self._llm.started <= self._owed_after:
+            return
+        if spoke or called:
+            self._answer_owed = None
+            return
+        if not self._asked_again:
+            self._asked_again = True
+            self._owed_after = self._llm.started
+            logger.info(
+                "call %s: the reply to an answer said nothing; asking again",
+                self._session.id,
+            )
+            message = {"role": "developer", "content": note("commentary", owed)}
+            self._held.append(
+                [LLMMessagesAppendFrame(messages=[message], run_llm=True)]
+            )
+            return
+        self._answer_owed = None
+        logger.info(
+            "call %s: the reply to an answer said nothing twice; speaking it",
+            self._session.id,
+        )
+        self._held.append([TTSSpeakFrame(sentence) for sentence in sentences(owed)])
 
     def _said_before_call(self, tool_call_id: str, text: str) -> bool:
         """Put ``text`` into the context in front of the tool call, as an

@@ -1182,3 +1182,68 @@ async def test_no_second_holding_sentence_right_after_one(call, fakes):
     await call.until(lambda: len(delegation_ids(call)) == 1)
     await call.quiet()
     assert [t.strip() for t in call.transcripts("assistant")] == [FILLER]
+
+
+async def _delegated(call, fakes, question: str) -> str:
+    """The caller asks; the voice hands it on with the filler."""
+    fakes.stt_texts = [question]
+    fakes.llm_replies = [("delegate", question)]
+    call.port.say(tone(1.0))
+    await call.until(lambda: len(delegation_ids(call)) == 1)
+    await call.quiet()
+    return delegation_ids(call)[0]
+
+
+THOUGHT = "<|channel>thought<channel|>"
+
+
+@pytest.mark.asyncio
+async def test_an_answer_the_reply_leaves_unsaid_is_asked_for_again(call, fakes):
+    # Gemma 4 reasoned after an answer and said nothing (§9.14).
+    delegation = await _delegated(call, fakes, "Gibt es Housekeeping?")
+    fakes.llm_replies = [THOUGHT, "Ja, die Zimmer werden täglich gereinigt."]
+    await call.append("commentary", "Zimmerreinigung täglich.", delegation)
+    await call.until(lambda: "täglich" in "".join(call.transcripts("assistant")))
+    await call.quiet()
+    assert len(fakes.llm_requests) == 3
+    again = fakes.llm_requests[2]["messages"][-1]
+    assert "Zimmerreinigung täglich." in again["content"]
+    assert "tell the caller this now" in again["content"]
+    assert "Zimmerreinigung" not in "".join(fakes.tts_inputs)
+
+
+@pytest.mark.asyncio
+async def test_an_answer_left_unsaid_twice_is_spoken_as_it_came(call, fakes):
+    delegation = await _delegated(call, fakes, "Wann ist die Rezeption besetzt?")
+    fakes.llm_replies = [THOUGHT, THOUGHT]
+    await call.append("commentary", "Die Rezeption ist bis 22 Uhr besetzt.", delegation)
+    await call.until(lambda: "22 Uhr" in "".join(call.transcripts("assistant")))
+    await call.quiet()
+    assert len(fakes.llm_requests) == 3
+    assert "Die Rezeption ist bis 22 Uhr besetzt." in fakes.tts_inputs
+    assert call.engine._answer_owed is None
+
+
+@pytest.mark.asyncio
+async def test_a_said_answer_needs_no_net(call, fakes):
+    delegation = await _delegated(call, fakes, "Gibt es Parkplätze?")
+    fakes.llm_replies = ["Ja, es gibt zwanzig Parkplätze am Haus."]
+    await call.append("commentary", "20 Parkplätze am Haus.", delegation)
+    await call.until(lambda: "Parkplätze" in "".join(call.transcripts("assistant")))
+    await call.quiet()
+    await asyncio.sleep(0.5)
+    assert len(fakes.llm_requests) == 2
+    assert call.engine._answer_owed is None
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_an_addition_open_may_stay_unsaid(call, fakes):
+    first, _second = await _cut_off_then_completed(call, fakes)
+    fakes.llm_replies = [THOUGHT]
+    await call.append("commentary", "Fünf Personen brauchen zwei Zimmer.", first)
+    await call.until(lambda: len(fakes.llm_requests) == 3)
+    await call.quiet()
+    await asyncio.sleep(0.5)
+    # "say only what it already settles, or nothing yet" (prompt rules).
+    assert len(fakes.llm_requests) == 3
+    assert "zwei Zimmer" not in "".join(fakes.tts_inputs)
