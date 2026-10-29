@@ -65,6 +65,22 @@ Running an approved image also needs the `custom_harness_images` capability
 grant (Admin → Grants). It is denied by default and resolves user, then
 project, then global. Administrators bypass it.
 
+Two operator notes on capacity and upgrades:
+
+- **`MAX_AGENTS` must exceed the warm-pool floor, `MIN_AGENTS` plus
+  `AGENT_BUFFER`.** A custom-image Job gets its pod only while fewer than
+  `MAX_AGENTS` agent pods run. The warm pool keeps `MIN_AGENTS` pods running
+  and `AGENT_BUFFER` default pods idle, and the dispatcher never removes an
+  idle default pod to make room for a custom image. If either setting alone
+  reaches `MAX_AGENTS`, custom-image Jobs never get a pod; if only their sum
+  does, they wait whenever busy default Jobs fill the pool.
+- **A pod whose image is neither installed nor approved serves nothing.** This
+  is what an image's pods become when it is removed from the approved list.
+  The dispatcher gives them no Job, but they still count towards `MAX_AGENTS`.
+  The lifecycle reconciler drains them as build drift only when the agent
+  images are SHA-tagged (`...:sha-<hash>`); with semver or `latest` tags they
+  stay until they exit by themselves.
+
 ## Name the image on an Expert
 
 An Expert runs a harness image when its runtime uses the `srw/v1` adapter and

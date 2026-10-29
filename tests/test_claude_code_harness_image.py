@@ -93,8 +93,10 @@ def test_example_manifests_validate_against_the_manifest_schema():
 
     validator = Draft202012Validator(load_schema())
     docs = {}
+    text_of = {}
     for name in ("claude-code-harness-expert.yaml", "claude-code-harness-job.yaml"):
         text = (ROOT / "examples/manifests" / name).read_text()
+        text_of[name] = text
         documents = parse_documents(text)
         for document in documents:
             assert list(validator.iter_errors(document)) == [], name
@@ -109,6 +111,11 @@ def test_example_manifests_validate_against_the_manifest_schema():
     )
     assert runtime["image"].endswith("0" * 64)
     assert runtime["config"]["config_name"] == "worker_base"
+    # The model goes in the private SRW config leaf, as the live check ran it:
+    # without one the account default (often an openai-chat model) is refused.
+    model = runtime["config"]["config"]["llm"]["model"]
+    assert isinstance(model, str) and model
+    assert "anthropic-messages" in text_of["claude-code-harness-expert.yaml"]
     for launch_field in ("command", "args", "env", "probes"):
         assert launch_field not in runtime
     job = docs["claude-code-harness-job.yaml"]
