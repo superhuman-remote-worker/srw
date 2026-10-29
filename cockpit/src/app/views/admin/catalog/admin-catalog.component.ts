@@ -353,10 +353,11 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                       <span class="col-protocol">
                         @if (m.provider_kind === 'endpoint') {
                           <!-- app-select keeps its own value after a pick; re-creating it
-                               on a resync snaps it back to the stored shape. -->
+                               on a resync snaps it back to the row's shape: the stored
+                               one, else the one the agent really calls it with. -->
                           @for (epoch of [protocolResync()]; track epoch) {
                             <app-select
-                              [value]="m.client_protocol ?? 'openai-chat'"
+                              [value]="m.client_protocol || m.effective_client_protocol || null"
                               [ariaLabel]="'API shape for ' + m.display_label"
                               (changed)="setProtocol(m, $event)"
                             >

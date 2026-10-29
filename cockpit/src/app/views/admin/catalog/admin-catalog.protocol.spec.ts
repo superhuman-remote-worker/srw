@@ -175,6 +175,26 @@ describe('API shape', () => {
     expect(body.params_json.routing.client_protocol).toBe('anthropic-messages');
   });
 
+  it('shows the effective shape when the row stores none', () => {
+    // A subscription-proxy row discovery has not yet routed: the agent calls
+    // it over Responses, so the select must not claim Chat Completions.
+    models.models.set([row({client_protocol: null, effective_client_protocol: 'openai-responses'})]);
+    const fixture = setup(makeProviders([ENDPOINT]));
+    fixture.detectChanges();
+    const select = fixture.nativeElement.querySelector('.model-row .col-protocol app-select');
+    expect(select.value).toBe('openai-responses');
+  });
+
+  it('shows the stored shape when the row has one', () => {
+    models.models.set([
+      row({client_protocol: 'anthropic-messages', effective_client_protocol: 'openai-responses'}),
+    ]);
+    const fixture = setup(makeProviders([ENDPOINT]));
+    fixture.detectChanges();
+    const select = fixture.nativeElement.querySelector('.model-row .col-protocol app-select');
+    expect(select.value).toBe('anthropic-messages');
+  });
+
   it('hides the select for provider-anchored rows', () => {
     models.models.set([row({provider_kind: 'system', provider_ref: 'openai', client_protocol: null})]);
     const fixture = setup(makeProviders([ENDPOINT]));

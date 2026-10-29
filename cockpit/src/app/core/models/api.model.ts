@@ -989,8 +989,10 @@ export interface CatalogModel {
   source?: HelmProvenanceSource | null;
   managed_by_helm?: boolean;
   helm_drift?: boolean;
-  /** API shape the model is called with; null for provider-anchored (system) rows. */
+  /** API shape stored on the row; null when the row sets none (always for provider-anchored rows). */
   client_protocol: string | null;
+  /** API shape the agent really calls the model with: the stored one, else the one its provider or transport implies. Read-only, computed server-side. */
+  effective_client_protocol?: string;
   subscription_sources?: string[];
   routing_needs_review?: boolean;
 }
