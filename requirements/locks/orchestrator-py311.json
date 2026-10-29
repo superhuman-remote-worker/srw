@@ -9,5 +9,5 @@
     "scripts/lock_dependencies.py": "c3b0733a66f018d7c92ee92f362dd49bc09300312b9f4dfef1c085c32bb8fba7",
     "src/orchestrator/requirements.txt": "6839fb1d036654112f504ed52f625e839f1a4ee8569375d30adc02f890f6b2eb"
   },
-  "lock_sha256": "da5e0449fa95ee4cc3600e11cd7d8efc6394414186d9f57442384740d82a1c21"
+  "lock_sha256": "623e407a11d799659479565d96bb431035ca4992f2a834c0e5706389cada1fa0"
 }
