@@ -98,6 +98,10 @@ DEFAULT_WRITERS = [
 # a no-op manager (nothing retrieved, capture() has no writers) and the legacy
 # direct-store blocks stay skipped. `memory.enabled: false` additionally skips
 # RecallStore construction (no store => todo_complete queues nothing either).
+# None of this reaches KB note injection: a job's own project KB is always a
+# knowledge binding, and graph.py injects bound KBs through its own retrieval,
+# ignoring the pipeline's knowledge block. So `off` and `kb-only` both push KB
+# notes and differ in no effective setting; no config key turns that path off.
 ARMS: dict[str, dict] = {
     "off": {
         "memory": {
