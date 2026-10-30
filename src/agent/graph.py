@@ -50,7 +50,7 @@ import re
 import asyncio
 import time
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
 
 from langchain_core.language_models import BaseChatModel
@@ -67,7 +67,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
-from agent.core.archiver import get_archiver
+from agent.core.archiver import get_archiver, inflight_tool_calls
 from agent.core.context import (
     ContextManager,
     ContextConfig,
@@ -75,6 +75,8 @@ from agent.core.context import (
     is_compaction_summary,
     keep_window_start,
     repair_tool_call_arguments,
+    repair_tool_pairing,
+    repair_tool_result_adjacency,
     sanitize_message_history,
     scrub_history_tool_call_arguments,
 )
@@ -1220,9 +1222,16 @@ def create_execute_node(
         # Claude Code harnesses do
         # (knowledge-base/knowledge/issues/per_turn_tool_result_clearing_breaks_prompt_cache.md).
 
-        # Sanitize message history to remove orphaned ToolMessages
-        # (can occur from improper context compaction or checkpoint corruption)
-        messages = sanitize_message_history(messages)
+        # Every tool call must have its result and every result its call, or
+        # the provider rejects the request with a deterministic 400 ("No tool
+        # output found for function call ..."). A feedback resume settles the
+        # calls its run stopped in (``settle_interrupted_tool_calls``); this
+        # backstop puts results behind their calls and drops what still has
+        # no partner, from compaction or checkpoint damage, as the session
+        # loop does (dev jobs 19837f4b, 1dc0fac1).
+        messages = sanitize_message_history(
+            repair_tool_pairing(repair_tool_result_adjacency(messages))
+        )
         # Backstop: scrub malformed tool-call arguments already sitting in the
         # checkpoint (poison predating the ingestion repair) so a resumed job
         # sends clean history instead of dying on a deterministic 400.
@@ -4743,6 +4752,42 @@ def _todo_list_restatement_update(
     return {"messages": [HumanMessage(content=restated)]} if restated else {}
 
 
+# The result of a call the job's run stopped in before it returned.
+INTERRUPTED_TOOL_RESULT = (
+    "Result unknown: the job stopped while this call was running, so it may or "
+    "may not have finished. Check its effects before relying on them or "
+    "repeating it."
+)
+
+
+def settle_interrupted_tool_calls(
+    messages: Sequence[BaseMessage],
+) -> Tuple[List[BaseMessage], List[ToolMessage]]:
+    """``messages`` with a result for each call the run stopped in.
+
+    A run that stops between an assistant tool call and its results (a pause
+    or a lost workspace while the tool ran) checkpoints the call without
+    them. An ordinary resume runs the pending tools node again; a feedback
+    resume enters ``restore_from_feedback`` instead, so nothing would answer
+    the call and the provider rejects every later request with a 400 ("No
+    tool output found for function call ...", dev jobs 19837f4b, 1dc0fac1).
+    The results stand directly behind their call. Returns the history and
+    the results it added.
+    """
+    calls = [call for call in inflight_tool_calls(messages) if call["id"]]
+    if not calls:
+        return list(messages), []
+    results = [
+        ToolMessage(
+            content=INTERRUPTED_TOOL_RESULT,
+            tool_call_id=call["id"],
+            name=call["tool"],
+        )
+        for call in calls
+    ]
+    return repair_tool_result_adjacency([*messages, *results]), results
+
+
 def create_restore_from_feedback_node(
     workspace: WorkspaceManager,
     todo_manager: TodoManager,
@@ -4794,6 +4839,15 @@ def create_restore_from_feedback_node(
         logger.info(
             f"[{job_id}] Restoring from feedback resume ({len(feedback)} chars)"
         )
+
+        # Step 0: Answer the calls the stopped run never finished, so the
+        # compacted history and every request after it stay well formed.
+        messages, settled = settle_interrupted_tool_calls(messages)
+        if settled:
+            logger.warning(
+                f"[{job_id}] Feedback resume settled {len(settled)} interrupted "
+                f"tool call(s): {', '.join(m.name or '?' for m in settled)}"
+            )
 
         # Step 1: Force-compact old conversation context
         # This gives the agent a "fresh start" with just a summary of prior work
