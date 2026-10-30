@@ -15,6 +15,12 @@ import {AppMenuItemComponent} from './menu-item.component';
 
 export type MenuPlacement = 'bottom-start' | 'bottom-end' | 'top-start' | 'top-end';
 
+/** A viewport position, as a MouseEvent's clientX/clientY report it. */
+export interface MenuPoint {
+  x: number;
+  y: number;
+}
+
 @Component({
   selector: 'app-menu',
   standalone: true,
@@ -54,10 +60,16 @@ export class AppMenuComponent {
   private readonly onScroll = () => this.reposition();
   private readonly onResize = () => this.reposition();
 
-  open(anchor: HTMLElement, placement: MenuPlacement = 'bottom-start'): void {
+  /**
+   * `at` opens the menu at a point instead of beside the anchor — a context
+   * menu opens where the pointer was. The anchor still owns focus restore
+   * and the outside-click test.
+   */
+  open(anchor: HTMLElement, placement: MenuPlacement = 'bottom-start', at?: MenuPoint): void {
     if (this.isOpen()) return;
     this.anchor = anchor;
     this.placement = placement;
+    this.point = at ?? null;
 
     const panel = this.panelRef().nativeElement;
     if (panel.parentElement !== this.doc.body) {
@@ -133,6 +145,7 @@ export class AppMenuComponent {
   }
 
   private placement: MenuPlacement = 'bottom-start';
+  private point: MenuPoint | null = null;
 
   private reposition(): void {
     if (!this.anchor || !this.isOpen()) return;
@@ -143,8 +156,11 @@ export class AppMenuComponent {
     // screen). Force the open style on for measurement; the binding re-affirms
     // it on the next tick, and close() clears it via the same binding.
     if (!panel.hasAttribute('data-open')) panel.setAttribute('data-open', '');
-    const a = this.anchor.getBoundingClientRect();
-    const margin = 4;
+    const point = this.point;
+    const a = point
+      ? {left: point.x, right: point.x, top: point.y, bottom: point.y}
+      : this.anchor.getBoundingClientRect();
+    const margin = point ? 0 : 4;
 
     panel.style.visibility = 'hidden';
     panel.style.left = '0px';
@@ -162,6 +178,12 @@ export class AppMenuComponent {
 
     const viewW = this.doc.defaultView?.innerWidth ?? 1024;
     const viewH = this.doc.defaultView?.innerHeight ?? 768;
+    // At a point, flip to the pointer's other side when the menu doesn't fit,
+    // as native context menus do, rather than sliding it over the pointer.
+    if (point) {
+      if (left + p.width > viewW - 8) left = point.x - p.width;
+      if (top + p.height > viewH - 8) top = point.y - p.height;
+    }
     left = Math.max(8, Math.min(left, viewW - p.width - 8));
     top = Math.max(8, Math.min(top, viewH - p.height - 8));
 

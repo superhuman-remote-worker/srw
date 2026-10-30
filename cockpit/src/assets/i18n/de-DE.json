@@ -418,6 +418,17 @@
       "today": "Heute",
       "yesterday": "Gestern",
       "earlier": "Früher"
+    },
+    "sessionMenu": {
+      "options": "Sitzungsoptionen",
+      "openInNewTab": "In neuem Tab öffnen",
+      "copyLink": "Link kopieren",
+      "linkCopied": "Link kopiert",
+      "sessionFiles": "Sitzungsdateien",
+      "end": "Sitzung beenden",
+      "resume": "Sitzung fortsetzen",
+      "endRetryable": "Das Beenden hat begonnen, die Bereinigung ist aber noch nicht abgeschlossen. Wähle gleich noch einmal „Sitzung beenden“, um es erneut zu versuchen.",
+      "deleteRetryable": "Diese Sitzung wird noch heruntergefahren und konnte noch nicht gelöscht werden. Versuche es gleich unter „Alle Sitzungen anzeigen“ erneut."
     }
   },
   "grants": {

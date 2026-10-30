@@ -145,3 +145,23 @@ describe('SessionListService.renameLocal', () => {
     expect(service.threads().map((t) => t.title)).toEqual(['Session a']);
   });
 });
+
+describe('SessionListService deleted sessions', () => {
+  it('leaves a session out of Recents while its permanent Delete retires it, but keeps it in threads', async () => {
+    const now = new Date().toISOString();
+    const deleting = {...thread('d', now), status: 'ending', retirement_permanent: true} as Thread;
+    const {service} = create([thread('a', now), deleting]);
+    await service.refresh();
+    expect(service.grouped().flatMap((g) => g.threads.map((t) => t.id))).toEqual(['a']);
+    expect(service.threads().map((t) => t.id)).toEqual(['a', 'd']);
+  });
+
+  it('removeLocal drops the thread without a re-fetch', async () => {
+    const now = new Date().toISOString();
+    const {service, http} = create([thread('a', now), thread('b', now)]);
+    await service.refresh();
+    service.removeLocal('a');
+    expect(service.threads().map((t) => t.id)).toEqual(['b']);
+    expect(http.get).toHaveBeenCalledTimes(1);
+  });
+});

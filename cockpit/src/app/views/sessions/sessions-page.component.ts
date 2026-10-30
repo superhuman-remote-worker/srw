@@ -1,4 +1,4 @@
-import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, DestroyRef, inject, linkedSignal, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
 import {TitleCasePipe} from '@angular/common';
@@ -599,7 +599,23 @@ export class SessionsPageComponent implements OnInit {
     private readonly transloco = inject(TranslocoService);
     private readonly sessionList = inject(SessionListService);
 
-    threads = signal<Thread[]>([]);
+    /**
+     * The shared list, as this page shows it. Linked rather than copied: the
+     * rail's session menu ends, renames and deletes sessions too and refreshes
+     * only the shared list, so a copy kept cards for sessions already gone.
+     * Still writable, for this page's optimistic edits.
+     */
+    threads = linkedSignal<Thread[]>(() =>
+        this.sessionList.threads()
+            // The server filters children, but keep the mutation-heavy
+            // session controls fail-closed against an older/cached list.
+            .filter(thread => thread.kind !== 'subagent')
+            .map(thread =>
+                thread.runtime_retirement_pending === true
+                    ? { ...thread, status: 'ending' as const }
+                    : thread,
+            ),
+    );
     projects = signal<Project[]>([]);
     loading = signal(true);
     creating = signal(false);
@@ -667,25 +683,15 @@ export class SessionsPageComponent implements OnInit {
     /**
      * Re-read the list without the loading placeholder (which would swap the
      * whole list out on every poll), then re-arm or stop the ending poll.
+     * `threads` follows the shared list by itself.
      */
     private async refreshThreads(): Promise<void> {
         // No try/catch: SessionListService.refresh() never rejects — both its
         // success and failure paths resolve, updating its own signals either
         // way (a failed fetch leaves sessionList.threads() as whatever it
-        // already had, so re-reading it below is safe on either outcome).
+        // already had, so the steps below are safe on either outcome).
         await this.sessionList.refresh();
         if (this.destroyed) return;
-        this.threads.set(
-            this.sessionList.threads()
-                // The server filters children, but keep the mutation-heavy
-                // session controls fail-closed against an older/cached list.
-                .filter(thread => thread.kind !== 'subagent')
-                .map(thread =>
-                    thread.runtime_retirement_pending === true
-                        ? { ...thread, status: 'ending' as const }
-                        : thread,
-                ),
-        );
         this.dropSettledDeleteRetries();
         this.syncEndingPoll();
     }
@@ -836,20 +842,12 @@ export class SessionsPageComponent implements OnInit {
     async onRenameThread(thread: Thread, title: string): Promise<void> {
         const previous = thread.title;
         // Optimistic: update the card immediately, revert if the PATCH fails.
-        // This page's own `threads` is a filtered/mapped snapshot of
-        // SessionListService, not a computed over it (see loadThreads), so it
-        // doesn't pick up sessionList.renameLocal below for free — both need
-        // the explicit update, and both revert together on failure.
-        this.threads.update((list) =>
-            list.map((t) => (t.id === thread.id ? {...t, title} : t)),
-        );
+        // Through the shared list, which `threads` follows — the rail shows
+        // the same title.
         this.sessionList.renameLocal(thread.id, title);
         try {
             await this.chat.renameThread(thread.id, title);
         } catch (e) {
-            this.threads.update((list) =>
-                list.map((t) => (t.id === thread.id ? {...t, title: previous} : t)),
-            );
             this.sessionList.renameLocal(thread.id, previous);
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
         }

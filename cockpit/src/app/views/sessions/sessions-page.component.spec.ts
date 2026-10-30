@@ -292,9 +292,8 @@ describe('SessionsPageComponent', () => {
 
     // =========================================================================
     // F3: onRenameThread() must keep SessionListService (the rail's copy of
-    // the list) in sync — this page's own `threads` is a filtered/mapped
-    // snapshot, not a computed over the service, so nothing does that for
-    // free.
+    // the list) in sync. It renames through the service, which `threads`
+    // follows, so the card and the rail show the same title.
     // =========================================================================
 
     describe('onRenameThread()', () => {
@@ -319,6 +318,38 @@ describe('SessionsPageComponent', () => {
             expect(component.threads()[0].title).toBe('Old title');
             expect(sessionList.threads()[0].title).toBe('Old title');
             expect(mockToast.danger).toHaveBeenCalled();
+        });
+    });
+
+    // The rail's session menu ends, renames and deletes sessions through the
+    // shared list alone; the cards must follow without a re-read here.
+    describe('changes made from the rail', () => {
+        it('drops a card the rail deleted', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a'}), makeThread({id: 'b'})]}));
+            await component.loadThreads();
+
+            sessionList.removeLocal('a');
+
+            expect(component.threads().map((t) => t.id)).toEqual(['b']);
+        });
+
+        it('shows a title the rail renamed', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a', title: 'Old title'})]}));
+            await component.loadThreads();
+
+            sessionList.renameLocal('a', 'From the rail');
+
+            expect(component.threads()[0].title).toBe('From the rail');
+        });
+
+        it('shows a status the rail\'s own re-read brought in', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a', status: 'active'})]}));
+            await component.loadThreads();
+
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a', status: 'ended'})]}));
+            await sessionList.refresh();
+
+            expect(component.threads()[0].status).toBe('ended');
         });
     });
 

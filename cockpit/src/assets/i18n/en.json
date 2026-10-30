@@ -418,6 +418,17 @@
       "today": "Today",
       "yesterday": "Yesterday",
       "earlier": "Earlier"
+    },
+    "sessionMenu": {
+      "options": "Session options",
+      "openInNewTab": "Open in new tab",
+      "copyLink": "Copy link",
+      "linkCopied": "Link copied",
+      "sessionFiles": "Session files",
+      "end": "End session",
+      "resume": "Resume session",
+      "endRetryable": "Ending has started, but cleanup hasn't finished yet. Choose End session again in a moment to retry.",
+      "deleteRetryable": "This session is still shutting down, so it couldn't be deleted yet. Retry from See all sessions in a moment."
     }
   },
   "grants": {
