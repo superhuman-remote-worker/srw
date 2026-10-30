@@ -10,6 +10,7 @@ See knowledge-base/knowledge/features/vm_backend.md for the full design.
 
 import base64
 import errno
+import functools
 import fnmatch
 import hashlib
 import hmac
@@ -42,11 +43,15 @@ from shared.runtime.core.shell_protocol import (
     INTERACTIVE_PROMPT_TEMPLATE,
     NO_CHANGE_TIMEOUT_SECONDS,
     NONINTERACTIVE_ENV_EXPORT,
+    SESSION_ENDED_MESSAGE,
     STILL_RUNNING_HARDCAP_TEMPLATE,
     STILL_RUNNING_TEMPLATE,
     SUDO_FREEZE_SENTINEL,
+    TAB_SHELL_ENDED_TEMPLATE,
     build_sentinel_command,
+    command_shell_ended_message,
     compute_no_change_state,
+    confine_shell_exit,
     new_start_marker,
     start_marker_command,
 )
@@ -355,6 +360,47 @@ DEFAULT_BLOCKED_COMMANDS = frozenset(
 )
 
 
+class ShellEndedError(KeyError):
+    """A tab's shell exited, so the tab, or the whole session, is gone.
+
+    A ``KeyError`` because every shell tool already reports a missing tab as
+    a tool error the model can act on; the job carries on. The message is
+    written for the model, so ``str()`` is the text, not KeyError's repr.
+    """
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if self.args else ""
+
+
+class ShellSessionLostError(WorkspaceUnavailableError):
+    """The tmux session is gone while the workspace itself still answers.
+
+    The shell of its last pane exited (``exit`` typed into it, ``kill $$``) or
+    the tmux server died. Still a ``WorkspaceUnavailableError`` wherever the
+    shell cannot be rebuilt; the shell calls rebuild it and raise
+    ``ShellEndedError`` instead of pausing the job.
+    """
+
+
+def _rebuilds_ended_session(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Rebuild a shell session found ended at the start of a shell call.
+
+    The call's first capture found the session gone before it did anything,
+    so after a fresh session the model is told to repeat it. A rebuild that
+    fails raises ``WorkspaceUnavailableError``, as any shell call did before.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "RemoteBackend", *args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(self, *args, **kwargs)
+        except ShellSessionLostError as lost:
+            self._ensure_shell()
+            raise ShellEndedError(SESSION_ENDED_MESSAGE) from lost
+
+    return wrapper
+
+
 class _RemoteTab:
     """Tracks per-tab state for a remote tmux session."""
 
@@ -643,6 +689,9 @@ class RemoteBackend(WorkspaceBackend):
         # A pane pruned while reattaching must be reported to the agent once,
         # before the usual ensure-tab path is allowed to recreate it.
         self._lost_tab_notices: set[str] = set()
+        # Sessions this backend created rather than adopted. A change across a
+        # reconnect proves that the pane a command was waiting on is gone.
+        self._shell_creations = 0
         # A claim that could start its shell only by spending the disk
         # reserve leaves this for the next shell tool result, once.
         self._disk_full_notice: Optional[str] = None
@@ -3249,6 +3298,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     tab_name, pane_id = pane_context
                     try:
                         pane_gone = self._tmux_pane_gone(tab_name, pane_id)
+                        session_gone = not pane_gone and self._tmux_session_gone()
                     except Exception as probe_error:
                         self._shell_initialized = False
                         self._tabs.clear()
@@ -3257,7 +3307,14 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         ) from probe_error
                     if pane_gone:
                         self._prune_lost_tmux_tab(tab_name)
-                        raise KeyError(self._lost_tab_message(tab_name))
+                        raise ShellEndedError(self._lost_tab_message(tab_name))
+                    if session_gone:
+                        self._shell_initialized = False
+                        self._tabs.clear()
+                        raise ShellSessionLostError(
+                            f"Remote tmux {operation} failed with exit code "
+                            f"{exit_code}: the shell session has ended"
+                        )
                 self._shell_initialized = False
                 self._tabs.clear()
                 raise self._tmux_exit_error(
@@ -3340,10 +3397,16 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         return notice
 
     def _lost_tab_message(self, tab_name: str) -> str:
-        return (
-            f"Tab '{tab_name}' no longer exists. "
-            f"Available: {', '.join(self._tabs.keys())}"
+        return TAB_SHELL_ENDED_TEMPLATE.format(
+            tab=tab_name, tabs=", ".join(self._tabs.keys()) or "none"
         )
+
+    def _tmux_session_gone(self) -> bool:
+        """True when this backend's exact tmux session no longer answers."""
+        _output, session_exit = self._exec_with_status(
+            f"tmux has-session -t {self._tmux_target()} >/dev/null 2>&1"
+        )
+        return session_exit != 0
 
     def _tmux_pane_gone(self, tab_name: str, pane_id: str) -> bool:
         """Prove that one pane vanished while its exact session stayed live.
@@ -4448,6 +4511,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     _TMUX_SETUP_OPTION,
                     _TMUX_SETUP_COMPLETE,
                 )
+                self._shell_creations += 1
                 logger.info("Remote shell created: session=%s", self._session_name)
 
             if not self._shell_protocol_current:
@@ -4486,32 +4550,50 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             self._init_shell()
 
     def _resume_wait_after_transport_loss(
-        self, tab_name: str, sentinel: str
+        self, tab_name: str, sentinel: str, pane_id: Optional[str]
     ) -> Optional[_RemoteTab]:
-        """Re-adopt the tab a running command owns after the SSH transport died.
+        """Re-adopt the tab a running command owns after the shell was lost.
 
         Reading the pane is idempotent and the command keeps running in tmux,
         so a dropped transport is no reason to fail the wait. Reconnect,
         re-adopt the tmux session (which re-attests ownership and restores the
         durable pending guards) and return the tab when this exact command
-        still owns it. ``None`` when the failure was not a transport loss or
-        the command no longer owns the tab: the caller fails as before.
+        still owns it. When re-adoption succeeds but the command's pane did
+        not survive (a new session, or the tab gone or on another pane) the
+        workspace answers and only that shell ended: raise
+        ``ShellEndedError`` for the model. ``None`` when the failure was not a
+        loss or the tab changed owner on the same pane: the caller fails as
+        before.
         """
         if self._retired or (self.is_connected() and self._shell_initialized):
             return None
         logger.warning(
-            "SSH transport to %s lost while waiting on tab %r; reconnecting "
-            "to keep waiting on the running command",
+            "Shell session or SSH transport to %s lost while waiting on tab %r; "
+            "reconnecting to keep waiting on the running command",
             self._host,
             tab_name,
         )
+        creations = self._shell_creations
         self._ensure_connected()
         self._ensure_shell()
         tab = self._tabs.get(tab_name)
-        if tab is None or tab.pending_sentinel != sentinel:
-            return None
-        logger.info("Resumed waiting on tab %r after reconnect", tab_name)
-        return tab
+        if tab is not None and tab.pending_sentinel == sentinel:
+            logger.info("Resumed waiting on tab %r after reconnect", tab_name)
+            return tab
+        session_reset = self._shell_creations != creations
+        if tab is None or tab.pane_id != pane_id or session_reset:
+            logger.warning(
+                "shell_ended_mid_command: session=%s tab=%s session_reset=%s",
+                self._session_name,
+                tab_name,
+                session_reset,
+            )
+            # This error tells the model; a reattach notice would repeat it.
+            self._lost_tab_notices.discard(tab_name)
+            raise ShellEndedError(
+                command_shell_ended_message(tab_name, session_reset=session_reset)
+            )
+        return None
 
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
@@ -4647,8 +4729,16 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         working_dir: Optional[str],
         start_marker: Optional[str] = None,
     ) -> str:
-        """Build one command whose sentinel follows any requested cwd restore."""
-        command = self._with_credential_environment(self._spill_long_command(command))
+        """Build one command whose sentinel follows any requested cwd restore.
+
+        A command that would end the tab's shell (``...; exit "$rc"``) runs in
+        a subshell first, so its ``exit`` sets the exit code as under
+        ``bash -c``; a spilled command is sourced into the tab's shell, so the
+        subshell goes on before the spill.
+        """
+        command = self._with_credential_environment(
+            self._spill_long_command(confine_shell_exit(command))
+        )
         if not working_dir:
             return build_sentinel_command(command, sentinel, start_marker)
 
@@ -4674,6 +4764,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             f'printf \'\\n{sentinel} %s %s\\n\' "$_srw_rc" "$_srw_cwd"'
         )
 
+    @_rebuilds_ended_session
     def shell_run(
         self,
         command: str,
@@ -4783,18 +4874,30 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             last_content_hash = None
             stall_start = None
             resumes = 0
+            pane_id = tab.pane_id
 
             while time.monotonic() - start_time < timeout:
                 time.sleep(0.3)  # Slightly longer poll interval for SSH latency
                 try:
                     all_lines = self._tmux_capture(tab_name)
-                except WorkspaceUnavailableError:
+                except ShellEndedError as ended:
+                    # The pane exited under the command; the session lives on.
+                    raise ShellEndedError(
+                        command_shell_ended_message(tab_name, session_reset=False)
+                    ) from ended
+                except WorkspaceUnavailableError as lost:
                     resumed_tab = (
-                        self._resume_wait_after_transport_loss(tab_name, sentinel)
+                        self._resume_wait_after_transport_loss(
+                            tab_name, sentinel, pane_id
+                        )
                         if resumes < _SHELL_WAIT_RESUMES
                         else None
                     )
                     if resumed_tab is None:
+                        if isinstance(lost, ShellSessionLostError):
+                            # The command did run: never let the session
+                            # rebuild report it as a call that did nothing.
+                            raise WorkspaceUnavailableError(str(lost)) from lost
                         raise
                     resumes += 1
                     tab = resumed_tab
@@ -4975,6 +5078,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             logger.debug(f"Failed to capture terminal state: {e}")
             return "(failed to capture terminal state)"
 
+    @_rebuilds_ended_session
     def shell_send(
         self,
         tab_name: str,
@@ -5051,6 +5155,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             tab.last_activity = datetime.now(timezone.utc)
         return f"Sent to '{tab_name}'"
 
+    @_rebuilds_ended_session
     def shell_cancel(self, tab_name: str = "default") -> str:
         """Send Ctrl+C to a shell tab to abort a stuck/hung command.
 
@@ -5106,6 +5211,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             f"reset (shell-local state and background jobs were cleared)."
         )
 
+    @_rebuilds_ended_session
     def shell_read(
         self,
         tab_name: str,
@@ -5148,6 +5254,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
         return text, metadata
 
+    @_rebuilds_ended_session
     def shell_read_with_offset(
         self,
         tab_name: str,
@@ -5201,7 +5308,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 return
             if name in self._lost_tab_notices:
                 self._lost_tab_notices.remove(name)
-                raise KeyError(self._lost_tab_message(name))
+                raise ShellEndedError(self._lost_tab_message(name))
             self.shell_open_tab(name)
 
     def shell_open_tab(
