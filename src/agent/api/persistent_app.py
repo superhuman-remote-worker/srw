@@ -132,6 +132,7 @@ from shared.permission_modes import (
     normalize_permission_mode,
 )
 from shared.tool_catalog import tool_effect
+from shared.tool_result_state import TOOL_RESULT_STATES
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
@@ -6081,6 +6082,7 @@ async def _loop_on_tool_result(
     result: str,
     tool_call_id: str,
     is_error: bool = False,
+    result_state: Optional[str] = None,
 ) -> None:
     global _tool_inflight
     # Only this call ended: siblings of a parallel batch are still running.
@@ -6091,15 +6093,17 @@ async def _loop_on_tool_result(
     _tool_inflight = bool(_tool_inflight_calls)
     # Truncate large results for transport (full result is in message history)
     display_result = result[:2000] + "..." if len(result) > 2000 else result
-    _broadcast(
-        "tool.completed",
-        {
-            "tool": tool_name,
-            "result": display_result,
-            "id": tool_call_id,
-            "is_error": is_error,
-        },
-    )
+    frame: Dict[str, Any] = {
+        "tool": tool_name,
+        "result": display_result,
+        "id": tool_call_id,
+        "is_error": is_error,
+    }
+    # A result that does not report what the call did (its outcome is unknown,
+    # or it never ran) says so, as its history row's marker does.
+    if result_state in TOOL_RESULT_STATES:
+        frame["result_state"] = result_state
+    _broadcast("tool.completed", frame)
 
     # Notify frontend of file checkpoint availability after writes
     if tool_name in ("write_file", "edit_file") and _session is not None:

@@ -39,7 +39,7 @@ import {
   parseSubagentRecoveryContinuation,
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
-import { parseToolResultState } from '../models/tool-result-state.model';
+import { parseMarkedToolResultState, parseToolResultState } from '../models/tool-result-state.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
@@ -8070,6 +8070,7 @@ export class PersistentChatService {
           toolUseId: completedId,
           result: (params['result'] as string) || '',
           isError: !!params['is_error'],
+          resultState: parseMarkedToolResultState(params['result_state']) ?? undefined,
           timestamp: now,
         });
         // Only the finished call leaves; its siblings in a batch still run.
