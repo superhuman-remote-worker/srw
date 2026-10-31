@@ -17,6 +17,15 @@ LEASE_TABLE_MIGRATIONS = ("0346_", "0347_", "0430_")
 # duplicated model ids, which an old-head fixture database does not have.
 CATALOG_COLUMN_MIGRATIONS = ("0552_",)
 
+# Today's ``get_job`` selects ``jobs.harness_image`` (0559): every fixture
+# that reads a job back goes through it. 0559 adds one nullable column each to
+# ``agents`` and ``jobs`` (both present since cutover) and nothing else.
+HARNESS_IMAGE_COLUMN_MIGRATIONS = ("0559_",)
+
 
 def is_lease_table_migration(name: str) -> bool:
-    return name.startswith(LEASE_TABLE_MIGRATIONS + CATALOG_COLUMN_MIGRATIONS)
+    return name.startswith(
+        LEASE_TABLE_MIGRATIONS
+        + CATALOG_COLUMN_MIGRATIONS
+        + HARNESS_IMAGE_COLUMN_MIGRATIONS
+    )

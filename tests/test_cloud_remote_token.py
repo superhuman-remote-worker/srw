@@ -333,7 +333,11 @@ def test_the_application_composes_the_route_and_its_dependencies():
     assert isinstance(
         deps.cloud_mount_dependencies(), agent_cloud_mounts.AgentCloudMountDependencies
     )
-    paths = {getattr(route, "path", None) for route in orch_main.app.routes}
+    from tests._route_inventory import mounted_route_objects
+
+    # Newer FastAPI includes a router lazily: app.routes holds one wrapper
+    # per router, and only the flattened inventory names its paths.
+    paths = {route.path for route in mounted_route_objects(orch_main.app)}
     assert "/internal/units/{unit_id}/cloud-token" in paths
     assert callable(orch_main.app.state.cloud_remote_token_dependencies_factory)
 
