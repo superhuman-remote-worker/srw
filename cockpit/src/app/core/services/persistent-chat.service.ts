@@ -39,6 +39,7 @@ import {
   parseSubagentRecoveryContinuation,
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
+import { parseToolResultState } from '../models/tool-result-state.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
@@ -9435,6 +9436,11 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       const recovery = parseSubagentRecoveryResult(m.metrics, callId);
       if (recovery) tc.recovery = recovery;
       else delete tc.recovery;
+      // A row that says the result is unknown or that the call never ran
+      // (session_unknown_tool_result_needs_admin.md) is no "completed".
+      const resultState = parseToolResultState(m.metrics, callId);
+      if (resultState) tc.resultState = resultState;
+      else delete tc.resultState;
       // Don't clobber a 'denied' decision recorded on the AI side. A
       // recovered declined call is that same refusal.
       const refused = tc.decision === 'denied' || recovery?.class === 'declined';
@@ -9511,6 +9517,10 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
           // The AI row that carried the call: calls sharing it were issued in
           // one model response, which is what makes a delegate fan-out.
           messageKey: m.id,
+          // Until its result row turns up below: a call with none must not
+          // read "completed". A refused or unanswered gate never ran, and
+          // its own status already says so.
+          ...(decision === 'denied' || decision === 'expired' ? {} : {resultState: 'missing' as const}),
         };
         turn.events.push(event);
         if (tc.id) toolCallById.set(tc.id, event);

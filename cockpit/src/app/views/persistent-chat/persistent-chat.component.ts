@@ -4808,12 +4808,24 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     private readonly toolViewCache = new WeakMap<ToolCallEvent, ToolCardView>();
+    private readonly runningToolViewCache = new WeakMap<ToolCallEvent, ToolCardView>();
+
+    /** Calls the session reports as running (the attach snapshot, live updates). */
+    private readonly runningToolIds = computed(
+        () => new Set(this.chat.runningTools().map((rt) => rt.id)),
+    );
 
     toolView(tc: ToolCallEvent): ToolCardView {
-        const cached = this.toolViewCache.get(tc);
+        // A reload during a call loads it from history without a result; it is
+        // running, not "no result". A parked session's cut-off call is the
+        // owner's to decide, whatever its tab still shows.
+        const running =
+            tc.resultState === 'missing' && !this.chat.isParked() && this.runningToolIds().has(tc.id);
+        const cache = running ? this.runningToolViewCache : this.toolViewCache;
+        const cached = cache.get(tc);
         if (cached) return cached;
-        const view = toolCardViewFromEvent(tc);
-        this.toolViewCache.set(tc, view);
+        const view = toolCardViewFromEvent(tc, {running});
+        cache.set(tc, view);
         return view;
     }
 

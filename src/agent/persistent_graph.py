@@ -66,6 +66,11 @@ from agent.core.summarizer import count_text_tokens
 from agent.core.tool_output_redaction import redact_tool_result
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from shared.tool_arg_coercion import coerce_tool_args
+from shared.tool_result_state import (
+    RESULT_NOT_RUN,
+    RESULT_UNKNOWN,
+    TOOL_RESULT_STATE_KEY,
+)
 from shared.runtime.llm.exceptions import ContextOverflowError
 from shared.runtime.llm.reasoning_chat import (
     _STREAM_REASONING_SINK,
@@ -2556,8 +2561,17 @@ async def _execute_turn(
         for name, call_id, content, started in closing:
             if not call_id:
                 continue
+            # The marker the row serializer stores, so the history labels the
+            # call by what happened to it rather than "completed".
+            state = RESULT_UNKNOWN if started else RESULT_NOT_RUN
             message = _adopt(
-                _ensure_msg_id(ToolMessage(content=content, tool_call_id=call_id))
+                _ensure_msg_id(
+                    ToolMessage(
+                        content=content,
+                        tool_call_id=call_id,
+                        additional_kwargs={TOOL_RESULT_STATE_KEY: state},
+                    )
+                )
             )
             messages.append(message)
             try:

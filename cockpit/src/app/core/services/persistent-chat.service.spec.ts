@@ -10559,6 +10559,55 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     });
   });
 
+  describe('historyToTurns — a call without a result it produced is not "completed"', () => {
+    // session_unknown_tool_result_needs_admin.md: a call a lost process cut
+    // off has no result row, and the rows that answer it say the result is
+    // unknown or that it never ran. None of them is a completed call.
+    const ai = (decision?: string) => ({
+      id: 'a1',
+      role: 'ai',
+      content: null,
+      tool_calls: [{ name: 'shell_execute', args: {}, id: 'tc1', ...(decision ? { decision } : {}) }],
+      turn_number: 1,
+      created_at: '2026-10-31T09:38:09Z',
+    });
+    const result = (content: string, metrics: unknown = null) => ({
+      id: 't1',
+      role: 'tool',
+      content,
+      tool_calls: null,
+      turn_number: 1,
+      tool_call_id: 'tc1',
+      metrics,
+      created_at: '2026-10-31T09:46:46Z',
+    });
+    const toolOf = (messages: unknown[]) =>
+      (historyToTurns(messages as never)[0] as AssistantTurn).events.filter(isToolCall)[0];
+
+    it('marks a call with no result row as missing its result', () => {
+      expect(toolOf([ai()]).resultState).toBe('missing');
+    });
+
+    it('takes the state a marked result row names', () => {
+      const unknown = { tool_result_state: { state: 'unknown', tool_call_id: 'tc1' } };
+      const notRun = { tool_result_state: { state: 'not_run', tool_call_id: 'tc1' } };
+      expect(toolOf([ai(), result('Result unknown: …', unknown)]).resultState).toBe('unknown');
+      expect(toolOf([ai(), result('Not run: …', notRun)]).resultState).toBe('not_run');
+    });
+
+    it('clears it for an ordinary result', () => {
+      const tool = toolOf([ai(), result('Exit code: 0')]);
+      expect(tool.resultState).toBeUndefined();
+      expect(tool.status).toBe('completed');
+    });
+
+    it('leaves a refused call to its own status', () => {
+      const tool = toolOf([ai('denied')]);
+      expect(tool.status).toBe('denied');
+      expect(tool.resultState).toBeUndefined();
+    });
+  });
+
   describe('historyToTurns — tool categories survive the replay', () => {
     // The folded-chip summary (session_turn_rendering.md "Phase 2 — the live
     // edge") groups by category. The live SSE `tool.started` frame carries

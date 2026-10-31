@@ -431,7 +431,19 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 return {...turn, events: [...closed, newCall]};
             });
 
-        case 'tool_completed':
+        case 'tool_completed': {
+            const settle = (existing: ToolCallEvent): ToolCallEvent => ({
+                ...existing,
+                status: action.isError ? 'error' : 'completed',
+                result: action.result,
+                resultStatus: action.isError ? 'error' : 'ok',
+                resultState: undefined,
+                durationMs: Math.max(0, action.timestamp - existing.startedAt),
+            });
+            // A reload during the call holds it in a history turn that the
+            // stream did not replay: its result belongs on that card.
+            const settledInHistory = settleHistoricalToolCall(state, action.toolUseId, settle);
+            if (settledInHistory) return settledInHistory;
             return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
                 const idx = turn.events.findIndex(
                     (e) => e.kind === 'tool_call' && e.id === action.toolUseId,
@@ -451,16 +463,9 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                     };
                     return {...turn, events: [...turn.events, synthetic]};
                 }
-                const existing = turn.events[idx] as ToolCallEvent;
-                const updated: ToolCallEvent = {
-                    ...existing,
-                    status: action.isError ? 'error' : 'completed',
-                    result: action.result,
-                    resultStatus: action.isError ? 'error' : 'ok',
-                    durationMs: Math.max(0, action.timestamp - existing.startedAt),
-                };
-                return {...turn, events: replaceAt(turn.events, idx, updated)};
+                return {...turn, events: replaceAt(turn.events, idx, settle(turn.events[idx] as ToolCallEvent))};
             });
+        }
 
         case 'permission_request':
             return updateActiveTurn(ensurePlaceholderTurn(state, action.timestamp), (turn) => {
@@ -920,6 +925,32 @@ function updateActiveTurn(
             return updater(t);
         }),
     };
+}
+
+/**
+ * Apply `settle` to a call held by an assistant turn other than the active one
+ * (a history turn), or return null when no such turn holds it: the call is in
+ * the active turn, or nowhere.
+ */
+function settleHistoricalToolCall(
+    state: ConversationState,
+    toolUseId: string,
+    settle: (existing: ToolCallEvent) => ToolCallEvent,
+): ConversationState | null {
+    const holds = (t: Turn): t is AssistantTurn =>
+        t.kind === 'assistant' &&
+        t.events.some((e) => e.kind === 'tool_call' && e.id === toolUseId);
+    const active = state.turns.find(
+        (t) => t.kind === 'assistant' && t.id === state.activeAssistantTurnId,
+    );
+    if (active && holds(active)) return null;
+    const index = state.turns.findIndex(holds);
+    if (index < 0) return null;
+    const turn = state.turns[index] as AssistantTurn;
+    const events = turn.events.map((e) =>
+        e.kind === 'tool_call' && e.id === toolUseId ? settle(e) : e,
+    );
+    return {...state, turns: replaceAt(state.turns, index, {...turn, events})};
 }
 
 function replaceAt<T>(arr: T[], idx: number, value: T): T[] {

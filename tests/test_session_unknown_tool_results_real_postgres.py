@@ -21,6 +21,7 @@ from shared.run_queue import (
     record_input_seq,
 )
 from shared.session_tool_debt import has_tool_debt
+from shared.tool_result_state import RESULT_UNKNOWN, tool_result_state_metrics
 from tests import test_workspace_pull_failure_real_postgres as full
 
 pg_dsn = full.pg_dsn
@@ -111,9 +112,9 @@ async def queue(db, thread):
 
 async def tool_rows(db, thread):
     return [
-        dict(r)
+        {**dict(r), "metrics": json.loads(r["metrics"]) if r["metrics"] else None}
         for r in await db.fetch(
-            "SELECT tool_call_id, turn_number, content FROM thread_messages "
+            "SELECT tool_call_id, turn_number, content, metrics FROM thread_messages "
             "WHERE thread_id=$1 AND role='tool' ORDER BY seq",
             thread,
         )
@@ -140,6 +141,8 @@ async def test_decision_answers_the_call_and_settles_the_interrupted_turn(db, de
             "tool_call_id": "call_sleep",
             "turn_number": 1,
             "content": utr.result_text(decision),
+            # The cockpit labels the call by this, not "completed".
+            "metrics": tool_result_state_metrics(RESULT_UNKNOWN, "call_sleep"),
         }
     ]
     async with db.acquire() as conn:

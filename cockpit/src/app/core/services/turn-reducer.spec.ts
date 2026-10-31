@@ -764,6 +764,40 @@ describe('turn-reducer — tool calls', () => {
         expect(tc!.id).toBe('tc-orphan');
     });
 
+    it('tool_completed for a call a history turn holds settles it there', () => {
+        // A reload during the call: the stream did not replay its turn, so the
+        // call sits in a history turn without a result.
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'h1',
+            events: [
+                {
+                    kind: 'tool_call',
+                    id: 'tc1',
+                    tool: 'shell_execute',
+                    args: {},
+                    status: 'completed',
+                    resultState: 'missing',
+                    startedAt: 1000,
+                },
+            ],
+            status: 'done',
+            turnNumber: 1,
+            startedAt: 1000,
+            historical: true,
+        };
+        const state = play(
+            [{type: 'tool_completed', toolUseId: 'tc1', result: 'done-sleeping', timestamp: 1500}],
+            {...EMPTY_CONVERSATION, turns: [historical]},
+        );
+        expect(state.turns).toHaveLength(1);
+        const tc = (state.turns[0] as AssistantTurn).events[0] as ToolCallEvent;
+        expect(tc.status).toBe('completed');
+        expect(tc.result).toBe('done-sleeping');
+        expect(tc.resultState).toBeUndefined();
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
     it('tool_started closes any open thinking event before pushing the tool call', () => {
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},

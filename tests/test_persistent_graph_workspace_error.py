@@ -9,6 +9,11 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.tool_result_state import (
+    RESULT_NOT_RUN,
+    RESULT_UNKNOWN,
+    TOOL_RESULT_STATE_KEY,
+)
 from agent.persistent_graph import (
     PersistentLoopCallbacks,
     _user_facing_turn_error,
@@ -189,6 +194,13 @@ async def test_workspace_loss_leaves_no_call_without_a_result():
     assert results["c1"].startswith("Result unknown:")
     assert "workspace gone" in results["c1"]
     assert results["c2"].startswith("Not run:")
+    # Each row carries the marker the history labels the call by.
+    states = {
+        m.tool_call_id: m.additional_kwargs.get(TOOL_RESULT_STATE_KEY)
+        for m in persisted
+        if isinstance(m, ToolMessage)
+    }
+    assert states == {"c1": RESULT_UNKNOWN, "c2": RESULT_NOT_RUN}
     # The started call's card closes as failed; the unstarted one never opened.
     on_tool_result.assert_awaited_once()
     assert on_tool_result.await_args.args[:2] == ("boom", results["c1"])

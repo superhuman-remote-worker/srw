@@ -12,6 +12,11 @@
       "denied": "denied",
       "expired": "not run"
     },
+    "outcome": {
+      "noResult": "no result",
+      "resultUnknown": "result unknown",
+      "notRun": "not run"
+    },
     "diff": {
       "replace": "diff",
       "append": "appended",

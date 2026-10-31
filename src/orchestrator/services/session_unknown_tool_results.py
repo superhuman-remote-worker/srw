@@ -16,6 +16,7 @@ session_unknown_tool_result_needs_admin.md (F4).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +28,7 @@ from shared.run_queue import (
     settle_parked_unit,
 )
 from shared.session_tool_debt import has_tool_debt, unanswered_tool_calls
+from shared.tool_result_state import RESULT_UNKNOWN, tool_result_state_metrics
 
 DECISION_CONTINUE = "continue"
 DECISION_STOP = "stop"
@@ -109,12 +111,13 @@ async def decide_unknown_tool_results(
         for call in calls:
             await conn.execute(
                 "INSERT INTO thread_messages "
-                "(thread_id, role, content, turn_number, tool_call_id) "
-                "VALUES ($1::uuid, 'tool', $2, $3, $4)",
+                "(thread_id, role, content, turn_number, tool_call_id, metrics) "
+                "VALUES ($1::uuid, 'tool', $2, $3, $4, $5::jsonb)",
                 thread_id,
                 content,
                 call["turn_number"],
                 call["call_id"],
+                json.dumps(tool_result_state_metrics(RESULT_UNKNOWN, call["call_id"])),
             )
         if await has_tool_debt(conn, thread_id):
             raise UnknownToolResultRefused(409, "tool_history_ambiguous")

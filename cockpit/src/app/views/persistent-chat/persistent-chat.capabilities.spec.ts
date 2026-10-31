@@ -882,3 +882,44 @@ describe('the continuation a delegation-batch recovery wrote', () => {
     }
   });
 });
+
+describe('a call the history holds without a result', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+  const call = {
+    kind: 'tool_call' as const, id: 'tc1', tool: 'shell_execute', args: {command: 'sleep 240'},
+    status: 'completed' as const, resultState: 'missing' as const, startedAt: 0,
+  };
+
+  // A reload during the call: the session still reports it running, so the
+  // card says running, never "completed" or "no result". Once the session is
+  // parked the cut-off call is the owner's to decide and reads "no result".
+  it('reads running while the session reports it, else no result', async () => {
+    const chat = sessionState() as any;
+    chat.runningTools.set([{id: 'tc1', tool: 'shell_execute', args: {}}]);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = () => fixture.componentInstance.toolView(call);
+      expect(view().status).toBe('running');
+      expect(view().outcome).toBeUndefined();
+
+      chat.isParked.set(true);
+      expect(view().outcome?.labelKey).toBe('toolCard.outcome.noResult');
+
+      chat.isParked.set(false);
+      chat.runningTools.set([]);
+      expect(view().outcome?.labelKey).toBe('toolCard.outcome.noResult');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});

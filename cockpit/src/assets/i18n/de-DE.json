@@ -12,6 +12,11 @@
       "denied": "abgelehnt",
       "expired": "nicht ausgeführt"
     },
+    "outcome": {
+      "noResult": "kein Ergebnis",
+      "resultUnknown": "Ergebnis unbekannt",
+      "notRun": "nicht ausgeführt"
+    },
     "diff": {
       "replace": "Diff",
       "append": "angehängt",

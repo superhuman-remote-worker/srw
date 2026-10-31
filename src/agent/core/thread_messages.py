@@ -18,6 +18,11 @@ from shared.runtime.llm.reasoning_chat import extract_reasoning_text_from_block
 from shared.runtime.core.context_entries import SRW_INJECTION_KEY
 from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT, PERSIST_ROLE_EVENT
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
+from shared.tool_result_state import (
+    TOOL_RESULT_STATE_KEY,
+    TOOL_RESULT_STATES,
+    tool_result_state_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -370,8 +375,14 @@ def _serialize_message_row(
             # (the image included) and a context entry folds in as a part.
             provider_raw = {NATIVE_CONTENT_KEY: _stored_content(content)}
         content = content_text(content)
-    # Attach metrics only to AI messages (not tool results)
+    # Attach the turn metrics only to AI messages. A tool result carries one
+    # thing there: the marker of a result that does not report what the call
+    # did (shared/tool_result_state.py).
     msg_metrics = metrics if role == "ai" else None
+    if role == "tool" and tool_call_id:
+        state = getattr(msg, "additional_kwargs", {}).get(TOOL_RESULT_STATE_KEY)
+        if state in TOOL_RESULT_STATES:
+            msg_metrics = tool_result_state_metrics(state, tool_call_id)
     row: Dict[str, Any] = {
         "id": getattr(msg, "id", None),
         "role": role,
