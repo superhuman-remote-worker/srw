@@ -11,6 +11,17 @@ change the published OpenAPI operation for a route this batch must leave
 byte-identical. ``list_agents`` keeps its ``Query`` defaults verbatim, bounds
 included, because those bounds are the published request contract.
 
+**The fleet admin routes** (list, read, system info, deregister) are served
+under ``/api/admin/agents``. ``/api/agents`` is the agent-internal prefix, and
+an edge that blocks it (the dev tunnel does) left the Cockpit's Agents panel
+empty. Each still answers on its old ``/api/agents`` path through a second,
+``deprecated=True`` decorator — the same handler, gate and response — for one
+release, so an already-loaded Cockpit and other old clients keep working.
+**Remove those decorators in a later release** — except ``DELETE
+/api/agents/{agent_id}``, which is also the agent's own internal-key
+deregistration (``OrchestratorClient.deregister``) and stays; only its admin
+use is deprecated there.
+
 **The access gate is called here, as the handler's first statement**, exactly as
 it was in the application module. That placement is load-bearing twice over: it
 preserves the pre-extraction ordering (nothing is read or written before the
@@ -107,7 +118,8 @@ async def agent_heartbeat(
     )
 
 
-@router.get("/api/agents")
+@router.get("/api/agents", deprecated=True)
+@router.get("/api/admin/agents")
 async def list_agents(
     request: Request,
     status: str | None = Query(default=None),
@@ -129,7 +141,8 @@ async def list_agents(
     )
 
 
-@router.get("/api/agents/{agent_id}")
+@router.get("/api/agents/{agent_id}", deprecated=True)
+@router.get("/api/admin/agents/{agent_id}")
 async def get_agent(request: Request, agent_id: str) -> dict[str, Any]:
     """Get agent details by ID. **Admin only** (G4)."""
     dependencies = get_agent_registration_dependencies(request)
@@ -139,7 +152,8 @@ async def get_agent(request: Request, agent_id: str) -> dict[str, Any]:
     )
 
 
-@router.get("/api/agents/{agent_id}/system-info")
+@router.get("/api/agents/{agent_id}/system-info", deprecated=True)
+@router.get("/api/admin/agents/{agent_id}/system-info")
 async def get_agent_system_info(request: Request, agent_id: str) -> dict[str, Any]:
     """Proxy system info request to an agent's /system/info endpoint.
     **Admin only** (G4) — proxies host-level CPU/memory/process/port
@@ -155,18 +169,26 @@ async def get_agent_system_info(request: Request, agent_id: str) -> dict[str, An
     )
 
 
+# The old path is not deprecated as a whole: agents deregister on it. Only an
+# admin calling it is (see the module docstring).
 @router.delete("/api/agents/{agent_id}")
+@router.delete("/api/admin/agents/{agent_id}")
 async def delete_agent(request: Request, agent_id: str) -> dict[str, str]:
     """Deregister an agent. **Admin or internal-key** (G4).
 
-    Used by the cockpit's agent-list admin tool, and by agents
-    deregistering on graceful shutdown via X-Internal-Key so clean exits
-    stop aging into missed-heartbeat corpses (Track B will move them to a
-    bearer-credentialled path). The heartbeat timeout (3min) remains the
-    backstop for crashes.
+    Used by the cockpit's agent-list admin tool (``/api/admin/agents/{id}``;
+    admin use of ``/api/agents/{id}`` is deprecated), and by agents
+    deregistering on graceful shutdown via X-Internal-Key on
+    ``/api/agents/{id}`` so clean exits stop aging into missed-heartbeat
+    corpses (Track B will move them to a bearer-credentialled path). The
+    heartbeat timeout (3min) remains the backstop for crashes.
+
+    Only a bare internal-key call skips the admin gate. The MCP server sends
+    the key with ``X-MCP-User-Id`` on every tool call a user drives, so the
+    MCP ``deregister_agent`` tool is an admin call like the cockpit's (N9).
     """
     dependencies = get_agent_registration_dependencies(request)
-    if not dependencies.is_internal_call(request):
+    if not dependencies.is_internal_service_call(request):
         await dependencies.require_admin(request)
     return await agent_registration.delete_agent(
         request, agent_id, dependencies=dependencies

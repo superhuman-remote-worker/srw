@@ -1574,6 +1574,60 @@
             }
           ]
         },
+        "skills": {
+          "description": "Skill tools (src/agent/tools/workspace/skills.py): use_skill loads a skill from skills/<name>/. Its own group so that a workspace list cannot drop it. The skill list in the prompt follows this tool: false or [] means no list and no skill files, except that a before_tool skill binding in instruction_files brings use_skill back. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "use_skill"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
         "sql": {
           "description": "PostgreSQL query tools (src/agent/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
@@ -2202,12 +2256,12 @@
         "permission_mode": {
           "type": "string",
           "enum": [
-            "supervised",
+            "read_only",
             "auto_accept",
             "autonomous"
           ],
-          "default": "supervised",
-          "description": "Default permission mode for tool execution in interactive sessions"
+          "default": "read_only",
+          "description": "Default permission mode for tool execution in interactive sessions. read_only runs reads freely and asks before changes, outbound actions and commands; auto_accept also runs workspace edits; autonomous asks for nothing. The legacy value supervised is read as read_only."
         },
         "idle_timeout_minutes": {
           "type": "integer",
@@ -2380,7 +2434,7 @@
         },
         "live": {
           "type": "object",
-          "description": "The live voice entry's session settings (with `driver: live`). The orchestrator builds the voice's instructions from `persona` + `facts` + the framework's voice rules and `texts.fallback`, and its first words from `greeting`; the job's voice subagent reads `answer_timeout_s`, `texts.follow_up` and `texts.goodbye`. Persona and facts are plain text: the six assembler placeholders are rejected. Keep customer content in a DB expert, not in a bundled one.",
+          "description": "The live voice entry's session settings. The resolved entry needs `driver: live`; an expert that extends one may set only the keys it changes (e.g. `live: {greeting, facts}`) and inherits the driver. The orchestrator builds the voice's instructions from `persona` + `facts` + the framework's voice rules and `texts.fallback`, and its first words from `greeting`; the job's voice subagent reads `answer_timeout_s`, `texts.follow_up` and `texts.goodbye`. Persona and facts are plain text: the six assembler placeholders are rejected. Keep customer content in a DB expert, not in a bundled one.",
           "properties": {
             "persona": {
               "type": "string",

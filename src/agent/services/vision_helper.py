@@ -81,6 +81,7 @@ class VisionHelper:
         # while the primary agent uses a text-only model on a custom endpoint
         from shared.runtime.core.transport_resolution import (
             is_openai_default_endpoint,
+            served_model_from_env,
             wire_model_id,
         )
 
@@ -97,7 +98,13 @@ class VisionHelper:
             else ""
         )
         self.api_key = os.getenv("VISION_API_KEY", primary_key)
-        self.model = wire_model_id(os.getenv("VISION_MODEL", "gpt-4o"), self.api_base)
+        # VISION_MODEL is the catalog id; the request carries the upstream
+        # string its catalog row names (VISION_SERVED_MODEL), when it names one.
+        catalog_model = os.getenv("VISION_MODEL")
+        served_model = served_model_from_env("VISION") if catalog_model else None
+        self.model = wire_model_id(
+            served_model or catalog_model or "gpt-4o", self.api_base
+        )
         self.timeout = float(os.getenv("VISION_TIMEOUT", "120"))
 
         if not self.api_key:

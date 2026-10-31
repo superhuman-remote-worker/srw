@@ -302,16 +302,21 @@ class TestLiveSessionOfAManifestJob:
         assert status in error.value.detail
 
 
+GENERIC_IMAGE = "example/x@sha256:" + "d" * 64
+
+
 class TestAdmitRefusesALiveGenericImage:
     @pytest.mark.asyncio
     async def test_a_generic_image_cannot_take_a_live_session(self):
         user_id = str(uuid4())
         db = MagicMock()
+        db.user_can_run_custom_harness_images = AsyncMock(return_value=True)
         service = ManifestExecutionService(
             db,
             runtime=MagicMock(),
             namespace="srw",
             native_hosting_enabled=True,
+            approved_images=[{"name": "x", "image": GENERIC_IMAGE}],
             connector_drivers=MagicMock(),
         )
         prepared = {
@@ -320,7 +325,7 @@ class TestAdmitRefusesALiveGenericImage:
                 "spec": {
                     "liveSession": True,
                     "execution": {
-                        "expert": {"inline": {"runtime": {"image": "example/x:1"}}},
+                        "expert": {"inline": {"runtime": {"image": GENERIC_IMAGE}}},
                         "connectors": {"telefon": _line_connector()},
                         "session": {"connector": "telefon", "id": "rtc_1"},
                     },
@@ -331,3 +336,113 @@ class TestAdmitRefusesALiveGenericImage:
             await service.admit(prepared, {}, {"id": user_id})
         assert error.value.status_code == 422
         assert "SRW harness" in error.value.detail
+
+
+INSTALLED_SRW_IMAGE = "example/srw@sha256:" + "e" * 64
+CUSTOM_SRW_IMAGE = "example/custom@sha256:" + "c" * 64
+
+
+def _srw_job_service(image, *, grant):
+    user_id = str(uuid4())
+    db = MagicMock()
+    db.user_can_run_custom_harness_images = AsyncMock(return_value=grant)
+    db.create_job = AsyncMock(return_value={"id": uuid4()})
+    service = ManifestExecutionService(
+        db,
+        runtime=MagicMock(),
+        namespace="srw",
+        srw_image=INSTALLED_SRW_IMAGE,
+        native_hosting_enabled=True,
+        approved_images=[{"name": "cc", "image": CUSTOM_SRW_IMAGE}],
+        connector_drivers=MagicMock(),
+    )
+    prepared = {
+        "document": {},
+        "revision": "r",
+        "dependencies": [],
+        "resolved": {
+            "metadata": {"scope": {"kind": "Account", "name": user_id}},
+            "spec": {
+                "task": {"text": "go"},
+                "completion": {"mode": "Reported"},
+                "retry": {"maxAttempts": 1},
+                "execution": {
+                    "expert": {
+                        "inline": {
+                            "runtime": {
+                                "adapter": "srw/v1",
+                                "image": image,
+                                "config": {"config_name": "worker_base"},
+                            }
+                        }
+                    },
+                    "connectors": {},
+                    "workspace": None,
+                },
+            },
+        },
+    }
+    return service, db, prepared, {"id": user_id}
+
+
+def _srw_snapshot(monkeypatch):
+    srw = {
+        "resolved": {
+            "spec": {
+                "execution": {"expert": {"inline": {"runtime": {"config": {"x": 1}}}}}
+            }
+        }
+    }
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_execution_snapshot.prepare_srw_snapshot",
+        AsyncMock(return_value=srw),
+    )
+
+
+class TestAdmitSrwJobOnAnApprovedImage:
+    @pytest.mark.asyncio
+    async def test_srw_job_on_an_approved_image_needs_the_grant(self, monkeypatch):
+        _srw_snapshot(monkeypatch)
+        service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE, grant=False)
+        with pytest.raises(HTTPException) as denied:
+            await service.admit(prepared, {}, user)
+        assert denied.value.status_code == 403
+        assert "custom_harness_images" in denied.value.detail
+        db.create_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_srw_job_on_an_approved_image_records_it_and_pins_the_lane(
+        self, monkeypatch
+    ):
+        _srw_snapshot(monkeypatch)
+        service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE, grant=True)
+        await service.admit(prepared, {}, user)
+        kwargs = db.create_job.call_args.kwargs
+        assert kwargs["harness_image"] == CUSTOM_SRW_IMAGE
+        assert kwargs["execution_lane"] == "pinned"
+        runtime = kwargs["execution_manifest"]["resolved"]["spec"]["execution"][
+            "expert"
+        ]["inline"]["runtime"]
+        assert runtime["image"] == CUSTOM_SRW_IMAGE
+
+    @pytest.mark.asyncio
+    async def test_srw_job_on_the_installed_image_records_no_harness_image(
+        self, monkeypatch
+    ):
+        _srw_snapshot(monkeypatch)
+        service, db, prepared, user = _srw_job_service(INSTALLED_SRW_IMAGE, grant=False)
+        await service.admit(prepared, {}, user)
+        kwargs = db.create_job.call_args.kwargs
+        assert kwargs["harness_image"] is None
+        db.user_can_run_custom_harness_images.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_live_job_on_a_custom_srw_image_is_refused(self, monkeypatch):
+        _srw_snapshot(monkeypatch)
+        service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE, grant=True)
+        prepared["resolved"]["spec"]["liveSession"] = True
+        with pytest.raises(HTTPException) as error:
+            await service.admit(prepared, {}, user)
+        assert error.value.status_code == 422
+        assert "SRW harness" in error.value.detail
+        db.create_job.assert_not_called()

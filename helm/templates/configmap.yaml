@@ -309,6 +309,9 @@ data:
   MANIFEST_NAMESPACE: {{ .Values.manifestHosting.namespace | default (printf "%s-native" (include "srw.fullname" . | trunc 56 | trimSuffix "-")) | quote }}
   MANIFEST_MAX_CONCURRENT_JOBS: {{ .Values.manifestHosting.maxConcurrentJobs | quote }}
   MANIFEST_HARNESS_EGRESS: {{ toJson .Values.manifestHosting.harnessEgress | quote }}
+  MANIFEST_APPROVED_IMAGES: {{ toJson .Values.manifestHosting.approvedImages | quote }}
+  MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION: {{ .Values.manifestHosting.allowApprovedImagesWithoutVerifiedIsolation | quote }}
+  MANIFEST_WORKSPACE_EGRESS: {{ toJson .Values.manifestHosting.workspaceEgress | quote }}
   # PostgreSQL (App DB) — non-secret connection parts. The DSN is composed
   # at runtime from these + POSTGRES_USER/POSTGRES_PASSWORD (Secret), with
   # URL-quoting applied to the credentials. Storing a full DATABASE_URL in
@@ -454,6 +457,9 @@ data:
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and
   # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
   WORKSPACE_RECLAIM_ON_IDLE: {{ .Values.workspace.reclaimOnIdle | default false | quote }}
+  # Idle job workspaces release their Pod and keep their PVC after this many
+  # seconds; 0 disables. Runs only with workspace cleanup reconciliation on.
+  WORKSPACE_IDLE_POD_RELEASE_SECONDS: {{ .Values.workspace.idlePodReleaseSeconds | default 0 | quote }}
 
   # Agent
   AGENT_CONFIG: {{ .Values.agent.config | quote }}
@@ -569,6 +575,19 @@ data:
   # The cockpit SPA still uses .Values.keycloak.cockpitClientId for its
   # PKCE-only Bearer flow.
   KEYCLOAK_CLIENT_ID: {{ .Values.auth.bff.clientId | quote }}
+  # Bearer token binding (auth.oidc): the clients (`azp`) and audiences
+  # (`aud`) whose access tokens the orchestrator accepts. The BFF client is
+  # also always accepted from KEYCLOAK_CLIENT_ID.
+  {{- $oidc := .Values.auth.oidc | default dict }}
+  {{- /* The SPA client the realm actually has: the external-Keycloak
+       bootstrap Job registers keycloak.bootstrap.cockpitClientId when set. */}}
+  {{- $cockpitClient := .Values.keycloak.cockpitClientId }}
+  {{- if and (not .Values.keycloak.internal) (.Values.keycloak.bootstrap | default dict).cockpitClientId }}
+  {{- $cockpitClient = .Values.keycloak.bootstrap.cockpitClientId }}
+  {{- end }}
+  {{- $oidcClients := concat (list .Values.auth.bff.clientId $cockpitClient) ($oidc.extraAllowedClients | default list) | compact | uniq }}
+  OIDC_ALLOWED_CLIENTS: {{ join "," $oidcClients | quote }}
+  OIDC_ALLOWED_AUDIENCES: {{ join "," ($oidc.allowedAudiences | default list | compact | uniq) | quote }}
   {{- if .Values.keycloak.adminApiDisabled }}
   KEYCLOAK_ADMIN_API_DISABLED: {{ "true" | quote }}
   {{- end }}

@@ -116,9 +116,15 @@ interface RepoEntry {
                 <span class="file-path">{{ selectedFile() }}</span>
                 <span class="file-size">{{ formatSize(fileSize()) }}</span>
               </div>
-              <div class="file-content">
-                <pre class="code-block"><code>{{ fileContent() }}</code></pre>
-              </div>
+              @if (fileIsBinary()) {
+                <div class="no-file">
+                  <span>Binary file, no text preview</span>
+                </div>
+              } @else {
+                <div class="file-content">
+                  <pre class="code-block"><code>{{ fileContent() }}</code></pre>
+                </div>
+              }
             } @else {
               <div class="no-file">
                 <span>Failed to load file</span>
@@ -385,6 +391,8 @@ export class WorkspaceBrowserComponent {
   readonly selectedFile = signal<string | null>(null);
   readonly fileContent = signal<string | null>(null);
   readonly fileSize = signal(0);
+  /** The selected file came back base64 (PDF, image, database). */
+  readonly fileIsBinary = signal(false);
   readonly isLoadingTree = signal(false);
   readonly isLoadingFile = signal(false);
 
@@ -462,10 +470,13 @@ export class WorkspaceBrowserComponent {
     this.selectedFile.set(path);
     this.isLoadingFile.set(true);
     this.fileContent.set(null);
+    this.fileIsBinary.set(false);
 
     this.api.getRepoFile(jobId, path).subscribe((result) => {
       if (result) {
-        this.fileContent.set(result.content);
+        const binary = result.encoding === 'base64';
+        this.fileIsBinary.set(binary);
+        this.fileContent.set(binary ? '' : result.content);
         this.fileSize.set(result.size);
       } else {
         this.fileContent.set(null);

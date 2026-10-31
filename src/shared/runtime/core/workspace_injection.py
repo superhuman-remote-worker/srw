@@ -1,10 +1,4 @@
-"""Helper functions for transient injection as synthetic tool calls.
-
-This module provides utilities to inject content as fake tool call results,
-making it appear as if the agent already read certain files. This approach:
-
-1. Avoids duplication (agent won't redundantly call read_file)
-2. Ensures injected content isn't included in summarization (re-injected fresh each turn)
+"""Helper functions for workspace injection.
 
 Handles injection of:
 - Todo lists (as transient HumanMessage) — no longer produced: the worker's
@@ -17,13 +11,14 @@ Handles injection of:
   protected HumanMessage (see src/shared/runtime/core/message_markers.py) that the graph
   appends to state and the context manager keeps out of every compaction
   strategy
-- Memory and knowledge injection use their own modules (memory_injection.py, knowledge_injection.py)
+- Memory, knowledge and the other per-request context are appended as typed
+  context entries (append-only context injection, agent.core.context_injection)
 """
 
 import hashlib
-from typing import List, Tuple
+from typing import Tuple
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from shared.runtime.core.context_entries import is_context_injection
 from shared.runtime.core.injection_markers import (
@@ -50,33 +45,6 @@ def content_hash_id(content: str) -> str:
     payload are not possible.
     """
     return hashlib.sha1(content.encode("utf-8", errors="replace")).hexdigest()[:8]
-
-
-def find_tail_injection_anchor(messages: List[BaseMessage]) -> int:
-    """Index at which to insert the transient injection block, at the tail.
-
-    Transient injections (memory, knowledge, citation feedback, guidance,
-    instruction files) are placed AFTER the conversation, not before it:
-    provider prompt caches match on a strict left-to-right prefix, so a
-    block that changes every turn must sit below the stable history or it
-    invalidates the cache for everything after it.
-
-    The anchor is the position just after the last Human/Tool message
-    rather than blindly ``len(messages)``: the injected memory/knowledge
-    pairs are synthetic ``AIMessage(tool_call)`` + ``ToolMessage`` turns,
-    and Gemini rejects a function-call turn that does not immediately
-    follow a user or function-response turn ("Please ensure that function
-    call turn comes immediately after a user turn or after a function
-    response turn."). Every real path into an LLM call ends the history
-    with a HumanMessage (new task/turn, transition, reminder) or the
-    ToolMessages of the previous iteration — so the anchor is normally the
-    end of the list; the walk-back only matters for degenerate histories
-    that end in a bare model turn.
-    """
-    for i in range(len(messages), 0, -1):
-        if isinstance(messages[i - 1], (HumanMessage, ToolMessage)):
-            return i
-    return len(messages)
 
 
 def create_todos_human_message(todos_content: str) -> HumanMessage:

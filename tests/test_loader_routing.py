@@ -189,29 +189,134 @@ class TestShouldUseReasoningSummary:
 class TestReasoningSummaryRouting:
     """Integration tests verifying correct reasoning kwargs reach ReasoningChatOpenAI."""
 
+    @pytest.mark.parametrize(
+        "model, level",
+        [
+            ("gpt-6-sol", "low"),
+            ("gpt-6-luna", "high"),
+            ("gpt-5.6-luna", "max"),
+            ("gpt-5.5", "medium"),
+            ("gpt-5.4-mini", "low"),
+            ("gpt-5.2-pro", "high"),
+            ("o3-mini", "medium"),
+        ],
+    )
+    @pytest.mark.parametrize("base_url", [None, "https://api.openai.com/v1"])
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
-    def test_gpt5_gets_reasoning_effort(self, mock_chat):
-        """gpt-5.2-pro should use Chat Completions reasoning_effort (not Responses API)."""
+    def test_native_reasoning_model_runs_on_responses(
+        self, mock_chat, model, level, base_url
+    ):
+        """OpenAI rejects function tools with a reasoning effort on Chat
+        Completions for these models (HTTP 400 on gpt-6-sol, dev 2026-10-20),
+        so OpenAI's own endpoint gets the Responses shape, not a flat
+        `reasoning_effort`, and no custom sampling values."""
         mock_chat.return_value = MagicMock()
-        config = _make_config(model="gpt-5.2-pro", reasoning_level="high")
+        config = _make_config(
+            model=model,
+            base_url=base_url,
+            reasoning_level=level,
+            temperature=0.2,
+            top_p=0.8,
+            top_k=64,
+        )
 
         _create_openai_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model"] == model
+        assert call_kwargs["use_responses_api"] is True
+        assert call_kwargs["reasoning"] == {"effort": level, "summary": "auto"}
+        assert "model_kwargs" not in call_kwargs
+        assert call_kwargs["temperature"] is None
+        assert "top_p" not in call_kwargs
+        assert "top_k" not in call_kwargs.get("extra_body", {})
+
+    @pytest.mark.parametrize("level", [None, "none"])
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_native_reasoning_model_stays_on_responses_without_effort(
+        self, mock_chat, level
+    ):
+        """No effort sent still means the provider default effort, which is
+        not `none` for gpt-6*: Chat Completions 400s on tools then too. The
+        route is per model, so a level change never flips the wire API."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-6-sol", reasoning_level=level)
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["use_responses_api"] is True
+        assert "reasoning" not in call_kwargs
+        assert "model_kwargs" not in call_kwargs
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_served_model_decides_the_route(self, mock_chat):
+        """The catalog row's served id is what OpenAI sees, so it decides."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="team-default", reasoning_level="low")
+        config.served_model = "gpt-6-sol"
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model"] == "gpt-6-sol"
+        assert call_kwargs["use_responses_api"] is True
+        assert call_kwargs["reasoning"] == {"effort": "low", "summary": "auto"}
+
+    @pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-sol-api"])
+    @pytest.mark.parametrize(
+        "base_url", [None, "https://api.openai.com/v1", "https://sol.invalid/v1"]
+    )
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_sol_6_1_unchanged_on_every_endpoint(self, mock_chat, model, base_url):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model=model, base_url=base_url, reasoning_level="xhigh", temperature=0.2
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["use_responses_api"] is True
+        assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+        assert call_kwargs["temperature"] is None
+
+    @pytest.mark.parametrize("model", ["gpt-4.1-mini", "gpt-4o"])
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_native_non_reasoning_model_keeps_chat_completions(self, mock_chat, model):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model=model, temperature=0.3, top_p=0.9)
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["use_responses_api"] is False
+        assert "reasoning" not in call_kwargs
+        assert call_kwargs["temperature"] == 0.3
+        assert call_kwargs["top_p"] == 0.9
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://srw-codex-proxy:8317/v1",  # an `openai-chat` proxy row
+            "https://openai-compatible.invalid/v1",
+        ],
+    )
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_other_endpoints_keep_chat_completions(self, mock_chat, base_url):
+        """An OpenAI-compatible server may not serve /v1/responses, and a
+        proxy row reaches this factory because it chose Chat Completions."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="gpt-6-sol", base_url=base_url, reasoning_level="high"
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["use_responses_api"] is False
         assert "reasoning" not in call_kwargs
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
-
-    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
-    def test_o3_gets_reasoning_effort(self, mock_chat):
-        """o3-mini should use Chat Completions reasoning_effort (not Responses API)."""
-        mock_chat.return_value = MagicMock()
-        config = _make_config(model="o3-mini", reasoning_level="medium")
-
-        _create_openai_llm(config, limits=None)
-
-        call_kwargs = mock_chat.call_args[1]
-        assert "reasoning" not in call_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "medium"
 
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_gpt_oss_is_prompt_delivered_not_api(self, mock_chat):
@@ -452,7 +557,7 @@ class TestFamilyOptionsDriveClamp:
         _create_openai_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+        assert call_kwargs["reasoning"]["effort"] == "high"
 
 
 class TestGpt56Reasoning:
@@ -810,7 +915,7 @@ class TestOpenAIReasoningClamping:
         _create_openai_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+        assert call_kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
 
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
     def test_minimal_clamped_to_low(self, mock_chat):
@@ -821,8 +926,8 @@ class TestOpenAIReasoningClamping:
         _create_openai_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert "reasoning" not in call_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "low"
+        assert call_kwargs["reasoning"] == {"effort": "low", "summary": "auto"}
+        assert "model_kwargs" not in call_kwargs
 
 
 class TestOpenRouterReasoningFormat:

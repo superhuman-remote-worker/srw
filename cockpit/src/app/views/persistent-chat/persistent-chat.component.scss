@@ -1303,6 +1303,12 @@
         min-width: 0;
       }
 
+      .permission-note {
+        padding-left: 22px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
       .approval-badge {
         display: inline-flex;
         align-items: center;
@@ -2264,30 +2270,6 @@
         font-style: italic;
         cursor: help;
         border-bottom: 1px dashed var(--info);
-      }
-
-      // Inline citation markers — [N] resolved + renumbered by CitationRefDirective.
-      .message-body ::ng-deep sup.citation-ref {
-        color: var(--accent-color);
-        font-weight: 600;
-        padding: 0 1px;
-        cursor: default;
-      }
-      .message-body ::ng-deep sup.citation-ref.resolved {
-        cursor: help;
-      }
-      .message-body ::ng-deep sup.citation-ref.resolved.clickable {
-        cursor: pointer;
-        text-decoration: underline dotted;
-        text-underline-offset: 2px;
-      }
-      // A [N] that wasn't a real citation: render flat, like the literal text.
-      .message-body ::ng-deep sup.citation-ref.unresolved {
-        vertical-align: baseline;
-        font-size: inherit;
-        font-weight: inherit;
-        color: inherit;
-        cursor: default;
       }
 
       @media (max-width: 768px) {

@@ -25,6 +25,8 @@ import contextlib
 import functools
 import importlib
 import inspect
+import json
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -549,6 +551,7 @@ DEFAULT_CREATION = [
     ("project_loop_sweeper_loop", False, None),
     ("stale_verification_sweeper_loop", False, None),
     ("session_wake_sweeper_loop", False, None),
+    ("default_project_knowledge_backfill_loop", True, None),
     ("kb_reindex_sweeper_loop", True, None),
     ("llm_pricing_sync_loop", False, None),
     ("cloud_pricing_sync_loop", False, None),
@@ -605,6 +608,7 @@ DEFAULT_SHUTDOWN = [
     "project_loop_sweeper_loop",
     "stale_verification_sweeper_loop",
     "session_wake_sweeper_loop",
+    "default_project_knowledge_backfill_loop",
     "kb_reindex_sweeper_loop",
     "llm_pricing_sync_loop",
     "cloud_pricing_sync_loop",
@@ -788,6 +792,46 @@ async def test_leader_task_uses_the_application_store(monkeypatch):
     leader = recorder.created[0]
     assert leader["label"] == "run_as_leader"
     assert leader["arguments"]["db"] is world.store
+
+
+_APPROVED_IMAGE = "example.invalid/h@sha256:" + "b" * 64
+
+
+@pytest.mark.asyncio
+async def test_startup_binds_the_approved_harness_images_to_the_store(monkeypatch):
+    """Dispatch reads the approved list from the store (swappable harness
+    image): the same validated MANIFEST_APPROVED_IMAGES admission uses."""
+    entries = [{"name": "cc", "image": _APPROVED_IMAGE}]
+    world = await _run_lifespan(
+        monkeypatch,
+        _Recorder(),
+        env={"MANIFEST_APPROVED_IMAGES": json.dumps(entries)},
+    )
+    assert world.store.manifest_approved_images == tuple(entries)
+
+
+@pytest.mark.asyncio
+async def test_no_approved_list_binds_an_empty_one(monkeypatch):
+    monkeypatch.delenv("MANIFEST_APPROVED_IMAGES", raising=False)
+    world = await _run_lifespan(monkeypatch, _Recorder())
+    assert world.store.manifest_approved_images == ()
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_approved_list_binds_none_and_warns(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger=lifecycle.logger.name)
+    world = await _run_lifespan(
+        monkeypatch,
+        _Recorder(),
+        env={"MANIFEST_APPROVED_IMAGES": '[{"name": "cc", "image": "srw:latest"}]'},
+    )
+    assert world.store.manifest_approved_images == ()
+    warnings = [
+        r.getMessage() for r in caplog.records if r.name == lifecycle.logger.name
+    ]
+    assert any("Invalid MANIFEST_APPROVED_IMAGES" in w for w in warnings)
+    # The operator's value is never echoed into the log.
+    assert not any("srw:latest" in w for w in warnings)
 
 
 # --------------------------------------------------------------------------- #

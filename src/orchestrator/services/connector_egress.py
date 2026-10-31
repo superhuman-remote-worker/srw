@@ -18,6 +18,15 @@ driver pod's declared egress is pinned when the pod is created:
 4. DNS stays off unless the driver declares ``needs_dns``; then only the
    cluster resolver pods on port 53, and names are unrestricted.
 
+One exception to step 2: an **in-cluster Service the installation opted in**
+for a driver (``<name>.<namespace>.svc``, annotated
+:data:`SERVICE_EGRESS_ANNOTATION` with the driver's name, e.g. the voice
+gateway for ``srw.gpt-live-sip/v1``). Its ClusterIP goes into hostAliases,
+and the policy admits the Service's own pods by namespace and selector on its
+target ports, never an address range: NetworkPolicy matches a Service's
+traffic after its address translation, so an ``ipBlock`` of the ClusterIP
+would admit nothing, and the cluster ranges stay refused for everything else.
+
 The pins and their resolution time are recorded with the pod; the capability
 matrix and the connector's egress view show them ("enforced"). Removing an
 address from a policy does not close an established connection: re-pinning
@@ -58,7 +67,13 @@ DNS_PEER = {
     "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
 }
 
+#: The annotation by which an in-cluster Service admits drivers' pods: a
+#: comma-separated list of driver names (``srw.gpt-live-sip/v1``).
+SERVICE_EGRESS_ANNOTATION = "srw.io/driver-egress"
+
 _CONFIG_REFERENCE = re.compile(r"\$\{config\.([a-z][a-z0-9_]*)\}\Z")
+_DNS_LABEL = r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
+_SERVICE_HOST = re.compile(rf"({_DNS_LABEL})\.({_DNS_LABEL})\.svc(?:\.{_DNS_LABEL})*\Z")
 _HOSTNAME = re.compile(
     r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\Z"
@@ -147,6 +162,47 @@ class EgressPolicy:
 
 
 @dataclass(frozen=True)
+class ServicePeer:
+    """An in-cluster Service that admits one driver's pods.
+
+    ``address`` is its ClusterIP (the pod dials it through hostAliases);
+    ``selector`` picks its pods, which the pod's policy admits; ``ports``
+    maps each Service port to the pods' port, which is what a NetworkPolicy
+    matches once the Service has translated the address.
+    """
+
+    namespace: str
+    name: str
+    address: str
+    selector: tuple[tuple[str, str], ...]
+    ports: tuple[tuple[int, int | str], ...]
+    protocols: tuple[tuple[int, str], ...] = ()
+
+    def target(self, port: int) -> int | str | None:
+        return dict(self.ports).get(port)
+
+    def record(self, ports: Sequence[int]) -> dict[str, Any]:
+        return {
+            "namespace": self.namespace,
+            "name": self.name,
+            "selector": dict(self.selector),
+            "target_ports": [self.target(port) for port in ports],
+        }
+
+
+#: Finds the Service ``(namespace, name)`` that admits the pod being pinned:
+#: ``None`` when there is none (the name then resolves like any other host);
+#: :class:`EgressRefused` when it exists and refuses this driver.
+ServicePeerLookup = Callable[[str, str], Awaitable["ServicePeer | None"]]
+
+
+def service_host(host: str) -> tuple[str, str] | None:
+    """``(namespace, name)`` of a ``<name>.<namespace>.svc[.<domain>]`` host."""
+    match = _SERVICE_HOST.fullmatch(host)
+    return (match.group(2), match.group(1)) if match else None
+
+
+@dataclass(frozen=True)
 class PinnedHost:
     """One declared destination as enforced: its addresses and ports."""
 
@@ -156,6 +212,8 @@ class PinnedHost:
     protocol: str = "tcp"
     #: ``True`` when the host was an address or a CIDR (no hostAlias).
     literal: bool = False
+    #: An in-cluster Service: the policy admits its pods, not the address.
+    service: ServicePeer | None = None
 
     @property
     def many_addresses(self) -> bool:
@@ -169,7 +227,7 @@ class PinnedHost:
         return out
 
     def record(self) -> dict[str, Any]:
-        return {
+        recorded = {
             "host": self.host,
             "addresses": list(self.addresses),
             "ports": list(self.ports),
@@ -177,6 +235,9 @@ class PinnedHost:
             "literal": self.literal,
             "many_addresses": self.many_addresses,
         }
+        if self.service is not None:
+            recorded["service"] = self.service.record(self.ports)
+        return recorded
 
 
 @dataclass(frozen=True)
@@ -193,6 +254,30 @@ class EgressPins:
         """``egress`` rules: one per pinned host, plus DNS when declared."""
         rules: list[dict[str, Any]] = []
         for pinned in self.hosts:
+            if pinned.service is not None:
+                peer = pinned.service
+                rules.append(
+                    {
+                        "to": [
+                            {
+                                "namespaceSelector": {
+                                    "matchLabels": {
+                                        "kubernetes.io/metadata.name": peer.namespace
+                                    }
+                                },
+                                "podSelector": {"matchLabels": dict(peer.selector)},
+                            }
+                        ],
+                        "ports": [
+                            {
+                                "protocol": pinned.protocol.upper(),
+                                "port": peer.target(port),
+                            }
+                            for port in pinned.ports
+                        ],
+                    }
+                )
+                continue
             rules.append(
                 {
                     "to": [{"ipBlock": {"cidr": cidr}} for cidr in pinned.cidrs()],
@@ -328,12 +413,21 @@ async def pin_egress(
     needs_dns: str | None = None,
     resolver: Resolver = system_resolver,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    service_peer: ServicePeerLookup | None = None,
 ) -> EgressPins:
     """Resolve and check every declared destination once; raise
-    :class:`EgressRefused` naming the first one SRW will not open."""
+    :class:`EgressRefused` naming the first one SRW will not open.
+
+    ``service_peer`` finds an in-cluster Service that admits this pod (see
+    the module docstring); without it every in-cluster name is refused."""
     pinned: list[PinnedHost] = []
     for rule in rules:
         host, ports = expand_rule(rule, config)
+        named = service_host(host) if service_peer is not None else None
+        peer = await service_peer(*named) if named is not None else None
+        if peer is not None:
+            pinned.append(_service_pin(host, ports, rule.protocol, peer, policy))
+            continue
         literal = True
         try:
             network = ipaddress.ip_network(host, strict=True)
@@ -391,6 +485,41 @@ async def pin_egress(
     )
 
 
+def _service_pin(
+    host: str,
+    ports: tuple[int, ...],
+    protocol: str,
+    peer: ServicePeer,
+    policy: EgressPolicy,
+) -> PinnedHost:
+    """An opted-in Service as a pin: every declared port must be one of its
+    ports (same protocol), and its ClusterIP one this cluster pins."""
+    try:
+        address = ipaddress.ip_address(peer.address)
+    except ValueError:
+        raise EgressRefused(f"{host}: the Service has no ClusterIP") from None
+    if address.version == 6 and not policy.ipv6:
+        raise EgressRefused(
+            f"{host}: the Service's ClusterIP is IPv6, and this cluster pins IPv4 only"
+        )
+    if not peer.selector:
+        raise EgressRefused(f"{host}: the Service selects no pods")
+    protocols = dict(peer.protocols)
+    for port in ports:
+        if peer.target(port) is None:
+            raise EgressRefused(f"{host}: the Service has no port {port}")
+        if protocols.get(port, "tcp") != protocol:
+            raise EgressRefused(f"{host}: the Service's port {port} is not {protocol}")
+    return PinnedHost(
+        host=host,
+        addresses=(str(address),),
+        ports=ports,
+        protocol=protocol,
+        literal=False,
+        service=peer,
+    )
+
+
 async def private_addresses_allowed(
     conn: Any, connector_id: str, *, private_tiers: Iterable[str]
 ) -> bool:
@@ -430,14 +559,18 @@ __all__ = [
     "DNS_PEER",
     "MANY_ADDRESSES",
     "RESOLVE_TIMEOUT_SECONDS",
+    "SERVICE_EGRESS_ANNOTATION",
     "EgressPins",
     "EgressPolicy",
     "EgressRefused",
     "ResolverBusy",
     "PinnedHost",
+    "ServicePeer",
+    "ServicePeerLookup",
     "expand_rule",
     "pin_egress",
     "private_addresses_allowed",
     "refusal",
+    "service_host",
     "system_resolver",
 ]

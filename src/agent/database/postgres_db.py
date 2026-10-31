@@ -1457,7 +1457,12 @@ class PostgresDB:
         # context entry, append-only context injection) is rebuilt from its
         # ``additional_kwargs.srw_injection`` schema, so the CASE fetches the
         # column for those rows only and stays NULL for every other row.
-        provider_projection = ", message.provider_raw" if include_provider_raw else ""
+        # A reader that asks for provider_raw (the restores) also gets the
+        # row's write time: a Responses turn's item ids are replayed only while
+        # OpenAI still stores what they point at (thread_messages.native_ai_fields).
+        provider_projection = (
+            ", message.provider_raw, message.created_at" if include_provider_raw else ""
+        )
         params: List[Any] = [thread_id]
         # The turn that consumed a row: an admitted delivery records it, the
         # row's own number is a hint for pinned input (restore orders by it,
@@ -1543,7 +1548,10 @@ class PostgresDB:
                     "turn_number": row["turn_number"],
                     "admitted_turn_number": row.get("admitted_turn_number"),
                     **(
-                        {"provider_raw": _j(row["provider_raw"])}
+                        {
+                            "provider_raw": _j(row["provider_raw"]),
+                            "created_at": row.get("created_at"),
+                        }
                         if include_provider_raw
                         else {}
                     ),
@@ -1982,6 +1990,63 @@ class PostgresDB:
                         str(expected_id),
                     )
         return True
+
+    # ------------------------------------------------------------------
+    # Stateless workspace upgrade copy marker (C1)
+    # ------------------------------------------------------------------
+
+    _CLEAR_WORKSPACE_UPGRADE_SEED_SQL = """
+        UPDATE threads
+        SET metadata = jsonb_set(
+                metadata,
+                '{workspace_container}',
+                (metadata -> 'workspace_container') - 'seed_from',
+                false
+            ),
+            last_activity = now()
+        WHERE id = $1::uuid
+          AND execution_lane = 'stateless'
+          AND metadata -> 'workspace_container' -> 'seed_from' = $2::jsonb
+        RETURNING 1
+    """
+
+    async def clear_workspace_upgrade_seed(
+        self, thread_id: str, *, expected_seed_from: Dict[str, Any]
+    ) -> bool:
+        """Clear a stateless upgrade's copy marker after a verified copy (C1).
+
+        Fenced like every claimant write: the thread row is locked first, then
+        the exact lease is proven. False when another claim already cleared it.
+        """
+        from agent.api.lease_context import LeaseLostError
+
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        if lease is None:
+            raise LeaseLostError("the workspace upgrade copy needs the session lease")
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if exists is None:
+                    return False
+                await _require_run_queue_fence(conn, lease)
+                cleared = await conn.fetchval(
+                    self._CLEAR_WORKSPACE_UPGRADE_SEED_SQL,
+                    thread_id,
+                    json.dumps(expected_seed_from),
+                )
+        return cleared is not None
+
+    async def workspace_upgrade_seed_pending(self, thread_id: str) -> bool:
+        """True while the Session's workspace upgrade still owes its copy."""
+        value = await self.fetchval(
+            "SELECT COALESCE(metadata -> 'workspace_container' ? 'seed_from', false) "
+            "FROM threads WHERE id = $1::uuid",
+            thread_id,
+        )
+        return bool(value)
 
     async def get_thread_pending_memory(
         self, thread_id: str

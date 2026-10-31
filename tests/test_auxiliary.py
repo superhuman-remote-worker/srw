@@ -741,7 +741,7 @@ class TestObservationWindowFiltersBeforeCap:
 
     @staticmethod
     def _history():
-        from agent.core.memory_injection import create_memory_injection_messages
+        from tests._legacy_injection_rows import create_memory_injection_messages
         from shared.runtime.core.context_entries import make_context_entry
 
         real = [
@@ -774,26 +774,6 @@ class TestObservationWindowFiltersBeforeCap:
 
         task = aux.chain.call_args[0][0]
         assert task.messages == real
-
-    @pytest.mark.asyncio
-    async def test_assembler_window_keeps_the_real_messages(self):
-        from shared.runtime.services.auxiliary import assemble_memories
-
-        real, history = self._history()
-        aux = MagicMock()
-        aux.agent = AsyncMock(
-            return_value=MagicMock(actions_taken=[], gaps_identified=[], summary="")
-        )
-
-        with patch(
-            "shared.runtime.services.assembler_tools.create_assembler_tools",
-            return_value=[],
-        ):
-            await assemble_memories(aux, MagicMock(), history, "", "prompt")
-
-        task = aux.agent.call_args[0][0]
-        assert task.recent_context == _format_messages_for_extraction(real)
-        assert "real 0" in task.recent_context
 
     @pytest.mark.asyncio
     async def test_all_injections_means_no_extraction(self):

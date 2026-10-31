@@ -667,9 +667,7 @@ async def _two_worker_turns(env):  # noqa: F811
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["legacy", "append_only"])
-async def test_the_worker_forks_its_last_request(env, mode):  # noqa: F811
-    env["config"].context_management.injection_mode = mode
+async def test_the_worker_forks_its_last_request(env):  # noqa: F811
     llm, aux, manager, result = await _two_worker_turns(env)
 
     assert len(llm.requests) == 3, "turn 1, the fork, turn 2"

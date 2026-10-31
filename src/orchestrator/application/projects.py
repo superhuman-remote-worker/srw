@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import functools
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 from orchestrator.application import (
     access as access_composition,
@@ -31,6 +33,7 @@ from orchestrator.services import (
     connector_secrets,
     datasource_config,
     datasources as datasources_operations,
+    default_project_knowledge as default_project_knowledge_operations,
     deployment_gates,
     dispatch_credentials,
     knowledge_index as knowledge_index_operations,
@@ -127,6 +130,20 @@ def project_provisioning_dependencies(
         logger=logger,
         repair=resources.project_repair_state,
         knowledge_index=knowledge_index_dependencies(resources),
+    )
+
+
+def schedule_default_project_knowledge(
+    resources: ApplicationResources, user: Mapping[str, Any]
+) -> bool:
+    """Schedule an admitted user's default-project vault on this application.
+
+    The admission paths (``security.auth``'s first login, role write-through
+    and approval, the OAuth bridge's JIT user) hold this, not the provisioning
+    ports; the owner is read per call so a patch of it applies.
+    """
+    return default_project_knowledge_operations.schedule_default_project_knowledge(
+        user, dependencies=project_provisioning_dependencies(resources)
     )
 
 

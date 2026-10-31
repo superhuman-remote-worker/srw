@@ -10,6 +10,7 @@ import {
   formatUsd,
   failureReason,
   heldForReviewReason,
+  jobExpertLabel,
   jobModelLabel,
   liveSubjobCount,
   JobDetailPanelComponent,
@@ -192,6 +193,13 @@ describe('typed workspace creation detail', () => {
     return {fixture, data};
   }
 
+  it('names the exit code of an exited Job container', () => {
+    const {fixture} = renderPanel({workspace_creation: {stage: 'readiness', state: 'attention',
+      reason_code: 'container_exited', readiness_deadline_at: null, exit_code: 3}});
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('Workspace needs attention: its container exited with code 3 before it was ready.');
+  });
+
   function loadedDetail(workspace_creation?: Job['workspace_creation']): JobDetailState {
     return {
       loading: false, error: false,
@@ -202,9 +210,9 @@ describe('typed workspace creation detail', () => {
   }
 
   const observing = {stage: 'scheduling', state: 'observing',
-    reason_code: 'observation_pending', readiness_deadline_at: null} as const;
+    reason_code: 'observation_pending', readiness_deadline_at: null, exit_code: null} as const;
   const attention = {stage: 'readiness', state: 'attention',
-    reason_code: 'invalid_image', readiness_deadline_at: null} as const;
+    reason_code: 'invalid_image', readiness_deadline_at: null, exit_code: null} as const;
 
   it('replaces the list observation with newer attention from the loaded detail', () => {
     const {fixture, data} = renderPanel({workspace_creation: observing});
@@ -265,7 +273,7 @@ describe('typed workspace creation detail', () => {
       id: 'job-startup', description: 'Start workspace', status: 'created',
       created_at: '2026-09-28T08:00:00Z',
       workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
-        reason_code: 'scheduler_unschedulable', readiness_deadline_at: null,
+        reason_code: 'scheduler_unschedulable', readiness_deadline_at: null, exit_code: null,
         private_diagnostic: '0/3 nodes had taint secret'},
       vm_creation: {state: 'observing', message: 'VM observation', resumable: true},
     } as unknown as JobSummary)});
@@ -439,6 +447,76 @@ describe('jobModelLabel', () => {
     expect(jobModelLabel({config_override: {autonomy: 'full'}} as unknown as Job)).toBeNull();
     expect(jobModelLabel(null)).toBeNull();
     expect(jobModelLabel({config_override: 'not json'} as unknown as Job)).toBeNull();
+  });
+});
+
+describe('jobExpertLabel', () => {
+  it("names a DB expert's job by its display name, not the worker_base root", () => {
+    // What a live automation on an account expert creates: the expert is
+    // selected by id and the stored selector is the framework root.
+    expect(
+      jobExpertLabel({
+        config_name: 'worker_base',
+        expert_display_name: 'Küppelsmühle Empfang (Demo)',
+      }),
+    ).toBe('Küppelsmühle Empfang (Demo)');
+  });
+
+  it('keeps the config name for bundled experts and rows without an expert id', () => {
+    expect(jobExpertLabel({config_name: 'scholar', expert_display_name: null})).toBe('scholar');
+    // Rows from before the list carried the field.
+    expect(jobExpertLabel({config_name: 'worker_base'})).toBe('worker_base');
+    expect(jobExpertLabel({config_name: 'scholar', expert_display_name: '  '})).toBe('scholar');
+    expect(jobExpertLabel({config_name: null, expert_display_name: null})).toBeNull();
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    it('shows the display name in the EXPERT fact', () => {
+      TestBed.configureTestingModule({
+        imports: [
+          JobDetailPanelComponent,
+          TranslocoTestingModule.forRoot({
+            langs: {en},
+            translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+          }),
+        ],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {
+        value: signal({
+          id: 'job-3',
+          description: 'Answer the phone',
+          status: 'processing',
+          origin: 'automation',
+          created_at: '2026-10-20T08:00:00Z',
+          config_name: 'worker_base',
+          expert_id: '44444444-4444-4444-8444-444444444444',
+          expert_display_name: 'Küppelsmühle Empfang (Demo)',
+        } as unknown as JobSummary),
+      });
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+      fixture.detectChanges();
+
+      const facts = Array.from(
+        (fixture.nativeElement as HTMLElement).querySelectorAll('.detail-grid .fact'),
+      );
+      const expert = facts.find(
+        (fact) => fact.querySelector('.fact-label')?.textContent?.trim() === en.jobs.detail.expert,
+      );
+      expect(expert?.querySelector('.fact-value')?.textContent?.trim()).toBe(
+        'Küppelsmühle Empfang (Demo)',
+      );
+    });
   });
 });
 

@@ -1356,6 +1356,221 @@ class TestIsReapable:
 
 
 # =============================================================================
+# Idle Pod release: an idle job's Pod goes, its PVC keeps the work
+# =============================================================================
+
+
+def _idle_job_metadata(**overrides) -> dict:
+    metadata = {
+        "labels": {"srw/job-id": "j1"},
+        "job_status": "pending_review",
+        "job_updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+        "job_assigned_agent": False,
+        "ide_status": None,
+        "pod_ip": "10.0.0.7",
+        "pod_uid": "11111111-1111-4111-8111-111111111111",
+        "volume_ephemeral": False,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def _pvc_backed_pod(name: str, labels: dict):
+    pod = _make_pod(name, labels=labels)
+    volume = MagicMock()
+    volume.name = "workspace-data"
+    volume.persistent_volume_claim = MagicMock()
+    pod.spec.volumes = [volume]
+    return pod
+
+
+class TestIdlePodRelease:
+    @pytest.fixture(autouse=True)
+    def _release_after_an_hour(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_IDLE_POD_RELEASE_SECONDS", "3600")
+
+    def _inst(self, **overrides) -> Instance:
+        return Instance(
+            kind="workspace",
+            id="workspace-j1",
+            bound_to="j1",
+            metadata=_idle_job_metadata(**overrides),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["pending_review", "waiting_for_reply", "paused"]
+    )
+    async def test_idle_pvc_job_is_reapable_and_clean(self, status):
+        mgr, *_ = _make_manager()
+        inst = self._inst(job_status=status)
+        assert await mgr.is_reapable(inst) is True
+        assert await mgr.is_dirty(inst) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [None, "0", "-5", "soon"])
+    async def test_release_off_keeps_capture_containment(self, monkeypatch, value):
+        if value is None:
+            monkeypatch.delenv("WORKSPACE_IDLE_POD_RELEASE_SECONDS")
+        else:
+            monkeypatch.setenv("WORKSPACE_IDLE_POD_RELEASE_SECONDS", value)
+        mgr, *_ = _make_manager()
+        inst = self._inst()
+        assert await mgr.is_reapable(inst) is False
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_recently_changed_job_keeps_its_pod(self):
+        mgr, *_ = _make_manager()
+        inst = self._inst(
+            job_updated_at=datetime.now(timezone.utc) - timedelta(minutes=10)
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_idle_age_keeps_its_pod(self):
+        mgr, *_ = _make_manager()
+        assert await mgr.is_reapable(self._inst(job_updated_at=None)) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("assigned", [True, None])
+    async def test_assigned_or_unknown_agent_keeps_its_pod(self, assigned):
+        # A parked pinned agent still drives the workspace; phase approval
+        # resumes it in-process without re-checking the Pod.
+        mgr, *_ = _make_manager()
+        assert await mgr.is_reapable(self._inst(job_assigned_agent=assigned)) is False
+
+    @pytest.mark.asyncio
+    async def test_emptydir_workspace_keeps_its_pod(self):
+        mgr, *_ = _make_manager()
+        assert await mgr.is_reapable(self._inst(volume_ephemeral=True)) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ide_status", ["active", "ready", "restoring", "cleanup_pending", "new"]
+    )
+    async def test_live_ide_keeps_its_pod(self, ide_status):
+        mgr, *_ = _make_manager()
+        assert await mgr.is_reapable(self._inst(ide_status=ide_status)) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ide_status", ["expired", "failed", "stopped"])
+    async def test_finished_ide_allows_release(self, ide_status):
+        mgr, *_ = _make_manager()
+        assert await mgr.is_reapable(self._inst(ide_status=ide_status)) is True
+
+    @pytest.mark.asyncio
+    async def test_reviewing_parent_stays_contained(self):
+        mgr, *_ = _make_manager()
+        inst = self._inst(job_status="reviewing")
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_live_shared_child_still_wins(self):
+        mgr, *_ = _make_manager()
+        assert await mgr.is_reapable(self._inst(has_live_shared_child=True)) is False
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_without_snapshot_stays_contained(self):
+        mgr, *_ = _make_manager()
+        inst = self._inst(job_status="completed")
+        assert await mgr.is_reapable(inst) is False
+        assert await mgr.is_dirty(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_dirty_thread_stays_contained(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-t1",
+            bound_to="t1",
+            metadata={
+                "labels": {"srw/thread-id": "t1"},
+                "thread_status": "ended",
+                "total_turns": 3,
+                "pod_ip": "10.0.0.8",
+                "pod_uid": "11111111-1111-4111-8111-111111111111",
+                "volume_ephemeral": False,
+            },
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_list_instances_reports_agent_and_ide(self):
+        mgr, *_ = _make_manager(
+            pods=[
+                _pvc_backed_pod("workspace-j1", labels={"srw/job-id": "j1"}),
+                _pvc_backed_pod("workspace-j2", labels={"srw/job-id": "j2"}),
+            ],
+            job_rows={
+                "j1": {
+                    "status": "pending_review",
+                    "assigned_agent_id": None,
+                    "context": {"ide_session": {"status": "active"}},
+                },
+                "j2": {
+                    "status": "pending_review",
+                    "assigned_agent_id": "agent-1",
+                    "context": {"ide_session": "malformed"},
+                },
+            },
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            instances = {i.bound_to: i for i in await mgr.list_instances()}
+
+        assert instances["j1"].metadata["job_assigned_agent"] is False
+        assert instances["j1"].metadata["ide_status"] == "active"
+        assert instances["j1"].metadata["volume_ephemeral"] is False
+        assert instances["j2"].metadata["job_assigned_agent"] is True
+        assert instances["j2"].metadata["ide_status"] is None
+
+    @pytest.mark.asyncio
+    async def test_tick_releases_the_pod_and_keeps_the_pvc(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        pod = _pvc_backed_pod("workspace-j1", labels={"srw/job-id": "j1"})
+        mgr, container, suspension, snapshot, db = _make_manager(
+            pods=[pod],
+            job_rows={
+                "j1": {
+                    "status": "pending_review",
+                    "assigned_agent_id": None,
+                    "updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+                    "context": {
+                        "workspace_container": {
+                            "status": "ready",
+                            "pod_ip": "10.0.0.7",
+                        }
+                    },
+                }
+            },
+        )
+        mgr.reap_orphans = AsyncMock(return_value=0)
+        mgr._tcp_probe = AsyncMock(return_value=True)
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            report = await InstanceLifecycleReconciler([mgr]).tick()
+
+        assert report["workspace"]["reaped"] == 1
+        assert report["workspace"]["reap_attempts"] == 0
+        assert report["workspace"]["reap_forced"] == 0
+        _assert_exact_workspace_delete(container, WorkspaceOwner.job("j1"))
+        prepare = container.prepare_workspace_cleanup_intent.await_args
+        assert prepare.kwargs["target_disposition"] == "deleted"
+        assert prepare.kwargs["reclaim_shared_resources"] is False
+        assert prepare.kwargs["admission_source"] == "automatic"
+        container.delete_workspace_pvc.assert_not_awaited()
+        container.attest_workspace_runtime.assert_not_awaited()
+        snapshot.capture_vm_snapshot.assert_not_awaited()
+        db.merge_workspace_container_context.assert_not_awaited()
+
+
+# =============================================================================
 # Missing-row orphan reap (job deleted while its pod lived)
 # =============================================================================
 

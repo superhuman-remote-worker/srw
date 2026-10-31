@@ -230,11 +230,11 @@ class ToolContext:
     verify_citation_prompt: Optional[str] = (
         None  # Matrix-resolved citation-verification system prompt.
     )
-    citation_verdict_callback: Optional[Callable[[int, str], None]] = (
-        None  # (citation_id, status) listener fired when a background
-        # verification lands a verdict. Persistent sessions wire this to a
-        # WS/SSE broadcast (live citations-panel update); worker jobs leave it
-        # None. Threaded to CitationEngine(on_verdict=...).
+    citation_event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = (
+        None  # (method, params) listener for citation.created / .updated /
+        # .verdict. Persistent sessions wire this to their WS/SSE broadcast so
+        # chips resolve live; worker jobs leave it None. Threaded to
+        # CitationEngine(on_event=...).
     )
     canvas_event_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = (
         None  # (method, params) post-commit Canvas invalidation hook. Persistent
@@ -723,7 +723,7 @@ class ToolContext:
                 context=ctx,
                 verify_aux=self.verify_aux,
                 verify_prompt=self.verify_citation_prompt,
-                on_verdict=self.citation_verdict_callback,
+                on_event=self.citation_event_callback,
             )
 
         return self.citation_engine
@@ -893,6 +893,8 @@ class ToolContext:
                     str(local_path),
                     name=name or posixpath.basename(source_key),
                     metadata=metadata,
+                    # The workspace path, not the temporary copy's (D2).
+                    identifier=source_key,
                 )
         else:
             source = await engine.add_doc_source(
@@ -1224,6 +1226,21 @@ class ToolContext:
         else:
             self._recent_read_versions[normalized] = content_version
 
+    def record_own_write(self, path: str, content: str | bytes) -> None:
+        """Record text this agent just wrote as its known version of the file.
+
+        The agent authored every byte, so writing or editing the same file
+        again needs no fresh read; the version hash still demands one after
+        any out-of-band change. A configured instruction file is refreshed
+        only when it was already read: writing one never satisfies a gate.
+        """
+        normalized = path.lstrip("/").strip()
+        if self._is_instruction_path(normalized) and not self.was_recently_read(
+            normalized
+        ):
+            return
+        self.record_file_read(normalized, content)
+
     def _is_instruction_path(self, normalized: str) -> bool:
         """Whether a normalized path is a configured instruction file."""
         for entry in self._instruction_files:
@@ -1267,6 +1284,20 @@ class ToolContext:
         raw = content.encode("utf-8") if isinstance(content, str) else content
         current = "sha256:" + hashlib.sha256(raw).hexdigest()
         return current == expected
+
+    def recent_read_changed(self, path: str, content: str | bytes) -> bool:
+        """Whether this agent did read ``path`` (a versioned read) and the
+        file's text is no longer what it read: another writer edited it in
+        between. False when the file was never read, which is the other
+        reason :meth:`recent_read_matches` says no."""
+
+        normalized = path.lstrip("/").strip()
+        if normalized not in self._recent_reads:
+            return False
+        expected = self._recent_read_versions.get(normalized)
+        if expected is None:
+            return False
+        return not self.recent_read_matches(path, content)
 
     def invalidate_recent_read(self, path: str) -> bool:
         """Forget a file read after an out-of-band user edit.
@@ -1409,6 +1440,13 @@ class ToolContext:
         if not self.was_recently_read(path):
             return False
 
+        stamp = self._instruction_read_stamps.get(path)
+        token = self._tool_batch_token()
+        if token is not None and stamp and stamp.get("delivered_in") == token:
+            # Delivered by a refusal in this same batch: calls the model
+            # wrote before the text arrived have still not seen it.
+            return False
+
         read_scope = getattr(entry, "read_scope", "job")
         max_age = getattr(entry, "max_read_age_turns", None)
         if read_scope == "job" and max_age is None:
@@ -1467,16 +1505,69 @@ class ToolContext:
         """
         for entry in self.get_enforcement_entries(tool_name):
             if not self.instruction_read_is_valid(entry):
-                from shared.runtime.services.guardrails import format_nudge
-
-                model = self._llm_config.model if self._llm_config is not None else None
-                return format_nudge(
-                    "read_file_required_error",
-                    model=model,
-                    file_path=entry.path,
-                    tool_name=tool_name,
-                )
+                return self._refuse_with_instruction(entry, tool_name)
         return None
+
+    def _tool_batch_token(self) -> Optional[str]:
+        """Identify the LLM response whose tool calls are running now.
+
+        The session loop (which also drives subagent children) stamps each
+        response's id; the worker graph advances ``turn_count`` once per
+        response. None when neither identifies a response.
+        """
+        ai_id = self._current_ai_message_id
+        if ai_id and ai_id != "None":
+            return f"ai:{ai_id}"
+        if self._current_phase is not None:
+            return f"turn:{self._current_turn_count}"
+        return None
+
+    def _refuse_with_instruction(self, entry: Any, tool_name: str) -> str:
+        """Refuse ``tool_name`` once, carrying the unread instruction file.
+
+        The refusal holds the file's full text and counts as its read, so the
+        next call goes through without a separate read_file round trip, and
+        the model sees the whole file rather than a slice. Other calls in the
+        same batch stay refused without repeating the text. An unreadable
+        file falls back to asking for a read_file.
+        """
+        from shared.runtime.services.guardrails import format_nudge
+
+        model = self._llm_config.model if self._llm_config is not None else None
+        path = (entry.path or "").lstrip("/").strip()
+        token = self._tool_batch_token()
+        stamp = self._instruction_read_stamps.get(path)
+        if token is not None and stamp and stamp.get("delivered_in") == token:
+            return format_nudge(
+                "read_file_delivered_in_batch",
+                model=model,
+                file_path=entry.path,
+                tool_name=tool_name,
+            )
+        content = None
+        if self.workspace_manager is not None:
+            try:
+                content = self.workspace_manager.read_file(path)
+            except Exception as exc:
+                logger.debug(f"Instruction {path} unreadable for delivery: {exc}")
+        if not isinstance(content, str) or not content.strip():
+            return format_nudge(
+                "read_file_required_error",
+                model=model,
+                file_path=entry.path,
+                tool_name=tool_name,
+            )
+        self.record_file_read(path, content)
+        delivered = self._instruction_read_stamps.get(path)
+        if delivered is not None:
+            delivered["delivered_in"] = token
+        return format_nudge(
+            "read_file_delivered_with_refusal",
+            model=model,
+            file_path=entry.path,
+            tool_name=tool_name,
+            content=content,
+        )
 
     def get_phase_instruction_files(self, phase: str) -> List[Any]:
         """Get instruction files eligible for once-only phase-start delivery.

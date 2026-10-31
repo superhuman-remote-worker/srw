@@ -1,11 +1,8 @@
-"""Helper functions for knowledge base injection as synthetic tool calls.
+"""Knowledge retrieval for context injection: which knowledge bases a
+conversation reads, and the notes it gets from its bound ones.
 
-Mirrors memory_injection.py pattern. Injects project knowledge (summary +
-retrieved notes) as a fake ``kb_search`` tool-call result so the agent sees
-relevant project context each turn without polluting real conversation history.
-
-The messages are transient — re-injected fresh every execute() call and
-excluded from summarization via is_knowledge_injection_message().
+The notes reach the model as an appended knowledge context entry
+(append-only context injection; ``agent.core.context_injection``).
 """
 
 from __future__ import annotations
@@ -14,15 +11,8 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
-
-from shared.runtime.core.injection_markers import (
-    KNOWLEDGE_TOOL_CALL_ID_PREFIX as KNOWLEDGE_TOOL_CALL_ID_PREFIX,
-    CHARTER_TOOL_CALL_ID_PREFIX as CHARTER_TOOL_CALL_ID_PREFIX,
-)
-from shared.runtime.core.workspace_injection import content_hash_id
 from agent.services.knowledge.bindings import KnowledgeBinding
 from shared.runtime.knowledge.chunker import embedding_version_for_service
 
@@ -261,100 +251,3 @@ async def retrieve_bound_knowledge(
         external_watermarks=external_watermarks,
         counts_by_binding=counts,
     )
-
-
-def create_knowledge_injection_messages(
-    content: str,
-) -> Tuple[AIMessage, ToolMessage]:
-    """Create synthetic AIMessage + ToolMessage pair for knowledge injection.
-
-    Creates a fake tool call that makes it appear as if the agent already
-    called ``kb_search`` and received the result.
-
-    Args:
-        content: Formatted knowledge block from KnowledgeStore.assemble_knowledge_block()
-
-    Returns:
-        Tuple of (AIMessage with tool_call, ToolMessage with knowledge content)
-    """
-    tool_call_id = f"{KNOWLEDGE_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
-
-    ai_message = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "kb_search",
-                "args": {"query": "current_task_context"},
-                "id": tool_call_id,
-            }
-        ],
-    )
-
-    tool_message = ToolMessage(
-        content=content,
-        tool_call_id=tool_call_id,
-    )
-
-    return ai_message, tool_message
-
-
-def create_charter_injection_messages(
-    content: str,
-) -> Tuple[AIMessage, ToolMessage]:
-    """Synthetic AIMessage + ToolMessage pair carrying the project charter.
-
-    The charter (centurion.md §5) is pinned intent: injected unconditionally
-    every officer/conference turn as its own block — never via relevance
-    ranking, where a small note can simply lose the top-5. Re-injection per
-    turn is the pinning mechanism; the pair is excluded from summarization
-    like every other transient injection (workspace_injection.py), so
-    compaction can never silently strip the standing orders
-    (governance-decay: arXiv 2606.22528).
-
-    Args:
-        content: Formatted charter block (title + body of the charter note)
-
-    Returns:
-        Tuple of (AIMessage with tool_call, ToolMessage with charter content)
-    """
-    tool_call_id = f"{CHARTER_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
-
-    ai_message = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "kb_read",
-                "args": {"note": "charter"},
-                "id": tool_call_id,
-            }
-        ],
-    )
-
-    tool_message = ToolMessage(
-        content=content,
-        tool_call_id=tool_call_id,
-    )
-
-    return ai_message, tool_message
-
-
-def is_knowledge_injection_message(message: BaseMessage) -> bool:
-    """Check if a message is part of a knowledge injection pair.
-
-    Args:
-        message: A LangChain message object
-
-    Returns:
-        True if this message is a synthetic knowledge injection message
-    """
-    if isinstance(message, ToolMessage):
-        tool_call_id = getattr(message, "tool_call_id", "")
-        return tool_call_id.startswith(KNOWLEDGE_TOOL_CALL_ID_PREFIX)
-
-    if isinstance(message, AIMessage):
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                if tc.get("id", "").startswith(KNOWLEDGE_TOOL_CALL_ID_PREFIX):
-                    return True
-
-    return False

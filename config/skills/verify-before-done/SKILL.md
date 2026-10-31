@@ -98,8 +98,10 @@ If the task explicitly asks you to execute commands or programs that none of you
   "the verifier is unavailable" from "the artifact failed verification."
 {% endif %}
 {% if has_tool("get_citation") %}
-- Research → use `get_citation` to confirm cited claims resolve to sources that
-  contain the claimed facts.
+- Research → use `list_citations` to find citations still UNVERIFIED and fix
+  (`edit_citation`) or withdraw (`withdraw_citation`) each one, and
+  `get_citation` to confirm cited claims resolve to sources that contain the
+  claimed facts.
 {% elif has_tool("cite_web") or has_tool("cite_document") %}
 - Research → use the available citation tools to connect factual claims to real
   sources that contain the claimed facts.

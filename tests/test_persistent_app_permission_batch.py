@@ -48,7 +48,7 @@ def _isolate_announced_rows():
     pa._announced_permission_rows.update(saved)
 
 
-def _mock_session(permission_mode: str = "supervised"):
+def _mock_session(permission_mode: str = "read_only"):
     session = MagicMock()
     session.permission_mode = permission_mode
     session.tool_decisions = {}
@@ -65,8 +65,8 @@ def _mock_session(permission_mode: str = "supervised"):
 
 
 CALLS = [
-    {"name": "web_search", "args": {"query": "france"}, "id": "tc_0"},
-    {"name": "web_search", "args": {"query": "japan"}, "id": "tc_1"},
+    {"name": "write_file", "args": {"query": "france"}, "id": "tc_0"},
+    {"name": "write_file", "args": {"query": "japan"}, "id": "tc_1"},
 ]
 
 
@@ -94,7 +94,7 @@ class TestAnnounceBatch:
         assert event == "permission.request_batch"
         assert [r["id"] for r in payload["requests"]] == ["tc_0", "tc_1"]
         assert payload["requests"][0]["approval_id"] == "rid-tc_0"
-        assert payload["requests"][0]["tool"] == "web_search"
+        assert payload["requests"][0]["tool"] == "write_file"
         assert payload["requests"][0]["args"] == {"query": "france"}
 
     @pytest.mark.asyncio
@@ -196,7 +196,7 @@ class TestClaimsAnnouncedRow:
             patch.object(pa, "_wait_for_permission_resolution", _wait),
             patch.object(pa, "_broadcast", MagicMock()),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_0")
 
         insert.assert_not_awaited()
         assert waited["id"] == "rid-announced"
@@ -221,7 +221,7 @@ class TestClaimsAnnouncedRow:
             ),
             patch.object(pa, "_broadcast", bcast),
         ):
-            await pa._loop_permission_check("web_search", {}, "tc_0")
+            await pa._loop_permission_check("write_file", {}, "tc_0")
 
         events = [c.args[0] for c in bcast.call_args_list]
         assert "permission.request" not in events
@@ -245,46 +245,70 @@ class TestClaimsAnnouncedRow:
             ),
             patch.object(pa, "_broadcast", bcast),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_9")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_9")
 
         insert.assert_awaited_once()
         assert "permission.request" in [c.args[0] for c in bcast.call_args_list]
         assert outcome is PermissionOutcome.APPROVED
 
 
-class TestSharedShellToolSet:
-    """``_gate_needed`` and ``_loop_permission_check`` must consult the SAME
-    shell-tool set. Two independently-maintained copies can silently drift:
-    a tool added to only one leaves a gated call with no announced row — a
-    permanently stuck approval card.
-
-    Patches ``_SHELL_TOOLS`` itself (rather than asserting against its
-    current real contents) so the test exercises the actual wiring — that
-    both call sites read the one shared constant — instead of a coincidence
-    that would hold even if _loop_permission_check still carried its own
-    hardcoded copy with today's same three names.
+class TestOneClassifier:
+    """``_gate_needed`` is the one decision: the batch announce, the sweep and
+    ``_loop_permission_check`` must agree for every tool in every mode, or a
+    gated call has no announced row (a stuck card) or a free call gets one.
     """
 
     @pytest.mark.asyncio
-    async def test_permission_check_and_gate_needed_agree_for_every_shell_tool(self):
-        fake_shell_tools = {"synthetic_shell_tool_for_drift_test"}
-        with patch.object(pa, "_SHELL_TOOLS", fake_shell_tools):
-            for tool_name in pa._SHELL_TOOLS:
-                assert pa._gate_needed("auto_accept", tool_name) is True
+    @pytest.mark.parametrize(
+        "mode", ["read_only", "supervised", "auto_accept", "autonomous", "bogus"]
+    )
+    async def test_permission_check_agrees_with_gate_needed_for_every_tool(self, mode):
+        from shared.tool_catalog import TOOL_REGISTRY
 
-                session = _mock_session("auto_accept")
-                session.postgres_conn = None  # deterministic DECLINE if gated
-                with patch.object(pa, "_session", session):
-                    outcome = await pa._loop_permission_check(tool_name, {}, "tc")
+        names = sorted(TOOL_REGISTRY) + ["mcp__unknown__tool", "no_such_tool"]
+        for tool_name in names:
+            session = _mock_session(mode)
+            session.postgres_conn = None  # deterministic DECLINE if gated
+            with patch.object(pa, "_session", session):
+                outcome = await pa._loop_permission_check(tool_name, {}, "tc")
 
-                # A shell tool must never be auto-approved here — it should
-                # fall through to the gate (and only DECLINE because
-                # postgres_conn is None in this test, not because it was
-                # waved through as a non-shell tool).
-                assert outcome is not PermissionOutcome.APPROVED, (
-                    f"{tool_name!r} was auto-approved though _gate_needed "
-                    "says it requires a gate — the two paths disagree"
-                )
+            gated = pa._gate_needed(mode, tool_name)
+            assert (outcome is PermissionOutcome.APPROVED) is (not gated), (
+                f"{tool_name!r} under {mode!r}: gate says gated={gated}, "
+                f"permission check returned {outcome}"
+            )
+
+    @pytest.mark.parametrize(
+        ("mode", "free", "gated"),
+        [
+            (
+                "read_only",
+                [
+                    "read_file",
+                    "web_search",
+                    "browser_navigate",
+                    "shell_read",
+                    "task_add",
+                ],
+                ["write_file", "delete_file", "run_command", "delegate_agent", "x"],
+            ),
+            (
+                "auto_accept",
+                [
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "shell_read",
+                    "cancel_command",
+                ],
+                ["delete_file", "repo_push", "email_draft", "run_command", "x"],
+            ),
+            ("autonomous", ["run_command", "delete_file", "x"], []),
+        ],
+    )
+    def test_gate_needed_follows_the_declared_effect(self, mode, free, gated):
+        assert [t for t in free if pa._gate_needed(mode, t)] == []
+        assert [t for t in gated if not pa._gate_needed(mode, t)] == []
 
 
 class TestAnnounceSkipsTerminalRows:
@@ -303,8 +327,8 @@ class TestAnnounceSkipsTerminalRows:
     @pytest.mark.asyncio
     async def test_skips_tool_call_with_existing_terminal_decision(self):
         calls = [
-            {"name": "web_search", "args": {"query": "a"}, "id": "tc_terminal"},
-            {"name": "web_search", "args": {"query": "b"}, "id": "tc_fresh"},
+            {"name": "write_file", "args": {"query": "a"}, "id": "tc_terminal"},
+            {"name": "write_file", "args": {"query": "b"}, "id": "tc_fresh"},
         ]
 
         async def _fetchval(sql, *args):
@@ -335,7 +359,7 @@ class TestAnnounceSkipsTerminalRows:
 
         # No fresh row for the already-decided call — inserting one would
         # orphan a card nobody claims or resolves.
-        insert.assert_awaited_once_with("tc_fresh", "web_search", {"query": "b"})
+        insert.assert_awaited_once_with("tc_fresh", "write_file", {"query": "b"})
         ids = [r["id"] for r in bcast.call_args.args[1]["requests"]]
         assert "tc_terminal" not in ids
         assert ids == ["tc_fresh"]
@@ -390,10 +414,10 @@ class TestCallbackWiring:
 
 
 FOUR_CALLS = [
-    {"name": "web_search", "args": {"query": "a"}, "id": "tc_0"},
-    {"name": "web_search", "args": {"query": "b"}, "id": "tc_1"},
-    {"name": "web_search", "args": {"query": "c"}, "id": "tc_2"},
-    {"name": "web_search", "args": {"query": "d"}, "id": "tc_3"},
+    {"name": "write_file", "args": {"query": "a"}, "id": "tc_0"},
+    {"name": "write_file", "args": {"query": "b"}, "id": "tc_1"},
+    {"name": "write_file", "args": {"query": "c"}, "id": "tc_2"},
+    {"name": "write_file", "args": {"query": "d"}, "id": "tc_3"},
 ]
 
 
@@ -434,7 +458,7 @@ class _FakeRowStore:
         return None
 
 
-def _session_with_store(store: _FakeRowStore, mode: str = "supervised"):
+def _session_with_store(store: _FakeRowStore, mode: str = "read_only"):
     acquire_ctx = MagicMock()
     acquire_ctx.__aenter__ = AsyncMock(return_value=store)
     acquire_ctx.__aexit__ = AsyncMock(return_value=False)
@@ -483,7 +507,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
             await pa._loop_announce_permission_batch(FOUR_CALLS)
             assert list(store.status.values()) == ["pending"] * 4
 
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_0")
             assert outcome is PermissionOutcome.NO_ANSWER
 
             await _end_the_turn()
@@ -516,7 +540,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
             ),
         ):
             await pa._loop_announce_permission_batch(FOUR_CALLS)
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_0")
             assert outcome is PermissionOutcome.NO_ANSWER
 
             await _end_the_turn()
@@ -572,7 +596,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
         ):
             await pa._loop_announce_permission_batch(FOUR_CALLS)
             session.permission_mode = "autonomous"
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_1")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_1")
 
         assert outcome is PermissionOutcome.APPROVED
         assert set(store.status.values()) == {"expired"}
@@ -597,7 +621,7 @@ class TestAnnouncedRowsDoNotOutliveTheTurn:
         ):
             await pa._loop_announce_permission_batch(calls)
             session.permission_mode = "auto_accept"
-            await pa._loop_permission_check("web_search", {}, "tc_0")
+            await pa._loop_permission_check("write_file", {}, "tc_0")
 
         assert store.status["rid-tc_0"] == "expired"
         assert store.status["rid-tc_1"] == "expired"
@@ -635,7 +659,7 @@ class TestClaimSelectSoftFailKeepsTheAnnouncedRow:
             store.fetchrow = AsyncMock(side_effect=RuntimeError("connection reset"))
             insert = AsyncMock(return_value="rid-SECOND")
             with patch.object(pa, "_insert_permission_request", insert):
-                outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+                outcome = await pa._loop_permission_check("write_file", {}, "tc_0")
 
         insert.assert_not_awaited()
         assert waited["id"] == "rid-tc_0"
@@ -757,7 +781,7 @@ class TestSweepCannotExpireAGateMidClaim:
             # Arm the hook only now — the announce's own acquires must not
             # trigger it.
             on_exit.append(_sweep_lands_now)
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_0")
 
         assert swept["ran"], "the race window was never reproduced"
         assert store.status["rid-tc_0"] == "approved", (
@@ -792,7 +816,7 @@ class TestGateReservationIsAlwaysReleased:
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_broadcast", MagicMock()),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_prior")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_prior")
 
         assert outcome is PermissionOutcome.APPROVED
         assert gates == set()
@@ -814,7 +838,7 @@ class TestGateReservationIsAlwaysReleased:
                 pa, "_insert_permission_request", AsyncMock(return_value=None)
             ),
         ):
-            outcome = await pa._loop_permission_check("web_search", {}, "tc_noinsert")
+            outcome = await pa._loop_permission_check("write_file", {}, "tc_noinsert")
 
         assert outcome is PermissionOutcome.DECLINED
         assert gates == set()
@@ -837,7 +861,7 @@ class TestGateReservationIsAlwaysReleased:
                 AsyncMock(return_value="approved"),
             ),
         ):
-            await pa._loop_permission_check("web_search", {}, "tc_ok")
+            await pa._loop_permission_check("write_file", {}, "tc_ok")
 
         assert gates == set()
 
@@ -864,7 +888,7 @@ class TestGateReservationIsAlwaysReleased:
             patch.object(pa, "_wait_for_permission_resolution", _wait),
         ):
             task = asyncio.create_task(
-                pa._loop_permission_check("web_search", {}, "tc_cancelled")
+                pa._loop_permission_check("write_file", {}, "tc_cancelled")
             )
             await entered.wait()
             assert gates == {"tc_cancelled"}
@@ -891,8 +915,8 @@ class TestSweepWithoutADbKeepsTheLedger:
     @pytest.mark.asyncio
     async def test_no_pool_leaves_every_entry_for_the_next_sweep(self):
         ledger = {
-            "tc_0": ("rid-tc_0", "web_search", "tid"),
-            "tc_1": ("rid-tc_1", "web_search", "tid"),
+            "tc_0": ("rid-tc_0", "write_file", "tid"),
+            "tc_1": ("rid-tc_1", "write_file", "tid"),
         }
         session = _mock_session()
         session.postgres_conn = None
@@ -915,7 +939,7 @@ class TestSweepWithoutADbKeepsTheLedger:
 
     @pytest.mark.asyncio
     async def test_no_session_leaves_every_entry_for_the_next_sweep(self):
-        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        ledger = {"tc_0": ("rid-tc_0", "write_file", "tid")}
 
         with (
             patch.object(pa, "_session", None),
@@ -952,7 +976,7 @@ class TestSweepHoldsExactRuntimeAuthority:
     async def test_irreversible_update_and_owner_fence_are_one_statement(
         self, authority, required_fragments
     ):
-        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        ledger = {"tc_0": ("rid-tc_0", "write_file", "tid")}
         session, conn = _conn_with(None)
         conn.fetchval = AsyncMock(return_value=None)
 
@@ -984,7 +1008,7 @@ class TestSweepHoldsExactRuntimeAuthority:
 
     @pytest.mark.asyncio
     async def test_missing_exact_owner_leaves_pending_row_for_successor(self):
-        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        ledger = {"tc_0": ("rid-tc_0", "write_file", "tid")}
         session, conn = _conn_with(None)
         conn.fetchval = AsyncMock()
 
@@ -1102,7 +1126,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
                 patch.object(pa._session_identity, "_thread_id", "tid-new"),
             ):
                 await pa._loop_announce_permission_batch(
-                    [{"name": "web_search", "args": {}, "id": "tc_new"}]
+                    [{"name": "write_file", "args": {}, "id": "tc_new"}]
                 )
 
         leaked = [
@@ -1122,7 +1146,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
         session = _session_with_store(store)
         session.cleanup = AsyncMock()
         session.workspace_manager = None
-        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        ledger = {"tc_0": ("rid-tc_0", "write_file", "tid")}
         gates = {"tc_0"}
         close_inbox = AsyncMock()
 
@@ -1152,7 +1176,7 @@ class TestTerminateDoesNotStrandOrLeakAnnouncedRows:
         session = _session_with_store(store)
         session.cleanup = AsyncMock()
         session.workspace_manager = None
-        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        ledger = {"tc_0": ("rid-tc_0", "write_file", "tid")}
         broadcast = MagicMock()
 
         # Admission closure succeeded in its earlier transaction, but the
@@ -1196,8 +1220,8 @@ class TestSweepIsThreadScoped:
         store.status["rid-mine"] = "pending"
         session = _session_with_store(store)
         ledger = {
-            "tc_old": ("rid-old", "web_search", "tid-old"),
-            "tc_mine": ("rid-mine", "web_search", "tid-mine"),
+            "tc_old": ("rid-old", "write_file", "tid-old"),
+            "tc_mine": ("rid-mine", "write_file", "tid-mine"),
         }
         bcast = MagicMock()
 
@@ -1231,8 +1255,8 @@ class TestGatesInFlightExclusion:
         store.status["rid-tc_1"] = "pending"
         session = _session_with_store(store)
         ledger = {
-            "tc_0": ("rid-tc_0", "web_search", "tid"),
-            "tc_1": ("rid-tc_1", "web_search", "tid"),
+            "tc_0": ("rid-tc_0", "write_file", "tid"),
+            "tc_1": ("rid-tc_1", "write_file", "tid"),
         }
 
         with (
@@ -1256,7 +1280,7 @@ class TestGatesInFlightExclusion:
         store = _FakeRowStore()
         store.status["rid-tc_0"] = "pending"
         session = _session_with_store(store)
-        ledger = {"tc_0": ("rid-tc_0", "web_search", "tid")}
+        ledger = {"tc_0": ("rid-tc_0", "write_file", "tid")}
 
         with (
             patch.object(pa, "_session", session),

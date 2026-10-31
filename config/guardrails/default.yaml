@@ -42,7 +42,7 @@ tool_examples:
         git_log()                  # last 10 commits, compact one-line format
         git_log(max_count=5)       # last 5 commits
         git_log(oneline=False)     # full commit details
-        git_log(repo="KurortEngine")  # history of an ATTACHED repository (repos/KurortEngine/)
+        git_log(repo="WidgetShop")    # history of an ATTACHED repository (repos/WidgetShop/)
 
   git_show: |-
     Examples:
@@ -50,7 +50,7 @@ tool_examples:
         git_show(stat_only=True)                                # latest commit, file list only
         git_show(commit_ref="HEAD~3")                           # commit from 3 commits ago
         git_show(commit_ref="phase-1-tactical-complete")        # tagged commit
-        git_show(commit_ref="5e08d4fa", repo="KurortEngine")    # a commit in an ATTACHED repository
+        git_show(commit_ref="5e08d4fa", repo="WidgetShop")      # a commit in an ATTACHED repository
 
   git_diff: |-
     Examples:
@@ -58,12 +58,12 @@ tool_examples:
         git_diff(ref1="HEAD~5")                                             # last 5 commits vs working dir
         git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")             # between tag and HEAD
         git_diff(file_path="plan.md")                                  # uncommitted changes in one file
-        git_diff(ref1="main", ref2="HEAD", repo="KurortEngine")        # inside an ATTACHED repository
+        git_diff(ref1="main", ref2="HEAD", repo="WidgetShop")          # inside an ATTACHED repository
 
   git_status: |-
     Examples:
         git_status()                        # this job's own workspace repo
-        git_status(repo="KurortEngine")     # an ATTACHED repository (repos/KurortEngine/)
+        git_status(repo="WidgetShop")       # an ATTACHED repository (repos/WidgetShop/)
 
     Example output (clean):
         Branch: master
@@ -86,7 +86,7 @@ tool_examples:
         git_tags(pattern="phase-1-*")       # only phase 1 tags for this job
         git_tags(pattern="*")               # all tags for this job
         git_tags(all_jobs=True)             # phase tags from every job in the repo
-        git_tags(pattern="v*", repo="KurortEngine")   # tags in an ATTACHED repository (never job-scoped)
+        git_tags(pattern="v*", repo="WidgetShop")     # tags in an ATTACHED repository (never job-scoped)
 
   git_merge_squash: |-
     Examples:
@@ -326,12 +326,6 @@ nudges:
 
   # ----- src/shared/runtime/services/recall_store.py -----
 
-  memory_block_header_pinned: "--- Pinned Memories (TTL-active) ---"
-  memory_block_header_retrieved: "--- Retrieved Memories (relevance-ranked) ---"
-  # Placeholders: {count} (full summary string e.g. "2 items: 0 pinned + 2 retrieved"),
-  # {tokens} (already-formatted, e.g. "150")
-  memory_block_footer: "--- End Memories ({count}, ~{tokens} tokens) ---"
-
   # Sites: RecallStore.render_memory_entry (append-only context injection).
   # Heads one appended memory entry. The entry stays in the history as is, so
   # this text must carry no per-turn data (no counts, TTLs or token totals).
@@ -364,6 +358,13 @@ nudges:
   # all finished.
   active_subagents_none: "No background subagents are active any more. The earlier subagent status list no longer applies."
 
+  # Sites: src/agent/core/context_injection.py format_permission_mode. The
+  # session's permission mode, appended at session start and whenever the
+  # user changes it (tool_permission_tiers.md, D13).
+  permission_mode_read_only: "Permission mode: Read-only. Reads, searches, web research and browsing run without asking. Changing files or data, actions outside the workspace (deleting, sending or drafting mail, pushing, database writes, jobs, delegating to a subagent) and shell commands wait for the user's approval; a call the user declines returns \"User declined this tool call.\" The user can change the mode at any time."
+  permission_mode_auto_accept: "Permission mode: Auto-accept. Reads and workspace file changes run without asking. Irreversible or outbound actions (deleting, sending or drafting mail, pushing, database writes, jobs, delegating to a subagent) and shell commands wait for the user's approval. The user can change the mode at any time."
+  permission_mode_autonomous: "Permission mode: Autonomous. Every tool runs without waiting for the user's approval. The user can change the mode at any time."
+
   # ----- src/agent/persistent_graph.py -----
 
   empty_response_recovery: "⚠ The model returned an empty response. Please try again or switch models."
@@ -374,3 +375,16 @@ nudges:
   read_file_required_error: |-
     Error: You must read `{file_path}` before using {tool_name}. It contains critical instructions for this operation.
     Read it first by invoking the `read_file` tool, then invoke {tool_name} again.
+
+  # An enforced instruction file arrives inside the refusal and counts as read
+  # (src/agent/tools/context.py). Placeholders: {file_path}, {tool_name}, {content}
+  read_file_delivered_with_refusal: |-
+    Not run yet: {tool_name} needs the instructions in `{file_path}`, which you have not read here. They are below and now count as read. Follow them, then invoke {tool_name} again.
+
+    <instructions path="{file_path}">
+    {content}
+    </instructions>
+
+  # Placeholders: {file_path}, {tool_name}
+  read_file_delivered_in_batch: |-
+    Not run yet: the instructions for {tool_name} (`{file_path}`) came with an earlier refusal in this same batch. Follow them, then invoke {tool_name} again.

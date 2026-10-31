@@ -311,6 +311,12 @@ async def test_audited_node_receipt_survives_reconstruction_and_invalidates(
         assert len(messages) == 1
         return messages[0].content or ""
 
+    def _assert_refused_with(text, body):
+        # A closed gate refuses the call and carries the file's current text.
+        assert "not run yet" in text.lower()
+        assert body.strip() in text
+        assert "GATED-OK" not in text
+
     def _restore(context, values):
         agent = UniversalAgent.__new__(UniversalAgent)
         agent._tool_context = context
@@ -334,7 +340,7 @@ async def test_audited_node_receipt_survives_reconstruction_and_invalidates(
         _state([make_tool_call("verify_probe", {}, "c-probe-0")], 2, 5),
         config=thread_config,
     )
-    assert "must read" in _content(blocked, "c-probe-0").lower()
+    _assert_refused_with(_content(blocked, "c-probe-0"), BODY_V1)
 
     first = await app1.ainvoke(
         _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-1")], 2, 5),
@@ -392,7 +398,7 @@ async def test_audited_node_receipt_survives_reconstruction_and_invalidates(
     stale = await app3.ainvoke(
         _state([make_tool_call("verify_probe", {}, "c-probe-3")], 2, 6)
     )
-    assert "must read" in _content(stale, "c-probe-3").lower()
+    _assert_refused_with(_content(stale, "c-probe-3"), BODY_V2)
     reread = await app3.ainvoke(
         _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-3")], 2, 6)
     )
@@ -412,7 +418,7 @@ async def test_audited_node_receipt_survives_reconstruction_and_invalidates(
     moved = await app4.ainvoke(
         _state([make_tool_call("verify_probe", {}, "c-probe-4")], 4, 9)
     )
-    assert "must read" in _content(moved, "c-probe-4").lower()
+    _assert_refused_with(_content(moved, "c-probe-4"), BODY_V1)
     reread4 = await app4.ainvoke(
         _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-4")], 4, 9)
     )
@@ -431,7 +437,7 @@ async def test_audited_node_receipt_survives_reconstruction_and_invalidates(
     expired = await app5.ainvoke(
         _state([make_tool_call("verify_probe", {}, "c-probe-5")], 2, 30)
     )
-    assert "must read" in _content(expired, "c-probe-5").lower()
+    _assert_refused_with(_content(expired, "c-probe-5"), BODY_V1)
     reread5 = await app5.ainvoke(
         _state([make_tool_call("read_file", {"path": SKILL_PATH}, "c-read-5")], 2, 30)
     )

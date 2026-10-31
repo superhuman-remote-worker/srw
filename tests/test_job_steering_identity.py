@@ -177,8 +177,8 @@ async def test_no_absorbed_entries_means_no_ack() -> None:
     client.ack_job_guidance.assert_not_awaited()
 
 
-def _append_only_execute(tmp_path, *, stateless: bool):
-    """The worker execute node in append_only mode with a scripted LLM."""
+def _execute_node(tmp_path, *, stateless: bool):
+    """The worker execute node with a scripted LLM."""
     from langchain_core.messages import AIMessage
 
     from agent.core.workspace import WorkspaceManager
@@ -211,7 +211,6 @@ def _append_only_execute(tmp_path, *, stateless: bool):
     config.llm.model_max_context_tokens = 100000
     config.limits.model_max_context_tokens = 100000
     config.limits.response_validation.enabled = False
-    config.context_management.injection_mode = "append_only"
     config.memory.max_memories_per_entry = 5
     context_mgr = MagicMock()
     context_mgr.get_token_count.return_value = 50
@@ -238,10 +237,10 @@ def _append_only_execute(tmp_path, *, stateless: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stateless", [False, True], ids=["pinned", "stateless"])
-async def test_append_only_records_delivered_guidance_on_both_lanes(
+async def test_delivered_guidance_is_recorded_on_both_lanes(
     tmp_path, stateless
 ) -> None:
-    """WP2 spec §C / B7: in append_only mode the execute node writes
+    """WP2 spec §C / B7: the execute node writes
     ``delivered_guidance_ids`` on both lanes and the next request filters
     them, so the entry is appended once and stays in the history. The
     stateless lane's ack is the fenced saver's: the checkpoint carrying the
@@ -249,7 +248,7 @@ async def test_append_only_records_delivered_guidance_on_both_lanes(
     request while the inbox still lists the entry."""
     from langchain_core.messages import HumanMessage
 
-    execute, requests = _append_only_execute(tmp_path, stateless=stateless)
+    execute, requests = _execute_node(tmp_path, stateless=stateless)
     pending = [{"id": "g-1", "text": "use staging", "source": "officer"}]
     ack = MagicMock()
     state = {

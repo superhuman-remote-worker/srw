@@ -46,6 +46,28 @@ def _parse_json(s: str, label: str = "input") -> Any:
         raise ValueError(f"Invalid JSON in {label}: {e}")
 
 
+# Aggregation stages that write. mongo_aggregate is a read tool (it is bound
+# for read-only connectors), so a pipeline that names one is refused.
+_WRITE_STAGES = frozenset({"$out", "$merge"})
+
+
+def _write_stage_in(node: Any) -> str | None:
+    """Return the first write stage anywhere in a parsed pipeline, else None."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _WRITE_STAGES:
+                return key
+            found = _write_stage_in(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _write_stage_in(item)
+            if found:
+                return found
+    return None
+
+
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
 
@@ -122,6 +144,12 @@ def create_mongo_tools(context: ToolContext) -> List[Any]:
             pipeline_list = _parse_json(pipeline, "pipeline")
             if not isinstance(pipeline_list, list):
                 return "Error: Pipeline must be a JSON array of stages"
+            write_stage = _write_stage_in(pipeline_list)
+            if write_stage:
+                return (
+                    f"Error: {write_stage} writes to the database; mongo_aggregate "
+                    "is read-only. Use mongo_insert or mongo_update for writes."
+                )
 
             coll = db[collection]
             results = list(coll.aggregate(pipeline_list))

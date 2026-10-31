@@ -226,6 +226,7 @@ type fixture struct {
 	hangupFailures                                         int
 	closeOnHangup                                          bool
 	attachTimes                                            []time.Time
+	replay                                                 []map[string]any // sent on every attach
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -324,7 +325,11 @@ func (f *fixture) engine(w http.ResponseWriter, r *http.Request) {
 		defer sock.conn.Close()
 		f.mu.Lock()
 		f.sockets = append(f.sockets, sock)
+		replay := append([]map[string]any(nil), f.replay...)
 		f.mu.Unlock()
+		for _, e := range replay {
+			_ = sock.send(e)
+		}
 		for {
 			op, p, masked, err := sock.read()
 			if err != nil {
@@ -537,6 +542,11 @@ func testDialWebsocket(ctx context.Context, endpoint string, headers http.Header
 // clock: a concurrent batch/heartbeat timer must not satisfy that precondition.
 func advanceFrom(t *testing.T, c *fakeClock, d time.Duration, owner string) {
 	t.Helper()
+	waitTimer(t, c, d, owner)
+	c.advance(d)
+}
+func waitTimer(t *testing.T, c *fakeClock, d time.Duration, owner string) {
+	t.Helper()
 	eventually(t, func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -547,5 +557,4 @@ func advanceFrom(t *testing.T, c *fakeClock, d time.Duration, owner string) {
 		}
 		return false
 	})
-	c.advance(d)
 }

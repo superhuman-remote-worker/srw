@@ -121,6 +121,33 @@ def _cloud_upperdir_guard_for_path(context: ToolContext, path: str) -> Optional[
         return None
 
 
+def _read_before_write_refusal(
+    context: ToolContext, path: str, tool_name: str, current: str
+) -> str:
+    """The refusal of a write whose target text is not what the agent last
+    read. Two cases, two messages: the file changed under the agent (another
+    writer, a user in the Canvas, a human in a cloud folder), or it was never
+    read in this window. Either way the recent read is forgotten, so the next
+    attempt needs a fresh ``read_file``."""
+    changed = context.recent_read_changed(path, current)
+    context.invalidate_recent_read(path)
+    if changed:
+        return (
+            f"Error: '{path}' changed since you read it (another writer edited "
+            f"the file). Read it again with read_file, then redo the "
+            f"{tool_name}; nothing was written."
+        )
+    from shared.runtime.services.guardrails import format_nudge
+
+    model = context._llm_config.model if context._llm_config is not None else None
+    return format_nudge(
+        "read_file_required_error",
+        model=model,
+        file_path=path,
+        tool_name=tool_name,
+    )
+
+
 def _absolute(workspace: Any, path: str) -> str:
     """Render ``path`` as the absolute path the shell would see.
 
@@ -1114,25 +1141,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # catches Canvas/user edits even when a best-effort invalidation was
             # missed while the agent was detached.
             existed = workspace.exists(path)
-            had_recent_read = context.was_recently_read(path)
             existing = workspace.read_file(path) if existed else ""
             if adds_redaction_marker(existing, content):
                 return redaction_marker_refusal(path, "write_file")
             if existed:
                 if existing.strip() and not context.recent_read_matches(path, existing):
-                    context.invalidate_recent_read(path)
-                    from shared.runtime.services.guardrails import format_nudge
-
-                    model = (
-                        context._llm_config.model
-                        if context._llm_config is not None
-                        else None
-                    )
-                    return format_nudge(
-                        "read_file_required_error",
-                        model=model,
-                        file_path=path,
-                        tool_name="write_file",
+                    return _read_before_write_refusal(
+                        context, path, "write_file", existing
                     )
 
             # Snapshot for undo before writing
@@ -1140,8 +1155,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 context._snapshot_callback(path)
 
             workspace.write_file(path, content)
-            if existed and had_recent_read:
-                context.record_file_read(path, content)
+            context.record_own_write(path, content)
 
             # Absolute, not the caller's own string: `output/x.md` here and
             # `output/x.md` in a shell that has cd'd elsewhere are different
@@ -1207,22 +1221,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Enforce read-before-write discipline (skip for empty files), and
             # reject a stale versioned read after an out-of-band edit.
             content = workspace.read_file(path)
-            had_recent_read = context.was_recently_read(path)
             if content.strip() and not context.recent_read_matches(path, content):
-                context.invalidate_recent_read(path)
-                from shared.runtime.services.guardrails import format_nudge
-
-                model = (
-                    context._llm_config.model
-                    if context._llm_config is not None
-                    else None
-                )
-                return format_nudge(
-                    "read_file_required_error",
-                    model=model,
-                    file_path=path,
-                    tool_name="edit_file",
-                )
+                return _read_before_write_refusal(context, path, "edit_file", content)
 
             # Validate position parameter
             if position is not None and position not in ("start", "end"):
@@ -1250,15 +1250,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if position == "end":
                 new_content = content + new_string
                 workspace.write_file(path, new_content)
-                if had_recent_read:
-                    context.record_file_read(path, new_content)
+                context.record_own_write(path, new_content)
                 return f"Appended to: {path}"
 
             if position == "start":
                 new_content = new_string + content
                 workspace.write_file(path, new_content)
-                if had_recent_read:
-                    context.record_file_read(path, new_content)
+                context.record_own_write(path, new_content)
                 return f"Prepended to: {path}"
 
             # Replace mode (default) - requires old_string
@@ -1298,8 +1296,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             new_content = content.replace(old_string, new_string, 1)
             workspace.write_file(path, new_content)
-            if had_recent_read:
-                context.record_file_read(path, new_content)
+            context.record_own_write(path, new_content)
 
             return f"Edited: {path}"
 

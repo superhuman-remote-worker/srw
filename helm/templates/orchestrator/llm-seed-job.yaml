@@ -25,7 +25,9 @@ The payload ConfigMap (hook-weight 0) still renders while quiesced. It is
 applied without a wait and is inert on its own, so it costs nothing and is back
 in step with this Job the moment the replicas return.
 */ -}}
-{{- if and .Values.llm.seed.enabled (gt (int .Values.orchestrator.replicas) 0) }}
+{{- $voice := include "srw.voiceCatalogSeeded" . }}
+{{- if and (or .Values.llm.seed.enabled $voice) (gt (int .Values.orchestrator.replicas) 0) }}
+{{- $seed := .Values.llm.seed.enabled }}
 {{- /* Dev-mode inline key values are rendered into this dedicated Secret by
        llm-seed-inline-secret.yaml; only this Job reads it. */}}
 {{- $inlineSecret := printf "%s-llm-seed-inline" (include "srw.fullname" .) }}
@@ -143,7 +145,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: APP_ENCRYPTION_KEY
-            {{- range $provider, $ref := .Values.llm.seed.systemApiKeys }}
+            {{- range $provider, $ref := (ternary .Values.llm.seed.systemApiKeys dict $seed) }}
             - name: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
               valueFrom:
                 secretKeyRef:
@@ -160,7 +162,7 @@ spec:
                   # Lets operators list providers without pre-creating empty keys.
                   optional: true
             {{- end }}
-            {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
+            {{- range $i, $ep := (ternary .Values.llm.seed.systemEndpoints list $seed) }}
             {{- if or $ep.apiKeyRef (hasKey $ep "apiKey") }}
             - name: {{ printf "SEED_ENDPOINT_%d_API_KEY" $i | quote }}
               valueFrom:
@@ -176,6 +178,14 @@ spec:
                   # creates the endpoint keyless rather than failing the pod.
                   optional: true
             {{- end }}
+            {{- end }}
+            {{- if $voice }}
+            # The voice gateway's Bearer key: its live_voice endpoint's key.
+            - name: SEED_VOICE_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.voiceSecretName" . | quote }}
+                  key: api-key
             {{- end }}
           volumeMounts:
             - name: seed-payload

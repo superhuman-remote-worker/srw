@@ -1,0 +1,81 @@
+name: docs
+
+# Public documentation site: https://docs.superhuman-remote-worker.com
+#
+# docs-site/ is an Astro Starlight project whose content is the Markdown under
+# docs/. The build also generates the Helm values reference from helm/values.yaml
+# and helm/values.schema.json, and fails on a broken link, so every push to
+# develop and main that touches those files builds the site. Only main deploys
+# it to GitHub Pages (Settings -> Pages -> Source: GitHub Actions).
+#
+# Both jobs run on GitHub-hosted runners (hosted_only in
+# scripts/check_ci_runners.py): a static site build has no reason to occupy a
+# homelab runner, and the deploy needs only the Pages OIDC token. There is no
+# pull_request trigger; pull requests keep using the main/develop pipelines.
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "docs/**"
+      - "docs-site/**"
+      - "helm/values.yaml"
+      - "helm/values.schema.json"
+      - "cockpit/public/favicon.svg"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# One run per branch at a time; a deploy in progress is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: Install dependencies
+        working-directory: docs-site
+        run: npm ci
+      - name: Build the site (Helm reference, search index, link validation)
+        working-directory: docs-site
+        run: npm run build
+      - name: Configure GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: actions/configure-pages@v6
+      - name: Upload the Pages artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs-site/dist
+
+  deploy:
+    name: deploy to GitHub Pages
+    if: github.ref == 'refs/heads/main'
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

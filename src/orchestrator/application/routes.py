@@ -50,6 +50,7 @@ from orchestrator.routers import (
     canvases_router,
     capacity as capacity_routes,
     citations as citations_routes,
+    cloud_remote_token as cloud_remote_token_routes,
     cloud_user_root as cloud_user_root_routes,
     config_catalog as config_catalog_routes,
     connector_drivers as connector_drivers_routes,
@@ -264,6 +265,9 @@ def bind_router_dependencies(app: FastAPI, resources: ApplicationResources) -> N
         lambda: preparation_composition.thread_workspace_delivery_dependencies(
             resources
         )
+    )
+    app.state.cloud_remote_token_dependencies_factory = (
+        lambda: workspace_composition.cloud_remote_token_dependencies(resources)
     )
     app.state.agent_registration_dependencies_factory = (
         lambda: sessions_composition.agent_registration_dependencies(resources)
@@ -484,6 +488,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(agent_git_swap_routes.router)
     app.include_router(job_assignment_routes.router)
     app.include_router(unit_claim_routes.router)
+    app.include_router(cloud_remote_token_routes.router)
     app.include_router(thread_admission_routes.router)
     app.include_router(agent_registration_routes.router)
     app.include_router(agent_child_threads_routes.router)

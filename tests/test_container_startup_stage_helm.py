@@ -18,14 +18,16 @@ ENV = "CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED"
 CHECKSUM = "checksum/container-startup-stage-authority"
 
 
-def test_startup_authority_defaults_off_in_runtime_and_example():
+def test_startup_authority_defaults_on_in_runtime_and_example():
+    # On by default since 2026-10-21, with stateless Sessions (their container
+    # upgrade needs it); the bridge shipped in v0.0.29.
     for name in ("values.yaml", "values.example.yaml"):
         values = yaml.safe_load((ROOT / "helm" / name).read_text())
         assert values["orchestrator"]["containerStartupStageAuthority"] == {
-            "enabled": False
+            "enabled": True
         }
     documents = render()
-    assert _env(documents, _orchestrator(documents))[ENV] == "false"
+    assert _env(documents, _orchestrator(documents))[ENV] == "true"
 
 
 def test_startup_activation_rolls_orchestrator_without_reloader():
@@ -52,7 +54,7 @@ def test_startup_authority_missing_legacy_parent_defaults_off(tmp_path):
     shutil.copytree(ROOT / "helm", chart)
     values_path = chart / "values.yaml"
     saved = values_path.read_text().replace(
-        "  containerStartupStageAuthority:\n    enabled: false\n", ""
+        "  containerStartupStageAuthority:\n    enabled: true\n", ""
     )
     assert "containerStartupStageAuthority" not in yaml.safe_load(saved)["orchestrator"]
     values_path.write_text(saved)

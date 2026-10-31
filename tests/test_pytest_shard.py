@@ -57,6 +57,19 @@ def test_junit_weights_sum_classes_and_ignore_missing_modules(tmp_path):
     assert file_timings([report], tmp_path) == {"tests/test_one.py": 4.0}
 
 
+def test_junit_weights_ignore_a_module_level_skip(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_one.py").touch()
+    report = tmp_path / "report.xml"
+    report.write_text("""<testsuite>
+      <testcase classname="tests.test_one" name="test_a" time="2.0"/>
+      <testcase classname="" name="tests.test_optional" time="0.000">
+        <skipped message="collection skipped">could not import 'optional'</skipped>
+      </testcase>
+    </testsuite>""")
+    assert file_timings([report], tmp_path) == {"tests/test_one.py": 2.0}
+
+
 def test_cli_executes_each_test_once_and_preserves_failure_exit(tmp_path):
     root = Path(__file__).resolve().parents[1]
     scripts = tmp_path / "scripts"

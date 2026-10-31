@@ -23,11 +23,14 @@ ARG CODE_SERVER_VERSION=4.100.3
 # Pinned upstream rclone (Ubuntu's packaged 1.60.1-DEV predates the webdav
 # `infinitescale` vendor needed for OpenCloud mounts and lacks modern VFS
 # cache flags — see knowledge-base/knowledge/features/rclone_cloud_mount.md §12). Keep version
-# and checksum in sync with docker/agent-vm-base/scripts/provision-stage1.sh.
+# and checksum in sync with docker/Dockerfile.agent, docker/Dockerfile.agent.dev,
+# docker/Dockerfile.in-pod-mount (the same release, by digest) and
+# docker/agent-vm-base/scripts/provision-stage1.sh; tests/test_workspace_image_targets.py
+# checks that they agree.
 # SRW_ prefix is load-bearing: rclone parses RCLONE_* env vars as flags, so
 # an ARG named RCLONE_VERSION crashes `rclone version` inside the RUN.
-ARG SRW_RCLONE_VERSION=1.74.3
-ARG SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
+ARG SRW_RCLONE_VERSION=1.75.2
+ARG SRW_RCLONE_SHA256=efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c
 
 LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
 LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
@@ -124,11 +127,21 @@ RUN fuse-overlayfs --version \
     && dpkg --compare-versions "$v" ge 1.13 \
         || { echo "fuse-overlayfs $v < 1.13 (big-dir/readdir fixes needed)"; exit 1; }
 
+# An unprivileged fusermount3 reads /etc/mtab to unmount and refuses without
+# it, so a FUSE mount the agent made could never be unmounted again. Docker
+# adds this link to every container it runs; containerd (Kubernetes) doesn't.
+RUN ln -sfn /proc/self/mounts /etc/mtab
+
 # ---------------------------------------------------------------------------
 # 2b. Chromium via Playwright (replaces apt chromium-browser, which on Ubuntu
 #     Noble is a snap shim — see docker/agent-vm-base/scripts/provision-stage1.sh).
 #     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
 #     provision.sh). The agent image has no Playwright/Chromium at all.
+#     The browsers stay in /opt/playwright, read-only for the agent. Its own
+#     Playwright looks in ~/.cache/ms-playwright and finds them through the
+#     links the entrypoint makes there (link-playwright-browsers), so no
+#     PLAYWRIGHT_BROWSERS_PATH is set: it would send every Playwright version,
+#     including a project's own, to this read-only folder.
 # ---------------------------------------------------------------------------
 ARG PLAYWRIGHT_VERSION=1.59.0
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -152,7 +165,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && test -n "$CHROMIUM_BIN" || (echo "chromium binary not found under /opt/playwright" && find /opt/playwright -maxdepth 4 -type d && exit 1) \
     && ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium \
     && rm -rf /root/.cache/ms-playwright
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+COPY --chmod=0755 docker/link-playwright-browsers /usr/local/bin/link-playwright-browsers
 
 # ---------------------------------------------------------------------------
 # 2c. browser-exec — workspace-side browser executor. The agent drives it over
@@ -198,15 +211,43 @@ RUN mkdir -p /etc/ssh/authorized_keys \
 
 # User-writable package directories (pip/npm without sudo)
 RUN mkdir -p /home/agent-host/.local/bin \
-             /home/agent-host/.local/lib/python3/site-packages \
              /home/agent-host/.npm-global \
              /home/agent-host/.cache \
              /cloud \
     && chown -R agent-host:agent-host /home/agent-host /cloud
 
-ENV PIP_TARGET=/home/agent-host/.local/lib/python3/site-packages \
+# The agent's own installs. pip refuses Ubuntu's Python unless
+# PIP_BREAK_SYSTEM_PACKAGES is set; with it, agent-host's `pip install` goes to
+# its user site (~/.local), because the system one isn't writable, and a
+# virtualenv works as usual. A root build step still installs system-wide. npm's
+# global prefix moves out of root-owned /usr.
+#
+# The agent's SSH sessions don't inherit ENV: sshd starts each one with a fresh
+# environment. write-agent-environment copies these values and PATH into
+# /etc/environment, which pam_env loads into every session. Run it again after
+# changing any of them; assert-workspace-contract checks the agent's shell.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
     PATH="/home/agent-host/.local/bin:/home/agent-host/.npm-global/bin:${PATH}" \
     npm_config_prefix=/home/agent-host/.npm-global
+COPY --chmod=0755 docker/write-agent-environment /usr/local/bin/write-agent-environment
+RUN /usr/local/bin/write-agent-environment
+
+# The agent's package caches live on the container's own disk, not on the
+# workspace volume: pip's cache alone took a third of a 10 Gi job volume
+# (knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md).
+# They are rebuilt on demand, so losing them with the Pod costs a download.
+# Only the agent's environment gets them, never image ENV: root build steps
+# keep their own caches and leave no root-owned files in the agent's. All of
+# XDG_CACHE_HOME stays put, because Playwright finds its browsers in
+# ~/.cache/ms-playwright. uv cannot hardlink across the two filesystems, so it
+# copies without warning about it on every install.
+RUN install -d -o agent-host -g agent-host -m 0700 /var/cache/agent-host \
+    && env PIP_CACHE_DIR=/var/cache/agent-host/pip \
+        UV_CACHE_DIR=/var/cache/agent-host/uv \
+        UV_LINK_MODE=copy \
+        npm_config_cache=/var/cache/agent-host/npm \
+        /usr/local/bin/write-agent-environment \
+        PIP_CACHE_DIR UV_CACHE_DIR UV_LINK_MODE npm_config_cache
 
 # ---------------------------------------------------------------------------
 # 5. SSH server config (mirrors provision.sh lines 141-155)

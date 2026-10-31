@@ -1161,7 +1161,7 @@ class TestSendSessionAttachPayload:
         resolved = {
             "agent": {
                 "interactive": {
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "narration_mode": "silent",
                 }
             }
@@ -1403,6 +1403,74 @@ class TestSendSessionAttachPayload:
         assert payload is not None
         assert payload["workspace_generation"] is None
         assert payload["workspace_runtime_incarnation"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", ["virtual", "sandbox"])
+    async def test_an_attach_without_a_workspace_takes_the_threads_lite_backend(
+        self, monkeypatch, backend
+    ):
+        """/prepare's warm attach sends ``{}`` (dev, 2026-10-18). A virtual
+        Session must still reach its agent with its object-store mounts, in the
+        resolver's input and in the fallback override alike; any other tier
+        stays as the caller sent it."""
+        monkeypatch.setattr(
+            "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+            lambda: {"type": "s3", "root": "srw-workspaces", "config": {}},
+        )
+        thread = self._thread(
+            user_id="owner-1",
+            metadata={
+                "config_override": {"workspace": {"backend": backend}},
+                "_workspace_binding": {
+                    "generation": "50000000-0000-4000-8000-000000000001",
+                    "kind": "virtual",
+                    "backing_id": "rclone:test-backing",
+                    "ssh_host_key_fingerprint": None,
+                },
+            },
+        )
+        resolve = AsyncMock(return_value=None)
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_project_authorization_module,
+                "revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_datasource_authorization_module,
+                "resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                session_config_resolution_module, "resolve_session_config", resolve
+            ),
+        ):
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                config_override={},
+                dependencies=preparation_composition.session_attach_payload_dependencies(
+                    orch_main.app.state.resources
+                ),
+            )
+
+        sent = resolve.await_args.kwargs["config_override"]
+        if backend == "sandbox":
+            assert "workspace" not in sent
+            return
+        (mount,) = sent["workspace"]["mounts"]
+        assert mount["prefix"] == f"threads/{self.thread_id}/"
+        assert sent["workspace"]["backend"] == "virtual"
+        assert payload["config_override"]["workspace"]["mounts"] == [mount]
 
     @pytest.mark.asyncio
     async def test_remote_binding_still_requires_a_physical_runtime_pair(self):

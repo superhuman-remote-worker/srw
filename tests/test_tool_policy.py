@@ -180,9 +180,12 @@ class TestPopulation:
         # restate it empty (a child has no memory of its own); 210 with the
         # receptionist expert (workspace, browser_direct, git, citation, graph
         # and communication restated empty for a desk without a workspace,
-        # plus research, knowledge and delegation).
-        assert len(_DECLARATIONS) == 210, (
-            f"expected 210 raw declarations, got {len(_DECLARATIONS)}"
+        # plus research, knowledge and delegation); 220 with the skills group
+        # (use_skill out of workspace, skills_tool_category.md): expert_base
+        # grants it, the subagent overlay and the seven library entries restate
+        # it, the receptionist restates it empty.
+        assert len(_DECLARATIONS) == 220, (
+            f"expected 220 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):

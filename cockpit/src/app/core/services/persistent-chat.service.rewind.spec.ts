@@ -174,7 +174,7 @@ describe('PersistentChatService rewind', () => {
             if (url.endsWith('/state')) {
                 return of({
                     thread_id: 'thread-rw',
-                    permission_mode: 'supervised',
+                    permission_mode: 'read_only',
                     narration_mode: 'verbose',
                     turn_count: 0,
                     turn_in_flight: false,

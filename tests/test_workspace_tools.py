@@ -567,6 +567,58 @@ class TestWriteFileReadRequirement:
         )
         assert not tool_context.was_recently_read("test.md")
 
+    def test_rewriting_a_file_the_agent_created_needs_no_read(self, workspace_tools):
+        # Bench jobs paid a refused call plus a read_file for every plan.md
+        # rewrite: a created file was never recorded as known content.
+        write_file = workspace_tools["write_file"]
+        assert "Written" in write_file.invoke({"path": "plan.md", "content": "v1"})
+
+        result = write_file.invoke({"path": "plan.md", "content": "v2"})
+
+        assert "Written" in result
+
+    def test_editing_a_file_the_agent_created_needs_no_read(
+        self, workspace_tools, workspace_manager
+    ):
+        workspace_tools["write_file"].invoke(
+            {"path": "code/ledger.py", "content": "x = 1\n"}
+        )
+
+        result = workspace_tools["edit_file"].invoke(
+            {"path": "code/ledger.py", "old_string": "x = 1", "new_string": "x = 2"}
+        )
+
+        assert "Edited" in result
+        assert workspace_manager.read_file("code/ledger.py") == "x = 2\n"
+
+    def test_consecutive_edits_need_no_read_between(
+        self, workspace_tools, workspace_manager
+    ):
+        workspace_tools["write_file"].invoke({"path": "a.py", "content": "a b c"})
+        edit_file = workspace_tools["edit_file"]
+
+        first = edit_file.invoke({"path": "a.py", "old_string": "a", "new_string": "A"})
+        second = edit_file.invoke(
+            {"path": "a.py", "old_string": "b", "new_string": "B"}
+        )
+
+        assert "Edited" in first and "Edited" in second
+        assert workspace_manager.read_file("a.py") == "A B c"
+
+    def test_own_write_still_requires_read_after_out_of_band_change(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        workspace_tools["write_file"].invoke({"path": "notes.md", "content": "agent"})
+        workspace_manager.write_file("notes.md", "user edit")
+
+        result = workspace_tools["write_file"].invoke(
+            {"path": "notes.md", "content": "agent again"}
+        )
+
+        assert "read_file" in result.lower()
+        assert workspace_manager.read_file("notes.md") == "user edit"
+        assert not tool_context.was_recently_read("notes.md")
+
 
 class TestAppendFileRemoved:
     """Tests that append_file is no longer available."""

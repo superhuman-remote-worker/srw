@@ -64,12 +64,32 @@ function emitResponse(
   const request = {
     method: () => method,
     url: () => url,
+    isNavigationRequest: () => false,
   } as Request;
   handlers.get('request')?.(request);
   handlers.get('response')?.({
     request: () => request,
     url: () => url,
     status: () => status,
+  } as Response);
+}
+
+function emitDocumentResponse(
+  handlers: Map<PageEvent, PageHandler>,
+  url: string,
+  parentFrame: object | null = null,
+): void {
+  const request = {
+    method: () => 'GET',
+    url: () => url,
+    isNavigationRequest: () => true,
+    frame: () => ({ parentFrame: () => parentFrame }),
+  } as unknown as Request;
+  handlers.get('request')?.(request);
+  handlers.get('response')?.({
+    request: () => request,
+    url: () => url,
+    status: () => 200,
   } as Response);
 }
 
@@ -381,10 +401,50 @@ describe('network ledger safety and warm-up classification', () => {
     expect(ledger.problems()).toHaveLength(1);
   });
 
-  it('rejects an owned thread-detail abort that started after reload began', () => {
+  it('accepts an owned thread-detail GET the old document starts after reload began', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    emitDocumentResponse(handlers, 'http://srw-e2e.test/');
+    ledger.setPhase('turn');
+    // The old document's poll fires between setPhase('reload') and the commit.
+    ledger.setPhase('reload');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    emitDocumentResponse(handlers, 'http://srw-e2e.test/sessions/owned-thread');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
+    expect(ledger.entries()).toContainEqual(
+      expect.objectContaining({
+        kind: 'requestfailed',
+        pathname: '/api/persistent/threads/owned-thread',
+        phase: 'reload',
+        started_phase: 'reload',
+        classification: 'expected-navigation-cancellation',
+      }),
+    );
+  });
+
+  it('accepts an old-document abort reported before the reload document arrives', () => {
     const { ledger, handlers } = ledgerHarness();
     ledger.registerThread('owned-thread');
     ledger.setPhase('reload');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
+  });
+
+  it('rejects an owned thread-detail abort started by the reloaded document', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    emitDocumentResponse(handlers, 'http://srw-e2e.test/sessions/owned-thread');
     const request = requestForFailure(
       'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
     );
@@ -392,6 +452,20 @@ describe('network ledger safety and warm-up classification', () => {
     handlers.get('requestfailed')?.(request);
 
     expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('counts only the main frame document as the reloaded document', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    emitDocumentResponse(handlers, 'http://srw-e2e.test/embedded', {});
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
   });
 
   it('rejects a thread-detail abort for an id that was never registered as owned', () => {
@@ -441,10 +515,11 @@ describe('network ledger safety and warm-up classification', () => {
     expect(ledger.problems()).toHaveLength(2);
   });
 
-  it('still rejects an owned connection poll that starts and aborts during reload', () => {
+  it('still rejects an owned connection poll the reloaded document starts and aborts', () => {
     const { ledger, handlers } = ledgerHarness();
     ledger.registerThread('owned-thread');
     ledger.setPhase('reload');
+    emitDocumentResponse(handlers, 'http://srw-e2e.test/sessions/owned-thread');
     const request = requestForFailure(
       'GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED',
     );

@@ -20,13 +20,14 @@ from dataclasses import is_dataclass as _dc_is_dataclass
 from dataclasses import replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
 from agent.core.context import ContextConfig, ContextManager
 from agent.core.summarizer import load_summarizer_prompt
+from shared.permission_modes import DEFAULT_PERMISSION_MODE
 from shared.runtime.core.loader import (
     AgentConfig,
     FileResolver,
@@ -202,7 +203,7 @@ def _in_workspace_cloud_folders(
     mounted = [
         {
             "name": state.workspace_name,
-            "path": f"workspace/cloud/{state.workspace_name}",
+            "path": f"cloud/{state.workspace_name}",
             "kind": state.mount_kind,
             "state": "mounted",
             "text": describe_mounted(
@@ -221,27 +222,111 @@ def _in_workspace_cloud_folders(
     return mounted, unavailable
 
 
+def _remote_cloud_folders(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(mounted, unavailable)`` prompt rows of a Virtual Session's cloud
+    folders (``VirtualWorkspaceBackend.cloud_folders()``): a folder that is
+    bound or answered its probe is in the workspace at ``cloud/<name>``; one
+    whose probe failed is named with its reason, in the same words the
+    sidecar's rows use, so the two deliveries read alike."""
+    from shared.runtime.services.cloud_mount.sidecar import (
+        REASON_TEXT,
+        describe_mounted,
+    )
+
+    mounted: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        path = str(row.get("path") or f"cloud/{name}")
+        if row.get("state") == "failed":
+            reason = str(row.get("reason") or "mount_failed")
+            unavailable.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "kind": str(row.get("kind") or ""),
+                    "reason": reason,
+                    "text": REASON_TEXT.get(reason, REASON_TEXT["mount_failed"]),
+                }
+            )
+            continue
+        shared = row.get("shared")
+        mounted.append(
+            {
+                "name": name,
+                "path": path,
+                "kind": str(row.get("kind") or ""),
+                "access": str(row.get("access") or "read_write"),
+                "state": "mounted",
+                "text": describe_mounted(
+                    str(row.get("kind") or ""),
+                    str(row.get("access") or "read_write"),
+                    shared=shared if isinstance(shared, bool) else None,
+                ),
+            }
+        )
+    return mounted, unavailable
+
+
 def _config_with_cloud_folders(
     config: Any,
     mounted: list[dict[str, Any]],
     unavailable: list[dict[str, Any]],
+    *,
+    status_tool: Optional[bool] = None,
 ) -> Any:
     """``config`` keeping a session's cloud folders for its system prompt:
     what is mounted, what is not (``cloud_mount_system_floor``). A copy,
     never an in-place write: the config may be the pod-wide singleton a
-    later session reuses."""
+    later session reuses. ``status_tool=False`` tells the floor that
+    ``srw_cloud_status`` is not bound (a Virtual Session has no shell
+    category), so the prompt never names a tool the agent cannot call."""
     if (not mounted and not unavailable) or not (
         _dc_is_dataclass(config) and hasattr(config, "extra")
     ):
         return config
-    return _dc_replace(
-        config,
-        extra={
-            **config.extra,
-            "_cloud_mounts_mounted": mounted,
-            "_cloud_mounts_unavailable": unavailable,
-        },
-    )
+    extra = {
+        **config.extra,
+        "_cloud_mounts_mounted": mounted,
+        "_cloud_mounts_unavailable": unavailable,
+    }
+    if status_tool is not None:
+        extra["_cloud_status_tool"] = status_tool
+    return _dc_replace(config, extra=extra)
+
+
+def cloud_token_source_factory(
+    client: Any, *, thread_id: str, plan: Optional[Dict[str, Any]]
+) -> Optional[Callable[[Mapping[str, Any]], Any]]:
+    """How a Virtual Session's executor fetches the bearer of a cloud folder
+    delivered with the ``oauth_token`` auth kind
+    (features/cloud_folders_on_virtual_sessions.md § Provider neutrality):
+    one :class:`~agent.core.backends.cloud_token.CloudTokenSource` per folder
+    over the orchestrator client's token fetcher, under the executor's live
+    claim lease (the mutable handle, read at each call). ``None`` without a
+    client or a lease (the pinned lane, tests): such a folder then binds as
+    failed, the workspace itself unaffected."""
+    from functools import partial
+
+    from agent.api.lease_context import current_lease
+
+    lease = current_lease.get()
+    fetcher = getattr(client, "cloud_remote_token_fetcher", None)
+    if client is None or lease is None or not callable(fetcher):
+        return None
+    from agent.core.backends.cloud_token import CloudTokenSource
+
+    fetch = fetcher(thread_id, lease=lease, plan=plan or {})
+
+    def source_for(entry: Mapping[str, Any]) -> CloudTokenSource:
+        mount_id = str(entry.get("mount_id") or entry.get("name") or "")
+        return CloudTokenSource(partial(fetch, mount_id))
+
+    return source_for
 
 
 @dataclass
@@ -276,6 +361,10 @@ class PersistentSession:
     # U5 session-parent delegation.  These are injected by persistent_app so
     # this state object never imports process-global owner/lease machinery.
     orchestrator_client: Optional[Any] = None
+    # The Virtual planner's record of this claim's cloud folders
+    # (``{"fingerprint", "incarnation"}``): the probe's report names it so
+    # the orchestrator keeps the state for the right claim.
+    cloud_remote_plan: Optional[Dict[str, Any]] = None
     session_parent_authority_provider: Optional[Callable[[], Any]] = None
     subagent_provider_admission: Optional[Callable[[], bool]] = None
     subagent_effect_authority: Optional[Callable[[], Any]] = None
@@ -295,7 +384,7 @@ class PersistentSession:
     subagent_fanout: bool = False
 
     # Permission mode (switchable at runtime)
-    permission_mode: str = "supervised"
+    permission_mode: str = DEFAULT_PERMISSION_MODE
     # Narration mode (switchable at runtime)
     narration_mode: str = "auto"
 
@@ -744,6 +833,50 @@ class PersistentSession:
         except Exception:
             logger.debug("backend read-cache close failed", exc_info=True)
 
+    def cloud_remote_rows(self) -> list[dict[str, Any]]:
+        """The Virtual Session's cloud folders as the backend reports them
+        (``VirtualWorkspaceBackend.cloud_folders()``), or ``[]`` on any other
+        tier or when none is bound."""
+        try:
+            from agent.core.backends.overlay import unwrap_backend
+
+            backend = getattr(self.workspace_manager, "backend", None)
+            if backend is None:
+                return []
+            rows = getattr(unwrap_backend(backend), "cloud_folders", None)
+            return list(rows()) if callable(rows) else []
+        except Exception:
+            logger.debug("cloud folder rows unavailable", exc_info=True)
+            return []
+
+    def _refresh_cloud_remote_prompt(self, backend: Any) -> None:
+        """Name the backend's cloud folders in the system prompt (the
+        ``<cloud_folders>`` floor), bound and failed alike."""
+        rows = getattr(backend, "cloud_folders", None)
+        rows = rows() if callable(rows) else []
+        if not rows:
+            return
+        self.config = _config_with_cloud_folders(
+            self.config, *_remote_cloud_folders(rows), status_tool=False
+        )
+
+    async def probe_cloud_remotes(self) -> list[dict[str, Any]]:
+        """Probe each cloud folder's root once, off the turn, and refresh the
+        prompt rows with the outcome (``ready`` or ``failed`` with a reason).
+        Returns the rows; ``[]`` when the session has no cloud folders."""
+        from agent.core.backends.overlay import unwrap_backend
+
+        backend = getattr(self.workspace_manager, "backend", None)
+        if backend is None:
+            return []
+        real = unwrap_backend(backend)
+        probe = getattr(real, "probe_cloud_folders", None)
+        if not callable(probe) or not getattr(real, "cloud_remotes", None):
+            return []
+        rows = await asyncio.to_thread(probe)
+        self._refresh_cloud_remote_prompt(real)
+        return rows
+
     def _drain_store_stats(self) -> str:
         """Object-store op tally for the phase that just ran, if the backend
         keeps one (rclone-backed virtual workspaces do — every op there is a
@@ -754,9 +887,18 @@ class PersistentSession:
             backend = getattr(self.workspace_manager, "backend", None)
             if backend is None:
                 return "n/a"
-            store = getattr(unwrap_backend(backend), "_store", None)
+            real = unwrap_backend(backend)
+            store = getattr(real, "_store", None)
             drain = getattr(store, "drain_op_stats", None)
-            return drain() if drain is not None else "n/a"
+            parts = [drain() if drain is not None else "n/a"]
+            # A Virtual Session's cloud folders, each its own remote: their
+            # tally beside the workspace's is the per-operation latency the
+            # feature's gate records (cloud_folders_on_virtual_sessions.md).
+            for remote in getattr(real, "cloud_remotes", None) or []:
+                remote_drain = getattr(remote.store, "drain_op_stats", None)
+                if remote_drain is not None:
+                    parts.append(f"{remote.path}: {remote_drain()}")
+            return "; ".join(parts)
         except Exception:
             return "n/a"
 
@@ -803,14 +945,38 @@ class PersistentSession:
         if effective_backend in LITE_BACKENDS:
             from types import SimpleNamespace
 
-            lite_cfg = SimpleNamespace(
-                backend=effective_backend,
-                mounts=(workspace_override or {}).get("mounts") or ws_data.mounts,
+            # The Session's cloud folders, served by the backend under
+            # cloud/<name> (features/cloud_folders_on_virtual_sessions.md):
+            # the workspace delivery's ``cloud_remote`` entries follow the
+            # workspace prefix in the mount list. Named in the prompt from
+            # the start; their probe runs after the attach
+            # (``probe_cloud_remotes``) and never holds it.
+            cloud_remote = (workspace_override or {}).get("cloud_remote") or {}
+            if not isinstance(cloud_remote, dict):
+                cloud_remote = {}
+            mounts = list(
+                (workspace_override or {}).get("mounts") or ws_data.mounts or []
             )
-            workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
+            if mounts and effective_backend == "virtual":
+                mounts = [mounts[0], *(cloud_remote.get("mounts") or [])]
+            plan = cloud_remote.get("plan")
+            self.cloud_remote_plan = plan if isinstance(plan, dict) else None
+            lite_cfg = SimpleNamespace(backend=effective_backend, mounts=mounts)
+            workspace_backend = create_lite_backend(
+                lite_cfg,
+                job_id=self.thread_id,
+                # A folder delivered with the oauth_token auth kind fetches
+                # its bearer per call, under this claim's lease.
+                cloud_token_source_for=cloud_token_source_factory(
+                    self.orchestrator_client,
+                    thread_id=self.thread_id,
+                    plan=self.cloud_remote_plan,
+                ),
+            )
             self._workspace_backend_for_cleanup = workspace_backend
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, workspace_backend.connect)
+            self._refresh_cloud_remote_prompt(workspace_backend)
             # Setup asks the store "does this exist?" dozens of times about
             # one small tree (scaffolding, instruction files, skill files,
             # the legacy-tools sweep) and every ask is an rclone spawn.
@@ -2012,9 +2178,10 @@ class PersistentSession:
         the workspace so the agent can read them via workspace tools.
         """
         # Workspace creation precedes ToolContext identity resolution and tool
-        # instantiation. Fail closed here: deploy ordinary catalog skills now,
-        # but admit present-with-canvas only after the actual loaded tool list is
-        # known in _load_tools_for_backend().
+        # instantiation. Fail closed here: no catalog skill is admitted until
+        # the actual loaded tool list is known in _load_tools_for_backend(),
+        # because ordinary skills follow use_skill and present-with-canvas
+        # also needs set_canvas (skills_tool_category.md D2).
         self._scope_skills_for_tool_names([])
 
         # Skill directories (Slice 2) — mirror of the agent.py worker path. Runs
@@ -2314,7 +2481,7 @@ class PersistentSession:
                     self.cloud_mount_manager and self.cloud_mount_manager.active
                 ),
                 "root": "/cloud",
-                "workspace_entry": "/workspace/cloud",
+                "workspace_entry": "cloud",
                 "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
                 # A protected session without its cloud (decision 42) keeps
                 # only the sidecar watcher, for srw_cloud_status to say why.
@@ -2399,13 +2566,9 @@ class PersistentSession:
         becomes the memory manager's pending set, which the first provider
         call of the next turn takes in. A set the manager already holds or
         has taken in is not taken again (a warm session at its next claim).
-        append_only only; returns True when the set was taken in.
+        Returns True when the set was taken in.
         """
         if stored is None or self.memory_service is None:
-            return False
-        from shared.runtime.core.context_entries import is_append_only
-
-        if not is_append_only(self.config):
             return False
         seed = getattr(self.memory_service, "seed_prefetch", None)
         if seed is None:
@@ -2438,10 +2601,6 @@ class PersistentSession:
             or self.memory_service is None
             or self.postgres_conn is None
         ):
-            return
-        from shared.runtime.core.context_entries import is_append_only
-
-        if not is_append_only(self.config):
             return
         reader = getattr(self.postgres_conn, "get_thread_pending_memory", None)
         if reader is None:
@@ -3152,16 +3311,6 @@ class PersistentSession:
             tool_names, getattr(self.workspace_manager, "backend", None)
         )
 
-        # Stateless lane: the upgrade's accept is a socket verb that lane has no
-        # transport for, so its offer card could never be accepted and the agent
-        # would wait on a human decision that cannot arrive. Stripped whichever
-        # source admitted it (config tool list or the lite-tier append above)
-        # (session_slash_commands_and_stateless_compact.md §2).
-        if os.environ.get("STATELESS_EXECUTOR", "").strip() == "1":
-            tool_names = [
-                name for name in tool_names if name != "request_workspace_upgrade"
-            ]
-
         # Background-officer capability ceiling
         # (knowledge-base/knowledge/features/officer_knowledge_plane.md §4, K3): a commissioned
         # background officer (officer.enabled is True — the runtime fact, not
@@ -3266,10 +3415,11 @@ class PersistentSession:
         # adapter or persistent identity was unavailable during registration.
         loaded_tool_names = [tool.name for tool in self.tools]
         self._scope_skills_for_tool_names(loaded_tool_names)
-        # This is the first point at which present-with-canvas may touch the
-        # workspace. Re-running after a none→workspace upgrade is idempotent and
-        # admits it only when both use_skill and set_canvas actually loaded.
-        self._deploy_catalog_skill_files({"present-with-canvas"})
+        # This is the first point at which catalog skills may touch the
+        # workspace: ordinary ones only when use_skill loaded, present-with-canvas
+        # only when use_skill and set_canvas did. Re-running after a
+        # none→workspace upgrade is idempotent (ordinary files are add-only).
+        self._deploy_catalog_skill_files()
 
         # Tool docs are virtual (knowledge-base/knowledge/features/virtual_directories.md).
         from agent.core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
@@ -3948,7 +4098,6 @@ class PersistentSession:
                         memory_config=self.config.memory,
                         auxiliary_config=self.config.auxiliary,
                         extraction_prompt=self.memory_extraction_prompt,
-                        assembler_prompt=None,  # persistent mode has no assembler
                         job_id=self.thread_id,
                         agent_type=self.config.agent_id,
                         project_id=self.project_id,
@@ -4013,7 +4162,14 @@ class PersistentSession:
             self.config.memory,
         )
 
-    def swap_backend(self, new_backend: Any) -> None:
+    def swap_backend(
+        self,
+        new_backend: Any,
+        *,
+        workspace_tier: Optional[str] = None,
+        workspace_generation: str = "",
+        workspace_runtime_incarnation: str = "",
+    ) -> None:
         """Hot-swap workspace backend at runtime (e.g. container → VM).
 
         Connects the new backend, disconnects the old one, replaces
@@ -4021,6 +4177,11 @@ class PersistentSession:
 
         Args:
             new_backend: A connected (or connectable) WorkspaceBackend instance.
+            workspace_tier: The new backend's tier. When given, it replaces
+                the tier and workspace identity setup recorded, so End drains
+                and names the new workspace as a Session created on it does.
+            workspace_generation: The new workspace's attested generation.
+            workspace_runtime_incarnation: Its attested runtime incarnation.
         """
         if not self.workspace_manager:
             raise RuntimeError("No workspace manager to swap backend on")
@@ -4082,6 +4243,12 @@ class PersistentSession:
         # `_backend` directly unwraps the overlay and 404s every virtual path
         # (knowledge-base/knowledge/features/virtual_directories.md).
         self.workspace_manager.swap_backend(new_backend)
+        if workspace_tier is not None:
+            self.workspace_backend_tier = str(workspace_tier)
+            self.workspace_generation = str(workspace_generation or "")
+            self.workspace_runtime_incarnation = str(
+                workspace_runtime_incarnation or ""
+            )
 
         # Rebuild ShellManager with new backend
         self._setup_shell_manager()
@@ -4265,7 +4432,7 @@ class PersistentSession:
                 )
 
         if self.tool_context is not None:
-            self.tool_context.citation_verdict_callback = None
+            self.tool_context.citation_event_callback = None
             self.tool_context.canvas_event_callback = None
             self.tool_context._resolved_tool_names = []
             self.tool_context.session_runtime_facts = None
@@ -4503,6 +4670,17 @@ class PersistentSession:
                         )
                     else:
                         logger.warning(f"Backend disconnect error: {e}")
+        elif backend_for_cleanup is not None and resident_cleanup_error is not None:
+            # The retry runs the resident teardown again over this backend.
+            # The protected shell retirement above kills every workspace-UID
+            # process, this transport's sftp-server among them, so reset the
+            # transport and let the retry reconnect with a fresh SFTP channel.
+            # Claim-resource admission stays open for the retry's scripts.
+            if hasattr(backend_for_cleanup, "disconnect"):
+                try:
+                    backend_for_cleanup.disconnect()
+                except Exception as e:
+                    logger.warning(f"Backend disconnect error: {e}")
 
         if (
             exact_pinned_terminal

@@ -26,8 +26,8 @@ import pytest
 import yaml
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent.core.guidance_injection import create_guidance_injection_messages
-from agent.core.knowledge_injection import create_charter_injection_messages
+from tests._legacy_injection_rows import create_guidance_injection_messages
+from tests._legacy_injection_rows import create_charter_injection_messages
 from shared.runtime.core import loader
 from shared.runtime.core.context_entries import (
     fold_context_entries,

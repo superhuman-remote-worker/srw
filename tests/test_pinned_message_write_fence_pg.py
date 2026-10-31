@@ -798,8 +798,9 @@ async def test_loop_writes_of_a_rebound_life_are_refused_and_swallowed(
         with pytest.raises(RuntimeError, match="not durably persisted"):
             await turn
         expected_rows: list = []
-        # The assistant row and the error row, once each.
-        expected_refusals = 2
+        # The turn's context entry (the subagent status, written before the
+        # provider call), the assistant row and the error row, once each.
+        expected_refusals = 3
     else:
         llm, turn = await _loop_delegation_turn(
             loop_session,
@@ -808,8 +809,8 @@ async def test_loop_writes_of_a_rebound_life_are_refused_and_swallowed(
         )
         with pytest.raises(DelegationResultNotDurable):
             await turn
-        # The assistant row landed while A was bound.
-        expected_rows = [("ai", None)]
+        # The context entry and the assistant row landed while A was bound.
+        expected_rows = [("context", None), ("ai", None)]
         # The strict result save's three bounded attempts of the same row,
         # then the error row once.
         expected_refusals = 4
@@ -839,6 +840,7 @@ async def test_loop_writes_during_a_forced_end_land_until_the_settle(
     await turn
     await loop_session._loop_on_error("End reached the turn.")
     assert await _roles(life) == [
+        ("context", None),
         ("ai", None),
         ("tool", "c1"),
         ("ai", None),
@@ -849,7 +851,7 @@ async def test_loop_writes_during_a_forced_end_land_until_the_settle(
     assert await _settle_end(life, authority)
     late = AIMessage(content="after the settle", id=f"msg_{uuid4()}")
     assert await loop_session._loop_persist_message(late) is False
-    assert len(await _roles(life)) == 4
+    assert len(await _roles(life)) == 5
 
 
 # --- Where the identity comes from -----------------------------------------

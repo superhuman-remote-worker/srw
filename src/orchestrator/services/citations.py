@@ -18,6 +18,7 @@ import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import HTTPException, Response
 
@@ -39,6 +40,14 @@ class CitationDependencies:
     logger: Any
 
 
+#: A citation's own view of its source (name, identifier, cloud anchor) is on
+#: the link of the job or session that cited it (vector 0029); NULL link
+#: fields fall back to the source row.
+_CITATION_SOURCE_LINK = (
+    "LEFT JOIN job_sources js ON js.job_id = c.job_id AND js.source_id = c.source_id"
+)
+
+
 def _source_cloud_meta(metadata: Any) -> dict[str, Any]:
     """Extract the ``metadata.cloud`` block from a ``sources.metadata`` value.
 
@@ -54,6 +63,29 @@ def _source_cloud_meta(metadata: Any) -> dict[str, Any]:
         return {}
     cloud = metadata.get("cloud")
     return cloud if isinstance(cloud, dict) else {}
+
+
+#: Longest snapshot download name kept, before encoding.
+_SNAPSHOT_FILENAME_MAX = 200
+
+
+def _snapshot_content_disposition(source_name: Any, citation_id: int) -> str:
+    """``attachment`` naming the cited file, safe for any stored source name.
+
+    The source name is agent-written. Only its last path segment is kept,
+    without control characters. The quoted ``filename`` is an ASCII fallback
+    (``"``, backslash and non-ASCII become ``_``) and ``filename*`` carries
+    the exact name percent-encoded (RFC 6266), so no name can end the header
+    value or fail its latin-1 encoding.
+    """
+    name = str(source_name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    name = name[:_SNAPSHOT_FILENAME_MAX] or f"citation-{citation_id}"
+    fallback = "".join(
+        ch if " " <= ch <= "~" and ch not in '"\\' else "_" for ch in name
+    )
+    encoded = quote(name, safe="")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def _home_relative_path(anchor_webdav_url: str, home_webdav_url: str) -> Optional[str]:
@@ -96,9 +128,18 @@ async def list_sources(
             params: list[Any] = []
             idx = 1
 
+            link_join = ""
+            name_cols = "s.identifier, s.name, s.metadata"
             if job_id:
-                conditions.append(
-                    f"s.id IN (SELECT source_id FROM job_sources WHERE job_id = ${idx}::uuid)"
+                # One job's view: its own name, identifier and cloud anchor.
+                link_join = (
+                    f"JOIN job_sources js ON js.source_id = s.id "
+                    f"AND js.job_id = ${idx}::uuid"
+                )
+                name_cols = (
+                    "COALESCE(js.identifier, s.identifier) AS identifier, "
+                    "COALESCE(js.name, s.name) AS name, "
+                    "COALESCE(js.metadata, s.metadata) AS metadata"
                 )
                 params.append(job_id)
                 idx += 1
@@ -111,7 +152,7 @@ async def list_sources(
 
             # Count total
             count_row = await conn.fetchrow(
-                f"SELECT COUNT(*) as total FROM sources s {where}", *params
+                f"SELECT COUNT(*) as total FROM sources s {link_join} {where}", *params
             )
             total = count_row["total"] if count_row else 0
 
@@ -119,11 +160,11 @@ async def list_sources(
             params.append(limit)
             params.append(offset)
             rows = await conn.fetch(
-                f"""SELECT s.id, s.type::text as type, s.identifier, s.name,
+                f"""SELECT s.id, s.type::text as type, {name_cols},
                        s.version, s.content_hash,
                        LEFT(s.content, 200) as content_preview,
-                       s.metadata, s.created_at
-                FROM sources s {where}
+                       s.created_at
+                FROM sources s {link_join} {where}
                 ORDER BY s.created_at DESC
                 LIMIT ${idx} OFFSET ${idx + 1}""",
                 *params,
@@ -250,13 +291,16 @@ async def list_job_citations(
             params.append(offset)
             rows = await conn.fetch(
                 f"""SELECT c.id, LEFT(c.claim, 200) as claim, c.source_id,
-                       s.name as source_name, s.type::text as source_type,
+                       COALESCE(js.name, s.name) as source_name,
+                       s.type::text as source_type,
                        c.verification_status::text as verification_status,
+                       c.verification_reason,
                        c.confidence::text as confidence,
                        c.extraction_method::text as extraction_method,
-                       c.similarity_score, c.created_at
+                       c.similarity_score, c.created_at, c.withdrawn_at
                 FROM citations c
                 JOIN sources s ON c.source_id = s.id
+                LEFT JOIN job_sources js ON js.job_id = c.job_id AND js.source_id = c.source_id
                 {where}
                 ORDER BY c.created_at DESC
                 LIMIT ${idx} OFFSET ${idx + 1}""",
@@ -315,13 +359,16 @@ async def get_citation_detail(
                       c.quote_language, c.relevance_reasoning,
                       c.confidence::text as confidence,
                       c.extraction_method::text as extraction_method,
-                      c.source_id, s.name as source_name, s.type::text as source_type,
-                      s.identifier as source_identifier,
+                      c.source_id, COALESCE(js.name, s.name) as source_name,
+                      s.type::text as source_type,
+                      COALESCE(js.identifier, s.identifier) as source_identifier,
                       c.locator, c.verification_status::text as verification_status,
-                      c.verification_notes, c.similarity_score, c.matched_location,
-                      c.created_at, c.created_by
+                      c.verification_reason, c.verification_notes,
+                      c.similarity_score, c.matched_location,
+                      c.created_at, c.created_by, c.withdrawn_at, c.withdrawn_reason
                 FROM citations c
                 JOIN sources s ON c.source_id = s.id
+                LEFT JOIN job_sources js ON js.job_id = c.job_id AND js.source_id = c.source_id
                 WHERE c.id = $1""",
                 citation_id,
             )
@@ -363,8 +410,10 @@ async def get_citation_snapshot(
     try:
         async with dependencies.vector_db.acquire() as conn:
             row = await conn.fetchrow(
-                """SELECT c.job_id, s.name AS source_name, s.metadata
+                f"""SELECT c.job_id, COALESCE(js.name, s.name) AS source_name,
+                          COALESCE(js.metadata, s.metadata) AS metadata
                    FROM citations c JOIN sources s ON c.source_id = s.id
+                   {_CITATION_SOURCE_LINK}
                    WHERE c.id = $1""",
                 citation_id,
             )
@@ -388,12 +437,19 @@ async def get_citation_snapshot(
         if data is None:
             raise HTTPException(status_code=404, detail="Snapshot blob not found")
 
+        # The stored type is the cited file's and may be ``text/html``: the
+        # bytes are always a download, never rendered or sniffed on the API
+        # origin (N51).
         media_type = cloud.get("content_type") or "application/octet-stream"
-        filename = (row["source_name"] or f"citation-{citation_id}").replace('"', "")
         return Response(
             content=data,
             media_type=media_type,
-            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            headers={
+                "Content-Disposition": _snapshot_content_disposition(
+                    row["source_name"], citation_id
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
         )
     except HTTPException:
         raise
@@ -426,8 +482,9 @@ async def get_citation_drift(
     try:
         async with dependencies.vector_db.acquire() as conn:
             row = await conn.fetchrow(
-                """SELECT c.job_id, s.metadata
+                f"""SELECT c.job_id, COALESCE(js.metadata, s.metadata) AS metadata
                    FROM citations c JOIN sources s ON c.source_id = s.id
+                   {_CITATION_SOURCE_LINK}
                    WHERE c.id = $1""",
                 citation_id,
             )
@@ -839,7 +896,9 @@ async def search_job_sources(
             params.append(top_k)
 
             rows = await conn.fetch(
-                f"""SELECT s.id, s.name, s.type::text as type, s.identifier,
+                f"""SELECT s.id, COALESCE(js.name, s.name) AS name,
+                       s.type::text as type,
+                       COALESCE(js.identifier, s.identifier) AS identifier,
                        ts_rank(to_tsvector('simple', s.content),
                                plainto_tsquery('simple', ${query_param_idx})) as rank,
                        ts_headline('simple', s.content,

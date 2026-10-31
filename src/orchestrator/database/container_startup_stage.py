@@ -41,9 +41,14 @@ class ReadyObservedAt:
 
 @dataclass(frozen=True, slots=True)
 class StartupAttention:
-    """An attested invalidity or elapsed frozen startup bound."""
+    """An attested invalidity, exit or elapsed frozen startup bound.
+
+    ``exit_code`` is set only with ``container_exited``: the exact Job Pod's
+    own process stopped before its first Ready.
+    """
 
     reason_code: str
+    exit_code: int | None = None
 
 
 SchedulingObservation: TypeAlias = Unknown | Unscheduled | ScheduledAt
@@ -56,6 +61,7 @@ class WorkspaceCreationView(TypedDict):
     state: str
     reason_code: str
     readiness_deadline_at: datetime | None
+    exit_code: int | None
 
 
 def public_workspace_creation_view(
@@ -85,6 +91,7 @@ def public_workspace_creation_view(
             "state": "observing",
             "reason_code": reason,
             "readiness_deadline_at": None,
+            "exit_code": None,
         }
     if (
         row["startup_protocol_version"] != 1
@@ -114,6 +121,7 @@ def public_workspace_creation_view(
             ("attention", "invalid_configuration"),
             ("attention", "pull_deadline"),
             ("attention", "readiness_deadline"),
+            ("attention", "container_exited"),
             ("attention", "ssh_deadline"),
         }:
             return None
@@ -130,11 +138,19 @@ def public_workspace_creation_view(
             return None
     else:
         return None
+    exit_code = row["startup_exit_code"]
+    if reason == "container_exited":
+        # Only the integer code crosses: never a termination reason or message.
+        if type(exit_code) is not int:
+            return None
+    elif exit_code is not None:
+        return None
     return {
         "stage": stage,
         "state": state,
         "reason_code": reason,
         "readiness_deadline_at": deadline,
+        "exit_code": exit_code,
     }
 
 

@@ -1,6 +1,7 @@
 import {ToolCallEvent} from '../models/turn.model';
 import {AuditEntry} from '../models/audit.model';
 import {recoveredDelegateCallOutcome} from '../models/delegate-batch.model';
+import {toolResultStateOutcome} from '../models/tool-result-state.model';
 import {NormalizedToolCall, ToolCardStatus, ToolCardView} from '../models/tool-card.model';
 import {buildToolCardView} from './tool-descriptors';
 
@@ -29,12 +30,20 @@ function mapEventStatus(s: ToolCallEvent['status']): ToolCardStatus {
     }
 }
 
-/** Live WS / history `ToolCallEvent` → unified view-model. */
-export function toolCardViewFromEvent(tc: ToolCallEvent): ToolCardView {
+/**
+ * Live WS / history `ToolCallEvent` → unified view-model.
+ *
+ * `running`: the session reports this call, which the history holds without
+ * a result, as still running (a reload during the call).
+ */
+export function toolCardViewFromEvent(
+    tc: ToolCallEvent,
+    options: {running?: boolean} = {},
+): ToolCardView {
     const normalized: NormalizedToolCall = {
         tool: tc.tool,
         args: tc.args || {},
-        status: mapEventStatus(tc.status),
+        status: options.running ? 'running' : mapEventStatus(tc.status),
         // The live result string is the full content the model saw (incl. the
         // error output on a failed call — surfaced tinted, not duplicated).
         result: tc.result,
@@ -42,8 +51,10 @@ export function toolCardViewFromEvent(tc: ToolCallEvent): ToolCardView {
         exitCode: tc.exitCode,
     };
     const view = buildToolCardView(normalized);
-    // A delegation a recovery settled says what became of the child.
-    const outcome = recoveredDelegateCallOutcome(tc);
+    if (options.running) return view;
+    // A delegation a recovery settled says what became of the child; a call
+    // whose history holds no result it produced says that.
+    const outcome = recoveredDelegateCallOutcome(tc) ?? toolResultStateOutcome(tc.resultState);
     return outcome ? {...view, outcome} : view;
 }
 

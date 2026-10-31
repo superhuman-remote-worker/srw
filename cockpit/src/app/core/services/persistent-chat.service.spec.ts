@@ -8,6 +8,7 @@ import { TranslocoService } from '@jsverse/transloco';
 import {
   PersistentChatService,
   historyToTurns,
+  isReturnedToolError,
   cloudCountFromSummary,
   describeAppliedConfig,
   parseRunningTools,
@@ -296,7 +297,7 @@ function activeSessionGet(url: string) {
     total: 0,
     citations: [],
     thread_id: threadId,
-    permission_mode: 'supervised',
+    permission_mode: 'read_only',
     narration_mode: 'auto',
     turn_count: 0,
     turn_in_flight: false,
@@ -519,7 +520,7 @@ describe('PersistentChatService — initial state', () => {
     expect(service.currentStreamingTurn()).toBeNull();
     expect(service.isStreaming()).toBe(false);
     expect(service.historyLoaded()).toBe(false);
-    expect(service.permissionMode()).toBe('supervised');
+    expect(service.permissionMode()).toBe('read_only');
     expect(service.narrationMode()).toBe('auto');
     expect(service.reconnectAttempt()).toBe(0);
     expect(service.reconnectGaveUp()).toBe(false);
@@ -1840,7 +1841,7 @@ describe('PersistentChatService — resume navigation safety', () => {
         detail: {
           code: 'config_drift',
           drift: [
-            { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine' },
+            { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop' },
           ],
         },
       },
@@ -1924,7 +1925,7 @@ describe('PersistentChatService — resume config drift', () => {
                     id: 'connector:abc',
                     kind: 'connector',
                     reason: 'deleted',
-                    label: 'KurortEngine',
+                    label: 'WidgetShop',
                   },
                 ],
               },
@@ -1936,7 +1937,7 @@ describe('PersistentChatService — resume config drift', () => {
     await service.resumeSession();
 
     expect(service.pendingDrift()).toEqual([
-      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine' },
+      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop' },
     ]);
     expect(service.error()).toBeNull();
     // connect() must not run against a still-ended thread when drift blocks it.
@@ -2119,7 +2120,7 @@ describe('PersistentChatService — resume config drift', () => {
   it('disconnect() clears a pending drift', () => {
     const { service } = createService();
     service.pendingDrift.set([
-      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine' },
+      { id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'WidgetShop' },
     ]);
 
     service.disconnect();
@@ -2298,7 +2299,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
       es,
       {
         method: 'session.state',
-        params: { permission_mode: 'supervised' },
+        params: { permission_mode: 'read_only' },
       },
       '1:1',
     );
@@ -2569,7 +2570,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
       '1:1',
     );
     expect(service.cloudFolderProblems()).toEqual([
-      { name: 'project', path: 'workspace/cloud/project', kind: '', reason: 'credential_rejected' },
+      { name: 'project', path: 'cloud/project', kind: '', reason: 'credential_rejected' },
     ]);
     // Every folder keeps its row in the header, mounted or not.
     expect(service.cloudFolders().map((f) => [f.name, f.state, f.reason])).toEqual([
@@ -4584,6 +4585,30 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.service.pendingPermissions()).toEqual([]);
   });
 
+  it('approveAll() settles only after every REST decision answered, failures included', async () => {
+    const ctx = await readySession();
+    const first = new Subject<Record<string, unknown>>();
+    const second = new Subject<Record<string, unknown>>();
+    ctx.mockHttp.post
+      .mockReturnValueOnce(first.asObservable())
+      .mockReturnValueOnce(second.asObservable());
+    (ctx.service as any).pendingPermissions.set([
+      { id: 'tc-a', approvalId: 'approval-a', tool: 'run_command', args: {} },
+      { id: 'tc-b', approvalId: 'approval-b', tool: 'write_file', args: {} },
+    ]);
+
+    let settled = false;
+    const done = ctx.service.approveAll().then(() => (settled = true));
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+    first.next({});
+    first.complete();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    second.error({ status: 0 });
+    await done;
+    expect(settled).toBe(true);
+  });
+
   it('does not resurrect a durable card when journal resolution beats a masked POST error', async () => {
     const ctx = await readySession();
     const response = new Subject<Record<string, unknown>>();
@@ -4925,7 +4950,7 @@ describe('PersistentChatService — control commands', () => {
 
     ctx.service.setMode('auto_accept');
     // Neither the optimistic click nor the HTTP response is authority.
-    expect(ctx.service.permissionMode()).toBe('supervised');
+    expect(ctx.service.permissionMode()).toBe('read_only');
     const requestId = ctx.mockHttp.post.mock.calls[0][1].client_request_id;
 
     fireSseMessage(
@@ -4937,6 +4962,57 @@ describe('PersistentChatService — control commands', () => {
       '1:2',
     );
     expect(ctx.service.permissionMode()).toBe('autonomous');
+  });
+
+  it('reads a legacy `supervised` from the server as read_only at every ingest point', async () => {
+    const ctx = createService();
+    // The durable REST snapshot (a thread row stored before the rename).
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      activeSessionGet(url).pipe(map((body) => ({ ...body, permission_mode: 'supervised' }))),
+    );
+    await ctx.service.connect('thread-legacy-mode');
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'ready', params: {} }, '1:1');
+    expect(ctx.service.permissionMode()).toBe('read_only');
+
+    const ingest = [
+      // A journaled mode.changed frame from before the rename.
+      (mode: string) => ({ method: 'mode.changed', params: { mode } }),
+      (mode: string) => ({ method: 'config.changed', params: { permission_mode: mode } }),
+      // A pinned agent's live welcome frame.
+      (mode: string) => ({ method: 'session.state', params: { permission_mode: mode } }),
+    ];
+    let seq = 2;
+    for (const frame of ingest) {
+      fireSseMessage(ctx.sseInstances[0], frame('autonomous'), `1:${seq++}`);
+      expect(ctx.service.permissionMode()).toBe('autonomous');
+      fireSseMessage(ctx.sseInstances[0], frame('supervised'), `1:${seq++}`);
+      expect(ctx.service.permissionMode()).toBe('read_only');
+    }
+
+    // An unknown value never lands in the signal.
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'session.state', params: { permission_mode: 'bogus' } },
+      `1:${seq++}`,
+    );
+    expect(ctx.service.permissionMode()).toBe('read_only');
+  });
+
+  it('/readonly and the hidden /supervised alias both send mode.set read_only', async () => {
+    const ctx = await readySession();
+    ctx.mockHttp.post.mockClear();
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true }));
+
+    expect(ctx.service.slashCommandAvailable('/readonly')).toBe(true);
+    expect((ctx.service as any).handleSlashCommand('/readonly')).toBe(true);
+    ctx.service.setMode('autonomous');
+    expect((ctx.service as any).handleSlashCommand('/supervised')).toBe(true);
+
+    const modes = ctx.mockHttp.post.mock.calls
+      .filter((call: any[]) => call[1]?.method === 'mode.set')
+      .map((call: any[]) => call[1].mode);
+    expect(modes).toEqual(['read_only', 'autonomous', 'read_only']);
   });
 
   it('correlates an owner acknowledgement that beats the HTTP 202', async () => {
@@ -4998,7 +5074,7 @@ describe('PersistentChatService — control commands', () => {
     ctx.service.setMode('auto_accept');
     ctx.service.setNarrationMode('silent');
     ctx.service.setMode('autonomous');
-    ctx.service.setMode('supervised');
+    ctx.service.setMode('read_only');
 
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
     const queued = (ctx.service as any).durableControlOutbox.map((item: any) => item.request);
@@ -5010,7 +5086,7 @@ describe('PersistentChatService — control commands', () => {
     expect(queued.map((request: any) => request.mode)).toEqual([
       'auto_accept',
       'silent',
-      'supervised',
+      'read_only',
     ]);
 
     firstAdmission.next({ accepted: true });
@@ -5019,7 +5095,7 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.mockHttp.post.mock.calls.map((call: any[]) => call[1].mode)).toEqual([
       'auto_accept',
       'silent',
-      'supervised',
+      'read_only',
     ]);
   });
 
@@ -5030,7 +5106,7 @@ describe('PersistentChatService — control commands', () => {
       threadId: `other-thread-${index}`,
       request: {
         method: 'mode.set',
-        mode: 'supervised',
+        mode: 'read_only',
         client_request_id: `existing-${index}`,
       },
       attempts: 0,
@@ -5206,17 +5282,17 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.service.permissionMode()).toBe('auto_accept');
     expect(ctx.service.error()).toBe('chat.control.admissionFailed');
 
-    ctx.service.setMode('supervised');
+    ctx.service.setMode('read_only');
     const newerRequestId = ctx.mockHttp.post.mock.calls[2][1].client_request_id;
     fireSseMessage(
       ctx.sseInstances[0],
       {
         method: 'mode.changed',
-        params: { mode: 'supervised', client_request_id: newerRequestId },
+        params: { mode: 'read_only', client_request_id: newerRequestId },
       },
       '1:3',
     );
-    expect(ctx.service.permissionMode()).toBe('supervised');
+    expect(ctx.service.permissionMode()).toBe('read_only');
     expect(ctx.service.error()).toBeNull();
   });
 
@@ -5364,7 +5440,7 @@ describe('PersistentChatService — control WS frame filtering', () => {
       method: 'session.state',
       params: {
         thread_id: 'thread-status',
-        permission_mode: 'manual',
+        permission_mode: 'autonomous',
         narration_mode: 'verbose',
         turn_count: 1,
         model: 'claude-opus-4-7',
@@ -5384,7 +5460,7 @@ describe('PersistentChatService — control WS frame filtering', () => {
     });
 
     expect(service.sessionReady()).toBe(true);
-    expect(service.permissionMode()).toBe('manual');
+    expect(service.permissionMode()).toBe('autonomous');
     expect(service.modelName()).toBe('claude-opus-4-7');
     expect(service.tasks().map((task) => task.id)).toEqual(['task_9']);
 
@@ -5482,7 +5558,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         return of(
           opts.sessionState ?? {
             thread_id: threadId,
-            permission_mode: 'supervised',
+            permission_mode: 'read_only',
             narration_mode: 'auto',
             turn_count: 0,
             turn_in_flight: false,
@@ -5581,7 +5657,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         },
         sessionState: {
           thread_id: 'socketless',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'verbose',
           turn_count: 3,
           turn_in_flight: false,
@@ -5603,7 +5679,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     (ctx.service as any)._revalidateConnection();
 
     expect(ctx.service.sessionReady()).toBe(true);
-    expect(ctx.service.permissionMode()).toBe('supervised');
+    expect(ctx.service.permissionMode()).toBe('read_only');
     expect(ctx.service.narrationMode()).toBe('verbose');
     // An expert profile is not a model name; an unresolved model stays
     // unknown instead of rendering `session_base` as though it were one.
@@ -5632,7 +5708,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'socketless-tasks',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 8,
           turn_in_flight: false,
@@ -5700,7 +5776,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'socketless-task-fence',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 10,
           turn_in_flight: false,
@@ -5916,7 +5992,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'stateful',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 8,
           turn_in_flight: true,
@@ -6016,7 +6092,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'approval-retry',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 3,
           turn_in_flight: true,
@@ -6129,7 +6205,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'midturn-rest',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 7,
           turn_in_flight: true,
@@ -6178,7 +6254,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       if (url.endsWith('/state')) {
         return of({
           thread_id: 'same-thread-live',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 7,
           turn_in_flight: true,
@@ -6239,7 +6315,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         const epoch = stateRead === 1 ? 1 : 2;
         return of({
           thread_id: 'same-thread-new-epoch',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 1,
           turn_in_flight: true,
@@ -6322,7 +6398,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         const advanced = stateRead > 1;
         return of({
           thread_id: 'same-epoch-gap',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: advanced ? 10 : 1,
           turn_in_flight: true,
@@ -6405,7 +6481,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         ],
         sessionState: {
           thread_id: 'covered-terminal',
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 7,
           turn_in_flight: false,
@@ -6503,7 +6579,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         if (url.endsWith('/state')) {
           return of({
             thread_id: 'terminal-425',
-            permission_mode: 'supervised',
+            permission_mode: 'read_only',
             narration_mode: 'auto',
             turn_count: 0,
             turn_in_flight: false,
@@ -8278,7 +8354,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         if (url.endsWith('/state')) {
           return of({
             thread_id: 'rest-ended',
-            permission_mode: 'supervised',
+            permission_mode: 'read_only',
             narration_mode: 'auto',
             turn_count: 0,
             turn_in_flight: false,
@@ -8616,7 +8692,7 @@ describe('PersistentChatService — endSession()', () => {
         messages: [],
         total: 0,
         thread_id: 'thread-reload-ending',
-        permission_mode: 'supervised',
+        permission_mode: 'read_only',
         narration_mode: 'auto',
         turn_count: 0,
         turn_in_flight: false,
@@ -9551,7 +9627,7 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     expect(lines.some((l) => l.includes('/upgrade-workspace'))).toBe(false);
   });
 
-  it('workspace_upgrade.progress surfaces a live heartbeat during a slow provision', async () => {
+  it('workspace_upgrade.progress keeps the elapsed time for the card, not as chat lines', async () => {
     const { service, es } = await setup();
     fireSseMessage(
       es,
@@ -9561,11 +9637,13 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
       },
       '1:1',
     );
-    expect(sysLines(service).some((l) => l.includes('120s'))).toBe(true);
+    expect(service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm', elapsed: 120 });
+    expect(sysLines(service).some((l) => l.includes('120s'))).toBe(false);
   });
 
   it('workspace_upgrade.complete mentions sudo for a vm target only', async () => {
     const { service, es } = await setup();
+    const translate = vi.spyOn((service as any).transloco, 'translate');
     fireSseMessage(
       es,
       {
@@ -9574,9 +9652,10 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
       },
       '1:1',
     );
-    const lines = sysLines(service);
-    expect(lines.some((l) => l.toLowerCase().includes('sudo'))).toBe(true);
-    expect(lines.some((l) => l.includes('3 file(s) carried over'))).toBe(true);
+    expect(sysLines(service)).toContain(
+      'chat.workspaceUpgrade.ready chat.workspaceUpgrade.readySudo chat.workspaceUpgrade.readySeeded',
+    );
+    expect(translate).toHaveBeenCalledWith('chat.workspaceUpgrade.readySeeded', { count: 3 });
   });
 
   it('workspace_upgrade.complete for a sandbox target does not mention sudo', async () => {
@@ -9589,7 +9668,8 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
       },
       '1:1',
     );
-    expect(sysLines(service).some((l) => l.toLowerCase().includes('sudo'))).toBe(false);
+    expect(sysLines(service)).toContain('chat.workspaceUpgrade.ready');
+    expect(sysLines(service).some((l) => l.includes('readySudo'))).toBe(false);
   });
 });
 
@@ -9812,6 +9892,25 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     expect(lines).toContain('The agent requested a VM workspace: need a shell');
   });
 
+  it('.started moves the upgrade card to its starting step without a chat line', async () => {
+    const ctx = await readySession();
+    ctx.service.upgradeWorkspace(null);
+    TestBed.tick();
+    const lines = ctx.service.turns().filter((t: any) => t.kind === 'system').length;
+
+    fireSseMessage(
+      ctx.es,
+      { method: 'workspace_upgrade.started', params: { target_tier: 'vm' } },
+      '1:9',
+    );
+    TestBed.tick();
+
+    expect(ctx.service.turns().filter((t: any) => t.kind === 'system')).toHaveLength(lines);
+    expect(ctx.service.workspaceUpgradeProgress()).toEqual(
+      expect.objectContaining({ tier: 'vm', active: 'starting' }),
+    );
+  });
+
   it('a bare upgrade then .started replaces the "next" placeholder with the target tier', async () => {
     const ctx = await readySession();
     ctx.service.upgradeWorkspace(null);
@@ -9866,6 +9965,9 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     const ctx = await readySession();
     ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
     expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    // That upgrade is over (a second one while it runs is refused locally
+    // and keeps its continuation; see the C2 lane-switch tests).
+    ctx.service.workspaceUpgradeInProgress.set(null);
     // The pane and /upgrade-workspace pass no opts — they must reset it,
     // or a stale flag would resume the agent behind the user's back.
     ctx.service.upgradeWorkspace('sandbox');
@@ -9979,6 +10081,15 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     expect(inputCalls(ctx)).toHaveLength(0);
   });
 
+  it('disconnect forgets the workspace tier so the next Session reads its own', async () => {
+    // 10-19: the first Session opened in a tab fixed the tier for every later
+    // one, so a container Session's settings ran as virtual.
+    const ctx = await readySession();
+    ctx.service.workspaceTier.set('virtual');
+    ctx.service.disconnect();
+    expect(ctx.service.workspaceTier()).toBeNull();
+  });
+
   it('disconnect clears the upgrade state so it cannot bleed across threads', async () => {
     const ctx = await readySession();
     offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
@@ -10029,7 +10140,7 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       if (url.endsWith('/state')) {
         const snapshot: Record<string, unknown> = {
           thread_id: threadId,
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 1,
           turn_in_flight: false,
@@ -10399,6 +10510,102 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     const u = service.usage()!;
     expect(u.turn).toBe(2);
     expect(u.reasoningEstimated).toBe(true);
+  });
+
+  describe('historyToTurns — a returned tool error stays an error after replay', () => {
+    // The live `tool.completed` frame carries is_error; history rows do not.
+    // Without the replay rule a reloaded "Error: File not found" showed as a
+    // completed call (seen on k3d 2026-10-28).
+    const turnWith = (toolName: string, result: string) =>
+      historyToTurns([
+        {
+          id: 'a1',
+          role: 'ai',
+          content: null,
+          tool_calls: [{ name: toolName, args: {}, id: 'tc1' }],
+          turn_number: 1,
+          created_at: '2026-10-28T22:00:00Z',
+        },
+        {
+          id: 't1',
+          role: 'tool',
+          content: result,
+          tool_calls: null,
+          turn_number: 1,
+          tool_call_id: 'tc1',
+          created_at: '2026-10-28T22:00:01Z',
+        },
+      ] as never);
+
+    it('marks an "Error:" result as a failed call', () => {
+      const [tool] = (turnWith('read_file', 'Error: File not found: x.txt')[0] as AssistantTurn).events.filter(isToolCall);
+      expect(tool).toMatchObject({ status: 'error', resultStatus: 'error' });
+    });
+
+    it('marks a raised tool ("Tool execution error:") as a failed call', () => {
+      const [tool] = (turnWith('run_command', 'Tool execution error: boom')[0] as AssistantTurn).events.filter(isToolCall);
+      expect(tool).toMatchObject({ status: 'error', resultStatus: 'error' });
+    });
+
+    it('keeps a result that only mentions an error a success', () => {
+      const [tool] = (turnWith('read_file', 'line 3: Error: retrying\nok')[0] as AssistantTurn).events.filter(isToolCall);
+      expect(tool).toMatchObject({ status: 'completed', resultStatus: 'ok' });
+    });
+
+    it('applies the leading-prefix rule only', () => {
+      expect(isReturnedToolError('  Error: x')).toBe(true);
+      expect(isReturnedToolError('error: lowercase is not the tool contract')).toBe(false);
+      expect(isReturnedToolError('All good')).toBe(false);
+    });
+  });
+
+  describe('historyToTurns — a call without a result it produced is not "completed"', () => {
+    // session_unknown_tool_result_needs_admin.md: a call a lost process cut
+    // off has no result row, and the rows that answer it say the result is
+    // unknown or that it never ran. None of them is a completed call.
+    const ai = (decision?: string) => ({
+      id: 'a1',
+      role: 'ai',
+      content: null,
+      tool_calls: [{ name: 'shell_execute', args: {}, id: 'tc1', ...(decision ? { decision } : {}) }],
+      turn_number: 1,
+      created_at: '2026-10-31T09:38:09Z',
+    });
+    const result = (content: string, metrics: unknown = null) => ({
+      id: 't1',
+      role: 'tool',
+      content,
+      tool_calls: null,
+      turn_number: 1,
+      tool_call_id: 'tc1',
+      metrics,
+      created_at: '2026-10-31T09:46:46Z',
+    });
+    const toolOf = (messages: unknown[]) =>
+      (historyToTurns(messages as never)[0] as AssistantTurn).events.filter(isToolCall)[0];
+
+    it('marks a call with no result row as missing its result', () => {
+      expect(toolOf([ai()]).resultState).toBe('missing');
+    });
+
+    it('takes the state a marked result row names', () => {
+      const unknown = { tool_result_state: { state: 'unknown', tool_call_id: 'tc1' } };
+      const notRun = { tool_result_state: { state: 'not_run', tool_call_id: 'tc1' } };
+      expect(toolOf([ai(), result('Result unknown: …', unknown)]).resultState).toBe('unknown');
+      expect(toolOf([ai(), result('Not run: …', notRun)]).resultState).toBe('not_run');
+    });
+
+    it('clears it for an ordinary result', () => {
+      const tool = toolOf([ai(), result('Exit code: 0')]);
+      expect(tool.resultState).toBeUndefined();
+      expect(tool.status).toBe('completed');
+    });
+
+    it('leaves a refused call to its own status', () => {
+      const tool = toolOf([ai('denied')]);
+      expect(tool.status).toBe('denied');
+      expect(tool.resultState).toBeUndefined();
+    });
   });
 
   describe('historyToTurns — tool categories survive the replay', () => {
@@ -11070,6 +11277,79 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         params: { citation_id: 'nope', verification_status: 'verified' },
       });
       expect(service.citationsByCid().get(5)?.verification_status).toBe('pending');
+    });
+
+    it('upserts the full row a newer agent sends with the verdict', () => {
+      const { service } = createService();
+      service.citationsByCid.set(new Map());
+      (service as any)._handleEvent({
+        method: 'citation.verdict',
+        params: {
+          citation_id: 7,
+          verification_status: 'failed',
+          citation: { id: 7, verification_status: 'failed', verification_reason: 'not_supported' },
+        },
+      });
+      expect(service.citationsByCid().get(7)?.verification_reason).toBe('not_supported');
+    });
+  });
+
+  // The chip must resolve while the text streams: the engine announces a
+  // citation before the cite tool returns, so before the agent can write its
+  // handle (citation engine overhaul §6.2).
+  describe('citation.created / citation.updated live upsert', () => {
+    it('adds a created citation to the map at once', () => {
+      const { service } = createService();
+      service.citationsByCid.set(new Map());
+      (service as any)._handleEvent({
+        method: 'citation.created',
+        params: {
+          citation_id: 1241,
+          verification_status: 'pending',
+          citation: { id: 1241, claim: 'c', verification_status: 'pending', source_name: 'S' },
+        },
+      });
+      expect(service.citationsByCid().get(1241)?.source_name).toBe('S');
+    });
+
+    it('merges an update into the loaded row (withdrawal)', () => {
+      const { service } = createService();
+      service.citationsByCid.set(
+        new Map([[3, { id: 3, claim: 'kept', verification_status: 'failed' } as any]]),
+      );
+      (service as any)._handleEvent({
+        method: 'citation.updated',
+        params: { citation_id: 3, citation: { id: 3, withdrawn_at: '2026-10-28T00:00:00Z' } },
+      });
+      const row = service.citationsByCid().get(3)!;
+      expect(row.withdrawn_at).toBe('2026-10-28T00:00:00Z');
+      expect(row.claim).toBe('kept');
+    });
+
+    it('ignores a frame without a row', () => {
+      const { service } = createService();
+      service.citationsByCid.set(new Map());
+      (service as any)._handleEvent({ method: 'citation.created', params: { citation_id: 4 } });
+      expect(service.citationsByCid().size).toBe(0);
+    });
+  });
+
+  describe('loadCitations paging', () => {
+    it('reads every page and keeps rows a frame added meanwhile', async () => {
+      const { service, mockHttp } = createService();
+      service.threadId.set('t-1');
+      const page1 = Array.from({ length: 500 }, (_, i) => ({ id: i + 1 }));
+      const page2 = [{ id: 501 }];
+      mockHttp.get.mockImplementation((_url: string, opts?: { params?: { offset?: number } }) =>
+        of({ citations: opts?.params?.offset ? page2 : page1, total: 501 }),
+      );
+      service.citationsByCid.set(new Map([[900, { id: 900 } as any]]));
+      await (service as any).loadCitations('t-1');
+      const map = service.citationsByCid();
+      expect(map.size).toBe(502);
+      expect(map.has(501)).toBe(true);
+      expect(map.has(900)).toBe(true);
+      expect(service.citationsLoaded()).toBe(true);
     });
   });
 });
@@ -11946,7 +12226,10 @@ describe('PersistentChatService — control transport is declared, never inferre
     vi.clearAllMocks();
   });
 
-  function socketlessGet(connection: Record<string, unknown>) {
+  function socketlessGet(
+    connection: Record<string, unknown>,
+    threadMeta: Record<string, unknown> = {},
+  ) {
     return (url: string) => {
       if (url.includes('/api/sessions/') && url.endsWith('/connection')) return of(connection);
       if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
@@ -11967,7 +12250,7 @@ describe('PersistentChatService — control transport is declared, never inferre
           snapshot_source: 'durable_journal',
         });
       }
-      return of({ status: 'active', total_turns: 2, config_name: 'session_base' });
+      return of({ status: 'active', total_turns: 2, config_name: 'session_base', ...threadMeta });
     };
   }
 
@@ -12105,6 +12388,735 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.controlTransport('upgrade-to-workspace')).toBe('unavailable');
     await ctx.service.sendMessage('/upgrade-workspace container');
     expect(ctx.service.error()).toBe('chat.control.upgradeUnavailable');
+  });
+
+  const upgradeable = {
+    ...declaredSocketless,
+    controls: { ...declaredSocketless.controls, 'upgrade-to-workspace': 'rest' },
+    control_options: {
+      'upgrade-to-workspace': { version: 1, targets: ['container'], requires_idle: true },
+    },
+  };
+  const failedUpgrade = {
+    workspace_upgrade: { target_tier: 'sandbox', phase: 'failed', reason_code: 'invalid_image' },
+    workspace_creation: {
+      stage: 'readiness',
+      state: 'attention',
+      reason_code: 'invalid_image',
+      readiness_deadline_at: null,
+    },
+  };
+
+  it('a declared stateless container upgrade rides the durable control inbox', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    ctx.service.upgradeWorkspace('sandbox');
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringMatching(/\/persistent\/threads\/socketless\/controls$/),
+      expect.objectContaining({
+        method: 'upgrade-to-workspace',
+        target_tier: 'sandbox',
+        session_runtime_generation: '99999999-9999-4999-8999-999999999999',
+      }),
+    );
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('a bare /upgrade-workspace on a stateless session asks for the next tier', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    (ctx.service as any).handleSlashCommand('/upgrade-workspace');
+
+    const body = ctx.mockHttp.post.mock.calls[0][1];
+    expect(body.method).toBe('upgrade-to-workspace');
+    expect(body.target_tier).toBeUndefined();
+  });
+
+  it('/upgrade-workspace vm on a stateless session answers locally until a VM target is declared', async () => {
+    const ctx = await socketlessSession(upgradeable);
+
+    (ctx.service as any).handleSlashCommand('/upgrade-workspace vm');
+
+    expect(ctx.service.error()).toBe('chat.control.vmUpgradeUnavailable');
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+  });
+
+  it('an upgrade asked for mid-response waits for the session to go idle', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.pendingTurnCount.set(1);
+    TestBed.tick();
+
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.control.upgradeDeferred'),
+    ).toHaveLength(1);
+    ctx.service.pendingTurnCount.set(0);
+    TestBed.tick();
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+  });
+
+  it('a refused upgrade leaves no provisioning line behind', async () => {
+    // 10-19: each refused try left a "provisioning…" line in the chat.
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(
+      throwError(() => ({
+        status: 409,
+        error: {
+          detail:
+            "This Session's workspace can't be upgraded in place. " +
+            'Start a new Session with a container workspace.',
+        },
+      })),
+    );
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    ctx.service.upgradeWorkspace('sandbox');
+
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceOffer.provisioning'),
+    ).toHaveLength(0);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    // Shown in the user's language, not as the server's English detail.
+    expect(ctx.service.error()).toBe('chat.workspaceUpgrade.notPossible');
+  });
+
+  it('a second /upgrade-workspace while one is provisioning posts nothing and keeps the first', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post
+      .mockReturnValueOnce(of({ state: 'pending' }))
+      .mockReturnValue(throwError(() => ({ status: 409, error: { detail: 'already upgraded' } })));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    (ctx.service as any).handleSlashCommand('/upgrade-workspace');
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    expect(ctx.service.error()).toBeNull();
+    // The upgrade card is already showing; neither try adds a chat line.
+    expect(stamps).not.toHaveBeenCalled();
+  });
+
+  const reread = async (ctx: any, threadMeta: Record<string, unknown>) => {
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, threadMeta));
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+  };
+
+  it('an accepted stateless upgrade shows its steps instead of a provisioning line', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeProgress()).toEqual(
+      expect.objectContaining({ tier: 'sandbox', active: 'starting' }),
+    );
+    expect(stamps).not.toHaveBeenCalled();
+  });
+
+  it('a read before the server reports the upgrade does not end its card', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+
+    await reread(ctx, {});
+
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.workspaceUpgradeProgress()?.active).toBe('starting');
+  });
+
+  it('the upgrade card follows the server phases and ends when the server is done', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'provisioning' } });
+    expect(ctx.service.workspaceUpgradeProgress()?.active).toBe('starting');
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'copying' } });
+    expect(ctx.service.workspaceUpgradeProgress()?.active).toBe('copying');
+
+    await reread(ctx, { workspace_upgrade: null });
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.workspaceUpgradeProgress()).toBeNull();
+    expect(ctx.service.workspaceTier()).toBe('sandbox');
+  });
+
+  it('after the done frame, a read that still says copying does not bring the card back', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox');
+    TestBed.tick();
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'copying' } });
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'sandbox', seeded_files: 3 } },
+      '1:30',
+    );
+    TestBed.tick();
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+
+    await reread(ctx, { workspace_upgrade: { target_tier: 'sandbox', phase: 'copying' } });
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.workspaceUpgradeProgress()).toBeNull();
+  });
+
+  it('a reload shows a container upgrade in progress, counting from its request', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(upgradeable, {
+        workspace_upgrade: {
+          target_tier: 'sandbox',
+          phase: 'provisioning',
+          started_at: '2026-01-01T09:30:00+00:00',
+        },
+      }),
+    );
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.workspaceUpgradeProgress()).toEqual(
+      expect.objectContaining({
+        active: 'starting',
+        starts: { starting: Date.parse('2026-01-01T09:30:00Z') },
+      }),
+    );
+  });
+
+  it('an accepted upgrade re-reads the session for its startup line', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const reads = ctx.mockHttp.get.mock.calls.length;
+
+    ctx.service.upgradeWorkspace('sandbox');
+    await Promise.resolve();
+
+    const later = ctx.mockHttp.get.mock.calls.slice(reads).map((c: any) => String(c[0]));
+    expect(later.some((url: string) => url.endsWith('/persistent/threads/socketless'))).toBe(true);
+  });
+
+  it('the palette offers /upgrade-workspace where the session declares it', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    expect(ctx.service.slashCommandAvailable('/upgrade-workspace')).toBe(true);
+  });
+
+  it('a failed stateless upgrade shows once on load and clears the pending state', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.continueAfterUpgrade.set(true);
+
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeFailed()).toBe(true);
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.failedStartup'),
+    ).toHaveLength(1);
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+  });
+
+  it.each([
+    ['pull_deadline', 'chat.workspaceUpgrade.failedStartupRetry'],
+    ['readiness_deadline', 'chat.workspaceUpgrade.failedStartupRetry'],
+    ['ssh_deadline', 'chat.workspaceUpgrade.failedStartupRetry'],
+    ['invalid_image', 'chat.workspaceUpgrade.failedStartup'],
+    ['invalid_configuration', 'chat.workspaceUpgrade.failedStartup'],
+    ['container_exited', 'chat.workspaceUpgrade.failedStartup'],
+  ])('a container upgrade that failed on %s says how to go on', async (reason, key) => {
+    const ctx = await socketlessSession(upgradeable);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'sandbox' });
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(upgradeable, {
+        workspace_upgrade: { target_tier: 'sandbox', phase: 'failed', reason_code: reason },
+        workspace_creation: { ...failedUpgrade.workspace_creation, reason_code: reason },
+      }),
+    );
+
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+
+    expect(stamps).toHaveBeenCalledWith(key);
+  });
+
+  it('a failure that appears on a later lifecycle read is announced live', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    // Armed after connect() (which resets them), so the clearing is the announcer's.
+    ctx.service.continueAfterUpgrade.set(true);
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'sandbox' });
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
+
+    await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+      fresh: true,
+      lifecycleOnly: true,
+    });
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeFailed()).toBe(true);
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.failedStartup');
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+  });
+
+  it('End after a failed upgrade does not ask about a running turn', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, failedUpgrade));
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+    const ask = vi.spyOn(window, 'confirm');
+    ctx.mockHttp.delete
+      .mockReturnValueOnce(
+        throwError(() => ({ status: 409, error: { detail: { code: 'stateless_end_busy' } } })),
+      )
+      .mockReturnValueOnce(of({ status: 'ended' }));
+
+    await ctx.service.endSession();
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(String(ctx.mockHttp.delete.mock.calls.at(-1)?.[0])).toContain('force=true');
+  });
+
+  it('a container offer on a stateless session with a container target raises the card', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.needed', params: { target_tier: 'sandbox', reason: 'tests' } },
+      '1:20', // above the /state replay cursor (1:8), so it isn't covered by the snapshot
+    );
+    expect(ctx.service.pendingWorkspaceOffer()).toEqual({ tier: 'sandbox', reason: 'tests' });
+  });
+
+  const upgradeableVm = {
+    ...declaredSocketless,
+    controls: { ...declaredSocketless.controls, 'upgrade-to-workspace': 'rest' },
+    control_options: {
+      'upgrade-to-workspace': { version: 1, targets: ['container', 'vm'], requires_idle: true },
+    },
+  };
+  const pinnedConnection = {
+    state: 'ready',
+    control_socket: 'websocket',
+    ws_url: 'ws://test/ws',
+    token: 'tok',
+    expires_at: 4_102_444_800,
+    pinned_runtime_generation_contract: 1,
+    session_runtime_generation: '99999999-9999-4999-8999-999999999999',
+    controls: { 'upgrade-to-workspace': 'websocket', 'mode.set': 'rest', 'narration.set': 'rest' },
+  };
+
+  /** After the switch, /connection answers 425 (pinned, unbound) once, then the socket. */
+  function switchingRoutes() {
+    let pinned = false;
+    let connectionCalls = 0;
+    const base = socketlessGet(upgradeableVm);
+    return {
+      pin: () => {
+        pinned = true;
+      },
+      get: (url: string) => {
+        if (pinned && url.includes('/api/sessions/') && url.endsWith('/connection')) {
+          connectionCalls += 1;
+          return connectionCalls === 1 ? throwError(() => ({ status: 425 })) : of(pinnedConnection);
+        }
+        return base(url);
+      },
+    };
+  }
+
+  async function switchingSession() {
+    const ctx = createService();
+    const routes = switchingRoutes();
+    ctx.mockHttp.get.mockImplementation(routes.get);
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    (ctx.service as any)._ensureControlWs();
+    await Promise.resolve();
+    return { ...ctx, routes };
+  }
+
+  it('/upgrade-workspace vm on a stateless session with a VM target sends the durable control', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    await ctx.service.sendMessage('/upgrade-workspace vm');
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringMatching(/\/persistent\/threads\/socketless\/controls$/),
+      expect.objectContaining({ method: 'upgrade-to-workspace', target_tier: 'vm' }),
+    );
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('a VM template on a stateless session says which template it provisions', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    await ctx.service.sendMessage('/upgrade-workspace vm-big');
+    TestBed.tick();
+
+    expect(ctx.mockHttp.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ method: 'upgrade-to-workspace', template: 'vm-big' }),
+    );
+    // The upgrade card's title names it.
+    expect(ctx.service.workspaceUpgradeProgress()?.template).toBe('vm-big');
+  });
+
+  it('the 202 transport_changed flag moves the session to the pinned transport and holds the composer', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/controls')
+        ? of({ state: 'pending', request_id: 'r-1', transport_changed: true })
+        : of({ state: 'preparing' }),
+    );
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.routes.pin();
+
+    ctx.service.upgradeWorkspace('vm');
+
+    expect(ctx.service.executionLane()).toBe('pinned');
+    expect(ctx.service.sessionReady()).toBe(false);
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.movingToVm'),
+    ).toHaveLength(1);
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringMatching(/\/sessions\/socketless\/prepare$/),
+      {},
+    );
+  });
+
+  it('the session.lane_changed frame resets a second tab once', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'preparing' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.routes.pin();
+    const frame = {
+      method: 'session.lane_changed',
+      params: { from: 'stateless', to: 'pinned', reason: 'vm_upgrade', control_request_id: 'r-1' },
+    };
+
+    fireSseMessage(ctx.sseInstances[0], frame, '1:20');
+    fireSseMessage(ctx.sseInstances[0], frame, '1:21');
+
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.movingToVm'),
+    ).toHaveLength(1);
+    expect(
+      ctx.mockHttp.post.mock.calls.filter(([url]: [string]) => String(url).endsWith('/prepare')),
+    ).toHaveLength(1);
+  });
+
+  it('a lane_changed frame covered by the new-epoch snapshot still switches a socketless tab', async () => {
+    const ctx = createService();
+    const routes = switchingRoutes();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.endsWith('/state')
+        ? of({
+            thread_id: 'socketless',
+            permission_mode: 'autonomous',
+            narration_mode: 'auto',
+            turn_count: 2,
+            turn_in_flight: false,
+            message_count: 4,
+            model: 'gpt-5.6-sol',
+            temperature: 0,
+            running_tool: null,
+            pending_permissions: [],
+            event_cursor: { epoch: 2, seq: 5 },
+            replay_cursor: { epoch: 2, seq: 5 },
+            snapshot_source: 'durable_journal',
+          })
+        : routes.get(url),
+    );
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'preparing' }));
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    (ctx.service as any)._ensureControlWs();
+    await Promise.resolve();
+    routes.pin();
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'session.lane_changed',
+        params: { from: 'stateless', to: 'pinned', reason: 'vm_upgrade', control_request_id: 'r-1' },
+      },
+      '2:1',
+    );
+
+    expect(ctx.service.executionLane()).toBe('pinned');
+    expect(ctx.service.sessionReady()).toBe(false);
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+  });
+
+  it('a meta read that sees the pinned lane on a socketless tab switches it once', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'preparing' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.routes.pin();
+    const base = ctx.mockHttp.get.getMockImplementation()!;
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.includes('/connection') || url.endsWith('/messages') || url.endsWith('/state')
+        ? base(url)
+        : of({ status: 'active', total_turns: 2, config_name: 'session_base', execution_lane: 'pinned' }),
+    );
+
+    for (let i = 0; i < 2; i++) {
+      await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+        fresh: true,
+        lifecycleOnly: true,
+      });
+    }
+
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.movingToVm'),
+    ).toHaveLength(1);
+  });
+
+  it('the journaled .started is the receipt, and .complete continues once', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const send = vi.spyOn(ctx.service, 'sendMessage');
+    ctx.service.upgradeWorkspace('vm', { thenContinue: true });
+    const body = ctx.mockHttp.post.mock.calls.find(([url]: [string]) =>
+      String(url).endsWith('/controls'),
+    )[1];
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'workspace_upgrade.started',
+        params: {
+          client_request_id: body.client_request_id,
+          method: 'upgrade-to-workspace',
+          target_tier: 'vm',
+          provision_generation: 'p-1',
+        },
+      },
+      '1:20',
+    );
+    expect((ctx.service as any).durableControlAwaitingAck.has(body.client_request_id)).toBe(false);
+
+    const complete = {
+      method: 'workspace_upgrade.complete',
+      params: { target_tier: 'vm', seeded_files: 2, request_id: 'r-1', client_request_id: body.client_request_id },
+    };
+    fireSseMessage(ctx.sseInstances[0], complete, '1:21');
+    fireSseMessage(ctx.sseInstances[0], complete, '1:22');
+
+    expect(
+      send.mock.calls.filter(([message]) => message === 'chat.workspaceOffer.continueMessage'),
+    ).toHaveLength(1);
+    expect(ctx.service.workspaceTier()).toBe('vm');
+  });
+
+  it.each([
+    ['upgrade_cancelled', 'chat.workspaceUpgrade.failed.upgradeCancelled'],
+    ['upgrade_refused', 'chat.workspaceUpgrade.failed.upgradeRefused'],
+    ['upgrade_failed', 'chat.workspaceUpgrade.failed.upgradeFailed'],
+    ['upgrade_interrupted', 'chat.workspaceUpgrade.failed.upgradeInterrupted'],
+  ])('a typed .failed (%s) shows translated copy, never backend text', async (code, key) => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'vm' });
+    ctx.service.continueAfterUpgrade.set(true);
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.failed', params: { error_code: code, reason: 'raw backend text' } },
+      '1:20',
+    );
+
+    expect(stamps).toHaveBeenCalledWith(key);
+    expect(stamps.mock.calls.some(([line]) => String(line).includes('raw backend text'))).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+  });
+
+  it('an already-running .failed says so but leaves the running upgrade its progress and continue', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.workspaceUpgradeInProgress.set({ tier: 'vm' });
+    ctx.service.continueAfterUpgrade.set(true);
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'workspace_upgrade.failed',
+        params: { error_code: 'upgrade_already_running', reason: 'raw backend text' },
+      },
+      '1:20',
+    );
+
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.failed.upgradeAlreadyRunning');
+    expect(stamps.mock.calls.some(([line]) => String(line).includes('raw backend text'))).toBe(false);
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+  });
+
+  it('a second /upgrade-workspace vm after the lane switch keeps the running upgrade', async () => {
+    const ctx = await switchingSession();
+    ctx.mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/controls')
+        ? of({ state: 'pending', request_id: 'r-1', transport_changed: true })
+        : of({ state: 'preparing' }),
+    );
+    ctx.routes.pin();
+    ctx.service.upgradeWorkspace('vm', { thenContinue: true });
+    await vi.waitFor(() => expect(ctx.wsInstances).toHaveLength(1));
+    expect(ctx.service.controlTransport('upgrade-to-workspace')).toBe('websocket');
+    const sendControl = vi.spyOn(ctx.service as any, '_sendControl');
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    await ctx.service.sendMessage('/upgrade-workspace vm');
+
+    expect(sendControl).not.toHaveBeenCalled();
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    expect(stamps).toHaveBeenCalledTimes(1);
+  });
+
+  it('a .complete that names skipped files says they stayed in the old storage', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const transloco = (ctx.service as any).transloco;
+    const translate = vi.spyOn(transloco, 'translate');
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'workspace_upgrade.complete',
+        params: { target_tier: 'vm', seeded_files: 2, skipped_files: ['big.iso', 'data/huge.bin'] },
+      },
+      '1:20',
+    );
+
+    expect(translate).toHaveBeenCalledWith('chat.workspaceUpgrade.skippedFiles', {
+      files: 'big.iso, data/huge.bin',
+    });
+    expect(stamps).toHaveBeenCalledWith('chat.workspaceUpgrade.skippedFiles');
+  });
+
+  it('a .complete without skipped files adds no line', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'vm', seeded_files: 2 } },
+      '1:20',
+    );
+    expect(stamps).toHaveBeenCalledTimes(1);
+    expect(stamps).not.toHaveBeenCalledWith('chat.workspaceUpgrade.skippedFiles');
+  });
+
+  it("an untyped .failed (the WebSocket path) keeps today's line", async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'workspace_upgrade.failed', params: { reason: 'vm workspace did not become ready in time' } },
+      '1:20',
+    );
+    expect(stamps).toHaveBeenCalledWith(
+      'Workspace upgrade failed: vm workspace did not become ready in time',
+    );
+  });
+
+  it('control.rejected for a VM upgrade on the pinned lane suggests /upgrade-workspace vm again', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.service.executionLane.set('pinned');
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'control.rejected',
+        params: { method: 'upgrade-to-workspace', error_code: 'unsupported_control', client_request_id: 'x' },
+      },
+      '1:20',
+    );
+    expect(ctx.service.error()).toBe('chat.control.vmUpgradeRetry');
+  });
+
+  it('a reload shows a VM upgrade in progress, and a failed one once', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(declaredSocketless, {
+        workspace_upgrade: { target_tier: 'vm', phase: 'provisioning' },
+      }),
+    );
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances[0]);
+    TestBed.tick();
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
+
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.mockHttp.get.mockImplementation(
+      socketlessGet(declaredSocketless, {
+        workspace_upgrade: { target_tier: 'vm', phase: 'failed', reason_code: 'upgrade_failed' },
+      }),
+    );
+    for (let i = 0; i < 2; i++) {
+      await (ctx.service as any).loadThreadMeta('socketless', (ctx.service as any).connectGeneration, {
+        fresh: true,
+        lifecycleOnly: true,
+      });
+      TestBed.tick();
+    }
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.workspaceUpgrade.failed.upgradeFailed'),
+    ).toHaveLength(1);
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+  });
+
+  it('an upgrade refused 425 past the retry cap gives up with the busy copy', async () => {
+    const ctx = await socketlessSession(upgradeableVm);
+    ctx.mockHttp.post.mockReturnValue(throwError(() => ({ status: 425, error: { detail: 'busy' } })));
+    vi.useFakeTimers();
+    try {
+      ctx.service.upgradeWorkspace('vm');
+      for (let i = 0; i < 40; i++) await vi.advanceTimersByTimeAsync(4_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(30);
+    expect(ctx.service.error()).toBe('chat.control.upgradeBusy');
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
   });
 
   it('/done without an archive socket ends through the owner End path', async () => {
@@ -12423,6 +13435,38 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
     expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
   });
 
+  it('decideUnknownToolResult applies the returned block and reloads the transcript', async () => {
+    const ctx = await readyOn('thread-u');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    expect(ctx.service.isParked()).toBe(true);
+    const settled = { ...parkedBlock, state: 'done', park_reason: null, pending_input: false };
+    (ctx.mockApi as any).decideUnknownToolResult = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'ok', queue: settled, continued: true }));
+    const reload = vi.spyOn(ctx.service as any, '_reloadAfterRewind').mockResolvedValue(undefined);
+    expect(await ctx.service.decideUnknownToolResult('continue')).toBe('ok');
+    expect((ctx.mockApi as any).decideUnknownToolResult).toHaveBeenCalledWith('thread-u', 'continue');
+    expect(ctx.service.isParked()).toBe(false);
+    // Continue admitted a "Continue." turn server-side: wait for it.
+    expect(ctx.service.pendingTurnCount()).toBeGreaterThan(0);
+    expect(reload).toHaveBeenCalled();
+  });
+
+  it('decideUnknownToolResult keeps the card and toasts the code on refusal', async () => {
+    const ctx = await readyOn('thread-uf');
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 1, queue: parkedBlock }));
+    await ctx.service.sendMessage('x');
+    await Promise.resolve();
+    (ctx.mockApi as any).decideUnknownToolResult = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'refused', status: 409, code: 'tool_history_ambiguous' }));
+    expect(await ctx.service.decideUnknownToolResult('stop')).toBe('refused');
+    expect(ctx.service.isParked()).toBe(true);
+    expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
+  });
+
   it('retryParked on a unit with no pending input opens no awaiting stretch', async () => {
     // A unit parked with nothing to run (e.g. a push remainder) settles to
     // `done` on retry without ever starting a turn; counting a turn here
@@ -12452,7 +13496,7 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
       if (url.endsWith(`/threads/${threadId}/state`)) {
         return of({
           thread_id: threadId,
-          permission_mode: 'supervised',
+          permission_mode: 'read_only',
           narration_mode: 'auto',
           turn_count: 2,
           turn_in_flight: false,
@@ -13204,6 +14248,7 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     meta = {...meta, workspace_creation: {
       stage: 'scheduling', state: 'waiting_capacity', reason_code: 'scheduler_unschedulable',
       readiness_deadline_at: null,
+      exit_code: null,
     }};
     await connected();
     expect(ctx.service.workspaceCreation()?.state).toBe('waiting_capacity');
@@ -13225,6 +14270,7 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     late.next({status: 'active', workspace_creation: {
       stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
       readiness_deadline_at: null,
+      exit_code: null,
     }});
     late.complete();
     await flushMicrotasks();

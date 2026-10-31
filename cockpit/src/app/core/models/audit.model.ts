@@ -109,6 +109,13 @@ export interface JobSummary {
   status: string;
   completion_outcome_kind?: 'blocked_undelivered' | null;
   config_name?: string | null;
+  /** The account/global Expert the job ran; null for a bundled expert. */
+  expert_id?: string | null;
+  /**
+   * That Expert's display name. A DB expert's job stores `config_name`
+   * `worker_base` (the framework root), so this is what names the expert.
+   */
+  expert_display_name?: string | null;
   user_id?: string | null;
   project_id?: string | null;
   project_name?: string | null;

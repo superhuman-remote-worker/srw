@@ -1,3 +1,8 @@
+---
+title: Security model
+description: SRW's supported deployment model during the public beta, its trust boundary and isolation choices, their limits, and guidance for deploying it safely.
+---
+
 # Security model
 
 This document describes SRW's intended trust boundary and its limitations. It
@@ -6,6 +11,32 @@ code safe.
 
 For vulnerability reporting, supported versions, and disclosure expectations,
 see [SECURITY.md](../SECURITY.md).
+
+## Supported deployment model
+
+SRW is a public beta. It supports one deployment per organisation, used by
+people who trust one another:
+
+- **Single-tenant.** Every approved user belongs to the same organisation.
+  Signing in through the identity provider is not enough: an administrator
+  approves each account before it can use SRW.
+- **Trusted users.** SRW keeps sessions, jobs and projects apart by owner and
+  project membership, and operations authorize their caller. That separation
+  has not yet been hardened or verified against a hostile user of the same
+  deployment, so it is not part of the boundary this document describes.
+  Don't put people on one deployment who must not see each other's data or
+  credentials.
+- **Trusted administrators.** Administrators manage every user, project and
+  setting of the deployment.
+- **Hostile content, not hostile users.** The boundary SRW is built to hold
+  runs between the work (repositories, documents, web content, model output
+  and the code it runs) and the platform that runs it. The threat model below
+  describes it.
+
+Out of scope during the beta: hosting several customers or mutually
+distrusting groups on one deployment, and protecting a user's data from
+another approved user or from an administrator. Run a separate deployment for
+each organisation instead.
 
 ## Threat model
 
@@ -55,6 +86,41 @@ only the capability and scoped credential required for one operation. An agent
 runtime that requires its harness and subscription credentials to live inside
 the writable workspace crosses this boundary and needs a separate threat
 analysis; it is not a drop-in model provider.
+
+## Identity and API credentials
+
+The orchestrator API accepts these credentials:
+
+- the Cockpit's session cookie, which the orchestrator issues after a
+  Keycloak sign-in;
+- a Keycloak access token sent as `Authorization: Bearer`, under the rule
+  below;
+- a personal access token or MCP token, which acts for its user within its
+  scopes; and
+- SRW's internal workload credential. SRW's own services and agent pods all
+  share it, which is one reason the agent harness belongs to the trusted
+  computing base. Workspaces don't receive it.
+
+Keycloak signs the tokens of every client in its realm with the same key, so
+a valid signature only proves that some client of the realm received the
+token. The orchestrator accepts a Bearer token only when it is an access
+token, never an ID token, and either:
+
+- it was issued to one of SRW's own clients: the Cockpit BFF client
+  (`auth.bff.clientId`), the Cockpit SPA client (`keycloak.cockpitClientId`),
+  or a client listed in `auth.oidc.extraAllowedClients`; or
+- its `aud` claim names an audience listed in `auth.oidc.allowedAudiences`.
+  The default is `orchestrator-api`, the bundled realm's client for this API.
+
+Tokens that Keycloak issues to Gitea, Nextcloud, OpenCloud or any other
+client of the realm are refused. Those applications therefore can't call the
+API as their user, and neither can a workspace holding a cloud token. The
+orchestrator logs each refusal with the token's client id.
+
+If your realm also serves other applications, keep `auth.oidc` to SRW's own
+clients. Listing a client lets everyone who holds its tokens act as their user
+in SRW. SRW never accepts `account` as an audience, because Keycloak puts it on
+nearly every token it issues.
 
 ## Workspace boundaries
 
@@ -313,28 +379,31 @@ services remain possible.
 
 Before exposing a deployment or connecting valuable systems:
 
-1. Pin component images to verified digests or registry-enforced immutable tags;
+1. Run one deployment per organisation, and approve only accounts of people
+   you trust (see [Supported deployment model](#supported-deployment-model)).
+   Keep `auth.oidc` limited to SRW's own Keycloak clients.
+2. Pin component images to verified digests or registry-enforced immutable tags;
    do not rely on the source chart's moving development defaults.
-2. Put model, encryption, identity, and infrastructure credentials in a secret
+3. Put model, encryption, identity, and infrastructure credentials in a secret
    manager rather than values files.
-3. Confirm NetworkPolicy enforcement with the actual cluster CNI.
-4. Disable privileged FUSE workspaces unless the feature is required; isolate
+4. Confirm NetworkPolicy enforcement with the actual cluster CNI.
+5. Disable privileged FUSE workspaces unless the feature is required; isolate
    workspace nodes when it is enabled. The in-pod plane already removes it
    from most Session workspaces (see above). Keep `workspace.customImages.privileged`
    off, and add only images you trust to
    `workspace.images.trustedRepositories`. Cap what one workspace may request
    with a namespace `LimitRange` and `ResourceQuota`; SRW sets no ceilings of
    its own.
-5. Prefer VM workspaces for adversarial repositories or privileged commands.
-6. Restrict connector permissions, network destinations, and data scopes to the
+6. Prefer VM workspaces for adversarial repositories or privileged commands.
+7. Restrict connector permissions, network destinations, and data scopes to the
    minimum needed by one project.
-7. Begin with supervised sessions and review-gated jobs before enabling full
+8. Begin with read-only sessions and review-gated jobs before enabling full
    autonomy, schedules, or project loops.
-8. Configure backups outside the failure domain of the SRW cluster and test
+9. Configure backups outside the failure domain of the SRW cluster and test
    restoration.
-9. Monitor audit and lifecycle events, and define retention for workspaces,
-   checkpoints, credentials, and logs.
-10. Keep Kubernetes, the container runtime, KubeVirt, SRW, and bundled services
+10. Monitor audit and lifecycle events, and define retention for workspaces,
+    checkpoints, credentials, and logs.
+11. Keep Kubernetes, the container runtime, KubeVirt, SRW, and bundled services
     patched.
 
 The local k3d values intentionally contain published development credentials

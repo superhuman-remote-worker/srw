@@ -2,25 +2,36 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, get_args
+from typing import Annotated, Any, Literal, Optional, get_args
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from orchestrator.schemas.inline_expert import InlineExpertSelection
+from shared.permission_modes import (
+    legacy_wire_permission_mode,
+    normalize_permission_mode,
+)
 
 
-# The `threads.valid_permission_mode` CHECK values. Request schemas validate
-# against this so a bad value is a 422, not a 500 from the insert.
-PermissionMode = Literal["supervised", "auto_accept", "autonomous"]
-PERMISSION_MODES = frozenset(get_args(PermissionMode))
+# The canonical `threads.valid_permission_mode_v2` CHECK values. Request
+# schemas validate against this so a bad value is a 422, not a 500 from the
+# insert. The legacy `supervised` spelling is accepted and normalised before
+# validation, so OpenAPI lists only the canonical names.
+PermissionMode = Annotated[
+    Literal["read_only", "auto_accept", "autonomous"],
+    BeforeValidator(normalize_permission_mode),
+]
+PERMISSION_MODES = frozenset(get_args(get_args(PermissionMode)[0]))
 
 
 class ThreadControlRequest(BaseModel):
     """Strict public envelope for the durable control-inbox subset."""
 
     client_request_id: UUID
-    method: Literal["mode.set", "narration.set", "workspace.undo", "compact"]
+    method: Literal[
+        "mode.set", "narration.set", "workspace.undo", "compact", "upgrade-to-workspace"
+    ]
     session_runtime_generation: UUID | None = Field(
         None,
         description=(
@@ -28,17 +39,18 @@ class ThreadControlRequest(BaseModel):
             "admission compares it under the thread-row lock."
         ),
     )
-    mode: (
+    mode: Annotated[
         Literal[
-            "supervised",
+            "read_only",
             "auto_accept",
             "autonomous",
             "silent",
             "verbose",
             "auto",
         ]
-        | None
-    ) = None
+        | None,
+        BeforeValidator(normalize_permission_mode),
+    ] = None
     focus: str | None = Field(
         None,
         max_length=4000,
@@ -53,6 +65,19 @@ class ThreadControlRequest(BaseModel):
             "message, keeping it and what follows (the rewind sheet's "
             "'Summarize up to here')."
         ),
+    )
+    target_tier: Literal["sandbox", "container", "vm"] | None = Field(
+        None,
+        description=(
+            "upgrade-to-workspace only: the tier to move to; omitted means the "
+            "next tier (a container for a stateless Virtual/None session)."
+        ),
+    )
+    template: str | None = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description="upgrade-to-workspace only: a WorkspaceTemplate name.",
     )
 
     @model_validator(mode="after")
@@ -72,13 +97,26 @@ class ThreadControlRequest(BaseModel):
             raise ValueError(
                 "focus and boundary_message_id are accepted only by compact"
             )
+        if self.method == "upgrade-to-workspace":
+            if self.mode is not None:
+                raise ValueError("upgrade-to-workspace does not accept a mode")
+            if self.session_runtime_generation is None:
+                raise ValueError(
+                    "upgrade-to-workspace requires session_runtime_generation"
+                )
+        elif self.target_tier is not None or self.template is not None:
+            raise ValueError(
+                "target_tier and template are accepted only by upgrade-to-workspace"
+            )
         return self
 
     def control_payload(self) -> dict[str, Any]:
         """Canonical payload used for idempotency and durable admission.
 
         ``compact`` carries only the keys that are present, so an empty focus
-        and an absent one are the same request.
+        and an absent one are the same request. ``upgrade-to-workspace``
+        spells a container as ``sandbox`` and always carries the runtime
+        generation it was asked against.
         """
 
         if self.method == "workspace.undo":
@@ -90,6 +128,19 @@ class ThreadControlRequest(BaseModel):
             if self.boundary_message_id:
                 payload["boundary_message_id"] = self.boundary_message_id
             return payload
+        if self.method == "upgrade-to-workspace":
+            payload = {"runtime_generation": str(self.session_runtime_generation)}
+            if self.target_tier is not None:
+                payload["target_tier"] = (
+                    "sandbox" if self.target_tier == "container" else self.target_tier
+                )
+            if self.template:
+                payload["template"] = self.template
+            return payload
+        if self.method == "mode.set" and self.mode is not None:
+            # Agent images from before the read_only rename reject it on
+            # mode.set; the contract step of the rename drops this.
+            return {"mode": legacy_wire_permission_mode(self.mode)}
         return {"mode": self.mode}
 
 
@@ -106,6 +157,10 @@ class ToolGroupPreviewRequest(BaseModel):
     config_override: Optional[dict[str, Any]] = None
     workspace: Optional[dict[str, Any]] = None
     workspace_preference: Literal["none", "virtual", "sandbox", "vm"] | None = None
+    #: The connectors the form will submit, once its user changed them; the
+    #: tier a cloud folder takes is predicted from them. ``None`` predicts
+    #: from the defaults.
+    datasource_ids: Optional[list[str]] = None
     #: Which surface is asking. ``worker`` is the job-create form and defaults
     #: the base to ``worker_base``; ``session`` is the New Session form. Default
     #: stays ``session`` so the shipped cockpit's payloads keep their meaning.

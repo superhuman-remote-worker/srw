@@ -621,9 +621,9 @@ class TestLoopRetroReExport:
 
 PR_RECORD = {
     "forge": "github",
-    "repo": "Knaeckebrothero/KurortEngine",
+    "repo": "Acme/WidgetShop",
     "number": 1,
-    "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+    "url": "https://github.com/Acme/WidgetShop/pull/1",
     "head": "design/hotel-rheinland-theme",
     "base": "main",
 }
@@ -649,10 +649,10 @@ class TestPersistedPullRequestIsDelivery:
         changes = derive_changes(_job(context={"pull_request": PR_RECORD}))
         entry = next(c for c in changes if c["kind"] == "pull_request")
         assert entry == {
-            "datasource": "Knaeckebrothero/KurortEngine",
+            "datasource": "Acme/WidgetShop",
             "kind": "pull_request",
             "action": "open",
-            "ref": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+            "ref": "https://github.com/Acme/WidgetShop/pull/1",
             "summary": ("github PR #1: design/hotel-rheinland-theme → main"),
             "verified": True,
         }

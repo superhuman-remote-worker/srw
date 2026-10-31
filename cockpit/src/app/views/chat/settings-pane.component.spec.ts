@@ -92,7 +92,7 @@ function createPane(options: {
     isConnected: signal(true),
     modelName: signal<string | null>('gemma-4-moe'),
     temperature: signal<number | null>(0.7),
-    permissionMode: signal('supervised'),
+    permissionMode: signal('read_only'),
     narrationMode: signal('auto'),
     workspaceTier: signal<string | null>(null),
     workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
@@ -107,6 +107,8 @@ function createPane(options: {
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
     controlTransport: vi.fn(() => 'websocket'),
+    upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
+    executionLane: signal<'pinned' | 'stateless' | null>('pinned'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -210,7 +212,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     isConnected: signal(true),
     modelName: signal<string | null>(null),
     temperature: signal<number | null>(null),
-    permissionMode: signal('supervised'),
+    permissionMode: signal('read_only'),
     narrationMode: signal('auto'),
     workspaceTier: signal<string | null>(null),
     workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
@@ -225,6 +227,8 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
     controlTransport: vi.fn(() => 'websocket'),
+    upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
+    executionLane: signal<'pinned' | 'stateless' | null>('pinned'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -389,7 +393,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       isConnected: signal(true),
       modelName: signal<string | null>(null),
       temperature: signal<number | null>(null),
-      permissionMode: signal('supervised'),
+      permissionMode: signal('read_only'),
       narrationMode: signal('auto'),
       workspaceTier: signal<string | null>(null),
       workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
@@ -404,6 +408,8 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       setNarrationMode: vi.fn(),
       upgradeWorkspace: vi.fn(),
       controlTransport: vi.fn(() => 'websocket'),
+      upgradeTargetAvailable: vi.fn((tier: string) => tier === 'vm'),
+      executionLane: signal<'pinned' | 'stateless' | null>('pinned'),
     };
     const api = {
       getPersistentThread: vi.fn().mockReturnValue(
@@ -833,6 +839,28 @@ describe('SettingsPaneComponent datasources (Slice B)', () => {
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, []);
   });
 
+  it('a lite tier never drops an attached connector it hides from the picker', () => {
+    // 10-19: a stale virtual tier made the picker leave out a container
+    // Session's cloud folder and outbox, and the next save detached them. The
+    // server refuses whatever a tier can't serve; the pane never decides that.
+    const SHELL_ONLY = {id: 'ds-folder', type: 'credentials', name: 'Folder'};
+    const {component, chat, fakeSettings} = createPane({
+      override: {workspace: {backend: 'virtual'}},
+      attachedIds: ['ds-folder', 'ds-pg'],
+      eligible: [SHELL_ONLY, PG, WEB],
+    });
+    // The picker's lite filter returns the selection without the shell row.
+    fakeSettings.getSelectedDatasourceIds.mockReturnValue(['ds-pg', 'ds-web']);
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith(
+      {},
+      ['ds-folder', 'ds-pg', 'ds-web'],
+    );
+  });
+
   it('a config-only edit sends no datasource_ids at all', () => {
     const {component, chat, fakeSettings} = createPane({
       attachedIds: ['ds-pg'],
@@ -995,16 +1023,57 @@ describe('SettingsPaneComponent workspace tier', () => {
     expect(component.pendingTier()).toBeNull();
   });
 
-  it('a REST upgrade transport keeps the container choice', () => {
+  it('a stateless session follows its declared targets: container yes, VM not yet', () => {
     const {component, chat} = createPane({grants: null});
-    chat.controlTransport.mockReturnValue('rest');
+    chat.upgradeTargetAvailable.mockImplementation((tier: string) => tier === 'sandbox');
     chat.workspaceTier.set('virtual');
     expect(component.tierReachability()['sandbox']).toBe('ok');
+    expect(component.tierReachability()['vm']).toBe('sessionUnsupported');
+  });
+
+  it('a stateless none session can upgrade to a container', () => {
+    const {component, chat} = createPane({
+      override: {workspace: {backend: 'none'}},
+      grants: null,
+    });
+    chat.upgradeTargetAvailable.mockImplementation((tier: string) => tier === 'sandbox');
+    chat.workspaceTier.set('none');
+    expect(component.tierReachability()).toEqual({
+      sandbox: 'ok',
+      vm: 'sessionUnsupported',
+    });
+  });
+
+  it('a stateless session with a declared VM target offers the VM and says it reconnects first', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.controlTransport.mockReturnValue('rest');
+    chat.upgradeTargetAvailable.mockImplementation(() => true);
+    chat.executionLane.set('stateless');
+    chat.workspaceTier.set('virtual');
+    expect(component.tierReachability()['vm']).toBe('ok');
+    component.onTierPicked('vm');
+    expect(component.vmReconnectNote()).toBe(true);
+  });
+
+  it('a stateless none session reaches a declared VM without a container target', () => {
+    const {component, chat} = createPane({override: {workspace: {backend: 'none'}}, grants: null});
+    chat.controlTransport.mockReturnValue('rest');
+    chat.upgradeTargetAvailable.mockImplementation((tier: string) => tier === 'vm');
+    chat.workspaceTier.set('none');
+    expect(component.tierReachability()).toEqual({vm: 'ok'});
+  });
+
+  it('a pinned none session still reaches nothing (owner, 2026-10-14)', () => {
+    const {component, chat} = createPane({override: {workspace: {backend: 'none'}}, grants: null});
+    chat.workspaceTier.set('none');
+    expect(component.tierReachability()).toEqual({});
+    component.onTierPicked('vm');
+    expect(component.vmReconnectNote()).toBe(false);
   });
 
   it('a session with no upgrade transport reaches no tier, and says so', () => {
     const {component, chat} = createPane({grants: null});
-    chat.controlTransport.mockReturnValue('unavailable');
+    chat.upgradeTargetAvailable.mockReturnValue(false);
     // Re-read: the reachability computed depends on the tier signal, so
     // nudge it the way a real thread-meta load would.
     chat.workspaceTier.set('virtual');

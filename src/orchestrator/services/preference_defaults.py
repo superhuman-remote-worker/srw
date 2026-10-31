@@ -67,7 +67,7 @@ async def resolve_preference_defaults(
             # default (base_defaults in _resolve_session_config), so surface that
             # — not the session base's placeholder.
             "model": registry_chat or p_llm.get("model"),
-            "permission_mode": "supervised",
+            "permission_mode": "read_only",
             "idle_timeout_minutes": 30,
         },
     }

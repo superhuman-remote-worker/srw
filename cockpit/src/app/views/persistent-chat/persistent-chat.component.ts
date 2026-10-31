@@ -18,18 +18,25 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import {DatePipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {DatePipe, NgTemplateOutlet} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
+import {
+    citationScopeFor,
+    citationScopeForText,
+    holdBackPartialHandle,
+} from '../../core/markdown/citation-scope';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
+import {PERMISSION_MODE_LABEL_KEYS} from '../../core/models/permission-mode';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo, workspaceTierLabel,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
+import {upgradeCardTitle, upgradeProgressRows} from '../../core/services/workspace-upgrade-progress';
 import {
     AssistantTurn,
     collapsedAnswer,
@@ -66,7 +73,7 @@ import {buildDelegateBatchMembers, DelegateBatchMember} from '../../core/models/
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
-import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
@@ -100,6 +107,7 @@ import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
 import {copyText} from '../../ui/copy-field';
 import {queueParkReasonKey} from '../../core/models/queue-park-reason';
+import type {SessionUnknownToolCall, SessionUnknownToolResultDecision} from '../../core/models/api.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
 import {SessionListService} from '../../core/services/session-list.service';
@@ -131,7 +139,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/undo', descriptionKey: 'chat.slash.undo'},
     {command: '/rewind', descriptionKey: 'chat.slash.rewind'},
     {command: '/auto', descriptionKey: 'chat.slash.auto'},
-    {command: '/supervised', descriptionKey: 'chat.slash.supervised'},
+    // `/supervised` still works as a hidden alias of /readonly; it is not listed.
+    {command: '/readonly', descriptionKey: 'chat.slash.readonly'},
     {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
     {command: '/silent', descriptionKey: 'chat.slash.silent'},
     {command: '/verbose', descriptionKey: 'chat.slash.verbose'},
@@ -241,6 +250,7 @@ const TOOL_LABELS: Record<string, string> = {
  */
 const CATEGORY_NOUNS_ONE: Record<string, string> = {
     workspace: 'file',
+    skills: 'skill',
     git: 'git op',
     shell: 'command',
     research: 'search',
@@ -263,6 +273,7 @@ const CATEGORY_NOUNS_ONE: Record<string, string> = {
 
 const CATEGORY_NOUNS: Record<string, string> = {
     workspace: 'files',
+    skills: 'skills',
     git: 'git ops',
     shell: 'commands',
     research: 'searches',
@@ -290,6 +301,7 @@ const CHIP_CATEGORY_CAP = 4;
 
 const CATEGORY_LABELS: Record<string, string> = {
     workspace: 'Working with files',
+    skills: 'Using skills',
     git: 'Version control',
     shell: 'Running commands',
     research: 'Research & browsing',
@@ -584,6 +596,15 @@ export function permissionApproveKey(count: number): string {
     return count === 1 ? 'chat.permission.approve' : 'chat.permission.approveAll';
 }
 
+/** Tools whose approval starts a subagent that then asks for nothing
+ *  (tool_permission_tiers.md, D10): the card says so. */
+const UNATTENDED_CHILD_TOOLS = new Set(['delegate_agent', 'message_agent']);
+
+/** A one-line note under an approval row, or null for none. */
+export function permissionNoteKey(tool: string): string | null {
+    return UNATTENDED_CHILD_TOOLS.has(tool) ? 'chat.permission.childRunsUnattended' : null;
+}
+
 /** The workspace-upgrade card to render, or null when there's nothing to show. */
 export type WorkspaceOfferCard =
     | {state: 'provisioning'; tier: string; elapsed?: number; willContinue: boolean}
@@ -842,6 +863,40 @@ export function shouldPin(autoScroll: boolean, isRestoringScroll: boolean): bool
 }
 
 /**
+ * The language label of a rendered code fence, read back from its
+ * `language-…` class. The fence info string is model output, and the markdown
+ * sanitizer keeps it inside the class attribute verbatim, so the value is
+ * reduced to the characters a language name uses (`c++`, `c#`, `objective-c`,
+ * `x.y`) and capped. The label is still set as text, never as markup.
+ */
+export function codeFenceLanguage(className: string | null | undefined): string {
+    const raw = className?.match(/(?:^|\s)language-(\S+)/)?.[1] ?? '';
+    return raw.replace(/[^A-Za-z0-9_+.#-]/g, '').slice(0, 32);
+}
+
+/**
+ * The `<summary>` of a collapsed code block: icon, language label and expand
+ * hint, each a text node. Built with DOM calls, not `innerHTML`, because the
+ * label comes from model output and this runs after the markdown sanitizer.
+ */
+export function buildCodeCollapseSummary(doc: Document, lang: string, expandHint: string): HTMLElement {
+    const summary = doc.createElement('summary');
+    summary.className = 'code-collapse-summary';
+    const parts: [string, string][] = [
+        ['code-collapse-icon', 'code'],
+        ['code-collapse-label', lang || 'code'],
+        ['code-collapse-hint', expandHint],
+    ];
+    for (const [className, text] of parts) {
+        const span = doc.createElement('span');
+        span.className = className;
+        span.textContent = text;
+        summary.appendChild(span);
+    }
+    return summary;
+}
+
+/**
  * Header-fold geometry. Same reason as the scroll pin above: the decision is
  * pure and unit tested, the wiring is a browser check.
  *
@@ -934,7 +989,6 @@ export function clearDraft(threadId: string | null): void {
     imports: [
         FormsModule,
         NgTemplateOutlet,
-        TitleCasePipe,
         DatePipe,
         MarkdownComponent,
         ExternalImageDirective,
@@ -1018,7 +1072,7 @@ export function clearDraft(threadId: string | null): void {
             <app-badge tone="accent" size="sm" role="button" tabindex="0"
                        [title]="'chat.header.settingsTooltip' | transloco"
                        (click)="settingsRequested.emit(undefined)"
-                       (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
+                       (keydown.enter)="settingsRequested.emit(undefined)">{{ permissionModeLabelKey() | transloco }}</app-badge>
 
             <!-- Transient conditions: conditional and usually absent, so they cost
                  nothing when nothing is wrong. -->
@@ -1171,9 +1225,11 @@ export function clearDraft(threadId: string | null): void {
           }
         </div>
       }
-      @if (chat.workspaceCreation(); as creation) {
+      @if (chat.workspaceUpgradeFailed()) {
+        <div class="vm-lifecycle" role="status">{{ chat.workspaceUpgradeFailureText() }}</div>
+      } @else if (chat.workspaceCreation(); as creation) {
         <div class="vm-lifecycle" role="status">
-          {{ workspaceCreationMessageKey(creation) | transloco }}
+          {{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}
         </div>
       }
 
@@ -1267,7 +1323,7 @@ export function clearDraft(threadId: string | null): void {
       <!-- Citations panel (Half-B v2): session citations + view-original/drift -->
       @if (showCitations()) {
         <div class="settings-panel citations-panel-wrap">
-          <app-citations-panel (close)="showCitations.set(false)" />
+          <app-citations-panel (close)="showCitations.set(false); chat.citationFocus.set(null)" />
         </div>
       }
 
@@ -1363,17 +1419,18 @@ export function clearDraft(threadId: string | null): void {
         formatting, status icons, decision badges, etc. should only happen
         here.
       -->
-      <ng-template #toolDetails let-tools>
+      <ng-template #toolDetails let-tools let-turn="turn">
         <div class="tool-detail-list">
           @for (tc of tools; track tc.id) {
             <app-tool-card [view]="toolView(tc)" (actionRequested)="canvasRequested.emit()"
+                           [citationScope]="turn ? citationScopeFor(turn) : null"
                            (jobDiffRequested)="openJobDiff($event)" />
           }
         </div>
       </ng-template>
 
       <!-- Per-event card templates (referenced by the turn loop below). -->
-      <ng-template #thoughtCard let-event>
+      <ng-template #thoughtCard let-event let-turn="turn">
         <details class="thinking-block event-thought" [attr.open]="chatPrefs.reasoningExpanded() ? '' : null">
           <summary class="thinking-header">
             <app-icon size="sm" class="thinking-icon">psychology</app-icon>
@@ -1382,7 +1439,9 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </summary>
           <div class="thinking-content" [class.streaming-block]="event.status === 'streaming'">
-            <markdown appCitationRef appKatex appWorkspaceFileLink [data]="event.content"
+            <markdown appCitationRef appKatex appWorkspaceFileLink
+                      [data]="holdBackPartialHandle(event.content, event.status === 'streaming')"
+                      [citationScope]="turn ? citationScopeFor(turn) : null"
                       [katexDefer]="event.status === 'streaming'"
                       (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
           </div>
@@ -1492,7 +1551,8 @@ export function clearDraft(threadId: string | null): void {
                        class (its base styles are benign; the bubble styling is gated on
                        .message-user/.message-assistant, which this isn't). -->
                   <div class="compaction-summary-body message-body">
-                    <markdown appKatex appWorkspaceFileLink [data]="turn.summary"
+                    <markdown appCitationRef appKatex appWorkspaceFileLink [data]="turn.summary"
+                              [citationScope]="citationScopeForText(turn.summary)"
                               (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                   </div>
                 </details>
@@ -1671,7 +1731,7 @@ export function clearDraft(threadId: string | null): void {
                          the closing prose. -->
                     @for (nc of collapsedNotifyCalls(turn); track nc.id) {
                       <div class="event-tool">
-                        <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [nc] }"></ng-container>
+                        <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [nc], turn: turn }"></ng-container>
                       </div>
                     }
                     @let answer = finalAnswer(turn);
@@ -1681,7 +1741,9 @@ export function clearDraft(threadId: string | null): void {
                            renders growing text too — gate its DOM post-processing
                            + KaTeX off the turn's streaming status. -->
                       <div class="event-text turn-final-answer" [class.streaming-block]="streaming">
-                        <markdown appCitationRef appKatex appWorkspaceFileLink [data]="answer" [katexDefer]="streaming"
+                        <markdown appCitationRef appKatex appWorkspaceFileLink
+                                  [data]="holdBackPartialHandle(answer, streaming)" [katexDefer]="streaming"
+                                  [citationScope]="citationScopeFor(turn)"
                                   (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                       </div>
                     } @else {
@@ -1710,9 +1772,9 @@ export function clearDraft(threadId: string | null): void {
                             <div class="tool-group-body">
                               @for (event of group.events; track event.id) {
                                 @if (event.kind === 'tool_call') {
-                                  <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                                  <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event], turn: turn }"></ng-container>
                                 } @else if (chat.narrationMode() !== 'silent') {
-                                  <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                                  <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event, turn: turn }"></ng-container>
                                 }
                               }
                             </div>
@@ -1722,10 +1784,10 @@ export function clearDraft(threadId: string | null): void {
                           @for (event of group.events; track event.id) {
                             @if (event.kind === 'tool_call') {
                               <div class="event-tool">
-                                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event], turn: turn }"></ng-container>
                               </div>
                             } @else if (chat.narrationMode() !== 'silent') {
-                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event, turn: turn }"></ng-container>
                             }
                           }
                         }
@@ -1752,17 +1814,19 @@ export function clearDraft(threadId: string | null): void {
                           @case ('tool_call') {
                             <!-- Pinned: in flight, or the turn's latest call. -->
                             <div class="event-tool">
-                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [group.event] }"></ng-container>
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [group.event], turn: turn }"></ng-container>
                             </div>
                           }
                           @case ('thought') {
                             @if (chat.narrationMode() !== 'silent') {
-                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event }"></ng-container>
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event, turn: turn }"></ng-container>
                             }
                           }
                           @case ('text') {
                             <div class="event-text" [class.streaming-block]="group.event.status === 'streaming'">
-                              <markdown appCitationRef appKatex appWorkspaceFileLink [data]="group.event.content"
+                              <markdown appCitationRef appKatex appWorkspaceFileLink
+                                        [data]="holdBackPartialHandle(group.event.content, group.event.status === 'streaming')"
+                                        [citationScope]="citationScopeFor(turn)"
                                         [katexDefer]="group.event.status === 'streaming'"
                                         (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                             </div>
@@ -1780,7 +1844,8 @@ export function clearDraft(threadId: string | null): void {
                               <details class="compaction-summary">
                                 <summary>{{ 'chat.compaction.viewSummary' | transloco }}</summary>
                                 <div class="compaction-summary-body message-body">
-                                  <markdown appKatex appWorkspaceFileLink [data]="group.event.summary"
+                                  <markdown appCitationRef appKatex appWorkspaceFileLink [data]="group.event.summary"
+                                            [citationScope]="citationScopeForText(group.event.summary)"
                                             (workspaceFileOpen)="workspaceFileRequested.emit($event)"></markdown>
                                 </div>
                               </details>
@@ -1872,7 +1937,33 @@ export function clearDraft(threadId: string | null): void {
              settlement failure). Rendered from the durable queue block, so a
              reload shows it too. Never the waiting/busy copy: this is a
              failure with a way out, not a queue. -->
-        @if (chat.isParked()) {
+        @if (chat.isParked() && unknownToolCalls().length > 0) {
+          <!-- Parked over tool calls whose result is unknown: the owner
+               decides, on the same card as a tool approval
+               (session_unknown_tool_result_needs_admin.md). -->
+          <div class="mile mile-permission" role="alert" data-testid="chat-unknown-result">
+            <div class="mile-label">{{ 'chat.unknownResult.label' | transloco }}</div>
+            <div class="mile-title">{{ (unknownToolCalls().length === 1 ? 'chat.unknownResult.singleTitle' : 'chat.unknownResult.batchTitle') | transloco: {count: unknownToolCalls().length} }}</div>
+            <ul class="permission-list">
+              @for (call of unknownToolCalls(); track call.id) {
+                <li class="permission-row">
+                  <app-icon size="sm">{{ toolIcon(call.name) }}</app-icon>
+                  <code class="permission-tool">{{ call.name }}</code>
+                  <code class="permission-args">{{ unknownCallArgs(call) }}</code>
+                </li>
+              }
+              <li class="permission-note">{{ 'chat.unknownResult.hint' | transloco }}</li>
+            </ul>
+            <div class="mile-actions">
+              <app-button variant="success" size="sm" data-testid="chat-unknown-continue"
+                          [disabled]="decidingUnknown()"
+                          (clicked)="decideUnknownToolResult('continue')">{{ 'chat.unknownResult.continue' | transloco }}</app-button>
+              <app-button variant="danger" size="sm" data-testid="chat-unknown-stop"
+                          [disabled]="decidingUnknown()"
+                          (clicked)="decideUnknownToolResult('stop')">{{ 'chat.unknownResult.stop' | transloco }}</app-button>
+            </div>
+          </div>
+        } @else if (chat.isParked()) {
           <div class="message message-assistant turn-bubble parked-turn" role="alert" data-testid="chat-parked">
             <div class="avatar">
               <app-icon size="sm" class="avatar-icon parked-icon">error_outline</app-icon>
@@ -1955,11 +2046,15 @@ export function clearDraft(threadId: string | null): void {
                   <code class="permission-tool">{{ perm.tool }}</code>
                   <code class="permission-args">{{ permissionArgs(perm) }}</code>
                 </li>
+                @if (permissionNoteKey(perm.tool); as noteKey) {
+                  <li class="permission-note">{{ noteKey | transloco }}</li>
+                }
               }
             </ul>
             <div class="mile-actions">
               <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ permissionApproveKey(chat.pendingPermissions().length) | transloco }}</app-button>
-              <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
+              <app-button variant="info" size="sm" [title]="'chat.permission.autoAcceptHint' | transloco"
+                          (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
           </div>
@@ -1988,42 +2083,56 @@ export function clearDraft(threadId: string | null): void {
              gated on streaming — request_workspace_upgrade doesn't stop the
              turn, so this appears while the agent is still talking. -->
         @if (workspaceOfferCard(); as woc) {
-          <div class="mile">
-            @switch (woc.state) {
-              @case ('offer') {
-                <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
-                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: tierLabel(woc.tier) } }}</div>
-                <div class="mile-detail">
-                  <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
-                  <span class="mile-args">{{ woc.reason }}</span>
+          @if (woc.state === 'offer') {
+            <div class="mile">
+              <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
+              <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: tierLabel(woc.tier) } }}</div>
+              <div class="mile-detail">
+                <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
+                <span class="mile-args">{{ woc.reason }}</span>
+              </div>
+              <div class="mile-actions">
+                <app-button variant="success" size="sm" (clicked)="upgradeAndContinue(woc.tier)">
+                  {{ 'chat.workspaceOffer.upgradeAndContinue' | transloco }}
+                </app-button>
+                <app-button variant="info" size="sm" (clicked)="upgradeOnly(woc.tier)">
+                  {{ 'chat.workspaceOffer.upgrade' | transloco }}
+                </app-button>
+                <app-button variant="danger" size="sm" (clicked)="denyOffer()">
+                  {{ 'chat.workspaceOffer.deny' | transloco }}
+                </app-button>
+              </div>
+            </div>
+          } @else if (upgradeCard(); as card) {
+            <!-- The "Starting session" card's look and place, with the upgrade's own steps. -->
+            <div class="startup-wrapper">
+              <div class="startup-card" role="status">
+                <div class="startup-card-head">
+                  <span class="startup-card-spinner"></span>
+                  <span class="startup-card-title">{{ card.title.key | transloco: (card.title.params ?? {}) }}</span>
                 </div>
-                <div class="mile-actions">
-                  <app-button variant="success" size="sm" (clicked)="upgradeAndContinue(woc.tier)">
-                    {{ 'chat.workspaceOffer.upgradeAndContinue' | transloco }}
-                  </app-button>
-                  <app-button variant="info" size="sm" (clicked)="upgradeOnly(woc.tier)">
-                    {{ 'chat.workspaceOffer.upgrade' | transloco }}
-                  </app-button>
-                  <app-button variant="danger" size="sm" (clicked)="denyOffer()">
-                    {{ 'chat.workspaceOffer.deny' | transloco }}
-                  </app-button>
+                <div class="startup-steps">
+                  @for (step of card.rows; track step.key) {
+                    <div class="startup-step" [class]="'state-' + step.state">
+                      @if (step.state === 'active') {
+                        <span class="step-spinner" aria-hidden="true"></span>
+                      } @else {
+                        <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
+                      }
+                      <span class="step-label">{{ step.labelKey | transloco }}</span>
+                      <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+                    </div>
+                  }
+                  @if (woc.willContinue) {
+                    <div class="startup-step state-todo">
+                      <app-icon size="lg" class="step-icon">play_arrow</app-icon>
+                      <span class="step-label">{{ 'chat.workspaceOffer.willContinue' | transloco }}</span>
+                    </div>
+                  }
                 </div>
-              }
-              @case ('provisioning') {
-                <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
-                <div class="mile-detail">
-                  <span class="action-spinner-sm" aria-hidden="true"></span>
-                  <span class="mile-args">
-                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: tierLabel(woc.tier) } }}
-                    @if (woc.elapsed) { ({{ woc.elapsed }}s) }
-                  </span>
-                </div>
-                @if (woc.willContinue) {
-                  <div class="mile-title">{{ 'chat.workspaceOffer.willContinue' | transloco }}</div>
-                }
-              }
-            }
-          </div>
+              </div>
+            </div>
+          }
         }
 
         <!-- Live context-compaction progress (compaction.started/progress
@@ -2355,12 +2464,15 @@ export function clearDraft(threadId: string | null): void {
 
           @if (!isRecording()) {
           <div class="composer-row">
-            <!-- Attach button + popover menu -->
+            <!-- Attach button + popover menu. Open whenever the composer is:
+                 a chip rides the outbox with the text, so on the landing
+                 draft or a starting/ended session it uploads once the thread
+                 it creates or resumes is ready. -->
             <div class="attach-wrap">
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isParked()"
+                [disabled]="!canCompose()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -2390,7 +2502,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isParked()"
+                [disabled]="!canCompose()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -2410,7 +2522,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="send mic"
-                [disabled]="!chat.isConnected() || chat.isParked() || isTranscribing() || sttUnavailable()"
+                [disabled]="!canCompose() || isTranscribing() || sttUnavailable()"
                 [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
                 (pointerdown)="$event.preventDefault()"
                 (click)="startRecording()"
@@ -2668,6 +2780,25 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
+    /** Calls a parked unit's Continue / Stop card decides (empty: plain bubble). */
+    readonly unknownToolCalls = computed(() => this.chat.queueState()?.unknown_tool_calls ?? []);
+    readonly decidingUnknown = signal(false);
+
+    /** The cut-off call's arguments, shown in full like an approval row's. */
+    unknownCallArgs(call: SessionUnknownToolCall): string {
+        return formatPermissionArgs(call.args);
+    }
+
+    async decideUnknownToolResult(decision: SessionUnknownToolResultDecision): Promise<void> {
+        if (this.decidingUnknown()) return;
+        this.decidingUnknown.set(true);
+        try {
+            await this.chat.decideUnknownToolResult(decision);
+        } finally {
+            this.decidingUnknown.set(false);
+        }
+    }
+
     private readonly compactionNow = signal(Date.now());
     private compactionTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -2741,6 +2872,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Settings panel
     readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
+    /** Citation chips: numbering per answer, and no half-written handle while streaming. */
+    protected readonly citationScopeFor = citationScopeFor;
+    protected readonly citationScopeForText = citationScopeForText;
+    protected readonly holdBackPartialHandle = holdBackPartialHandle;
     readonly showSshPanel = signal(false);
 
     /** Disconnect is a ~5s round trip (DELETE + agent/workspace teardown). The
@@ -2818,7 +2953,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly attachmentMenuOpen = signal(false);
     readonly isRecording = signal(false);
     readonly recordingDuration = signal(0);
-    readonly isTranscribing = signal(false);
+    /** The transcription in flight and the composer it belongs to: a thread
+     *  id, or null for the landing draft. */
+    private readonly transcription = signal<{owner: string | null} | null>(null);
+    /** Scoped to its composer. This component is reused across sessions, and
+     *  another session's transcription must neither show here nor hold Send. */
+    readonly isTranscribing = computed(() => {
+        const run = this.transcription();
+        return run !== null && run.owner === this.chat.threadId();
+    });
+    /** Set on destroy: a transcription that resolves later has no composer. */
+    private composerDestroyed = false;
     // Hard cap on a single dictation (20 min). Generous enough for the "10+ min
     // voice message" case, while bounding memory + staying well under the 25 MB
     // backend cap (opus ≈ 0.3 MB/min ⇒ ~6 MB). The recording service is handed
@@ -2852,6 +2997,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // unavailability disables it (fail-open: null/true ⇒ leave it enabled).
     // Read-aloud availability + playback now live in <app-read-aloud>.
     readonly sttUnavailable = computed(() => this.voiceCaps.stt() === false);
+
+    /** The header badge's mode label (the raw value would title-case to "Read_only"). */
+    readonly permissionModeLabelKey = computed(() => PERMISSION_MODE_LABEL_KEYS[this.chat.permissionMode()]);
 
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
@@ -2898,6 +3046,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly phaseRevision = signal(0);
     private readonly nowTick = signal<number>(Date.now());
     private startupTickInterval: ReturnType<typeof setInterval> | null = null;
+    private upgradeTickInterval: ReturnType<typeof setInterval> | null = null;
+
+    /** The workspace-upgrade card: the startup card's look, the upgrade's steps. */
+    readonly upgradeCard = computed(() => {
+        const progress = this.chat.workspaceUpgradeProgress();
+        if (!progress) return null;
+        return {title: upgradeCardTitle(progress), rows: upgradeProgressRows(progress, this.nowTick())};
+    });
     private prevActivePhase: string | null = null;
     private prevReadyForTiming = false;
     private prevThreadIdForTiming: string | null = null;
@@ -2994,6 +3150,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
     readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
     readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
+    readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
     private pendingVmIdeOpen: PendingVmIdeOpen | null = null;
     private vmIdeOpenDestroyed = false;
@@ -3005,6 +3162,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private isRestoringScroll = false;
 
     constructor() {
+        // A chip popover's "show in citations list" opens the panel on it.
+        effect(() => {
+            if (this.chat.citationFocus() !== null) this.showCitations.set(true);
+        });
+
         // Start/stop IDE polling when connection state changes
         effect(() => {
             const connected = this.chat.isConnected();
@@ -3282,6 +3444,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 this.startupTickInterval = null;
             }
         });
+
+        // The upgrade card's active step counts every second, like startup's.
+        effect(() => {
+            const upgrading = this.chat.workspaceUpgradeProgress() !== null;
+            if (upgrading && !this.upgradeTickInterval) {
+                this.nowTick.set(Date.now());
+                this.upgradeTickInterval = setInterval(() => this.nowTick.set(Date.now()), 1000);
+            } else if (!upgrading && this.upgradeTickInterval) {
+                clearInterval(this.upgradeTickInterval);
+                this.upgradeTickInterval = null;
+            }
+        });
     }
 
     readonly completedTaskCount = computed(() =>
@@ -3355,6 +3529,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // since a park is no readiness evidence — because the composer is
         // closed while parked (canComposeDuringSession) and this line says why.
         if (this.chat.isParked()) {
+            // Parked over cut-off tool calls: the owner's Continue / Stop
+            // card above is the way out, not an administrator.
+            if (this.unknownToolCalls().length > 0) {
+                return this.transloco.translate('chat.input.parkedDecide');
+            }
             return this.transloco.translate(
                 this.chat.queueState()?.retryable ? 'chat.input.parked' : 'chat.input.parkedBlocked',
             );
@@ -3392,6 +3571,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             (this.chat.draftDefaultsLoading() || this.chat.draftDefaultsError() ||
                 this.chat.draftDatasourceIds() === null)
         ) return false;
+        // The transcript is still on its way into this composer. A send now
+        // would go out without it — and on the landing draft would create the
+        // session and leave the composer the transcript was meant for.
+        if (this.isTranscribing()) return false;
         return canSendMessage(
             this.canCompose(),
             this.inputText,
@@ -3451,12 +3634,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             clearInterval(this.startupTickInterval);
             this.startupTickInterval = null;
         }
+        if (this.upgradeTickInterval) {
+            clearInterval(this.upgradeTickInterval);
+            this.upgradeTickInterval = null;
+        }
         if (this.compactionTimer) {
             clearInterval(this.compactionTimer);
             this.compactionTimer = null;
         }
         this.capabilitiesSub?.unsubscribe();
         this.recordingStateSub?.unsubscribe();
+        this.composerDestroyed = true;
         if (this.isRecording()) {
             this.voiceRecording.cancelRecording();
         }
@@ -3662,34 +3850,39 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      */
     async stopRecording(): Promise<void> {
         if (!this.isRecording()) return;
+        // The composer this clip belongs to: a session, or the landing draft
+        // (null), which transcribes through the account route.
+        const threadId = this.chat.threadId();
         const result = await this.voiceRecording.stopRecording();
         if (!result || result.duration < 1) return;
         const preview = await this.fileHandling.createAudioFilePreview(result);
 
-        const threadId = this.chat.threadId();
-        if (threadId) {
-            this.isTranscribing.set(true);
-            try {
-                const res = await firstValueFrom(
-                    this.api.transcribeVoice(threadId, preview.file),
-                );
-                if (res && res !== 'unavailable' && res.text.trim()) {
-                    const transcript = res.text.trim();
-                    this.inputText = this.inputText.trim()
-                        ? `${this.inputText.trim()}\n\n${transcript}`
-                        : transcript;
-                    queueMicrotask(() => this.autoResizeInput());
-                } else if (res === null) {
-                    // Transport/server error — keep the audio, surface a notice.
-                    this.chat.attachmentError.set(
-                        this.transloco.translate('chat.composer.transcribeError'),
-                    );
-                }
-                // 'unavailable' (no STT model configured) → attach audio silently.
-            } finally {
-                this.isTranscribing.set(false);
-            }
+        const run = {owner: threadId};
+        this.transcription.set(run);
+        const res = await firstValueFrom(this.api.transcribeVoice(threadId, preview.file))
+            // Only clear our own: the user may have started another one since.
+            .finally(() => {
+                if (this.transcription() === run) this.transcription.set(null);
+            });
+        // A long clip can outlive its composer: the user switched sessions
+        // (this component is reused) or left the draft (it is destroyed).
+        // Drop the text AND the audio — composer chips never follow the user
+        // to another thread, and a late chip would upload into the wrong one.
+        if (this.composerDestroyed || this.chat.threadId() !== threadId) return;
+
+        if (res && res !== 'unavailable' && res.text.trim()) {
+            const transcript = res.text.trim();
+            this.inputText = this.inputText.trim()
+                ? `${this.inputText.trim()}\n\n${transcript}`
+                : transcript;
+            queueMicrotask(() => this.autoResizeInput());
+        } else if (res === null) {
+            // Transport/server error — keep the audio, surface a notice.
+            this.chat.attachmentError.set(
+                this.transloco.translate('chat.composer.transcribeError'),
+            );
         }
+        // 'unavailable' (no STT model configured) → attach audio silently.
 
         this.chat.addAttachments([preview]);
     }
@@ -3829,10 +4022,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
-        // Honour the same gating as the file picker — if the session is
-        // disconnected, the upload would fail anyway; if its unit is parked,
-        // the chip could never be sent.
-        if (!this.chat.isConnected() || this.chat.isParked()) return;
+        // Same gate as the Attach button: wherever the composer is open the
+        // chip rides the outbox with the text (the landing draft included,
+        // where no session exists yet). A mid-session reconnect or a parked
+        // unit closes both.
+        if (!this.canCompose()) return;
 
         this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }
@@ -4148,9 +4342,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
-    approveAndAutoAccept(): void {
+    /** Approve every pending card, then stay in Auto-accept. Auto-accept still
+     *  asks before commands and irreversible or outbound actions, so the
+     *  button's copy never promises that nothing will ask again.
+     *
+     *  The switch waits for the approvals. Sent first, the new mode reached
+     *  the agent's next gate, which retires every announced card that
+     *  auto_accept runs freely; the approvals still in flight for those cards
+     *  then answered 409 and the chat said "already decided". In this order
+     *  each card is decided once, by its approval. */
+    async approveAndAutoAccept(): Promise<void> {
+        await this.chat.approveAll();
         this.chat.setMode('auto_accept');
-        this.chat.approveAll();
     }
 
     /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */
@@ -4463,16 +4666,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             if (pre.closest('.streaming-block')) continue;
             pre.setAttribute('data-collapsed', '');
             if (pre.scrollHeight <= 200) continue;
-            const lang = pre.querySelector('code')?.className?.match(/language-(\S+)/)?.[1] || '';
+            const lang = codeFenceLanguage(pre.querySelector('code')?.getAttribute('class'));
             const wrapper = document.createElement('details');
             wrapper.className = 'code-collapse';
-            const summary = document.createElement('summary');
-            summary.className = 'code-collapse-summary';
             const expandHint = this.transloco.translate('chat.code.expandHint');
-            summary.innerHTML = `<span class="code-collapse-icon">code</span>`
-                + `<span class="code-collapse-label">${lang || 'code'}</span>`
-                + `<span class="code-collapse-hint">${expandHint}</span>`;
-            wrapper.appendChild(summary);
+            wrapper.appendChild(buildCodeCollapseSummary(document, lang, expandHint));
             pre.parentNode!.insertBefore(wrapper, pre);
             wrapper.appendChild(pre);
         }
@@ -4610,12 +4808,24 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     private readonly toolViewCache = new WeakMap<ToolCallEvent, ToolCardView>();
+    private readonly runningToolViewCache = new WeakMap<ToolCallEvent, ToolCardView>();
+
+    /** Calls the session reports as running (the attach snapshot, live updates). */
+    private readonly runningToolIds = computed(
+        () => new Set(this.chat.runningTools().map((rt) => rt.id)),
+    );
 
     toolView(tc: ToolCallEvent): ToolCardView {
-        const cached = this.toolViewCache.get(tc);
+        // A reload during a call loads it from history without a result; it is
+        // running, not "no result". A parked session's cut-off call is the
+        // owner's to decide, whatever its tab still shows.
+        const running =
+            tc.resultState === 'missing' && !this.chat.isParked() && this.runningToolIds().has(tc.id);
+        const cache = running ? this.runningToolViewCache : this.toolViewCache;
+        const cached = cache.get(tc);
         if (cached) return cached;
-        const view = toolCardViewFromEvent(tc);
-        this.toolViewCache.set(tc, view);
+        const view = toolCardViewFromEvent(tc, {running});
+        cache.set(tc, view);
         return view;
     }
 
@@ -4853,6 +5063,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Template bridges to the pure key-pickers (see their definitions). */
     permissionTitleKey = permissionTitleKey;
     permissionApproveKey = permissionApproveKey;
+    permissionNoteKey = permissionNoteKey;
 
     permissionArgs(perm: PermissionRequest): string {
         return formatPermissionArgs(perm.args);

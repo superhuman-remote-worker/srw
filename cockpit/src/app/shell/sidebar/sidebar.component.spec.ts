@@ -11,6 +11,8 @@ import {PersistentChatService} from '../../core/services/persistent-chat.service
 import {SessionListService} from '../../core/services/session-list.service';
 import {ActionCenterService} from '../../core/services/action-center.service';
 import {RailTakeoverService} from '../../core/services/rail-takeover.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
+import {AppToastService} from '../../ui/toast';
 import {environment} from '../../core/environment';
 import type {Thread} from '../../core/models/api.model';
 
@@ -49,6 +51,7 @@ function create(opts: {
     threads,
     loading: signal(false),
     refresh: vi.fn(),
+    renameLocal: vi.fn(),
     grouped: computed(() =>
       threads().length ? [{label: 'today' as const, threads: threads()}] : [],
     ),
@@ -60,6 +63,8 @@ function create(opts: {
   };
   const counts = signal({notifications: 0, unseen: 0, total: 0, byCategory: opts.byCategory ?? {}});
   const takeover = new RailTakeoverService();
+  const chat = {threadId: signal(null), renameThread: vi.fn().mockResolvedValue(undefined)};
+  const toast = {danger: vi.fn()};
   const injector = Injector.create({
     providers: [
       {provide: Router, useValue: router},
@@ -72,12 +77,14 @@ function create(opts: {
       {provide: SidebarService, useValue: sidebarService},
       {provide: ViewportService, useValue: {isMobile: signal(opts.mobile ?? false)}},
       {provide: RailTakeoverService, useValue: takeover},
-      {provide: PersistentChatService, useValue: {threadId: signal(null)}},
+      {provide: PersistentChatService, useValue: chat},
       {provide: ActionCenterService, useValue: {counts}},
+      {provide: AppToastService, useValue: toast},
+      {provide: ErrorMessageService, useValue: {translate: (_e: unknown, key: string) => key}},
     ],
   });
   const component = runInInjectionContext(injector, () => new SidebarComponent());
-  return {component, router, sessions, sidebarService, counts, takeover};
+  return {component, router, sessions, sidebarService, counts, takeover, chat, toast};
 }
 
 function navigate(router: ReturnType<typeof create>['router'], url: string): void {
@@ -485,5 +492,53 @@ describe('SidebarComponent clearFilter', () => {
     component.filterText.set('something');
     expect(() => component.clearFilter()).not.toThrow();
     expect(component.filterText()).toBe('');
+  });
+});
+
+// The session menu's Rename turns the row into its input; the commit is the
+// rail's own (the menu itself is covered in rail-session-menu.component.spec.ts).
+describe('SidebarComponent inline rename', () => {
+  const t = {id: 't1', title: 'Old title'} as Thread;
+
+  it('renames optimistically and persists through the chat service', async () => {
+    const {component, sessions, chat} = create({url: '/'});
+    component.renamingId.set('t1');
+    await component.commitRename(t, '  New title  ');
+    expect(component.renamingId()).toBeNull();
+    expect(sessions.renameLocal).toHaveBeenCalledWith('t1', 'New title');
+    expect(chat.renameThread).toHaveBeenCalledWith('t1', 'New title');
+  });
+
+  it('reverts the title when the server refuses', async () => {
+    const {component, sessions, chat, toast} = create({url: '/'});
+    chat.renameThread.mockRejectedValueOnce({status: 500});
+    component.renamingId.set('t1');
+    await component.commitRename(t, 'New title');
+    expect(sessions.renameLocal).toHaveBeenLastCalledWith('t1', 'Old title');
+    expect(toast.danger).toHaveBeenCalledWith('errors.sessions.renameFailed');
+  });
+
+  it('commits once when Enter removes the input and it then blurs', async () => {
+    const {component, chat} = create({url: '/'});
+    component.renamingId.set('t1');
+    await component.commitRename(t, 'New title');
+    await component.commitRename(t, 'New title');
+    expect(chat.renameThread).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['', '   ', 'Old title'])('leaves the title alone for %j', async (value) => {
+    const {component, chat} = create({url: '/'});
+    component.renamingId.set('t1');
+    await component.commitRename(t, value);
+    expect(component.renamingId()).toBeNull();
+    expect(chat.renameThread).not.toHaveBeenCalled();
+  });
+
+  it('cancels without saving', () => {
+    const {component, chat} = create({url: '/'});
+    component.renamingId.set('t1');
+    component.cancelRename();
+    expect(component.renamingId()).toBeNull();
+    expect(chat.renameThread).not.toHaveBeenCalled();
   });
 });

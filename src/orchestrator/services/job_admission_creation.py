@@ -135,6 +135,9 @@ class JobAdmissionCreationInputs:
     workspace_selection: dict[str, Any] | None = None
     # A validated inline Expert definition; frozen by the INSERT's snapshot.
     expert_row: dict[str, Any] | None = None
+    # The approved image the selected Expert names; None for the installed
+    # harness. The INSERT's snapshot re-derives it and refuses a mismatch.
+    harness_image: str | None = None
     # Runs in the INSERT's transaction with the new job's id: a live job's
     # session is bound with its job or neither is (live_session_jobs §4.2).
     on_created: Callable[[Any, str], Awaitable[None]] | None = None
@@ -216,6 +219,11 @@ async def create_admitted_job(
         create_kwargs["workspace_selection"] = inputs.workspace_selection
     if inputs.expert_row is not None:
         create_kwargs["expert_row"] = inputs.expert_row
+    if inputs.harness_image is not None:
+        create_kwargs["harness_image"] = inputs.harness_image
+        # A custom image runs on a pod started for its job: the pinned lane,
+        # whatever lane the request or the stateless default chose.
+        create_kwargs["execution_lane"] = "pinned"
     if inputs.officer_preparation is not None:
         try:
             result = await dependencies.admit_officer(

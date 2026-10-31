@@ -341,7 +341,15 @@ jobs:
           uv pip install --system torch
           --index-url https://download.pytorch.org/whl/cpu
       - name: Install Python dependencies
-        run: uv pip install --system -r requirements.txt
+        # Every shipped component's runtime set, not only the agent's:
+        # pip-audit reads the installed environment, so a requirements file
+        # nobody installed here is never audited.
+        run: >-
+          uv pip install --system
+          -r requirements.txt
+          -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt
+          -r src/vm_controller/requirements.txt
       - name: Audit Python dependencies
         # CVE-2026-4539: pygments ReDoS in AdlLexer — local-only, no fix released
         # CVE-2026-25645: requests extract_zipped_paths() temp path — we don't call it;
@@ -609,9 +617,13 @@ jobs:
       vm-controller: ${{ steps.check.outputs.vm-controller }}
       vm-preparer: ${{ steps.check.outputs.vm-preparer }}
       driver-shim: ${{ steps.check.outputs.driver-shim }}
+      harness-claude-code: ${{ steps.check.outputs.harness-claude-code }}
       driver-mcp-front: ${{ steps.check.outputs.driver-mcp-front }}
       driver-git-swap: ${{ steps.check.outputs.driver-git-swap }}
       driver-gpt-live-sip: ${{ steps.check.outputs.driver-gpt-live-sip }}
+      # The local voice path: SRW's voice gateway and its Asterisk addon.
+      voice-gateway: ${{ steps.check.outputs.voice-gateway }}
+      asterisk: ${{ steps.check.outputs.asterisk }}
       # The in-pod plane (D7): the FUSE opener and the co-built cloud mount
       # supervisor, one identity.
       fuse-opener: ${{ steps.check.outputs.fuse-opener }}
@@ -628,9 +640,12 @@ jobs:
       vm-controller-sha: ${{ steps.check.outputs.vm-controller-sha }}
       vm-preparer-sha: ${{ steps.check.outputs.vm-preparer-sha }}
       driver-shim-sha: ${{ steps.check.outputs.driver-shim-sha }}
+      harness-claude-code-sha: ${{ steps.check.outputs.harness-claude-code-sha }}
       driver-mcp-front-sha: ${{ steps.check.outputs.driver-mcp-front-sha }}
       driver-git-swap-sha: ${{ steps.check.outputs.driver-git-swap-sha }}
       driver-gpt-live-sip-sha: ${{ steps.check.outputs.driver-gpt-live-sip-sha }}
+      voice-gateway-sha: ${{ steps.check.outputs.voice-gateway-sha }}
+      asterisk-sha: ${{ steps.check.outputs.asterisk-sha }}
       fuse-opener-sha: ${{ steps.check.outputs.fuse-opener-sha }}
       vm-base-sha: ${{ steps.check.outputs.vm-base-sha }}
       vm-base-stage1-sha: ${{ steps.check.outputs.vm-base-stage1-sha }}
@@ -638,6 +653,7 @@ jobs:
       python-changed: ${{ steps.test-paths.outputs.python }}
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
       mcp-test-changed: ${{ steps.test-paths.outputs.mcp-test }}
+      voice-test-changed: ${{ steps.test-paths.outputs.voice }}
       # Space-separated test files for pytest, or `tests/` for the whole suite.
       pytest-target: ${{ steps.select.outputs.pytest-target }}
     steps:
@@ -724,6 +740,7 @@ jobs:
             echo "python=true" >> "$GITHUB_OUTPUT"
             echo "cockpit=true" >> "$GITHUB_OUTPUT"
             echo "mcp-test=true" >> "$GITHUB_OUTPUT"
+            echo "voice=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -739,6 +756,7 @@ jobs:
             'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
             'docker/Dockerfile.cockpit' \
+            'harnesses/' 'docker/Dockerfile.harness-claude-code' 'examples/manifests/' \
             'requirements.txt' 'requirements-dev.txt' 'requirements/' 'pyproject.toml' '.squawk.toml' \
             | grep -q .; then
             echo "python=true" >> "$GITHUB_OUTPUT"
@@ -762,7 +780,17 @@ jobs:
             echo "mcp-test=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Test path detection: $(grep -E '^(python|cockpit|mcp-test)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
+          # The voice gateway's pipeline tests run in its own locked
+          # environment (test-voice-gateway), not in the combined suite.
+          if git diff --name-only "$BASE" HEAD -- 'src/voice_gateway/' \
+            'tests/test_voice_gateway_*' 'requirements/' 'scripts/lock_dependencies.py' \
+            '.github/workflows/develop.yml' | grep -q .; then
+            echo "voice=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "voice=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Test path detection: $(grep -E '^(python|cockpit|mcp-test|voice)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
 
       - name: Select affected test files
         id: select
@@ -903,6 +931,7 @@ jobs:
             docker/browser-exec docker/check-browser-stream.py
             docker/assert-browser-stack.sh
             docker/assert-workspace-contract.sh
+            docker/link-playwright-browsers docker/write-agent-environment
             .playwright-version .dockerignore)
 
           VM_PREPARER_PATHS=(src/vm_controller/__init__.py src/vm_controller/preparation_builder.py src/vm_controller/preparation_firewall.py
@@ -915,6 +944,11 @@ jobs:
           DRIVER_SHIM_PATHS=(drivers/shim/ .dockerignore docker/Dockerfile.driver-shim)
           DRIVER_SHIM_SHA=$(last_input_sha "${DRIVER_SHIM_PATHS[@]}")
           DRIVER_SHIM=$(image_missing driver-shim "$DRIVER_SHIM_SHA")
+
+          # The Claude Code harness image: Python package, pinned requirements.
+          HARNESS_CLAUDE_CODE_PATHS=(harnesses/claude-code/ .dockerignore docker/Dockerfile.harness-claude-code)
+          HARNESS_CLAUDE_CODE_SHA=$(last_input_sha "${HARNESS_CLAUDE_CODE_PATHS[@]}")
+          HARNESS_CLAUDE_CODE=$(image_missing harness-claude-code "$HARNESS_CLAUDE_CODE_SHA")
 
           # The managed MCP front (D5a): one static Go binary, stdlib only,
           # and the stdio bridge its image carries (D5b, drivers/mcp-bridge).
@@ -932,6 +966,16 @@ jobs:
           DRIVER_GPT_LIVE_SIP_PATHS=(drivers/gpt-live-sip/ .dockerignore docker/Dockerfile.driver-gpt-live-sip)
           DRIVER_GPT_LIVE_SIP_SHA=$(last_input_sha "${DRIVER_GPT_LIVE_SIP_PATHS[@]}")
           DRIVER_GPT_LIVE_SIP=$(image_missing driver-gpt-live-sip "$DRIVER_GPT_LIVE_SIP_SHA")
+
+          # The local voice path: the gateway (Python, its own dependency lock
+          # role) and the Asterisk addon (built from the verified source).
+          VOICE_GATEWAY_PATHS=(src/voice_gateway/ requirements/ scripts/lock_dependencies.py
+            .dockerignore docker/Dockerfile.voice-gateway)
+          VOICE_GATEWAY_SHA=$(last_input_sha "${VOICE_GATEWAY_PATHS[@]}")
+          VOICE_GATEWAY=$(image_missing voice-gateway "$VOICE_GATEWAY_SHA")
+          ASTERISK_PATHS=(docker/Dockerfile.asterisk docker/asterisk/ .dockerignore)
+          ASTERISK_SHA=$(last_input_sha "${ASTERISK_PATHS[@]}")
+          ASTERISK=$(image_missing asterisk "$ASTERISK_SHA")
 
           # The in-pod plane (D7): the FUSE opener and the cloud mount
           # supervisor, two static Go binaries (stdlib only) in two targets of
@@ -1018,6 +1062,7 @@ jobs:
             docker/agent-vm-base/Dockerfile.containerDisk
             docker/agent-vm-base/files/
             docker/browser-exec docker/check-browser-stream.py
+            docker/link-playwright-browsers docker/write-agent-environment
             vm/sudo-daemon/ vm/sudo-plugin/
             "${VM_BASE_STAGE1_PATHS[@]}")
           VM_BASE_SHA=$(last_input_sha "${VM_BASE_PATHS[@]}")
@@ -1044,9 +1089,11 @@ jobs:
           echo "  mcp=$MCP  workspace=$WORKSPACE"
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1"
           echo "  vm-preparer=$VM_PREPARER  driver-shim=$DRIVER_SHIM (${DRIVER_SHIM_SHA::7})"
+          echo "  harness-claude-code=$HARNESS_CLAUDE_CODE (${HARNESS_CLAUDE_CODE_SHA::7})"
           echo "  driver-mcp-front=$DRIVER_MCP_FRONT (${DRIVER_MCP_FRONT_SHA::7})"
           echo "  driver-git-swap=$DRIVER_GIT_SWAP (${DRIVER_GIT_SWAP_SHA::7})"
           echo "  driver-gpt-live-sip=$DRIVER_GPT_LIVE_SIP (${DRIVER_GPT_LIVE_SIP_SHA::7})"
+          echo "  voice-gateway=$VOICE_GATEWAY (${VOICE_GATEWAY_SHA::7})  asterisk=$ASTERISK (${ASTERISK_SHA::7})"
           echo "  fuse-opener=$FUSE_OPENER (${FUSE_OPENER_SHA::7})"
           echo "  vm input shas: vm-controller=${VM_CONTROLLER_SHA::7} vm-base=${VM_BASE_SHA::7} vm-base-stage1=${VM_BASE_STAGE1_SHA::7}"
           echo "  chart=$CHART"
@@ -1069,12 +1116,18 @@ jobs:
             echo "vm-preparer-sha=$VM_PREPARER_SHA"
             echo "driver-shim=$DRIVER_SHIM"
             echo "driver-shim-sha=$DRIVER_SHIM_SHA"
+            echo "harness-claude-code=$HARNESS_CLAUDE_CODE"
+            echo "harness-claude-code-sha=$HARNESS_CLAUDE_CODE_SHA"
             echo "driver-mcp-front=$DRIVER_MCP_FRONT"
             echo "driver-mcp-front-sha=$DRIVER_MCP_FRONT_SHA"
             echo "driver-git-swap=$DRIVER_GIT_SWAP"
             echo "driver-git-swap-sha=$DRIVER_GIT_SWAP_SHA"
             echo "driver-gpt-live-sip=$DRIVER_GPT_LIVE_SIP"
             echo "driver-gpt-live-sip-sha=$DRIVER_GPT_LIVE_SIP_SHA"
+            echo "voice-gateway=$VOICE_GATEWAY"
+            echo "voice-gateway-sha=$VOICE_GATEWAY_SHA"
+            echo "asterisk=$ASTERISK"
+            echo "asterisk-sha=$ASTERISK_SHA"
             echo "fuse-opener=$FUSE_OPENER"
             echo "fuse-opener-sha=$FUSE_OPENER_SHA"
             echo "vm-base=$VM_BASE"
@@ -1808,9 +1861,9 @@ jobs:
           ls -la /dev/kvm
           id
           python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
-      - uses: hashicorp/setup-packer@main
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
         with:
-          version: latest
+          version: 1.16.1
       - name: Compute cloud image cache key
         id: img-key
         run: echo "key=ubuntu-noble-cloudimg-$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
@@ -1979,9 +2032,9 @@ jobs:
           ls -la /dev/kvm
           id
           python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
-      - uses: hashicorp/setup-packer@main
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
         with:
-          version: latest
+          version: 1.16.1
       # Login is unconditional here — needed to PULL the stage1 containerDisk
       # from GHCR even on PR validation runs. Push of the final image still
       # gates on push events below.
@@ -2275,6 +2328,114 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-shim:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
+  # The Claude Code harness image (harnesses/claude-code): built and published
+  # for operators to approve by digest in manifestHosting.approvedImages. Its
+  # Python tests run in test-python; the chart is not stamped with it.
+  build-harness-claude-code:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.harness-claude-code == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.harness-claude-code-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-harness-claude-code
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      # Smoke test before anything is published: the SDK the image pins (the
+      # test venv may run another version) must import the harness, parse a
+      # start request and build the session options. No session, no network.
+      # Loaded into the local daemon only; the push below reuses the layers.
+      - name: Build the image for the smoke test
+        run: >-
+          docker buildx build --load --platform linux/amd64
+          --file ./docker/Dockerfile.harness-claude-code
+          --cache-from type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-develop
+          --tag srw-harness-claude-code:smoke .
+      - name: Smoke-test the image
+        run: |
+          docker run --rm --network none --entrypoint python3 srw-harness-claude-code:smoke -I -c '
+          from pathlib import Path
+          from srw_claude_code_harness.__main__ import _versions
+          from srw_claude_code_harness.job import parse_job_start, require_anthropic_route
+          from srw_claude_code_harness.session import job_options
+          from srw_claude_code_harness.tools import TOOL_NAMES, make_tools
+          llm = {"model": "claude-smoke", "provider": "anthropic", "client_protocol": "anthropic-messages", "api_key": "smoke"}
+          remote = {"host": "127.0.0.1", "port": 22, "username": "agent-host", "key_path": "/nonexistent/key", "workspace_path": "/home/agent-host/workspace"}
+          spec = parse_job_start({"job_id": "smoke", "description": "smoke", "resolved_config": {"agent": {"llm": llm, "workspace": {"remote": remote}}}})
+          require_anthropic_route(spec.model)
+          options = job_options(spec, tools=make_tools(None, TOOL_NAMES), env={"PATH": "/usr/bin"}, cwd=Path("/home/agent-host/workspace"))
+          assert options.model == "claude-smoke" and len(options.allowed_tools) == 4, options
+          versions = _versions()
+          assert versions["sdk"] and versions["cli"], versions
+          print("harness smoke ok", versions)
+          '
+          # The local user resolves with the USER variables cleared (passwd entry for uid 999),
+          # under the identity SRW's agent pod gives every image: 999:999, read-only root.
+          docker run --rm --network none --user 999:999 --read-only --tmpfs /tmp --entrypoint python3 -e USER= -e LOGNAME= srw-harness-claude-code:smoke -I -c 'import getpass, os; print("local user", getpass.getuser(), "uid", os.getuid())'
+          # The real start command (python3 -I -u -m srw_claude_code_harness):
+          # with no ORCHESTRATOR_URL it must reach the harness and exit 2.
+          rc=0
+          docker run --rm --network none srw-harness-claude-code:smoke || rc=$?
+          test "$rc" -eq 2 || { echo "start command exited $rc; expected 2 (no ORCHESTRATOR_URL)"; exit 1; }
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.harness-claude-code
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=harness-claude-code
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-harness-claude-code:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
   # The development MCP server (D5a) the front's integration tests and the
   # k3d gate run behind it: vetted and tested when it changes, never built or
   # published, so a change to it alone republishes nothing.
@@ -2566,6 +2727,189 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-driver-gpt-live-sip:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
 
+  # The voice gateway's pipeline tests need Pipecat, which only the gateway's
+  # own lock carries (not the combined test environment), and run without
+  # the repository's conftest (it imports the orchestrator). Installed the
+  # way the image installs it (hashes, wheels, --no-deps).
+  test-voice-gateway:
+    needs: [changes]
+    if: >-
+      needs.changes.outputs.voice-test-changed == 'true' ||
+      needs.changes.outputs.voice-gateway == 'true' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the gateway's locked environment
+        run: |
+          python scripts/lock_dependencies.py check voice-gateway
+          python -m venv .voice-venv
+          .voice-venv/bin/python -m pip install --require-hashes --no-deps --only-binary :all: \
+            -r requirements/locks/voice-gateway-py312.txt
+          .voice-venv/bin/python scripts/lock_dependencies.py check voice-gateway --installed
+          .voice-venv/bin/python scripts/lock_dependencies.py pip-check voice-gateway
+          .voice-venv/bin/python -m pip install pytest pytest-asyncio
+      - name: Run the voice gateway and pipeline tests
+        env:
+          PYTHONPATH: src
+        run: >-
+          .voice-venv/bin/python -m pytest --noconftest -q
+          tests/test_voice_gateway_cascade.py tests/test_voice_gateway_cascade_settings.py
+          tests/test_voice_gateway_config.py tests/test_voice_gateway_asterisk_render.py
+          tests/test_voice_gateway_asterisk_media.py tests/test_voice_gateway_asterisk_source.py
+
+  # SRW's voice gateway (local phone lines): its pipeline tests first, then
+  # the image; the chart pins its digest.
+  build-voice-gateway:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit, test-voice-gateway]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.voice-gateway == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-voice-gateway.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.voice-gateway-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-voice-gateway
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.voice-gateway
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=voice-gateway
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-voice-gateway:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-voice-gateway:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
+  # SRW's Asterisk addon (srw-asterisk, GPL-2.0, its own process): Asterisk
+  # 22 LTS built from the signed release tarball with only the voice path's
+  # modules; the image carries its licences and source tarballs. The chart
+  # pins its digest.
+  build-asterisk:
+    needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      (needs.changes.outputs.asterisk == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result != 'failure' && needs.test-python.result != 'cancelled' &&
+      needs.test-cockpit.result != 'failure' && needs.test-cockpit.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.asterisk-sha }}"
+          : "${FULL:?component identity is required}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-asterisk
+          tags: |
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.asterisk
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=asterisk
+          provenance: false
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-asterisk:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-asterisk:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
   # The in-pod plane (connector drivers D7): the privileged FUSE opener and
   # the unprivileged cloud mount supervisor, two targets of one Dockerfile.
   # Both Go modules are vetted and tested under the race detector with the
@@ -2709,6 +3053,8 @@ jobs:
       - build-driver-mcp-front
       - build-driver-git-swap
       - build-driver-gpt-live-sip
+      - build-voice-gateway
+      - build-asterisk
       - build-fuse-opener
       - chart-test
       - chart-schema-negative
@@ -2737,7 +3083,8 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64
+          echo "8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f  /usr/local/bin/yq" | sha256sum -c -
           sudo chmod +x /usr/local/bin/yq
 
       - name: Install Helm
@@ -2798,6 +3145,8 @@ jobs:
           needs.build-driver-mcp-front.result == 'success' ||
           needs.build-driver-git-swap.result == 'success' ||
           needs.build-driver-gpt-live-sip.result == 'success' ||
+          needs.build-voice-gateway.result == 'success' ||
+          needs.build-asterisk.result == 'success' ||
           needs.build-fuse-opener.result == 'success'
         env:
           SHA_ORCHESTRATOR: ${{ needs.changes.outputs.orchestrator-sha }}
@@ -2811,6 +3160,8 @@ jobs:
           SHA_DRIVERMCPFRONT: ${{ needs.changes.outputs.driver-mcp-front-sha }}
           SHA_DRIVERGITSWAP: ${{ needs.changes.outputs.driver-git-swap-sha }}
           SHA_DRIVERGPTLIVESIP: ${{ needs.changes.outputs.driver-gpt-live-sip-sha }}
+          SHA_VOICEGATEWAY: ${{ needs.changes.outputs.voice-gateway-sha }}
+          SHA_ASTERISK: ${{ needs.changes.outputs.asterisk-sha }}
           SHA_FUSEOPENER: ${{ needs.changes.outputs.fuse-opener-sha }}
         run: |
           helm repo add collabora https://collaboraonline.github.io/online --force-update
@@ -2853,6 +3204,10 @@ jobs:
           export TAG_DRIVERGITSWAP="sha-${SHA_DRIVERGITSWAP::7}"
           : "${SHA_DRIVERGPTLIVESIP:?verified component identity is required}"
           export TAG_DRIVERGPTLIVESIP="sha-${SHA_DRIVERGPTLIVESIP::7}"
+          : "${SHA_VOICEGATEWAY:?verified component identity is required}"
+          export TAG_VOICEGATEWAY="sha-${SHA_VOICEGATEWAY::7}"
+          : "${SHA_ASTERISK:?verified component identity is required}"
+          export TAG_ASTERISK="sha-${SHA_ASTERISK::7}"
           : "${SHA_FUSEOPENER:?verified component identity is required}"
           export TAG_FUSEOPENER="sha-${SHA_FUSEOPENER::7}"
           export REV_ORCHESTRATOR="$SHA_ORCHESTRATOR"
@@ -2869,6 +3224,8 @@ jobs:
           : "${DRIVER_MCP_FRONT_DIGEST:?verified managed MCP front image digest is required}"
           : "${DRIVER_GIT_SWAP_DIGEST:?verified git swap driver image digest is required}"
           : "${DRIVER_GPT_LIVE_SIP_DIGEST:?verified phone-line driver image digest is required}"
+          : "${VOICE_GATEWAY_DIGEST:?verified voice gateway image digest is required}"
+          : "${ASTERISK_DIGEST:?verified Asterisk addon image digest is required}"
           : "${FUSE_OPENER_DIGEST:?verified FUSE opener image digest is required}"
           : "${CLOUD_MOUNT_DIGEST:?verified cloud mount image digest is required}"
 
@@ -2891,6 +3248,10 @@ jobs:
             .connectors.drivers.gitSwap.image.digest = strenv(DRIVER_GIT_SWAP_DIGEST) |
             .connectors.drivers.gptLiveSip.image.tag = strenv(TAG_DRIVERGPTLIVESIP) |
             .connectors.drivers.gptLiveSip.image.digest = strenv(DRIVER_GPT_LIVE_SIP_DIGEST) |
+            .voiceGateway.image.tag = strenv(TAG_VOICEGATEWAY) |
+            .voiceGateway.image.digest = strenv(VOICE_GATEWAY_DIGEST) |
+            .asterisk.image.tag = strenv(TAG_ASTERISK) |
+            .asterisk.image.digest = strenv(ASTERISK_DIGEST) |
             .connectors.inPodPlane.opener.image.tag = strenv(TAG_FUSEOPENER) |
             .connectors.inPodPlane.opener.image.digest = strenv(FUSE_OPENER_DIGEST) |
             .connectors.inPodPlane.rclone.image.tag = strenv(TAG_FUSEOPENER) |

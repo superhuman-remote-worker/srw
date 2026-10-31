@@ -32,7 +32,7 @@ from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 def _make_config(**overrides):
     """Build a minimal AgentConfig mock for PersistentSession."""
     cfg = MagicMock()
-    cfg.interactive.permission_mode = overrides.get("permission_mode", "supervised")
+    cfg.interactive.permission_mode = overrides.get("permission_mode", "read_only")
     cfg.interactive.greeting = overrides.get("greeting", "Hello")
     cfg.interactive.idle_timeout_minutes = overrides.get("idle_timeout", 30)
     cfg.workspace.backend = overrides.get("ws_backend", None)
@@ -498,7 +498,7 @@ class TestCapabilityScopedCanvasSkillDeployment:
         session.workspace_manager = workspace
         session.tool_context = SimpleNamespace(config={})
 
-        session._scope_skills_for_tool_names(["read_product_guide"])
+        session._scope_skills_for_tool_names(["read_product_guide", "use_skill"])
         session._deploy_catalog_skill_files()
 
         scoped = session.config.extra["_resolved_skills"]
@@ -508,6 +508,34 @@ class TestCapabilityScopedCanvasSkillDeployment:
         assert "STALE-OR-USER-GUIDE" not in scoped["files"]["app-guide"]["SKILL.md"]
         assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
         assert session.tool_context.config["_resolved_skills"] == scoped
+
+    def test_catalog_skills_follow_use_skill(self):
+        """No use_skill, no ordinary skill in the menu or the workspace; the
+        managed guide keeps its own reader (skills_tool_category.md D2)."""
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {
+                    "menu": [{"name": "ordinary-skill"}],
+                    "files": {"ordinary-skill": {"SKILL.md": "ordinary"}},
+                }
+            }
+        )
+        session = _make_session(config=cfg)
+        written: dict[str, str] = {}
+        workspace = MagicMock()
+        workspace.exists.side_effect = lambda path: path in written
+        workspace.write_file.side_effect = lambda path, content: written.__setitem__(
+            path, content
+        )
+        session.workspace_manager = workspace
+        session.tool_context = SimpleNamespace(config={})
+
+        session._scope_skills_for_tool_names(["read_product_guide", "read_file"])
+        session._deploy_catalog_skill_files()
+
+        menu = session.config.extra["_resolved_skills"]["menu"]
+        assert [item["name"] for item in menu] == ["app-guide"]
+        assert written == {}
 
     def test_app_guide_is_withheld_if_reader_failed_to_instantiate(self):
         cfg = _make_config(extra={"_resolved_skills": {}})
@@ -702,18 +730,19 @@ class TestCapabilityScopedCanvasSkillDeployment:
         session.workspace_manager = workspace
         session.tool_context = SimpleNamespace(config={})
 
-        # Workspace setup can deploy ordinary skills, but Canvas has not yet
-        # instantiated and must be absent from both the menu and workspace.
+        # Workspace setup precedes tool instantiation, so no catalog skill is
+        # admitted yet: ordinary skills follow use_skill, Canvas also needs
+        # set_canvas (skills_tool_category.md D2).
         session._deploy_instruction_files()
-        assert [
-            item["name"] for item in session.config.extra["_resolved_skills"]["menu"]
-        ] == ["ordinary-skill"]
-        assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
+        assert session.config.extra["_resolved_skills"]["menu"] == []
+        assert written == {}
 
         # Missing identity, an explicit disable, and backend=none all result in
-        # an actual loaded set without set_canvas; none may add the skill.
+        # an actual loaded set without set_canvas; none may add the skill. The
+        # loaded use_skill admits the ordinary skill.
         session._scope_skills_for_tool_names(["use_skill"])
-        session._deploy_catalog_skill_files({"present-with-canvas"})
+        session._deploy_catalog_skill_files()
+        assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
         assert "skills/present-with-canvas/SKILL.md" not in written
 
         # A later none→workspace rebind can admit both tools and add the skill.
@@ -796,7 +825,7 @@ class TestExcludedTools:
 class TestPersistentSessionDefaults:
     def test_permission_mode_default(self):
         session = _make_session()
-        assert session.permission_mode == "supervised"
+        assert session.permission_mode == "read_only"
 
     def test_messages_default_new_list_per_instance(self):
         s1 = _make_session()
@@ -2613,11 +2642,10 @@ class TestSetupTools:
         assert "set_skill_bundle" in loaded_names
         assert "set_automation_bundle" in loaded_names
 
-    def test_stateless_lane_never_offers_a_workspace_upgrade(self, monkeypatch):
-        """The upgrade accept is a socket verb the stateless lane cannot carry,
-        so a lite stateless session must not be handed the tool whose offer
-        card could never be accepted (the agent would wait on a human decision
-        that cannot arrive)."""
+    def test_stateless_lane_binds_the_upgrade_offer(self, monkeypatch):
+        """The stateless lane now carries the accept as a durable REST control
+        (C1); whether an offer is shown is the availability route's call, per
+        request."""
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         session = _make_session(config=_make_config())
         session.workspace_manager = MagicMock()
@@ -2645,7 +2673,7 @@ class TestSetupTools:
 
         loaded_names = mock_load.call_args_list[0].args[0]
         assert "web_search" in loaded_names
-        assert "request_workspace_upgrade" not in loaded_names
+        assert "request_workspace_upgrade" in loaded_names
 
     def test_workflows_can_be_disabled(self):
         """Automations & Loops opt-out removes workflow tools."""
@@ -3601,6 +3629,46 @@ class TestSwapBackend:
                 session.swap_backend(new_backend)
                 assert events == ["install", "retire"]
 
+    def test_records_the_new_tier_and_workspace_identity(self):
+        """A live upgrade leaves the session as a Session created on that tier."""
+        session = _make_session()
+        session.workspace_backend_tier = "virtual"
+        session.workspace_manager = MagicMock(backend=MagicMock(spec=[]))
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = True
+
+        with patch.object(session, "_setup_shell_manager"):
+            session.swap_backend(
+                new_backend,
+                workspace_tier="vm",
+                workspace_generation="generation-1",
+                workspace_runtime_incarnation="launcher-pod-1",
+            )
+
+        assert session.workspace_backend_tier == "vm"
+        assert session.workspace_generation == "generation-1"
+        assert session.workspace_runtime_incarnation == "launcher-pod-1"
+
+    def test_a_failed_swap_keeps_the_old_tier_and_identity(self):
+        session = _make_session()
+        session.workspace_backend_tier = "virtual"
+        session.workspace_manager = MagicMock(backend=MagicMock(spec=[]))
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = False
+        new_backend.connect.side_effect = OSError("ssh refused")
+
+        with pytest.raises(OSError, match="ssh refused"):
+            session.swap_backend(
+                new_backend,
+                workspace_tier="vm",
+                workspace_generation="generation-1",
+                workspace_runtime_incarnation="launcher-pod-1",
+            )
+
+        assert session.workspace_backend_tier == "virtual"
+        assert session.workspace_generation == ""
+        assert session.workspace_runtime_incarnation == ""
+
     def test_raises_when_workspace_manager_none(self):
         """RuntimeError raised when workspace_manager is None."""
         session = _make_session()
@@ -4102,7 +4170,7 @@ class TestCleanup:
     async def test_cleanup_withdraws_runtime_facts_and_loaded_tool_names(self):
         session = _make_session()
         context = SimpleNamespace(
-            citation_verdict_callback=MagicMock(),
+            citation_event_callback=MagicMock(),
             canvas_event_callback=MagicMock(),
             _resolved_tool_names=["email_read"],
             session_runtime_facts=object(),
@@ -4397,6 +4465,44 @@ class TestCleanup:
         else:
             cloud.aclose.assert_not_awaited()
         session.shell_manager.cleanup.assert_called_once_with(strict=True)
+
+    @pytest.mark.asyncio
+    async def test_protected_cleanup_retries_a_resident_over_a_fresh_transport(self):
+        # The strict shell retirement kills every workspace-UID process, the
+        # transport's sftp-server among them. A retry over that transport
+        # failed with "Socket is closed" forever (dev, 10-19), so a resident
+        # failure resets the transport and keeps claim-resource admission.
+        session = _make_session(
+            protected_cloud_required=True,
+            pinned_runtime_identity_required=True,
+            workspace_backend_tier="sandbox",
+        )
+        backend = MagicMock()
+        backend.terminal_local_quiescence_protocol = "workspace_process_zero_v1"
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        overlay = MagicMock()
+        overlay.unmount.side_effect = [RuntimeError("overlay remained mounted"), None]
+        cloud = MagicMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        with pytest.raises(WorkspaceUnavailableError, match="residents remain active"):
+            await session.cleanup()
+
+        backend.disconnect.assert_called_once_with()
+        backend.retire.assert_not_called()
+        backend.retire_claim_resource_owner.assert_not_called()
+        cloud.aclose.assert_not_awaited()
+        assert session.overlay_mount_manager is overlay
+
+        await session.cleanup()
+
+        assert overlay.unmount.call_count == 2
+        cloud.aclose.assert_awaited_once_with(strict=True)
+        backend.retire.assert_called_once_with()
+        assert session.overlay_mount_manager is None
 
     @pytest.mark.asyncio
     async def test_protected_cleanup_waits_for_busy_upperdir_to_quiesce(self):

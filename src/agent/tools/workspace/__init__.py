@@ -6,6 +6,9 @@ for the agent's workspace-centric architecture.
 Tools are split into two modules:
 - files.py: Core file operations (read, write, edit)
 - filesystem.py: Filesystem operations (list, delete, move, copy, search, etc.)
+
+skills.py (``use_skill``) lives here because it reads workspace files, but it is
+its own ``skills`` category and is loaded by the registry, not by this factory.
 """
 
 from typing import Any, Dict, List
@@ -32,12 +35,10 @@ def create_workspace_tools(context: ToolContext) -> List[Any]:
 
     from agent.tools.workspace.files import create_file_tools
     from agent.tools.workspace.filesystem import create_filesystem_tools
-    from agent.tools.workspace.skills import create_skill_tools
 
     tools = []
     tools.extend(create_file_tools(context))
     tools.extend(create_filesystem_tools(context))
-    tools.extend(create_skill_tools(context))
 
     return tools
 
@@ -46,9 +47,8 @@ def get_workspace_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all workspace tools."""
     from agent.tools.workspace.files import FILE_TOOLS_METADATA
     from agent.tools.workspace.filesystem import FILESYSTEM_TOOLS_METADATA
-    from agent.tools.workspace.skills import SKILL_TOOLS_METADATA
 
-    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA, **SKILL_TOOLS_METADATA}
+    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA}
 
 
 # Re-export metadata for backwards compatibility
@@ -56,6 +56,5 @@ def _get_combined_metadata() -> Dict[str, Dict[str, Any]]:
     """Internal: get combined metadata (called at module level for registry)."""
     from agent.tools.workspace.files import FILE_TOOLS_METADATA
     from agent.tools.workspace.filesystem import FILESYSTEM_TOOLS_METADATA
-    from agent.tools.workspace.skills import SKILL_TOOLS_METADATA
 
-    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA, **SKILL_TOOLS_METADATA}
+    return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA}

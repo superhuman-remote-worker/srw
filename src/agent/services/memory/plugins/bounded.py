@@ -2,10 +2,11 @@
 
 Caps how much of the memory channel actually gets injected, in the
 post-scorer order. Motivated by the Phase-2/3 eval findings on the seam
-arm: ~95% of a multi-session project corpus is TTL-pinned (cross-session
-memories freeze once their job scope stops ticking), so the two-tier
-read path degenerates to dump-the-store (~236 items / ~9k tokens per
-turn) and the reader has to find the answer mid-dump. With a reranker
+arm: ~95% of a multi-session project corpus was TTL-pinned (cross-session
+memories froze once their job scope stopped ticking; the tier is retired
+since), so the two-tier read path degenerated to dump-the-store (~236
+items / ~9k tokens per turn) and the reader had to find the answer
+mid-dump. With a reranker
 scorer placing the evidence at first-hit rank ~1.35, a small top-K is
 strictly better reading material.
 

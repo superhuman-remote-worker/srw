@@ -9,10 +9,10 @@ is a binder, the registry is the driver catalog).
 Usage:
     from agent.services.memory.registry import register_memory_plugin
 
-    @register_memory_plugin("retriever", "recall_two_tier",
-                            description="Legacy two-tier RecallStore.retrieve")
+    @register_memory_plugin("retriever", "recall_hybrid",
+                            description="RecallStore.retrieve, budget-fit")
     def _build(runtime: MemoryRuntime) -> Retriever:
-        return RecallTwoTierRetriever(runtime.recall_store, ...)
+        return RecallHybridRetriever(runtime.recall_store, ...)
 
 Resolution failures are loud by design: an unknown name in config is a
 misconfiguration, not a degradation — it must fail at bind time with the
@@ -21,7 +21,7 @@ available names in the message.
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,14 @@ class MemoryPluginSpec:
 # plugin modules (src/services/memory/plugins/), mirroring TOOL_REGISTRY.
 MEMORY_PLUGIN_REGISTRY: Dict[str, Dict[str, MemoryPluginSpec]] = {
     kind: {} for kind in PLUGIN_KINDS
+}
+
+
+#: Plugin names a release removed, with the reason. A stored or frozen config
+#: that still names one (a resumed job's ``resolved_config``, a copied expert)
+#: binds without it instead of failing at bind time.
+RETIRED_MEMORY_PLUGINS: Dict[Tuple[str, str], str] = {
+    ("writer", "memory_assembler"): "the memory assembler was removed",
 }
 
 

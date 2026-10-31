@@ -315,6 +315,7 @@ async def _poll(
     thread_metadata: dict | None = None,
     session_folder: bool = True,
     cloud_mount: dict | None = None,
+    execution_lane: str = "stateless",
 ) -> dict:
     """The real delivery under the application's composition, with the cloud
     payload of a sidecar Pod (``sidecar_pod``, by default under the mounting
@@ -352,7 +353,7 @@ async def _poll(
         "user_id": None,
         "project_id": None,
         "status": "active",
-        "execution_lane": "stateless",
+        "execution_lane": execution_lane,
         "runtime_generation": str(uuid4()),
         "runtime_retirement_token": None,
         "nc_session_folder": (
@@ -507,6 +508,59 @@ async def test_the_sync_driver_names_the_folders_it_does_not_deliver():
     writes.clear()
     response = await _poll("sidecar", status_writes=writes)
     assert response["cloud_folders_excluded"] == [] and writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["rclone_mount", "sync"])
+async def test_a_virtual_session_names_the_cloud_folders_it_left_out(
+    driver, monkeypatch
+):
+    """A Virtual Session mounts no cloud folder: what its creation left out
+    (its record) reaches the agent, and a rewritten record keeps it
+    (owner 2026-10-21, virtual_sessions_get_no_cloud_connectors)."""
+    from orchestrator.application import preparation as preparation_composition
+    from orchestrator.services import workspace_binding
+    from orchestrator.services.cloud_mount_status import sync_status
+
+    spec = {"type": "s3", "root": "srw-workspaces", "config": {}}
+    monkeypatch.setattr(
+        preparation_composition.virtual_workspace,
+        "virtual_workspace_rclone_spec",
+        lambda: spec,
+    )
+    binding = {
+        "generation": str(uuid4()),
+        "kind": "virtual",
+        "backing_id": workspace_binding.virtual_thread_backing_id(THREAD_ID, spec),
+        "ssh_host_key_fingerprint": None,
+    }
+
+    left_out = [
+        {
+            "source_ref": "00000000-0000-4000-8000-0000000000f2",
+            "mount_kind": "cloud_outbox",
+            "reason": "mount_unsupported",
+            "detail": "virtual_workspace",
+            "title": "Session outbox",
+        }
+    ]
+    writes: list = []
+    response = await _poll(
+        "sidecar",
+        driver=driver,
+        sidecar_pod=False,
+        status_writes=writes,
+        thread_metadata={
+            "config_override": {"workspace": {"backend": "virtual"}},
+            "workspace_container": {},
+            "_workspace_binding": binding,
+            "cloud_mount_status": sync_status(left_out),
+        },
+    )
+
+    assert response["cloud_folders_excluded"] == left_out
+    for _thread_id, status in writes:
+        assert status is not None and left_out[0] in status["excluded"]
 
 
 @pytest.mark.asyncio

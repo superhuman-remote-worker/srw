@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# srw-voice-gateway — SRW's local voice gateway (local_voice_gateway.md §4)
+# =============================================================================
+# A GPT-Live-compatible endpoint for SRW's phone-line driver: it takes calls
+# from Asterisk over ARI and chan_websocket and talks with the caller through
+# an engine (scripted, echo, or the cascade: VAD, Smart Turn, STT, voice LLM,
+# TTS over OpenAI-compatible HTTP). The same image renders the Asterisk
+# addon's config (python -m voice_gateway.asterisk.render, an init container).
+#
+#   docker build -f docker/Dockerfile.voice-gateway -t srw-voice-gateway .
+#
+# Dependencies come from requirements/locks/voice-gateway-py312.txt (hashes
+# required, wheels only, installed with --no-deps; scripts/lock_dependencies.py
+# documents the one excluded distribution). Pipecat 1.12.0 carries Silero VAD
+# v6.0 and the Smart Turn v3.2 model in its locked wheel; Silero VAD v6.2.3,
+# which the cascade loads instead (turn.vad_model_file), is fetched here from
+# a pinned commit and checked by sha256.
+#
+# Runs as uid/gid 10001 on a read-only root: a pod mounts /tmp as a memory
+# emptyDir (Numba's cache). Nothing writes audio; the gateway keeps a call's
+# audio in memory only.
+# =============================================================================
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+
+# Optional: a pip cache to install from (an offline or slow-link build):
+#   docker build --build-context pip-cache=DIR ...
+# Empty by default; pip checks every file against the lock's hashes either way.
+FROM scratch AS pip-cache
+
+FROM ${PYTHON_IMAGE} AS build
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /build
+COPY requirements/ ./requirements/
+COPY scripts/lock_dependencies.py ./scripts/
+COPY src/voice_gateway/requirements.txt ./src/voice_gateway/requirements.txt
+RUN --mount=type=bind,from=pip-cache,target=/root/.cache/pip,rw \
+    python scripts/lock_dependencies.py check voice-gateway \
+    && mkdir -p -m 0755 /opt/srw-voice/models \
+    && python -m venv /opt/srw-voice/venv \
+    && /opt/srw-voice/venv/bin/python -m pip install \
+        --require-hashes --no-deps --only-binary :all: \
+        -r requirements/locks/voice-gateway-py312.txt
+RUN --network=none /opt/srw-voice/venv/bin/python -I scripts/lock_dependencies.py \
+        check voice-gateway --installed \
+    && /opt/srw-voice/venv/bin/python -I scripts/lock_dependencies.py pip-check voice-gateway
+
+# Silero VAD v6.2.3 (MIT), the snakers4/silero-vad tree at its v6.2.3 commit.
+ADD --checksum=sha256:1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3 --chmod=0444 \
+    https://raw.githubusercontent.com/snakers4/silero-vad/5cd7945676eb32225748052e2e6a0580e4686a08/src/silero_vad/data/silero_vad.onnx \
+    /opt/srw-voice/models/silero_vad-v6.2.3.onnx
+
+COPY src/voice_gateway/ /app/voice_gateway/
+# Bytecode now, so nothing is written on a read-only root at start; then an
+# offline import of every entry point and the cascade's Pipecat stack.
+RUN --network=none set -eux; \
+    /opt/srw-voice/venv/bin/python -m compileall -q /opt/srw-voice/venv/lib /app; \
+    cd /; \
+    PYTHONPATH=/app /opt/srw-voice/venv/bin/python -c "\
+import voice_gateway.__main__, voice_gateway.asterisk.render, voice_gateway.server; \
+import voice_gateway.engines.cascade.engine, voice_gateway.engines.cascade.turns; \
+import onnxruntime; \
+onnxruntime.InferenceSession('/opt/srw-voice/models/silero_vad-v6.2.3.onnx', providers=['CPUExecutionProvider'])"
+
+FROM ${PYTHON_IMAGE}
+
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/superhuman-remote-worker/srw"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/superhuman-remote-worker/srw"
+
+LABEL org.opencontainers.image.title="srw-voice-gateway" \
+      org.opencontainers.image.description="SRW's local voice gateway: Asterisk calls to a GPT-Live-compatible live session" \
+      org.opencontainers.image.source="${SRW_SOURCE_URL}" \
+      org.opencontainers.image.revision="${SRW_SOURCE_REVISION}" \
+      org.opencontainers.image.version="${SRW_RELEASE_VERSION}" \
+      org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}" \
+      io.srw.component="voice-gateway"
+
+COPY --from=build /opt/srw-voice /opt/srw-voice
+COPY --from=build /app /app
+
+ENV PATH=/opt/srw-voice/venv/bin:$PATH \
+    PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    NUMBA_CACHE_DIR=/tmp/numba
+
+USER 10001:10001
+WORKDIR /app
+# Protocol API (Bearer key) and the media listener Asterisk dials.
+EXPOSE 18440/tcp 18441/tcp
+ENTRYPOINT ["python", "-m", "voice_gateway"]
+CMD ["--config", "/etc/srw-voice/gateway.yaml"]

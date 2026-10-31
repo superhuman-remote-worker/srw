@@ -1,0 +1,30 @@
+# A Job that runs the Claude Code harness image through the Expert in
+# claude-code-harness-expert.yaml. Apply that Expert first.
+# Needs: the image approved in manifestHosting.approvedImages, the
+# custom_harness_images grant (administrators bypass it), and a catalog model
+# whose API shape is anthropic-messages (Admin -> Models). The Claude Code image
+# refuses a job whose model uses another API shape. The job runs as an SRW agent
+# pod: one cold pod for this job, pinned to one lane, gone when it reports.
+# See docs/harness-images.md and harnesses/claude-code/README.md.
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: claude-code-harness-example
+  scope: {kind: Account, name: personal}
+spec:
+  task:
+    text: Read README.md in the workspace and write a one-page summary of the project to SUMMARY.md.
+  execution:
+    expert:
+      ref:
+        name: claude-code-harness
+        scope: {kind: Account, name: personal}
+    workspace:
+      template:
+        inline:
+          backend: sandbox
+          resources: {cpu: 2, memory: 4Gi, storage: 10Gi}
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 3600

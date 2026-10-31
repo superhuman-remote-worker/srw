@@ -7,6 +7,7 @@ knowledge-base/knowledge/issues/website_demo_findings_2026_10_11.md, F1.
 """
 
 import dataclasses
+import json
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -17,7 +18,11 @@ from agent.core.context import (
     sanitize_history_for_provider_boundary,
     strip_unreplayable_blocks,
 )
-from agent.core.thread_messages import ANTHROPIC_CONTENT_KEY, _serialize_message_row
+from agent.core.thread_messages import (
+    ANTHROPIC_CONTENT_KEY,
+    NATIVE_CONTENT_KEY,
+    _serialize_message_row,
+)
 from shared.runtime.core import loader
 
 PROXY_URL = "http://srw-codex-proxy:8317/v1"
@@ -112,6 +117,20 @@ class TestRequest:
         assert _sampling(payload, "temperature") == 0.0
         assert _sampling(payload, "top_p") == 0.9
 
+    def test_a_non_claude_model_on_the_anthropic_shape_sends_no_sampling(self):
+        # Meta's Anthropic-compatible API answers 400 "temperature is removed".
+        config = _config(
+            model="muse-spark-1.3-contributor",
+            provider="anthropic",
+            base_url="https://api.meta.ai",
+            top_k=40,
+        )
+        payload = _payload(loader._create_anthropic_llm(config))
+
+        assert "thinking" not in payload
+        for sampling in ("temperature", "top_p", "top_k"):
+            assert _sampling(payload, sampling) is None, sampling
+
 
 class TestReplayHygiene:
     def test_a_stripped_call_takes_its_tool_use_block_along(self):
@@ -179,15 +198,33 @@ class TestPersistence:
         row = _serialize_message_row(self._claude_turn(), 1)
 
         assert row["content"] == ""
+        # As JSON text: jsonb would hand the tool_use block back "id" first.
         assert row["provider_raw"] == {
-            ANTHROPIC_CONTENT_KEY: self._claude_turn().content,
+            NATIVE_CONTENT_KEY: json.dumps(self._claude_turn().content),
             "model": "claude-opus-5-5",
+            "provider": "anthropic",
         }
 
-    def test_other_list_content_is_not_kept(self):
-        message = AIMessage(content=[{"type": "text", "text": "hello"}])
+    def test_a_plain_text_turn_keeps_no_envelope(self):
+        message = AIMessage(content="hello")
 
         assert "provider_raw" not in _serialize_message_row(message, 1)
+
+    def test_a_row_stored_under_the_anthropic_key_still_restores(self):
+        from agent.api.persistent_app import _db_rows_to_lc_messages
+
+        row = {
+            **_serialize_message_row(self._claude_turn(), 1),
+            "id": "ai-1",
+            "provider_raw": {
+                ANTHROPIC_CONTENT_KEY: self._claude_turn().content,
+                "model": "claude-opus-5-5",
+            },
+        }
+        (ai,) = _db_rows_to_lc_messages([row])
+
+        assert ai.content == self._claude_turn().content
+        assert ai.response_metadata == {"model_name": "claude-opus-5-5"}
 
     def test_restore_rebuilds_the_blocks_and_keeps_own_thinking(self):
         from agent.api.persistent_app import _db_rows_to_lc_messages

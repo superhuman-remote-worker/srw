@@ -3,6 +3,7 @@ import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {forkJoin, map} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
+import {chatModelLabel} from '../../core/services/model.service';
 import {
   SUBAGENT_INHERIT_MODEL,
   type Expert,
@@ -61,6 +62,7 @@ export interface RosterEntryDraft {
 export interface ModelCatalogGroup {
   group: string;
   models: string[];
+  labels?: Record<string, string>;
 }
 
 export interface ParsedExtra {
@@ -280,7 +282,7 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
                 @for (g of models(); track g.group) {
                   <optgroup [label]="g.group">
                     @for (m of g.models; track m) {
-                      <option [ngValue]="m" [disabled]="!modelAllowed()(m)">{{ m }}</option>
+                      <option [ngValue]="m" [disabled]="!modelAllowed()(m)">{{ modelLabel(g, m) }}</option>
                     }
                   </optgroup>
                 }
@@ -438,6 +440,8 @@ export class SubagentsEditorComponent {
 
   /** The model catalog (same source as the Model row). */
   models = input<readonly ModelCatalogGroup[]>([]);
+  /** Option text: the catalog label; the value stays the model id. */
+  readonly modelLabel = chatModelLabel;
   /** True when a model_selection restriction is in force. */
   modelGated = input(false);
   /** Per-model allow predicate (deny-default PDP mirror). */

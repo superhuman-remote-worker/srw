@@ -5,8 +5,10 @@ import {
   datasourceSelectionDifferenceCount,
   datasourceSetKey,
   isRepositoryDatasource,
+  liteHoldsBack,
   requiresShellWorkspace,
   selectedDatasourceIds,
+  tierHiddenAttachedIds,
   DatasourcesGroupComponent,
 } from './datasources-group.component';
 import {DatasourceType, EligibleDatasource} from '../../core/models/api.model';
@@ -43,6 +45,12 @@ function makeDs(id: string, type: string, defaultSelected = false): EligibleData
 }
 
 describe('datasources-group selection logic', () => {
+  it('names the attached connectors a lite tier hides, so a save keeps them', () => {
+    const ds = [makeDs('key', 'credentials'), makeDs('kb', 'kb'), makeDs('spare', 'credentials')];
+    expect(tierHiddenAttachedIds(ds, ['key', 'kb'], true)).toEqual(['key']);
+    expect(tierHiddenAttachedIds(ds, ['key', 'kb'], false)).toEqual([]);
+  });
+
   it('excludes credentials from workspaces without a shell', () => {
     const ds = [makeDs('key', 'credentials'), makeDs('kb', 'kb')];
     const selection = {key: datasourceSetKey(ds), ids: new Set(['key', 'kb'])};
@@ -176,6 +184,38 @@ describe('datasources-group selection logic', () => {
     // The explicit empty list the create form sends: no connector at all.
     expect(selectedDatasourceIds(ds, none, false)).toEqual([]);
     expect(datasourceSelectionDifferenceCount(ds, none)).toBe(2);
+  });
+
+  it('keeps cloud folders on a Virtual default a cloud folder takes to a Container, and only them', () => {
+    const folder = makeDs('folder', 'cloud_folder', true);
+    const outbox = makeDs('outbox', 'cloud_outbox', true);
+    const repo = makeDs('repo', 'repository', true);
+    const kb = makeDs('kb', 'kb', true);
+    const ds = [folder, outbox, repo, kb];
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, true)).toBe(false);
+    expect(liteHoldsBack('cloud_outbox', BUILTIN_DRIVERS, true)).toBe(false);
+    expect(liteHoldsBack('repository', BUILTIN_DRIVERS, true)).toBe(true);
+    // Without the tier's name either lite tier may refuse it; a Virtual
+    // Session named serves cloud folders itself (the cloud_remote form).
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS)).toBe(true);
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, false, 'virtual')).toBe(false);
+    expect(liteHoldsBack('cloud_outbox', BUILTIN_DRIVERS, false, 'virtual')).toBe(false);
+    expect(liteHoldsBack('cloud_folder', BUILTIN_DRIVERS, false, 'none')).toBe(true);
+    expect(liteHoldsBack('repository', BUILTIN_DRIVERS, false, 'virtual')).toBe(true);
+    // The fallback copy knows the Virtual tier's two served types too.
+    expect(requiresShellWorkspace('cloud_folder', null, 'virtual')).toBe(false);
+    expect(requiresShellWorkspace('cloud_outbox', [], 'virtual')).toBe(false);
+    expect(requiresShellWorkspace('cloud_folder', null, 'none')).toBe(true);
+    expect(requiresShellWorkspace('repository', null, 'virtual')).toBe(true);
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS, false, 'virtual'))
+      .toEqual(['folder', 'outbox', 'kb']);
+    // Ticked on Virtual, the cloud folders are sent (they take the Session
+    // to a Container); a repository still waits for a shell.
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS, true))
+      .toEqual(['folder', 'outbox', 'kb']);
+    expect(selectedDatasourceIds(ds, null, true, undefined, true, BUILTIN_DRIVERS))
+      .toEqual(['kb']);
+    expect(allDatasourcesSelected(ds, null, true, undefined, [], true, BUILTIN_DRIVERS, true)).toBe(true);
   });
 
   it('isRepositoryDatasource is case-insensitive', () => {

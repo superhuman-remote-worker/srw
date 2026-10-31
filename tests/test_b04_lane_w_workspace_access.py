@@ -2,7 +2,7 @@
 
 R1.B04 lane W. The refusal ordering is the point: the internal-key gate fires
 before any body-shaped 400, the owner-grant check fires before provisioning,
-and ``ensure-workspace-access`` keeps its authentication *inside* the
+and ``ensure-workspace-access`` keeps its job-access gate *inside* the
 try/except that turns an unexpected failure into a logged 500.
 """
 
@@ -43,6 +43,8 @@ def wire(monkeypatch):
         events.append("job_access")
         if request.headers.get("x-test-user") != USER["id"]:
             raise HTTPException(status_code=401, detail="Authentication required")
+        if state.job_access_error is not None:
+            raise state.job_access_error
         return USER, dict(state.job)
 
     async def require_approved_user(request, store):
@@ -75,6 +77,7 @@ def wire(monkeypatch):
         job={"id": JOB, "status": "processing", "context": {}, "user_id": USER["id"]},
         repo=("srw-job", "main"),
         approve_error=None,
+        job_access_error=None,
         grants_error=None,
         contract=_Contract(),
         transitioned=True,
@@ -318,7 +321,7 @@ class TestEnsureWorkspaceAccess:
 
     @pytest.mark.asyncio
     async def test_authentication_precedes_the_job_lookup(self, wire):
-        wire.state.approve_error = HTTPException(status_code=403, detail="pending")
+        wire.state.job_access_error = HTTPException(status_code=403, detail="pending")
 
         response = await call(wire, "POST", self.PATH)
 
@@ -327,8 +330,24 @@ class TestEnsureWorkspaceAccess:
         wire.holder.store.get_job.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_caller_who_cannot_see_the_job_is_granted_nothing(self, wire):
+        # N36: an approved account is not enough; the grant makes the caller
+        # a collaborator on the job's repo, so the gate is job visibility.
+        wire.state.job = dict(wire.state.job, repo_name="srw-job")
+        wire.state.job_access_error = HTTPException(
+            status_code=403, detail="Not authorized to access this job"
+        )
+
+        response = await call(wire, "POST", self.PATH)
+
+        assert response.status_code == 403
+        assert "job_access" in wire.events
+        assert "approved" not in wire.events
+        wire.holder.forge.grant_user_repo_access.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_non_http_gate_failure_becomes_a_logged_500(self, wire):
-        wire.state.approve_error = RuntimeError("keycloak down")
+        wire.state.job_access_error = RuntimeError("keycloak down")
 
         response = await call(wire, "POST", self.PATH)
 
@@ -361,13 +380,12 @@ class TestEnsureWorkspaceAccess:
             wire.holder.forge.is_initialized = False
         if reason == "no_email":
             user_without_email = {k: v for k, v in USER.items() if k != "email"}
-            wire.state.approve_error = None
             wire.holder.store.get_job = AsyncMock(
                 side_effect=lambda _id: dict(wire.state.job)
             )
 
-            async def approve(_request, _store):
-                return user_without_email
+            async def approve(_request, _store, _job_id):
+                return user_without_email, dict(wire.state.job)
 
             wire.app.state.workspace_access_dependencies_factory = lambda: _swap_gate(
                 wire.factory(), approve
@@ -408,8 +426,8 @@ def _swap_gate(dependencies, approve):
         operations=dependencies.operations,
         resolve_job_repo=dependencies.resolve_job_repo,
         require_admin=dependencies.require_admin,
-        require_approved_user=approve,
-        require_job_access=dependencies.require_job_access,
+        require_approved_user=dependencies.require_approved_user,
+        require_job_access=approve,
         require_internal=dependencies.require_internal,
     )
 

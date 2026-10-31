@@ -13,6 +13,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from shared.workspace_upgrade import SEED_FROM_KEY
+
 
 @dataclass(frozen=True)
 class SessionCreationCursor:
@@ -149,7 +151,10 @@ SELECT s.*, to_jsonb(t) AS owner,
              AND (h.target_disposition<>'deleted' OR h.snapshot_restore_required)
        ) AS conflicting_authority
 FROM sources s JOIN threads t ON t.id=s.thread_id
-WHERE t.status IN ('created','active') AND t.execution_lane=s.lane
+WHERE (t.status IN ('created','active')
+       OR (t.status='awaiting_user' AND s.lane='stateless'
+           AND t.metadata->'workspace_container' ? 'seed_from'))
+  AND t.execution_lane=s.lane
   AND ($2::timestamptz IS NULL OR
        (s.created_at,s.thread_id,s.source_id)>($2,$3::uuid,$4::uuid))
 ORDER BY s.created_at,s.thread_id,s.source_id LIMIT $5
@@ -307,6 +312,18 @@ def _retained_create_lineage(
     }
 
 
+def _owner_status_observable(owner: dict, lane: str, workspace: dict) -> bool:
+    """A creation is observed while its owner runs or is new. A C1 upgrade owed
+    its copy is also observed while the Session waits for its user: it has
+    chatted, and nothing else carries its Pod to Ready."""
+    status = owner.get("status")
+    if status in {"created", "active"}:
+        return True
+    return (
+        status == "awaiting_user" and lane == "stateless" and SEED_FROM_KEY in workspace
+    )
+
+
 def candidate_from_record(row: Any) -> SessionCreationCandidate | None:
     """Fail closed on malformed, retired, restored or historical source hints."""
     try:
@@ -328,7 +345,7 @@ def candidate_from_record(row: Any) -> SessionCreationCandidate | None:
         )
         if (
             (not retained and row["initial_source"] is not True)
-            or owner.get("status") not in {"created", "active"}
+            or not _owner_status_observable(owner, lane, workspace)
             or owner.get("execution_lane") != lane
             or owner.get("runtime_retirement_token") is not None
             or (agent is None) != (attach is None)

@@ -1418,8 +1418,9 @@ def apply_mcp_scope(
 #      can't forge the key).
 #
 # For pure-internal endpoints (``require_internal``) the key is mandatory.
-# For dual-callable endpoints (``require_internal_or_job_access``) the key
-# acts as an agent-side bypass: with key → skip user auth; without key →
+# For dual-callable endpoints (``require_internal_or_job_access``) the bare
+# key acts as an agent-side bypass: key alone → skip user auth; key plus a
+# delegated ``X-MCP-User-Id`` → ``require_job_access`` as that user; no key →
 # normal ``require_job_access``. Cockpit Bearer flows keep working.
 
 
@@ -1433,6 +1434,28 @@ def is_internal_call(request: Request) -> bool:
     if not _INTERNAL_KEY:
         return False
     return request.headers.get("X-Internal-Key", "") == _INTERNAL_KEY
+
+
+#: The user the MCP server forwards a call for. It rides along with
+#: ``X-Internal-Key`` on every user-driven MCP tool call
+#: (``shared/orch_surface/client.py``), and ``security/auth.py`` resolves it as
+#: the caller.
+DELEGATED_USER_HEADER = "X-MCP-User-Id"
+
+
+def is_internal_service_call(request: Request) -> bool:
+    """True iff a valid ``X-Internal-Key`` arrives with no delegated user.
+
+    The key alone does not make a call the service's own: the MCP server
+    sends it together with ``X-MCP-User-Id`` on every tool call a user
+    drives, and such a call must pass that user's gates. Only a bare
+    internal-key call (an agent deregistering itself on shutdown) is the
+    service acting for itself. Use this, not :func:`is_internal_call`, where
+    the internal key skips a user gate (N9).
+    """
+    if not is_internal_call(request):
+        return False
+    return not request.headers.get(DELEGATED_USER_HEADER, "").strip()
 
 
 async def require_internal(request: Request) -> None:
@@ -1454,18 +1477,29 @@ async def require_internal_or_job_access(
     """Dual-callable endpoint guard. Returns ``(user, job)`` for user calls,
     ``(None, job)`` for internal calls (job still loaded for the handler).
 
-    Internal calls skip the user resolution entirely (the agent runtime
-    has no Keycloak session) but still get the job dict — handlers
-    frequently use it to look up project_id, status, etc. We pay the
-    extra ``get_job`` cost (one query) to keep handler bodies identical
+    A bare internal-key call (the agent runtime, which carries no user)
+    skips the user resolution entirely but still gets the job dict —
+    handlers frequently use it to look up project_id, status, etc. We pay
+    the extra ``get_job`` cost (one query) to keep handler bodies identical
     across the two paths.
 
-    Raises 404 if the job doesn't exist (both paths).
+    A delegated internal call — the key plus ``X-MCP-User-Id``, which MCP,
+    session and officer tool calls all send — must pass
+    :func:`require_job_access` as that user first (owner, project member
+    or admin, with an MCP ``project:`` scope applied; N13). It still
+    returns ``None`` for the user, so the handler keeps the internal-actor
+    semantics it had: a resume's redispatch-livelock acknowledgement stays
+    the runtime-actor (officer) check, and attribution stays "internal".
+
+    Raises 404 if the job doesn't exist (every path).
     """
-    if is_internal_call(request):
+    if is_internal_service_call(request):
         job = await db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        return None, job
+    if is_internal_call(request):
+        _delegated_user, job = await require_job_access(request, db, job_id)
         return None, job
     # Local import to avoid the forward-reference dance — require_job_access
     # is defined earlier in this module.

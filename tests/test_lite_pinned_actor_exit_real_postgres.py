@@ -45,12 +45,20 @@ _schema_applied = fixtures._schema_applied
 
 
 async def _retired_lite_actor(
-    db, monkeypatch, *, permanent=False, status="active", input_state=None
+    db,
+    monkeypatch,
+    *,
+    permanent=False,
+    status="active",
+    input_state=None,
+    untaken_upgrade=False,
 ):
     """One lite actor after Begin+authorize, its exact Pod already terminal.
 
     ``input_state`` seeds a single pinned input owned by that Pod and drives it
     to ``queued``/``admitted``/``settled``; ``None`` seeds no input at all.
+    ``untaken_upgrade`` leaves a VM upgrade request no agent took (a C2 lane
+    switch whose pinned attach failed) before End.
     """
     ids = await fixtures._seed(db, protected_agent_pod=True, workspace_claim=False)
     ids.pop("old_access")
@@ -146,6 +154,14 @@ async def _retired_lite_actor(
         ),
     )
 
+    if untaken_upgrade:
+        await db.execute(
+            "INSERT INTO thread_control_requests (thread_id, request_seq, "
+            "client_request_id, verb, payload, requested_by) VALUES ($1::uuid, 1, "
+            "$2, 'upgrade-to-workspace', '{}'::jsonb, 'real-pg')",
+            ids["thread"],
+            uuid4(),
+        )
     retirement = await db.begin_pinned_thread_retirement(
         ids["thread"], permanent=permanent
     )
@@ -302,6 +318,47 @@ async def test_lite_actor_exit_lets_the_durable_retry_finish_the_thread(
     assert thread["status"] == "ended"
     assert thread["runtime_retirement_token"] is None
     assert await db.list_retryable_pinned_retirements(grace_seconds=0) == []
+
+
+@pytest.mark.asyncio
+async def test_actor_exit_finishes_past_an_upgrade_request_no_agent_took(
+    db, monkeypatch
+):
+    """Dev 2026-10-18 (E2): a lane-switched Session's warm agent failed its
+    attach before it took the VM upgrade request. End passes that request, so
+    the exact zero-admission receipt must pass it too, or the authorized
+    retirement never finishes. The request stays pending for the next owner
+    to cancel."""
+    ids, retirement, k8s = await _retired_lite_actor(
+        db, monkeypatch, untaken_upgrade=True
+    )
+    assert await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
+    receipt = _receipt(await db.get_thread(ids["thread"]))
+    assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
+    assert "recovery_protocol" not in receipt
+
+    await db.execute(
+        "UPDATE agents SET status='offline' WHERE id=$1::uuid", ids["agent"]
+    )
+    (candidate,) = await db.list_retryable_pinned_retirements(grace_seconds=0)
+    assert await stale_agent_detector_service.retry_pending_pinned_retirement(
+        candidate,
+        dependencies=controls_composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+
+    thread = await db.get_thread(ids["thread"])
+    assert thread["status"] == "ended"
+    assert thread["runtime_retirement_token"] is None
+    request = await db.fetchrow(
+        "SELECT outcome, accepted_agent_id FROM thread_control_requests "
+        "WHERE thread_id=$1::uuid",
+        ids["thread"],
+    )
+    assert (request["outcome"], request["accepted_agent_id"]) == (None, None)
 
 
 def _route_died_with_the_pod(monkeypatch, ids):

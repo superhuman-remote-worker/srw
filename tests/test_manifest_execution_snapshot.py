@@ -148,7 +148,7 @@ class Connection:
             return deepcopy(self.execution)
         if "INSERT INTO jobs" in query:
             assert self.in_transaction
-            row = {"id": args[-1], "status": args[5]}
+            row = {"id": args[22], "status": args[5]}
             self.jobs.append(row)
             return row
         if "INSERT INTO threads" in query:
@@ -279,7 +279,7 @@ async def test_thread_snapshot_captures_complete_initial_metadata_in_insert_tran
         assert kwargs["expert_id"] == WORK
         assert kwargs["config_override"]["llm"] == {"model": "chosen"}
         assert (
-            kwargs["config_override"]["interactive"]["permission_mode"] == "supervised"
+            kwargs["config_override"]["interactive"]["permission_mode"] == "read_only"
         )
         return {}
 
@@ -558,6 +558,109 @@ def test_srw_private_authority_and_tool_smuggling_are_rejected(fragment):
     with pytest.raises(HTTPException):
         snapshots.validate_srw_authored_fragment(fragment)
     assert fragment == before
+
+
+_DESK_GREETING = "Hello, this is the Example desk's AI assistant."
+_DESK_FACTS = "The Example desk is open Monday to Friday."
+
+
+async def _admit_expert(config, *, base="worker_base"):
+    """Admit a Job for a DB expert whose fragment is ``config`` on ``base``."""
+    db = SimpleNamespace(
+        get_user_settings=AsyncMock(return_value={"default_model": "gpt-4o"}),
+        resolve_default_for_capability=AsyncMock(return_value=None),
+        get_system_setting=AsyncMock(return_value={"value": {"enabled": False}}),
+        get_user=AsyncMock(return_value={"id": USER, "is_admin": False}),
+    )
+    return await snapshots.prepare_srw_snapshot(
+        db,
+        work_kind="Job",
+        work_id=WORK,
+        owner_id=USER,
+        project_ids=[],
+        config_name="worker_base",
+        expert_id=None,
+        expert_row={
+            "name": "example-desk",
+            "expert_type": "worker",
+            "harness_config_name": base,
+            "harness_asset_name": base if base != "worker_base" else None,
+            "config": config,
+            "prompts": {},
+        },
+        description="Answer the call",
+        config_override={"workspace": {"backend": "none"}},
+        datasource_ids=[],
+        policy_revisions={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_partial_override_of_an_inherited_live_entry_is_admitted():
+    """A DB expert on the receptionist overrides only the voice's greeting
+    and facts; it inherits `driver: live` (it was refused with 422
+    `subagents.roster.voice.live: requires driver: live`)."""
+    result = await _admit_expert(
+        {
+            "subagents": {
+                "roster": {
+                    "voice": {
+                        "live": {"greeting": _DESK_GREETING, "facts": _DESK_FACTS}
+                    }
+                }
+            }
+        },
+        base="receptionist",
+    )
+    blob, policy = snapshots.srw_snapshot_config(result)
+    voice = blob["agent"]["subagents"]["roster"]["voice"]
+    assert voice["driver"] == "live"
+    assert voice["live"]["greeting"] == _DESK_GREETING
+    assert voice["live"]["facts"] == _DESK_FACTS
+    assert voice["live"]["persona"].startswith("You are the receptionist")
+    assert policy["subagents"]["roster"]["voice"]["driver"] == "live"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "base", "message"),
+    [
+        # A live block on an entry that is not a live voice entry: each layer
+        # is well formed, the merged entry is not.
+        (
+            {
+                "subagents": {
+                    "roster": {
+                        "helper": {
+                            "description": "An LLM helper.",
+                            "live": {"greeting": _DESK_GREETING},
+                        }
+                    }
+                }
+            },
+            "worker_base",
+            "subagents.roster.helper.live: requires driver: live",
+        ),
+        (
+            {"subagents": {"roster": {"voice": {"driver": None}}}},
+            "receptionist",
+            "subagents.roster.voice.live: requires driver: live",
+        ),
+        # Refused by the authored-fragment gate already.
+        (
+            {"subagents": {"roster": {"voice": {"driver": "phone"}}}},
+            "receptionist",
+            "'phone' is not a driver",
+        ),
+    ],
+)
+async def test_a_roster_that_breaks_the_live_contract_is_refused_at_admission(
+    config, base, message
+):
+    with pytest.raises(HTTPException) as refused:
+        await _admit_expert(config, base=base)
+    assert refused.value.status_code == 422
+    assert message in str(refused.value.detail)
 
 
 @pytest.mark.asyncio
@@ -1496,3 +1599,131 @@ async def test_a_changed_inline_expert_is_what_gets_frozen(monkeypatch):
     assert blob["prompts"]["instructions"] == "Edited in the creation form."
     # The authored reasoning level the form did not touch survives the copy.
     assert blob["agent"]["llm"]["reasoning_level"] == "high"
+
+
+CUSTOM_HARNESS = "example.invalid/h@sha256:" + "b" * 64
+APPROVED_HARNESSES = ({"name": "cc", "image": CUSTOM_HARNESS},)
+SAVED_EXPERT = "77777777-7777-4777-8777-777777777777"
+
+
+def _saved_expert_db(image=CUSTOM_HARNESS, *, approved=APPROVED_HARNESSES):
+    """A saved SRW Expert naming ``image``, on an installation at installed:1."""
+    runtime = {"adapter": "srw/v1"}
+    if image is not None:
+        runtime["image"] = image
+    return SimpleNamespace(
+        manifest_runtime_image="installed:1",
+        manifest_approved_images=approved,
+        get_expert_by_id=AsyncMock(
+            return_value={
+                "id": SAVED_EXPERT,
+                "name": "custom-harness",
+                "harness_adapter": "srw/v1",
+                "expert_type": "worker",
+                "config": {},
+                "prompts": {},
+                "harness_config_layers": [],
+                "manifest": {"spec": {"runtime": runtime}},
+            }
+        ),
+        get_user_settings=AsyncMock(return_value={"default_model": "gpt-4o"}),
+        resolve_default_for_capability=AsyncMock(return_value=None),
+        get_system_setting=AsyncMock(return_value={"value": {"enabled": True}}),
+        get_user=AsyncMock(return_value={"id": USER, "is_admin": True}),
+    )
+
+
+async def _saved_expert_snapshot(db, kind="Job", **extra):
+    return await snapshots.prepare_srw_snapshot(
+        db,
+        work_kind=kind,
+        work_id=WORK,
+        owner_id=USER,
+        project_ids=[],
+        config_name="worker_base" if kind == "Job" else "session_base",
+        expert_id=SAVED_EXPERT,
+        description="Run on the Expert's harness",
+        config_override={},
+        datasource_ids=[],
+        policy_revisions={},
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_snapshot_refuses_an_approved_image_expert_as_jobs_only():
+    with pytest.raises(HTTPException) as refused:
+        await _saved_expert_snapshot(_saved_expert_db(), kind="Session")
+    assert refused.value.status_code == 422
+    assert "jobs only" in refused.value.detail
+
+
+@pytest.mark.asyncio
+async def test_a_job_snapshot_records_the_experts_approved_image():
+    result = await _saved_expert_snapshot(
+        _saved_expert_db(), harness_image=CUSTOM_HARNESS
+    )
+    validate_documents([result["document"]])
+    for key in ("document", "resolved"):
+        runtime = result[key]["spec"]["execution"]["expert"]["inline"]["runtime"]
+        assert runtime["image"] == CUSTOM_HARNESS
+
+
+@pytest.mark.asyncio
+async def test_a_custom_image_expert_never_falls_back_to_the_installed_image():
+    """Automations, loops, officer and verification paths create jobs without
+    job admission; such a job must be refused, not run on the default image."""
+    with pytest.raises(HTTPException) as refused:
+        await _saved_expert_snapshot(_saved_expert_db())
+    assert refused.value.status_code == 422
+    assert refused.value.detail == (
+        "This Expert's harness image runs only through job admission."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expert_image", [None, "installed:1"])
+async def test_a_harness_image_the_expert_does_not_name_is_refused(expert_image):
+    with pytest.raises(HTTPException) as refused:
+        await _saved_expert_snapshot(
+            _saved_expert_db(expert_image), harness_image=CUSTOM_HARNESS
+        )
+    assert refused.value.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expert_image", [None, "installed:1"])
+async def test_an_installed_image_expert_records_the_installed_image(expert_image):
+    result = await _saved_expert_snapshot(_saved_expert_db(expert_image))
+    runtime = result["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"]
+    assert runtime["image"] == "installed:1"
+
+
+@pytest.mark.asyncio
+async def test_an_image_off_the_approved_list_is_refused_at_the_snapshot():
+    with pytest.raises(HTTPException) as refused:
+        await _saved_expert_snapshot(
+            _saved_expert_db(approved=()), harness_image=CUSTOM_HARNESS
+        )
+    assert refused.value.status_code == 422
+    assert "approved list" in refused.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness_image", [CUSTOM_HARNESS, None])
+async def test_job_insert_forwards_its_harness_image_to_its_snapshot(
+    monkeypatch, harness_image
+):
+    connection = Connection()
+    db = database(connection)
+    capture = AsyncMock(side_effect=HTTPException(409, "stop after capture"))
+    monkeypatch.setattr(snapshots, "capture_execution", capture)
+    with pytest.raises(HTTPException):
+        await db.create_job(
+            description="Task",
+            job_id=WORK,
+            expert_id=SAVED_EXPERT,
+            harness_image=harness_image,
+        )
+    assert capture.await_args.kwargs["harness_image"] == harness_image
+    assert connection.jobs == []

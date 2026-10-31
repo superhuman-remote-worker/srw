@@ -1,0 +1,298 @@
+{{- /*
+The Asterisk addon (local_voice_gateway.md §4.2, §4.4): SRW's own Asterisk
+(the srw-asterisk image) speaks SIP to the customer's phone system. Each line
+registers as an extension or takes calls from the PBX's address (peer); every
+call goes to the voice gateway's ARI app, its audio over chan_websocket.
+
+* Config is rendered at start by an init container (the gateway image's
+  python -m voice_gateway.asterisk.render) from the line values and the
+  password files into a memory emptyDir Asterisk mounts read-only.
+* Read-only root: its key-value store and control socket live in a memory
+  emptyDir at /run/asterisk. Nothing records audio (no file formats loaded).
+* The PBX reaches SIP 5060 (UDP and TCP) and an RTP range (two ports per call)
+  either at a pinned node's address (hostNetwork) or at a LoadBalancer IP
+  (network.externalAddress, which Asterisk advertises outside localNets).
+* ARI admits only the gateway (on the pod network; a hostNetwork pod is
+  outside NetworkPolicy, see asterisk.network).
+*/ -}}
+{{- if .Values.asterisk.enabled }}
+{{- include "srw.voiceValidate" . }}
+{{- $asterisk := .Values.asterisk }}
+{{- $network := $asterisk.network }}
+{{- $name := include "srw.asteriskName" . }}
+{{- $hostNetwork := eq $network.mode "hostNetwork" }}
+{{- $ariPort := int $asterisk.ari.port }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+data:
+  asterisk.yaml: |
+    {{- include "srw.asteriskAddonValues" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+spec:
+  replicas: 1
+  # One registration per line, and on hostNetwork one owner of the node's
+  # SIP and RTP ports: the old pod stops before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "srw.asteriskAddonValues" . | sha256sum }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $hostNetwork }}
+      hostNetwork: true
+      # Cluster names (the gateway's media Service) from the node's network.
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ $asterisk.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $asterisk.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $asterisk.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $asterisk.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: render
+          image: {{ include "srw.imageRef" (dict "image" .Values.voiceGateway.image) | quote }}
+          imagePullPolicy: {{ .Values.voiceGateway.image.pullPolicy }}
+          command: ["python", "-m", "voice_gateway.asterisk.render"]
+          args:
+            - --values
+            - /etc/srw-voice/asterisk.yaml
+            # A directory of its own in the volume: the renderer makes it
+            # 0750 (the volume's root belongs to the kubelet).
+            - --out
+            - /etc/asterisk-rendered/etc
+            # ARI on the pod's own address, never every interface.
+            - --ari-bind
+            - {{ printf "$(POD_IP):%d" $ariPort | quote }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: values
+              mountPath: /etc/srw-voice
+              readOnly: true
+            - name: secrets
+              mountPath: /run/srw-voice
+              readOnly: true
+            - name: config
+              mountPath: /etc/asterisk-rendered
+      containers:
+        - name: asterisk
+          image: {{ include "srw.imageRef" (dict "image" $asterisk.image) | quote }}
+          imagePullPolicy: {{ $asterisk.image.pullPolicy }}
+          ports:
+            - name: sip-udp
+              containerPort: {{ int $asterisk.sip.port }}
+              protocol: UDP
+            - name: sip-tcp
+              containerPort: {{ int $asterisk.sip.port }}
+              protocol: TCP
+            - name: ari
+              containerPort: {{ $ariPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: ari
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: ari
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml $asterisk.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/asterisk
+              subPath: etc
+              readOnly: true
+            - name: run
+              mountPath: /run/asterisk
+      volumes:
+        - name: values
+          configMap:
+            name: {{ $name }}
+        - name: secrets
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ include "srw.voiceSecretName" . }}
+                  items:
+                    - key: asterisk-password
+                      path: asterisk-password
+              {{- range $line := .Values.voiceGateway.lines }}
+              {{- with $line.passwordSecret }}
+              - secret:
+                  name: {{ .name }}
+                  items:
+                    - key: {{ .key }}
+                      path: {{ printf "lines/%s/sip-password" $line.name }}
+              {{- end }}
+              {{- end }}
+        # The rendered /etc/asterisk (it holds the passwords): in memory.
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
+        # Asterisk's key-value store and control socket.
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.asteriskAriName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: ari
+      port: {{ $ariPort }}
+      targetPort: {{ $ariPort }}
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+{{- if not $hostNetwork }}
+---
+# SIP and RTP for the phone system, at one load balancer address. Local
+# traffic policy keeps the PBX's source address (a peer line is matched by
+# it) and RTP on the node that runs Asterisk.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-sip" $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+  {{- with $network.loadBalancer.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  {{- with $network.loadBalancer.class }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- with $network.loadBalancer.ip }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with $network.allowedSources }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: sip-udp
+      port: {{ int $asterisk.sip.port }}
+      targetPort: {{ int $asterisk.sip.port }}
+      protocol: UDP
+    - name: sip-tcp
+      port: {{ int $asterisk.sip.port }}
+      targetPort: {{ int $asterisk.sip.port }}
+      protocol: TCP
+    {{- range $port := untilStep (int $asterisk.rtp.start) (add1 (int $asterisk.rtp.end) | int) 1 }}
+    - name: {{ printf "rtp-%d" $port }}
+      port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: UDP
+    {{- end }}
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "asterisk") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "asterisk") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # ARI: the voice gateway only.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "voice-gateway") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $ariPort }}
+    # SIP and RTP: the phone system (network.allowedSources; any when empty).
+    - {{- with $network.allowedSources }}
+      from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      ports:
+        - protocol: UDP
+          port: {{ int $asterisk.sip.port }}
+        - protocol: TCP
+          port: {{ int $asterisk.sip.port }}
+        - protocol: UDP
+          port: {{ int $asterisk.rtp.start }}
+          endPort: {{ int $asterisk.rtp.end }}
+{{- end }}
+{{- end }}

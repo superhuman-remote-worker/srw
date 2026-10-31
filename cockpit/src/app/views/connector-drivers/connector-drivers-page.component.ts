@@ -260,7 +260,12 @@ export function errorDetail(error: unknown): string {
 
               <dl class="facts">
                 <dt>{{ 'connectorDrivers.plane' | transloco }}</dt>
-                <dd>{{ planeLabel(driver) | transloco }}</dd>
+                <dd>
+                  {{ planeLabel(driver) | transloco }}
+                  @for (entry of formPlanes(driver); track entry.form) {
+                    <span class="form-plane">· {{ entry.form }}: {{ entry.label | transloco }}</span>
+                  }
+                </dd>
 
                 <dt>{{ 'connectorDrivers.delivery' | transloco }}</dt>
                 <dd>{{ driver.delivery_forms.join(', ') }}</dd>
@@ -785,6 +790,19 @@ export class ConnectorDriversPageComponent implements OnInit {
 
   protected planeLabel(driver: ConnectorDriver): string {
     return PLANES.has(driver.plane) ? `connectorDrivers.planes.${driver.plane}` : driver.plane;
+  }
+
+  /** The plane per delivery form, for a driver whose forms run in different
+   *  planes (a cloud folder: mounted for a Container, reached from the agent
+   *  process for a Virtual Session); empty for every other driver. */
+  protected formPlanes(driver: ConnectorDriver): {form: string; label: string}[] {
+    const planes = driver.form_planes ?? {};
+    return Object.entries(planes)
+      .filter(([, plane]) => plane !== driver.plane)
+      .map(([form, plane]) => ({
+        form,
+        label: PLANES.has(plane as ConnectorDriver['plane']) ? `connectorDrivers.planes.${plane}` : plane,
+      }));
   }
 
   protected egressText(column: ConnectorEgressStatus): string {

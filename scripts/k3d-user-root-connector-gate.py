@@ -101,6 +101,7 @@ import argparse
 import base64
 import hashlib
 import html
+import importlib.util
 import json
 import re
 import secrets
@@ -114,6 +115,16 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# The run's OAuth client gets the gate clients' protocol mappers: `sub` and
+# the audience the API's Bearer check accepts (scripts/k3d_gate_oauth.py),
+# so its logins send an access token, never an ID token.
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 LOCAL_CONTEXT = "k3d-srw"
 LOCAL_NAMESPACE = "srw"
 LOCAL_CONFIRMATION = "LOCAL-K3D-DISPOSABLE"
@@ -300,7 +311,7 @@ form = urllib.parse.urlencode({
     "username": envelope["username"], "password": envelope["password"],
 }).encode()
 with opener.open(envelope["token_url"], data=form, timeout=30) as response:
-    token = json.load(response)["id_token"]
+    token = json.load(response)["access_token"]
 body = envelope.get("body")
 request = urllib.request.Request(
     "http://localhost:8085" + envelope["path"],
@@ -353,6 +364,7 @@ print(json.dumps({
 # run's marker or e-mail. The D4 gate's program, for several users.
 _KEYCLOAK_PROGRAM = (
     _POD_MEMORY_CAP
+    + gate_oauth.MAPPERS_SOURCE
     + r"""
 import json, os, sys, urllib.error, urllib.parse, urllib.request
 cap_memory()
@@ -411,6 +423,7 @@ if action == "create-client":
         "standardFlowEnabled": False, "directAccessGrantsEnabled": True,
         "serviceAccountsEnabled": False, "fullScopeAllowed": True,
         "defaultClientScopes": ["profile", "email", "roles"],
+        "protocolMappers": _SRW_GATE_MAPPERS,
         "optionalClientScopes": [], "attributes": {"srw-gate": request["marker"]},
     })
     print(json.dumps({"status": status, "found": [c["id"] for c in clients()]}))
@@ -1017,8 +1030,8 @@ class UserRootGate:
         if created.get("exists"):
             self.client_started = False
             raise GateError(f"a Keycloak client {self.oauth_client} already exists")
-        # Everyone logs in through the run's client: its ID token carries the
-        # e-mail and the realm roles (admin-cli's does not, and a login
+        # Everyone logs in through the run's client: its access token carries
+        # the e-mail and the realm roles (admin-cli's does not, and a login
         # without them would demote the owner and give an account a new row).
         self.owner.client_id = self.oauth_client
         owner = self.owner.ok("GET", "/api/auth/me")["user"]

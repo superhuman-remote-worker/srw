@@ -750,7 +750,11 @@ def test_stateless_unmount_requires_exact_identity_and_pid_cmdline():
 
 
 def _resident_unmount_runtime(
-    tmp_path: Path, *, resident_pid: int
+    tmp_path: Path,
+    *,
+    resident_pid: int,
+    terminal: bool = False,
+    only_root_umount_detaches: bool = False,
 ) -> tuple[str, dict[str, str]]:
     backend = FakeFencedRemoteBackend()
     manager = RcloneMountManager(
@@ -812,8 +816,28 @@ sleep() { :; }
 timeout() { shift; "$@"; }
 export -f mountpoint findmnt fusermount3 fusermount sleep timeout
 """
+        + (
+            # The 10-04 incident: no fusermount and no sudo in the workspace
+            # image; the daemon ran as root, where a plain lazy umount works.
+            """
+fusermount3() { return 1; }
+fusermount() { return 1; }
+sudo() { return 1; }
+umount() {
+  printf 'umount %s\\n' "$*" >> "$SRW_TEST_EVENTS"
+  [ "$1" = -l ] && rm -f "$SRW_TEST_MOUNTED"
+}
+export -f fusermount3 fusermount sudo umount
+"""
+            if only_root_umount_detaches
+            else ""
+        )
     )
-    script = manager._unmount_script(state)
+    script = (
+        manager._terminal_unmount_script(state, drain=False)
+        if terminal
+        else manager._unmount_script(state)
+    )
     env = {
         **os.environ,
         "BASH_ENV": str(bash_env),
@@ -939,6 +963,31 @@ def test_stateless_dead_resident_pid_unmounts_stale_target(tmp_path):
     assert "fusermount3 -u" in (tmp_path / "events").read_text()
     assert not (tmp_path / "mounted").exists()
     assert not (tmp_path / "resident" / "resident.identity").exists()
+
+
+@pytest.mark.parametrize("terminal", [True, False], ids=["end", "claim"])
+def test_a_dead_mount_only_root_can_detach_does_not_block_end(tmp_path, terminal):
+    """dead_rclone_mount_blocks_stateless_session_retirement (10-04): the
+    daemon died, fusermount and sudo were unavailable, and End failed with 88
+    until someone ran ``umount -l`` in the pod."""
+    dead_pid = 2_147_483_647
+    script, env = _resident_unmount_runtime(
+        tmp_path,
+        resident_pid=dead_pid,
+        terminal=terminal,
+        only_root_umount_detaches=True,
+    )
+    script_path = tmp_path / "unmount-dead-root.sh"
+    script_path.write_text(script)
+
+    result = subprocess.run(
+        ["bash", str(script_path)], env=env, text=True, capture_output=True
+    )
+
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    assert "__SRW_RCLONE_MOUNT_OK__" in result.stdout
+    assert "umount -l" in (tmp_path / "events").read_text()
+    assert not (tmp_path / "mounted").exists()
 
 
 def test_stateless_reused_live_pid_refuses_kill_and_unmount(tmp_path):

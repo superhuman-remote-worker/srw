@@ -45,6 +45,11 @@ DeliveryForm = Literal[
     # A folder SRW copies into the job's repository before it starts (the
     # project folder's checkout): the workspace clones it like any file.
     "cloud_checkout",
+    # A folder the agent process reaches through explicit operations against
+    # a remote descriptor SRW hands it (a Virtual Session's cloud folder,
+    # features/cloud_folders_on_virtual_sessions.md): the workspace
+    # configuration is the delivery, never a connector entry.
+    "cloud_remote",
 ]
 CredentialKind = Literal[
     "secret_string", "file", "ssh_private_key", "oauth2", "kubeconfig"
@@ -283,6 +288,11 @@ class DriverSpec:
     supported_backends: frozenset[str]
     workspace_requirements: str
     protocol_version: str = PROTOCOL_VERSION
+    #: The plane per delivery form where a driver's forms run in different
+    #: ones (a cloud folder: mounted by the in-pod sidecar for a Container,
+    #: reached from the agent process for a Virtual Session). A form it does
+    #: not name runs on ``plane``; :meth:`plane_for` answers for every form.
+    form_planes: Mapping[str, Plane] = field(default_factory=dict)
     legacy_type: str | None = None
     guide_topic: str | None = None
     credential_slots: tuple[CredentialSlot, ...] = ()
@@ -311,6 +321,11 @@ class DriverSpec:
     #: (live_session_jobs §2); the cockpit offers its connectors to live
     #: automations. Its pod is standing and called by the agent process.
     live: bool = False
+
+    def plane_for(self, form: str) -> Plane:
+        """Where the driver's work for ``form`` runs (``plane`` unless
+        ``form_planes`` names the form)."""
+        return self.form_planes.get(form, self.plane)
 
     def access_level(self, level_id: str) -> AccessLevel | None:
         return next(
@@ -746,6 +761,19 @@ def validate_spec(spec: DriverSpec) -> list[str]:
         for form in spec.delivery_forms
         if form not in DELIVERY_FORMS
     ]
+    if not isinstance(spec.form_planes, Mapping):
+        problems.append("form_planes is a mapping of delivery form to plane")
+    else:
+        problems += [
+            f"form_planes names {form!r}, which is not one of the driver's forms"
+            for form in spec.form_planes
+            if form not in spec.delivery_forms
+        ]
+        problems += [
+            f"form_planes[{form!r}] = {plane!r} is not one of {PLANES}"
+            for form, plane in spec.form_planes.items()
+            if plane not in PLANES
+        ]
     if not isinstance(spec.config_schema, Mapping) or (
         spec.config_schema.get("type") != "object"
     ):

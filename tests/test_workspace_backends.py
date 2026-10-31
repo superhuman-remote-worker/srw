@@ -15,7 +15,7 @@ import stat as stat_module
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -290,6 +290,8 @@ class TestExecDrainLoopDeadline:
 
 from shared.runtime.core.backends.remote import (  # noqa: E402
     RemoteBackend,
+    ShellEndedError,
+    ShellSessionLostError,
     _INHERITED_BUSY_SENTINEL,
     _PENDING_GUARD_STALE_SECONDS,
     _RemoteTab,
@@ -3131,7 +3133,7 @@ if os.path.exists(sentinel):
         assert backend._shell_initialized is False
         assert backend._tabs == {}
 
-    @pytest.mark.parametrize("failure", ("session", "transport", "pane_present"))
+    @pytest.mark.parametrize("failure", ("transport", "pane_present"))
     def test_key_send_requires_conclusive_pane_absence(self, remote_backend, failure):
         backend, _, _ = remote_backend
         backend._shell_initialized = True
@@ -3144,7 +3146,7 @@ if os.path.exists(sentinel):
             if command.startswith("tmux has-session"):
                 if failure == "transport":
                     raise WorkspaceUnavailableError("SSH command failed")
-                return "", 1 if failure == "session" else 0
+                return "", 0
             if command.startswith("tmux list-panes"):
                 return "%2\n", 0
             raise AssertionError("Unexpected remote command")
@@ -3155,6 +3157,60 @@ if os.path.exists(sentinel):
 
         assert backend._shell_initialized is False
         assert backend._tabs == {}
+
+    def test_ended_session_is_rebuilt_and_reported_as_a_tool_error(
+        self, remote_backend
+    ):
+        """The last pane's shell exited: a fresh session, not a paused job."""
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["closed"] = _RemoteTab("closed", pane_id="%2")
+
+        def execute(command, **_kwargs):
+            if "tmux send-keys" in command or command.startswith("tmux has-session"):
+                return "", 1
+            raise AssertionError("Unexpected remote command")
+
+        def rebuild():
+            backend._tabs["default"] = _RemoteTab("default", pane_id="%0")
+            backend._shell_initialized = True
+
+        with (
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+            patch.object(backend, "_init_shell", side_effect=rebuild) as init_shell,
+        ):
+            with pytest.raises(ShellEndedError) as ended:
+                backend.shell_send("closed", "C-c", enter=False)
+
+        init_shell.assert_called_once_with()
+        assert not isinstance(ended.value, WorkspaceUnavailableError)
+        assert isinstance(ended.value.__cause__, ShellSessionLostError)
+        assert str(ended.value).startswith("The shell session had ended")
+        assert "Nothing ran in this call" in str(ended.value)
+        assert list(backend._tabs) == ["default"]
+
+    def test_ended_session_that_cannot_be_rebuilt_stays_unavailable(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["closed"] = _RemoteTab("closed", pane_id="%2")
+
+        def execute(command, **_kwargs):
+            if "tmux send-keys" in command or command.startswith("tmux has-session"):
+                return "", 1
+            raise AssertionError("Unexpected remote command")
+
+        with (
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+            patch.object(
+                backend,
+                "_init_shell",
+                side_effect=WorkspaceUnavailableError("exit code 79"),
+            ),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 79"):
+                backend.shell_send("closed", "C-c", enter=False)
 
     @pytest.mark.parametrize("probe_failure", ("tmux", "transport"))
     def test_capture_probe_server_failure_keeps_workspace_error_semantics(
@@ -4516,6 +4572,286 @@ class TestRemoteBackendShellRun:
         assert lifecycle.mock_calls[-1] == call.clear("default", self._SENTINEL)
         assert "Exit code: 0" in result
 
+    def _drop_transport_once(self, stack, backend, mock_ssh, *, same_owner):
+        """Enter patches for one transport loss mid-wait and the reattach.
+
+        The second capture fails as a dead transport does. Reconnecting resets
+        the shell state like ``_ensure_connected``; re-adoption restores the
+        tab with the pending guard tmux holds: this command's when
+        ``same_owner``, another one's otherwise. Returns the reconnect and
+        re-adoption mocks.
+        """
+        transport = mock_ssh.get_transport.return_value
+        sent = {}
+        captures = iter(
+            [
+                [f"agent@host:{self._ROOT}$"],
+                WorkspaceUnavailableError("SSH command failed on 10.0.0.42"),
+                [f"agent@host:{self._ROOT}$", f"{self._SENTINEL} 0 {self._ROOT}"],
+            ]
+        )
+
+        def capture(_tab_name):
+            item = next(captures)
+            if isinstance(item, Exception):
+                transport.is_active.return_value = False
+                raise item
+            return item
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            sent["sentinel"] = sentinel
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        def reconnect():
+            transport.is_active.return_value = True
+            backend._shell_initialized = False
+            backend._tabs.clear()
+
+        def readopt():
+            tab = _RemoteTab("default", pane_id="%1")
+            tab.pending_sentinel = sent["sentinel"] if same_owner else "__DONE_x__"
+            backend._tabs["default"] = tab
+            backend._shell_initialized = True
+
+        backend._ssh = mock_ssh
+        self._uuid(
+            stack.enter_context(patch("shared.runtime.core.backends.remote.uuid.uuid4"))
+        )
+        stack.enter_context(patch("shared.runtime.core.backends.remote.time.sleep"))
+        stack.enter_context(patch.object(backend, "_tmux_capture", side_effect=capture))
+        stack.enter_context(
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            )
+        )
+        stack.enter_context(patch.object(backend, "_clear_tab_pending_if_current"))
+        reconnect_mock = stack.enter_context(
+            patch.object(backend, "_ensure_connected", side_effect=reconnect)
+        )
+        readopt_mock = stack.enter_context(
+            patch.object(backend, "_init_shell", side_effect=readopt)
+        )
+        return reconnect_mock, readopt_mock
+
+    def test_transport_loss_mid_wait_reconnects_and_keeps_waiting(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        with ExitStack() as stack:
+            reconnect, readopt = self._drop_transport_once(
+                stack, backend, mock_ssh, same_owner=True
+            )
+            result = backend.shell_run("sleep 570", tab_name="default")
+
+        reconnect.assert_called_once_with()
+        readopt.assert_called_once_with()
+        assert "Exit code: 0" in result
+
+    def test_transport_loss_after_the_tab_changed_owner_fails_as_before(
+        self, remote_backend
+    ):
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        with ExitStack() as stack:
+            self._drop_transport_once(stack, backend, mock_ssh, same_owner=False)
+            with pytest.raises(WorkspaceUnavailableError, match="SSH command failed"):
+                backend.shell_run("sleep 570", tab_name="default")
+
+    def test_unavailable_on_a_live_transport_is_not_retried(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        backend._ssh = mock_ssh
+        captures = [
+            [f"agent@host:{self._ROOT}$"],
+            WorkspaceUnavailableError("tmux pane vanished"),
+        ]
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        with (
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ),
+            patch.object(backend, "_ensure_connected") as reconnect,
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="pane vanished"):
+                backend.shell_run("sleep 570", tab_name="default")
+
+        reconnect.assert_not_called()
+
+    def _send_then_capture(self, stack, backend, second_capture):
+        """Patch one command send whose second pane capture raises."""
+        captures = iter([[f"agent@host:{self._ROOT}$"], second_capture])
+
+        def capture(_tab_name):
+            item = next(captures)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        stack.enter_context(patch("shared.runtime.core.backends.remote.time.sleep"))
+        stack.enter_context(patch.object(backend, "_tmux_capture", side_effect=capture))
+        stack.enter_context(
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            )
+        )
+
+    def test_pane_that_exits_under_the_command_is_a_tool_error(self, remote_backend):
+        """``...; exit`` past the subshell guard closes only that tab."""
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        with ExitStack() as stack:
+            self._send_then_capture(
+                stack, backend, ShellEndedError("Tab 'default' no longer exists")
+            )
+            with pytest.raises(ShellEndedError) as ended:
+                backend.shell_run("kill -9 $$", tab_name="default")
+
+        message = str(ended.value)
+        assert message.startswith(
+            "The shell in tab 'default' exited while your command ran"
+        )
+        assert "The next command on 'default' opens a fresh shell" in message
+        assert "whole shell session" not in message
+
+    def test_session_that_ends_under_the_command_is_rebuilt_not_paused(
+        self, remote_backend
+    ):
+        """Dev jobs 19837f4b/1dc0fac1: the last pane exited mid-command."""
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        backend._ssh = mock_ssh
+
+        def session_lost():
+            backend._shell_initialized = False
+            backend._tabs.clear()
+            return ShellSessionLostError("the shell session has ended")
+
+        def rebuild():
+            backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+            backend._shell_initialized = True
+            backend._shell_creations += 1
+
+        with ExitStack() as stack:
+            captures = iter([[f"agent@host:{self._ROOT}$"], None])
+
+            def capture(_tab_name):
+                if next(captures) is None:
+                    raise session_lost()
+                return [f"agent@host:{self._ROOT}$"]
+
+            def reserve(_tab_name, *, sentinel, **_kwargs):
+                backend._tabs["default"].pending_sentinel = sentinel
+
+            stack.enter_context(patch("shared.runtime.core.backends.remote.time.sleep"))
+            stack.enter_context(
+                patch.object(backend, "_tmux_capture", side_effect=capture)
+            )
+            stack.enter_context(
+                patch.object(
+                    backend, "_reserve_and_send_shell_command", side_effect=reserve
+                )
+            )
+            reconnect = stack.enter_context(patch.object(backend, "_ensure_connected"))
+            init_shell = stack.enter_context(
+                patch.object(backend, "_init_shell", side_effect=rebuild)
+            )
+            with pytest.raises(ShellEndedError) as ended:
+                backend.shell_run("pytest; exit $?", tab_name="default")
+
+        reconnect.assert_called_once_with()
+        init_shell.assert_called_once_with()
+        message = str(ended.value)
+        assert "exited while your command ran" in message
+        assert "whole shell session ended with it" in message
+        assert not isinstance(ended.value, WorkspaceUnavailableError)
+
+    def test_tab_missing_after_readoption_is_a_tool_error(self, remote_backend):
+        """Re-adopted session, but the command's window is gone."""
+        backend, mock_ssh, _ = remote_backend
+        self._ready(backend)
+        backend._tabs["git"] = _RemoteTab("git", pane_id="%2")
+        backend._ssh = mock_ssh
+        backend._lost_tab_notices.add("git")
+
+        def lost(_tab_name):
+            backend._shell_initialized = False
+            backend._tabs.clear()
+            raise ShellSessionLostError("the shell session has ended")
+
+        def readopt():
+            backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+            backend._shell_initialized = True
+
+        captures = iter([[f"agent@host:{self._ROOT}$"]])
+
+        def capture(tab_name):
+            item = next(captures, None)
+            if item is None:
+                lost(tab_name)
+            return item
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["git"].pending_sentinel = sentinel
+
+        with (
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=capture),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ),
+            patch.object(backend, "_ensure_connected"),
+            patch.object(backend, "_init_shell", side_effect=readopt),
+        ):
+            with pytest.raises(ShellEndedError, match="tab 'git' exited"):
+                backend.shell_run("make test", tab_name="git")
+
+        assert "git" not in backend._lost_tab_notices
+
+    def test_shell_ended_error_reads_as_plain_text(self):
+        assert str(ShellEndedError("Tab 'x' exited")) == "Tab 'x' exited"
+        assert isinstance(ShellEndedError("x"), KeyError)
+
+    @pytest.mark.parametrize(
+        ("command", "working_dir", "expected"),
+        (
+            ('pytest; exit "$rc"', None, '( pytest; exit "$rc" )'),
+            ("set -euo pipefail; make", "repo", "&& ( set -euo pipefail; make )"),
+            ("make test || exit 1 # all", None, "(\nmake test || exit 1 # all\n)"),
+        ),
+    )
+    def test_command_that_would_end_the_shell_runs_in_a_subshell(
+        self, remote_backend, command, working_dir, expected
+    ):
+        backend, _, _ = remote_backend
+        built = backend._build_guarded_shell_command(
+            command, self._SENTINEL, working_dir
+        )
+        assert expected in built
+
+    def test_ordinary_command_is_typed_unchanged(self, remote_backend):
+        backend, _, _ = remote_backend
+        built = backend._build_guarded_shell_command(
+            "cd src && pytest -x", self._SENTINEL, None
+        )
+        assert built.startswith("cd src && pytest -x; printf")
+
+    def test_spilled_command_keeps_its_subshell(self, remote_backend):
+        """A long command is sourced into the tab: the subshell must be in it."""
+        backend, _, _ = remote_backend
+        long_command = "echo " + "x" * 20000 + "; exit 3"
+        with patch.object(backend, "write_file") as write:
+            backend._build_guarded_shell_command(long_command, self._SENTINEL, None)
+        written = write.call_args.args[1]
+        assert written.startswith("( echo ")
+        assert written.rstrip().endswith("exit 3 )")
+
     def test_commands_on_distinct_tabs_do_not_serialize(self, remote_backend):
         backend, _, _ = remote_backend
         self._ready(backend)
@@ -5459,6 +5795,26 @@ class TestConnectionHardening:
         backend.connect()
         mock_ssh.get_transport.return_value.set_keepalive.assert_called_with(15)
         mock_sftp.get_channel.return_value.settimeout.assert_called_with(60.0)
+
+    def test_connect_leaves_rekeys_to_the_server(self, remote_backend):
+        """A client-initiated rekey can deadlock paramiko's transport thread on
+        a CHANNEL_CLOSE already in flight; the limits defer rekeys to sshd."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        packetizer = mock_ssh.get_transport.return_value.packetizer
+        assert packetizer.REKEY_BYTES == 2**36
+        assert packetizer.REKEY_PACKETS == 2**31
+
+    def test_paramiko_reads_rekey_limits_per_instance(self):
+        """The override works only while paramiko compares against
+        ``self.REKEY_*``; a class-constant comparison would ignore it."""
+        import inspect
+
+        from paramiko.packet import Packetizer
+
+        source = inspect.getsource(Packetizer)
+        assert "self.REKEY_BYTES" in source
+        assert "self.REKEY_PACKETS" in source
 
     def test_connect_sets_transport_socket_options(self, remote_backend):
         """Connect applies kernel socket options for long-halt recovery."""

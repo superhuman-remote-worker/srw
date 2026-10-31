@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import posixpath
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping
 
 from agent.core.backends.overlay import unwrap_backend
 
@@ -22,6 +22,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# The largest file the lite-workspace copy reads: the per-file cap on uploads
+# into a virtual workspace (``MAX_FILE_SIZE`` in
+# src/orchestrator/services/thread_uploads.py ~:95; the agent package can't
+# import orchestrator code). A bigger object (one the agent wrote) is skipped
+# with a warning instead of failing every retry; the old prefix keeps it.
+VIRTUAL_UPLOAD_MAX_FILE_BYTES = 100 * 1024 * 1024
+
+# How many skipped file names a workspace upgrade's ``.complete`` names
+# (``skipped_files``); the log names every one.
+SKIPPED_FILES_REPORTED = 20
 
 # --------------------------------------------------------------------------
 # Seeded-content sentinel
@@ -139,7 +150,14 @@ def reseed_missing_files(
     return written
 
 
-def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
+def seed_workspace(
+    src: "WorkspaceBackend",
+    dst: "WorkspaceBackend",
+    *,
+    exclude: "Callable[[str], bool] | None" = None,
+    max_file_bytes: int | None = None,
+    oversized: "List[str] | None" = None,
+) -> int:
     """Copy every file from ``src`` into ``dst``, preserving relative paths.
 
     Walks the source recursively (``agent.walk()``), reads each file as bytes,
@@ -155,6 +173,14 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
     Args:
         src: Source backend (e.g. the live ``VirtualWorkspaceBackend``).
         dst: Destination backend (e.g. the freshly connected ``RemoteBackend``).
+        exclude: Paths for which ``exclude(rel)`` is true are neither copied
+            nor verified — the stateless upgrade leaves cloud-synced roots to
+            the first pull.
+        max_file_bytes: When set, a file the source refuses to read because it
+            is larger than this is skipped with a warning (and not verified)
+            instead of failing the copy. Any other read error still raises.
+        oversized: When given, each file skipped for its size is appended
+            to it (an unreadable entry, such as a mount point, is not).
 
     Returns:
         The number of files written.
@@ -164,6 +190,8 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
             the copy.
     """
     files = src.walk()
+    if exclude is not None:
+        files = [rel for rel in files if not exclude(rel)]
     written = 0
     skipped: list[str] = []
     for rel in files:
@@ -180,6 +208,20 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
             # the new backend (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md).
             logger.warning("Seed: skipping unreadable entry %r: %s", rel, e)
             skipped.append(rel)
+            continue
+        except ValueError:
+            size = _size_over_limit(src, rel, max_file_bytes)
+            if size is None:
+                raise
+            logger.warning(
+                "Seed: skipping %r: %d bytes is over the %d-byte copy limit",
+                rel,
+                size,
+                max_file_bytes,
+            )
+            skipped.append(rel)
+            if oversized is not None:
+                oversized.append(rel)
             continue
         parent = posixpath.dirname(rel)
         if parent:
@@ -198,10 +240,87 @@ def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
         )
 
     logger.info(
-        "Seeded %d file(s) (skipped %d unreadable) from %s to %s",
+        "Seeded %d file(s) (skipped %d unreadable or oversized) from %s to %s",
         written,
         len(skipped),
         type(src).__name__,
         type(dst).__name__,
     )
     return written
+
+
+def _size_over_limit(
+    src: "WorkspaceBackend", rel: str, limit: int | None
+) -> int | None:
+    """``rel``'s size when it is over ``limit``; None otherwise or unknown."""
+    if limit is None:
+        return None
+    try:
+        size = int(src.stat(rel))
+    except Exception:
+        return None
+    return size if size > limit else None
+
+
+def upgrade_seed_source(backend: Any) -> Any:
+    """The source a workspace upgrade's hot-swap seed reads (C2).
+
+    A live ``virtual`` backend reads at most ``DEFAULT_MAX_READ_BYTES`` (50
+    MiB) a file, while uploads into it allow
+    :data:`VIRTUAL_UPLOAD_MAX_FILE_BYTES`: the seed reads through a sibling
+    over the same store and prefix with the upload ceiling, so every file a
+    user could upload is copied. Any other backend is returned as it is.
+    """
+    from agent.core.backends.virtual import VirtualWorkspaceBackend
+
+    real = unwrap_backend(backend)
+    if isinstance(real, VirtualWorkspaceBackend):
+        return real.with_max_read_bytes(VIRTUAL_UPLOAD_MAX_FILE_BYTES)
+    return backend
+
+
+def reported_skipped_files(names: "List[str]") -> "List[str]":
+    """The skipped file names a ``.complete`` frame or receipt carries."""
+    return list(names[:SKIPPED_FILES_REPORTED])
+
+
+def seed_from_lite_workspace(
+    workspace: Mapping[str, Any],
+    *,
+    owner_id: str,
+    destination: "WorkspaceBackend",
+    exclude: "Callable[[str], bool] | None" = None,
+    oversized: "List[str] | None" = None,
+) -> int:
+    """Copy an old lite workspace (``virtual`` mounts or ``none``) into ``destination``.
+
+    Shared by the stateless container upgrade (C1) and the VM upgrade's
+    recovery copy (C2). ``none`` has nothing durable to copy. A file over
+    :data:`VIRTUAL_UPLOAD_MAX_FILE_BYTES` is skipped with a warning (and
+    appended to ``oversized`` when given); the old prefix keeps it.
+    """
+    from types import SimpleNamespace
+
+    from agent.core.backends.factory import create_lite_backend
+
+    backend = workspace.get("backend")
+    if backend == "none":
+        return 0
+    if backend != "virtual":
+        raise ValueError(f"cannot seed from a {backend!r} workspace")
+    # The workspace prefix only: a Session's cloud folders (the entries after
+    # the first mount) are bound again by the Container as mounts, never
+    # copied into its PVC (features/cloud_folders_on_virtual_sessions.md).
+    source = create_lite_backend(
+        SimpleNamespace(backend="virtual", mounts=list(workspace.get("mounts") or [])),
+        job_id=owner_id,
+        max_read_bytes=VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+        cloud_folders=False,
+    )
+    return seed_workspace(
+        source,
+        destination,
+        exclude=exclude,
+        max_file_bytes=VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+        oversized=oversized,
+    )

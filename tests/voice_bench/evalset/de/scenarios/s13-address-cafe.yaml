@@ -1,0 +1,14 @@
+id: s13-address-cafe
+title: A postal address in a café
+why: Street, house number, postcode and town in babble.
+categories: [back_office, addresses]
+voice: f-middle
+condition: cafe
+turns:
+  - say: Bitte schicken Sie die Unterlagen für die Gruppenreise an Lindenallee dreiundzwanzig, neun neun neun neun neun Beispielstadt.
+    expect:
+      outcome: delegate
+      values: [{address: "Lindenallee 23, 99999 Beispielstadt", in: request}]
+    back_office:
+      answer: Die Unterlagen gehen morgen an die Lindenallee 23 in Beispielstadt raus.
+      after: 5

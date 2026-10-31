@@ -18,10 +18,10 @@ import {
 } from './job-review.component';
 
 const JOB_ID = '29c28492-df7c-4eb3-847f-38892557ac4e';
-const PR_URL = 'https://github.com/Knaeckebrothero/KurortEngine/pull/1';
+const PR_URL = 'https://github.com/Acme/WidgetShop/pull/1';
 const OPEN_STATUS: PullRequestStatus = {
   forge: 'github',
-  repo: 'Knaeckebrothero/KurortEngine',
+  repo: 'Acme/WidgetShop',
   number: 1,
   url: PR_URL,
   state: 'open',
@@ -92,7 +92,7 @@ describe('job-review delivery URL helpers', () => {
         JSON.stringify({
           pull_request: {
             forge: 'github',
-            repo: 'Knaeckebrothero/KurortEngine',
+            repo: 'Acme/WidgetShop',
             number: 1,
             url: PR_URL,
             head: 'design/hotel-rheinland-theme',
@@ -124,7 +124,7 @@ describe('job-review delivery URL helpers', () => {
       reviewJob({
         pull_request: {
           forge: 'github',
-          repo: 'Knaeckebrothero/KurortEngine',
+          repo: 'Acme/WidgetShop',
           number: 1,
           url: PR_URL,
           head: 'design/hotel-rheinland-theme',
@@ -135,11 +135,11 @@ describe('job-review delivery URL helpers', () => {
     const selected = selectDeliveryRepository(
       [
         repository('unrelated', 'https://github.com/acme/other.git'),
-        repository('kurort-engine', 'https://github.com/Knaeckebrothero/KurortEngine.git'),
+        repository('widget-shop', 'https://github.com/Acme/WidgetShop.git'),
       ],
       pullRequest,
     );
-    expect(selected?.id).toBe('kurort-engine');
+    expect(selected?.id).toBe('widget-shop');
   });
 
   it('does not substitute the same owner/repo from another forge host', () => {
@@ -147,7 +147,7 @@ describe('job-review delivery URL helpers', () => {
       reviewJob({
         pull_request: {
           forge: 'github',
-          repo: 'Knaeckebrothero/KurortEngine',
+          repo: 'Acme/WidgetShop',
           number: 1,
           url: PR_URL,
           head: 'design/hotel-rheinland-theme',
@@ -159,11 +159,11 @@ describe('job-review delivery URL helpers', () => {
       [
         repository(
           'enterprise-lookalike',
-          'https://github.enterprise.test/Knaeckebrothero/KurortEngine.git',
+          'https://github.enterprise.test/Acme/WidgetShop.git',
         ),
         repository(
           'github-delivery',
-          'https://github.com/Knaeckebrothero/KurortEngine.git',
+          'https://github.com/Acme/WidgetShop.git',
         ),
       ],
       pullRequest,
@@ -175,7 +175,7 @@ describe('job-review delivery URL helpers', () => {
         [
           repository(
             'enterprise-lookalike',
-            'https://github.enterprise.test/Knaeckebrothero/KurortEngine.git',
+            'https://github.enterprise.test/Acme/WidgetShop.git',
           ),
         ],
         pullRequest,
@@ -188,7 +188,7 @@ describe('job-review delivery URL helpers', () => {
       reviewJob({
         pull_request: {
           forge: 'github',
-          repo: 'Knaeckebrothero/KurortEngine',
+          repo: 'Acme/WidgetShop',
           number: 1,
           url: PR_URL,
           head: 'design/hotel-rheinland-theme',
@@ -223,7 +223,7 @@ describe('JobReviewComponent delivery section', () => {
     context: Job['context'] = JSON.stringify({
       pull_request: {
         forge: 'github',
-        repo: 'Knaeckebrothero/KurortEngine',
+        repo: 'Acme/WidgetShop',
         number: 1,
         url: PR_URL,
         head: 'design/hotel-rheinland-theme',
@@ -248,7 +248,7 @@ describe('JobReviewComponent delivery section', () => {
       getJobDatasources: vi
         .fn()
         .mockReturnValue(
-          of([repository('kurort-engine', 'https://github.com/Knaeckebrothero/KurortEngine.git')]),
+          of([repository('widget-shop', 'https://github.com/Acme/WidgetShop.git')]),
         ),
       ensureWorkspaceAccess: vi.fn().mockReturnValue(of({ status: 'ready' })),
     };
@@ -298,15 +298,15 @@ describe('JobReviewComponent delivery section', () => {
     expect(text).toContain('Pull request #1 · Open');
     expect(text).toContain('Review in session');
     expect(text).toContain('fresh sandbox');
-    expect(text).toContain('supervised');
+    expect(text).toContain('read-only session');
     expect(text).toContain('Job workspace');
     expect(text).not.toContain('Browse workspace in Gitea');
 
     expect(fixture.componentInstance.sourceRepositoryUrl()).toBe(
-      'https://github.com/Knaeckebrothero/KurortEngine',
+      'https://github.com/Acme/WidgetShop',
     );
     expect(fixture.componentInstance.deliveryBranchUrl()).toBe(
-      'https://github.com/Knaeckebrothero/KurortEngine/tree/design/hotel-rheinland-theme',
+      'https://github.com/Acme/WidgetShop/tree/design/hotel-rheinland-theme',
     );
     expect(fixture.componentInstance.pullRequest()?.url).toBe(PR_URL);
     expect(fixture.componentInstance.getJobWorkspaceUrl()).toMatch(/\/job-29c28492$/);

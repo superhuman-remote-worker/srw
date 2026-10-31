@@ -1,0 +1,25 @@
+# An Expert whose runtime is the Claude Code harness image
+# (harnesses/claude-code/README.md), used instead of SRW's own agent image.
+# Needs: the image approved by digest in manifestHosting.approvedImages, and the
+# custom_harness_images grant for whoever submits a Job that uses it
+# (administrators bypass the grant). See docs/harness-images.md.
+#
+# Substitute the digest you approved. The image starts on its own entrypoint, so
+# the runtime carries no command, args, env or probes.
+apiVersion: srw/v1alpha1
+kind: Expert
+metadata:
+  name: claude-code-harness
+  scope: {kind: Account, name: personal}
+spec:
+  runtime:
+    adapter: srw/v1
+    image: ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    config:
+      config_name: worker_base
+      config:
+        llm:
+          # Replace with a model in your catalog whose API shape is
+          # anthropic-messages (Admin -> Models): the harness speaks only that
+          # shape, and a Job on any other model is refused before it starts.
+          model: your-anthropic-messages-model

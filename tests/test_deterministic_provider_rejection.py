@@ -105,6 +105,24 @@ EDGE_400 = (
     "<html><head><title>400 Bad Request</title></head><body><center>"
     "<h1>400 Bad Request</h1></center><hr><center>nginx</center></body></html>"
 )
+# reasoning_chat._overflow_response_413: the capture client's answer to a
+# pre-flight overflow, so the SDK raises a status error instead of retrying.
+SYNTHETIC_OVERFLOW = {
+    "error": {
+        "message": "Request body has 250,000 tokens, exceeds model limit of 200,000",
+        "type": "invalid_request_error",
+        "code": "context_overflow",
+        "token_count": 250_000,
+        "limit": 200_000,
+    }
+}
+ANTHROPIC_TOO_LARGE = {
+    "type": "error",
+    "error": {
+        "type": "request_too_large",
+        "message": "Request exceeds the maximum allowed number of bytes.",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +257,27 @@ def _anthropic_status(status: int, payload: Any):
 # ---------------------------------------------------------------------------
 
 _CASES = [
+    # --- too big for the model: deterministic, the caller shrinks it ------
+    (
+        "capture client's synthetic pre-flight 413",
+        lambda: _openai_status(413, SYNTHETIC_OVERFLOW),
+        "context_overflow",
+    ),
+    (
+        "anthropic 413 request_too_large",
+        lambda: _anthropic_status(413, ANTHROPIC_TOO_LARGE),
+        "context_overflow",
+    ),
+    (
+        "edge 413 without an API body",
+        lambda: _openai_status(413, text="<html>413 Request Entity Too Large</html>"),
+        "context_overflow",
+    ),
+    (
+        "stringified 413 that lost its exception class",
+        lambda: Exception(str(_openai_status(413, SYNTHETIC_OVERFLOW))),
+        "context_overflow",
+    ),
     # --- deterministic: an identical request fails identically ------------
     (
         "unsupported reasoning effort",
@@ -591,6 +630,7 @@ def test_session_turns_share_the_worker_verdict():
     """One verdict product-wide: a session turn does not replay it either."""
     assert not _is_retryable_llm_error(_openai_status(400, UNSUPPORTED_EFFORT))
     assert not _is_retryable_llm_error(_openai_status(400, OPENROUTER_INVALID_MODEL))
+    assert not _is_retryable_llm_error(_openai_status(413, SYNTHETIC_OVERFLOW))
     assert _is_retryable_llm_error(_openai_status(503, PROVIDER_OUTAGE))
     assert _is_retryable_llm_error(
         _openai_status(400, PROXY_NOT_LOADED, base_url=PROXY_URL)
@@ -610,6 +650,7 @@ def test_session_turns_share_the_worker_verdict():
         pytest.param(UNSUPPORTED_EFFORT, 400, 1, id="deterministic-once"),
         pytest.param(OPENROUTER_INVALID_MODEL, 400, 1, id="invalid-model-once"),
         pytest.param(PROVIDER_OUTAGE, 503, 3, id="outage-retried"),
+        pytest.param(SYNTHETIC_OVERFLOW, 413, 1, id="context-overflow-once"),
     ],
 )
 async def test_shared_retry_loop_replays_only_retryable_failures(
@@ -861,6 +902,97 @@ async def test_model_the_proxy_never_routes_still_fails_at_the_outer_layer(
     status, message = determine_job_status(job, result)
     assert status == "failed"
     assert "unknown provider for model" in message
+
+
+async def _execute_preflight_overflow(
+    request, tmp_path, monkeypatch, *, compaction_shrinks: bool
+):
+    """One worker execute whose request overflows the pre-flight count, so the
+    capture client answers with its synthetic 413. Returns (result, wire,
+    forced compactions)."""
+    wire = []
+
+    def respond(http_request):
+        wire.append(json.loads(http_request.content))
+        return httpx.Response(200, json=_COMPLETION)
+
+    llm, bound, config = _wire_llm(tmp_path, monkeypatch, respond)
+    oversized = [True]
+    # The pre-flight count sees an oversized body until compaction ran.
+    monkeypatch.setattr(
+        reasoning_chat,
+        "count_request_tokens",
+        lambda *a, **kw: 10**9 if oversized[0] else 10,
+    )
+    env_ = request.getfixturevalue("env")
+    forced = []
+    original_ensure = env_["context"].ensure_within_limits
+
+    async def ensure_within_limits(messages, *args, **kwargs):
+        if kwargs.get("force"):
+            forced.append(len(messages))
+            oversized[0] = not compaction_shrinks
+        return await original_ensure(messages, *args, **kwargs)
+
+    env_["context"].ensure_within_limits = ensure_within_limits
+    node = _make_node(
+        env_,
+        bound,
+        config=config,
+        retry_manager=ToolRetryManager(max_retries=5, base_delay=0.0, max_delay=0.0),
+    )
+    try:
+        with patch("agent.graph.checkpointer_backend", return_value="postgres"):
+            result = await _run(node, _state())
+    finally:
+        llm.http_client.close()
+        await llm.http_async_client.aclose()
+    return result, wire, forced
+
+
+@pytest.mark.asyncio
+async def test_preflight_overflow_runs_emergency_compaction_not_the_retry_ladder(
+    request, tmp_path, monkeypatch
+):
+    """The capture client's synthetic 413 reaches the worker's emergency
+    compaction once; the compacted request then goes out and succeeds.
+
+    Before: the 413 classified ``transient``, so the in-process ladder re-sent
+    the identical oversized request six times and froze the job as an outage.
+    """
+    result, wire, forced = await _execute_preflight_overflow(
+        request, tmp_path, monkeypatch, compaction_shrinks=True
+    )
+
+    assert len(forced) == 1
+    assert len(wire) == 1
+    assert result.get("error") is None
+    assert result.get("freeze_data") is None
+    assert not result.get("should_stop")
+    assert "Recovered." in [m.content for m in result["messages"]]
+
+
+@pytest.mark.asyncio
+async def test_overflow_that_compaction_cannot_shrink_stops_the_job(
+    request, tmp_path, monkeypatch
+):
+    """One forced compaction, then a stop: routing never reads ``error``, so
+    an unstopped result re-entered execute and compacted again, forever."""
+    result, wire, forced = await _execute_preflight_overflow(
+        request, tmp_path, monkeypatch, compaction_shrinks=False
+    )
+
+    assert len(forced) == 1
+    assert wire == []
+    assert result["should_stop"] is True
+    assert result.get("freeze_data") is None
+    assert result["error"]["type"] == "context_overflow"
+    assert result["error"]["recoverable"] is False
+    assert result["error"]["token_count"] == 10**9
+    status, _ = determine_job_status(
+        {"id": "job", "status": "processing", "context": {}}, result
+    )
+    assert status == "failed"
 
 
 # ---------------------------------------------------------------------------

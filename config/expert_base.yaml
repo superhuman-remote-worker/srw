@@ -17,7 +17,7 @@
 #
 # Where the two old bases disagreed on a shared key, this file holds the
 # conservative value and the overlay that wants the other value restates it
-# (llm.max_retries, memory budgets, browser blocklist, assemble_memories).
+# (llm.max_retries, memory budgets, browser blocklist).
 # Role-only keys (instruction_files, phase_settings, delegation, autonomy,
 # verification, scholar, curator, communication, canvas grants, ...) live in
 # the overlays, never here.
@@ -96,7 +96,6 @@ tools:
     - read_file
     - write_file
     - edit_file
-    - use_skill
     - list_files
     - delete_file
     - search_files
@@ -107,6 +106,13 @@ tools:
     - get_document_info
     - create_directory
     - delete_directory
+  # Skill tools - use_skill loads a skill from skills/<name>/ (src/agent/tools/workspace/skills.py).
+  # Its own group so that a `workspace` list written by an expert cannot drop it.
+  # The skill list in the prompt follows this tool: `skills: []` means no list and
+  # no skill files. A `before_tool` skill binding in instruction_files brings
+  # use_skill back regardless (knowledge-base/knowledge/features/skills_tool_category.md).
+  skills:
+    - use_skill
   # Research tools - web search, academic papers, browser & workflows (src/agent/tools/research/)
   research:
     - web_search
@@ -136,6 +142,7 @@ tools:
     - get_citation
     - list_citations
     - edit_citation
+    - withdraw_citation
     - annotate_source
     - get_annotations
     - tag_source
@@ -235,12 +242,6 @@ context_management:
   summarization_template: summarization_prompt.txt
   reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
   max_summary_length: 20000
-  # legacy: memory, knowledge, guidance, ... are rebuilt at the request tail
-  # every call. append_only: they are appended to the history once, when
-  # they change (append-only context injection, WP2). The rollback flag:
-  # set it back to legacy to roll back; the code fallback for a config
-  # without this key stays legacy.
-  injection_mode: append_only
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
@@ -257,14 +258,20 @@ memory:
   required: false                  # When true, a memory-dependent job pauses for bounded re-dispatch instead of running blind if memory/KB fail to init (self-improvement loop sets this)
   budget_tokens: 4000              # Max tokens for memory injection per LLM call (P-4 A/B, strategy doc §14); the session overlay raises it
   max_memories_per_injection: 50   # Cap on number of memories injected; the session overlay raises it
-  max_memories_per_entry: 5        # context_management.injection_mode append_only: new/changed memories per appended entry; the rest drip in on later requests (D29)
+  max_memories_per_entry: 5        # new/changed memories per appended context entry; the rest drip in on later requests (append-only context injection D29)
   observer_interval: 5             # Run observer every N turns
-  assembler_interval: 7            # Run assembler every N turns (TTL curation)
-  default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
   importance_threshold: 0.3        # Minimum importance to store
   dedup_threshold: 0.85            # Cosine similarity threshold for dedup
   retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
   project_scoped: true             # When true, memories are shared across all jobs in the same project
+  # May a retrieval inject a memory the observer extracted from this same job
+  # or session? skip_in_context = not while its source turns are still in
+  # context, again once a compaction removed them (the default since
+  # 2026-10-29, D38); allow = always (the behaviour before). memory_search is
+  # never filtered. Append-only context injection P4, decided by the test in
+  # knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md
+  retrieval:
+    same_conversation: skip_in_context
   # NOTE: the observer runs on the auxiliary LLM (see `auxiliary:` below) and
   # the embedding model comes from the EMBEDDING_* env vars — neither is
   # configurable here (dead keys removed, knowledge-base/knowledge/issues/memory_bugs.md B9).
@@ -277,7 +284,7 @@ memory:
     enabled: true
   pipeline:
     retrievers:
-      - recall_two_tier              # TTL-pinned tier + hybrid search (RecallStore)
+      - recall_hybrid                # Hybrid search over the project's memories (RecallStore)
       - kb_notes                     # Top-5 project knowledge notes
     scorers:
       - reranker                     # GATE B (overhaul Phase 3): cross-encoder rerank over the fused candidates
@@ -286,22 +293,21 @@ memory:
       - bounded                      # cap the survivors at max_items
     extensions:
       - memory_search                # the memory_search tool (tools.memory): hybrid search + the scorers/policies above, or one memory by handle
-    # `writers` is role-owned: the worker's in-loop / phase-boundary / assembler
-    # set versus the session's elapsed-gate / teardown set. Each overlay
+    # `writers` is role-owned: the worker's in-loop / phase-boundary set
+    # versus the session's elapsed-gate / teardown set. Each overlay
     # declares its own.
   # Phase-3+4 production-candidate stack, flipped on for the dev rollout
   # (GATE B — knowledge-base/knowledge/features/agent_memory_overhaul.md). Harness-measured:
   # R@5 0.20->1.0 at ~111 tok/q (80x cheaper than the full dump) and
   # knowledge-update end-task 0/4->3/4 once stale facts are retired.
   # ROLLBACK: set scorers/policies back to [] and ingestion.enabled false —
-  # the legacy two-tier read + cosine-dedup write stay in place behind these
+  # the plain hybrid read + cosine-dedup write stay in place behind these
   # flags, so this is a one-edit revert.
   reranker:
     # model / base_url / api_key: deliberately unset — the `rerank` catalog pin
     # (Admin → Models) arrives as RERANK_MODEL/_BASE_URL/_API_KEY at dispatch;
     # with no pin the scorer runs qwen3-reranker-8b on the embedding endpoint.
     top_k: 512                       # cover the candidate set; any tail past this fails the gate open, bounded backstops it
-    keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
     timeout: 10                      # live-latency cap per attempt (eval used 60 for cold-batch throughput)
     # Transient faults (timeout/connection drop/5xx) retry in-call, then
     # degrade THAT TURN to hybrid order instead of failing the job; structural
@@ -354,11 +360,6 @@ auxiliary:
       enabled: true
       # The worker overlay turns on `verdict` (adjudicate each curator write
       # against existing notes) — it fires only where the curator runs.
-    assemble_memories:
-      # Worker-only: no persistent code path calls assemble_memories
-      # (knowledge-base/knowledge/issues/memory_bugs.md B3). The worker overlay
-      # enables it; everything else keeps it off.
-      enabled: false
     # Citation verification (citation engine Phase 2): cite_* returns 'pending'
     # and the verifier writes the verdict back async on the citation model
     # (CITATION_LLM_*, dispatched per job) or the auxiliary model fallback.
@@ -400,6 +401,6 @@ shell:
 # Interactive persistent agent settings
 # Only used when agent is started with --mode persistent
 interactive:
-  permission_mode: supervised   # supervised | auto_accept | autonomous
+  permission_mode: read_only   # read_only | auto_accept | autonomous
   narration_mode: auto          # silent | verbose | auto
   idle_timeout_minutes: 30      # Auto-pause session after idle period (0 = disabled)

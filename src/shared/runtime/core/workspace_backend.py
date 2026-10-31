@@ -13,6 +13,8 @@ from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
+from shared.workspace_disk import WorkspaceDiskFullReport, WorkspaceDiskUsage
+
 
 class WorkspaceUnavailableError(Exception):
     """Raised when the workspace backend cannot be reached.
@@ -22,6 +24,29 @@ class WorkspaceUnavailableError(Exception):
     """
 
     pass
+
+
+class WorkspaceDiskFullError(WorkspaceUnavailableError):
+    """The workspace volume is full, so the shell cannot record its owner.
+
+    Still a ``WorkspaceUnavailableError``: no shell command can run, and every
+    caller that stops on an unavailable workspace must stop here too. The
+    completion report adds the usage, so the orchestrator can grow the volume
+    or say the disk is full instead of reporting a lost transport.
+    knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: WorkspaceDiskUsage | None,
+        command_in_flight: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.report = WorkspaceDiskFullReport(
+            usage=usage, command_in_flight=command_in_flight
+        )
 
 
 class WorkspaceAuthenticationError(Exception):
@@ -168,6 +193,10 @@ def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
 
     Order matters: deterministic authentication and dead-workspace errors are
     checked before the socket-level names in the transient set.
+
+    A full workspace disk stays ``workspace_unavailable`` and adds ``reason``,
+    ``disk`` and ``command_in_flight`` (``shared.workspace_disk``): an
+    orchestrator that predates the reason still holds the job.
     """
     if isinstance(exc, WorkspaceAuthenticationError):
         error_type, recoverable = "workspace_authentication", False
@@ -177,13 +206,14 @@ def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
         error_type, recoverable = "infra_transient", True
     else:
         error_type, recoverable = "job_error", False
-    return {
-        "error": {
-            "message": str(exc),
-            "type": error_type,
-            "recoverable": recoverable,
-        }
+    error: Dict[str, Any] = {
+        "message": str(exc),
+        "type": error_type,
+        "recoverable": recoverable,
     }
+    if isinstance(exc, WorkspaceDiskFullError):
+        error.update(exc.report.error_fields())
+    return {"error": error}
 
 
 class RemoteCommandTimeoutError(Exception):

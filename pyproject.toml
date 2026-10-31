@@ -1,11 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77 is the first setuptools with PEP 639 license expressions.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "superhuman-remote-worker"
 version = "0.0.0"
 description = "Superhuman Remote Worker application packages"
+# Functional Source License 1.1, Apache 2.0 future license (see LICENSE).
+license = "FSL-1.1-ALv2"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 # Images install their existing, separate requirements before --no-deps -e .
 dependencies = []
@@ -18,13 +22,15 @@ manifests = ["PyYAML>=6.0", "jsonschema>=4.18,<5"]
 cli = ["httpx>=0.27,<1", "PyYAML>=6.0", "jsonschema>=4.18,<5"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "harnesses/claude-code"]
 include = [
   "agent", "agent.*",
   "orchestrator", "orchestrator.*",
   "mcp_server", "mcp_server.*",
   "vm_controller", "vm_controller.*",
+  "voice_gateway", "voice_gateway.*",
   "shared", "shared.*",
+  "srw_claude_code_harness", "srw_claude_code_harness.*",
 ]
 namespaces = false
 
@@ -38,6 +44,7 @@ orchestrator = [
   "config/prompts/*.md",
 ]
 mcp_server = ["templates/*.html"]
+voice_gateway = ["config.example.yaml", "requirements.txt", "asterisk/addon.example.yaml"]
 shared = [
   "**/*.sql",
   "manifests/schema.json",
@@ -52,13 +59,13 @@ shared = [
 target-version = "py310"
 
 [tool.importlinter]
-root_packages = ["agent", "orchestrator", "mcp_server", "vm_controller", "shared"]
+root_packages = ["agent", "orchestrator", "mcp_server", "vm_controller", "voice_gateway", "shared"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "Applications and shared code use canonical package names"
 type = "forbidden"
-source_modules = ["agent", "orchestrator", "mcp_server", "vm_controller", "shared"]
+source_modules = ["agent", "orchestrator", "mcp_server", "vm_controller", "voice_gateway", "shared"]
 forbidden_modules = [
   "src", "database", "services", "security", "models", "main", "auth",
   "routers", "utils", "graph_routes", "logging_config", "uploads", "seed",
@@ -69,13 +76,13 @@ forbidden_modules = [
 [[tool.importlinter.contracts]]
 name = "Applications are independent"
 type = "independence"
-modules = ["agent", "orchestrator", "mcp_server", "vm_controller"]
+modules = ["agent", "orchestrator", "mcp_server", "vm_controller", "voice_gateway"]
 
 [[tool.importlinter.contracts]]
 name = "Shared code does not depend on applications"
 type = "forbidden"
 source_modules = ["shared"]
-forbidden_modules = ["agent", "orchestrator", "mcp_server", "vm_controller"]
+forbidden_modules = ["agent", "orchestrator", "mcp_server", "vm_controller", "voice_gateway"]
 
 [[tool.importlinter.contracts]]
 name = "Lightweight shared modules do not depend on shared runtime"
@@ -602,9 +609,9 @@ ignore_imports = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "MCP and VM controller do not depend on shared runtime"
+name = "MCP, VM controller and voice gateway do not depend on shared runtime"
 type = "forbidden"
-source_modules = ["mcp_server", "vm_controller"]
+source_modules = ["mcp_server", "vm_controller", "voice_gateway"]
 forbidden_modules = ["shared.runtime"]
 
 [[tool.importlinter.contracts]]
@@ -681,3 +688,9 @@ name = "Live session routes and services do not import application startup or co
 type = "forbidden"
 source_modules = ["orchestrator.routers.live", "orchestrator.services.live"]
 forbidden_modules = ["orchestrator.main", "orchestrator.application"]
+
+[[tool.importlinter.contracts]]
+name = "Voice gateway does not depend on agent or orchestrator"
+type = "forbidden"
+source_modules = ["voice_gateway"]
+forbidden_modules = ["agent", "orchestrator"]

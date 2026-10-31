@@ -38,14 +38,13 @@ if [[ -z "$THREAD" ]]; then
     exit 1
 fi
 
-# admin-cli issues a *lightweight* access token with no `sub`, which 500s the
-# auth resolver — the id_token is the one that validates as a Bearer.
+# The gates' Keycloak client mints the access token (scripts/k3d_gate_oauth.py):
+# it carries `sub` and the audience the API's Bearer check accepts. An ID
+# token, or admin-cli's lightweight access token, is refused with 401.
+# SRW_K3D_TEST_USER / SRW_K3D_TEST_PASSWORD pick the account (default test).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mint_token() {
-    kubectl $CTX $NS exec deploy/srw-orchestrator -c orchestrator -- \
-        curl -s -X POST http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token \
-        -d grant_type=password -d client_id=admin-cli \
-        -d username=test -d password=test -d scope=openid \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['id_token'])"
+    KUBE_CONTEXT=k3d-srw KUBE_NAMESPACE=srw python3 "$ROOT/scripts/k3d_gate_oauth.py"
 }
 
 max_seq() {

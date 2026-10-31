@@ -19,6 +19,10 @@ driver:
 * speaks the main agent's answer (``message_agent(reply_to=…)`` → a
   ``commentary`` append with the delegation id) and its steering
   (``message_agent`` without ``reply_to`` → an ``instructions`` append);
+* takes an answer to a later question as settling the earlier ones still
+  open (``covered``): a caller who pauses is cut off, and the voice hands on
+  the rest as the next question, which the main agent answers with
+  everything it knows;
 * after ``answer_timeout_s`` without an answer, tells the caller the request
   is noted and marks the question a follow-up for after the session;
 * ends with the session's ``closed`` event and returns the transcript, the
@@ -788,11 +792,30 @@ class LiveVoiceDriver:
         question["status"] = "answered_late" if late else "answered"
         question["answer"] = text
         question["answered_at"] = _utcnow().isoformat()
+        covered = self._cover_before(delegation_id)
         await self._changed()
-        return {
+        outcome: Dict[str, Any] = {
             "result": "answered_late" if late else "answered",
             "reply_to": delegation_id,
         }
+        if covered:
+            outcome["covered"] = covered
+        return outcome
+
+    def _cover_before(self, delegation_id: str) -> List[str]:
+        """Settle the questions asked before ``delegation_id`` that are still
+        open: its answer covers them, so none of them expires into a "noted"
+        follow-up the caller would hear after the answer."""
+        covered: List[str] = []
+        for other_id, other in self.questions.items():
+            if other_id == delegation_id:
+                break
+            if other["status"] == "open":
+                other["status"] = "covered"
+                other["covered_by"] = delegation_id
+                other["surfaced"] = True
+                covered.append(other_id)
+        return covered
 
     async def instruct(self, text: str) -> bool:
         return await self._append(
@@ -1002,8 +1025,20 @@ class LiveVoiceDriver:
             if question is not None and question["status"] == "open":
                 question["status"] = "follow_up"
                 question["surfaced"] = True
-        for item in delegations:
+        # An answer covers the questions asked before it (``answer``).
+        last_answered = max(
+            (
+                index
+                for index, item in enumerate(delegations)
+                if item["delegation_id"] in answered
+            ),
+            default=-1,
+        )
+        for index, item in enumerate(delegations):
             if item["delegation_id"] in answered:
+                continue
+            if index < last_answered and item["delegation_id"] not in noted:
+                self._note_covered(item["delegation_id"], upto_turn=item["turn"])
                 continue
             if item["delegation_id"] in noted:
                 # The pod told the caller it is noted before the job got
@@ -1068,6 +1103,21 @@ class LiveVoiceDriver:
             "asked_at": now,
             "answer_by": now,
             "status": "follow_up",
+            "surfaced": True,
+        }
+
+    def _note_covered(self, delegation_id: str, *, upto_turn: Optional[int]) -> None:
+        """A question a later answer settled before this run saw it."""
+        if delegation_id in self.questions:
+            return
+        now = _utcnow().isoformat()
+        self.questions[delegation_id] = {
+            "delegation_id": delegation_id,
+            "request": self._request_upto(upto_turn),
+            "transcript_tail": self.transcript.render(last=_TRANSCRIPT_TAIL_TURNS),
+            "asked_at": now,
+            "answer_by": now,
+            "status": "covered",
             "surfaced": True,
         }
 
@@ -1329,6 +1379,8 @@ class LiveVoiceDriver:
                 entry = f"{index}. [{question['status']}] {question['request'] or '(no request text)'}"
                 if question.get("answer"):
                     entry += f" → answered: {question['answer']}"
+                elif question["status"] == "covered":
+                    entry += " → answered with a later question"
                 lines.append(entry)
         follow_ups = [
             q

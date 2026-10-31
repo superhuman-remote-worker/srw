@@ -1,0 +1,24 @@
+id: s21-answer-during-hold
+title: The answer comes in while the voice says a hold sentence
+why: >-
+  Owner's call 2026-10-23 (§9.14): the answer arrived during a hold sentence
+  and reached the caller 7.6 s later; on the bench it was lost until the
+  caller spoke. The LLM reasoned before relaying it (the holding sentence and
+  its call as one message after the result). The answer must follow the hold
+  sentence by itself.
+categories: [back_office]
+voice: m-middle
+condition: g711a
+turns:
+  - utterance: bof-01
+    expect:
+      outcome: delegate
+      values:
+        - {keyword: "120|hundertzwanzig", in: reply}
+    back_office:
+      answer: Ja, vom zwölften bis vierzehnten März ist ein Doppelzimmer frei, 120 Euro pro Nacht mit Frühstück.
+      after: 9
+  - utterance: sho-02
+    when: after_voice
+    offset: 4
+    expect: {outcome: any}

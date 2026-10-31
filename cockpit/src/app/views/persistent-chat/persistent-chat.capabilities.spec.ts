@@ -6,7 +6,7 @@ import {FormsModule} from '@angular/forms';
 import {By} from '@angular/platform-browser';
 import {Router} from '@angular/router';
 import {TranslocoService} from '@jsverse/transloco';
-import {of, Subject} from 'rxjs';
+import {Observable, of, Subject} from 'rxjs';
 import {beforeAll, describe, expect, it, vi} from 'vitest';
 import {environment} from '../../core/environment';
 import {WorkspaceLifecycleView} from '../../core/models/api.model';
@@ -41,18 +41,19 @@ function sessionState() {
     'workspaceUpgradeInProgress', 'continueAfterUpgrade', 'rewindInFlight', 'rewindOutcomeUnknown',
     'rewindPreviewLoading', 'rewindModeAvailable', 'summarizeAvailable', 'outboxStalled',
     'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable', 'cloudFoldersAgentOutdated',
-    'cloudFoldersProtected']) state[key] = signal(false);
+    'cloudFoldersProtected', 'workspaceUpgradeFailed']) state[key] = signal(false);
   for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions', 'tasks',
     'outbox', 'outboxIds', 'draftDatasourceIds', 'runningTools', 'cloudFolderProblems',
     'cloudFolders']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'pendingWorkspaceOffer',
     'currentUsage', 'queueState', 'verifiedProjectFolder', 'cloudSessionUrl', 'ncSessionFolder',
     'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError',
-    'workspaceCreation']) state[key] = signal(null);
+    'workspaceCreation', 'workspaceUpgradeProgress']) state[key] = signal(null);
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
-    modelName: signal('Test model'), permissionMode: signal('supervised'), narrationMode: signal('off'),
-    startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()),
+    modelName: signal('Test model'), permissionMode: signal('read_only'), narrationMode: signal('off'),
+    workspaceUpgradeFailureText: () => '',
+    startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()), citationFocus: signal(null),
     awaitingElapsedMs: signal(0), reconnectAttempt: signal(0), agentSilenceSeconds: signal(0), cloudChangesCount: signal(0),
     sshHandle: signal('test-thread'), resetWindow: vi.fn(), refreshPendingRewindReceipt: vi.fn(),
     // The real service answers per command from /connection; here only
@@ -254,6 +255,39 @@ describe('parked unit composer', () => {
     }
   });
 
+  // A park over cut-off tool calls is the owner's decision, not an operator's:
+  // the approval-style card replaces the "an administrator has to release it"
+  // bubble (session_unknown_tool_result_needs_admin.md).
+  it('shows the Continue / Stop card for a park over unknown tool results', async () => {
+    const chat = sessionState() as any;
+    chat.isParked.set(true);
+    chat.queueState.set({
+      state: 'parked', park_reason: 'loop_died_after_tool_effect', parked_at: null,
+      retryable: false, attempts: 2, pending_input: true,
+      unknown_tool_calls: [{id: 'call_sleep', name: 'shell_execute', args: {command: 'sleep 570'}}],
+    });
+    chat.decideUnknownToolResult = vi.fn(async () => 'ok');
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      const card = el.querySelector('[data-testid="chat-unknown-result"]');
+      expect(card).not.toBeNull();
+      expect(card!.textContent).toContain('shell_execute');
+      expect(card!.textContent).toContain('sleep 570');
+      expect(el.querySelector('[data-testid="chat-unknown-continue"]')).not.toBeNull();
+      expect(el.querySelector('[data-testid="chat-unknown-stop"]')).not.toBeNull();
+      expect(el.querySelector('[data-testid="chat-parked"]')).toBeNull();
+      const composer = el.querySelector<HTMLTextAreaElement>('[data-testid="chat-composer"]')!;
+      expect(composer.placeholder).toBe('chat.input.parkedDecide');
+
+      await fixture.componentInstance.decideUnknownToolResult('continue');
+      expect(chat.decideUnknownToolResult).toHaveBeenCalledWith('continue');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
   // End and suspension settle the unit (the End funnel closes a parked one to
   // `done`), so a parked block that outlived an in-tab End is stale: the box
   // stays the resume path it always was.
@@ -301,6 +335,263 @@ describe('parked unit composer', () => {
       fixture.destroy();
       TestBed.resetTestingModule();
     }
+  });
+});
+
+/** The landing draft (New chat): an open composer with no session behind it. */
+function draftState() {
+  const chat = sessionState() as any;
+  chat.isDraftSession.set(true);
+  chat.isConnected.set(false);
+  chat.sessionReady.set(false);
+  chat.threadId.set(null);
+  chat.threadStatus.set(null);
+  chat.connectionState.set('disconnected');
+  chat.startupPhase.set(null);
+  chat.draftDatasourceIds.set([]);
+  chat.draftConnectorsEnabled = signal(true);
+  return chat;
+}
+
+// New chat lands on a draft with no session behind it. A chip rides the first
+// send's outbox item into the thread that send creates, exactly like the text,
+// so Attach and drop follow the composer rather than the connection.
+describe('attachments follow the composer', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  function dropEvent(file: File): DragEvent {
+    return {dataTransfer: {types: ['Files'], files: [file]}, preventDefault: vi.fn()} as unknown as DragEvent;
+  }
+
+  async function mountWithPreviews(chat: any) {
+    chat.addAttachments = vi.fn();
+    const fixture = await mountChat(chat, api, false);
+    const preview = {id: 'p1', name: 'notes.pdf', size: 3, mimeType: 'application/pdf'};
+    Object.assign(TestBed.inject(FileHandlingService), {
+      createFilePreviews: vi.fn(async () => ({previews: [preview], rejected: []})),
+    });
+    return {fixture, preview};
+  }
+
+  it('attaches on the landing draft before any session exists', async () => {
+    const chat = draftState();
+    const {fixture, preview} = await mountWithPreviews(chat);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      expect(el.querySelector<HTMLButtonElement>('.attach-wrap button')!.disabled).toBe(false);
+
+      await fixture.componentInstance.onDrop(dropEvent(new File(['pdf'], 'notes.pdf')));
+      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([preview]);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('refuses Attach and drop during a mid-session reconnect', async () => {
+    const chat = sessionState() as any;
+    chat.isConnected.set(false);
+    chat.connectionState.set('connecting');
+    const {fixture} = await mountWithPreviews(chat);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      expect(el.querySelector<HTMLButtonElement>('.attach-wrap button')!.disabled).toBe(true);
+
+      await fixture.componentInstance.onDrop(dropEvent(new File(['pdf'], 'notes.pdf')));
+      expect(chat.addAttachments).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
+// Dictation on the landing draft (knowledge-base/knowledge/features/draft_session_dictation.md):
+// the mic follows the composer, the draft transcribes through the account
+// route, and a result that outlives its composer is dropped whole.
+describe('dictation follows the composer', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const clip = new File(['ogg'], 'voice.webm', {type: 'audio/webm'});
+  const preview = {id: 'a1', file: clip, name: 'voice.webm', size: 3, mimeType: 'audio/webm', type: 'audio'};
+
+  /** Mount with a usable mic and a stopped recording ready to hand back. */
+  async function mountWithMic(chat: any, transcription: Observable<unknown>) {
+    chat.addAttachments = vi.fn();
+    const api = {
+      getThreadIdeStatus: () => of(null),
+      getMyCapabilities: () => of(null),
+      getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+      transcribeVoice: vi.fn(() => transcription),
+    };
+    const fixture = await mountChat(chat, api, false);
+    Object.assign(TestBed.inject(VoiceCapabilitiesService), {stt: signal(true)});
+    Object.assign(TestBed.inject(VoiceRecordingService), {
+      stopRecording: vi.fn(async () => ({blob: clip, duration: 3, mimeType: 'audio/webm'})),
+      cancelRecording: vi.fn(),
+    });
+    Object.assign(TestBed.inject(FileHandlingService), {
+      createAudioFilePreview: vi.fn(async () => preview),
+    });
+    fixture.componentInstance.hasAudioInput.set(true);
+    fixture.detectChanges();
+    return {fixture, api};
+  }
+
+  const micButton = (fixture: {nativeElement: HTMLElement}) =>
+    fixture.nativeElement.querySelector<HTMLButtonElement>('button.send.mic')!;
+
+  it('records and transcribes on the landing draft through the account route', async () => {
+    const chat = draftState();
+    const {fixture, api} = await mountWithMic(chat, of({text: 'plan my week'}));
+    try {
+      expect(micButton(fixture).disabled).toBe(false);
+
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      await component.stopRecording();
+
+      expect(api.transcribeVoice).toHaveBeenCalledExactlyOnceWith(null, clip);
+      expect(component.inputText).toBe('plan my week');
+      // The clip rides the first send like any attachment.
+      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([preview]);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('closes the mic during a mid-session reconnect', async () => {
+    const chat = sessionState() as any;
+    chat.isConnected.set(false);
+    chat.connectionState.set('connecting');
+    const {fixture} = await mountWithMic(chat, of({text: ''}));
+    try {
+      expect(micButton(fixture).disabled).toBe(true);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('refuses Send while the transcript is still on its way', async () => {
+    const chat = draftState();
+    chat.sendMessage = vi.fn(async () => true);
+    const transcription = new Subject<unknown>();
+    const {fixture} = await mountWithMic(chat, transcription);
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      const stopped = component.stopRecording();
+      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+
+      component.inputText = 'typed meanwhile';
+      expect(component.canSend()).toBe(false);
+      component.send();
+      expect(chat.sendMessage).not.toHaveBeenCalled();
+
+      transcription.next({text: 'and dictated'});
+      transcription.complete();
+      await stopped;
+      expect(component.inputText).toBe('typed meanwhile\n\nand dictated');
+      expect(component.canSend()).toBe(true);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('drops a transcription that lands after the user switched sessions', async () => {
+    const chat = sessionState() as any;
+    const transcription = new Subject<unknown>();
+    const {fixture} = await mountWithMic(chat, transcription);
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      const stopped = component.stopRecording();
+      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+
+      // The reused component now shows another session: the first one's
+      // transcription neither shows here nor holds this composer's Send.
+      chat.threadId.set('another-session');
+      expect(component.isTranscribing()).toBe(false);
+      component.inputText = 'a message for this session';
+      expect(component.canSend()).toBe(true);
+
+      transcription.next({text: 'meant for the first session'});
+      transcription.complete();
+      await stopped;
+
+      expect(component.inputText).toBe('a message for this session');
+      expect(chat.addAttachments).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it("an earlier session's late transcription leaves a newer one running", async () => {
+    const chat = sessionState() as any;
+    const first = new Subject<unknown>();
+    const second = new Subject<unknown>();
+    const {fixture, api} = await mountWithMic(chat, first);
+    api.transcribeVoice.mockReturnValueOnce(first).mockReturnValueOnce(second);
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      const firstStopped = component.stopRecording();
+      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+
+      chat.threadId.set('another-session');
+      component.isRecording.set(true);
+      const secondStopped = component.stopRecording();
+      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+
+      first.next({text: 'late'});
+      first.complete();
+      await firstStopped;
+      expect(component.isTranscribing()).toBe(true);
+
+      second.next({text: 'current'});
+      second.complete();
+      await secondStopped;
+      expect(component.isTranscribing()).toBe(false);
+      expect(component.inputText).toBe('current');
+      expect(chat.addAttachments).toHaveBeenCalledOnce();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('drops a transcription that lands after its draft composer is gone', async () => {
+    const chat = draftState();
+    const transcription = new Subject<unknown>();
+    const {fixture} = await mountWithMic(chat, transcription);
+    const component = fixture.componentInstance;
+    component.isRecording.set(true);
+    const stopped = component.stopRecording();
+    await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+
+    fixture.destroy();
+    transcription.next({text: 'too late'});
+    transcription.complete();
+    await stopped;
+
+    expect(chat.addAttachments).not.toHaveBeenCalled();
+    TestBed.resetTestingModule();
   });
 });
 
@@ -425,6 +716,56 @@ describe('the slash menu completes the command word, never its argument', () => 
   });
 });
 
+describe('permission mode surfaces', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  it('offers /readonly but never lists the hidden /supervised alias', async () => {
+    const fixture = await mountChat(sessionState() as any, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.onInputChange('/');
+      const offered = view.filteredCommands().map((c) => c.command);
+      expect(offered).toContain('/readonly');
+      expect(offered).toContain('/auto');
+      expect(offered).toContain('/autonomous');
+      expect(offered).not.toContain('/supervised');
+      view.onInputChange('/sup');
+      expect(view.filteredCommands()).toEqual([]);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('labels the header badge from i18n, never the raw value', async () => {
+    const chat = sessionState() as any;
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      expect(view.permissionModeLabelKey()).toBe('chat.settings.modeReadOnly');
+      fixture.detectChanges();
+      const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+      expect(text).toContain('chat.settings.modeReadOnly');
+      expect(text).not.toMatch(/read_only/i);
+
+      chat.permissionMode.set('auto_accept');
+      expect(view.permissionModeLabelKey()).toBe('chat.settings.modeAutoAccept');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
 describe('rewind affordances follow the declared controls', () => {
   beforeAll(async () => {
     HTMLElement.prototype.scrollTo = vi.fn();
@@ -535,6 +876,47 @@ describe('the continuation a delegation-batch recovery wrote', () => {
       const line = fixture.nativeElement.querySelector('.message-system .system-message') as HTMLElement;
       expect(line.textContent!.replace(/\s+/g, ' ').trim()).toBe('info report of the orphaned child');
       expect(line.hasAttribute('title')).toBe(false);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
+describe('a call the history holds without a result', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+  const call = {
+    kind: 'tool_call' as const, id: 'tc1', tool: 'shell_execute', args: {command: 'sleep 240'},
+    status: 'completed' as const, resultState: 'missing' as const, startedAt: 0,
+  };
+
+  // A reload during the call: the session still reports it running, so the
+  // card says running, never "completed" or "no result". Once the session is
+  // parked the cut-off call is the owner's to decide and reads "no result".
+  it('reads running while the session reports it, else no result', async () => {
+    const chat = sessionState() as any;
+    chat.runningTools.set([{id: 'tc1', tool: 'shell_execute', args: {}}]);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = () => fixture.componentInstance.toolView(call);
+      expect(view().status).toBe('running');
+      expect(view().outcome).toBeUndefined();
+
+      chat.isParked.set(true);
+      expect(view().outcome?.labelKey).toBe('toolCard.outcome.noResult');
+
+      chat.isParked.set(false);
+      chat.runningTools.set([]);
+      expect(view().outcome?.labelKey).toBe('toolCard.outcome.noResult');
     } finally {
       fixture.destroy();
       TestBed.resetTestingModule();

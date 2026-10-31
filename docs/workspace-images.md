@@ -1,3 +1,8 @@
+---
+title: Build your own workspace image
+description: Add your own tools to a workspace image and run jobs and sessions on it.
+---
+
 # Build your own workspace image
 
 A Job or Session on the Container tier runs in a container whose image comes
@@ -76,21 +81,26 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Python packages: unset PIP_TARGET so that pip installs system-wide.
-RUN env -u PIP_TARGET pip install --break-system-packages --no-cache-dir yamllint
+# Python packages: as root, pip installs system-wide.
+RUN pip install --break-system-packages --no-cache-dir yamllint
 
 # Last step: fail the build if the image no longer meets the workspace contract.
 RUN /usr/local/bin/assert-workspace-contract
 ```
 
-Follow three rules:
+Follow four rules:
 
 - **Install system-wide.** A workspace mounts its volume over
-  `/home/agent-host`, so anything your build puts there is hidden. The base
-  images point `PIP_TARGET` and `npm_config_prefix` into that directory for the
-  agent's own installs; unset them for yours, as above. For npm, write
-  `RUN env -u npm_config_prefix npm install -g <package>`. Node.js and npm are
-  only in `srw-workspace`, not in the minimal base.
+  `/home/agent-host`, so anything your build puts there is hidden. pip run as
+  root, as in your build, installs system-wide. The base images point
+  `npm_config_prefix` into that directory for the agent's own installs; unset it
+  for yours: `RUN env -u npm_config_prefix npm install -g <package>`. Node.js
+  and npm are only in `srw-workspace`, not in the minimal base.
+- **Pass your `ENV` settings on to the agent.** The agent's commands run over
+  SSH, and every SSH session starts with a fresh environment, so a value set
+  with `ENV` doesn't reach them. After your `ENV` lines, run
+  `RUN /usr/local/bin/write-agent-environment NAME ...` with the names you set.
+  It copies them into `/etc/environment`, together with `PATH`.
 - **Don't set `ENTRYPOINT`, `CMD` or `USER`.** The base's entrypoint runs as
   root, starts sshd and keeps the container running. SRW reaches the workspace
   over SSH, so a container that exits never becomes ready. Replacing
@@ -260,9 +270,9 @@ project template, write `scope: {kind: Project, name: <project UUID>}`.
 
 **Try a new image with a Job first.** A Job shows more about why its workspace
 didn't start; see [When it doesn't start](#when-it-doesnt-start). A Session may
-show nothing. On a default installation a container Session has no workspace
-status line at all. Where your operator runs Sessions on stateless executors
-(`agent.stateless.enabled`) without startup-stage tracking, it keeps saying
+show nothing. A container Session on a pinned agent (`agent.stateless.enabled:
+false`) has no workspace status line at all. Where your operator runs stateless
+Sessions (the default) with startup-stage tracking turned off, it keeps saying
 "Checking workspace scheduling; the result is not yet confirmed." You can still
 End a Session whose image can't be pulled when it first starts. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
@@ -285,17 +295,18 @@ have your tools either. See
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| The Job fails with "Workspace container exited with code `<code>` (`<reason>`) before it became ready. A workspace image must keep running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.", and its workspace is cleaned up. Where your installation reports container startup stages (see below), the Job stays **Created** instead and the Jobs list says "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER." once the startup limit has passed: for your own image, `workspace.imagePullTimeoutSeconds` (600 seconds by default). | The container exited, for example because the image replaces the base's `ENTRYPOINT` or `USER`, or isn't built `FROM` an SRW base. Without startup-stage tracking, a container that keeps running but never opens SSH can instead leave the Job **Created** with "Checking an older workspace creation; completion evidence is unavailable." | Rebuild `FROM` a base without those settings, and run step 3 before you push. Cancel a Job that stays **Created**. |
+| The Job fails with "Workspace container exited with code `<code>` (`<reason>`) before it became ready. A workspace image must keep running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.", and its workspace is cleaned up. Where your installation reports container startup stages (see below), the Job stays **Created** instead, and within seconds the Jobs list says "Workspace needs attention: its container exited with code `<code>` before it was ready. A workspace image must keep running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER." | The container exited, for example because the image replaces the base's `ENTRYPOINT` or `USER`, or isn't built `FROM` an SRW base. A container that keeps running but never opens SRW's SSH server ends the same way: the liveness check stops it after about two minutes, with code 137 or 143 (not an out-of-memory kill, which is reported as `OOMKilled`). Sessions don't get this message: a Session whose image exits reaches the "didn't become ready in time" message below after its budget. | Rebuild `FROM` a base without those settings, and run step 3 before you push. Cancel a Job that stays **Created**. |
+| The Job stays **Created** and, once the startup limit has passed, the Jobs list says "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER. The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory." For your own image the limit is `workspace.imagePullTimeoutSeconds` (600 seconds by default). Without startup stages, the Jobs list says "Checking an older workspace creation; completion evidence is unavailable." instead. | The cluster stopped the container (for example `OOMKilled`, an evicted Pod or `ContainerStatusUnknown`), or the start is slow. A Session whose image exits or never opens SRW's SSH server also ends here. Without startup stages, a cluster stop fails the Job with "Workspace container exited with code `<code>` (`<reason>`) before it became ready." and no image advice. | Check the image as in the row above. After a cluster stop, use a template with more memory. Cancel a Job that stays **Created**. |
 | The Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`". Where your installation reports startup stages, the Job stays **Created** instead and the Jobs list says "Workspace needs attention: its image didn't finish pulling in time. Check the image reference and that the cluster can pull from its registry.", or "Workspace needs attention: its image is invalid." for a malformed reference. | The reference is wrong, the pull secret is missing, or the nodes can't reach the registry. | Check the reference from step 4 and the registry access. Where startup stages are reported, Cancel the Job. See [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start). |
 | A Job has no cloud folder. | Cloud folders mount into Sessions only. A Job gets its project's folder as a copy in its repository, under `projects/<slug>/`, when the project's **Project folder copy** connector is selected. | Keep that connector on the Job. See [Cloud folders](cloud-folders.md#jobs). |
 | A Session on your own image gets no cloud folder where its folders mount inside the workspace: OpenCloud folders, or any folder with `connectors.inPodPlane.enabled` off. | Images that aren't SRW's run unprivileged, without the FUSE mount. With the in-pod plane on, a Session on such an image still gets its other folders, from the plane's sidecars. | Your operator adds your image's repository to `workspace.images.trustedRepositories`. `workspace.customImages.privileged: true` gives every custom image that profile, which is one step from root on the node; it suits only an installation that trusts everyone who can author templates. See [Privilege](../examples/manifests/container-workspace-templates.md#privilege). |
 | `sshfs`, `rclone mount` or another FUSE mount fails in a Session's shell ("fuse: device not found"), or a system call the default seccomp profile blocks fails. | With the in-pod plane on (the default), the Session's cloud folders come from sidecars, and its workspace runs unprivileged: no FUSE, seccomp `RuntimeDefault`. | Use a VM workspace, or your operator turns off `connectors.inPodPlane.enabled`. See [Cloud folders from the in-pod plane](security-model.md#cloud-folders-from-the-in-pod-plane). |
 | A cloud folder of a Session is shown as unavailable. | Its mount did not come up when the workspace started; the Session says why (the cloud refused the credential, the folder no longer exists, the cloud did not answer…). The rest of the workspace works. | Fix what the reason names, then start a new Session: folders are set up when its workspace is created. |
 | A cloud folder of a Session is shown as left out. | SRW did not mount it at all: no level it may have is offered on this tier, it is beside a protected folder, its own cloud account is not ready, My cloud is not connected… The Session names the reason; nothing is mounted in its place. | See [When a folder is left out](cloud-folders.md#when-a-folder-is-left-out). |
-| "command not found" for a tool your Dockerfile installed. | It was installed under `/home/agent-host`, which the workspace volume hides, for example by `pip` or `npm` without unsetting `PIP_TARGET` or `npm_config_prefix`. | Install system-wide, as in step 2. |
+| "command not found" for a tool your Dockerfile installed. | It was installed under `/home/agent-host`, which the workspace volume hides, for example by `npm` without unsetting `npm_config_prefix`. Or it is in a directory your Dockerfile added to `PATH` with `ENV`, which the agent's SSH sessions don't inherit. | Install system-wide, as in step 2. For a `PATH` entry, run `write-agent-environment` after your `ENV` lines. |
 
-Startup stages are reported when the operator enables Helm
-`orchestrator.containerStartupStageAuthority.enabled` (off by default); see
+Startup stages are reported while Helm
+`orchestrator.containerStartupStageAuthority.enabled` is on (the default); see
 [Container startup stage rollout](../helm/README.md#container-startup-stage-rollout).
 
 An operator can read a Job's pod status and events with

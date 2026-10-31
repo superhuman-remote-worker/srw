@@ -123,7 +123,7 @@ function makeThread(overrides: Partial<any> = {}) {
         title: 'Test Session',
         status: 'active',
         config_name: 'persistent_defaults',
-        permission_mode: 'supervised',
+        permission_mode: 'read_only',
         created_at: '2026-01-01T00:00:00Z',
         last_activity: '2026-01-01T01:00:00Z',
         ended_at: null,
@@ -222,7 +222,7 @@ describe('SessionsPageComponent', () => {
 
         it('should have default form values', () => {
             expect(component.newConfig).toBe('session_base');
-            expect(component.newPermission).toBe('supervised');
+            expect(component.newPermission).toBe('read_only');
             expect(component.newModel).toBe('');
             expect(component.newTitle).toBe('');
         });
@@ -292,9 +292,8 @@ describe('SessionsPageComponent', () => {
 
     // =========================================================================
     // F3: onRenameThread() must keep SessionListService (the rail's copy of
-    // the list) in sync — this page's own `threads` is a filtered/mapped
-    // snapshot, not a computed over the service, so nothing does that for
-    // free.
+    // the list) in sync. It renames through the service, which `threads`
+    // follows, so the card and the rail show the same title.
     // =========================================================================
 
     describe('onRenameThread()', () => {
@@ -319,6 +318,38 @@ describe('SessionsPageComponent', () => {
             expect(component.threads()[0].title).toBe('Old title');
             expect(sessionList.threads()[0].title).toBe('Old title');
             expect(mockToast.danger).toHaveBeenCalled();
+        });
+    });
+
+    // The rail's session menu ends, renames and deletes sessions through the
+    // shared list alone; the cards must follow without a re-read here.
+    describe('changes made from the rail', () => {
+        it('drops a card the rail deleted', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a'}), makeThread({id: 'b'})]}));
+            await component.loadThreads();
+
+            sessionList.removeLocal('a');
+
+            expect(component.threads().map((t) => t.id)).toEqual(['b']);
+        });
+
+        it('shows a title the rail renamed', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a', title: 'Old title'})]}));
+            await component.loadThreads();
+
+            sessionList.renameLocal('a', 'From the rail');
+
+            expect(component.threads()[0].title).toBe('From the rail');
+        });
+
+        it('shows a status the rail\'s own re-read brought in', async () => {
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a', status: 'active'})]}));
+            await component.loadThreads();
+
+            mockHttp.get.mockReturnValue(of({threads: [makeThread({id: 'a', status: 'ended'})]}));
+            await sessionList.refresh();
+
+            expect(component.threads()[0].status).toBe('ended');
         });
     });
 
@@ -517,7 +548,7 @@ describe('SessionsPageComponent', () => {
                     detail: {
                         code: 'config_drift',
                         drift: [{id: 'connector:abc', kind: 'connector',
-                                 reason: 'deleted', label: 'KurortEngine'}],
+                                 reason: 'deleted', label: 'WidgetShop'}],
                     },
                 },
             })));
@@ -1014,9 +1045,10 @@ describe('SessionsPageComponent', () => {
 /** Keys straight through: the card is asserted on its bindings, not its copy. */
 @Pipe({name: 'transloco', standalone: true})
 class TranslocoStubPipe implements PipeTransform {
-    transform(key: string): string {
+    transform(key: string, params: Record<string, unknown> = {}): string {
         if (key.startsWith('workspaceCreation.')) {
-            return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+            const copy = (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+            return copy.replace(/{{\s*(\w+)\s*}}/g, (_match, name: string) => String(params[name] ?? ''));
         }
         return key;
     }
@@ -1084,7 +1116,7 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         serveThreadLists(mocks.mockHttp, [makeThread({
             id: 't-startup', status: 'created',
             workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
-                reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+                reason_code: 'scheduler_unschedulable', readiness_deadline_at: null, exit_code: null},
         })]);
         const fixture = TestBed.createComponent(SessionsPageComponent);
         fixture.detectChanges();
@@ -1093,6 +1125,19 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         expect(sessionCard.textContent).toContain('Waiting for scheduling');
         expect(sessionCard.querySelectorAll('app-icon-button').length).toBeGreaterThanOrEqual(2);
         expect(deleteButton(fixture.nativeElement as HTMLElement, 't-startup').disabled).not.toBe(true);
+    });
+
+    it('shows the reworded readiness deadline copy on a Session', async () => {
+        serveThreadLists(mocks.mockHttp, [makeThread({
+            id: 't-deadline', status: 'created',
+            workspace_creation: {stage: 'readiness', state: 'attention',
+                reason_code: 'readiness_deadline', readiness_deadline_at: null, exit_code: null},
+        })]);
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        fixture.detectChanges();
+        await settle(fixture);
+        expect(card(fixture.nativeElement as HTMLElement, 't-deadline').textContent)
+            .toContain('The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.');
     });
 
     it('keeps Delete enabled as a retry on the ending card, re-sends it on click, and drops the retry on a 200', async () => {

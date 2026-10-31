@@ -91,12 +91,12 @@ describe('SessionListService', () => {
     const second = service.refresh();
     newer.next({threads: [{...thread('a', new Date().toISOString()),
       workspace_creation: {stage: 'readiness', state: 'attention',
-        reason_code: 'invalid_image', readiness_deadline_at: null}}]});
+        reason_code: 'invalid_image', readiness_deadline_at: null, exit_code: null}}]});
     newer.complete();
     await second;
     older.next({threads: [{...thread('a', new Date().toISOString()),
       workspace_creation: {stage: 'scheduling', state: 'observing',
-        reason_code: 'observation_pending', readiness_deadline_at: null}}]});
+        reason_code: 'observation_pending', readiness_deadline_at: null, exit_code: null}}]});
     older.complete();
     await first;
     expect(service.threads()[0].workspace_creation?.state).toBe('attention');
@@ -143,5 +143,25 @@ describe('SessionListService.renameLocal', () => {
     service.renameLocal('does-not-exist', 'Renamed session');
 
     expect(service.threads().map((t) => t.title)).toEqual(['Session a']);
+  });
+});
+
+describe('SessionListService deleted sessions', () => {
+  it('leaves a session out of Recents while its permanent Delete retires it, but keeps it in threads', async () => {
+    const now = new Date().toISOString();
+    const deleting = {...thread('d', now), status: 'ending', retirement_permanent: true} as Thread;
+    const {service} = create([thread('a', now), deleting]);
+    await service.refresh();
+    expect(service.grouped().flatMap((g) => g.threads.map((t) => t.id))).toEqual(['a']);
+    expect(service.threads().map((t) => t.id)).toEqual(['a', 'd']);
+  });
+
+  it('removeLocal drops the thread without a re-fetch', async () => {
+    const now = new Date().toISOString();
+    const {service, http} = create([thread('a', now), thread('b', now)]);
+    await service.refresh();
+    service.removeLocal('a');
+    expect(service.threads().map((t) => t.id)).toEqual(['b']);
+    expect(http.get).toHaveBeenCalledTimes(1);
   });
 });

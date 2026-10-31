@@ -21,9 +21,6 @@ The properties that travel with it and are not re-derived:
 * **Job create and repo/cloud provisioning raise; only the dispatch nudge is
   best effort.** An unprovisioned job is sealed ``failed`` rather than left
   runnable against a void.
-* **A fan-out stage disables the memory assembler** on its members, because
-  >1 analysis role against one shared project store is a read-modify-write
-  race.
 * :func:`record_loop_job_outcome` reads the orchestrator's own persisted
   record, never the agent's prose, and fires the "delivered nothing" alarm
   only when NO path delivered — neither the project cloud nor a pull request.
@@ -170,7 +167,6 @@ async def spawn_loop_job(
     iteration: int,
     seq_index: int | None = None,
     remaining_iterations: int | None = None,
-    disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
     park_until: datetime | None = None,
     dependencies: ProjectLoopDependencies,
@@ -188,9 +184,7 @@ async def spawn_loop_job(
     baseline provisioning (the caller fails the loop); only the final dispatch
     nudge is best-effort. ``seq_index`` / ``remaining_iterations`` are
     stamped into the job's context for the torn-advance heal (see
-    ``create_loop_job``). ``disable_memory_assembler`` (set for fan-out stage
-    members) turns off the TTL-curation assembler so concurrent members don't
-    race the shared project store. The real ticket pool (knowledge-base/knowledge/superpowers/specs/
+    ``create_loop_job``). The real ticket pool (knowledge-base/knowledge/superpowers/specs/
     2026-07-26-project-backlog-pipeline-design.md) is fetched here — the single
     funnel every loop spawn passes through — and handed to ``create_loop_job``
     pre-rendered. The recent structured job history is injected alongside it;
@@ -261,7 +255,6 @@ async def spawn_loop_job(
         iteration=iteration,
         seq_index=seq_index,
         remaining_iterations=remaining_iterations,
-        disable_memory_assembler=disable_memory_assembler,
         extra_context=extra_context,
         backlog_block=backlog_block,
         history_block=history_block,
@@ -357,10 +350,6 @@ async def spawn_loop_stage(
 
     roles = normalize_stage(stage)
     new_total = int(base_total) + len(roles)
-    # A fan-out stage runs >1 analysis role concurrently against the one shared
-    # project store — its members must not each run the TTL-curation assembler
-    # (read-modify-write race). A single-role stage keeps the assembler on.
-    is_fan_out = len(roles) > 1
     jobs: list[dict[str, Any]] = []
     for role in roles:
         job = await spawn_loop_job(
@@ -370,7 +359,6 @@ async def spawn_loop_stage(
             iteration=new_total,
             seq_index=seq_index,
             remaining_iterations=remaining,
-            disable_memory_assembler=is_fan_out,
             extra_context=extra_context,
             park_until=park_until,
         )

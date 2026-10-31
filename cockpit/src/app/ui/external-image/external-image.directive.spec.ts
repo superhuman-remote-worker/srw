@@ -16,7 +16,11 @@ import {of} from 'rxjs';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {externalImageExtension} from '../../core/markdown/external-image-extension';
 import {sanitizeMarkdownHtml} from '../../core/markdown/markdown-sanitizer';
-import {ExternalImageDirective, reviewExternalImageUrl} from './external-image.directive';
+import {
+  ExternalImageDirective,
+  rasterImageType,
+  reviewExternalImageUrl,
+} from './external-image.directive';
 
 @Component({
   standalone: true,
@@ -140,6 +144,55 @@ describe('ExternalImageDirective', () => {
     expect(revokeObjectUrl).toHaveBeenCalledWith('blob:reviewed-image');
   });
 
+  it('refuses an SVG response instead of showing it from a Cockpit-origin blob', async () => {
+    const fixture = TestBed.createComponent(ExternalImageHost);
+    fixture.componentInstance.content = '![logo](https://images.example/logo.svg)';
+    fixture.detectChanges();
+    await fixture.whenStable();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+
+    const root = fixture.nativeElement as HTMLElement;
+    root
+      .querySelector<HTMLButtonElement>('button[data-external-image-action="load"]')
+      ?.click();
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+    http
+      .expectOne((candidate) => candidate.url.endsWith('/api/media/remote-image'))
+      .flush(new Blob([svg], {type: 'image/svg+xml'}));
+    fixture.detectChanges();
+
+    expect(createObjectUrl).not.toHaveBeenCalled();
+    expect(root.querySelector('img')).toBeNull();
+    expect(
+      root.querySelector<HTMLElement>('.external-image-card')?.dataset['externalImageState'],
+    ).toBe('error');
+    fixture.destroy();
+  });
+
+  it('shows a raster response under its bare type', async () => {
+    const fixture = TestBed.createComponent(ExternalImageHost);
+    fixture.componentInstance.content = '![photo](https://images.example/p.webp)';
+    fixture.detectChanges();
+    await fixture.whenStable();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+
+    const root = fixture.nativeElement as HTMLElement;
+    root
+      .querySelector<HTMLButtonElement>('button[data-external-image-action="load"]')
+      ?.click();
+    http
+      .expectOne((candidate) => candidate.url.endsWith('/api/media/remote-image'))
+      .flush(new Blob([new Uint8Array([1, 2, 3])], {type: 'image/webp; q=1'}));
+    fixture.detectChanges();
+
+    expect(createObjectUrl).toHaveBeenCalledOnce();
+    expect((createObjectUrl.mock.calls[0][0] as Blob).type).toBe('image/webp');
+    expect(root.querySelector('.external-image-card__image')).not.toBeNull();
+    fixture.destroy();
+  });
+
   it('strips raw img HTML and disables unsupported non-HTTPS cards', async () => {
     const fixture = TestBed.createComponent(ExternalImageHost);
     fixture.componentInstance.content =
@@ -160,6 +213,20 @@ describe('ExternalImageDirective', () => {
     http.expectNone(() => true);
 
     fixture.destroy();
+  });
+});
+
+describe('rasterImageType', () => {
+  it('admits only raster image types, normalized to the bare type', () => {
+    expect(rasterImageType('image/png')).toBe('image/png');
+    expect(rasterImageType('IMAGE/JPEG; charset=binary')).toBe('image/jpeg');
+    expect(rasterImageType('image/gif')).toBe('image/gif');
+    expect(rasterImageType('image/webp')).toBe('image/webp');
+    expect(rasterImageType('image/avif')).toBe('image/avif');
+    expect(rasterImageType('image/svg+xml')).toBeNull();
+    expect(rasterImageType('image/svg+xml; charset=utf-8')).toBeNull();
+    expect(rasterImageType('text/html')).toBeNull();
+    expect(rasterImageType('')).toBeNull();
   });
 });
 

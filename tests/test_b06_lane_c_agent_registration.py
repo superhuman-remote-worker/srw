@@ -8,6 +8,11 @@ What is under test is the identity discipline (port contract §P6/§P7): the
 persistent bind fence refuses *before* the hostname upsert, every refusal keeps
 its exact ``code``, and each runtime-actor bootstrap refusal writes its
 ``runtime_actor_denied`` security event.
+
+The fleet admin routes moved to ``/api/admin/agents``; their old ``/api/agents``
+paths stay as deprecated aliases for one release, so each admin test runs on
+both (``DELETE /api/agents/{agent_id}`` is also the agent's own
+deregistration and is not deprecated).
 """
 
 from __future__ import annotations
@@ -120,7 +125,7 @@ def _deps(store=None, **over) -> AgentRegistrationDependencies:
         logger=MagicMock(),
         require_internal=AsyncMock(return_value=None),
         require_admin=AsyncMock(return_value={"id": "admin"}),
-        is_internal_call=MagicMock(return_value=False),
+        is_internal_service_call=MagicMock(return_value=False),
         log_security_event=AsyncMock(),
         completion_commands_enabled=lambda: False,
         require_pinned_status_identity=lambda: False,
@@ -184,6 +189,25 @@ def test_worker_registration_never_takes_the_thread_lane_path():
     assert resp.json()["session_runtime_attach_token"] is None
     store.get_thread.assert_not_awaited()
     deps.bind_registered_persistent_agent.assert_not_awaited()
+
+
+def test_registration_stores_the_image():
+    store = _store()
+    image = "example.invalid/h@sha256:" + "a" * 64
+    resp = _client(_deps(store=store)).post(
+        "/api/agents/register", json=_registration(image=image)
+    )
+    assert resp.status_code == 200
+    assert store.register_agent.await_args.kwargs["image"] == image
+
+
+def test_registration_without_an_image_stores_none():
+    store = _store()
+    resp = _client(_deps(store=store)).post(
+        "/api/agents/register", json=_registration()
+    )
+    assert resp.status_code == 200
+    assert store.register_agent.await_args.kwargs["image"] is None
 
 
 def test_registration_may_not_self_assert_verified_provenance():
@@ -819,62 +843,91 @@ def test_graph_progress_folds_into_metrics():
 
 # --- admin reads and deregistration ------------------------------------------
 
+# The moved fleet admin prefix, and its deprecated pre-move alias.
+_FLEET_PREFIXES = pytest.mark.parametrize("fleet", ["/api/admin/agents", "/api/agents"])
 
-def test_list_agents_is_admin_only():
+
+@_FLEET_PREFIXES
+def test_list_agents_is_admin_only(fleet):
     deps = _deps(
         require_admin=AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Admin required")
         )
     )
-    resp = _client(deps).get("/api/agents")
+    resp = _client(deps).get(fleet)
     assert resp.status_code == 403
     deps.store.list_agents.assert_not_awaited()
 
 
-def test_list_agents_enforces_its_limit_bounds():
+@_FLEET_PREFIXES
+def test_list_agents_enforces_its_limit_bounds(fleet):
     deps = _deps()
-    assert _client(deps).get("/api/agents?limit=501").status_code == 422
-    assert _client(deps).get("/api/agents?limit=0").status_code == 422
+    assert _client(deps).get(f"{fleet}?limit=501").status_code == 422
+    assert _client(deps).get(f"{fleet}?limit=0").status_code == 422
     deps.store.list_agents.assert_not_awaited()
 
 
-def test_list_agents_passes_the_status_filter_through():
+@_FLEET_PREFIXES
+def test_list_agents_passes_the_status_filter_through(fleet):
     store = _store(list_agents=AsyncMock(return_value=[{"id": AGENT_ID}]))
     deps = _deps(store=store)
-    resp = _client(deps).get("/api/agents?status=ready&limit=5")
+    resp = _client(deps).get(f"{fleet}?status=ready&limit=5")
     assert resp.status_code == 200
     assert resp.json() == [{"id": AGENT_ID}]
     store.list_agents.assert_awaited_once_with(status="ready", limit=5)
 
 
-def test_get_agent_missing_is_404():
+@_FLEET_PREFIXES
+def test_list_agents_defaults_its_limit(fleet):
     deps = _deps()
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}")
+    assert _client(deps).get(fleet).json() == []
+    deps.store.list_agents.assert_awaited_once_with(status=None, limit=100)
+
+
+@_FLEET_PREFIXES
+def test_get_agent_missing_is_404(fleet):
+    deps = _deps()
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 404
     assert resp.json() == {"detail": f"Agent '{AGENT_ID}' not found"}
 
 
-def test_system_info_refuses_an_offline_agent():
+@_FLEET_PREFIXES
+def test_get_agent_is_admin_only(fleet):
+    deps = _deps(
+        require_admin=AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Admin required")
+        )
+    )
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}")
+    assert resp.status_code == 403
+    deps.store.get_agent.assert_not_awaited()
+
+
+@_FLEET_PREFIXES
+def test_system_info_refuses_an_offline_agent(fleet):
     store = _store(
         get_agent=AsyncMock(return_value={"status": "offline", "pod_ip": "10.0.0.9"})
     )
     deps = _deps(store=store)
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}/system-info")
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}/system-info")
     assert resp.status_code == 400
     assert resp.json() == {"detail": "Agent is offline"}
 
 
-def test_system_info_refuses_an_agent_with_no_pod_ip():
+@_FLEET_PREFIXES
+def test_system_info_refuses_an_agent_with_no_pod_ip(fleet):
     store = _store(
         get_agent=AsyncMock(return_value={"status": "ready", "pod_ip": None})
     )
     deps = _deps(store=store)
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}/system-info")
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}/system-info")
     assert resp.status_code == 400
     assert resp.json() == {"detail": "Agent has no pod IP configured"}
 
 
-def test_system_info_proxies_and_maps_a_transport_error_to_502(monkeypatch):
+@_FLEET_PREFIXES
+def test_system_info_proxies_and_maps_a_transport_error_to_502(monkeypatch, fleet):
     import httpx
 
     class _Boom:
@@ -897,39 +950,139 @@ def test_system_info_proxies_and_maps_a_transport_error_to_502(monkeypatch):
         )
     )
     deps = _deps(store=store)
-    resp = _client(deps).get(f"/api/agents/{AGENT_ID}/system-info")
+    resp = _client(deps).get(f"{fleet}/{AGENT_ID}/system-info")
     assert resp.status_code == 502
     assert "Failed to connect to agent" in resp.json()["detail"]
 
 
-def test_delete_agent_accepts_the_internal_key_without_admin():
+@_FLEET_PREFIXES
+def test_delete_agent_accepts_the_internal_key_without_admin(fleet):
     store = _store()
     deps = _deps(
         store=store,
-        is_internal_call=MagicMock(return_value=True),
+        is_internal_service_call=MagicMock(return_value=True),
         require_admin=AsyncMock(
             side_effect=AssertionError("admin gate must not run for internal callers")
         ),
     )
-    resp = _client(deps).delete(f"/api/agents/{AGENT_ID}")
+    resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 200
     assert resp.json() == {"status": "deleted"}
 
 
-def test_delete_agent_requires_admin_for_everyone_else():
+@_FLEET_PREFIXES
+def test_delete_agent_requires_admin_for_everyone_else(fleet):
     deps = _deps(
         require_admin=AsyncMock(
             side_effect=HTTPException(status_code=403, detail="Admin required")
         )
     )
-    resp = _client(deps).delete(f"/api/agents/{AGENT_ID}")
+    resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 403
     deps.store.delete_agent.assert_not_awaited()
 
 
-def test_delete_agent_missing_is_404():
+INTERNAL_KEY = "test-internal-key"
+NON_ADMIN_ID = "77777777-7777-4777-8777-777777777777"
+ADMIN_ID = "88888888-8888-4888-8888-888888888888"
+
+
+@pytest.fixture
+def real_internal_gates(monkeypatch):
+    """The real key predicate and the real admin gate over MCP header auth.
+
+    ``X-MCP-User-Id`` resolves through ``security/auth.py`` against the store,
+    as an MCP tool call does in the cluster; only the database is fake.
+    """
+    from orchestrator.security import access as access_module
+
+    monkeypatch.setattr(access_module, "_INTERNAL_KEY", INTERNAL_KEY)
+    monkeypatch.setenv("MCP_INTERNAL_KEY", INTERNAL_KEY)
+    users = {
+        NON_ADMIN_ID: {"id": NON_ADMIN_ID, "is_admin": False, "is_approved": True},
+        ADMIN_ID: {"id": ADMIN_ID, "is_admin": True, "is_approved": True},
+    }
+    store = _store(get_user=AsyncMock(side_effect=lambda uid: dict(users[uid])))
+    audit = AsyncMock()
+
+    async def require_admin(request):
+        return await access_module.require_admin(request, store, audit=audit)
+
+    deps = _deps(
+        store=store,
+        is_internal_service_call=access_module.is_internal_service_call,
+        require_admin=require_admin,
+    )
+    return SimpleNamespace(client=_client(deps), store=store, audit=audit)
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_bare_internal_key_is_the_agents_own_call(
+    fleet, real_internal_gates
+):
+    resp = real_internal_gates.client.delete(
+        f"{fleet}/{AGENT_ID}", headers={"X-Internal-Key": INTERNAL_KEY}
+    )
+    assert resp.status_code == 200
+    real_internal_gates.store.get_user.assert_not_awaited()
+    real_internal_gates.store.delete_agent.assert_awaited_once_with(AGENT_ID)
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_refuses_an_mcp_non_admin_despite_the_internal_key(
+    fleet, real_internal_gates
+):
+    """N9: the MCP server sends the key with the user on every tool call, so a
+    non-admin's ``deregister_agent`` passed as an internal call."""
+    resp = real_internal_gates.client.delete(
+        f"{fleet}/{AGENT_ID}",
+        headers={"X-Internal-Key": INTERNAL_KEY, "X-MCP-User-Id": NON_ADMIN_ID},
+    )
+    assert resp.status_code == 403
+    real_internal_gates.store.delete_agent.assert_not_awaited()
+    assert real_internal_gates.audit.await_args.kwargs["event_type"] == "admin_denied"
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_admits_an_mcp_admin(fleet, real_internal_gates):
+    resp = real_internal_gates.client.delete(
+        f"{fleet}/{AGENT_ID}",
+        headers={"X-Internal-Key": INTERNAL_KEY, "X-MCP-User-Id": ADMIN_ID},
+    )
+    assert resp.status_code == 200
+    real_internal_gates.store.delete_agent.assert_awaited_once_with(AGENT_ID)
+
+
+@_FLEET_PREFIXES
+def test_delete_agent_missing_is_404(fleet):
     store = _store(delete_agent=AsyncMock(return_value=False))
     deps = _deps(store=store)
-    resp = _client(deps).delete(f"/api/agents/{AGENT_ID}")
+    resp = _client(deps).delete(f"{fleet}/{AGENT_ID}")
     assert resp.status_code == 404
     assert resp.json() == {"detail": f"Agent '{AGENT_ID}' not found"}
+
+
+def test_the_fleet_aliases_are_published_as_deprecated():
+    """The old admin reads are deprecated; the agent's own DELETE is not, and
+    neither is any moved route or agent-internal route."""
+    app = FastAPI()
+    app.include_router(router_mod.router)
+    published = {
+        (method.upper(), path): operation.get("deprecated", False)
+        for path, operations in app.openapi()["paths"].items()
+        for method, operation in operations.items()
+    }
+
+    assert published == {
+        ("POST", "/api/agents/register"): False,
+        ("POST", "/api/agents/{agent_id}/runtime-actor/session"): False,
+        ("POST", "/api/agents/{agent_id}/heartbeat"): False,
+        ("GET", "/api/admin/agents"): False,
+        ("GET", "/api/agents"): True,
+        ("GET", "/api/admin/agents/{agent_id}"): False,
+        ("GET", "/api/agents/{agent_id}"): True,
+        ("DELETE", "/api/admin/agents/{agent_id}"): False,
+        ("DELETE", "/api/agents/{agent_id}"): False,
+        ("GET", "/api/admin/agents/{agent_id}/system-info"): False,
+        ("GET", "/api/agents/{agent_id}/system-info"): True,
+    }

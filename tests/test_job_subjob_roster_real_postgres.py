@@ -462,3 +462,52 @@ class TestListWirePagination:
         assert last.status_code == 200, last.text
         assert last.json()["total"] == 1 and last.json()["total_is_capped"] is True
         assert last.json()["has_more"] is False
+
+
+class TestListNamesTheExpert:
+    @pytest.mark.asyncio
+    async def test_a_db_expert_job_carries_the_display_name(self, db, list_client):
+        """A DB expert's job stores ``config_name='worker_base'`` — the framework
+        root — and names the expert only by ``expert_id``; the list row must
+        carry the display name or the Jobs page can only say ``worker_base``."""
+        from orchestrator.schemas.job_list import PublicJobListPage
+
+        expert_id = uuid.uuid4()
+        async with db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO experts (id, name, display_name, expert_type,
+                                     managed_key, is_global)
+                VALUES ($1, $2, 'Küppelsmühle Empfang (Demo)', 'worker', $2, TRUE)
+                """,
+                expert_id,
+                f"receptionist-{expert_id.hex[:8]}",
+            )
+        stamp = datetime(2026, 10, 20, 8, tzinfo=timezone.utc)
+        db_job = await _job(
+            db,
+            description="answer the phone",
+            origin="automation",
+            config_name="worker_base",
+            created_at=stamp + timedelta(minutes=1),
+        )
+        bundled = await _job(
+            db, description="research", config_name="scholar", created_at=stamp
+        )
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET expert_id = $1 WHERE id = $2",
+                expert_id,
+                uuid.UUID(db_job),
+            )
+
+        response = await list_client.get("/api/jobs")
+        assert response.status_code == 200, response.text
+        PublicJobListPage.model_validate_json(response.text, strict=True)
+        rows = {row["id"]: row for row in response.json()["jobs"]}
+        assert rows[db_job]["config_name"] == "worker_base"
+        assert rows[db_job]["expert_id"] == str(expert_id)
+        assert rows[db_job]["expert_display_name"] == "Küppelsmühle Empfang (Demo)"
+        assert rows[bundled]["config_name"] == "scholar"
+        assert rows[bundled]["expert_id"] is None
+        assert rows[bundled]["expert_display_name"] is None

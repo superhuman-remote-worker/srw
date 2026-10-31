@@ -23,18 +23,14 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from agent.core.citation_feedback_injection import (
-    create_citation_feedback_injection_messages,
-)
-from agent.core.guidance_injection import (
-    GUIDANCE_TOOL_CALL_ID_PREFIX,
-    create_guidance_injection_messages,
-)
-from agent.core.knowledge_injection import (
+from tests._legacy_injection_rows import create_citation_feedback_injection_messages
+from shared.runtime.core.injection_markers import GUIDANCE_TOOL_CALL_ID_PREFIX
+from tests._legacy_injection_rows import create_guidance_injection_messages
+from tests._legacy_injection_rows import (
     create_charter_injection_messages,
     create_knowledge_injection_messages,
 )
-from agent.core.memory_injection import create_memory_injection_messages
+from tests._legacy_injection_rows import create_memory_injection_messages
 from agent.managers.todo import TODO_LIST_RESTATEMENT_LEAD
 from agent.subagents.runtime import SubagentRuntime
 from shared.runtime.core import injection_markers
@@ -156,6 +152,7 @@ class TestSchema:
             "citation",
             "guidance",
             "subagents",
+            "permission_mode",
             "turn_boundary",
         )
 

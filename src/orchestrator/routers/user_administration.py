@@ -230,8 +230,15 @@ async def update_user(
         get_user_administration_dependencies
     ),
 ) -> dict[str, str]:
-    """Update a user (requires authentication)."""
-    await dependencies.require_approved_user(request, dependencies.store)
+    """Update a user's profile: the caller's own, or anyone's for an admin.
+
+    A cross-user edit goes through the admin gate, so a non-admin gets the
+    audited ``admin_denied`` 403. E-mail is not editable here (Keycloak
+    owns it, and first login links an unlinked row by it).
+    """
+    caller = await dependencies.require_approved_user(request, dependencies.store)
+    if str(caller.get("id") or "").lower() != user_id.lower():
+        await dependencies.require_admin(request)
     return await user_administration.update_user(
         user_id=user_id, body=body, dependencies=dependencies.operations
     )

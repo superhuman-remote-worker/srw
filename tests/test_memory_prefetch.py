@@ -39,7 +39,7 @@ from agent.services.memory.pending_set import (
     deserialize_pending_set,
     serialize_pending_set,
 )
-from agent.services.memory.plugins.legacy import RecallTwoTierRetriever
+from agent.services.memory.plugins.legacy import RecallHybridRetriever
 from agent.services.memory.plugins.reranker import RerankerScorer
 from agent.services.memory.query import build_exchange_query_text
 from agent.services.memory.types import InjectionBlock, MemoryPayload, Scored
@@ -62,7 +62,7 @@ from tests._memory_fixtures import (
 
 
 def _prefetch_req(text: str = "q?\n\nanswer.") -> AssembleRequest:
-    return AssembleRequest(query_text=text, retries=False, ttl_tick=False)
+    return AssembleRequest(query_text=text, retries=False)
 
 
 def _never() -> AsyncMock:
@@ -348,26 +348,21 @@ class TestSessionSeams:
     persistent_app callbacks the loop's prefetch uses."""
 
     @staticmethod
-    def _session(*, mode="append_only", manager=None, shell_owner_token=None):
+    def _session(*, manager=None, shell_owner_token=None):
         from agent.api.persistent_session import PersistentSession
 
         session = object.__new__(PersistentSession)
         session.thread_id = "thread-1"
         session.config = MagicMock()
-        session.config.context_management.injection_mode = mode
         session.memory_service = manager
         session.postgres_conn = None
         session.shell_owner_token = shell_owner_token
         return session
 
-    def test_apply_takes_a_stored_set_in_append_only_only(self):
+    def test_apply_takes_a_stored_set_in(self):
         stored = serialize_pending_set(_result(make_memories(), pending_id="set-1"))
         manager = make_async_manager(GatedRetriever(auto=True))
 
-        assert (
-            self._session(mode="legacy", manager=manager).apply_pending_memory(stored)
-            is False
-        )
         assert self._session(manager=None).apply_pending_memory(stored) is False
         session = self._session(manager=manager)
         assert session.apply_pending_memory({"v": 1}) is False
@@ -567,18 +562,16 @@ class TestPluginFlags:
         assert client.posts == posts
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("tick", "decrements"), [(True, 1), (False, 0)])
-    async def test_a_read_only_retrieval_leaves_the_ttl_tier_alone(
-        self, tick, decrements
-    ):
+    async def test_the_hybrid_retriever_only_reads(self):
+        # The TTL tier is retired (D36): no decrement rides a retrieval.
         store = AsyncMock()
         store.retrieve.return_value = make_memories()
-        retriever = RecallTwoTierRetriever(store)
+        retriever = RecallHybridRetriever(store)
 
-        found = await retriever.retrieve(AssembleRequest(query_text="q", ttl_tick=tick))
+        found = await retriever.retrieve(AssembleRequest(query_text="q"))
 
         assert len(found) == 2
-        assert store.decrement_ttl.await_count == decrements
+        assert [name for name, _, _ in store.method_calls] == ["retrieve"]
 
 
 # ---------------------------------------------------------------------------

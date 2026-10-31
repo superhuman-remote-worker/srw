@@ -1,0 +1,27 @@
+id: s18-hard-voice-a1
+title: The A1 call in the hard Piper voice
+why: The acceptance call (local_voice_gateway.md §5 A1) with the bench's old, garbling caller voice.
+categories: [facts, back_office, transfer]
+voice: piper-mls
+condition: g711a
+turns:
+  - say: Bis wann muss ich das Zimmer am Abreisetag räumen?
+    expect:
+      outcome: answer
+      values: [{keyword: "11|elf", in: reply}]
+  - say: Können Sie mir die Rechnung von meinem Aufenthalt letzte Woche noch einmal schicken?
+    expect:
+      outcome: delegate
+      values: [{keyword: rechnung, in: request}, {keyword: rechnung, in: reply}]
+    back_office:
+      match: ["rechnung"]
+      answer: Die Rechnung vom letzten Aufenthalt geht heute noch per E-Mail raus.
+      after: 5
+  - say: Verbinden Sie mich bitte mit der Rezeption.
+    expect:
+      outcome: transfer
+      values: [{keyword: rezeption, in: request}]
+    back_office:
+      answer: Ich verbinde Sie jetzt mit der Rezeption.
+      after: 4
+      transfer: true

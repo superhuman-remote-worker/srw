@@ -237,6 +237,10 @@ async def _live_voice_model(db, *, enabled: bool = True) -> dict:
         "sk-live-secret",
         "sk-l",
     )
+    # A model id names one catalog row: drop an earlier test's row first.
+    previous = await db.find_model_by_model_id(MODEL)
+    if previous is not None:
+        await db.delete_model(str(previous["id"]))
     model = await db.create_model(
         provider_kind="endpoint",
         provider_ref=str(endpoint["id"]),

@@ -86,6 +86,10 @@ class ModelMeta:
     transport_kind: Optional[str] = None
     client_protocol: Optional[str] = None
     subscription_sources: tuple[str, ...] = ()
+    # The name sent to the provider when it differs from ``model_id`` (the
+    # catalog id every reference stores). ``None`` sends ``model_id``. The
+    # catalog guarantees ``model_id`` is this name plus a same-family suffix.
+    served_model_id: Optional[str] = None
 
 
 _FACTORY_PROVIDERS = {
@@ -457,6 +461,52 @@ def family_of(model_id: str, default: str = "default") -> str:
     return default
 
 
+# Routing prefixes a catalog id may carry ahead of the provider's own name;
+# the agent's LLM factories strip them before sending.
+_ROUTING_PREFIXES = ("openrouter/", "groq/", "mistral/", "codex/")
+
+
+def _without_routing_prefix(model_id: str) -> str:
+    for prefix in _ROUTING_PREFIXES:
+        if model_id.lower().startswith(prefix):
+            return model_id[len(prefix) :]
+    return model_id
+
+
+def served_model_problem(
+    model_id: str, served_model_id: Optional[str]
+) -> Optional[str]:
+    """Why catalog id ``model_id`` may not send ``served_model_id`` upstream.
+
+    Returns ``None`` when the pair is allowed (or there is no served name).
+    The id must be the served name plus a ``-suffix`` and read as the same
+    family: the agent decides API behaviour from ``llm.model`` (``family_of``,
+    the reasoning-summary and o-series prefix checks, tiktoken's encoding
+    lookup), so an id that keeps the served name as its prefix makes every one
+    of them answer as it would for the served name itself.
+    """
+    if not served_model_id:
+        return None
+    bare_id = _without_routing_prefix(model_id)
+    bare_served = _without_routing_prefix(served_model_id)
+    if bare_id == bare_served:
+        return None
+    if not bare_id.startswith(f"{bare_served}-"):
+        return (
+            f"model id {model_id!r} must be the served model id "
+            f"{served_model_id!r} plus a suffix, e.g. {served_model_id}-api"
+        )
+    id_family = family_of(model_id)
+    served_family = family_of(served_model_id)
+    if id_family != served_family:
+        return (
+            f"model id {model_id!r} reads as family {id_family!r} but "
+            f"{served_model_id!r} is {served_family!r}; pick a suffix that "
+            f"keeps the family, e.g. {served_model_id}-api"
+        )
+    return None
+
+
 def _params_max_output_tokens(row: dict[str, Any]) -> Optional[int]:
     """Per-model output cap from a catalog row's ``params_json`` (Admin → Models).
 
@@ -574,6 +624,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
             client_protocol=routing.client_protocol
             or protocol_for_factory_provider(provider),
             subscription_sources=routing.subscription_sources,
+            served_model_id=row.get("served_model_id") or None,
         )
     provider = _factory_provider(provider_ref)
     return ModelMeta(
@@ -590,6 +641,27 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
         capability=capability,
+        served_model_id=row.get("served_model_id") or None,
+    )
+
+
+#: Client protocol implied by a model's factory provider when the model
+#: carries no explicit ``client_protocol`` (provider-anchored rows).
+_PROVIDER_CLIENT_PROTOCOL = {
+    "anthropic": "anthropic-messages",
+    "codex": "openai-responses",
+    "openai": "openai-chat",
+    "openrouter": "openai-chat",
+    "local": "openai-chat",
+}
+
+
+def effective_client_protocol(meta: ModelMeta) -> str:
+    """The API shape ``meta`` is called with: explicit, else provider-implied."""
+    return (
+        meta.client_protocol
+        or _PROVIDER_CLIENT_PROTOCOL.get(meta.provider)
+        or f"{meta.provider}-native"
     )
 
 

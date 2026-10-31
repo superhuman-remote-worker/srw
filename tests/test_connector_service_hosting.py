@@ -324,6 +324,138 @@ async def test_the_exchange_cluster_ip_comes_from_the_api(api, runtime):
 
 
 @pytest.mark.asyncio
+async def test_a_service_is_read_with_its_opt_in_selector_and_ports(api, runtime):
+    api.objects[("service", "srw-voice-gateway")] = {
+        "metadata": {
+            "name": "srw-voice-gateway",
+            "annotations": {"srw.io/driver-egress": "srw.gpt-live-sip/v1"},
+        },
+        "spec": {
+            "clusterIP": "10.43.7.7",
+            "selector": {"app.kubernetes.io/component": "voice-gateway"},
+            "ports": [
+                {"port": 18440, "targetPort": 18440, "protocol": "TCP"},
+                {"port": 80},
+            ],
+        },
+    }
+    assert await runtime.read_service("srw-voice-gateway", "srw") == {
+        "annotations": {"srw.io/driver-egress": "srw.gpt-live-sip/v1"},
+        "clusterIP": "10.43.7.7",
+        "selector": {"app.kubernetes.io/component": "voice-gateway"},
+        "ports": [
+            {"port": 18440, "targetPort": 18440, "protocol": "TCP"},
+            {"port": 80, "targetPort": 80, "protocol": "TCP"},
+        ],
+    }
+    assert await runtime.read_service("absent", "srw") is None
+    api.fail["read_namespaced_service"] = ApiError(403)
+    with pytest.raises(hosting.ServiceRuntimeError, match="failed"):
+        await runtime.read_service("srw-voice-gateway", "srw")
+
+
+class TestServicePeer:
+    """An in-cluster Service a driver's pod may reach (the voice gateway for
+    the phone line): only in the release namespace, only when its
+    annotation names the driver."""
+
+    DRIVER = "srw.gpt-live-sip/v1"
+
+    @staticmethod
+    def _reconciler(services: dict) -> hosting.ServiceHostingReconciler:
+        class Runtime:
+            async def read_service(self, name, namespace):
+                found = services.get((namespace, name))
+                if isinstance(found, Exception):
+                    raise found
+                return found
+
+        return hosting.ServiceHostingReconciler(
+            store=None,
+            runtime=Runtime(),
+            drivers=None,
+            settings=hosting.ServiceHostingSettings(
+                namespace="srw-connectors",
+                release_namespace="srw",
+                shim_image="shim",
+                exchange_host="srw-orchestrator.srw.svc",
+                exchange_port=8088,
+                orchestrator_labels={"app": "orchestrator"},
+            ),
+        )
+
+    @staticmethod
+    def _service(annotation: str | None = "srw.gpt-live-sip/v1") -> dict:
+        return {
+            "annotations": {}
+            if annotation is None
+            else {"srw.io/driver-egress": annotation},
+            "clusterIP": "10.43.7.7",
+            "selector": {"app.kubernetes.io/component": "voice-gateway"},
+            "ports": [{"port": 18440, "targetPort": 18440, "protocol": "TCP"}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_admitting_service_becomes_a_peer(self):
+        reconciler = self._reconciler(
+            {("srw", "srw-voice-gateway"): self._service("x/v1, srw.gpt-live-sip/v1")}
+        )
+        peer = await reconciler._service_peer(self.DRIVER, "srw", "srw-voice-gateway")
+        assert peer.address == "10.43.7.7"
+        assert dict(peer.selector) == {"app.kubernetes.io/component": "voice-gateway"}
+        assert peer.target(18440) == 18440
+        assert dict(peer.protocols) == {18440: "tcp"}
+
+    @pytest.mark.asyncio
+    async def test_other_namespaces_and_absent_services_are_no_peers(self):
+        reconciler = self._reconciler({("kube-system", "kube-dns"): self._service()})
+        assert (
+            await reconciler._service_peer(self.DRIVER, "kube-system", "kube-dns")
+            is None
+        )
+        assert await reconciler._service_peer(self.DRIVER, "srw", "absent") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("annotation", [None, "", "srw.git-swap/v1"])
+    async def test_a_service_that_does_not_name_the_driver_refuses_it(self, annotation):
+        from orchestrator.services.connector_egress import EgressRefused
+
+        reconciler = self._reconciler(
+            {("srw", "srw-orchestrator"): self._service(annotation)}
+        )
+        with pytest.raises(EgressRefused, match="does not admit srw.gpt-live-sip/v1"):
+            await reconciler._service_peer(self.DRIVER, "srw", "srw-orchestrator")
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_service_refuses_the_pod(self):
+        from orchestrator.services.connector_egress import EgressRefused
+
+        reconciler = self._reconciler(
+            {("srw", "x"): hosting.ServiceRuntimeError("reading the Service failed")}
+        )
+        with pytest.raises(EgressRefused, match="failed"):
+            await reconciler._service_peer(self.DRIVER, "srw", "x")
+
+    @pytest.mark.asyncio
+    async def test_the_phone_lines_pod_is_pinned_to_the_gateways_pods(self):
+        from shared.connectors.builtin import GPT_LIVE_SIP_SPEC
+
+        reconciler = self._reconciler({("srw", "srw-voice-gateway"): self._service()})
+        pins = await reconciler._pin(
+            GPT_LIVE_SIP_SPEC,
+            {"api_host": "srw-voice-gateway.srw.svc", "api_port": 18440},
+            private_allowed=False,
+        )
+        (rule,) = pins.network_policy_egress()
+        assert rule["to"][0]["podSelector"] == {
+            "matchLabels": {"app.kubernetes.io/component": "voice-gateway"}
+        }
+        assert pins.host_aliases() == [
+            {"ip": "10.43.7.7", "hostnames": ["srw-voice-gateway.srw.svc"]}
+        ]
+
+
+@pytest.mark.asyncio
 async def test_observe_reads_why_an_init_container_last_failed(api, runtime):
     """The canary wait's verdict (its last log line, the termination
     message with FallbackToLogsOnError) is what the pod is stopped with."""
@@ -621,6 +753,35 @@ class TestEgressWithdrawn:
         assert check("10.0.50.0/24") is None
         found = check("10.0.50.0/24", "1.1.1.0/24")
         assert found is not None and "1.1.1.1" in found and "refuses" in found
+
+    def test_an_admitting_services_cluster_address_is_not_withdrawn(self):
+        """The pin of an opted-in Service holds its ClusterIP, inside the
+        cluster range every policy refuses: its rule admits the Service's
+        pods by selector, so the address check skips it."""
+        from orchestrator.services.connector_egress import EgressPolicy
+        from orchestrator.services.connector_service_hosting import egress_withdrawn
+
+        recorded = self._recorded(host="srw-voice-gateway.srw.svc", ports=(18440,))
+        recorded["hosts"][0]["addresses"] = ["10.43.7.7"]
+        policy = EgressPolicy.build(
+            ("10.42.0.0/16", "10.43.0.0/16"), allow_private=False
+        )
+        config = {"config": {"host": "srw-voice-gateway.srw.svc", "port": 18440}}
+
+        def check():
+            return egress_withdrawn(
+                self._spec(), config, recorded, private_allowed=False, policy=policy
+            )
+
+        found = check()
+        assert found is not None and "cluster" in found
+        recorded["hosts"][0]["service"] = {
+            "namespace": "srw",
+            "name": "srw-voice-gateway",
+            "selector": {"app.kubernetes.io/component": "voice-gateway"},
+            "target_ports": [18440],
+        }
+        assert check() is None
 
     def test_an_ipv6_address_pinned_on_a_cluster_now_ipv4_only_is_withdrawn(self):
         from orchestrator.services.connector_egress import EgressPolicy

@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0549_main_cloud_service_credentials.sql"
+    / "src/orchestrator/database/migrations/app/0561_refused_session_creation_ends_without_pod.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

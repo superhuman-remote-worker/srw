@@ -579,6 +579,26 @@ def _bad_request_verdict(exc: BaseException) -> Optional[str]:
     return None
 
 
+def _is_context_overflow(exc: BaseException) -> bool:
+    """True if ``exc`` itself (not its cause chain) says "request too big".
+
+    Three shapes, one meaning. ``reasoning_chat`` answers a pre-flight overflow
+    with a synthetic HTTP 413 (``code: context_overflow``) so the SDK does not
+    wrap it into a retryable connection error; a provider or its edge answers
+    an oversized body with its own 413; and the typed ``ContextOverflowError``
+    is matched by class name to keep this module free of non-stdlib imports.
+    Before this verdict the 413 had no rule and fell to the ``transient``
+    catch-all, so every retry loop re-sent the identical oversized request and
+    the worker's emergency compaction never ran.
+    """
+    if type(exc).__name__ == "ContextOverflowError":
+        return True
+    if getattr(exc, "status_code", None) == 413:
+        return True
+    err_obj = _api_error_object(exc)
+    return err_obj is not None and _error_field(err_obj, "code") == "context_overflow"
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -614,6 +634,12 @@ def _classify_llm_error(error: Exception) -> str:
       :func:`_cooldown_reset_seconds`.
     * ``rate_limit`` — transient, but the caller should respect Retry-After
       via :func:`_extract_rate_limit_delay`.
+    * ``context_overflow`` — the request is too big for the model (a 413, the
+      capture client's synthetic pre-flight 413 ``code: context_overflow``, or
+      a typed ``ContextOverflowError``). Deterministic: the identical request
+      fails identically, so no retry loop replays it; the caller shrinks the
+      request (emergency compaction) or gives up. See
+      :func:`_is_context_overflow`.
     * ``transient``  — retry with the existing backoff schedule.
     """
     _PERMANENT_STATUS = {400, 401, 403, 404}
@@ -622,6 +648,9 @@ def _classify_llm_error(error: Exception) -> str:
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+
+        if _is_context_overflow(current):
+            return "context_overflow"
 
         status_code = getattr(current, "status_code", None)
         if isinstance(status_code, int):
@@ -732,6 +761,9 @@ def _classify_llm_error(error: Exception) -> str:
     # on the message wording generalises to every future transport status
     # (409, 425, 499, 5xx, …) instead of needing a new marker each time one bites.
     m_status = re.search(r"error code:\s*(\d{3})", error_str)
+    if (m_status and m_status.group(1) == "413") or "context_overflow" in error_str:
+        # A stringified overflow that lost its exception: still deterministic.
+        return "context_overflow"
     if m_status and m_status.group(1) not in _TEXT_INPUT_REJECTION_STATUS:
         return "transient"
     if _is_stream_disconnect(error_str):
@@ -790,9 +822,10 @@ def initial_error_freeze_fields(
 # ---------------------------------------------------------------------------
 
 # Verdicts that another identical attempt could plausibly clear. `permanent`,
-# `quota_exhausted` and `cooldown` are deliberately absent: no wait fixes a bad
-# model name, a billing wall, or a multi-day quota reset, and retrying them is
-# what produced the 2026-05-12 cluster outage.
+# `quota_exhausted`, `cooldown` and `context_overflow` are deliberately absent:
+# no wait fixes a bad model name, a billing wall, a multi-day quota reset, or a
+# request too big for the window, and retrying them is what produced the
+# 2026-05-12 cluster outage.
 RETRYABLE_CLASSIFICATIONS = frozenset({"transient", "rate_limit", "auth_unavailable"})
 
 

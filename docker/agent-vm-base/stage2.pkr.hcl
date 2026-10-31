@@ -97,7 +97,8 @@ build {
   # Daemon + sudo-gate files. Packer's `sources` uploads multiple files in
   # one SCP session, saving SSH-handshake overhead.
   #
-  # browser-exec, check-browser-stream.py, and assert-browser-stack.sh are
+  # browser-exec, check-browser-stream.py, assert-browser-stack.sh,
+  # link-playwright-browsers and write-agent-environment are
   # deliberately sourced from ../ (docker/) rather than copied into files/:
   # they are the exact same files the container workspace ships
   # (docker/Dockerfile.workspace). A copy under files/ would reintroduce the
@@ -119,6 +120,8 @@ build {
       "../browser-exec",
       "../check-browser-stream.py",
       "../assert-browser-stack.sh",
+      "../link-playwright-browsers",
+      "../write-agent-environment",
       # VM-only, unlike its browser sibling: the sandbox tier cannot run
       # containers at all, so there is no twin image to keep in step.
       "../assert-container-stack.sh",

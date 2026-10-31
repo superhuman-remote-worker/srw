@@ -25,9 +25,16 @@ export class SessionListService {
   readonly threads = this._threads.asReadonly();
   readonly loading = this._loading.asReadonly();
 
+  /**
+   * The rail's Recents. A session whose permanent Delete is still retiring
+   * its runtime (a pinned one takes about a minute) is already gone from
+   * here: the owner deleted it. /sessions reads `threads` and keeps the card
+   * for its retry.
+   */
   readonly grouped = computed<ThreadGroup[]>(() => {
     const buckets: Record<RecencyLabel, Thread[]> = {today: [], yesterday: [], earlier: []};
     for (const t of this._threads()) {
+      if (t.retirement_permanent === true) continue;
       buckets[recency(t.last_activity)].push(t);
     }
     return (['today', 'yesterday', 'earlier'] as const)
@@ -47,6 +54,11 @@ export class SessionListService {
     this._threads.update((threads) =>
       threads.map((t) => (t.id === id ? {...t, title} : t)),
     );
+  }
+
+  /** Drop a thread the owner just deleted, ahead of the re-read that confirms it. */
+  removeLocal(id: string): void {
+    this._threads.update((threads) => threads.filter((t) => t.id !== id));
   }
 
   refresh(): Promise<void> {

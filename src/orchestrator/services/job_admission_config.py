@@ -49,6 +49,10 @@ class JobConfigStore(Protocol):
 
     async def get_project(self, project_id: str) -> dict[str, Any] | None: ...
 
+    async def user_can_run_custom_harness_images(
+        self, user: dict[str, Any], project_id: str | None
+    ) -> bool: ...
+
 
 class RequireJobProjectAccess(Protocol):
     async def __call__(
@@ -96,6 +100,9 @@ class JobAdmissionConfigDependencies:
     # The installed SRW harness image an inline expert's explicit image must
     # equal: the one the execution snapshot records.
     srw_image: Callable[[], str]
+    # The installation's approved harness images a saved Expert may name
+    # (manifestHosting.approvedImages). Inline Experts never consult it.
+    approved_images: Callable[[], tuple[dict[str, Any], ...]]
 
 
 @dataclass(frozen=True)
@@ -124,6 +131,70 @@ class JobAdmissionConfig:
     # execution snapshot freezes. It has no catalogue identity: expert_id is
     # None and config_name is the worker base whenever this is set.
     expert_row: dict[str, Any] | None = None
+    # The approved image a saved Expert names; None for the installed harness.
+    # The job runs on its own pinned pod started from this image.
+    harness_image: str | None = None
+    # A project, personal or application default whose launch rule and grant
+    # are still owed (admit_expert_harness). The work-default stage may
+    # displace it, and a displaced default must never refuse the job, so the
+    # coordinator checks it only once that stage has kept it.
+    pending_harness_expert: dict[str, Any] | None = None
+
+
+_CUSTOM_HARNESS_GRANT_REQUIRED = (
+    "Running approved harness images requires the 'custom_harness_images' "
+    "capability grant. Ask an administrator to grant it (Admin → Grants)."
+)
+
+
+def expert_harness_image(expert: dict[str, Any], *, trusted_image: str) -> str | None:
+    """The custom image a saved Expert names; None for the installed harness."""
+    from orchestrator.services.manifest_runtime_ownership import custom_srw_image
+
+    manifest = expert.get("manifest")
+    if not manifest:
+        return None
+    return custom_srw_image(manifest["spec"]["runtime"], trusted_image=trusted_image)
+
+
+async def admit_expert_harness(
+    expert: dict[str, Any],
+    *,
+    principal: dict[str, Any] | None,
+    user_id: str | None,
+    project_id: str | None,
+    dependencies: JobAdmissionConfigDependencies,
+) -> str | None:
+    """Admit the harness of the saved Expert this job runs on.
+
+    The SRW launch rule (an explicit image is the installed harness or on the
+    approved list) and, for a custom image, the owner's
+    ``custom_harness_images`` grant. Returns the custom image, None for the
+    installed harness. A caller's Expert is checked in the config stage; a
+    default only after the work-default stage kept it.
+    """
+    from orchestrator.services.manifest_runtime_ownership import (
+        require_srw_expert_configuration,
+    )
+
+    trusted_image = dependencies.srw_image()
+    require_srw_expert_configuration(
+        expert,
+        trusted_image=trusted_image,
+        approved_images=dependencies.approved_images(),
+    )
+    harness_image = expert_harness_image(expert, trusted_image=trusted_image)
+    if harness_image is None:
+        return None
+    owner = principal
+    if owner is None and user_id:
+        # The admin bypass reads is_admin, which only the user row carries.
+        owner = await dependencies.store.get_user(str(user_id))
+    if owner is None or not (
+        await dependencies.store.user_can_run_custom_harness_images(owner, project_id)
+    ):
+        raise HTTPException(status_code=403, detail=_CUSTOM_HARNESS_GRANT_REQUIRED)
+    return harness_image
 
 
 async def prepare_job_admission_config(
@@ -199,7 +270,10 @@ async def prepare_job_admission_config(
         from orchestrator.services.inline_expert import admit_inline_expert
 
         expert_row = admit_inline_expert(
-            inline_expert, role="worker", trusted_image=dependencies.srw_image()
+            inline_expert,
+            role="worker",
+            trusted_image=dependencies.srw_image(),
+            approved_images=dependencies.approved_images(),
         )
         context["expert_selection"] = {"source": "inline"}
         if job.expert_based_on:
@@ -310,6 +384,7 @@ async def prepare_job_admission_config(
     )
     selection = None
     unselected_config_override: dict[str, Any] | None = None
+    harness_image: str | None = None
     try:
         if should_resolve_default or should_validate_explicit:
             principal = scope.principal
@@ -324,6 +399,11 @@ async def prepare_job_admission_config(
             )
 
             require_srw_expert_configuration(selection.expert)
+            # Its launch rule and grant are admitted below, once it is known
+            # whether this Expert is the caller's or a displaceable default.
+            harness_image = expert_harness_image(
+                selection.expert, trusted_image=dependencies.srw_image()
+            )
             resolved_expert_id = str(selection.expert["id"])
             config_name = "worker_base"
             if selection.project_override and not (project or {}).get(
@@ -369,6 +449,18 @@ async def prepare_job_admission_config(
         else:
             # Only the legacy project slug above can have moved config_name.
             expert_source = "fallback" if config_name == "worker_base" else "scope"
+    pending_harness_expert: dict[str, Any] | None = None
+    if selection is not None:
+        if expert_source == "caller":
+            harness_image = await admit_expert_harness(
+                selection.expert,
+                principal=scope.principal,
+                user_id=effective_user_id,
+                project_id=project_id,
+                dependencies=dependencies,
+            )
+        else:
+            pending_harness_expert = selection.expert
 
     if request_config_override:
         config_override = deep_merge_dicts(
@@ -432,4 +524,6 @@ async def prepare_job_admission_config(
         expert_source=expert_source,
         unselected_config_override=unselected_config_override,
         expert_row=expert_row,
+        harness_image=harness_image,
+        pending_harness_expert=pending_harness_expert,
     )

@@ -1,12 +1,18 @@
 """Browser security utilities — URL validation and content nonce wrapping.
 
-Blocks dangerous schemes, cloud metadata endpoints, and K8s internal DNS.
-Content nonces prevent prompt injection from page content.
+Blocks dangerous schemes, cloud metadata endpoints (by name, and by literal
+address in any spelling: link-local, metadata, multicast and reserved ranges,
+through :mod:`shared.url_safety`), and K8s internal DNS. Content nonces
+prevent prompt injection from page content.
 
 Note: Private IPs and localhost are intentionally allowed. The browser runs
 inside the agent's isolated workspace container, so localhost refers to that
 container — not the host or orchestrator. Blocking it would prevent the
-agent from testing any web application it builds.
+agent from testing any web application it builds. Names are not resolved
+here (the workspace resolves them, not the agent pod); the workspace's
+NetworkPolicy is the gate for a name that points somewhere private.
+Server-side fetches from the agent pod use the stricter
+``shared.url_safety.check_public_http_url``.
 """
 
 import logging
@@ -14,6 +20,8 @@ import re
 import secrets
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+
+from shared.url_safety import address_refusal, literal_ip, url_host
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +76,12 @@ def validate_url(
     if scheme not in ("http", "https"):
         raise ValueError(f"Unsupported scheme: {scheme}://")
 
-    hostname = (parsed.hostname or "").lower()
+    # The host Chromium will dial: a backslash ends the authority for it
+    # (``http://169.254.169.254\@example.com/``), not for urlparse.
+    try:
+        hostname = (url_host(url.strip()).hostname or "").lower()
+    except ValueError as exc:
+        raise ValueError(f"Invalid URL: {exc}") from exc
     if not hostname:
         raise ValueError("URL has no hostname")
 
@@ -94,6 +107,18 @@ def validate_url(
         for d in blocked_domains:
             if hostname == d or hostname.endswith(f".{d}"):
                 raise ValueError(f"Blocked domain: {hostname}")
+
+    # A literal address in any spelling (169.254.169.254, 2852039166,
+    # [::ffff:169.254.169.254]) in the never-dialled ranges: link-local and
+    # cloud metadata, multicast, reserved. Loopback and private addresses stay
+    # allowed (see the module docstring), and so does the unspecified address,
+    # which reaches the workspace's own listeners the way a dev server
+    # announces them ("listening on 0.0.0.0:3000").
+    literal = literal_ip(hostname)
+    if literal is not None and not literal.is_unspecified:
+        reason = address_refusal(literal, private_allowed=True)
+        if reason is not None:
+            raise ValueError(f"Blocked address: {hostname} {reason}")
 
     return url.strip()
 

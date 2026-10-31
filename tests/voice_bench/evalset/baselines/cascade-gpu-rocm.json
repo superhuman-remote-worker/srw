@@ -1,0 +1,2089 @@
+{
+ "meta": {
+  "profile": "cascade-gpu-rocm",
+  "profile_file": "docker/voice-models/cascade-gpu.yaml",
+  "started": "2026-10-22T15:57:18+02:00",
+  "git": "3f36cf414 (voice-test-set)",
+  "today": "2026-10-22",
+  "stages": {
+   "stt": "whisper-large-v3-turbo at http://127.0.0.1:18453/v1",
+   "llm": "gemma-4-12b-it at http://127.0.0.1:18451/v1",
+   "tts": "qwen3-tts-0.6b voice de-1 at http://127.0.0.1:18456/v1"
+  },
+  "judge": "Qwen3-ASR 0.6B on the CPU at http://127.0.0.1:18495/v1",
+  "gpu": "16.9 of 17.1 GB VRAM in use",
+  "levels": [
+   "stt",
+   "file",
+   "call"
+  ],
+  "llm_judge": null,
+  "notes": [
+   "timings come from model servers other clients may share; while they do, the latency numbers are noisy",
+   "what the caller heard was judged by Qwen3-ASR 0.6B on the CPU at http://127.0.0.1:18495/v1"
+  ]
+ },
+ "stt": {
+  "overall": {
+   "clips": 1836,
+   "wer_mean": 0.122,
+   "wer_median": 0.0,
+   "perfect": 1215,
+   "values": 2076,
+   "values_ok": 1819,
+   "exact_rate": 0.876,
+   "silent_clips": 36,
+   "phantoms": 34
+  },
+  "by_category_condition": {
+   "addresses": {
+    "cafe": {
+     "wer_mean": 0.14,
+     "exact_rate": 0.667
+    },
+    "clean": {
+     "wer_mean": 0.173,
+     "exact_rate": 0.75
+    },
+    "clipped": {
+     "wer_mean": 0.122,
+     "exact_rate": 0.667
+    },
+    "g711a": {
+     "wer_mean": 0.206,
+     "exact_rate": 0.667
+    },
+    "g711u": {
+     "wer_mean": 0.103,
+     "exact_rate": 0.833
+    },
+    "g722": {
+     "wer_mean": 0.196,
+     "exact_rate": 0.667
+    },
+    "loss-3": {
+     "wer_mean": 0.103,
+     "exact_rate": 0.833
+    },
+    "loss-8": {
+     "wer_mean": 0.14,
+     "exact_rate": 0.667
+    },
+    "mobile": {
+     "wer_mean": 0.193,
+     "exact_rate": 0.75
+    },
+    "office": {
+     "wer_mean": 0.103,
+     "exact_rate": 0.833
+    },
+    "quiet": {
+     "wer_mean": 0.103,
+     "exact_rate": 0.833
+    },
+    "street": {
+     "wer_mean": 0.194,
+     "exact_rate": 0.5
+    }
+   },
+   "back_office": {
+    "cafe": {
+     "wer_mean": 0.027,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.062,
+     "exact_rate": 1.0
+    },
+    "clipped": {
+     "wer_mean": 0.018,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.066,
+     "exact_rate": 0.953
+    },
+    "g711u": {
+     "wer_mean": 0.018,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.018,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.018,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.04,
+     "exact_rate": 0.947
+    },
+    "mobile": {
+     "wer_mean": 0.062,
+     "exact_rate": 1.0
+    },
+    "office": {
+     "wer_mean": 0.027,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.018,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.046,
+     "exact_rate": 1.0
+    }
+   },
+   "backchannels": {
+    "cafe": {
+     "wer_mean": 0.25,
+     "exact_rate": null
+    },
+    "clean": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "clipped": {
+     "wer_mean": 0.25,
+     "exact_rate": null
+    },
+    "g711a": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "g711u": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "g722": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "loss-3": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "loss-8": {
+     "wer_mean": 0.25,
+     "exact_rate": null
+    },
+    "mobile": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "office": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "quiet": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    },
+    "street": {
+     "wer_mean": 0.0,
+     "exact_rate": null
+    }
+   },
+   "barge_in": {
+    "cafe": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "clipped": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711u": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.086,
+     "exact_rate": 1.0
+    },
+    "mobile": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "office": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.2,
+     "exact_rate": 0.75
+    }
+   },
+   "counts": {
+    "cafe": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.057,
+     "exact_rate": 0.966
+    },
+    "clipped": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.057,
+     "exact_rate": 0.966
+    },
+    "g711u": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "mobile": {
+     "wer_mean": 0.145,
+     "exact_rate": 0.966
+    },
+    "office": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.031,
+     "exact_rate": 0.909
+    }
+   },
+   "dates_times": {
+    "cafe": {
+     "wer_mean": 0.064,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.149,
+     "exact_rate": 0.949
+    },
+    "clipped": {
+     "wer_mean": 0.044,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.124,
+     "exact_rate": 0.949
+    },
+    "g711u": {
+     "wer_mean": 0.044,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.044,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.044,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.06,
+     "exact_rate": 1.0
+    },
+    "mobile": {
+     "wer_mean": 0.14,
+     "exact_rate": 0.949
+    },
+    "office": {
+     "wer_mean": 0.055,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.034,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.105,
+     "exact_rate": 0.952
+    }
+   },
+   "emails": {
+    "cafe": {
+     "wer_mean": 0.532,
+     "exact_rate": 0.0
+    },
+    "clean": {
+     "wer_mean": 0.518,
+     "exact_rate": 0.167
+    },
+    "clipped": {
+     "wer_mean": 0.554,
+     "exact_rate": 0.167
+    },
+    "g711a": {
+     "wer_mean": 0.543,
+     "exact_rate": 0.25
+    },
+    "g711u": {
+     "wer_mean": 0.554,
+     "exact_rate": 0.167
+    },
+    "g722": {
+     "wer_mean": 0.554,
+     "exact_rate": 0.167
+    },
+    "loss-3": {
+     "wer_mean": 0.485,
+     "exact_rate": 0.167
+    },
+    "loss-8": {
+     "wer_mean": 0.541,
+     "exact_rate": 0.333
+    },
+    "mobile": {
+     "wer_mean": 0.508,
+     "exact_rate": 0.333
+    },
+    "office": {
+     "wer_mean": 0.515,
+     "exact_rate": 0.167
+    },
+    "quiet": {
+     "wer_mean": 0.554,
+     "exact_rate": 0.167
+    },
+    "street": {
+     "wer_mean": 0.56,
+     "exact_rate": 0.0
+    }
+   },
+   "facts": {
+    "cafe": {
+     "wer_mean": 0.009,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.05,
+     "exact_rate": 0.962
+    },
+    "clipped": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.05,
+     "exact_rate": 0.962
+    },
+    "g711u": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.008,
+     "exact_rate": 1.0
+    },
+    "mobile": {
+     "wer_mean": 0.013,
+     "exact_rate": 1.0
+    },
+    "office": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.038,
+     "exact_rate": 1.0
+    }
+   },
+   "messages": {
+    "cafe": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "clean": {
+     "wer_mean": 0.01,
+     "exact_rate": 0.955
+    },
+    "clipped": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "g711a": {
+     "wer_mean": 0.01,
+     "exact_rate": 0.955
+    },
+    "g711u": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "g722": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "loss-3": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "loss-8": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "mobile": {
+     "wer_mean": 0.031,
+     "exact_rate": 0.955
+    },
+    "office": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "quiet": {
+     "wer_mean": 0.021,
+     "exact_rate": 0.9
+    },
+    "street": {
+     "wer_mean": 0.036,
+     "exact_rate": 0.9
+    }
+   },
+   "names": {
+    "cafe": {
+     "wer_mean": 0.236,
+     "exact_rate": 0.556
+    },
+    "clean": {
+     "wer_mean": 0.262,
+     "exact_rate": 0.722
+    },
+    "clipped": {
+     "wer_mean": 0.157,
+     "exact_rate": 0.778
+    },
+    "g711a": {
+     "wer_mean": 0.277,
+     "exact_rate": 0.75
+    },
+    "g711u": {
+     "wer_mean": 0.217,
+     "exact_rate": 0.556
+    },
+    "g722": {
+     "wer_mean": 0.194,
+     "exact_rate": 0.611
+    },
+    "loss-3": {
+     "wer_mean": 0.189,
+     "exact_rate": 0.556
+    },
+    "loss-8": {
+     "wer_mean": 0.246,
+     "exact_rate": 0.556
+    },
+    "mobile": {
+     "wer_mean": 0.242,
+     "exact_rate": 0.75
+    },
+    "office": {
+     "wer_mean": 0.192,
+     "exact_rate": 0.611
+    },
+    "quiet": {
+     "wer_mean": 0.243,
+     "exact_rate": 0.611
+    },
+    "street": {
+     "wer_mean": 0.279,
+     "exact_rate": 0.5
+    }
+   },
+   "phone_numbers": {
+    "cafe": {
+     "wer_mean": 0.22,
+     "exact_rate": 0.917
+    },
+    "clean": {
+     "wer_mean": 0.228,
+     "exact_rate": 0.767
+    },
+    "clipped": {
+     "wer_mean": 0.206,
+     "exact_rate": 0.917
+    },
+    "g711a": {
+     "wer_mean": 0.243,
+     "exact_rate": 0.767
+    },
+    "g711u": {
+     "wer_mean": 0.194,
+     "exact_rate": 0.917
+    },
+    "g722": {
+     "wer_mean": 0.203,
+     "exact_rate": 0.917
+    },
+    "loss-3": {
+     "wer_mean": 0.219,
+     "exact_rate": 0.917
+    },
+    "loss-8": {
+     "wer_mean": 0.219,
+     "exact_rate": 0.917
+    },
+    "mobile": {
+     "wer_mean": 0.231,
+     "exact_rate": 0.733
+    },
+    "office": {
+     "wer_mean": 0.202,
+     "exact_rate": 0.917
+    },
+    "quiet": {
+     "wer_mean": 0.183,
+     "exact_rate": 0.917
+    },
+    "street": {
+     "wer_mean": 0.158,
+     "exact_rate": 0.917
+    }
+   },
+   "short_answers": {
+    "cafe": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.062,
+     "exact_rate": 0.938
+    },
+    "clipped": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.188,
+     "exact_rate": 0.875
+    },
+    "g711u": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "mobile": {
+     "wer_mean": 0.125,
+     "exact_rate": 0.938
+    },
+    "office": {
+     "wer_mean": 0.1,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.05,
+     "exact_rate": 0.9
+    }
+   },
+   "silence": {
+    "cafe": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "clean": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "clipped": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "g711a": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "g711u": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "g722": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "loss-3": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "loss-8": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "mobile": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "office": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 1
+    },
+    "quiet": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    },
+    "street": {
+     "wer_mean": null,
+     "exact_rate": null,
+     "phantoms": 3
+    }
+   },
+   "transfer": {
+    "cafe": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "clean": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "clipped": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711a": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g711u": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "g722": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-3": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "loss-8": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "mobile": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "office": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "quiet": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    },
+    "street": {
+     "wer_mean": 0.0,
+     "exact_rate": 1.0
+    }
+   }
+  },
+  "by_category": {
+   "addresses": {
+    "clips": 90,
+    "wer_mean": 0.157,
+    "wer_median": 0.1,
+    "perfect": 35,
+    "values": 90,
+    "values_ok": 65,
+    "exact_rate": 0.722
+   },
+   "back_office": {
+    "clips": 156,
+    "wer_mean": 0.042,
+    "wer_median": 0.0,
+    "perfect": 116,
+    "values": 300,
+    "values_ok": 297,
+    "exact_rate": 0.99
+   },
+   "backchannels": {
+    "clips": 48,
+    "wer_mean": 0.062,
+    "wer_median": 0.0,
+    "perfect": 45,
+    "values": 0,
+    "values_ok": 0,
+    "exact_rate": null
+   },
+   "barge_in": {
+    "clips": 48,
+    "wer_mean": 0.024,
+    "wer_median": 0.0,
+    "perfect": 44,
+    "values": 48,
+    "values_ok": 47,
+    "exact_rate": 0.979
+   },
+   "counts": {
+    "clips": 132,
+    "wer_mean": 0.041,
+    "wer_median": 0.0,
+    "perfect": 125,
+    "values": 186,
+    "values_ok": 182,
+    "exact_rate": 0.978
+   },
+   "dates_times": {
+    "clips": 270,
+    "wer_mean": 0.088,
+    "wer_median": 0.0,
+    "perfect": 205,
+    "values": 306,
+    "values_ok": 299,
+    "exact_rate": 0.977
+   },
+   "emails": {
+    "clips": 90,
+    "wer_mean": 0.532,
+    "wer_median": 0.5,
+    "perfect": 0,
+    "values": 90,
+    "values_ok": 17,
+    "exact_rate": 0.189
+   },
+   "facts": {
+    "clips": 180,
+    "wer_mean": 0.019,
+    "wer_median": 0.0,
+    "perfect": 170,
+    "values": 204,
+    "values_ok": 202,
+    "exact_rate": 0.99
+   },
+   "messages": {
+    "clips": 90,
+    "wer_mean": 0.02,
+    "wer_median": 0.0,
+    "perfect": 76,
+    "values": 156,
+    "values_ok": 144,
+    "exact_rate": 0.923
+   },
+   "names": {
+    "clips": 270,
+    "wer_mean": 0.234,
+    "wer_median": 0.2,
+    "perfect": 122,
+    "values": 270,
+    "values_ok": 176,
+    "exact_rate": 0.652
+   },
+   "phone_numbers": {
+    "clips": 198,
+    "wer_mean": 0.216,
+    "wer_median": 0.2,
+    "perfect": 55,
+    "values": 198,
+    "values_ok": 167,
+    "exact_rate": 0.843
+   },
+   "short_answers": {
+    "clips": 138,
+    "wer_mean": 0.054,
+    "wer_median": 0.0,
+    "perfect": 132,
+    "values": 138,
+    "values_ok": 133,
+    "exact_rate": 0.964
+   },
+   "silence": {
+    "clips": 36,
+    "wer_mean": null,
+    "wer_median": null,
+    "perfect": 0,
+    "values": 0,
+    "values_ok": 0,
+    "exact_rate": null,
+    "silent_clips": 36,
+    "phantoms": 34
+   },
+   "transfer": {
+    "clips": 90,
+    "wer_mean": 0.0,
+    "wer_median": 0.0,
+    "perfect": 90,
+    "values": 90,
+    "values_ok": 90,
+    "exact_rate": 1.0
+   }
+  },
+  "by_condition": {
+   "cafe": {
+    "clips": 123,
+    "wer_mean": 0.113,
+    "wer_median": 0.0,
+    "perfect": 80,
+    "values": 137,
+    "values_ok": 119,
+    "exact_rate": 0.869,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "clean": {
+    "clips": 243,
+    "wer_mean": 0.145,
+    "wer_median": 0.0,
+    "perfect": 155,
+    "values": 281,
+    "values_ok": 245,
+    "exact_rate": 0.872,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "clipped": {
+    "clips": 123,
+    "wer_mean": 0.095,
+    "wer_median": 0.0,
+    "perfect": 88,
+    "values": 137,
+    "values_ok": 124,
+    "exact_rate": 0.905,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "g711a": {
+    "clips": 243,
+    "wer_mean": 0.157,
+    "wer_median": 0.0,
+    "perfect": 152,
+    "values": 281,
+    "values_ok": 243,
+    "exact_rate": 0.865,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "g711u": {
+    "clips": 123,
+    "wer_mean": 0.094,
+    "wer_median": 0.0,
+    "perfect": 89,
+    "values": 137,
+    "values_ok": 121,
+    "exact_rate": 0.883,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "g722": {
+    "clips": 123,
+    "wer_mean": 0.096,
+    "wer_median": 0.0,
+    "perfect": 87,
+    "values": 137,
+    "values_ok": 121,
+    "exact_rate": 0.883,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "loss-3": {
+    "clips": 123,
+    "wer_mean": 0.089,
+    "wer_median": 0.0,
+    "perfect": 88,
+    "values": 137,
+    "values_ok": 121,
+    "exact_rate": 0.883,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "loss-8": {
+    "clips": 123,
+    "wer_mean": 0.118,
+    "wer_median": 0.0,
+    "perfect": 79,
+    "values": 137,
+    "values_ok": 120,
+    "exact_rate": 0.876,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "mobile": {
+    "clips": 243,
+    "wer_mean": 0.15,
+    "wer_median": 0.0,
+    "perfect": 154,
+    "values": 281,
+    "values_ok": 248,
+    "exact_rate": 0.883,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "office": {
+    "clips": 123,
+    "wer_mean": 0.1,
+    "wer_median": 0.0,
+    "perfect": 85,
+    "values": 137,
+    "values_ok": 122,
+    "exact_rate": 0.891,
+    "silent_clips": 3,
+    "phantoms": 1
+   },
+   "quiet": {
+    "clips": 123,
+    "wer_mean": 0.095,
+    "wer_median": 0.0,
+    "perfect": 87,
+    "values": 137,
+    "values_ok": 122,
+    "exact_rate": 0.891,
+    "silent_clips": 3,
+    "phantoms": 3
+   },
+   "street": {
+    "clips": 123,
+    "wer_mean": 0.133,
+    "wer_median": 0.0,
+    "perfect": 71,
+    "values": 137,
+    "values_ok": 113,
+    "exact_rate": 0.825,
+    "silent_clips": 3,
+    "phantoms": 3
+   }
+  },
+  "by_voice": {
+   "f-middle": {
+    "clips": 276,
+    "wer_mean": 0.11,
+    "wer_median": 0.0,
+    "perfect": 190,
+    "values": 318,
+    "values_ok": 274,
+    "exact_rate": 0.862
+   },
+   "f-older-slow": {
+    "clips": 300,
+    "wer_mean": 0.105,
+    "wer_median": 0.0,
+    "perfect": 193,
+    "values": 324,
+    "values_ok": 281,
+    "exact_rate": 0.867,
+    "silent_clips": 12,
+    "phantoms": 11
+   },
+   "f-young-fast": {
+    "clips": 297,
+    "wer_mean": 0.109,
+    "wer_median": 0.0,
+    "perfect": 197,
+    "values": 339,
+    "values_ok": 296,
+    "exact_rate": 0.873,
+    "silent_clips": 12,
+    "phantoms": 12
+   },
+   "m-middle": {
+    "clips": 309,
+    "wer_mean": 0.107,
+    "wer_median": 0.0,
+    "perfect": 202,
+    "values": 333,
+    "values_ok": 299,
+    "exact_rate": 0.898,
+    "silent_clips": 12,
+    "phantoms": 11
+   },
+   "m-older-slow": {
+    "clips": 297,
+    "wer_mean": 0.109,
+    "wer_median": 0.0,
+    "perfect": 210,
+    "values": 333,
+    "values_ok": 311,
+    "exact_rate": 0.934
+   },
+   "m-young-fast": {
+    "clips": 297,
+    "wer_mean": 0.116,
+    "wer_median": 0.0,
+    "perfect": 210,
+    "values": 357,
+    "values_ok": 317,
+    "exact_rate": 0.888
+   },
+   "piper-mls": {
+    "clips": 60,
+    "wer_mean": 0.51,
+    "wer_median": 0.2,
+    "perfect": 13,
+    "values": 72,
+    "values_ok": 41,
+    "exact_rate": 0.569
+   }
+  },
+  "by_style": {
+   "grouped": {
+    "clips": 120,
+    "wer_mean": 0.26,
+    "wer_median": 0.2,
+    "perfect": 31,
+    "values": 120,
+    "values_ok": 119,
+    "exact_rate": 0.992
+   },
+   "hesitation": {
+    "clips": 84,
+    "wer_mean": 0.094,
+    "wer_median": 0.0,
+    "perfect": 58,
+    "values": 96,
+    "values_ok": 82,
+    "exact_rate": 0.854
+   },
+   "pause": {
+    "clips": 72,
+    "wer_mean": 0.087,
+    "wer_median": 0.0,
+    "perfect": 58,
+    "values": 96,
+    "values_ok": 95,
+    "exact_rate": 0.99
+   },
+   "plain": {
+    "clips": 1278,
+    "wer_mean": 0.1,
+    "wer_median": 0.0,
+    "perfect": 897,
+    "values": 1518,
+    "values_ok": 1358,
+    "exact_rate": 0.895,
+    "silent_clips": 36,
+    "phantoms": 34
+   },
+   "self_correction": {
+    "clips": 78,
+    "wer_mean": 0.132,
+    "wer_median": 0.1,
+    "perfect": 25,
+    "values": 90,
+    "values_ok": 48,
+    "exact_rate": 0.533
+   },
+   "short": {
+    "clips": 186,
+    "wer_mean": 0.056,
+    "wer_median": 0.0,
+    "perfect": 177,
+    "values": 138,
+    "values_ok": 133,
+    "exact_rate": 0.964
+   },
+   "spelled": {
+    "clips": 66,
+    "wer_mean": 0.552,
+    "wer_median": 0.7,
+    "perfect": 4,
+    "values": 66,
+    "values_ok": 31,
+    "exact_rate": 0.47
+   }
+  },
+  "by_value_kind": {
+   "address": {
+    "n": 90,
+    "ok": 65,
+    "rate": 0.722
+   },
+   "date": {
+    "n": 252,
+    "ok": 246,
+    "rate": 0.976
+   },
+   "email": {
+    "n": 90,
+    "ok": 17,
+    "rate": 0.189
+   },
+   "keyword": {
+    "n": 762,
+    "ok": 754,
+    "rate": 0.99
+   },
+   "name": {
+    "n": 348,
+    "ok": 242,
+    "rate": 0.695
+   },
+   "number": {
+    "n": 222,
+    "ok": 218,
+    "rate": 0.982
+   },
+   "phone": {
+    "n": 198,
+    "ok": 167,
+    "rate": 0.843
+   },
+   "time": {
+    "n": 114,
+    "ok": 110,
+    "rate": 0.965
+   }
+  }
+ },
+ "file": {
+  "overall": {
+   "scenarios": 20,
+   "scenarios_ok": 13,
+   "turns": 35,
+   "turns_ok": 28,
+   "values": 50,
+   "values_ok": 42
+  },
+  "by_category": {
+   "facts": {
+    "turns": 13,
+    "turns_ok": 13,
+    "decisions": 13,
+    "decisions_ok": 13,
+    "decision_rate": 1.0
+   },
+   "back_office": {
+    "turns": 13,
+    "turns_ok": 10,
+    "decisions": 13,
+    "decisions_ok": 13,
+    "decision_rate": 1.0
+   },
+   "transfer": {
+    "turns": 2,
+    "turns_ok": 1,
+    "decisions": 2,
+    "decisions_ok": 2,
+    "decision_rate": 1.0
+   },
+   "messages": {
+    "turns": 3,
+    "turns_ok": 1,
+    "decisions": 3,
+    "decisions_ok": 2,
+    "decision_rate": 0.667
+   },
+   "names": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 6,
+    "values_ok": 4,
+    "exact_rate": 0.667
+   },
+   "phone_numbers": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 0,
+    "exact_rate": 0.0
+   },
+   "dates_times": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 5,
+    "values_ok": 5,
+    "exact_rate": 1.0
+   },
+   "addresses": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 1,
+    "values_ok": 1,
+    "exact_rate": 1.0
+   },
+   "emails": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 1,
+    "values_ok": 1,
+    "exact_rate": 1.0
+   },
+   "counts": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 4,
+    "values_ok": 4,
+    "exact_rate": 1.0
+   },
+   "short_answers": {
+    "turns": 2,
+    "turns_ok": 2
+   },
+   "backchannels": {
+    "turns": 2,
+    "turns_ok": 1,
+    "decisions": 2,
+    "decisions_ok": 1,
+    "decision_rate": 0.5
+   },
+   "barge_in": {
+    "turns": 1,
+    "turns_ok": 1
+   },
+   "silence": {
+    "turns": 1,
+    "turns_ok": 1,
+    "decisions": 1,
+    "decisions_ok": 1,
+    "decision_rate": 1.0
+   },
+   "keywords": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 31,
+    "values_ok": 27,
+    "exact_rate": 0.871
+   },
+   "pauses": {
+    "turns": 1,
+    "turns_ok": 0
+   }
+  },
+  "decisions": {
+   "answer": {
+    "n": 13,
+    "ok": 13,
+    "rate": 1.0
+   },
+   "delegate": {
+    "n": 13,
+    "ok": 13,
+    "rate": 1.0
+   },
+   "ignore": {
+    "n": 3,
+    "ok": 2,
+    "rate": 0.667
+   },
+   "message": {
+    "n": 3,
+    "ok": 2,
+    "rate": 0.667
+   },
+   "transfer": {
+    "n": 2,
+    "ok": 2,
+    "rate": 1.0
+   }
+  },
+  "values_by_where": {
+   "reply": {
+    "n": 23,
+    "ok": 21,
+    "rate": 0.913
+   },
+   "request": {
+    "n": 27,
+    "ok": 21,
+    "rate": 0.778
+   }
+  },
+  "values_by_kind": {
+   "address": {
+    "n": 1,
+    "ok": 1,
+    "rate": 1.0
+   },
+   "date": {
+    "n": 4,
+    "ok": 4,
+    "rate": 1.0
+   },
+   "email": {
+    "n": 1,
+    "ok": 1,
+    "rate": 1.0
+   },
+   "keyword": {
+    "n": 31,
+    "ok": 27,
+    "rate": 0.871
+   },
+   "name": {
+    "n": 6,
+    "ok": 4,
+    "rate": 0.667
+   },
+   "number": {
+    "n": 4,
+    "ok": 4,
+    "rate": 1.0
+   },
+   "phone": {
+    "n": 2,
+    "ok": 0,
+    "rate": 0.0
+   },
+   "weekday": {
+    "n": 1,
+    "ok": 1,
+    "rate": 1.0
+   }
+  },
+  "turn_taking": {
+   "backchannel_taken": 1,
+   "backchannel_turns": 2,
+   "barge_in_ok": 1,
+   "barge_in_turns": 1,
+   "cut_off": 2,
+   "delegated_early": 1,
+   "false_barge_in": 2
+  },
+  "wording": {
+   "two_holding_sentences": 1
+  },
+  "first_audio_ms": {
+   "median": 1360,
+   "p90": 2860,
+   "n": 33
+  },
+  "wait_silence_ms": {
+   "median": 5960,
+   "max": 8860
+  },
+  "by_scenario": {
+   "s01-facts-simple": {
+    "turns": 3,
+    "turns_ok": 3,
+    "values": 3,
+    "values_ok": 3,
+    "pass": true,
+    "failures": []
+   },
+   "s02-availability-booking": {
+    "turns": 2,
+    "turns_ok": 1,
+    "values": 7,
+    "values_ok": 6,
+    "pass": false,
+    "failures": [
+     "t2 name:Vöhringer not in request"
+    ]
+   },
+   "s03-thinking-pauses": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 3,
+    "values_ok": 1,
+    "pass": false,
+    "failures": [
+     "t1 keyword:montag not in request",
+     "t1 keyword:mittwoch not in request",
+     "t1 cut off",
+     "t1 delegated early",
+     "t1 false barge-in"
+    ],
+    "cut_off": 1,
+    "delegated_early": 1
+   },
+   "s04-message-callback": {
+    "turns": 2,
+    "turns_ok": 1,
+    "values": 4,
+    "values_ok": 2,
+    "pass": false,
+    "failures": [
+     "t2 name:Oelschlägel not in request",
+     "t2 phone:030 23125 417 not in request",
+     "t2 expected message, got answer"
+    ]
+   },
+   "s05-spelled-lookup": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s06-transfer-person": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 1,
+    "pass": false,
+    "failures": [
+     "t1 keyword:verbind not in reply"
+    ]
+   },
+   "s07-follow-up-yes": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s08-backchannels": {
+    "turns": 4,
+    "turns_ok": 3,
+    "values": 2,
+    "values_ok": 2,
+    "pass": false,
+    "failures": [
+     "t4 expected ignore, got taken"
+    ]
+   },
+   "s09-barge-in-correction": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   },
+   "s10-silence-street": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   },
+   "s11-long-wait": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 1,
+    "pass": false,
+    "failures": [
+     "t1 keyword:rechnung|mail not in reply",
+     "t1 cut off",
+     "t1 false barge-in"
+    ],
+    "cut_off": 1,
+    "wording_faults": 1
+   },
+   "s12-email-office": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   },
+   "s13-address-cafe": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   },
+   "s14-mobile-street-facts": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s15-self-correction-date": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 3,
+    "values_ok": 3,
+    "pass": true,
+    "failures": []
+   },
+   "s16-family-relative": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 5,
+    "values_ok": 5,
+    "pass": true,
+    "failures": []
+   },
+   "s17-quiet-caller": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s18-hard-voice-a1": {
+    "turns": 3,
+    "turns_ok": 3,
+    "values": 4,
+    "values_ok": 4,
+    "pass": true,
+    "failures": []
+   },
+   "s19-number-in-pairs": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 1,
+    "pass": false,
+    "failures": [
+     "t1 phone:0152 28817386 not in request"
+    ]
+   },
+   "s20-what-day": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   }
+  },
+  "timings": {
+   "answered": {
+    "turns": 20,
+    "turn_wait_ms": 501.5,
+    "stt_ms": 284.0,
+    "llm_first_token_ms": 141.5,
+    "llm_first_text_ms": 399.0,
+    "tts_first_audio_ms": 461.0,
+    "first_audio_ms": 1343.5,
+    "first_audio_ms_p90": 3009
+   },
+   "delegated": {
+    "turns": 17,
+    "turn_wait_ms": 503,
+    "stt_ms": 303,
+    "llm_first_token_ms": 144,
+    "llm_first_text_ms": 868,
+    "tts_first_audio_ms": 0,
+    "first_audio_ms": 1367,
+    "first_audio_ms_p90": 1769
+   },
+   "all": {
+    "turns": 37,
+    "turn_wait_ms": 503,
+    "stt_ms": 287,
+    "llm_first_token_ms": 143,
+    "llm_first_text_ms": 589,
+    "tts_first_audio_ms": 0,
+    "first_audio_ms": 1345,
+    "first_audio_ms_p90": 2905
+   }
+  },
+  "phantom_transcripts": 0,
+  "intelligibility": {
+   "judge": "Qwen3-ASR 0.6B on the CPU at http://127.0.0.1:18495/v1",
+   "lines": 71,
+   "wer_mean": 0.031,
+   "perfect": 58
+  }
+ },
+ "call": {
+  "overall": {
+   "scenarios": 20,
+   "scenarios_ok": 11,
+   "turns": 35,
+   "turns_ok": 26,
+   "values": 50,
+   "values_ok": 40
+  },
+  "by_category": {
+   "facts": {
+    "turns": 13,
+    "turns_ok": 13,
+    "decisions": 13,
+    "decisions_ok": 13,
+    "decision_rate": 1.0
+   },
+   "back_office": {
+    "turns": 13,
+    "turns_ok": 8,
+    "decisions": 13,
+    "decisions_ok": 13,
+    "decision_rate": 1.0
+   },
+   "transfer": {
+    "turns": 2,
+    "turns_ok": 1,
+    "decisions": 2,
+    "decisions_ok": 2,
+    "decision_rate": 1.0
+   },
+   "messages": {
+    "turns": 3,
+    "turns_ok": 1,
+    "decisions": 3,
+    "decisions_ok": 2,
+    "decision_rate": 0.667
+   },
+   "names": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 6,
+    "values_ok": 4,
+    "exact_rate": 0.667
+   },
+   "phone_numbers": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 0,
+    "exact_rate": 0.0
+   },
+   "dates_times": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 5,
+    "values_ok": 5,
+    "exact_rate": 1.0
+   },
+   "addresses": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 1,
+    "values_ok": 0,
+    "exact_rate": 0.0
+   },
+   "emails": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 1,
+    "values_ok": 0,
+    "exact_rate": 0.0
+   },
+   "counts": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 4,
+    "values_ok": 3,
+    "exact_rate": 0.75
+   },
+   "short_answers": {
+    "turns": 2,
+    "turns_ok": 2
+   },
+   "backchannels": {
+    "turns": 2,
+    "turns_ok": 1,
+    "decisions": 2,
+    "decisions_ok": 1,
+    "decision_rate": 0.5
+   },
+   "barge_in": {
+    "turns": 1,
+    "turns_ok": 1
+   },
+   "silence": {
+    "turns": 1,
+    "turns_ok": 1,
+    "decisions": 1,
+    "decisions_ok": 1,
+    "decision_rate": 1.0
+   },
+   "keywords": {
+    "turns": 0,
+    "turns_ok": 0,
+    "values": 31,
+    "values_ok": 28,
+    "exact_rate": 0.903
+   },
+   "pauses": {
+    "turns": 1,
+    "turns_ok": 0
+   }
+  },
+  "decisions": {
+   "answer": {
+    "n": 13,
+    "ok": 13,
+    "rate": 1.0
+   },
+   "delegate": {
+    "n": 13,
+    "ok": 13,
+    "rate": 1.0
+   },
+   "ignore": {
+    "n": 3,
+    "ok": 2,
+    "rate": 0.667
+   },
+   "message": {
+    "n": 3,
+    "ok": 2,
+    "rate": 0.667
+   },
+   "transfer": {
+    "n": 2,
+    "ok": 2,
+    "rate": 1.0
+   }
+  },
+  "values_by_where": {
+   "reply": {
+    "n": 23,
+    "ok": 22,
+    "rate": 0.957
+   },
+   "request": {
+    "n": 27,
+    "ok": 18,
+    "rate": 0.667
+   }
+  },
+  "values_by_kind": {
+   "address": {
+    "n": 1,
+    "ok": 0,
+    "rate": 0.0
+   },
+   "date": {
+    "n": 4,
+    "ok": 4,
+    "rate": 1.0
+   },
+   "email": {
+    "n": 1,
+    "ok": 0,
+    "rate": 0.0
+   },
+   "keyword": {
+    "n": 31,
+    "ok": 28,
+    "rate": 0.903
+   },
+   "name": {
+    "n": 6,
+    "ok": 4,
+    "rate": 0.667
+   },
+   "number": {
+    "n": 4,
+    "ok": 3,
+    "rate": 0.75
+   },
+   "phone": {
+    "n": 2,
+    "ok": 0,
+    "rate": 0.0
+   },
+   "weekday": {
+    "n": 1,
+    "ok": 1,
+    "rate": 1.0
+   }
+  },
+  "turn_taking": {
+   "backchannel_taken": 1,
+   "backchannel_turns": 1,
+   "barge_in_ok": 1,
+   "barge_in_turns": 1,
+   "cut_off": 2,
+   "delegated_early": 1,
+   "not_over_voice": 1
+  },
+  "wording": {
+   "relay_holds_again": 1,
+   "two_holding_sentences": 1
+  },
+  "first_audio_ms": {
+   "median": 1364,
+   "p90": 2619,
+   "n": 33
+  },
+  "wait_silence_ms": {
+   "median": 5200,
+   "max": 8640
+  },
+  "by_scenario": {
+   "s01-facts-simple": {
+    "turns": 3,
+    "turns_ok": 3,
+    "values": 3,
+    "values_ok": 3,
+    "pass": true,
+    "failures": []
+   },
+   "s02-availability-booking": {
+    "turns": 2,
+    "turns_ok": 1,
+    "values": 7,
+    "values_ok": 6,
+    "pass": false,
+    "failures": [
+     "t2 name:Vöhringer not in request"
+    ]
+   },
+   "s03-thinking-pauses": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 3,
+    "values_ok": 0,
+    "pass": false,
+    "failures": [
+     "t1 number:5 not in request",
+     "t1 keyword:montag not in request",
+     "t1 keyword:mittwoch not in request",
+     "t1 cut off",
+     "t1 delegated early"
+    ],
+    "cut_off": 1,
+    "delegated_early": 1
+   },
+   "s04-message-callback": {
+    "turns": 2,
+    "turns_ok": 1,
+    "values": 4,
+    "values_ok": 2,
+    "pass": false,
+    "failures": [
+     "t2 name:Oelschlägel not in request",
+     "t2 phone:030 23125 417 not in request",
+     "t2 expected message, got answer"
+    ]
+   },
+   "s05-spelled-lookup": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s06-transfer-person": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 1,
+    "pass": false,
+    "failures": [
+     "t1 keyword:verbind not in reply"
+    ]
+   },
+   "s07-follow-up-yes": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s08-backchannels": {
+    "turns": 4,
+    "turns_ok": 3,
+    "values": 2,
+    "values_ok": 2,
+    "pass": false,
+    "failures": [
+     "t4 expected ignore, got taken"
+    ]
+   },
+   "s09-barge-in-correction": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   },
+   "s10-silence-street": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   },
+   "s11-long-wait": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 2,
+    "pass": false,
+    "failures": [
+     "t1 cut off"
+    ],
+    "cut_off": 1,
+    "wording_faults": 2
+   },
+   "s12-email-office": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 1,
+    "values_ok": 0,
+    "pass": false,
+    "failures": [
+     "t1 email:m.weber@post.example not in request"
+    ]
+   },
+   "s13-address-cafe": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 1,
+    "values_ok": 0,
+    "pass": false,
+    "failures": [
+     "t1 address:Lindenallee 23, 99999 Beispielstadt not in request"
+    ]
+   },
+   "s14-mobile-street-facts": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s15-self-correction-date": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 3,
+    "values_ok": 3,
+    "pass": true,
+    "failures": []
+   },
+   "s16-family-relative": {
+    "turns": 1,
+    "turns_ok": 1,
+    "values": 5,
+    "values_ok": 5,
+    "pass": true,
+    "failures": []
+   },
+   "s17-quiet-caller": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 2,
+    "values_ok": 2,
+    "pass": true,
+    "failures": []
+   },
+   "s18-hard-voice-a1": {
+    "turns": 3,
+    "turns_ok": 3,
+    "values": 4,
+    "values_ok": 4,
+    "pass": true,
+    "failures": []
+   },
+   "s19-number-in-pairs": {
+    "turns": 1,
+    "turns_ok": 0,
+    "values": 2,
+    "values_ok": 1,
+    "pass": false,
+    "failures": [
+     "t1 phone:0152 28817386 not in request"
+    ]
+   },
+   "s20-what-day": {
+    "turns": 2,
+    "turns_ok": 2,
+    "values": 1,
+    "values_ok": 1,
+    "pass": true,
+    "failures": []
+   }
+  },
+  "timings": {
+   "answered": {
+    "turns": 21,
+    "turn_wait_ms": 497,
+    "stt_ms": 286,
+    "llm_first_token_ms": 142,
+    "llm_first_text_ms": 370,
+    "tts_first_audio_ms": 450.0,
+    "first_audio_ms": 1439.0,
+    "first_audio_ms_p90": 2927
+   },
+   "delegated": {
+    "turns": 17,
+    "turn_wait_ms": 504,
+    "stt_ms": 304,
+    "llm_first_token_ms": 277,
+    "llm_first_text_ms": 843,
+    "tts_first_audio_ms": 0,
+    "first_audio_ms": 1429,
+    "first_audio_ms_p90": 1667
+   },
+   "all": {
+    "turns": 38,
+    "turn_wait_ms": 502.5,
+    "stt_ms": 290.0,
+    "llm_first_token_ms": 143.5,
+    "llm_first_text_ms": 540.5,
+    "tts_first_audio_ms": 0,
+    "first_audio_ms": 1429,
+    "first_audio_ms_p90": 2777
+   }
+  },
+  "phantom_transcripts": 0,
+  "intelligibility": {
+   "judge": "Qwen3-ASR 0.6B on the CPU at http://127.0.0.1:18495/v1",
+   "lines": 34,
+   "wer_mean": 0.023,
+   "perfect": 26
+  },
+  "no_audio_written": true
+ }
+}

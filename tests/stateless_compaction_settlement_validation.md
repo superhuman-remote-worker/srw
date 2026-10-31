@@ -176,9 +176,9 @@ Gate driver — mint token, create thread, send input, poll state
 ```bash
 ORCH=$(kubectl --context=k3d-srw -n srw get pods -o name | grep srw-orchestrator | head -1)
 kx() { kubectl --context=k3d-srw -n srw exec "$ORCH" -c orchestrator -- "$@"; }
-TOKEN=$(kx curl -s -X POST http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token \
-  -d grant_type=password -d client_id=admin-cli -d username=test -d password=test -d scope=openid \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["id_token"])')
+# An access token of the gates' Keycloak client; the API refuses ID tokens
+# (this run used admin-cli's ID token, before the Bearer binding).
+TOKEN=$(python3 scripts/k3d_gate_oauth.py)
 api() { kx curl -s -X "$1" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
         "http://localhost:8085/api$2" ${3:+-d "$3"}; }
 TID=$(api POST /persistent/threads '{"config_name":"session_base","permission_mode":"autonomous","model":"gemma-4-moe","title":"compaction gate"}' \

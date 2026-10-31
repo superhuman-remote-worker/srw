@@ -1,0 +1,19 @@
+# =============================================================================
+# srw-voice-audio-adapter — OpenAI audio routes over llama-server
+# =============================================================================
+# The cascade-gpu test profile's TTS front (and the bench judge's ASR front):
+# audio_adapter.py (standard library only) turns /v1/audio/speech into
+# llama.cpp's streamed /tts (Qwen3-TTS) and /v1/audio/transcriptions into a
+# chat completion with input_audio (Qwen3-ASR). Reference voices are mounted
+# at /voices. Nothing is written to disk. Local only, never pushed:
+#
+#   docker build -f docker/voice-models/Dockerfile.audio-adapter \
+#       -t srw-voice-audio-adapter:1 docker/voice-models
+# =============================================================================
+FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+
+COPY audio_adapter.py /usr/local/lib/audio_adapter.py
+USER 65532:65532
+ENV PORT=8000 VOICES_DIR=/voices PYTHONDONTWRITEBYTECODE=1
+EXPOSE 8000
+ENTRYPOINT ["python3", "/usr/local/lib/audio_adapter.py"]

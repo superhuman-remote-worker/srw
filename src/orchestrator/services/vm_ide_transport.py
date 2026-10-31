@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 import h11
 from websockets.client import ClientProtocol
-from websockets.frames import Frame, OP_BINARY, OP_CONT, OP_TEXT
+from websockets.frames import Frame, Opcode
 from websockets.http11 import Response as WSResponse
 from websockets.protocol import State as WSState
 from websockets.uri import parse_uri
@@ -99,10 +99,10 @@ class VMIDEWebSocket:
                 event = self._events.popleft()
                 if not isinstance(event, Frame):
                     continue
-                if event.opcode in {OP_TEXT, OP_BINARY}:
+                if event.opcode in {Opcode.TEXT, Opcode.BINARY}:
                     self._fragment_type = event.opcode
                     self._fragment = bytearray(event.data)
-                elif event.opcode == OP_CONT and self._fragment_type is not None:
+                elif event.opcode == Opcode.CONT and self._fragment_type is not None:
                     self._fragment.extend(event.data)
                 else:
                     continue
@@ -113,7 +113,7 @@ class VMIDEWebSocket:
                     kind = self._fragment_type
                     self._fragment.clear()
                     self._fragment_type = None
-                    return data.decode("utf-8") if kind == OP_TEXT else data
+                    return data.decode("utf-8") if kind == Opcode.TEXT else data
             if self.protocol.state is WSState.CLOSED:
                 raise StopAsyncIteration
             data = await self.reader.read(65536)

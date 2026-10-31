@@ -188,8 +188,9 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "read_only",
             "offered",
             "a reader account allowed to read only this folder; on a VM its "
-            "credential sits in the workspace's rclone config",
-            frozenset({"sandbox", "vm"}),
+            "credential sits in the workspace's rclone config, on a Virtual "
+            "Session in the executor process, which also refuses writes",
+            frozenset({"sandbox", "vm", "virtual"}),
         ),
         CloudCapability(
             "cloud_folder",
@@ -197,8 +198,9 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "read_write",
             "offered",
             "a writer account per project member that can read and write only "
-            "this project's folder",
-            frozenset({"sandbox"}),
+            "this project's folder; on a Virtual Session it is held in the "
+            "executor process for the session's turns",
+            frozenset({"sandbox", "virtual"}),
         ),
         CloudCapability(
             "cloud_folder",
@@ -216,8 +218,9 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "offered",
             "a per-user app token for the user's own files, granted once by the "
             "user (Connect your cloud); it cannot be limited to read-only or to "
-            "one folder",
-            frozenset({"sandbox"}),
+            "one folder; on a Virtual Session it is held in the pooled executor "
+            "process and dropped when the session's turns leave it",
+            frozenset({"sandbox", "virtual"}),
         ),
         CloudCapability(
             "cloud_folder",
@@ -258,8 +261,9 @@ NEXTCLOUD_CAPABILITIES = ProviderCapabilities(
             "a folder SRW creates in the agent-service account's home and "
             "shares with the execution's owner; a session mounts it with "
             "agent-service's credential (which can still write every project "
-            "folder, until slice 7b), so not on a root VM",
-            frozenset({"sandbox"}),
+            "folder, until slice 7b), so not on a root VM; a Virtual Session "
+            "holds that credential in the executor process",
+            frozenset({"sandbox", "virtual"}),
         ),
     ),
 )

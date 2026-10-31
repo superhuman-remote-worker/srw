@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
@@ -27,12 +28,29 @@ from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
+from orchestrator.services.job_mutation_target import PinnedJobMutationTarget
 from orchestrator.services.vm_workspace_policy import vm_needs_release
 from orchestrator.services.completion_teardown_replay import (
     CancelledContainerCompletionReplay,
 )
 
 TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS = 900
+HARNESS_PAUSE_UNSUPPORTED_DETAIL = (
+    "This job's harness does not support pause; cancel it instead."
+)
+
+
+def _harness_lacks_pause(capabilities: Mapping[str, Any]) -> bool:
+    """Whether a pod's ``/ready`` says its harness has no ``/job/pause``.
+
+    SRW's agent declares ``pause: true``. A pod that declares ``jobs`` speaks
+    the harness capability vocabulary, so leaving ``pause`` out means it has
+    no such route (it answers 404). A pod that declares neither key is SRW's
+    agent of the previous release, which always had the route.
+    """
+    if "pause" in capabilities:
+        return capabilities["pause"] is not True
+    return "jobs" in capabilities
 
 
 class JobCancelResponse(TypedDict):
@@ -521,11 +539,13 @@ class JobControlOperations:
         *,
         reason: str | None = None,
         timeout_seconds: float = 130.0,
+        target: PinnedJobMutationTarget | None = None,
     ) -> tuple[bool, int | None]:
         d = self.dependencies
-        target = await d.prepare_pinned_mutation_target(
-            agent_id=agent_id, job_id=job_id, require_idle=False
-        )
+        if target is None:
+            target = await d.prepare_pinned_mutation_target(
+                agent_id=agent_id, job_id=job_id, require_idle=False
+            )
         if target is None:
             return False, -1
         payload: dict[str, Any] = {
@@ -652,14 +672,43 @@ class JobControlOperations:
         pinned = [c for c in processing if c.get("execution_lane") != "stateless"]
         stateless = [c for c in processing if c.get("execution_lane") == "stateless"]
 
+        async def probe(
+            child: dict[str, Any],
+        ) -> tuple[bool, PinnedJobMutationTarget | None]:
+            """Whether to pause the child, and its pod as the probe found it.
+
+            Asked before anything is written, as the public pause is: under
+            completion commands the claim itself publishes the pause, and a
+            harness without ``/job/pause`` would keep running a child its row
+            calls paused, so a later resume would start a second pod on the
+            same workspace. Such a child keeps running.
+            """
+            agent_id = child.get("assigned_agent_id")
+            if not agent_id:
+                return True, None
+            target = await d.prepare_pinned_mutation_target(
+                agent_id=str(agent_id), job_id=str(child["id"]), require_idle=False
+            )
+            if target is not None and _harness_lacks_pause(target.capabilities):
+                d.logger.warning(
+                    "child %s runs a harness without pause; not paused", child["id"]
+                )
+                return False, None
+            return True, target
+
         async def signal_pause(
-            child: dict[str, Any], *, require_positive_quiescence: bool
+            child: dict[str, Any],
+            target: PinnedJobMutationTarget | None,
+            *,
+            require_positive_quiescence: bool,
         ) -> bool:
             agent_id = child.get("assigned_agent_id")
             if not agent_id:
                 return not require_positive_quiescence
+            if target is None:
+                return False
             acknowledged, status = await self._signal(
-                str(child["id"]), str(agent_id), "pause"
+                str(child["id"]), str(agent_id), "pause", target=target
             )
             if status == -1:
                 return False
@@ -669,10 +718,19 @@ class JobControlOperations:
                 await d.store.pause_job(str(child["id"]))
             return True
 
+        async def probe_and_signal(child: dict[str, Any]) -> bool:
+            pause, target = await probe(child)
+            if not pause:
+                return True
+            return await signal_pause(child, target, require_positive_quiescence=False)
+
         if self.commands_enabled:
 
             async def claim_and_signal(child: dict[str, Any]) -> None:
                 child_id = str(child["id"])
+                pause, target = await probe(child)
+                if not pause:
+                    return
                 try:
                     claim = await d.completion_control.claim_pause(
                         child_id,
@@ -685,7 +743,7 @@ class JobControlOperations:
                     )
                 except HTTPException:
                     return
-                if await signal_pause(child, require_positive_quiescence=True):
+                if await signal_pause(child, target, require_positive_quiescence=True):
                     await d.completion_control.abort(claim)
 
             await asyncio.gather(
@@ -694,10 +752,7 @@ class JobControlOperations:
             )
         else:
             await asyncio.gather(
-                *(
-                    signal_pause(child, require_positive_quiescence=False)
-                    for child in pinned
-                ),
+                *(probe_and_signal(child) for child in pinned),
                 return_exceptions=True,
             )
         for child in stateless:
@@ -1072,6 +1127,22 @@ class JobControlOperations:
                 await d.maybe_wake_session(job_id, "paused")
                 await self.cascade_pause_to_children(job_id)
                 return {"status": "paused", "job_id": job_id}
+
+            if job.get("assigned_agent_id"):
+                # Asked before anything is written: under completion commands
+                # the claim itself publishes the pause, and a harness without
+                # the route would keep running a job its row calls paused. A
+                # 404 from /job/pause cannot tell this instead, because SRW's
+                # agent answers 404 when the job ended first.
+                probed = await d.prepare_pinned_mutation_target(
+                    agent_id=str(job["assigned_agent_id"]),
+                    job_id=job_id,
+                    require_idle=False,
+                )
+                if probed is not None and _harness_lacks_pause(probed.capabilities):
+                    raise HTTPException(
+                        status_code=409, detail=HARNESS_PAUSE_UNSUPPORTED_DETAIL
+                    )
 
             claim = (
                 await d.completion_control.claim_pause(

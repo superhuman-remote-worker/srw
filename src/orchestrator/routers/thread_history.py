@@ -7,6 +7,7 @@ read snapshot so a rewind can never pair a newer fence with an older page.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,14 +45,20 @@ async def get_thread_citations(
     *,
     dependencies: ThreadHistoryDependencies = Depends(get_thread_history_dependencies),
 ) -> dict[str, Any]:
-    """List citations created in a persistent session, for inline ``[N]`` rendering.
+    """List citations created in a persistent session, for inline chip rendering.
 
     The citation engine stores a session's citations with ``job_id = thread_id``
     (it maps ``CitationContext.session_id`` → ``job_id``), so the thread UUID *is*
     the ``job_id`` — there is no separate thread column. Owner-only (the by-job
-    endpoint 404s for a thread since no ``jobs`` row exists). The marker the agent
-    emits is the citation ``id``; the cockpit renumbers for display and resolves
-    each ``[id]`` to a row returned here.
+    endpoint 404s for a thread since no ``jobs`` row exists). The handle the
+    agent writes (``[^c<id>]``, or ``[<id>]`` in sessions from before
+    2026-10-28) names the citation ``id``; the cockpit numbers chips per answer
+    and resolves each handle to a row returned here.
+
+    Each row has the shape of ``CitationEngine.wire_row``, which the live
+    ``citation.created`` / ``.updated`` / ``.verdict`` frames carry, so the
+    chat upserts both into one map. Paged by ``limit``/``offset`` in id order;
+    the cockpit reads every page (a session is not capped at one page).
     """
     await dependencies.require_thread_owner(request, dependencies.store, thread_id)
     try:
@@ -62,14 +69,26 @@ async def get_thread_citations(
             )
             total = count_row["total"] if count_row else 0
             rows = await conn.fetch(
-                """SELECT c.id, LEFT(c.claim, 300) AS claim, c.source_id,
-                       s.name AS source_name, s.type::text AS source_type,
-                       s.identifier AS source_identifier,
+                """SELECT c.id, LEFT(c.claim, 300) AS claim,
+                       LEFT(COALESCE(c.verbatim_quote, c.quote_context), 500)
+                           AS quote,
+                       c.locator, c.extraction_method::text AS extraction_method,
+                       c.source_id,
+                       COALESCE(js.name, s.name) AS source_name,
+                       s.type::text AS source_type,
+                       COALESCE(js.identifier, s.identifier) AS source_identifier,
                        c.verification_status::text AS verification_status,
+                       c.verification_reason,
+                       LEFT(c.verification_notes, 500) AS verification_notes,
+                       LEFT(c.matched_location->>'matched_text', 500)
+                           AS matched_text,
                        c.confidence::text AS confidence,
-                       c.created_at, s.metadata
+                       c.created_at, c.withdrawn_at, c.withdrawn_reason,
+                       COALESCE(js.metadata, s.metadata) AS metadata
                 FROM citations c
                 JOIN sources s ON c.source_id = s.id
+                LEFT JOIN job_sources js
+                       ON js.job_id = c.job_id AND js.source_id = c.source_id
                 WHERE c.job_id = $1::uuid
                 ORDER BY c.id ASC
                 LIMIT $2 OFFSET $3""",
@@ -80,6 +99,13 @@ async def get_thread_citations(
             citations = []
             for r in rows:
                 d = dict(r)
+                locator = d.get("locator")
+                if isinstance(locator, (str, bytes)):
+                    try:
+                        locator = json.loads(locator)
+                    except ValueError:
+                        locator = None
+                d["locator"] = locator if isinstance(locator, dict) else {}
                 # Cloud-document citations (cite_document with a snapshot-anchor)
                 # can offer "view original" (/snapshot) + on-view drift (/drift);
                 # web citations have neither. Surface the two flags so the cockpit

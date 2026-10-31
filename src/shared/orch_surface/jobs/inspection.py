@@ -57,7 +57,12 @@ def _scope_for(caller: CallerCtx, job_id: str | None = None) -> dict[str, str]:
     return scope
 
 
-@descriptor(group="job_inspection", plane="job_observability", caller_defaults=_ALL)
+@descriptor(
+    effect="read",
+    group="job_inspection",
+    plane="job_observability",
+    caller_defaults=_ALL,
+)
 async def list_jobs(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -112,7 +117,12 @@ async def list_jobs(
     return rendered
 
 
-@descriptor(group="job_inspection", plane="job_observability", caller_defaults=_ALL)
+@descriptor(
+    effect="read",
+    group="job_inspection",
+    plane="job_observability",
+    caller_defaults=_ALL,
+)
 async def get_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) -> str:
     """Get detailed information about a specific job by ID.
 
@@ -140,6 +150,7 @@ async def get_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) ->
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -183,6 +194,7 @@ async def get_audit_trail(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP,
@@ -228,6 +240,7 @@ async def get_audit_bulk(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -268,6 +281,7 @@ async def get_chat_history(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP,
@@ -304,6 +318,7 @@ async def get_chat_bulk(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -331,6 +346,7 @@ async def get_todos(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) 
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -361,6 +377,7 @@ async def get_llm_request(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -422,6 +439,7 @@ async def get_job_summary(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -509,6 +527,7 @@ async def search_audit(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_workspace",
     caller_defaults=_MCP,
@@ -551,6 +570,7 @@ async def list_job_commits(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_workspace",
     caller_defaults=_MCP,
@@ -592,7 +612,12 @@ async def get_job_diff(
         return fmt.format_git_error("get diff", resolved, error)
 
 
-@descriptor(group="job_inspection", plane="job_workspace", caller_defaults=_MCP_SESSION)
+@descriptor(
+    effect="read",
+    group="job_inspection",
+    plane="job_workspace",
+    caller_defaults=_MCP_SESSION,
+)
 async def get_job_file(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -637,7 +662,12 @@ async def get_job_file(
     return f"{prefix}File: {file_path} (ref: {ref_label}, {size} bytes)\n---\n{content}"
 
 
-@descriptor(group="job_inspection", plane="job_workspace", caller_defaults=_MCP_SESSION)
+@descriptor(
+    effect="read",
+    group="job_inspection",
+    plane="job_workspace",
+    caller_defaults=_MCP_SESSION,
+)
 async def list_job_files(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -677,6 +707,7 @@ async def list_job_files(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -706,6 +737,7 @@ async def get_frozen_job(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_workspace",
     caller_defaults=_MCP,
@@ -737,6 +769,7 @@ async def get_workspace_overview(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -774,6 +807,7 @@ async def get_job_progress(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -810,6 +844,7 @@ async def get_stuck_jobs(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -852,6 +887,7 @@ async def get_job_log(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -891,6 +927,7 @@ async def list_llm_requests(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_workspace",
     caller_defaults=_MCP,
@@ -923,6 +960,7 @@ async def get_shell_state(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -954,6 +992,7 @@ async def get_current_todos(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -983,6 +1022,7 @@ async def list_todo_archives(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -1017,6 +1057,7 @@ async def get_todo_archive(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP,
@@ -1050,6 +1091,7 @@ async def get_audit_timerange(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -1079,6 +1121,7 @@ async def list_message_threads(
 
 
 @descriptor(
+    effect="read",
     group="job_inspection",
     plane="job_observability",
     caller_defaults=_MCP_OFFICER,
@@ -1129,7 +1172,9 @@ async def get_message_thread(
 # ---------------------------------------------------------------------------
 
 
-@descriptor(group="job_inspection", plane="job_evidence", caller_defaults=_ALL)
+@descriptor(
+    effect="read", group="job_inspection", plane="job_evidence", caller_defaults=_ALL
+)
 async def get_job_completion_report(
     client: AsyncCockpitClient, caller: CallerCtx, job_id: str
 ) -> str:
@@ -1160,7 +1205,9 @@ async def get_job_completion_report(
     return fmt.format_completion_report(resolved, data)
 
 
-@descriptor(group="job_inspection", plane="job_evidence", caller_defaults=_ALL)
+@descriptor(
+    effect="read", group="job_inspection", plane="job_evidence", caller_defaults=_ALL
+)
 async def list_job_evidence(
     client: AsyncCockpitClient, caller: CallerCtx, job_id: str
 ) -> str:
@@ -1187,7 +1234,9 @@ async def list_job_evidence(
     return fmt.format_evidence_list(resolved, data)
 
 
-@descriptor(group="job_inspection", plane="job_evidence", caller_defaults=_ALL)
+@descriptor(
+    effect="read", group="job_inspection", plane="job_evidence", caller_defaults=_ALL
+)
 async def read_job_evidence(
     client: AsyncCockpitClient,
     caller: CallerCtx,

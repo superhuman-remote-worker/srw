@@ -25,6 +25,17 @@ RESOURCE_MAPS = {
 }
 
 
+def _refuse_authored_expert_contradiction(spec, *, expert_type=None):
+    """The SRW adapter's one write-time rule on an authored Expert spec: its
+    private ``$extends`` may not contradict its ``config_name``. A no-op for
+    any other adapter; the private config is read, never merged."""
+    from orchestrator.services.manifest_experts import (
+        refuse_contradicting_spec_extends,
+    )
+
+    refuse_contradicting_spec_extends(spec, expert_type=expert_type)
+
+
 class LiveManifestResolver:
     def __init__(self, store, authority):
         self.store, self.authority = store, authority
@@ -146,6 +157,9 @@ class LiveManifestResolver:
 
     async def selection(self, kind, selection, scope, dependencies):
         if "inline" in selection:
+            if kind == "Expert":
+                # A Job's inline Expert is authored here; a stored ref below is not.
+                _refuse_authored_expert_contradiction(selection["inline"])
             return {
                 "inline": await self.spec(
                     kind, deepcopy(selection["inline"]), scope, dependencies
@@ -403,6 +417,15 @@ class LiveManifestResolver:
                 result["project_id"] = None
                 self.prepared[key] = result
                 return result
+        if doc["kind"] == "Expert":
+            # Every candidate is being written (applied documents and a
+            # Project's managed inline Experts); stored refs never reach here.
+            _refuse_authored_expert_contradiction(
+                doc["spec"],
+                expert_type=(doc["metadata"].get("annotations") or {}).get(
+                    "srw.io/expert-type"
+                ),
+            )
         dependencies = []
         project_id = (
             self.project_aliases.get(doc["metadata"]["name"])

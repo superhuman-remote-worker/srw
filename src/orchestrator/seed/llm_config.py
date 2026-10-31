@@ -784,19 +784,25 @@ def _declared_model_fields(
     """The catalog columns a helm entry declares, in ``create_model`` spelling.
 
     The same dict is hashed for reconcile, so two renders of the same values
-    produce the same ``helm_value_hash``.
+    produce the same ``helm_value_hash``. ``served_model_id`` is present only
+    when declared, so rows without one keep the hash they had before the key
+    existed.
     """
-    return {
+    served = entry.get("servedModelId") or entry.get("served_model_id") or None
+    fields = {
         "display_label": (
             entry.get("displayName") or entry.get("display_name") or model_id
         ),
         "capabilities": list(capabilities),
-        "family": entry.get("family") or family_of(model_id),
+        "family": entry.get("family") or family_of(served or model_id),
         "context_window": entry.get("contextWindow") or entry.get("context_window"),
         "reasoning_level": entry.get("reasoningLevel") or entry.get("reasoning_level"),
         "params_json": _params_from_entry(entry, context=context),
         "enabled": entry.get("enabled", True),
     }
+    if served and served != model_id:
+        fields["served_model_id"] = served
+    return fields
 
 
 async def _apply_model_row(
@@ -818,6 +824,15 @@ async def _apply_model_row(
     entry is reconciled, in which case a differing row is rewritten to the
     declared fields and stamped ``source='helm'``.
     """
+    from shared.runtime.core.model_registry import served_model_problem
+
+    problem = served_model_problem(model_id, fields.get("served_model_id"))
+    if problem:
+        logger.error(
+            "catalog row %s under %s skipped: %s", model_id, anchor_desc, problem
+        )
+        report.models_skipped.append((report_key, model_id))
+        return
     declared_hash = value_hash(fields)
     if reconcile:
         report.manifest["models"].append(identity)
@@ -840,6 +855,29 @@ async def _apply_model_row(
             anchor_desc,
         )
         return
+    holder = await db.find_model_by_model_id(model_id)
+    if holder is not None and (holder["provider_kind"], holder["provider_ref"]) != (
+        provider_kind,
+        provider_ref,
+    ):
+        # A model id names one catalog row. Seeding a second one under another
+        # provider would take that model's traffic away from the row every
+        # reference already points at; give this entry its own id and
+        # `servedModelId` instead.
+        logger.error(
+            "catalog row %s under %s skipped: the id is already in the catalog "
+            "under %s %s. Give the entry its own id (e.g. %s-%s) with "
+            "servedModelId: %s",
+            model_id,
+            anchor_desc,
+            holder["provider_kind"],
+            holder["provider_ref"],
+            model_id,
+            report_key,
+            holder.get("served_model_id") or model_id,
+        )
+        report.models_skipped.append((report_key, model_id))
+        return
     if not reconcile:
         report.models_skipped.append((report_key, model_id))
         return
@@ -861,7 +899,8 @@ async def _apply_model_row(
         str(current["id"]),
         source=SOURCE_HELM,
         helm_value_hash=declared_hash,
-        **fields,
+        # Absent from `fields` when undeclared; clear a previous value then.
+        **{"served_model_id": None, **fields},
     )
     _record_reconcile(report, "models", identity, current.get("source"))
     logger.info("reconciled catalog row %s under %s", model_id, anchor_desc)

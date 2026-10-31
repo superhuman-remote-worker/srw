@@ -12,6 +12,11 @@
       "denied": "denied",
       "expired": "not run"
     },
+    "outcome": {
+      "noResult": "no result",
+      "resultUnknown": "result unknown",
+      "notRun": "not run"
+    },
     "diff": {
       "replace": "diff",
       "append": "appended",
@@ -127,6 +132,8 @@
     "untrusted": "Agent-provided content",
     "lastSynced": "Last synced",
     "refresh": "Refresh Canvas status",
+    "download": "Download file",
+    "staticHtmlNotice": "This preview hides the page's scripts and styles for safety. Download the file to open it in your browser.",
     "popOut": "Open Canvas in a new window",
     "close": "Close Canvas",
     "open": "Open Canvas",
@@ -134,7 +141,10 @@
     "skipToCanvas": "Skip to Canvas",
     "newContent": "New Canvas content waiting",
     "workspaceFile": {
-      "notPresented": "{{path}} is a file in this session's workspace. Ask the agent to present it on the Canvas."
+      "notFound": "{{path}} isn't in this session's workspace.",
+      "tooLarge": "{{path}} is too large to download here (the limit is 50 MB).",
+      "unavailable": "{{path}} can't be downloaded while the workspace is asleep. Send a message to wake the session, then try again.",
+      "downloadFailed": "{{path}} couldn't be downloaded."
     },
     "returnToChat": "Return to chat",
     "resize": "Resize chat and Canvas",
@@ -418,6 +428,17 @@
       "today": "Today",
       "yesterday": "Yesterday",
       "earlier": "Earlier"
+    },
+    "sessionMenu": {
+      "options": "Session options",
+      "openInNewTab": "Open in new tab",
+      "copyLink": "Copy link",
+      "linkCopied": "Link copied",
+      "sessionFiles": "Session files",
+      "end": "End session",
+      "resume": "Resume session",
+      "endRetryable": "Ending has started, but cleanup hasn't finished yet. Choose End session again in a moment to retry.",
+      "deleteRetryable": "This session is still shutting down, so it couldn't be deleted yet. Retry from See all sessions in a moment."
     }
   },
   "grants": {
@@ -628,7 +649,7 @@
       "projectArchivedWarning": "An archived project is still selected — creating a session against it will be refused. Deselect it, or unarchive the project.",
       "projectsHint": "Choose the project this session works in.",
       "permissionLabel": "Permission Mode",
-      "permissionSupervised": "Supervised",
+      "permissionReadOnly": "Read-only",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "creating": "Creating...",
@@ -674,8 +695,9 @@
     "invalidImage": "Workspace needs attention: its image is invalid.",
     "invalidConfiguration": "Workspace needs attention: its configuration is invalid.",
     "pullDeadline": "Workspace needs attention: its image didn't finish pulling in time. Check the image reference and that the cluster can pull from its registry.",
-    "readinessDeadline": "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.",
+    "readinessDeadline": "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER. The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.",
     "sshDeadline": "Workspace needs attention: SSH authentication grace expired.",
+    "containerExited": "Workspace needs attention: its container exited with code {{exitCode}} before it was ready. A workspace image must keep running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.",
     "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
   "jobs": {
@@ -1480,7 +1502,7 @@
       "defaultPrefix": "Default:",
       "permissionMode": "Permission Mode",
       "idleTimeout": "Idle Timeout (minutes)",
-      "permissionSupervised": "Supervised",
+      "permissionReadOnly": "Read-only",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "workspaceMoved": "The workspace for new Sessions is set in your personal project's settings.",
@@ -2013,10 +2035,32 @@
       "driftChanged": "Source changed since cited",
       "driftUnreachable": "Live source not reachable",
       "driftUnknown": "Drift unknown",
-      "statusVerified": "Verified",
-      "statusPending": "Verifying…",
-      "statusFailed": "Unverified",
-      "statusUnknown": "Unknown"
+      "state": {
+        "pending": "Being checked",
+        "verified": "Verified",
+        "failed": "Unverified",
+        "unchecked": "Not checked",
+        "withdrawn": "Withdrawn"
+      },
+      "reason": {
+        "quote_not_found": "The quoted words are not in the source",
+        "not_supported": "The passage does not support the claim",
+        "source_unavailable": "The source could not be found to check against",
+        "not_checked": "No check ran"
+      },
+      "popover": {
+        "label": "Citation {{n}}",
+        "unknownSource": "Unnamed source",
+        "pendingNote": "The source is still being checked.",
+        "withdrawn": "The agent withdrew this citation: {{reason}}",
+        "noReason": "no reason given",
+        "claim": "Claim",
+        "passage": "Passage",
+        "openSource": "Open source",
+        "showInList": "Show in citations list"
+      },
+      "chipLabel": "Citation {{n}}: {{source}}, {{state}}",
+      "notFound": "Citation {{handle}} is not in this session"
     },
     "status": {
       "agentQuiet": "Working — no output for {{seconds}}s",
@@ -2037,7 +2081,7 @@
       },
       "state": {
         "mounted": "mounted",
-        "pending": "connecting…"
+        "pending": "confirmed when the agent starts"
       },
       "review": "Go to the review",
       "notAttachedKind": {
@@ -2074,7 +2118,9 @@
         "cloud_not_connected": "no cloud account yet: connect your cloud under Settings → Connectors",
         "cloud_grant_revoked": "the cloud no longer accepts your connection: reconnect it under Settings → Connectors",
         "delivery_unsupported": "this deployment syncs files instead of mounting them; cloud folders aren't delivered here",
-        "mount_unsupported": "this workspace can't mount cloud folders; they aren't delivered here"
+        "mount_unsupported": "this workspace can't mount cloud folders; they aren't delivered here",
+        "virtual_workspace": "a Virtual workspace can't serve it at the level requested; a Container gets it: upgrade this session, or start a new one with a Container",
+        "bearer_token": "your cloud signs in with a token a Virtual workspace can't hold yet; a Container gets it: upgrade this session, or start a new one with a Container"
       }
     },
     "cloudReview": {
@@ -2119,8 +2165,18 @@
         "stopped": "The session stopped before this message was handled.",
         "retryExhausted": "This message kept failing the same way, so it was set aside.",
         "modelUnavailable": "This session's model is no longer available. Choose another model in this session's settings, then retry.",
+        "toolResultUnknown": "A command was cut off before its result was recorded, and the history around it can't be read safely — an administrator has to repair it before this message can run.",
         "generic": "The session hit a problem it can't clear on its own — an administrator has to release it before this message can run."
       }
+    },
+    "unknownResult": {
+      "label": "Result unknown",
+      "singleTitle": "A tool call was cut off before its result was recorded",
+      "batchTitle": "{{count}} tool calls were cut off before their results were recorded",
+      "hint": "A cut-off call may or may not have finished. Continue tells the agent the result is unknown and lets it pick up from there; Stop here ends that request. Anything you sent afterwards runs either way.",
+      "continue": "Continue",
+      "stop": "Stop here",
+      "failed": "The decision was refused ({{code}})"
     },
     "queued": {
       "notSent": "Not sent",
@@ -2197,6 +2253,7 @@
           "title": "Upgrade to a VM?",
           "body": "Provisions a dedicated virtual machine with root and sudo, and copies your files onto it. A cold start takes 6–25 minutes."
         },
+        "vmReconnect": "The session reconnects to a dedicated agent first.",
         "irreversible": "This can't be undone — the session can't move back down a tier.",
         "confirm": "Upgrade"
       }
@@ -2208,7 +2265,7 @@
       "toolCalls": "Tool calls",
       "model": "Model",
       "temperature": "Temperature: {{value}}",
-      "modeSupervised": "Supervised",
+      "modeReadOnly": "Read-only",
       "modeAutoAccept": "Auto-accept",
       "modeAutonomous": "Autonomous",
       "narrationAuto": "Auto",
@@ -2336,6 +2393,8 @@
       "batchTitle": "The agent wants to run {{count}} tool(s)",
       "approveAll": "Approve all",
       "autoAccept": "Auto-accept",
+      "autoAcceptHint": "Approves these calls and switches to Auto-accept. Workspace file changes then run without asking; commands and irreversible or outbound actions still ask.",
+      "childRunsUnattended": "The subagent then runs its own tools without asking, including commands and outbound actions.",
       "stop": "Stop"
     },
     "control": {
@@ -2355,7 +2414,41 @@
       "undoUnsupported": "Undo isn't available for this session's workspace.",
       "undoRejected": "The agent could not undo the last file changes.",
       "containerUpgradeUnavailable": "Container upgrades aren't available in this session. Use /upgrade-workspace vm, or start a new session with a container workspace.",
-      "upgradeUnavailable": "Workspace upgrades aren't available in this session."
+      "upgradeUnavailable": "Workspace upgrades aren't available in this session.",
+      "upgradeDeferred": "The workspace upgrade will start after the current response.",
+      "vmUpgradeUnavailable": "VM workspaces aren't available on this installation.",
+      "vmUpgradeRetry": "The VM upgrade couldn't start on this session's agent. Send /upgrade-workspace vm to try again.",
+      "upgradeBusy": "The session is still finishing background work (for example a cloud sync), so the workspace upgrade didn't start. Try again in a minute."
+    },
+    "workspaceUpgrade": {
+      "failedStartupRetry": "Workspace upgrade failed. {{reason}} To try again, End this session and then resume it; your files are kept.",
+      "failedStartup": "Workspace upgrade failed. {{reason}} End this session and start a new one; your files are kept.",
+      "notPossible": "This Session's workspace can't be upgraded in place. Start a new Session with a container workspace.",
+      "movingToVm": "Moving this session to a VM workspace (the session reconnects first)…",
+      "card": {
+        "title": "Upgrading the workspace",
+        "titleContainer": "Upgrading to a Container",
+        "titleVm": "Upgrading to a VM",
+        "titleTemplate": "Upgrading to {{template}}"
+      },
+      "steps": {
+        "requested": "Upgrade requested",
+        "startingContainer": "Starting the Container",
+        "startingVm": "Starting the VM (this can take a few minutes)",
+        "startingWorkspace": "Starting the workspace",
+        "copying": "Copying your files"
+      },
+      "skippedFiles": "These files were over the 100 MB copy limit and weren't copied; they're still in the old storage: {{files}}",
+      "ready": "Workspace ready — shell, git, and file tools are now available.",
+      "readySudo": "Running on a VM — sudo is now available.",
+      "readySeeded": "{{count}} file(s) carried over.",
+      "failed": {
+        "upgradeCancelled": "The VM upgrade was cancelled when this session ended.",
+        "upgradeRefused": "The VM upgrade couldn't start: SRW refused it when the session reconnected. The session keeps its current workspace; you can try /upgrade-workspace vm again.",
+        "upgradeFailed": "The VM upgrade failed. This session keeps working for now, but it can't restart: End it and start a new one when you're done. Your files are kept.",
+        "upgradeInterrupted": "The VM upgrade was interrupted before your files were copied. End this session and start a new one; your files are kept in the old storage.",
+        "upgradeAlreadyRunning": "A workspace upgrade is already running."
+      }
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",
@@ -2365,7 +2458,6 @@
       "deny": "Deny",
       "denyStarter": "Don't upgrade the workspace — ",
       "continueMessage": "The workspace is ready — shell, git, and file tools are now available. Please continue where you left off.",
-      "provisioning": "Provisioning {{tier}}…",
       "willContinue": "Will continue automatically when ready."
     },
     "approval": {
@@ -2386,6 +2478,7 @@
       "queued": "Waiting for an available agent…",
       "parked": "This message needs a retry",
       "parkedBlocked": "Blocked until an administrator clears it",
+      "parkedDecide": "Choose Continue or Stop here above to go on",
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)",
@@ -2481,9 +2574,9 @@
       "done": "End session — extract memories and archive",
       "undo": "Undo file changes from the last turn",
       "rewind": "Rewind to an earlier message",
-      "auto": "Switch to auto-accept mode (approve all except shell)",
-      "supervised": "Switch to supervised mode (approve all writes)",
-      "autonomous": "Switch to autonomous mode (approve nothing)",
+      "auto": "Switch to Auto-accept — changes workspace files freely, asks before irreversible or outbound actions and commands",
+      "readonly": "Switch to Read-only — reads, searches and browses freely, asks before changes, outside actions and commands",
+      "autonomous": "Switch to Autonomous — runs every tool without asking",
       "silent": "Hide reasoning and minimize tool detail",
       "verbose": "Show full reasoning and tool detail",
       "upgradeWorkspace": "Upgrade the workspace: no argument for the next tier, \"vm\", or a template name"
@@ -2559,6 +2652,7 @@
     },
     "toolCategories": {
       "workspace": "Working with files",
+      "skills": "Using skills",
       "git": "Version control",
       "shell": "Running commands",
       "research": "Research & browsing",
@@ -2600,6 +2694,7 @@
       "research": "searches",
       "session_task": "tasks",
       "shell": "commands",
+      "skills": "skills",
       "sql": "queries",
       "thought": "thoughts",
       "workspace": "files"
@@ -2621,6 +2716,7 @@
       "research": "search",
       "session_task": "task",
       "shell": "command",
+      "skills": "skill",
       "sql": "query",
       "thought": "thought",
       "workspace": "file"
@@ -2659,6 +2755,12 @@
     "inUse": "Expert is in use by {{count}} job(s)",
     "saveFailed": "Save failed",
     "invalidJson": "Invalid JSON file",
+    "view": "View",
+    "back": "Back",
+    "readonlyNotice": "You can't edit this expert. Duplicate it to get an editable copy.",
+    "duplicateToEdit": "Duplicate to edit",
+    "duplicateFailed": "Duplicate failed",
+    "loadFailed": "Couldn't load this expert: {{detail}}",
     "model": {
       "title": "Model",
       "model": "Model",
@@ -3605,7 +3707,7 @@
       "noBaseline": "The project folder was not copied for this job, so there are no changes to review.",
       "headUnreadable": "The job's changes to its copy of the project folder could not be read, so there is nothing to review."
     },
-    "reviewSessionHint": "Starts a supervised session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
+    "reviewSessionHint": "Starts a read-only session in a fresh sandbox checkout of the delivered branch with this job's model, project, and connectors. Job-only workspace and tool settings are not copied.",
     "vmUpgrade": {
       "title": "Sudo Required",
       "reason": "The agent attempted a privileged command in a hardened container:",
@@ -3903,6 +4005,7 @@
           "changes": "{{n}} changed",
           "template": "Template",
           "upgradeOnly": "Upgrade only",
+          "fixed": "Fixed",
           "default": "Default",
           "custom": "Custom",
           "none": "None",
@@ -3916,6 +4019,7 @@
         "project": "Project",
         "templateAndResources": "Template and resources",
         "templateAndResourcesHint": "The tier above can be upgraded. Image and resources stay as created.",
+        "resourcesFixedHint": "Image and resources stay as created.",
         "moreLive": "These were fixed when the session started.",
         "moreUnavailable": "The values this session was started with could not be loaded."
       },
@@ -3946,6 +4050,7 @@
       "loadFailed": "Connectors could not be loaded for this project context. Creation is disabled.",
       "retry": "Retry",
       "unavailableName": "Unavailable connector",
+      "requiresShellWorkspace": "Needs a Container or VM workspace",
       "unavailableLive": "This attached connector is no longer authorized or in scope. Detach it before continuing.",
       "unavailableBadge": "Unavailable",
       "notReady": "Not fully indexed yet — the agent may see incomplete results.",
@@ -3980,7 +4085,7 @@
       "label": "Workspace",
       "default": "Default: {{what}} ({{layer}})",
       "defaultUnknown": "Default (project or installation)",
-      "layer": {"project": "project default", "installation": "installation default"},
+      "layer": {"project": "project default", "installation": "installation default", "cloud_connectors": "needed for cloud folders"},
       "mode": {"none": "No workspace", "virtual": "Virtual", "container": "Container", "vm": "VM"},
       "group": {"shared": "Shared", "project": "This project", "mine": "Mine"},
       "none": "No workspace",
@@ -4009,6 +4114,12 @@
       "tierCurrent": "current",
       "tierNext": "the next tier",
       "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
+      "tierFixed": {
+        "needsApproval": "Upgrading this session needs an admin's approval.",
+        "sessionUnsupported": "This session can't change its workspace. Start a new session to work on another tier.",
+        "highest": "This session already runs on the highest tier.",
+        "unsupported": "This tier can't be upgraded."
+      },
       "tierUpgrading": "Provisioning {{tier}}…",
       "tierUnreachable": {
         "downgrade": "can't move down a tier",
@@ -4037,11 +4148,11 @@
       },
       "partial": {
         "label": "Partial",
-        "description": "Freezes at phase boundaries and job completion"
+        "description": "Freezes after the first strategic phase and at job completion"
       },
       "guided": {
         "label": "Guided",
-        "description": "Freezes after every tactical phase"
+        "description": "Freezes after every strategic phase and at job completion"
       },
       "dependent": {
         "label": "Dependent",
@@ -4049,17 +4160,17 @@
       }
     },
     "permissionModes": {
-      "supervised": {
-        "label": "Supervised",
-        "description": "Agent asks for approval before executing commands"
+      "read_only": {
+        "label": "Read-only",
+        "description": "Reads, searches and browses freely. Asks before changing anything, acting outside the workspace, or running commands."
       },
       "auto_accept": {
         "label": "Auto-accept",
-        "description": "Auto-approve most actions, flag risky ones"
+        "description": "Changes workspace files freely. Asks before irreversible or outbound actions and commands."
       },
       "autonomous": {
         "label": "Autonomous",
-        "description": "Agent runs without asking for approval"
+        "description": "Runs every tool without asking."
       }
     },
     "imageQuality": {
@@ -4124,6 +4235,10 @@
       "canvas": {
         "label": "Canvas",
         "description": "Ability to present workspace files in the shared session Canvas"
+      },
+      "skills": {
+        "label": "Skills",
+        "description": "Ability to load skills from your skill catalog. Off means the agent sees no skill list"
       },
       "citation": {
         "label": "Citation",
@@ -4257,6 +4372,8 @@
     "loadingAgents": "Loading agents...",
     "empty": "No agents registered",
     "emptyHint": "Agents will appear here when they connect to the orchestrator",
+    "loadFailed": "Couldn't load agents",
+    "loadFailedHint": "The orchestrator did not return the agent list. Refresh to try again.",
     "table": {
       "status": "Status",
       "config": "Config",

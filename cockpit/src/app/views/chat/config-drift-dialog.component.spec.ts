@@ -19,12 +19,12 @@ describe('groupDriftForDisplay', () => {
     it('keeps distinct labels separate and preserves order', () => {
         const rows = groupDriftForDisplay([
             {id: 'connector:a', kind: 'connector', reason: 'deleted',
-             label: 'KurortEngine'},
+             label: 'WidgetShop'},
             {id: 'grant:shell_tools', kind: 'grant', reason: 'revoked',
              label: 'shell tools'},
         ]);
 
-        expect(rows.map(r => r.label)).toEqual(['KurortEngine', 'shell tools']);
+        expect(rows.map(r => r.label)).toEqual(['WidgetShop', 'shell tools']);
         expect(rows.every(r => r.count === 1)).toBe(true);
     });
 

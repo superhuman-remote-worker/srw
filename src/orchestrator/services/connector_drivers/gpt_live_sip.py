@@ -37,7 +37,23 @@ from shared.connectors.builtin import GPT_LIVE_SIP_SPEC
 _WEBHOOK_SECRET = re.compile(r"\Awhsec_[A-Za-z0-9+/=]{16,512}\Z")
 _TRANSFER = re.compile(r"\A(sip|tel):[^\s]{1,500}\Z")
 _DERIVED = ("api_host", "api_port")
-_CONFIG_KEYS = {"model", "max_duration_s", "no_job_fallback_s", "transfer_target"}
+_CONFIG_KEYS = {
+    "model",
+    "max_duration_s",
+    "no_job_fallback_s",
+    "transfer_target",
+    "greeting_delay_ms",
+    "greeting_retry_ms",
+    "idle_nudge_ms",
+    "idle_nudge_max",
+}
+#: Bounds the pod's own config parser enforces (drivers/gpt-live-sip/config.go).
+_GREETING_BOUNDS = {
+    "greeting_delay_ms": 10000,
+    "greeting_retry_ms": 30000,
+    "idle_nudge_ms": 30000,
+}
+_IDLE_NUDGE_MAX = 5
 
 
 def _webhook_secret_ok(secret: Any) -> bool:
@@ -101,6 +117,13 @@ class GptLiveSipDriver(DatasourceDriver):
                 config["no_job_fallback_s"], 1, 120
             ):
                 raise HTTPException(400, "no_job_fallback_s is 1 to 120 seconds")
+            for key, high in _GREETING_BOUNDS.items():
+                if key in config and not _int_in(config[key], 0, high):
+                    raise HTTPException(400, f"{key} is 0 to {high} milliseconds")
+            if "idle_nudge_max" in config and not _int_in(
+                config["idle_nudge_max"], 0, _IDLE_NUDGE_MAX
+            ):
+                raise HTTPException(400, f"idle_nudge_max is 0 to {_IDLE_NUDGE_MAX}")
             target = config.get("transfer_target")
             if target is not None and (
                 not isinstance(target, str) or not _TRANSFER.fullmatch(target)

@@ -15,8 +15,9 @@ import { UserService } from '../../core/services/user.service';
 import { ViewModeService } from '../../core/services/view-mode.service';
 import { ApiService } from '../../core/services/api.service';
 import { SettingsService } from '../../core/services/settings.service';
-import { ModelService } from '../../core/services/model.service';
+import { chatModelLabel, ModelService } from '../../core/services/model.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
+import { normalizePermissionMode } from '../../core/models/permission-mode';
 import { I18nService, SupportedLang } from '../../core/services/i18n.service';
 import type { ExpertEditorNavigationState } from '../experts/expert-editor.component';
 import {
@@ -549,7 +550,7 @@ const EXPIRY_OPTIONS = [
                         >
                           @for (model of group.models; track model) {
                             <option [value]="model">
-                              {{ model
+                              {{ modelLabel(group, model)
                               }}{{
                                 !prefModel() && model === resolved().default_model
                                   ? ' (' + ('common.default' | transloco) + ')'
@@ -830,20 +831,13 @@ const EXPIRY_OPTIONS = [
                   "
                 >
                   <app-select
-                    [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
-                    (changed)="
-                      onPrefChange(
-                        paPermissionMode,
-                        resolved().persistent_agent?.permission_mode,
-                        $event
-                      )
-                    "
+                    [value]="paPermissionMode() ?? resolvedPaPermissionMode() ?? ''"
+                    (changed)="onPrefChange(paPermissionMode, resolvedPaPermissionMode(), $event)"
                   >
-                    <option value="supervised">
-                      {{ 'settings.persistent.permissionSupervised' | transloco
+                    <option value="read_only">
+                      {{ 'settings.persistent.permissionReadOnly' | transloco
                       }}{{
-                        !paPermissionMode() &&
-                        resolved().persistent_agent?.permission_mode === 'supervised'
+                        !paPermissionMode() && resolvedPaPermissionMode() === 'read_only'
                           ? ' (' + ('common.default' | transloco) + ')'
                           : ''
                       }}
@@ -854,8 +848,7 @@ const EXPIRY_OPTIONS = [
                     >
                       {{ 'settings.persistent.permissionAutoAccept' | transloco
                       }}{{
-                        !paPermissionMode() &&
-                        resolved().persistent_agent?.permission_mode === 'auto_accept'
+                        !paPermissionMode() && resolvedPaPermissionMode() === 'auto_accept'
                           ? ' (' + ('common.default' | transloco) + ')'
                           : ''
                       }}
@@ -866,8 +859,7 @@ const EXPIRY_OPTIONS = [
                     >
                       {{ 'settings.persistent.permissionAutonomous' | transloco
                       }}{{
-                        !paPermissionMode() &&
-                        resolved().persistent_agent?.permission_mode === 'autonomous'
+                        !paPermissionMode() && resolvedPaPermissionMode() === 'autonomous'
                           ? ' (' + ('common.default' | transloco) + ')'
                           : ''
                       }}
@@ -2451,6 +2443,8 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
   readonly modelService = inject(ModelService);
+  /** Option text: the catalog label; the value stays the model id. */
+  readonly modelLabel = chatModelLabel;
   readonly capabilities = inject(CapabilitiesService);
   readonly i18n = inject(I18nService);
   readonly viewMode = inject(ViewModeService);
@@ -2867,6 +2861,11 @@ export class SettingsComponent implements OnInit, OnDestroy {
   // Persistent Agent form state — null = use resolved default
   readonly paModel = signal<string | null>(null);
   readonly paPermissionMode = signal<string | null>(null);
+  /** The resolved default mode; a stored preference may still say `supervised`. */
+  readonly resolvedPaPermissionMode = computed(() => {
+    const raw = this.resolved().persistent_agent?.permission_mode;
+    return normalizePermissionMode(raw) ?? raw ?? null;
+  });
   readonly paIdleTimeout = signal<number | null>(null);
   readonly paIdleTimeoutText = computed(() => {
     const v = this.paIdleTimeout();
@@ -2945,7 +2944,10 @@ export class SettingsComponent implements OnInit, OnDestroy {
         const pa = prefs.persistent_agent;
         if (pa) {
           this.paModel.set(pa.model ?? null);
-          this.paPermissionMode.set(pa.permission_mode ?? null);
+          // Saved before the rename ⇒ `supervised`; the next save writes read_only.
+          this.paPermissionMode.set(
+            normalizePermissionMode(pa.permission_mode) ?? pa.permission_mode ?? null,
+          );
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
           this.paHeadlessMode.set(pa.headless_mode ?? null);
           this.paAttentionSleepMinutes.set(pa.headless_attention_sleep_minutes ?? null);

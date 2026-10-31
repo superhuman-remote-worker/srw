@@ -104,7 +104,7 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
 
     session = MagicMock()
     session.turn_count = turn_count
-    session.permission_mode = "supervised"
+    session.permission_mode = "read_only"
     session.tool_decisions = {}
     session.postgres_conn = None
     session.config = MagicMock()

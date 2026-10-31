@@ -7,6 +7,7 @@ Implements the slice of GPT-Live SIP that SRW uses (design §3.1.1):
 * ``GET /v1/live/sessions/{id}/attach`` — the sideband WebSocket. Several
   sidebands may attach; each new one gets the events of the last
   ``replay_window_s`` seconds replayed with their original ``event_id``.
+  An accept emits ``session.started``, so an attach right after it replays it.
 
 Appends (``session.{instructions,thinking,commentary}.append``) are answered
 with ``*.appended`` on the sending socket, or an ``error`` carrying the
@@ -185,6 +186,8 @@ class FakeGptLive:
                 )
             session.accept_config = config
             session.status = "accepted"
+            # The call's timeline starts; the connector pod greets only after it.
+            await self.emit(session.session_id, {"type": "session.started"})
         elif action == "reject":
             if session.status != "pending":
                 return self._error(409, "decision_already_made", "already decided")

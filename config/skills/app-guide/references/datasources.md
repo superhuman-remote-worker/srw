@@ -83,8 +83,9 @@ attachment are separate steps:
 1. Open **Connectors** to create or configure the appropriate connection. Use
    the focused `datasources-email` or `datasources-okf` guide for those types.
    Keep passwords, tokens, and keys in the connector's credential controls.
-2. Return to the connected session and open header **Settings → Connectors**.
-   On a narrow screen, **Settings** is in the header's three-dot menu. Select
+2. Return to the connected session and open **Session settings →
+   Connectors** (**Session settings** is in the chat header's **More actions**
+   (⋮) menu). Select
    the eligible connector for this conversation. If the list fails to load,
    use **Retry**; an empty or failed list is not proof that a type is unsupported.
 3. Changes apply automatically from the next response. Read any error, then

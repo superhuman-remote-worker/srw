@@ -15,7 +15,7 @@ test_prompt_cache_prefix_invariance.py. Here:
   nothing written);
 - the per-conversation loader (only with ``memory_search`` bound, once per
   manager, nothing while the history holds it, failures never fatal);
-- the worker and session wiring: in the first append_only request, folded
+- the worker and session wiring: in the first request, folded
   into the carrier, exactly once across a run, re-appended after a
   compaction from the cached body, never re-read or re-sent after a resume
   or a restore (also through the real thread_messages round trip).
@@ -440,7 +440,6 @@ def _worker_node(
     *,
     memory_service: Any,
     tool_names: Optional[List[str]] = BOUND,
-    mode: str = "append_only",
     context_mgr: Optional[CompactingContextMgr] = None,
 ):
     from agent.core.workspace import WorkspaceManager
@@ -457,7 +456,6 @@ def _worker_node(
     )
     workspace.initialize()
     config = load_agent_config(harness.WORKER_CONFIG_PATH)
-    config.context_management.injection_mode = mode
     todo = TodoManager(workspace)
     todo.add("Do the task")
     ctx = ToolContext(workspace_manager=workspace)
@@ -597,16 +595,14 @@ class TestWorker:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "tool_names,mode",
-        [(None, "append_only"), (["read_file"], "append_only"), (BOUND, "legacy")],
-        ids=["no-tools", "memory_search-unbound", "legacy"],
+        "tool_names",
+        [None, ["read_file"]],
+        ids=["no-tools", "memory_search-unbound"],
     )
-    async def test_none_without_the_tool_or_in_legacy(self, tmp_path, tool_names, mode):
+    async def test_none_without_the_tool(self, tmp_path, tool_names):
         memory = harness.RecordingMemoryManager()
         llm = CapturingLLM([AIMessage("done")])
-        node = _worker_node(
-            tmp_path, llm, memory_service=memory, tool_names=tool_names, mode=mode
-        )
+        node = _worker_node(tmp_path, llm, memory_service=memory, tool_names=tool_names)
 
         await _execute(node, _state(_with_ids([HumanMessage("Go.")])), "t1-")
 
@@ -637,7 +633,6 @@ class TestWorkerOnTheWire:
             sources=harness.VARIANTS["injected"],
             workdir=tmp_path,
             monkeypatch=monkeypatch,
-            injection_mode="append_only",
             memory_search=memory_search,
         )
         expected = int(memory_search)
@@ -657,13 +652,10 @@ class Session:
         script: List[Any],
         *,
         memory_search: bool = True,
-        mode: str = "append_only",
         compact_at: Optional[int] = None,
     ) -> None:
         self.llm = FakeChatModel(script)
-        self.config = harness._session_config(
-            injections=True, model=MODEL, injection_mode=mode
-        )
+        self.config = harness._session_config(injections=True, model=MODEL)
         names = [t["function"]["name"] for t in harness.SESSION_TOOLS]
         if memory_search:
             names.append(MEMORY_SEARCH_TOOL_NAME)
@@ -809,15 +801,8 @@ class TestSession:
         assert BODY in "\n".join(str(m.content) for m in call)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "memory_search,mode",
-        [(False, "append_only"), (True, "legacy")],
-        ids=["memory_search-unbound", "legacy"],
-    )
-    async def test_none_without_the_tool_or_in_legacy(self, memory_search, mode):
-        session = Session(
-            [text_turn("Answer.")], memory_search=memory_search, mode=mode
-        )
+    async def test_none_without_the_tool(self):
+        session = Session([text_turn("Answer.")], memory_search=False)
         messages: List[BaseMessage] = []
 
         await session.run(messages, "Question?")

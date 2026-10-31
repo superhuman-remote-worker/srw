@@ -1,7 +1,9 @@
 """Physical workspace evidence shared by pinned retirement Begin and recovery."""
 
+import re
 from collections.abc import Mapping
 from typing import Any
+from uuid import UUID
 
 
 _PHYSICAL_WORKSPACE_FIELDS = (
@@ -32,6 +34,38 @@ def has_pinned_physical_workspace_evidence(
             field in workspace and workspace[field] is not None
             for field in _PHYSICAL_WORKSPACE_FIELDS
         )
+    )
+
+
+_VIRTUAL_BINDING_FIELDS = frozenset(
+    {"generation", "kind", "backing_id", "ssh_host_key_fingerprint"}
+)
+
+
+def canonical_virtual_binding(binding: Any) -> bool:
+    """Whether ``binding`` is exactly the one the virtual tier binds.
+
+    ``ensure_virtual_thread_workspace_binding`` writes it: an object-store
+    prefix, with no process, Pod or disk behind it. SQL
+    ``pinned_canonical_virtual_binding`` (0556) is the same test.
+    """
+
+    if not isinstance(binding, Mapping) or set(binding) != _VIRTUAL_BINDING_FIELDS:
+        return False
+    generation = binding.get("generation")
+    backing_id = binding.get("backing_id")
+    try:
+        canonical_generation = (
+            isinstance(generation, str) and str(UUID(generation)) == generation
+        )
+    except ValueError:
+        canonical_generation = False
+    return bool(
+        canonical_generation
+        and binding.get("kind") == "virtual"
+        and isinstance(backing_id, str)
+        and re.fullmatch(r"rclone:[0-9a-f]{64}", backing_id) is not None
+        and binding.get("ssh_host_key_fingerprint") is None
     )
 
 

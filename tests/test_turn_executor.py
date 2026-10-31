@@ -366,6 +366,7 @@ class Harness:
         self.restored_turn_count = 0
         self.heartbeat_result: Any = datetime.now(timezone.utc)
         self.bundle_error: Optional[Exception] = None
+        self.bundle_extra: Dict[str, Any] = {}
         self.attach_error: Optional[Exception] = None
         self.stateless_warm_reuse_safe = True
         self.session_postgres_conn = None
@@ -531,6 +532,7 @@ class Harness:
                     "execution_lane": "stateless",
                     "watermarks": {"input_seq": None, "consumed_seq": None},
                     "attach": harness.attach_for(unit_id),
+                    **harness.bundle_extra,
                 }
 
         pa._orchestrator_client = FakeClient()
@@ -3114,6 +3116,29 @@ class TestScrubOnClaim:
         assert emb._embedding_service is None
         session_attach.apply_session_embedding_env(None)  # cleanup
 
+    def test_whisper_transport_is_replaced_per_attach(self):
+        session_attach.apply_session_whisper_env(
+            {
+                "WHISPER_MODEL": "a-whisper",
+                "WHISPER_BASE_URL": "https://a.example/v1",
+                "WHISPER_API_KEY": "sk-a",
+                "WHISPER_LANGUAGE": "de",
+                "SOME_SDK_VARIABLE": "never exported",
+            }
+        )
+        assert os.environ.get("WHISPER_API_KEY") == "sk-a"
+        assert os.environ.get("WHISPER_LANGUAGE") == "de"
+        assert "SOME_SDK_VARIABLE" not in os.environ
+
+        # Tenant B delivers only a model: none of A's transport survives.
+        session_attach.apply_session_whisper_env({"WHISPER_MODEL": "b-whisper"})
+        assert os.environ.get("WHISPER_MODEL") == "b-whisper"
+        for key in ("WHISPER_BASE_URL", "WHISPER_API_KEY", "WHISPER_LANGUAGE"):
+            assert key not in os.environ, key
+
+        session_attach.apply_session_whisper_env(None)
+        assert "WHISPER_MODEL" not in os.environ
+
     def test_executor_scrub_clears_dual_inboxes(self, harness):
         import agent.api.dual_app as dual_app
 
@@ -3153,7 +3178,7 @@ class TestAffinity:
                 "resolved_at": "first",
                 "agent": {
                     "interactive": {
-                        "permission_mode": "supervised",
+                        "permission_mode": "read_only",
                         "narration_mode": "auto",
                         "idle_timeout_minutes": 30,
                     },
@@ -3199,7 +3224,7 @@ class TestAffinity:
             "thread_id": "t1",
             "config_override": {
                 "interactive": {
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "narration_mode": "auto",
                 }
             },
@@ -3421,7 +3446,7 @@ class TestAffinity:
                 "agent": {
                     **base["resolved_config"]["agent"],
                     "interactive": {
-                        "permission_mode": "supervised",
+                        "permission_mode": "read_only",
                         "narration_mode": "auto",
                     },
                 },
@@ -4142,3 +4167,57 @@ class TestPendingMemorySet:
         assert not any(
             sql == te._LEASED_INPUT_SEQ_SQL for sql, _ in harness.db.fetch_calls
         )
+
+
+class TestWorkspaceUpgradeSeed:
+    @pytest.mark.asyncio
+    async def test_seed_runs_after_attach_and_before_controls_and_input(
+        self, harness, monkeypatch
+    ):
+        """Review Focus 1: whatever is queued, the copy comes first."""
+        order: List[str] = []
+        spec = {"version": 1}
+
+        async def fake_seed(session, seed_spec, *, thread_id, lease_token):
+            order.append(f"seed:{lease_token}")
+            assert seed_spec == spec
+            assert harness.calls["attach"], "seed must follow attach"
+            assert not harness.calls["control_start"], "seed must precede controls"
+            return 2
+
+        monkeypatch.setattr(te, "seed_upgraded_workspace", fake_seed)
+        harness.bundle_extra = {"workspace_upgrade_seed": spec}
+        unit = uuid4()
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 5, "content": "hi"}]
+        claim = make_claim(unit_id=unit, token=7, input_seq=5, consumed_seq=None)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert order == ["seed:7"]
+        assert harness.calls["control_start"]
+        assert harness.consumed
+
+    @pytest.mark.asyncio
+    async def test_a_failed_seed_releases_before_controls_or_input(
+        self, harness, monkeypatch
+    ):
+        async def failing_seed(*_args, **_kwargs):
+            raise RuntimeError("object store unavailable")
+
+        monkeypatch.setattr(te, "seed_upgraded_workspace", failing_seed)
+        harness.bundle_extra = {"workspace_upgrade_seed": {"version": 1}}
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 5, "content": "hi"}]
+        claim = make_claim(token=3, input_seq=5, consumed_seq=None)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert len(harness.calls["release"]) == 1
+        assert harness.calls["release"][0]["error"] is True
+        assert not harness.calls["control_start"]
+        assert not harness.consumed
+        assert not harness.calls["complete"]
+
+    def test_seed_failure_counts_toward_the_park_budget(self):
+        assert te._release_is_deterministic("workspace_upgrade_seed_failed")

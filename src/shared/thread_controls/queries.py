@@ -22,6 +22,12 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from shared.permission_modes import PERMISSION_MODES, normalize_permission_mode
+from shared.workspace_upgrade import (
+    WORKSPACE_UPGRADE_PAYLOAD_KEYS,
+    WORKSPACE_UPGRADE_VERB,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ControlRequest:
@@ -207,13 +213,18 @@ def applied_control_scalar(
     request_payload = _json_object(request_payload)
     event_payload = _json_object(event_payload)
     requested_mode = request_payload.get("mode")
+    applied_mode = event_payload.get("mode")
     expected_kind: str
     column: str
-    allowed: set[str]
+    allowed: set[str] | frozenset[str]
     if verb == "mode.set":
         expected_kind = "mode.changed"
         column = "permission_mode"
-        allowed = {"supervised", "auto_accept", "autonomous"}
+        allowed = frozenset(PERMISSION_MODES)
+        # Either side may carry the legacy `supervised` spelling: requests
+        # admitted during the rename window, and journals of older images.
+        requested_mode = normalize_permission_mode(requested_mode)
+        applied_mode = normalize_permission_mode(applied_mode)
     elif verb == "narration.set":
         expected_kind = "narration.changed"
         column = "narration_mode"
@@ -232,7 +243,7 @@ def applied_control_scalar(
         or receipt_request_seq != int(request_seq)
         or str(event_payload.get("method") or "") != verb
         or requested_mode not in allowed
-        or event_payload.get("mode") != requested_mode
+        or applied_mode != requested_mode
     ):
         return None
     return column, str(requested_mode)
@@ -326,6 +337,26 @@ def control_receipt_result(
             and (summary is None or (isinstance(summary, str) and summary))
         ):
             return "applied", None, None
+
+    # ``upgrade-to-workspace`` (C1 container, C2 VM) receipts: started or
+    # complete is applied; a typed failure is a rejection.
+    if verb == WORKSPACE_UPGRADE_VERB:
+        request_payload = _json_object(request_payload)
+        if (
+            envelope_matches
+            and set(request_payload) <= WORKSPACE_UPGRADE_PAYLOAD_KEYS
+            and event_kind
+            in {"workspace_upgrade.started", "workspace_upgrade.complete"}
+            and event_payload.get("target_tier") in {"sandbox", "vm"}
+        ):
+            return "applied", None, None
+        failure_code = str(event_payload.get("error_code") or "")
+        if (
+            envelope_matches
+            and event_kind == "workspace_upgrade.failed"
+            and failure_code
+        ):
+            return "rejected", failure_code, None
 
     error_code = str(event_payload.get("error_code") or "")
     if event_kind != "control.rejected" or not envelope_matches or not error_code:

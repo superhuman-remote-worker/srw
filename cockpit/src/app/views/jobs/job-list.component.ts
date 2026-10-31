@@ -44,7 +44,7 @@ import {
 } from '../../core/util/job-status';
 import {JobListParams} from '../../core/models/audit.model';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
-import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {MultiSelectOption} from '../../ui/multi-select';
 import {JobFilterBarComponent} from './job-filter-bar.component';
 import {JobFilterPanelComponent} from './job-filter-panel.component';
@@ -363,7 +363,7 @@ export type {JobCloudAction};
                     @if (row.job.workspace_creation; as creation) {
                       <div class="workspace-recovery" [class.attention]="creation.state === 'attention'"
                            [style.padding-left.px]="row.isChild ? 16 : 0" role="status">
-                        {{ workspaceCreationMessageKey(creation) | transloco }}
+                        {{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}
                       </div>
                     }
                     @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation && !row.job.workspace_creation) {
@@ -1218,6 +1218,7 @@ export type {JobCloudAction};
 })
 export class JobListComponent implements OnInit, OnDestroy {
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
+  readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
   private readonly api = inject(ApiService);
   private readonly liveSessionService = inject(LiveSessionService);
   private readonly data = inject(DataService);
@@ -1496,7 +1497,7 @@ export class JobListComponent implements OnInit, OnDestroy {
     const rows = new Map(this.jobs().map((job) => [job.id, job]));
     for (const jobId of expanded) {
       const state = cache[jobId];
-      if (!state || state.loading) continue;
+      if (!state || state.loading || state.refreshing) continue;
       // Ended sessions can gain post-call answers/follow-ups, including after the
       // parent job completes. Keep their existing panel refresh alive.
       if (
@@ -1508,7 +1509,7 @@ export class JobListComponent implements OnInit, OnDestroy {
       // silently dropped them back to own-spend would be its own small lie.
       const wantSubtree = state.subtreeAttempted;
       this.loadJobDetail(jobId, true);
-      if (wantSubtree) this.loadSubtreeUsage(jobId);
+      if (wantSubtree) this.loadSubtreeUsage(jobId, true);
     }
   }
 
@@ -1751,27 +1752,32 @@ export class JobListComponent implements OnInit, OnDestroy {
    * three steps reads as broken — and each call already degrades to null on
    * error inside ApiService, so one failing source still renders the rest. Only
    * a total failure sets `error`.
+   *
+   * A refresh leaves the panel showing what it has until the answers land, and
+   * a source that fails on refresh keeps its last answer. Resetting to the
+   * first-load state swapped the figures for a spinner on every 30s poll, which
+   * made an open panel blink and shift the rows beneath it.
    */
   private loadJobDetail(jobId: string, refresh = false): void {
-    if (this.jobDetails()[jobId] && !refresh) return; // cached, including a failed attempt
-    const previousSessions = this.jobDetails()[jobId]?.sessions;
+    const previous = this.jobDetails()[jobId];
+    if (previous && !refresh) return; // cached, including a failed attempt
     this.jobDetails.update((cache) => ({
       ...cache,
-      [jobId]: {
-        loading: true,
-        error: false,
-        detail: null,
-        usage: null,
-        progress: null,
-        usageSubtree: null,
-        loadingSubtree: false,
-        subtreeAttempted: false,
-        subjobs: null,
-        subagents: null,
-        // Preserve mounted streams and the reader's scroll position while the
-        // job panel poll is in flight, including a failed sessions list read.
-        sessions: previousSessions ?? null,
-      },
+      [jobId]: previous
+        ? {...previous, refreshing: true}
+        : {
+            loading: true,
+            error: false,
+            detail: null,
+            usage: null,
+            progress: null,
+            usageSubtree: null,
+            loadingSubtree: false,
+            subtreeAttempted: false,
+            subjobs: null,
+            subagents: null,
+            sessions: null,
+          },
     }));
     forkJoin({
       detail: this.api.getJob(jobId),
@@ -1788,25 +1794,29 @@ export class JobListComponent implements OnInit, OnDestroy {
     })
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((result) => {
-        this.jobDetails.update((cache) => ({
-          ...cache,
-          [jobId]: {
-            ...cache[jobId],
-            loading: false,
-            error:
-              !result.detail &&
-              !result.usage &&
-              !result.progress &&
-              !result.subjobs &&
-              !result.subagents,
-            detail: result.detail,
-            usage: result.usage,
-            progress: result.progress,
-            subjobs: result.subjobs?.subjobs ?? null,
-            subagents: result.subagents?.subagents ?? null,
-            sessions: result.sessions?.sessions ?? cache[jobId]?.sessions ?? null,
-          },
-        }));
+        this.jobDetails.update((cache) => {
+          const prior = cache[jobId];
+          const detail = result.detail ?? prior?.detail ?? null;
+          const usage = result.usage ?? prior?.usage ?? null;
+          const progress = result.progress ?? prior?.progress ?? null;
+          const subjobs = result.subjobs?.subjobs ?? prior?.subjobs ?? null;
+          const subagents = result.subagents?.subagents ?? prior?.subagents ?? null;
+          return {
+            ...cache,
+            [jobId]: {
+              ...prior,
+              loading: false,
+              refreshing: false,
+              error: !detail && !usage && !progress && !subjobs && !subagents,
+              detail,
+              usage,
+              progress,
+              subjobs,
+              subagents,
+              sessions: result.sessions?.sessions ?? prior?.sessions ?? null,
+            },
+          };
+        });
       });
   }
 
@@ -1817,23 +1827,31 @@ export class JobListComponent implements OnInit, OnDestroy {
    * whose answer equals the one already on screen is pure waste. A parent's tree
    * can be many times its own spend, so the toggle is worth the extra call when
    * someone actually reaches for it.
+   *
+   * A refresh re-asks quietly, keeping the figure on screen like the panel does.
    */
-  loadSubtreeUsage(jobId: string): void {
+  loadSubtreeUsage(jobId: string, refresh = false): void {
     const state = this.jobDetails()[jobId];
     // `subtreeAttempted`, not `usageSubtree`: a failed call leaves the data null
     // and a data-keyed guard would then refetch on every click.
-    if (!state || state.subtreeAttempted) return;
-    this.jobDetails.update((cache) => ({
-      ...cache,
-      [jobId]: {...cache[jobId], loadingSubtree: true, subtreeAttempted: true},
-    }));
+    if (!state || (state.subtreeAttempted && !refresh)) return;
+    if (!refresh) {
+      this.jobDetails.update((cache) => ({
+        ...cache,
+        [jobId]: {...cache[jobId], loadingSubtree: true, subtreeAttempted: true},
+      }));
+    }
     this.api
       .getJobUsage(jobId, true)
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((usageSubtree) => {
         this.jobDetails.update((cache) => ({
           ...cache,
-          [jobId]: {...cache[jobId], loadingSubtree: false, usageSubtree},
+          [jobId]: {
+            ...cache[jobId],
+            loadingSubtree: false,
+            usageSubtree: usageSubtree ?? cache[jobId]?.usageSubtree ?? null,
+          },
         }));
       });
   }

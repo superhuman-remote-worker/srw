@@ -22,6 +22,10 @@ export const authGuard: CanActivateFn = () => {
   const injector = inject(Injector);
 
   if (userService.currentUser()) return true;
+  // The API did not answer the bootstrap read: the shell shows a Retry /
+  // Log out card. Sending the browser to /auth/login on an unreachable API
+  // would only trade that card for the browser's own error page.
+  if (userService.loadState() === 'failed') return false;
 
   return new Promise<boolean>((done) => {
     runInInjectionContext(injector, () => {
@@ -42,7 +46,7 @@ export const authGuard: CanActivateFn = () => {
         if (resolved) return;
         resolved = true;
         ref?.destroy();
-        session.login();
+        if (userService.loadState() !== 'failed') session.login();
         done(false);
       }, 1500);
     });

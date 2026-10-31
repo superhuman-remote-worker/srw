@@ -9,6 +9,7 @@
 @use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography
 @use 'styles/external-image';     // Inert click-to-load cards in untrusted Markdown
 @use 'styles/workspace-file-link'; // Inert workspace-path controls in untrusted Markdown
+@use 'styles/citation-chips';     // Citation chips and their popover in rendered Markdown
 @use 'styles/chat-queued';        // Retry/discard affordances on a stalled chat send
 @use 'styles/app-table';          // Shared data-table look (class="app-table" on <table>)
 

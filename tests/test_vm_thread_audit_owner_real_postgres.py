@@ -401,9 +401,12 @@ async def test_migration_backfills_live_identity_without_inventing_old_settlemen
     try:
         for path in discover(migrations):
             # Today's Begin revokes credential leases (C2), so the old
-            # head carries the lease tables the code it runs needs.
-            if path.name <= "0288_vm_initial_creation_cleanup_lineage.sql" or (
-                is_lease_table_migration(path.name)
+            # head carries the lease tables the code it runs needs; today's
+            # create_thread writes read_only, so it carries that CHECK too.
+            if (
+                path.name <= "0288_vm_initial_creation_cleanup_lineage.sql"
+                or is_lease_table_migration(path.name)
+                or path.name.startswith(("0554_", "0555_"))
             ):
                 (previous / path.name).write_bytes(path.read_bytes())
         await run_migrations(pool, previous)

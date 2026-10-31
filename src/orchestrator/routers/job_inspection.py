@@ -169,14 +169,14 @@ async def list_my_active_jobs(
     *,
     dependencies: JobInspectionDependencies = Depends(get_job_inspection_dependencies),
 ) -> list[dict[str, Any]]:
-    """Caller's in-flight jobs — the non-admin replacement for `/api/agents`.
+    """Caller's in-flight jobs — the non-admin replacement for `/api/admin/agents`.
 
     Returns jobs visible to the caller (G1 visibility OR — own jobs OR
     project-member jobs) in any of the active statuses (created,
     processing, paused, pending_review). The underlying ``query_jobs``
     SELECT already excludes pod IPs and hostnames, so this is safe to
     expose to non-admins. Admins still get the full fleet via
-    `/api/agents`; they can use this endpoint too if they want a personal
+    `/api/admin/agents`; they can use this endpoint too if they want a personal
     in-flight summary.
 
     Respects MCP ``project:<uuid>`` scope narrowing.

@@ -156,19 +156,10 @@ class TestKnowledgeRenderers:
 class TestGuidanceRenderer:
     ENTRIES = [{"id": "g1", "text": "Focus.", "source": "officer", "created_at": "t0"}]
 
-    def test_default_keeps_the_legacy_repeat_notice(self):
+    def test_one_block_without_a_repeat_notice(self):
+        # The entry is appended once and stays (D21): it never says it may
+        # repeat.
         rendered = format_supervisor_guidance(self.ENTRIES)
-        assert rendered == (
-            "[SUPERVISOR GUIDANCE] Mid-run guidance from your supervisor. "
-            "Your current plan and todos remain in force — fold this guidance "
-            "into the work in progress instead of re-planning. It may repeat "
-            "for a turn or two until delivery is confirmed; act on it once."
-            "\n\n- Focus. (officer, t0)"
-        )
-        assert format_supervisor_guidance(self.ENTRIES, repeat_notice=True) == rendered
-
-    def test_append_only_drops_the_repeat_notice(self):
-        rendered = format_supervisor_guidance(self.ENTRIES, repeat_notice=False)
         assert "may repeat" not in rendered
         assert "act on it once" not in rendered
         assert rendered == (
@@ -178,8 +169,8 @@ class TestGuidanceRenderer:
             "\n\n- Focus. (officer, t0)"
         )
 
-    def test_nothing_to_render_is_empty_either_way(self):
-        assert format_supervisor_guidance([], repeat_notice=False) == ""
+    def test_nothing_to_render_is_empty(self):
+        assert format_supervisor_guidance([]) == ""
 
 
 class TestClearedRenderings:
@@ -212,6 +203,18 @@ class TestClearedRenderings:
 
 def _minimal(**overrides):
     return {"agent_id": "test_agent", "display_name": "Test Agent", **overrides}
+
+
+class TestRetiredInjectionModeKey:
+    @pytest.mark.parametrize("value", ["legacy", "append_only", "anything"])
+    def test_a_stored_key_is_ignored(self, value):
+        # WP6 removed the rollback flag: a stored or frozen config that still
+        # carries it loads unchanged, and nothing reads the key.
+        config = load_agent_config_from_dict(
+            _minimal(context_management={"injection_mode": value})
+        )
+        assert not hasattr(config.context_management, "injection_mode")
+        assert "injection_mode" not in config.extra
 
 
 class TestMaxMemoriesPerEntry:

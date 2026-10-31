@@ -97,3 +97,71 @@ async def test_worker_job_keeps_the_sandbox_freeze(monkeypatch):
     assert freeze["target_tier"] == "sandbox"
     assert freeze["reason"] == "need pytest"
     assert result.startswith("Recorded your request for a sandbox workspace")
+
+
+@pytest.mark.asyncio
+async def test_an_available_container_is_offered_first(monkeypatch):
+    client = _Client(
+        {
+            "container": {"available": True, "reason": None},
+            "vm": {"available": True, "reason": None},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    result = await tool.ainvoke({"reason": "need to run pytest"})
+    freeze = context.consume_freeze_request()
+    assert freeze["target_tier"] == "sandbox"
+    assert "container workspace" in result
+
+
+@pytest.mark.asyncio
+async def test_a_stateless_session_without_a_container_target_is_offered_a_vm(
+    monkeypatch,
+):
+    """C2: the availability route answers vm on stateless; C1's ordered offer
+    picks it when no container is available."""
+    client = _Client(
+        {
+            "container": {"available": False, "reason": "tracking is off."},
+            "vm": {"available": True, "reason": None},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    await tool.ainvoke({"reason": "need sudo"})
+    assert context.consume_freeze_request()["target_tier"] == "vm"
+
+
+@pytest.mark.asyncio
+async def test_nothing_available_names_every_reason(monkeypatch):
+    client = _Client(
+        {
+            "container": {"available": False, "reason": "tracking is off."},
+            "vm": {"available": False, "reason": "VMs are off."},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    result = await tool.ainvoke({"reason": "need a shell"})
+    assert context.consume_freeze_request() is None
+    assert "tracking is off." in result and "VMs are off." in result
+
+
+@pytest.mark.asyncio
+async def test_pinned_nothing_available_names_only_the_vm_reason(monkeypatch):
+    # The pinned lane never offers a container, so its entry gives no reason.
+    client = _Client(
+        {
+            "vm": {
+                "available": False,
+                "reason": "VM workspaces aren't available on this installation.",
+            },
+            "container": {"available": False, "reason": None},
+        }
+    )
+    tool, context = _tool(monkeypatch, client)
+    result = await tool.ainvoke({"reason": "need a shell"})
+    assert context.consume_freeze_request() is None
+    assert result.startswith(
+        "No workspace upgrade is available for this Session: VM workspaces "
+        "aren't available on this installation. Nothing was offered"
+    )
+    assert "/upgrade-workspace vm" not in result

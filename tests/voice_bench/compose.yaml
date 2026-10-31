@@ -1,0 +1,85 @@
+# WP0 phone test bench. Driven by scripts/voice-bench.sh, which sets the
+# VOICE_BENCH_* variables below; see tests/voice_bench/README.md.
+name: srw-voice-bench
+
+x-ua: &ua
+  image: srw-voice-bench-ua:pjsua-2.17
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.ua
+  user: "${VOICE_BENCH_UID:-1000}:${VOICE_BENCH_GID:-1000}"
+  volumes:
+    - ${VOICE_BENCH_OUT:-./.run/current}:/bench/out
+    - ${VOICE_BENCH_AUDIO:-./.cache/audio}:/bench/audio:ro
+  stop_grace_period: 15s
+  depends_on:
+    pbx:
+      condition: service_healthy
+
+services:
+  pbx:
+    image: srw-asterisk:22.11.0
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.asterisk
+    volumes:
+      - ${VOICE_BENCH_RUN:-./.run}/pbx/etc:/etc/asterisk:ro
+      - ${VOICE_BENCH_RUN:-./.run}/pbx/log:/var/log/asterisk
+    networks:
+      bench:
+        ipv4_address: ${VOICE_BENCH_PBX_IP:-172.30.86.10}
+
+  dut:
+    <<: *ua
+    environment:
+      UA_SCENARIO: /bench/out/dut.json
+    networks:
+      bench:
+        ipv4_address: ${VOICE_BENCH_DUT_IP:-172.30.86.20}
+
+  human:
+    <<: *ua
+    environment:
+      UA_SCENARIO: /bench/out/human.json
+    networks:
+      bench:
+        ipv4_address: ${VOICE_BENCH_HUMAN_IP:-172.30.86.30}
+
+  caller:
+    <<: *ua
+    environment:
+      UA_SCENARIO: /bench/out/caller.json
+    networks:
+      bench:
+        ipv4_address: ${VOICE_BENCH_CALLER_IP:-172.30.86.40}
+
+  # Offline tools, started on demand with `docker compose run`.
+  whisper:
+    profiles: [tools]
+    image: srw-voice-bench-whisper:1.9.5
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.whisper
+    user: "${VOICE_BENCH_UID:-1000}:${VOICE_BENCH_GID:-1000}"
+    network_mode: none
+    volumes:
+      - ${VOICE_BENCH_MODELS:-./.cache/models}:/models:ro
+      - ${VOICE_BENCH_WORK:-./.run}:/work
+
+  piper:
+    profiles: [tools]
+    image: srw-voice-bench-piper:2023.11.14-2
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.piper
+    user: "${VOICE_BENCH_UID:-1000}:${VOICE_BENCH_GID:-1000}"
+    network_mode: none
+    volumes:
+      - ${VOICE_BENCH_MODELS:-./.cache/models}:/models:ro
+      - ${VOICE_BENCH_AUDIO_WORK:-./.cache/audio}:/audio
+
+networks:
+  bench:
+    ipam:
+      config:
+        - subnet: ${VOICE_BENCH_SUBNET:-172.30.86.0/24}

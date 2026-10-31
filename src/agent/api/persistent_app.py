@@ -89,6 +89,7 @@ from agent.api.orchestrator_client import (
     SessionEnded,
     SessionGrantDenied as SessionGrantDenied,
     ThreadConfigUpdateDenied,
+    VmUpgradeAbortPending,
     create_orchestrator_client_from_env,
 )
 from agent.api.persistent_session import (
@@ -124,22 +125,36 @@ from agent.api.lease_context import current_lease as _current_lease_var
 from agent.api.pinned_write_fence import PROCESS_PINNED_WRITE_FENCE
 from shared import event_journal as _event_journal
 from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
+from shared.permission_modes import (
+    DEFAULT_PERMISSION_MODE,
+    effect_asks,
+    is_permission_mode,
+    normalize_permission_mode,
+)
+from shared.tool_catalog import tool_effect
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
 )
 from shared.session_retirement import update_stateless_claim_status
+from shared.workspace_upgrade import (
+    UPGRADE_ALREADY_RUNNING,
+    UPGRADE_FAILED,
+    UPGRADE_INTERRUPTED,
+    WORKSPACE_UPGRADE_PAYLOAD_KEYS,
+    WORKSPACE_UPGRADE_VERB,
+)
 from agent.agent import UniversalAgent
 
 # Re-exported: tests/test_persistent_app.py and tests/test_session_wake_event_role.py
 # import the thread_messages serialiser from here (lifted to src/core in U3 WP1
 # so the subagent runtime shares it).
 from agent.core.thread_messages import (  # noqa: F401
-    ANTHROPIC_CONTENT_KEY,
     _ROLE_MAP,
     _extract_thinking,
     _persist_one_message,
     _serialize_message_row,
+    native_ai_fields,
 )
 from agent.persistent_graph import (
     INTERRUPT_SENTINEL,
@@ -286,6 +301,29 @@ _resume_message_limit: int = int(os.environ.get("RESUME_MESSAGE_LIMIT", "1000"))
 # Phase 2 / Q7.)
 _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "900"))
 
+#: An upgrade's event sink: the WebSocket that asked, or the journal (C2).
+UpgradeEmitter = Callable[[str, Dict[str, Any]], Awaitable[None]]
+WORKSPACE_UPGRADE_ALREADY_RUNNING = "A workspace upgrade is already running."
+#: One workspace upgrade per agent process (spec §4.4 "single flight").
+_workspace_upgrade_in_flight: bool = False
+#: E4: a failed VM upgrade's abort, asked again while the orchestrator answers
+#: "not yet" (capped delays, for a bounded window). End waits for it before
+#: it begins; past the window the abort's cleanup is crash recovery's.
+_VM_UPGRADE_ABORT_RETRY_DELAYS: tuple[float, ...] = (1.0, 3.0, 10.0)
+_VM_UPGRADE_ABORT_WINDOW_S: float = 300.0
+_vm_upgrade_abort: Optional[asyncio.Task] = None
+#: C2: a recovery copy made at owner start, until the first drain receipts it
+#: or ``_announce_recovered_vm_upgrade`` journals it.
+_recovered_vm_upgrade: Optional[Dict[str, Any]] = None
+#: C2: the request whose recovery copy owner start ended as interrupted, until
+#: the first drain receipts it or ``_announce_recovered_vm_upgrade`` journals it.
+_interrupted_vm_upgrade: Optional[str] = None
+_VM_UPGRADE_CANCELLED_REASON = "The VM upgrade was cancelled when this Session ended."
+_VM_UPGRADE_INTERRUPTED_REASON = (
+    "The VM upgrade was interrupted before your files were copied. "
+    "End this Session and start a new one."
+)
+
 # Subscriber registry for headless persistent sessions.
 #
 # Loop-driven output (token chunks, tool events, turn lifecycle, etc.) used to
@@ -429,7 +467,13 @@ async def _open_event_journal() -> None:
     writer.start()
     _event_writer = writer
     if live_lease is None and pinned_agent_id is not None:
+        # C2: a VM upgrade whose agent was lost after the VM request still owes
+        # its copy; make it before the first drain and before /ready. A failure
+        # raises: the attach coordinator aborts the attach and a later one
+        # retries, so no turn runs on an un-copied VM.
+        await _recover_pinned_vm_upgrade_seed()
         await _start_thread_control_watcher(agent_id=pinned_agent_id)
+        _announce_recovered_vm_upgrade()
 
 
 # Session attachment: the attach sequence, failed-attach cleanup and release
@@ -495,7 +539,7 @@ _session_attach = SessionAttachCoordinator(
         loop_running=lambda: _loop_task is not None and not _loop_task.done(),
         ensure_loop_started=lambda source: _ensure_persistent_loop_started(source),
         wire_aux_archiver=lambda: _wire_session_aux_archiver(),
-        emit_citation_verdict=lambda *args, **kwargs: _emit_citation_verdict(
+        emit_citation_event=lambda *args, **kwargs: _emit_citation_event(
             *args, **kwargs
         ),
         emit_canvas_event=lambda *args, **kwargs: _emit_canvas_event(*args, **kwargs),
@@ -653,6 +697,7 @@ _session_termination = SessionTerminationCoordinator(
         update_thread_status=lambda *args, **kwargs: _update_thread_status(
             *args, **kwargs
         ),
+        vm_upgrade_abort=lambda: _vm_upgrade_abort,
     ),
     logger=logger,
     termination_queue_sentinel=INTERRUPT_SENTINEL,
@@ -1234,6 +1279,7 @@ def _ensure_persistent_loop_started(
             on_tool_result=_loop_on_tool_result,
             permission_check=_loop_permission_check,
             announce_permission_batch=_loop_announce_permission_batch,
+            current_permission_mode=_loop_current_permission_mode,
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
@@ -3887,7 +3933,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
     """
 
     if _session is None:
-        return "supervised", "auto"
+        return DEFAULT_PERMISSION_MODE, "auto"
     fallback = (_session.permission_mode, _session.narration_mode)
     if _session.postgres_conn is None or _session_identity.thread_id is None:
         return fallback
@@ -3904,7 +3950,9 @@ async def _durable_session_control_modes() -> tuple[str, str]:
                 )
                 if row is None:
                     return fallback
-                permission_mode = str(row["permission_mode"] or "supervised")
+                permission_mode = normalize_permission_mode(
+                    str(row["permission_mode"] or DEFAULT_PERMISSION_MODE)
+                )
                 narration_mode = (
                     str(row["narration_mode"])
                     if row["narration_mode"] is not None
@@ -4084,11 +4132,7 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
     """Validate one request without mutating RAM or any durable state."""
 
     mode = str(request.payload.get("mode") or "")
-    if request.verb == "mode.set" and mode in {
-        "supervised",
-        "auto_accept",
-        "autonomous",
-    }:
+    if request.verb == "mode.set" and is_permission_mode(mode):
         return "mode.changed", "applied", None
     if request.verb == "narration.set" and mode in {"silent", "verbose", "auto"}:
         return "narration.changed", "applied", None
@@ -4096,6 +4140,10 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
         return "files.restored", "applied", None
     if request.verb == "compact" and _valid_compact_payload(request.payload):
         return "context.compacted", "applied", None
+    if request.verb == WORKSPACE_UPGRADE_VERB and _valid_workspace_upgrade_payload(
+        request.payload
+    ):
+        return "workspace_upgrade.complete", "applied", None
     return "control.rejected", "rejected", "unsupported_control"
 
 
@@ -4106,6 +4154,24 @@ def _valid_compact_payload(payload: Any) -> bool:
         and set(payload) <= {"focus", "boundary_message_id"}
         and all(isinstance(value, str) and value for value in payload.values())
     )
+
+
+# The agent-side name C2 consumes; the key set itself is shared.
+_UPGRADE_PAYLOAD_KEYS = WORKSPACE_UPGRADE_PAYLOAD_KEYS
+
+
+def _valid_workspace_upgrade_payload(payload: Any) -> bool:
+    """An upgrade request: no tier, ``sandbox`` (C1) or ``vm`` (C2).
+
+    The owner's lane picks the slice: a lease owner (stateless) serves
+    container requests; the pinned owner serves the lane switch's requests.
+    """
+    if not isinstance(payload, dict) or not set(payload) <= _UPGRADE_PAYLOAD_KEYS:
+        return False
+    if payload.get("target_tier", "sandbox") not in ("sandbox", "vm"):
+        return False
+    template = payload.get("template")
+    return template is None or (isinstance(template, str) and bool(template))
 
 
 async def _finalize_durable_control(
@@ -4193,7 +4259,9 @@ async def _reconcile_durable_control_scalars(
             )
     if row is None or _session is None:
         raise ControlInboxBlocked("control scalar reconciliation lost thread")
-    _session.permission_mode = str(row["permission_mode"] or "supervised")
+    _session.permission_mode = normalize_permission_mode(
+        str(row["permission_mode"] or DEFAULT_PERMISSION_MODE)
+    )
     # NULL is the migration sentinel for a legacy inherited narration value;
     # retain the mode already loaded from resolved config until a control (or
     # creation-time materialization) writes a first-class value.
@@ -4317,7 +4385,7 @@ def _apply_control_request(request: Any) -> tuple[str, str, Optional[str]]:
 
     mode = str(request.payload.get("mode") or "")
     if request.verb == "mode.set":
-        _session.permission_mode = mode
+        _session.permission_mode = normalize_permission_mode(mode)
         # Permission-card retirement stays owned by the existing gate/turn
         # cleanup path. It is not part of this control acknowledgement:
         # rows have no lease identity yet, so sweeping them here cannot be
@@ -4466,6 +4534,14 @@ async def _drain_thread_controls(
                     )
                 if result == outcome:
                     _apply_control_request(request)
+                    if (
+                        agent_id is not None
+                        and request.verb == WORKSPACE_UPGRADE_VERB
+                        and receipt.kind == "workspace_upgrade.started"
+                    ):
+                        # The receipt landed but its finalization didn't: the
+                        # VM was requested, so run the swap now.
+                        _resume_vm_upgrade_from_receipt(request, receipt.payload)
                 else:
                     await _reconcile_durable_control_scalars(
                         lease_token=lease_token,
@@ -4484,6 +4560,7 @@ async def _drain_thread_controls(
 
             event_kind, outcome, error_code = _describe_control_request(request)
             effect_params: Dict[str, Any] = {}
+            after_receipt: Optional[Callable[[], None]] = None
             if outcome == "applied" and request.verb == "workspace.undo":
                 if _session is None:
                     raise ControlInboxBlocked(
@@ -4517,6 +4594,29 @@ async def _drain_thread_controls(
                     error_code,
                     effect_params,
                 ) = await _apply_compact_control(request, lease_token=lease_token)
+            elif (
+                outcome == "applied"
+                and request.verb == WORKSPACE_UPGRADE_VERB
+                and agent_id is not None
+            ):
+                (
+                    event_kind,
+                    outcome,
+                    error_code,
+                    effect_params,
+                    after_receipt,
+                ) = await _apply_vm_workspace_upgrade_control(
+                    request, agent_id=agent_id
+                )
+            elif outcome == "applied" and request.verb == WORKSPACE_UPGRADE_VERB:
+                (
+                    event_kind,
+                    outcome,
+                    error_code,
+                    effect_params,
+                ) = await _apply_workspace_upgrade_control(
+                    request, lease_token=lease_token
+                )
             params: Dict[str, Any] = {
                 "request_id": str(request.id),
                 "client_request_id": str(request.client_request_id),
@@ -4531,10 +4631,14 @@ async def _drain_thread_controls(
             elif outcome == "applied" and request.verb in {
                 "workspace.undo",
                 "compact",
+                WORKSPACE_UPGRADE_VERB,
             }:
                 # The envelope above wins over any same-named effect key.
                 params = {**effect_params, **params}
             else:
+                if request.verb == WORKSPACE_UPGRADE_VERB:
+                    # A typed upgrade failure keeps its tier and reason (C2).
+                    params = {**effect_params, **params}
                 params["error_code"] = error_code
 
             journal_started = time.perf_counter()
@@ -4569,6 +4673,8 @@ async def _drain_thread_controls(
                 )
             if result == outcome:
                 _apply_control_request(request)
+                if after_receipt is not None:
+                    after_receipt()
             else:
                 await _reconcile_durable_control_scalars(
                     lease_token=lease_token,
@@ -5599,30 +5705,35 @@ async def _stop_thread_interrupt_watcher_locked() -> None:
             _interrupt_owner_turn_id = None
 
 
-def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
-    """Broadcast a citation verification verdict to the live session.
+#: Live citation frames the engine may send (``CitationEngine(on_event=...)``).
+_CITATION_EVENT_METHODS = frozenset(
+    {"citation.created", "citation.updated", "citation.verdict"}
+)
 
-    Wired onto the session's ``ToolContext`` (``citation_verdict_callback``) so
-    the CitationEngine's background verifier can push a ``pending`` →
-    ``verified``/``failed`` transition the moment it lands, instead of the
-    cockpit waiting for the next per-turn ``/citations`` refresh. The cockpit
-    patches the one citation in place (see ``citation.verdict`` in
+
+def _emit_citation_event(method: str, params: Dict[str, Any]) -> None:
+    """Broadcast a live citation change to the session.
+
+    Wired onto the session's ``ToolContext`` (``citation_event_callback``).
+    ``citation.created`` goes out before the cite tool returns, so the chip for
+    the handle the agent is about to write resolves while the text streams
+    (overhaul §6.2) instead of at the turn's end; ``citation.updated`` follows
+    an edit or a withdrawal and ``citation.verdict`` a check. Each carries
+    ``citation_id``, ``verification_status`` and the full row under
+    ``citation``; the cockpit upserts it into the thread's citation map (see
     persistent-chat.service). Worker jobs never set this, so the engine no-ops.
 
     Goes through ``_broadcast`` (WS subscribers + ``thread_events`` SSE replay).
     Not in ``_NOTIFICATION_METHODS`` — it's an in-session UI update, not a
-    cross-session notification. Fire-and-forget; never raises into the verifier.
+    cross-session notification. Fire-and-forget; never raises into the engine.
     """
+    if method not in _CITATION_EVENT_METHODS:
+        logger.warning("Ignored unsupported citation event method: %s", method)
+        return
     try:
-        _broadcast(
-            "citation.verdict",
-            {
-                "citation_id": int(citation_id),
-                "verification_status": str(verification_status),
-            },
-        )
+        _broadcast(method, params)
     except Exception as e:
-        logger.debug("citation.verdict broadcast failed (non-fatal): %s", e)
+        logger.debug("%s broadcast failed (non-fatal): %s", method, e)
 
 
 def _emit_canvas_event(method: str, params: Dict[str, Any]) -> None:
@@ -6124,20 +6235,18 @@ async def _insert_permission_request(
         return None
 
 
-_SHELL_TOOLS = {"run_command", "shell_execute", "shell_read"}
-
-
 def _gate_needed(mode: str, tool_name: str) -> bool:
     """Whether this call would actually hit a permission gate.
 
-    Mirrors the early-returns in ``_loop_permission_check`` so the announce
-    never creates a row for a call that auto-approves.
+    The one decision the batch announce, the mid-batch sweep and
+    ``_loop_permission_check`` all use, so the announce never creates a row
+    for a call that runs freely and a gated call always has one. The tool's
+    declared effect decides (knowledge-base/knowledge/features/
+    tool_permission_tiers.md, D8): read_only runs reads and bookkeeping,
+    auto_accept also runs workspace writes, autonomous runs everything. An
+    undeclared tool counts as external and an unknown mode asks for all.
     """
-    if mode == "autonomous":
-        return False
-    if mode == "auto_accept":
-        return tool_name in _SHELL_TOOLS
-    return True
+    return effect_asks(mode, tool_effect(tool_name))
 
 
 async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
@@ -6205,8 +6314,9 @@ _active_permission_request_id: Optional[str] = None
 # claim SELECT until the gate returns. `_active_permission_request_id` cannot
 # cover that whole span: the row id is not known until after the awaited
 # SELECT, and `async with pool.acquire()` exits through a yield point. A
-# fire-and-forget `mode.set` sweep landing in that window would CAS-expire the
-# very row the gate is about to wait on, and the waiter's re-SELECT would read
+# concurrent sweep (session termination, or another gate's mode-scoped sweep)
+# landing in that window would CAS-expire the very row the gate is about to
+# wait on, and the waiter's re-SELECT would read
 # 'expired' -> NO_ANSWER — parking the turn the user had just unblocked. The
 # reservation is keyed on tool_call_id, which IS known up front.
 _gates_in_flight: Set[str] = set()
@@ -6781,14 +6891,18 @@ async def _resolve_pending_permission(
     try:
         async with _session.postgres_conn.acquire() as conn:
             if approval_id is not None:
+                # Scoped to this session's thread like the fallback below and
+                # the orchestrator's decide_permission_request: a caller-
+                # supplied id from another thread must not resolve its gate.
                 row = await conn.fetchrow(
                     "UPDATE thread_permission_requests "
                     "SET status = $2, decided_at = now(), decided_by = $3 "
-                    "WHERE id = $1 AND status = 'pending' "
+                    "WHERE id = $1 AND thread_id = $4 AND status = 'pending' "
                     "RETURNING id, status, tool_call_id, thread_id",
                     approval_id,
                     decision,
                     decided_by,
+                    _session_identity.thread_id,
                 )
             else:
                 row = await conn.fetchrow(
@@ -6810,10 +6924,15 @@ async def _resolve_pending_permission(
         return None
 
 
+def _loop_current_permission_mode() -> Optional[str]:
+    """The live session's permission mode, which the model is told about."""
+    return _session.permission_mode if _session is not None else None
+
+
 async def _loop_permission_check(
     tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
 ) -> PermissionOutcome:
-    """Resolve a supervised gate. INSERTs a pending row and waits for the DB
+    """Resolve a permission gate. INSERTs a pending row and waits for the DB
     status to flip via short-acquisition polling.
 
     Returns a THREE-state outcome, because a gate is a question to the user:
@@ -6845,34 +6964,27 @@ async def _loop_permission_check(
 
     mode = _session.permission_mode
 
-    # A mid-batch mode downgrade takes these early exits *before* the claim
-    # block below, so this call's announced row — and every later one the new
-    # mode auto-approves — would never be retired by anyone. Sweep them here,
-    # scoped by the new mode so a shell call still gating under auto_accept
-    # keeps the row its own gate is about to claim.
-    if mode == "autonomous":
-        await _retire_announced_permission_rows("mode downgraded to autonomous", mode)
+    # A call the mode runs freely takes this exit *before* the claim block
+    # below. After a mid-batch mode change its own announced row — and every
+    # later one the new mode runs freely — would never be retired by anyone,
+    # so sweep them here, scoped by the mode so a call that still gates keeps
+    # the row its own gate is about to claim. Without announced rows the sweep
+    # returns at once, so a read in read_only costs nothing.
+    if not _gate_needed(mode, tool_name):
+        await _retire_announced_permission_rows(
+            f"mode {mode} runs the call without asking", mode
+        )
         return PermissionOutcome.APPROVED
-
-    if mode == "auto_accept":
-        # Auto-accept reads and writes; still ask for shell commands. Reads
-        # the shared _SHELL_TOOLS constant (not a local copy) so this stays
-        # in lockstep with _gate_needed — two independently-maintained sets
-        # could silently drift and leave a gated call with no announced row.
-        if tool_name not in _SHELL_TOOLS:
-            await _retire_announced_permission_rows(
-                "mode downgraded to auto_accept", mode
-            )
-            return PermissionOutcome.APPROVED
 
     # Reserve this gate BEFORE the claim SELECT. `async with pool.acquire()`
     # exits through a yield point and the row id is not known until after the
     # awaited SELECT, so `_active_permission_request_id` cannot cover the gap:
-    # a fire-and-forget mode.set sweep landing there would CAS-expire the very
-    # row this gate is about to wait on, and the waiter's re-SELECT would read
+    # a concurrent sweep (session termination, or another gate's mode-scoped
+    # sweep) landing there would CAS-expire the very row this gate is about to
+    # wait on, and the waiter's re-SELECT would read
     # 'expired' -> NO_ANSWER, parking the turn the user had just unblocked. The
     # tool_call_id IS known up front. Nothing may await between the add and the
-    # try, and the finally must cover EVERY exit below — including the two
+    # try, and the finally must cover EVERY exit below — including the
     # early returns — or the reservation strands a row no sweep will touch.
     _gates_in_flight.add(tool_call_id)
     try:
@@ -6985,9 +7097,9 @@ async def _loop_permission_check(
                     name="phase5-flip-awaiting-user-sudo",
                 )
 
-        # Publish the row we are blocked on so a concurrent sweep (mode.set from
-        # the WS task) can't expire it under us and turn a live question into a
-        # parked turn.
+        # Publish the row we are blocked on so a concurrent sweep (another
+        # gate's mode-scoped sweep, session termination) can't expire it under
+        # us and turn a live question into a parked turn.
         global _active_permission_request_id
         _active_permission_request_id = request_id
         try:
@@ -7778,6 +7890,14 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
         _cloud_sync_retry_pending = False
         return
 
+    if _session_workspace.remote_cloud_mounts(ws_info):
+        # A Virtual Session's cloud folders, the outbox included, are served
+        # by its own backend at cloud/<name> (the cloud_remote form): there is
+        # no mirror of the workspace root to build beside them, and that
+        # verdict does not change mid-session.
+        _cloud_sync_retry_pending = False
+        return
+
     cloud_cfg = ws_info.get("cloud_sync")
     if not cloud_cfg and ws_info.get("nc_session_folder"):
         cloud_cfg = _legacy_nc_cloud_cfg(ws_info["nc_session_folder"])
@@ -8383,8 +8503,13 @@ def _loop_archive_llm_call(
         return
     thread_id = _session_identity.thread_id
     turn = _session.turn_count
-    model = metrics.get("model") or getattr(
-        getattr(_session.config, "llm", None), "model", "unknown"
+    from shared.runtime.core.loader import recorded_model_name
+
+    llm_config = getattr(_session.config, "llm", None)
+    model = (
+        recorded_model_name(llm_config, metrics.get("model"))
+        or getattr(llm_config, "model", None)
+        or "unknown"
     )
 
     def _do() -> None:
@@ -8513,8 +8638,8 @@ async def _loop_on_workspace_upgrade_needed(freeze_data: Dict[str, Any]) -> None
 
     - ``workspace_upgrade_required`` — a lite agent called
       ``request_workspace_upgrade`` → emit ``workspace_upgrade.needed`` (the
-      upgrade offer: a VM in a Session, a container in a Job; accept sends
-      ``upgrade-to-workspace``).
+      upgrade offer: the first available of a container or a VM in a
+      Session, a container in a Job; accept sends ``upgrade-to-workspace``).
     - ``vm_upgrade_required`` — a sandbox sudo intercept → emit
       ``vm_upgrade.needed`` (the existing VM offer; accept sends
       ``upgrade-to-vm``). Unchanged behavior.
@@ -8606,6 +8731,9 @@ async def _persist_compaction_checkpoint(
     # that don't resolve to a persisted row).
     boundary_seq = None
     ctx_mgr = getattr(_session, "context_manager", None)
+    if ctx_mgr is not None:
+        # Where the live context now starts, for the memory take-in (P4).
+        ctx_mgr.compaction_boundary_turn = boundary_turn
     boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
     if boundary_id:
         try:
@@ -8731,18 +8859,32 @@ def _sanitize_restored_history(restored: list) -> list:
 
     The durable config's model may have changed while the session was
     detached (the owner-facing offline PATCH), so rows persisted under one
-    provider can be replayed under another. Reasoning shapes are already
-    flattened at persist time (``_serialize_message_row``); what survives
-    restore verbatim is tool-call ids — remap any that don't conform to the
-    bound model's accepted format. No-op (beyond the pairing re-check) when
-    the history is native to the bound model.
+    provider can be replayed under another. A turn comes back with its
+    native blocks (``provider_raw``): reasoning a different family produced
+    is stripped, and tool-call ids are remapped to the bound model's accepted
+    format. No-op (beyond the pairing re-check) when the history is native to
+    the bound model. A tool's image row keeps its image only for a model with
+    vision: a text-only one gets the row's text, as every restore did before
+    the rows kept the image.
     """
+    from langchain_core.messages import HumanMessage
+
     from agent.core.context import sanitize_history_for_provider_boundary
+    from agent.core.thread_messages import content_text
 
     model = ""
+    multimodal = True
     if _session is not None:
-        model = getattr(getattr(_session, "config", None), "llm", None)
-        model = getattr(model, "model", "") or ""
+        llm = getattr(getattr(_session, "config", None), "llm", None)
+        model = getattr(llm, "model", "") or ""
+        multimodal = getattr(llm, "multimodal", None) is not False
+    if not multimodal:
+        restored = [
+            message.model_copy(update={"content": content_text(message.content)})
+            if isinstance(message, HumanMessage) and isinstance(message.content, list)
+            else message
+            for message in restored
+        ]
     return sanitize_history_for_provider_boundary(restored, model)
 
 
@@ -8800,13 +8942,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     A ``role='context'`` row comes back as the typed context entry it was
     (its stored text, never re-rendered) and folds into its carrier at the
     next request build; an unreadable one is dropped, and the planner
-    re-injects what is still relevant.
+    re-injects what is still relevant. A tool's image row comes back with its
+    image, and a tool call with its arguments in the live key order, so the
+    restored request sends the bytes the live one did.
     """
     import uuid as _uuid
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+    from agent.core.thread_messages import (
+        restored_human_content,
+        restored_tool_call_args,
+    )
     from shared.runtime.core.context_entries import context_entry_from_row
-    from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
+    from shared.runtime.core.message_markers import (
+        PERSIST_ROLE_CONTEXT,
+        PERSIST_ROLE_EVENT,
+        PERSIST_ROLE_KEY,
+    )
 
     restored: list = []
     pending_tool_call_ids: list[str] = []
@@ -8823,7 +8975,9 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
         msg_id = str(db_msg.get("id") or _uuid.uuid4())
 
         if role in ("human", "user"):
-            restored.append(HumanMessage(content=content, id=msg_id))
+            restored.append(
+                HumanMessage(content=restored_human_content(db_msg), id=msg_id)
+            )
 
         elif role == "event":
             # System-injected notice (a worker job this session created reached
@@ -8853,7 +9007,15 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     )
                 )
             else:
-                restored.append(HumanMessage(content=content, id=msg_id))
+                # With its persist role, as the live message carried it: a
+                # restored notice that is saved again stays an event row.
+                restored.append(
+                    HumanMessage(
+                        content=restored_human_content(db_msg),
+                        additional_kwargs={PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT},
+                        id=msg_id,
+                    )
+                )
 
         elif role == PERSIST_ROLE_CONTEXT:
             # A typed context entry (append-only context injection). The
@@ -8873,27 +9035,25 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
                     {
                         "id": tc.get("id", ""),
                         "name": tc.get("name", ""),
-                        "args": tc.get("args", {}),
+                        "args": restored_tool_call_args(tc),
                     }
                     for tc in tool_calls
                 ]
             pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
-            # An Anthropic turn comes back as the blocks the provider produced
-            # (thinking with its signature, text, tool_use), so the restored
-            # request starts with the live one and keeps its reasoning.
-            raw = db_msg.get("provider_raw")
-            native = raw.get(ANTHROPIC_CONTENT_KEY) if isinstance(raw, dict) else None
-            response_metadata = {}
-            if isinstance(native, list) and native:
-                content = native
-                if raw.get("model"):
-                    response_metadata["model_name"] = raw["model"]
+            # A turn comes back as the blocks the provider produced (Claude's
+            # signed thinking, Responses reasoning items and item ids, Gemini
+            # thought parts and signatures), so the restored request starts
+            # with the live one and keeps its reasoning. A Responses turn past
+            # OpenAI's retention comes back flat (its item ids would 400).
+            native = native_ai_fields(
+                db_msg.get("provider_raw"), db_msg.get("created_at")
+            )
             restored.append(
                 AIMessage(
-                    content=content,
+                    content=native.pop("content", content),
                     tool_calls=lc_tool_calls,
                     id=msg_id,
-                    response_metadata=response_metadata,
+                    **native,
                 )
             )
 
@@ -8916,6 +9076,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     return repair_tool_result_adjacency(restored)
 
 
+def _note_restored_compaction_boundary(
+    ctx_mgr: Any, db_messages: Sequence[Dict[str, Any]], checkpoint_turn: int
+) -> None:
+    """Record where a restored context starts, for the memory take-in (P4).
+
+    The restored history holds the turns after the checkpoint's
+    ``boundary_turn`` (no checkpoint: the whole log), unless the resume
+    floor dropped the oldest rows: then the turns before the first row it
+    loaded are out of context too. A compaction during the restore records
+    its own boundary afterwards (``_persist_compaction_checkpoint``).
+    """
+    if ctx_mgr is None:
+        return
+    first_turn = min((m.get("turn_number") or 0 for m in db_messages), default=0)
+    ctx_mgr.compaction_boundary_turn = max(checkpoint_turn, first_turn - 1, 0)
+
+
 async def _restore_session_messages() -> None:
     """Restore LangChain message history from DB into session.messages.
 
@@ -8927,7 +9104,7 @@ async def _restore_session_messages() -> None:
 
     * **Path A — checkpoint resume:** if a ``role='summary'`` row exists with
       a ``metrics.boundary_turn`` set, restore
-      ``[SystemMessage(summary)] + history(since_turn=boundary_turn)``. The
+      ``[summary hand-back] + history(since_turn=boundary_turn)``. The
       summary covers turns ≤ boundary_turn; the tail covers everything after.
       This avoids re-loading the full pre-checkpoint history and
       re-summarizing on every resume — the fix for the OOM observed on a
@@ -9050,6 +9227,7 @@ async def _restore_session_messages() -> None:
                     default=_bturn,
                 )
                 _session.turn_count = max(tail_turn_max, _bturn)
+                _note_restored_compaction_boundary(ctx_mgr, db_messages, _bturn)
                 cursor = (
                     f"seq>{boundary_seq}"
                     if boundary_seq is not None
@@ -9150,6 +9328,7 @@ async def _restore_session_messages() -> None:
             # Set turn_count from the last stored message's turn_number
             last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
+            _note_restored_compaction_boundary(ctx_mgr, db_messages, 0)
             logger.info(
                 f"Restored {len(restored)} messages for thread {_session_identity.thread_id} "
                 f"(from {len(db_messages)} stored; last turn: {last_turn})"
@@ -9970,6 +10149,405 @@ async def _handle_compact(
             await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
 
 
+async def _apply_workspace_upgrade_control(
+    request: Any, *, lease_token: Optional[int]
+) -> Tuple[str, str, Optional[str], Dict[str, Any]]:
+    """Receipt a stateless container upgrade whose copy this claim already made.
+
+    The executor attaches the new container and copies the old files before
+    this drain (turn_executor ``seed_upgraded_workspace``). A marker still
+    present means the copy didn't finish: leave the request pending.
+    """
+    from agent.api.workspace_upgrade_seed import take_seed_result
+
+    if request.payload.get("target_tier") == "vm":
+        # C2's requests are served by the pinned owner after the lane switch;
+        # a stateless claimant never serves one (C1's test_a_vm_target_is_not_c1s).
+        return "control.rejected", "rejected", "unsupported_control", {}
+    if lease_token is None:
+        # The pinned owner's drain serves the verb in C2's branch, never here.
+        return "control.rejected", "rejected", "unsupported_control", {}
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        raise ControlInboxBlocked(f"workspace upgrade lost its session: {request.id}")
+    thread_id = str(_session_identity.thread_id)
+    if await _session.postgres_conn.workspace_upgrade_seed_pending(thread_id):
+        raise ControlInboxBlocked(f"workspace upgrade seed still pending: {request.id}")
+    params: Dict[str, Any] = {"target_tier": "sandbox"}
+    seeded = take_seed_result(thread_id, lease_token)
+    if seeded is not None:
+        params["seeded_files"] = seeded
+    return "workspace_upgrade.complete", "applied", None, params
+
+
+def _journaled_upgrade_emitter(envelope: Dict[str, Any]) -> UpgradeEmitter:
+    """Emit a durable upgrade's events to every tab through the journal (C2)."""
+
+    async def emit(method: str, params: Dict[str, Any]) -> None:
+        payload = dict(params)
+        if method == "workspace_upgrade.failed":
+            payload.setdefault("error_code", UPGRADE_FAILED)
+        payload.update(envelope)
+        _broadcast(method, payload)
+
+    return emit
+
+
+async def _mark_vm_upgrade_seeded(
+    *, control_request_id: str, provision_generation: str
+) -> None:
+    """The durable path's ``before_swap``: record the copy or fail before the swap."""
+    from agent.api.vm_upgrade_handoff import call_with_route_retry
+
+    client = _orchestrator_client
+    thread_id = _session_identity.thread_id
+    if client is None or thread_id is None:
+        raise WorkspaceUnavailableError("the VM upgrade lost its session")
+    await call_with_route_retry(
+        lambda: client.mark_workspace_upgrade_seeded(
+            str(thread_id),
+            provision_generation=provision_generation,
+            control_request_id=control_request_id,
+        )
+    )
+
+
+async def _mark_pending_vm_upgrade_seeded(_seeded: int) -> None:
+    """The WebSocket swap's ``before_swap``: settle a pending lane-switch copy (C2).
+
+    A WebSocket VM upgrade can run while a stateless lane switch's marker is
+    still ``pending`` (its durable swap failed, or never started because this
+    one held the single flight): the orchestrator answers that retry "already
+    in progress" and keeps the marker. This swap seeds the same old prefix, so
+    the marker is recorded ``seeded`` for the current provision generation
+    before the swap; otherwise the next VM attach's recovery copy would write
+    the old files over newer VM ones. No marker, or one that isn't pending:
+    nothing to record. A failed record fails the upgrade before the swap.
+    """
+    from shared.workspace_upgrade import (
+        VM_UPGRADE_SEED_PENDING,
+        vm_provision_generation,
+        vm_upgrade_seed,
+    )
+
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        return
+    thread = await _session.postgres_conn.get_thread(str(_session_identity.thread_id))
+    metadata = (thread or {}).get("metadata")
+    marker = vm_upgrade_seed(metadata)
+    if marker is None or marker["state"] != VM_UPGRADE_SEED_PENDING:
+        return
+    provision_generation = vm_provision_generation(metadata)
+    if provision_generation is None:
+        raise WorkspaceUnavailableError(
+            "the pending VM upgrade copy has no provision generation"
+        )
+    await _mark_vm_upgrade_seeded(
+        control_request_id=marker["control_request_id"],
+        provision_generation=provision_generation,
+    )
+    logger.info(
+        "WebSocket VM upgrade recorded the pending copy of request %s",
+        marker["control_request_id"],
+    )
+
+
+def _start_durable_vm_upgrade(request: Any, *, provision_generation: str) -> None:
+    """Run the VM hot swap for a receipted C2 request, journaling its events.
+
+    Takes the single flight now, so no other upgrade starts before the task
+    runs. The task's ``finally`` releases it; a task cancelled before its first
+    step never runs that ``finally``, so a done-callback releases it then.
+    The request is already receipted ``.started``: a start that can't run
+    (another upgrade holds the flight, or the session is gone) journals a
+    typed ``.failed`` instead of leaving every tab waiting.
+    """
+    global _workspace_upgrade_in_flight
+    envelope = {
+        "request_id": str(request.id),
+        "client_request_id": str(request.client_request_id),
+    }
+    if _session is None or _workspace_upgrade_in_flight:
+        code, reason = (
+            (UPGRADE_FAILED, "Session not ready")
+            if _session is None
+            else (UPGRADE_ALREADY_RUNNING, WORKSPACE_UPGRADE_ALREADY_RUNNING)
+        )
+        logger.warning(
+            "VM upgrade %s did not start its swap: %s (%s)", request.id, reason, code
+        )
+        _broadcast(
+            "workspace_upgrade.failed",
+            {
+                "thread_id": str(_session_identity.thread_id),
+                "target_tier": "vm",
+                "reason": reason,
+                "error_code": code,
+                **envelope,
+            },
+        )
+        return
+    src_backend = (
+        _session.workspace_manager.backend if _session.workspace_manager else None
+    )
+    control_request_id = str(request.id)
+    started = False
+
+    async def before_swap(_seeded: int) -> None:
+        await _mark_vm_upgrade_seeded(
+            control_request_id=control_request_id,
+            provision_generation=provision_generation,
+        )
+
+    async def run() -> None:
+        global _workspace_upgrade_in_flight
+        nonlocal started
+        started = True
+        try:
+            await _run_workspace_upgrade_swap(
+                _journaled_upgrade_emitter(envelope),
+                target_tier="vm",
+                src_backend=src_backend,
+                before_swap=before_swap,
+            )
+        finally:
+            _workspace_upgrade_in_flight = False
+
+    def release_if_never_started(_task: "asyncio.Task[None]") -> None:
+        # The flag stayed set from here to the task's end, so no other upgrade
+        # can own it yet; only an unstarted task leaves it to this callback.
+        global _workspace_upgrade_in_flight
+        if not started:
+            _workspace_upgrade_in_flight = False
+
+    _workspace_upgrade_in_flight = True
+    try:
+        task = asyncio.create_task(run(), name=f"vm-upgrade-{control_request_id[:8]}")
+    except BaseException:
+        _workspace_upgrade_in_flight = False
+        raise
+    task.add_done_callback(release_if_never_started)
+    _session_termination.track_session_side_task(task)
+
+
+def _resume_vm_upgrade_from_receipt(request: Any, payload: Any) -> None:
+    """A ``.started`` receipt found without its finalization: start the swap.
+
+    A held single flight is ``_start_durable_vm_upgrade``'s to report.
+    """
+    if _session is None:
+        return
+    if str(getattr(_session, "workspace_backend_tier", "") or "") not in (
+        "virtual",
+        "none",
+    ):
+        return
+    provision_generation = (payload or {}).get("provision_generation")
+    if isinstance(provision_generation, str) and provision_generation:
+        _start_durable_vm_upgrade(request, provision_generation=provision_generation)
+
+
+async def _apply_vm_workspace_upgrade_control(
+    request: Any, *, agent_id: str
+) -> tuple[str, str, Optional[str], Dict[str, Any], Optional[Callable[[], None]]]:
+    """C2: consume the lane switch's VM upgrade request on the pinned owner.
+
+    Returns the receipt (event kind, outcome, error code, params) and a
+    callable the drain runs once the receipt is final; it starts the hot swap.
+    The receipt is written at ``.started``, after the VM request, so the
+    strictly ordered inbox isn't held for a VM boot (spec §3).
+    """
+    from agent.api.vm_upgrade_handoff import (
+        ROW_BUSY,
+        ROW_CANCEL,
+        ROW_COMPLETE,
+        ROW_INTERRUPTED,
+        ROW_REQUEST,
+        vm_upgrade_consumer_row,
+        vm_upgrade_payload,
+    )
+    from shared.workspace_upgrade import (
+        UPGRADE_ALREADY_RUNNING,
+        UPGRADE_CANCELLED,
+        UPGRADE_REFUSED,
+        vm_provision_generation,
+        vm_upgrade_recorded,
+        vm_upgrade_seed,
+    )
+
+    global _recovered_vm_upgrade, _interrupted_vm_upgrade
+    parsed = vm_upgrade_payload(request.payload)
+    if (
+        parsed is None
+        or _session is None
+        or _session.postgres_conn is None
+        or _orchestrator_client is None
+        or _session_identity.thread_id is None
+    ):
+        return "control.rejected", "rejected", "unsupported_control", {}, None
+    generation, template = parsed
+    thread_id = str(_session_identity.thread_id)
+    tier = str(getattr(_session, "workspace_backend_tier", "") or "")
+    marker = None
+    if tier == "vm":
+        thread = await _session.postgres_conn.get_thread(thread_id)
+        marker = vm_upgrade_seed((thread or {}).get("metadata"))
+    row = vm_upgrade_consumer_row(
+        attached_tier=tier,
+        payload_generation=generation,
+        current_generation=str(_session_identity.session_generation or ""),
+        marker=marker,
+        request_id=str(request.id),
+        recovered=_recovered_vm_upgrade,
+        in_flight=_workspace_upgrade_in_flight,
+    )
+    params: Dict[str, Any] = {"target_tier": "vm"}
+
+    def failed(
+        code: str, reason: str
+    ) -> tuple[str, str, Optional[str], Dict[str, Any], None]:
+        return (
+            "workspace_upgrade.failed",
+            "rejected",
+            code,
+            {**params, "reason": reason},
+            None,
+        )
+
+    if row == ROW_CANCEL:
+        return failed(UPGRADE_CANCELLED, _VM_UPGRADE_CANCELLED_REASON)
+    if row == ROW_BUSY:
+        return failed(UPGRADE_ALREADY_RUNNING, WORKSPACE_UPGRADE_ALREADY_RUNNING)
+    if row == ROW_INTERRUPTED:
+        if _interrupted_vm_upgrade == str(request.id):
+            # This receipt tells every tab; owner start needn't announce it.
+            _interrupted_vm_upgrade = None
+        return failed(UPGRADE_INTERRUPTED, _VM_UPGRADE_INTERRUPTED_REASON)
+    if row == ROW_COMPLETE:
+        recovered = _recovered_vm_upgrade
+        if recovered is not None and recovered.get("control_request_id") == str(
+            request.id
+        ):
+            params["seeded_files"] = int(recovered["seeded_files"])
+            if recovered.get("skipped_files"):
+                params["skipped_files"] = list(recovered["skipped_files"])
+            _recovered_vm_upgrade = None
+        return "workspace_upgrade.complete", "applied", None, params, None
+    if row != ROW_REQUEST:
+        return failed(
+            UPGRADE_REFUSED, "This Session's workspace can't take a VM upgrade."
+        )
+
+    (
+        accepted,
+        status,
+        detail,
+    ) = await _orchestrator_client.request_vm_upgrade_for_control(
+        thread_id, template=template, control_request_id=str(request.id)
+    )
+    if accepted is False:
+        # A 4xx, or a typed 503: VM provisioning is off, or the request
+        # failed before anything was recorded for it.
+        return failed(UPGRADE_REFUSED, detail or "SRW refused the VM upgrade.")
+    thread = await _session.postgres_conn.get_thread(thread_id)
+    metadata = (thread or {}).get("metadata")
+    provision_generation = vm_provision_generation(metadata)
+    if accepted is None:
+        # No answer, or a 5xx that may have followed the provision CAS: the
+        # VM request took effect only if the CAS committed for this request
+        # (``vm_upgrade_recorded``, which the orchestrator asks too).
+        # Otherwise leave the request pending; the watcher retries it.
+        if not vm_upgrade_recorded(metadata, request.id):
+            raise ControlInboxBlocked(
+                f"VM upgrade request has no answer yet ({status or 'no HTTP answer'}): "
+                f"{request.id}"
+            )
+        logger.warning(
+            "VM upgrade request %s answered %s after its provision committed; "
+            "serving it as accepted",
+            request.id,
+            status or "nothing",
+        )
+    if provision_generation is None:
+        raise ControlInboxBlocked(
+            f"VM upgrade accepted without a provision generation: {request.id}"
+        )
+    params["provision_generation"] = provision_generation
+    return (
+        "workspace_upgrade.started",
+        "applied",
+        None,
+        params,
+        lambda: _start_durable_vm_upgrade(
+            request, provision_generation=provision_generation
+        ),
+    )
+
+
+async def _recover_pinned_vm_upgrade_seed() -> None:
+    """C2 (D4 (a)): finish a lost predecessor's VM upgrade copy at owner start."""
+    global _recovered_vm_upgrade, _interrupted_vm_upgrade
+    _recovered_vm_upgrade = None
+    _interrupted_vm_upgrade = None
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _orchestrator_client is None
+        or _session_identity.thread_id is None
+        or str(getattr(_session, "workspace_backend_tier", "") or "") != "vm"
+    ):
+        return
+    from agent.api.vm_upgrade_handoff import recover_vm_upgrade_seed
+
+    result = await recover_vm_upgrade_seed(
+        session=_session,
+        client=_orchestrator_client,
+        thread_id=str(_session_identity.thread_id),
+    )
+    if result is not None and result.get("interrupted"):
+        _interrupted_vm_upgrade = str(result["control_request_id"])
+    else:
+        _recovered_vm_upgrade = result
+
+
+def _announce_recovered_vm_upgrade() -> None:
+    """Journal a recovery outcome whose request was already receipted (C2)."""
+    global _recovered_vm_upgrade, _interrupted_vm_upgrade
+    recovered = _recovered_vm_upgrade
+    interrupted = _interrupted_vm_upgrade
+    _recovered_vm_upgrade = None
+    _interrupted_vm_upgrade = None
+    if interrupted is not None:
+        _broadcast(
+            "workspace_upgrade.failed",
+            {
+                "thread_id": str(_session_identity.thread_id),
+                "target_tier": "vm",
+                "reason": _VM_UPGRADE_INTERRUPTED_REASON,
+                "error_code": UPGRADE_INTERRUPTED,
+                "request_id": interrupted,
+            },
+        )
+    if recovered is None:
+        return
+    complete: Dict[str, Any] = {
+        "thread_id": str(_session_identity.thread_id),
+        "target_tier": "vm",
+        "seeded_files": int(recovered["seeded_files"]),
+        "request_id": recovered["control_request_id"],
+    }
+    if recovered.get("skipped_files"):
+        complete["skipped_files"] = list(recovered["skipped_files"])
+    _broadcast("workspace_upgrade.complete", complete)
+
+
 async def _apply_compact_control(
     request: Any, *, lease_token: Optional[int]
 ) -> Tuple[str, str, Optional[str], Dict[str, Any]]:
@@ -10359,12 +10937,14 @@ async def _handle_config_update(
         embedding_env_keys = (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
+            "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
             # The rerank slot is credential-bearing too; a change must round-
             # trip through the orchestrator for base_url/api_key enrichment.
             # The bound scorer keeps its attach-time transport until re-attach.
             "RERANK_MODEL",
+            "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
         )
@@ -10635,6 +11215,21 @@ async def _handle_config_update(
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}
         if any(k in new_env_block for k in embedding_env_keys):
+            from shared.runtime.core.transport_resolution import (
+                clear_served_model_env,
+            )
+
+            # A served string belongs to the model it came with: drop the old
+            # one of every slot this block touches before applying it.
+            clear_served_model_env(
+                sorted(
+                    {
+                        k.split("_", 1)[0]
+                        for k in embedding_env_keys
+                        if k in new_env_block
+                    }
+                )
+            )
             for k in embedding_env_keys:
                 if k in new_env_block and new_env_block[k] is not None:
                     os.environ[k] = str(new_env_block[k])
@@ -10660,8 +11255,8 @@ async def _handle_config_update(
             await _send_error("Session no longer active")
             return
         pm = (config_override.get("interactive") or {}).get("permission_mode")
-        if pm and pm in ("supervised", "auto_accept", "autonomous"):
-            _session.permission_mode = pm
+        if pm and is_permission_mode(pm):
+            _session.permission_mode = normalize_permission_mode(pm)
         nm = (config_override.get("interactive") or {}).get("narration_mode")
         if nm and nm in ("silent", "verbose", "auto"):
             _session.narration_mode = nm
@@ -11267,9 +11862,32 @@ async def _handle_workspace_upgrade(
     (e.g. an unavailable container-tier template, a tier that isn't higher, an
     unknown name) is surfaced verbatim as the ``workspace_upgrade.failed``
     reason.
+
+    The steps after the orchestrator accepts the request live in
+    ``_run_workspace_upgrade_swap``, which the stateless lane switch's durable
+    consumer (C2) also runs, with the journal as its emitter. One upgrade runs
+    per agent process at a time.
     """
+    global _workspace_upgrade_in_flight
+
+    async def emit(method: str, params: Dict[str, Any]) -> None:
+        await _ws_send(ws, method, params)
+
     if not _session or not _orchestrator_client or not _session_identity.thread_id:
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
+        return
+    if _workspace_upgrade_in_flight:
+        # One upgrade per agent process: the stateless lane switch's durable
+        # upgrade (C2) or another socket's may be running. The typed code
+        # tells the cockpit to leave the running upgrade's progress alone.
+        await _ws_send(
+            ws,
+            "workspace_upgrade.failed",
+            {
+                "reason": WORKSPACE_UPGRADE_ALREADY_RUNNING,
+                "error_code": UPGRADE_ALREADY_RUNNING,
+            },
+        )
         return
 
     if getattr(_session, "protected_cloud_required", None) is not False:
@@ -11315,41 +11933,85 @@ async def _handle_workspace_upgrade(
             },
         )
         return
-    await _ws_send(
-        ws,
-        "workspace_upgrade.started",
-        {"thread_id": _session_identity.thread_id, "target_tier": target_tier},
-    )
-
+    _workspace_upgrade_in_flight = True
     try:
-        # Already serves the requested tier — nothing to upgrade (idempotent).
-        # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
-        # shell-capable but unprivileged), so sandbox→vm falls through to provision
-        # below instead of short-circuiting here (workspace_tier_upgrade.md Q8).
-        if _upgrade_already_satisfied(src_backend, target_tier):
-            await _ws_send(
-                ws,
-                "workspace_upgrade.complete",
-                {
-                    "thread_id": _session_identity.thread_id,
-                    "target_tier": target_tier,
-                    "message": f"Workspace already provides the {target_tier} tier",
-                },
-            )
-            return
-
-        # 1. Request provisioning via orchestrator (S2).
-        ok, detail = await _orchestrator_client.request_thread_workspace_upgrade(
-            _session_identity.thread_id, target_tier=target_tier, template=template
+        await _ws_send(
+            ws,
+            "workspace_upgrade.started",
+            {"thread_id": _session_identity.thread_id, "target_tier": target_tier},
         )
-        if not ok:
-            await _ws_send(
-                ws,
-                "workspace_upgrade.failed",
-                {"reason": detail or "Orchestrator rejected workspace upgrade request"},
+
+        try:
+            # Already serves the requested tier — nothing to upgrade (idempotent).
+            # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
+            # shell-capable but unprivileged), so sandbox→vm falls through to provision
+            # below instead of short-circuiting here (workspace_tier_upgrade.md Q8).
+            if _upgrade_already_satisfied(src_backend, target_tier):
+                await _ws_send(
+                    ws,
+                    "workspace_upgrade.complete",
+                    {
+                        "thread_id": _session_identity.thread_id,
+                        "target_tier": target_tier,
+                        "message": f"Workspace already provides the {target_tier} tier",
+                    },
+                )
+                return
+
+            # 1. Request provisioning via orchestrator (S2).
+            ok, detail = await _orchestrator_client.request_thread_workspace_upgrade(
+                _session_identity.thread_id, target_tier=target_tier, template=template
             )
+            if not ok:
+                await _ws_send(
+                    ws,
+                    "workspace_upgrade.failed",
+                    {
+                        "reason": detail
+                        or "Orchestrator rejected workspace upgrade request"
+                    },
+                )
+                return
+        except Exception as e:
+            logger.exception(
+                f"Workspace upgrade failed for thread {_session_identity.thread_id}"
+            )
+            try:
+                await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
+            finally:
+                if target_tier == "vm" and _orchestrator_client is not None:
+                    await _abort_vm_upgrade(_session_identity.thread_id)
             return
 
+        await _run_workspace_upgrade_swap(
+            emit,
+            target_tier=target_tier,
+            src_backend=src_backend,
+            before_swap=_mark_pending_vm_upgrade_seeded,
+        )
+    finally:
+        _workspace_upgrade_in_flight = False
+
+
+async def _run_workspace_upgrade_swap(
+    emit: UpgradeEmitter,
+    *,
+    target_tier: str,
+    src_backend: Any,
+    before_swap: Optional[Callable[[int], Awaitable[None]]] = None,
+) -> None:
+    """Steps 2-7 of a workspace upgrade, after the orchestrator accepted it.
+
+    Poll readiness, connect, seed from the live lite backend, swap, remount
+    the cloud folders, retool, re-open sudo on a VM, persist the tier, and
+    emit ``.complete``; on a failure emit ``.failed``, then tear a VM down
+    unless the Session already runs on it.
+    The WebSocket verb passes ``_ws_send`` for ``emit`` (frames unchanged);
+    the stateless lane switch's durable consumer passes the journal (C2) and a
+    ``before_swap`` that records the seed marker.
+    """
+    swapped = False
+    try:
         # 2. Poll for readiness, then normalize to a {"backend", "remote"} block.
         #    A vm provisions through metadata.vm (vm_status), which _poll_vm_ready
         #    tolerates through the async provisioning window and bails promptly on
@@ -11361,8 +12023,7 @@ async def _handle_workspace_upgrade(
             async def _emit_vm_progress(elapsed_s: int) -> None:
                 # Heartbeat the cockpit so a multi-minute cold VM import isn't a
                 # silent black box (workspace_tier_upgrade.md Q7).
-                await _ws_send(
-                    ws,
+                await emit(
                     "workspace_upgrade.progress",
                     {
                         "thread_id": _session_identity.thread_id,
@@ -11389,6 +12050,15 @@ async def _handle_workspace_upgrade(
                         "key_path": ssh_key,
                         "workspace_path": "/home/agent-host/workspace",
                     },
+                    **{
+                        key: vm_cfg[key]
+                        for key in (
+                            "workspace_generation",
+                            "workspace_runtime_incarnation",
+                            "workspace_ssh_host_key_fingerprint",
+                        )
+                        if key in vm_cfg
+                    },
                 }
                 if vm_cfg
                 else None
@@ -11406,20 +12076,14 @@ async def _handle_workspace_upgrade(
             # DataVolume + importer pod running with nobody attached. Tear it down
             # so it doesn't leak — the orphan that previously needed a manual
             # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
-            if target_tier == "vm":
-                try:
-                    await _orchestrator_client.abort_thread_vm_upgrade(
-                        _session_identity.thread_id
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"VM abort/teardown after failed upgrade ({_session_identity.thread_id}): {e}"
-                    )
-            await _ws_send(
-                ws,
-                "workspace_upgrade.failed",
-                {"reason": f"{target_tier} workspace did not become ready in time"},
-            )
+            try:
+                await emit(
+                    "workspace_upgrade.failed",
+                    {"reason": f"{target_tier} workspace did not become ready in time"},
+                )
+            finally:
+                if target_tier == "vm":
+                    await _abort_vm_upgrade(_session_identity.thread_id)
             return
 
         # 3. Build a RemoteBackend from the ready connection block. The sandbox
@@ -11514,13 +12178,23 @@ async def _handle_workspace_upgrade(
         ):
             # 5. Seed the new workspace from the live virtual prefix (S3a).
             #    Pure in-process copy (the agent holds the object-store creds).
-            #    Run off the event loop — SFTP writes are blocking.
+            #    Run off the event loop — SFTP writes are blocking. A virtual
+            #    source is read with the upload ceiling, not the live 50 MiB
+            #    one, so every file a user could upload is copied; a file over
+            #    it is skipped with a warning (the old prefix keeps it) and
+            #    named in ``.complete`` instead of failing every upgrade after
+            #    the VM is Ready (C2).
             seeded = 0
+            oversized: list[str] = []
             if src_backend is not None:
-                from agent.core.backends.seed import seed_workspace
+                from agent.core.backends import seed as _seed
 
                 seeded = await asyncio.to_thread(
-                    seed_workspace, src_backend, new_backend
+                    _seed.seed_workspace,
+                    _seed.upgrade_seed_source(src_backend),
+                    new_backend,
+                    max_file_bytes=_seed.VIRTUAL_UPLOAD_MAX_FILE_BYTES,
+                    oversized=oversized,
                 )
                 logger.info(
                     f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
@@ -11528,7 +12202,28 @@ async def _handle_workspace_upgrade(
 
             # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
             #    appear on the next turn (get_current_tools re-reads per turn).
-            _session.swap_backend(new_backend)
+            if before_swap is not None:
+                # C2: record the copy durably before any turn can write to
+                # the new workspace; a failure here tears the VM down below.
+                await before_swap(seeded)
+
+            # The new tier and its identity go with the backend: End picks
+            # its drain by the tier and names this workspace (E4).
+            _session.swap_backend(
+                new_backend,
+                workspace_tier=backend_tier,
+                workspace_generation=(
+                    str(workspace_generation)
+                    if workspace_generation and workspace_runtime_incarnation
+                    else ""
+                ),
+                workspace_runtime_incarnation=(
+                    str(workspace_runtime_incarnation)
+                    if workspace_generation and workspace_runtime_incarnation
+                    else ""
+                ),
+            )
+            swapped = True
 
         # 6a. Re-establish the OpenCloud cloud mount on the NEW backend. The
         #     mount is a per-host rclone process, so it does NOT follow the
@@ -11556,8 +12251,7 @@ async def _handle_workspace_upgrade(
                 await _session._setup_cloud_mount(_fresh_cloud_mount)
                 _mgr = _session.cloud_mount_manager
                 if _mgr is None or not getattr(_mgr, "active", False):
-                    await _ws_send(
-                        ws,
+                    await emit(
                         "workspace_upgrade.cloud_mount_degraded",
                         {
                             "thread_id": _session_identity.thread_id,
@@ -11600,15 +12294,16 @@ async def _handle_workspace_upgrade(
         except Exception as e:
             logger.warning(f"Persisting upgraded tier failed (non-fatal): {e}")
 
-        await _ws_send(
-            ws,
-            "workspace_upgrade.complete",
-            {
-                "thread_id": _session_identity.thread_id,
-                "target_tier": backend_tier,
-                "seeded_files": seeded,
-            },
-        )
+        complete: Dict[str, Any] = {
+            "thread_id": _session_identity.thread_id,
+            "target_tier": backend_tier,
+            "seeded_files": seeded,
+        }
+        if oversized:
+            from agent.core.backends.seed import reported_skipped_files
+
+            complete["skipped_files"] = reported_skipped_files(oversized)
+        await emit("workspace_upgrade.complete", complete)
         logger.info(
             f"Workspace upgrade ({backend_tier}) complete for thread {_session_identity.thread_id}"
         )
@@ -11621,17 +12316,61 @@ async def _handle_workspace_upgrade(
         # once vm_status was already ready) would otherwise leak the running VM —
         # only the poll-timeout path tore it down before. Tear it down here too
         # (idempotent; a no-op if no vm was created) so no failure path leaks a
-        # ready VM (workspace_tier_upgrade.md Q7).
-        if target_tier == "vm" and _orchestrator_client is not None:
-            try:
-                await _orchestrator_client.abort_thread_vm_upgrade(
-                    _session_identity.thread_id
-                )
-            except Exception as ee:
+        # ready VM (workspace_tier_upgrade.md Q7). E4: the failure is told first,
+        # as the abort may retry for minutes; and once swapped, the Session runs
+        # on that VM, so tearing it down would leave the agent on a deleted VM.
+        try:
+            await emit("workspace_upgrade.failed", {"reason": str(e)})
+        finally:
+            if swapped:
                 logger.warning(
-                    f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
+                    f"Upgrade step after the swap failed; keeping the VM the "
+                    f"Session runs on ({_session_identity.thread_id}): {e}"
                 )
-        await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
+            elif target_tier == "vm" and _orchestrator_client is not None:
+                await _abort_vm_upgrade(_session_identity.thread_id)
+
+
+async def _abort_vm_upgrade(thread_id: Optional[str]) -> None:
+    """Tear a failed upgrade's VM down, asking again while it isn't done (E4).
+
+    One abort runs at a time, as its own tracked task: End waits for it
+    before it begins (``vm_upgrade_abort`` port), and a cancelled upgrade
+    leaves it running. Never raises: a failed teardown is logged, and what is
+    left is crash recovery's.
+    """
+    global _vm_upgrade_abort
+    task = _vm_upgrade_abort
+    if task is None or task.done():
+        task = _session_termination.track_session_side_task(
+            asyncio.create_task(_retry_vm_upgrade_abort(str(thread_id)))
+        )
+        _vm_upgrade_abort = task
+    try:
+        await asyncio.shield(task)
+    except Exception as e:
+        logger.warning(f"VM teardown after upgrade failure ({thread_id}): {e}")
+
+
+async def _retry_vm_upgrade_abort(thread_id: str) -> None:
+    deadline = time.monotonic() + _VM_UPGRADE_ABORT_WINDOW_S
+    attempt = 0
+    while True:
+        try:
+            await _orchestrator_client.abort_thread_vm_upgrade(thread_id)
+            return
+        except VmUpgradeAbortPending as e:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"VM upgrade abort still pending after "
+                    f"{_VM_UPGRADE_ABORT_WINDOW_S:.0f}s ({thread_id}): {e}"
+                )
+                return
+        delay = _VM_UPGRADE_ABORT_RETRY_DELAYS[
+            min(attempt, len(_VM_UPGRADE_ABORT_RETRY_DELAYS) - 1)
+        ]
+        attempt += 1
+        await asyncio.sleep(delay)
 
 
 async def _poll_vm_ready(
@@ -11678,9 +12417,21 @@ async def _poll_vm_ready(
                 deadline = max(deadline, start + timeout + preparation_budget)
             vm_status = ws.get("vm_status")
             if vm_status == "ready" and ws.get("vm_ssh_host"):
+                # A pinned owner's ready payload also attests the VM (provision
+                # generation, launcher Pod UID, host key); its End must name
+                # that VM, as a Session created on it does.
                 return {
                     "ssh_host": ws["vm_ssh_host"],
                     "ssh_port": ws.get("vm_ssh_port", 22),
+                    **{
+                        key: ws[key]
+                        for key in (
+                            "workspace_generation",
+                            "workspace_runtime_incarnation",
+                            "workspace_ssh_host_key_fingerprint",
+                        )
+                        if ws.get(key)
+                    },
                 }
             if vm_status == "failed":
                 logger.warning(f"VM provisioning failed for thread {thread_id}")

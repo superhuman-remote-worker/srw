@@ -9,6 +9,7 @@ import type {
 } from '../models/api.model';
 import {allowedEnumOptions} from '../../views/agent-settings/capability-gates';
 import {environment} from '../environment';
+import {PERMISSION_MODES} from '../models/permission-mode';
 
 /** `CapabilitiesService.sshGateway()`'s shape when the deployment has a
  * gateway configured — `hostname` plus its public host keys for client-side
@@ -18,9 +19,6 @@ export interface SshGatewayInfo {
   host_keys: SshHostKeyEntry[];
 }
 
-/** Permission modes, lowest→highest autonomy (mirrors the backend
- * `_PERMISSION_ORDER` in src/core/capability_grants.py). */
-export const PERMISSION_MODES = ['supervised', 'auto_accept', 'autonomous'];
 
 /**
  * The caller's resolved capability grants, fetched once and shared. Drives
@@ -120,7 +118,7 @@ export class CapabilitiesService {
 
   /** permission_mode options at/below the user's ceiling (admin/loading ⇒ all). */
   readonly permissionModes = computed(() =>
-    allowedEnumOptions(this.grants() ?? null, 'permission_mode', PERMISSION_MODES, this.catalog()),
+    allowedEnumOptions(this.grants() ?? null, 'permission_mode', [...PERMISSION_MODES], this.catalog()),
   );
 
   /** True if `mode` is selectable for this user. */

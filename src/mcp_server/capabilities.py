@@ -170,7 +170,7 @@ _READ_CAPABILITIES = (
     _read("get_job_stats", "GET /api/stats/jobs"),
     _read("get_agent_stats", "GET /api/stats/agents", authorization=_ADMIN_AUTH),
     _read("get_stuck_jobs", "GET /api/stats/stuck"),
-    _read("list_agents", "GET /api/agents", authorization=_ADMIN_AUTH),
+    _read("list_agents", "GET /api/admin/agents", authorization=_ADMIN_AUTH),
     _read("list_experts", "GET /api/experts"),
     _read("get_expert", "GET /api/experts/{expert_id}"),
     _read("list_skills", "GET /api/skills"),
@@ -200,7 +200,7 @@ _READ_CAPABILITIES = (
     _read("get_memory_stats", "GET /api/jobs/{job_id}/memory/stats"),
     _read(
         "get_agent_system_info",
-        "GET /api/agents/{agent_id}/system-info",
+        "GET /api/admin/agents/{agent_id}/system-info",
         authorization=_ADMIN_AUTH,
     ),
     _read("get_daily_stats", "GET /api/stats/daily"),
@@ -321,7 +321,7 @@ _MUTATION_CAPABILITIES = (
     ),
     _mutation(
         "deregister_agent",
-        "DELETE /api/agents/{agent_id}",
+        "DELETE /api/admin/agents/{agent_id}",
         "removes an agent fleet registration",
         authorization=_ADMIN_AUTH,
         destructive=True,
@@ -566,7 +566,7 @@ WORKFLOW_DECISIONS: tuple[WorkflowDecision, ...] = (
         "persistent thread approval REST operations",
         "required",
         _OWNER_AUTH,
-        "supervised sessions need a capability-scoped decision path",
+        "gated sessions need a capability-scoped decision path",
     ),
     WorkflowDecision(
         "persistent configuration and tool-group mutation",

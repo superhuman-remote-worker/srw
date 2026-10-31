@@ -51,6 +51,15 @@ mkdir -p /home/agent-host/workspace
 chown agent-host:agent-host /home/agent-host/workspace
 
 # ---------------------------------------------------------------------------
+# 1c. Link the image's Playwright browsers into ~/.cache/ms-playwright, where
+#     the agent's Playwright looks for them. On every start, because the volume
+#     outlives image upgrades. Runs as agent-host: the home is the agent's.
+#     Best-effort: without the links Playwright downloads its own copy.
+# ---------------------------------------------------------------------------
+su -s /bin/sh agent-host -c /usr/local/bin/link-playwright-browsers \
+    || echo "Playwright browser links not created (non-fatal)" >&2
+
+# ---------------------------------------------------------------------------
 # 2. Install SSH public key (outside home dir)
 #    Key is mounted from a K8s secret at /tmp/ssh-pubkey/. Written to
 #    /etc/ssh/authorized_keys/agent-host which sshd finds via the

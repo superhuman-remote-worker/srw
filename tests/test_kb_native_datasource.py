@@ -1230,8 +1230,8 @@ class TestKnowledgeRepoIsNotCloned:
                     },
                     {
                         "role": "source",
-                        "name": "kurort-engine",
-                        "repo_url": "http://gitea/srw/kurort.git",
+                        "name": "widget-shop",
+                        "repo_url": "http://gitea/srw/widget-shop.git",
                     },
                 ],
             ),
@@ -1250,6 +1250,6 @@ class TestKnowledgeRepoIsNotCloned:
 
         self._workspace(tmp_path)._clone_auxiliary_repos()
 
-        assert cloned == ["kurort-engine"]
+        assert cloned == ["widget-shop"]
         assert f"project-{ID8}-knowledge" not in cloned
         assert not (tmp_path / "repos" / f"project-{ID8}-knowledge").exists()

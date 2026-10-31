@@ -17,9 +17,8 @@ awaited (production fire-and-forgets the turn_end task) — same writer
 effects, deterministic completion.
 
 verbatim mode skips the extraction LLM entirely: each user-assistant
-round is stored directly with remaining_turns=0, so nothing is ever
-TTL-pinned and question-time retrieval is pure hybrid search over a flat
-round-granularity index (the cheap smoke arm + published-baseline arm).
+round is stored directly, so question-time retrieval is pure hybrid
+search over a flat round-granularity index (the cheap smoke arm + published-baseline arm).
 
 Scoping: one question = one project (cross-session sharing), one
 haystack session = one job — each memory row's job_id IS its source
@@ -34,7 +33,12 @@ from typing import Any, Callable, List, Optional
 
 from eval.memory.arms import ArmSpec
 from eval.memory.datasets import LMEQuestion, LMESession
-from eval.memory.infra import build_manager, make_recall_store, project_uuid, session_uuid
+from eval.memory.infra import (
+    build_manager,
+    make_recall_store,
+    project_uuid,
+    session_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +227,6 @@ async def _replay_session_seam(
 
     from agent.services.memory import AssembleRequest, CaptureEvent
 
-    model = getattr(handles.config.llm, "model", None)
     messages: List[Any] = []
     turn_count = 0
     prefix = _first_user_prefix(session, arm)
@@ -234,10 +237,7 @@ async def _replay_session_seam(
 
         if arm.ingestion.read_path_per_turn:
             payload = await manager.assemble(
-                AssembleRequest(
-                    query_text=_form_query_text(handles, messages),
-                    model=model,
-                )
+                AssembleRequest(query_text=_form_query_text(handles, messages))
             )
             result.assembles += 1
             result.errors.extend(payload.stats.errors)
@@ -271,7 +271,6 @@ async def _replay_session_verbatim(
             source="observer",
             source_turn_start=i,
             source_turn_end=i + 1,
-            remaining_turns=0,
         )
         result.turns += 1
 

@@ -37,6 +37,8 @@ from urllib3.exceptions import (
     ReadTimeoutError,
 )
 from shared.container_recovery import ContainerRecoveryCleanup
+from shared.kubernetes_quantities import normalize_byte_quantity
+from shared.workspace_disk import WorkspaceVolumeGrowth, format_bytes
 from shared.workspace_recovery import WorkspaceRecoveryCode
 from shared.tls_trust import TrustCaSource
 
@@ -102,6 +104,7 @@ from orchestrator.services.sandbox_workspace_settings import (
     SandboxPodProfile,
     SandboxSettings,
     classify_image_pull,
+    definite_admission_refusal_status,
     image_repository,
     pod_admission_rejection,
     resolve_sandbox_settings,
@@ -607,8 +610,33 @@ def _pod_has_exact_process_zero(pod: Any) -> bool:
     )
 
 
-def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
-    """A scheduled Never Pod ran its workspace container and then stopped."""
+@dataclass(frozen=True, slots=True)
+class _WorkspaceContainerExit:
+    """Exact proof that a scheduled ``restartPolicy: Never`` Pod's workspace
+    container ran and stopped before its first Ready.
+
+    ``reason`` is the container's termination reason, or ``Evicted`` when the
+    Pod itself reports eviction.
+    """
+
+    exit_code: int
+    reason: str
+
+    @property
+    def stopped_by_cluster(self) -> bool:
+        return self.reason in WorkspaceContainerExitedError.INFRASTRUCTURE_REASONS
+
+
+def _workspace_container_exit_before_first_ready(
+    pod: Any,
+) -> _WorkspaceContainerExit | None:
+    """The one exit classifier: the flag-off error and the flag-on observer.
+
+    It requires phase Failed/Succeeded, ``restartPolicy: Never``, a node, every
+    container terminated, no ``Ready=True`` condition, and exactly one
+    terminated ``workspace`` container with an integer exit code,
+    ``restartCount`` 0 and a container ID (the runtime really started it).
+    """
 
     spec = getattr(pod, "spec", None)
     status = getattr(pod, "status", None)
@@ -623,38 +651,58 @@ def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
             for condition in (getattr(status, "conditions", None) or ())
         )
     ):
-        return False
+        return None
     workspaces = [
         item
         for item in (getattr(status, "container_statuses", None) or ())
         if getattr(item, "name", None) == "workspace"
     ]
     if len(workspaces) != 1:
-        return False
+        return None
     workspace = workspaces[0]
     terminated = getattr(getattr(workspace, "state", None), "terminated", None)
-    return bool(
-        terminated is not None
-        and type(getattr(terminated, "exit_code", None)) is int
-        and getattr(workspace, "restart_count", None) == 0
-        and getattr(workspace, "container_id", None)
-    )
+    exit_code = getattr(terminated, "exit_code", None)
+    if (
+        terminated is None
+        or type(exit_code) is not int
+        or getattr(workspace, "restart_count", None) != 0
+        or not getattr(workspace, "container_id", None)
+    ):
+        return None
+    reason = str(getattr(terminated, "reason", None) or "").strip()
+    if getattr(status, "reason", None) == "Evicted":
+        # Eviction is reported on the Pod, not on its terminated container.
+        reason = "Evicted"
+    return _WorkspaceContainerExit(exit_code, reason)
+
+
+def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
+    """A scheduled Never Pod ran its workspace container and then stopped."""
+
+    return _workspace_container_exit_before_first_ready(pod) is not None
 
 
 def _workspace_container_exited_error(pod: Any) -> WorkspaceContainerExitedError:
     """Describe the exit that ``_pod_is_terminal_before_first_ready`` proved."""
 
-    (workspace,) = [
-        item
-        for item in (getattr(pod.status, "container_statuses", None) or ())
-        if getattr(item, "name", None) == "workspace"
-    ]
-    terminated = workspace.state.terminated
-    reason = getattr(terminated, "reason", None)
-    if getattr(pod.status, "reason", None) == "Evicted":
-        # Eviction is reported on the Pod, not on its terminated container.
-        reason = "Evicted"
-    return WorkspaceContainerExitedError(terminated.exit_code, reason)
+    exited = _workspace_container_exit_before_first_ready(pod)
+    if exited is None:
+        raise ValueError("the workspace container exit is not proven")
+    return WorkspaceContainerExitedError(exited.exit_code, exited.reason)
+
+
+def _image_exit_code_before_first_ready(pod: Any) -> int | None:
+    """The exit code when the image's own process stopped before Ready.
+
+    ``None`` without exact proof, or when the cluster stopped the container
+    (``WorkspaceContainerExitedError.INFRASTRUCTURE_REASONS``): that keeps the
+    readiness-deadline path, whose copy names a cluster stop.
+    """
+
+    exited = _workspace_container_exit_before_first_ready(pod)
+    if exited is None or exited.stopped_by_cluster:
+        return None
+    return exited.exit_code
 
 
 def _container_never_started(container: Any) -> bool:
@@ -737,6 +785,12 @@ def _pvc_name_for(owner: WorkspaceOwner) -> str:
     return f"{prefix}-{owner.id[:12]}"
 
 
+# A workspace PVC grown because its disk was full records the size it had. A
+# retried completion effect recognizes its own growth by this annotation.
+_PVC_GROWN_FROM_ANNOTATION = "srw.io/workspace-disk-grown-from"
+_PVC_GROW_POLL_SECONDS = 2.0
+
+
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
@@ -793,6 +847,15 @@ class ContainerProvisioner:
         # terminal. See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
         self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
         self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
+        # A job whose volume fills grows it once, to this size, and resumes
+        # (empty or 0 turns growth off). The online resize is awaited inside
+        # the completion effect, so the wait stays well under its 90 s lease.
+        self._pvc_grow_size: str = os.environ.get(
+            "WORKSPACE_PVC_GROW_SIZE", "20Gi"
+        ).strip()
+        self._pvc_grow_wait_seconds: float = float(
+            os.environ.get("WORKSPACE_PVC_GROW_WAIT_SECONDS", "40")
+        )
         # Single-replica node-loss fallback (Phase 3b). A REATTACH gets this
         # longer ready-wait so a transient node reboot (the replica's node coming
         # back) recovers without discarding data; past it, a still-wedged reattach
@@ -2443,8 +2506,22 @@ class ContainerProvisioner:
         reservation.update(row)
         return True
 
-    async def _workspace_cleanup_automatic_admission_is_safe(self) -> bool:
-        """Require both the rollout flag and a clean server-owned inventory."""
+    async def _workspace_cleanup_automatic_admission_is_safe(
+        self,
+        owner: WorkspaceOwner | None = None,
+        *,
+        scope: Literal["workspace_container", "ide"] = "workspace_container",
+    ) -> bool:
+        """Require the rollout flag and exact creation authority.
+
+        A clean server-owned inventory admits every owner. Otherwise an owner
+        is admitted only when no issued creation effect is ambiguous anywhere
+        and its own runtime carries a settled creation reservation. A legacy
+        unannotated runtime therefore blocks automatic cleanup of itself, not of
+        every annotated workspace; its explicit lifecycle owner settles it.
+        Owner-less callers and a database without the per-owner query keep the
+        all-or-nothing inventory.
+        """
 
         if not self._workspace_cleanup_reconciliation_enabled or self._db is None:
             return False
@@ -2456,7 +2533,30 @@ class ContainerProvisioner:
         if not callable(inventory):
             return False
         observed = await inventory(self._db)
-        return bool(isinstance(observed, dict) and observed.get("safe") is True)
+        if not isinstance(observed, dict):
+            return False
+        if observed.get("safe") is True:
+            return True
+        unannotated = getattr(
+            type(self._db),
+            "managed_repository_workspace_runtime_is_unannotated",
+            None,
+        )
+        if (
+            owner is None
+            or not callable(unannotated)
+            or observed.get("ambiguous_effect_count") != 0
+        ):
+            return False
+        return (
+            await unannotated(
+                self._db,
+                owner.id,
+                owner_kind=("thread" if owner.kind == "session" else "job"),
+                scope=scope,
+            )
+            is False
+        )
 
     @asynccontextmanager
     async def _workspace_creation_effect(
@@ -3844,6 +3944,7 @@ class ContainerProvisioner:
                 e,
                 strict_stateless=strict_stateless,
             )
+            await self._record_refused_pod_create(owner, _creation_reservation, e)
             # Once the durable reservation crosses its external-effect edge,
             # every response is potentially ambiguous.  Do not perform
             # name-based rollback or publish a failure projection here; the
@@ -4273,6 +4374,7 @@ class ContainerProvisioner:
                 e,
                 strict_stateless=strict_stateless,
             )
+            await self._record_refused_pod_create(owner, _creation_reservation, e)
             # Once the durable reservation crosses its external-effect edge,
             # every response is potentially ambiguous.  Do not perform
             # name-based rollback or publish a failure projection here; the
@@ -7259,6 +7361,178 @@ class ContainerProvisioner:
 
         return str(seed_name)
 
+    async def grow_job_workspace_volume(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> WorkspaceVolumeGrowth:
+        """Grow the exact runtime's full workspace PVC to the growth size.
+
+        The Pod must still carry the reported runtime UID, so a replacement's
+        volume is never touched; its storage plan names the claim. The JSON
+        Patch tests the claim's UID, resourceVersion and current request, and
+        records the old size in an annotation. The wait for the filesystem to
+        show the new size is bounded: Longhorn grows a mounted volume online.
+        A claim already at or above the size is left alone, unless that
+        annotation says this growth put it there (a retried effect).
+        knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
+        """
+        if self._pvc_grow_size in {"", "0"}:
+            return WorkspaceVolumeGrowth("unsupported", detail="volume growth is off")
+        try:
+            target = normalize_byte_quantity(
+                self._pvc_grow_size, resource="storage"
+            ).normalized_value
+        except ValueError:
+            return WorkspaceVolumeGrowth(
+                "unsupported", detail="WORKSPACE_PVC_GROW_SIZE is invalid"
+            )
+
+        async def read_claim(name: str) -> Any:
+            return await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=self._namespace,
+            )
+
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+            observed_uid = str(getattr(pod.metadata, "uid", "") or "").lower()
+            if observed_uid != expected_runtime_incarnation.lower():
+                return WorkspaceVolumeGrowth(
+                    "unsupported", target, "the workspace Pod was replaced"
+                )
+            pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+            if pvc_name is None:
+                return WorkspaceVolumeGrowth(
+                    "unsupported", target, "the workspace has no volume to grow"
+                )
+            claim = await read_claim(pvc_name)
+            self._require_stateless_pvc_identity(
+                claim, owner=owner, pvc_name=pvc_name, allow_any_storage_class=True
+            )
+            requested_text = str(
+                (getattr(claim.spec.resources, "requests", None) or {}).get(
+                    "storage", ""
+                )
+            )
+            requested = normalize_byte_quantity(
+                requested_text, resource="storage"
+            ).normalized_value
+        except WorkspaceRuntimeAuthorityError as exc:
+            return WorkspaceVolumeGrowth("unsupported", target, str(exc))
+        except ValueError:
+            return WorkspaceVolumeGrowth(
+                "unsupported", target, "the volume's size is unreadable"
+            )
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status is None:
+                raise
+            return WorkspaceVolumeGrowth(
+                "refused", target, f"reading the workspace failed (HTTP {status})"
+            )
+
+        annotations = dict(getattr(claim.metadata, "annotations", None) or {})
+        if requested < target:
+            annotation = {_PVC_GROWN_FROM_ANNOTATION: requested_text}
+            patch: list[dict[str, Any]] = [
+                {"op": "test", "path": "/metadata/uid", "value": claim.metadata.uid},
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": claim.metadata.resource_version,
+                },
+                {
+                    "op": "test",
+                    "path": "/spec/resources/requests/storage",
+                    "value": requested_text,
+                },
+                (
+                    {
+                        "op": "add",
+                        "path": "/metadata/annotations/"
+                        + _PVC_GROWN_FROM_ANNOTATION.replace("/", "~1"),
+                        "value": requested_text,
+                    }
+                    if annotations
+                    else {
+                        "op": "add",
+                        "path": "/metadata/annotations",
+                        "value": annotation,
+                    }
+                ),
+                {
+                    "op": "replace",
+                    "path": "/spec/resources/requests/storage",
+                    "value": self._pvc_grow_size,
+                },
+            ]
+            try:
+                await self._bounded_kubernetes_mutation(
+                    self._core_api.patch_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                    body=patch,
+                )
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                if status is None:
+                    raise
+                reason = str(getattr(exc, "reason", "") or "")[:80]
+                return WorkspaceVolumeGrowth(
+                    "refused",
+                    target,
+                    f"the cluster refused it (HTTP {status}"
+                    + (f" {reason}" if reason else "")
+                    + ")",
+                )
+            logger.warning(
+                "Workspace volume %s of %s %s was full: growing it from %s to %s",
+                pvc_name,
+                owner.kind,
+                owner.id,
+                requested_text,
+                self._pvc_grow_size,
+            )
+        elif _PVC_GROWN_FROM_ANNOTATION not in annotations:
+            return WorkspaceVolumeGrowth(
+                "unsupported",
+                target,
+                f"the volume already requests {format_bytes(requested)}",
+            )
+
+        deadline = asyncio.get_running_loop().time() + self._pvc_grow_wait_seconds
+        while True:
+            try:
+                claim = await read_claim(pvc_name)
+                capacity_text = (getattr(claim.status, "capacity", None) or {}).get(
+                    "storage"
+                )
+                capacity = (
+                    normalize_byte_quantity(
+                        capacity_text, resource="storage"
+                    ).normalized_value
+                    if capacity_text
+                    else 0
+                )
+            except Exception as exc:
+                if getattr(exc, "status", None) is None and not isinstance(
+                    exc, ValueError
+                ):
+                    raise
+                capacity = 0
+            if capacity >= target:
+                return WorkspaceVolumeGrowth("resized", target)
+            if asyncio.get_running_loop().time() >= deadline:
+                return WorkspaceVolumeGrowth("pending", target)
+            await asyncio.sleep(_PVC_GROW_POLL_SECONDS)
+
     def _workspace_pvc_name_from_pod(
         self,
         pod: Any,
@@ -7551,7 +7825,7 @@ class ContainerProvisioner:
         automatic_admission_enabled = False
         if admission_source == "automatic":
             automatic_admission_enabled = (
-                await self._workspace_cleanup_automatic_admission_is_safe()
+                await self._workspace_cleanup_automatic_admission_is_safe(owner)
             )
             if not automatic_admission_enabled:
                 return None
@@ -7873,6 +8147,181 @@ class ContainerProvisioner:
                     )
                 },
             }
+
+    async def capture_unpublished_stateless_creation_retirement(
+        self,
+        owner: WorkspaceOwner,
+    ) -> dict[str, Any] | None:
+        """Observe a creation the cluster refused before any Pod existed.
+
+        The ledger must show no runtime or Pod UID, a Pod effect never
+        observed and no create that can still land; the Pod name must read
+        404. Any Pod refuses. Release the physical mutation guard before
+        Begin: its terminal trigger acquires that same domain.
+        """
+        if owner.kind != "session" or self._db is None or not self._k8s_available:
+            return None
+        candidate = getattr(
+            type(self._db), "get_stateless_unpublished_creation_candidate", None
+        )
+        if not callable(candidate):
+            return None
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return None
+            unpublished = await candidate(self._db, owner.id, namespace=self._namespace)
+            if unpublished is None:
+                return None
+            try:
+                await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return None
+            else:
+                return None
+            if (
+                await candidate(self._db, owner.id, namespace=self._namespace)
+                != unpublished
+            ):
+                return None
+            return unpublished
+
+    async def reclaim_unpublished_creation_storage(
+        self,
+        owner: WorkspaceOwner,
+        unpublished: dict[str, Any],
+    ) -> bool:
+        """Remove the storage a soft End kept for a refused creation.
+
+        Permanent End after soft End: the aborted reservation still names the
+        exact PVC and Service it created. With no Pod by name, delete each by
+        UID, then record the reclaim on that reservation. Anything else that
+        answers to these names refuses, and the call stays retryable.
+        """
+        if owner.kind != "session" or self._db is None or not self._k8s_available:
+            return False
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return False
+            storage = await self._db.get_stateless_unpublished_creation_storage(
+                owner.id
+            )
+            if (
+                storage is None
+                or storage["unpublished_creation"] != unpublished
+                or unpublished["namespace"] != self._namespace
+            ):
+                return False
+            if storage["resource_policy"] == "terminal_reclaim":
+                return True
+            reservation_id = unpublished["reservation_id"]
+            try:
+                await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+            else:
+                return False
+            seed_name = self._seed_configmap_name(owner.pod_name)
+            try:
+                seed = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+                seed = None
+            if seed is not None:
+                try:
+                    seed_uid = self._require_stateless_seed_configmap_identity(
+                        seed,
+                        owner=owner,
+                        pod_name=owner.pod_name,
+                        creation_reservation_id=reservation_id,
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    return False
+                if storage["seed_configmap_uid"] not in {None, seed_uid}:
+                    return False
+                if not await self._delete_seed_configmap(
+                    owner.pod_name,
+                    expected_owner=owner,
+                    expected_creation_reservation_id=reservation_id,
+                    expected_configmap_uid=seed_uid,
+                ):
+                    return False
+            pvc_name = _pvc_name_for(owner)
+            try:
+                pvc = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+                pvc = None
+            if pvc is not None:
+                try:
+                    pvc_uid = self._require_stateless_pvc_identity(
+                        pvc,
+                        owner=owner,
+                        pvc_name=pvc_name,
+                        allow_any_storage_class=True,
+                    )
+                    self._require_workspace_creation_reservation_annotation(
+                        pvc, reservation_id=reservation_id
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    return False
+                if storage["pvc_uid"] not in {None, pvc_uid}:
+                    return False
+                outcome = await self._delete_pvc_outcome(
+                    pvc_name, expected_owner=owner, expected_uid=pvc_uid
+                )
+                if not outcome.captured_absent:
+                    return False
+            try:
+                service = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_service,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as error:
+                if getattr(error, "status", None) != 404:
+                    return False
+                service = None
+            if service is not None:
+                try:
+                    service_uid = self._require_stateless_service_identity(
+                        service, owner=owner
+                    )
+                except WorkspaceRuntimeAuthorityError:
+                    return False
+                if storage["service_uid"] not in {None, service_uid}:
+                    return False
+                outcome = await self._delete_service_outcome(
+                    owner, require_exact_owner=True, expected_uid=service_uid
+                )
+                if not outcome.captured_absent:
+                    return False
+            return await self._db.record_unpublished_creation_storage_reclaimed(
+                owner.id, unpublished=unpublished
+            )
 
     async def capture_retained_stateless_startup_attention_retirement(
         self, owner: WorkspaceOwner
@@ -8714,7 +9163,9 @@ class ContainerProvisioner:
         automatic_admission_enabled = False
         if not isinstance(existing, dict) and admission_source == "automatic":
             automatic_admission_enabled = (
-                await self._workspace_cleanup_automatic_admission_is_safe()
+                await self._workspace_cleanup_automatic_admission_is_safe(
+                    owner, scope="ide"
+                )
             )
             if not automatic_admission_enabled:
                 return None
@@ -9427,9 +9878,19 @@ class ContainerProvisioner:
             if not isinstance(reservation, dict):
                 counts["retryable"] += 1
                 continue
-            outcome = await self._reconcile_claimed_workspace_creation_reservation(
-                reservation
-            )
+            try:
+                outcome = await self._reconcile_claimed_workspace_creation_reservation(
+                    reservation
+                )
+            except Exception:
+                # Its claim lapses and a later sweep retries it. Raising here
+                # would also skip every other generation and all cleanup
+                # intents behind them.
+                logger.exception(
+                    "Workspace creation reconciliation failed for reservation %s",
+                    observed.get("id"),
+                )
+                outcome = "retryable"
             counts[outcome] += 1
         return counts
 
@@ -17347,6 +17808,21 @@ class ContainerProvisioner:
                 return None
 
         if (
+            owner.kind == "job"
+            and current.get("startup_first_ready_at") is None
+            and current.get("scheduled_at") is not None
+        ):
+            # Positive physical evidence, like an invalid image: this exact
+            # restartPolicy Never Pod's own process stopped before its first
+            # Ready, so it can never become Ready. A cluster stop keeps the
+            # deadline path, and so do Sessions (Jobs only, owner decision
+            # 2026-10-06).
+            exit_code = _image_exit_code_before_first_ready(pod)
+            if exit_code is not None:
+                await record(StartupAttention("container_exited", exit_code=exit_code))
+                return None
+
+        if (
             ready_condition is not None
             and getattr(ready_condition, "status", None) == "True"
         ):
@@ -18280,6 +18756,42 @@ class ContainerProvisioner:
             return
         if current:
             await self._set_context(owner, {"error": message})
+
+    async def _record_refused_pod_create(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        exc: BaseException,
+    ) -> None:
+        """End the wait for a late Pod create once the cluster refused it.
+
+        A 403/422 Status answer means the create stored nothing, so cleanup
+        need not wait out the ambiguity window. Best effort: it runs inside
+        the creation's failure handler, so it never raises there.
+        """
+        status = definite_admission_refusal_status(exc)
+        record = getattr(
+            type(self._db), "record_refused_workspace_creation_pod_effect", None
+        )
+        if status is None or not callable(record):
+            return
+        try:
+            await record(
+                self._db,
+                owner.id,
+                owner_kind=("thread" if owner.kind == "session" else "job"),
+                scope="workspace_container",
+                reservation_generation=int(reservation["reservation_generation"]),
+                claimant=str(reservation["claimed_by"]),
+                claim_token=int(reservation["claim_token"]),
+                refused_status=status,
+            )
+        except Exception:
+            logger.exception(
+                "Could not record the refused workspace Pod for %s %s",
+                owner.kind,
+                owner.id,
+            )
 
     async def _settle_failed_job_creation(
         self,

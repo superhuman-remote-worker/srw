@@ -41,6 +41,8 @@ from orchestrator.services import (
     session_tool_view as session_tool_view_operations,
     stateless_input_admission as stateless_input_operations,
     stateless_workspace_scheduler,
+    stateless_workspace_upgrade as stateless_workspace_upgrade_service,
+    thread_admission as thread_admission_service,
     workspace_suspension,
 )
 from shared.runtime.core import model_registry
@@ -84,6 +86,42 @@ def session_tool_view_dependencies(
         srw_image=functools.partial(
             manifest_experts.trusted_srw_image, resources.postgres_db
         ),
+        cloud_folders_need_a_container=bound(
+            thread_admission_service.cloud_folders_need_a_container,
+            sessions_composition.thread_admission_dependencies,
+            resources,
+        ),
+        cloud_folders_can_take_a_container=bound(
+            thread_admission_service.cloud_folders_can_take_a_container,
+            sessions_composition.thread_admission_dependencies,
+            resources,
+        ),
+    )
+
+
+def stateless_workspace_upgrade_dependencies(
+    resources: ApplicationResources,
+) -> stateless_workspace_upgrade_service.StatelessWorkspaceUpgradeDependencies:
+    config = sessions_composition.thread_config_update_dependencies(resources)
+    return stateless_workspace_upgrade_service.StatelessWorkspaceUpgradeDependencies(
+        container_provisioner=config.container_provisioner,
+        enforce_workspace_upgrade_grants=config.enforce_workspace_upgrade_grants,
+        schedule_stateless_workspace_ensure=bound(
+            stateless_workspace_scheduler.schedule_stateless_workspace_ensure,
+            preparation_composition.stateless_workspace_schedule_dependencies,
+            resources,
+        ),
+        vm_provisioner=config.vm_provisioner,
+        session_grant_violations=bound(
+            session_config_resolution.session_grant_violations,
+            preparation_composition.session_config_dependencies,
+            resources,
+        ),
+        session_endpoint_violations=bound(
+            session_config_resolution.session_endpoint_violations,
+            preparation_composition.session_config_dependencies,
+            resources,
+        ),
     )
 
 
@@ -110,6 +148,7 @@ def thread_session_dependencies(
             resources,
         ),
         tool_view=session_tool_view_dependencies(resources),
+        workspace_upgrade=stateless_workspace_upgrade_dependencies(resources),
     )
 
 

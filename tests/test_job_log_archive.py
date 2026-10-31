@@ -63,11 +63,15 @@ class TestScopeArchivedLines:
         assert len(lines) == 2
         assert all(JOB_ID in line for line in lines)
 
-    def test_returns_whole_log_when_nothing_matches(self):
-        # Text-format (or pre-Slice-0) pod log: no line carries the uuid —
-        # return it whole rather than hide it.
-        text = "plain line one\nplain line two"
-        assert _scope_archived_lines(text, JOB_ID) == text.splitlines()
+    def test_fails_closed_when_nothing_matches(self):
+        # Text-format (or pre-Slice-0) pod log: no line carries the uuid. A
+        # pooled pod's untagged log is other jobs' output, so serve nothing
+        # rather than all of it (N32).
+        text = f"plain line one\nplain line two\n{OTHER_ID} other job"
+        assert _scope_archived_lines(text, JOB_ID) == []
+
+    def test_an_empty_token_matches_nothing(self):
+        assert _scope_archived_lines("any line\nanother", "") == []
 
 
 class TestFilterLogLines:

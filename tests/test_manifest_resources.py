@@ -67,6 +67,11 @@ class ResourceDB(PostgresDB):
             )
             return dict(row)
 
+    async def user_can_run_custom_harness_images(self, user, project_id):
+        # Grant resolution has its own full-schema coverage; this fixture's
+        # schema has no capability_grants table.
+        return True
+
     async def get_project(self, project_id):
         try:
             return await self.fetchrow(
@@ -171,6 +176,10 @@ async def actor(database):
     return user
 
 
+WORKER_IMAGE = "example/worker@sha256:" + "c" * 64
+APPROVED_WORKER = [{"name": "worker", "image": WORKER_IMAGE}]
+
+
 def expert(name="worker", **runtime):
     return {
         "apiVersion": "srw/v1alpha1",
@@ -178,7 +187,7 @@ def expert(name="worker", **runtime):
         "metadata": {"name": name},
         "spec": {
             "runtime": {
-                "image": "example/worker:v1",
+                "image": WORKER_IMAGE,
                 "config": {"a": None, "tools": ["unknown"]},
                 **runtime,
             }
@@ -275,7 +284,7 @@ async def test_reviewed_dependency_changes_and_pinned_revisions(database, actor)
     runtime = resolved["resolved"][0]["spec"]["execution"]["expert"]["inline"][
         "runtime"
     ]
-    assert runtime["image"] == "example/worker:v1"
+    assert runtime["image"] == WORKER_IMAGE
     assert (
         await database.fetchval("SELECT count(*) FROM srw_resources WHERE kind='Job'")
         == 0
@@ -330,7 +339,7 @@ async def test_project_activation_is_atomic_and_defaults_use_pinned_content(
         preview["resolved"][0]["spec"]["execution"]["expert"]["inline"]["runtime"][
             "image"
         ]
-        == "example/worker:v1"
+        == WORKER_IMAGE
     )
     changed = deepcopy(project)
     changed["spec"]["resources"]["experts"]["worker"]["inline"]["runtime"]["image"] = (
@@ -456,6 +465,7 @@ async def admit_generic_project_job(database, actor, monkeypatch, project_id):
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -719,6 +729,7 @@ async def native_execution(database, actor, *, max_attempts=1, mode="ProcessExit
         runtime=process,
         namespace="test",
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -1049,6 +1060,7 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
         runtime=process,
         namespace="test",
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
@@ -1124,7 +1136,13 @@ class WorkspaceProcessRuntime(ProcessRuntime):
 
 
 async def native_workspace_execution(
-    database, actor, *, retention="Retain", mode="ProcessExit", attempts=2
+    database,
+    actor,
+    *,
+    retention="Retain",
+    mode="ProcessExit",
+    attempts=2,
+    workspace_egress="[]",
 ):
     from orchestrator.services.manifest_execution import ManifestExecutionService
     from orchestrator.services.connector_drivers import builtin_connector_drivers
@@ -1137,6 +1155,7 @@ async def native_workspace_execution(
         namespace="ws",
         harness_namespace="agents",
         default_image="workspace:test",
+        workspace_egress=workspace_egress,
     )
     executions = ManifestExecutionService(
         database,
@@ -1144,6 +1163,7 @@ async def native_workspace_execution(
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        approved_images=APPROVED_WORKER,
         connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=executions.admit)
@@ -1168,6 +1188,35 @@ async def native_workspace_execution(
         snapshot,
         result,
     )
+
+
+@pytest.mark.asyncio
+async def test_workspace_egress_rules_are_appended_to_the_public_default(
+    database, actor
+):
+    from orchestrator.services.manifest_workspaces import public_workspace_egress
+
+    rule = {
+        "to": [{"ipBlock": {"cidr": "10.18.2.105/32"}}],
+        "ports": [{"protocol": "TCP", "port": 7687}],
+    }
+    executions, *_, ws_processes, snapshot, _ = await native_workspace_execution(
+        database, actor, workspace_egress=json.dumps([rule])
+    )
+    await executions.reconcile_one(str(snapshot["id"]))
+    egress = ws_processes.launches[0].runtime.network_policy["spec"]["egress"]
+    assert egress[-1] == rule
+    assert egress[:-1] == list(public_workspace_egress())
+
+
+@pytest.mark.asyncio
+async def test_invalid_workspace_egress_blocks_admission_with_503(database, actor):
+    with pytest.raises(HTTPException) as invalid:
+        await native_workspace_execution(database, actor, workspace_egress="[{bad")
+    assert invalid.value.status_code == 503
+    assert invalid.value.detail["code"] == "HostingConfigurationInvalid"
+    assert "MANIFEST_WORKSPACE_EGRESS" in invalid.value.detail["message"]
+    assert "bad" not in invalid.value.detail["message"]
 
 
 @pytest.mark.asyncio

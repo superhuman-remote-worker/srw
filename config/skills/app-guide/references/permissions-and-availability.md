@@ -34,14 +34,25 @@ alone into a diagnosis.
 
 ## Permission mode is the approval policy
 
-Persistent sessions currently have three modes:
+Persistent sessions have three modes, from most to least careful. Each tool
+declares what kind of effect it has, and the mode decides which kinds ask:
 
-- **Supervised** asks for approval before every tool call.
-- **Auto-accept** runs non-shell tools without asking, but still asks for
-  `run_command`, `shell_execute`, and `shell_read`.
-- **Autonomous** runs tool calls without per-call approval.
+- **Read-only** runs reads freely — files, search, git history, the knowledge
+  base, web search, fetching pages, browser navigation — and the agent's own
+  task and canvas bookkeeping. It asks before anything that changes files or
+  data, acts outside the workspace, or runs a shell command.
+- **Auto-accept** also runs workspace edits freely (writing, editing, moving
+  files, commits). It still asks before irreversible or outbound actions —
+  deleting files, sending or drafting mail, pushing, database writes, starting
+  or controlling jobs, delegating to a subagent, tools of an MCP server that
+  do not declare themselves read-only — and before shell commands.
+- **Autonomous** runs every tool without per-call approval.
 
-New session experts default to Supervised unless an account, expert, or
+Read-only asks rather than refuses: approve a change and it runs. It is not the
+same as a connector's read-only access level, which binds no write tools at
+all. A delegated subagent runs unattended once its delegation is approved.
+
+New session experts default to Read-only unless an account, expert, or
 per-session setting overrides it. Change the current session from its header
 **Settings** panel; change the account fallback under
 **Settings → Persistent Agent → Permission Mode**.
@@ -86,6 +97,9 @@ The current grant catalog covers:
   refused, and a session configuration that switches `officer.enabled` on is
   rejected. Reading a loop's state, pausing it, and stopping it stay available —
   nobody is locked out of halting work that is already running;
+- `custom_harness_images` — run an admin-approved custom harness image
+  (`manifestHosting.approvedImages`) as a generic manifest Job. Denied by
+  default; admins bypass it;
 - `complete_unmerged_pr` — approve or auto-complete a job whose delivered pull
   request has not been merged. Without it, a job that opened a pull request stays
   in review until that pull request lands: approval is refused, and a job that
@@ -115,30 +129,58 @@ default is Container for jobs and Virtual for sessions; an operator can change i
 
 | Workspace | What it provides | Important limits |
 |---|---|---|
-| **Virtual** | Fast, durable cloud-backed file tools without starting a workspace container; file Canvas can work when the backing store is materializable by the orchestrator | No shell, direct browser, git, repository checkout, live application, or shared browser. A process-local development store cannot be presented on Canvas. |
+| **Virtual** | Fast file tools without starting a workspace container; the files are kept in SRW's own storage between turns and resumes; file Canvas can work when the backing store is materializable by the orchestrator | No shell, direct browser, git, repository checkout, live application, or shared browser. Its own files are not in your cloud storage; the agent hands you one as a link in chat. Attached Nextcloud folders (a project folder at Read-only or Read-write, My cloud, the session outbox) are reached at `cloud/<name>` with file tools; a Protected folder, or a cloud without the Virtual delivery yet, needs a Container. A process-local development store cannot be presented on Canvas. |
 | **Container** (`sandbox` internally) | Isolated files plus shell, git, repository checkout, and direct browser support; the current Protected Cloud session path also requires this tier | Slower cold start. Individual tools still depend on the expert, tool selection, grants, and service configuration. This is the proven live-app/shared-browser path. |
 | **None** | Chat with no workspace | No workspace file, shell, direct browser, git, or repository tools. Web research, databases, and knowledge may still work when independently configured and attached. |
 | **VM** | A full per-session virtual machine for work that needs VM isolation or sudo/root access | Per-session opt-in only; never a saved default. Requires the `vm_workspace` grant, operator enablement, and an available VM provisioner. Current file Canvas and shared-browser VM support are not promised. |
 
-A running session's header **Settings** panel shows **Workspace** in its main
-**Settings** tab. On narrow screens, use the header's three-dot menu →
-**Settings**. A running Virtual session can upgrade to a VM when its owner has
+A running session's **Session settings** panel (in the chat header's **More
+actions** (⋮) menu, or behind the model or permission-mode badge) shows
+**Workspace** in its main **Settings** tab. A running Virtual session can
+upgrade to a VM when its owner has
 the `vm_workspace` grant and VMs are enabled: choose **VM**, then confirm
 **Upgrade**. The session keeps its conversation and carries existing files
 over. Wait for provisioning to complete before checking the newly available
-tools. A running session can't upgrade to a Container; its Container choice
-says **not available in this session**. Start a new Container session for
-that. None currently shows a fixed workspace value in this selector; start a
-new Container session when no upgrade action is offered. Some sessions cannot
+tools. A session that can't upgrade to a Container in place says **not
+available in this session** on that choice. None currently shows a fixed
+workspace value in this selector; start a new Container session when no
+upgrade action is offered. Some sessions cannot
 change workspace in place at all: their Workspace choices say **not available
 in this session** and `/upgrade-workspace` is refused. Start a new session with
 the needed workspace then.
 
+A Virtual or None session served by the shared executors (the default when
+stateless sessions are on) can also upgrade to a **Container** in place, when
+the installation tracks workspace startup: choose **Container**, or send
+`/upgrade-workspace` (or `/upgrade-workspace <container template>`). If a
+response is running, the upgrade starts after it. The session keeps its
+conversation; the next message runs in the container, with the earlier files
+copied in (files under a cloud folder come back from the cloud). If the
+container never starts, the chat says **Workspace upgrade failed** with the
+reason: End the session and start a new one; your files are kept.
+
+These sessions can also upgrade to a **VM**, in place: choose **VM**, or send
+`/upgrade-workspace vm` (or a VM template's name). The upgrade starts only
+while the session is idle. The chat then says "Moving this session to a VM
+workspace (the session reconnects first)…": every open tab reconnects to a
+dedicated agent, the VM starts and the files are copied over; a cold VM can
+take several minutes. Ending the session before its VM is requested cancels
+the upgrade; after Resume, ask for it again. A file over 100 MB isn't copied:
+it stays in the old storage, and the chat names it when the upgrade finishes.
+If the agent is lost before the copy is recorded, the next one copies again
+before the session is ready, leaving out files under a cloud folder (they stay
+in the cloud and in the old storage). If VMs are off
+the request is refused with "VM workspaces aren't available on this
+installation." If the upgrade fails or is interrupted, the chat says so and
+your files stay in the old storage: the session keeps working until its agent
+restarts, then End it and start a new one. Only one upgrade runs at a time, and
+nothing moves back down.
+
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool
 category. If `request_workspace_upgrade` is currently visible, the agent can
-use it to present a VM upgrade request for the user's decision; when SRW would
-refuse a VM upgrade, the tool says why and nothing is shown to the user. It
+use it to present a container or VM upgrade request for the user's decision;
+when SRW would refuse the upgrade, the tool says why and nothing is shown to the user. It
 does not provision the workspace or automatically resume work; the user can
 send a follow-up message after the upgrade completes.
 
@@ -150,7 +192,7 @@ other categories can still be removed by backend or grant checks.
 
 For an already-running session, open header **Settings → Tools**. The list
 reflects the session's resolved tool categories, including **Browser**,
-**Shell**, **Research**, **Git**, **Canvas**, **Job Control**, **Job Inspection**,
+**Shell**, **Research**, **Git**, **Canvas**, **Skills**, **Job Control**, **Job Inspection**,
 **Experts & Skills**, and **Automations & Loops** where applicable. Live editing
 is not limited to the older four application groups. **Author Experts &
 Automations** is a separate category with its own grant.

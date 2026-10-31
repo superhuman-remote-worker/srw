@@ -25,6 +25,7 @@ from shared.run_queue import (
     queue_state_for,
 )
 from shared.session_retirement import CLAIM_LOSS_HOLD_KEY, stateless_stop_markers
+from shared.session_tool_debt import unanswered_tool_calls
 
 RETRY_REFUSAL_STOP_MARKERS = "stop_markers"
 RETRY_REFUSAL_CLAIM_LOSS_HOLD = "claim_loss_hold"
@@ -68,6 +69,44 @@ def park_retry_refusal(park_reason: str | None, metadata: Any) -> str | None:
     return None
 
 
+def unknown_result_refusal(metadata: Any) -> str | None:
+    """Why the owner may NOT decide a parked unit's unknown tool results.
+
+    The same correctness holds as :func:`park_retry_refusal`, without the
+    reason check: any park whose transcript holds unanswered tool calls is
+    the owner's decision (session_unknown_tool_result_needs_admin.md, F4).
+    """
+    try:
+        markers = stateless_stop_markers(_metadata_object(metadata))
+    except RuntimeError:
+        return RETRY_REFUSAL_STOP_MARKERS
+    if CLAIM_LOSS_HOLD_KEY in markers:
+        return RETRY_REFUSAL_CLAIM_LOSS_HOLD
+    if markers:
+        return RETRY_REFUSAL_STOP_MARKERS
+    return None
+
+
+# An unknown call's arguments are shown on the decision card; a huge payload
+# (a whole written file) is left out rather than shipped to the browser.
+_UNKNOWN_CALL_ARGS_LIMIT = 4000
+
+
+def _unknown_call_view(row: dict[str, Any]) -> dict[str, Any]:
+    args = None
+    text = row.get("args")
+    if isinstance(text, str) and len(text) <= _UNKNOWN_CALL_ARGS_LIMIT:
+        try:
+            args = json.loads(text)
+        except ValueError:
+            args = None
+    return {
+        "id": str(row.get("call_id") or ""),
+        "name": str(row.get("name") or "unknown"),
+        "args": args,
+    }
+
+
 def _iso(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -90,6 +129,7 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
             "retryable": False,
             "attempts": 0,
             "pending_input": False,
+            "unknown_tool_calls": [],
         }
     parked = state.get("state") == STATE_PARKED
     refusal = park_retry_refusal(state.get("park_reason"), metadata) if parked else None
@@ -108,7 +148,29 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
         "retryable": bool(parked and refusal is None),
         "attempts": int(state.get("attempts") or 0),
         "pending_input": bool(state.get("pending_input")),
+        "unknown_tool_calls": [],
     }
+
+
+async def unknown_tool_calls_block(
+    conn: Any, thread: dict[str, Any], block: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The calls the owner's Continue / Stop decision would answer.
+
+    Empty unless the unit is parked under no correctness hold. Diagnostics
+    only: a failed read leaves the plain parked bubble.
+    """
+    if (
+        block.get("state") != STATE_PARKED
+        or block.get("park_reason") == PARK_REASON_CLAIM_LOSS_HOLD
+        or unknown_result_refusal(thread.get("metadata")) is not None
+    ):
+        return []
+    try:
+        rows = await unanswered_tool_calls(conn, str(thread["id"]))
+    except Exception:
+        return []
+    return [_unknown_call_view(row) for row in rows]
 
 
 async def cloud_push_block(conn: Any, thread_id: str) -> dict[str, Any] | None:
@@ -144,6 +206,7 @@ async def queue_block_for_thread(conn: Any, thread: dict[str, Any]) -> dict[str,
     """
     state = await queue_state_for(conn, unit_id=str(thread["id"]))
     block = queue_block(state, thread.get("metadata"))
+    block["unknown_tool_calls"] = await unknown_tool_calls_block(conn, thread, block)
     block["cloud_push"] = await cloud_push_block(conn, str(thread["id"]))
     return block
 
@@ -156,4 +219,6 @@ __all__ = [
     "park_retry_refusal",
     "queue_block",
     "queue_block_for_thread",
+    "unknown_result_refusal",
+    "unknown_tool_calls_block",
 ]

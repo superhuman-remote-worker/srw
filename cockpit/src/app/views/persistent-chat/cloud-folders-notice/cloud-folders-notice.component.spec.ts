@@ -31,9 +31,9 @@ describe('cloud folder state', () => {
       notice: 'agent_outdated',
     });
     expect(state.problems).toEqual([
-      { name: 'project', path: 'workspace/cloud/project', kind: '', reason: 'credential_rejected' },
+      { name: 'project', path: 'cloud/project', kind: '', reason: 'credential_rejected' },
       // Anything outside the closed set reads as a mount failure, never raw.
-      { name: 'odd', path: 'workspace/cloud/odd', kind: '', reason: 'mount_failed' },
+      { name: 'odd', path: 'cloud/odd', kind: '', reason: 'mount_failed' },
       // A folder left out is named by what it was.
       { name: '', path: '', kind: 'project', reason: 'set_fallback' },
     ]);
@@ -41,11 +41,11 @@ describe('cloud folder state', () => {
     expect(state.protected).toBe(false);
   });
 
-  it('names a session\'s only folder workspace/cloud', () => {
+  it('names a session\'s only folder cloud', () => {
     const state = cloudFolderStateFromStatus({
       mounts: { home: { state: 'unavailable', reason: 'timeout' } },
     });
-    expect(state.problems[0].path).toBe('workspace/cloud');
+    expect(state.problems[0].path).toBe('cloud');
   });
 
   it('knows a protected session that runs without its cloud', () => {
@@ -73,7 +73,7 @@ describe('cloud folder state', () => {
         excluded: [{ mount_kind: 'session_folder', reason: 'unbuildable' }],
       }),
     ).toEqual([
-      { name: 'reference', path: 'workspace/cloud/reference', kind: '', reason: 'timeout' },
+      { name: 'reference', path: 'cloud/reference', kind: '', reason: 'timeout' },
       { name: '', path: '', kind: 'session_folder', reason: 'unbuildable' },
     ]);
     // An agent that reports is up to date.
@@ -106,8 +106,8 @@ describe('cloud folder state', () => {
       ],
     });
     expect(state.folders).toEqual([
-      { name: 'acme', path: 'workspace/cloud/acme', kind: 'project', level: 'read_only', state: 'mounted', reason: '', connectorId: '', title: '' },
-      { name: 'outbox', path: 'workspace/cloud/outbox', kind: 'cloud_outbox', level: 'read_write', state: 'pending', reason: '', connectorId: '', title: '' },
+      { name: 'acme', path: 'cloud/acme', kind: 'project', level: 'read_only', state: 'mounted', reason: '', connectorId: '', title: '' },
+      { name: 'outbox', path: 'cloud/outbox', kind: 'cloud_outbox', level: 'read_write', state: 'pending', reason: '', connectorId: '', title: '' },
       // Left out: nothing takes its place, and it says why.
       { name: '', path: '', kind: 'user_root', level: '', state: 'excluded', reason: 'cloud_not_connected', connectorId: 'ds-root', title: '' },
       { name: '', path: '', kind: 'project', level: '', state: 'excluded', reason: 'grant_unavailable', connectorId: 'ds-b', title: '' },
@@ -211,7 +211,10 @@ describe('CloudFoldersNoticeComponent', () => {
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
   });
-  afterEach(() => TestBed.resetTestingModule());
+  afterEach(() => {
+    TestBed.resetTestingModule();
+    window.localStorage.clear();
+  });
 
   async function render(inputs: Record<string, unknown>): Promise<HTMLElement> {
     TestBed.configureTestingModule({
@@ -241,7 +244,7 @@ describe('CloudFoldersNoticeComponent', () => {
   it('names each unavailable folder and why', async () => {
     const root = await render({
       problems: [
-        { name: 'project', path: 'workspace/cloud/project', kind: '', reason: 'credential_rejected' },
+        { name: 'project', path: 'cloud/project', kind: '', reason: 'credential_rejected' },
         { name: '', path: '', kind: 'session_folder', reason: 'unbuildable' },
         { name: '', path: '', kind: '', reason: 'set_fallback' },
       ],
@@ -250,7 +253,7 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(root.querySelector('[role="status"]')?.getAttribute('aria-label')).toBe('Cloud folders');
     expect(text(root)).toContain('Some cloud folders of this session are not available');
     const item = root.querySelector('li')!;
-    expect(item.querySelector('.cfn__name')?.textContent).toBe('workspace/cloud/project');
+    expect(item.querySelector('.cfn__name')?.textContent).toBe('cloud/project');
     expect(text(item)).toContain('the cloud refused its credential');
     expect(text(root)).toContain('The session folder was not attached');
     expect(text(root)).toContain('A cloud folder was not attached');
@@ -258,7 +261,7 @@ describe('CloudFoldersNoticeComponent', () => {
 
   it('says a protected session runs without its cloud, and why', async () => {
     const root = await render({
-      problems: [{ name: 'lower', path: 'workspace/cloud', kind: '', reason: 'credential_rejected' }],
+      problems: [{ name: 'lower', path: 'cloud', kind: '', reason: 'credential_rejected' }],
       protectedCloud: true,
       agentOutdated: false,
     });
@@ -279,6 +282,28 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(root.querySelector('[data-testid="cloud-folders-notice"]')).toBeNull();
   });
 
+  it('names the Virtual tier and the way to a Container for a folder it left out', async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: {},
+      excluded: [
+        {
+          source_ref: 'ds-folder',
+          mount_kind: 'project',
+          reason: 'mount_unsupported',
+          detail: 'virtual_workspace',
+          title: 'Acme cloud folder',
+        },
+        {source_ref: 'ds-other', mount_kind: 'project', reason: 'mount_unsupported', title: 'Other'},
+      ],
+    });
+    const root = await render({problems: state.problems, folders: state.folders, agentOutdated: false});
+    const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
+    expect(text(rows[0])).toBe(
+      "Acme cloud folder · a Virtual workspace can't serve it at the level requested; a Container gets it: upgrade this session, or start a new one with a Container",
+    );
+    expect(text(rows[1])).toBe("Other · this workspace can't mount cloud folders; they aren't delivered here");
+  });
+
   it("shows each folder's binding state, and a failed one names why", async () => {
     const state = cloudFolderStateFromStatus({
       mounts: {
@@ -290,8 +315,8 @@ describe('CloudFoldersNoticeComponent', () => {
     const root = await render({ problems: state.problems, folders: state.folders, agentOutdated: false });
     const rows = [...root.querySelectorAll<HTMLElement>('[data-cloud-folder]')];
     expect(rows.map((r) => r.dataset['state'])).toEqual(['mounted', 'pending', 'excluded']);
-    expect(text(rows[0])).toBe('workspace/cloud/acme · Project folder Read-only · mounted');
-    expect(text(rows[1])).toBe('workspace/cloud/outbox · Session outbox Read-write · connecting…');
+    expect(text(rows[0])).toBe('cloud/acme · Project folder Read-only · mounted');
+    expect(text(rows[1])).toBe('cloud/outbox · Session outbox Read-write · confirmed when the agent starts');
     expect(text(rows[2])).toBe(
       'My cloud was not attached · no cloud account yet: connect your cloud under Settings → Connectors Connect your cloud',
     );
@@ -340,5 +365,52 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(reviewed).toBe(1);
     expect(text(rows[1])).toContain('not mounted beside a protected folder');
     expect(rows[1].querySelector('[data-review]')).toBeNull();
+  });
+
+  it('folds to its title line, keeps its tone, and stays folded on this device', async () => {
+    const state = cloudFolderStateFromStatus({
+      mounts: { acme: { mount_kind: 'project', access: 'read_write', state: 'mounted' } },
+      excluded: [{ source_ref: 'ds-root', mount_kind: 'user_root', reason: 'cloud_not_connected' }],
+    });
+    const inputs = { problems: state.problems, folders: state.folders, agentOutdated: true };
+    let root = await render(inputs);
+    const toggle = root.querySelector<HTMLButtonElement>('[data-cloud-folders-toggle]')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(root.querySelectorAll('[data-cloud-folder]').length).toBe(2);
+
+    toggle.click();
+    fixture.detectChanges();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(root.querySelector('[data-cloud-folder]')).toBeNull();
+    expect(text(root)).not.toContain('older than its workspace');
+    // Folded, a folder that is not available still shows.
+    expect(text(root.querySelector('.cfn__title') as HTMLElement)).toBe(
+      'Some cloud folders of this session are not available',
+    );
+    expect(root.querySelector('.cfn')?.classList).not.toContain('cfn--ok');
+
+    // The next session on this device opens folded.
+    TestBed.resetTestingModule();
+    root = await render(inputs);
+    expect(root.querySelector('[data-cloud-folders-toggle]')?.getAttribute('aria-expanded')).toBe('false');
+    expect(root.querySelector('[data-cloud-folder]')).toBeNull();
+
+    root.querySelector<HTMLButtonElement>('[data-cloud-folders-toggle]')!.click();
+    fixture.detectChanges();
+    expect(root.querySelectorAll('[data-cloud-folder]').length).toBe(2);
+    expect(text(root)).toContain('older than its workspace');
+  });
+
+  it('folds a protected session to its title, which still says why', async () => {
+    window.localStorage.setItem('cockpit:chat:cloudFoldersFolded', 'true');
+    const root = await render({
+      problems: [{ name: 'lower', path: 'cloud', kind: '', reason: 'credential_rejected' }],
+      protectedCloud: true,
+      agentOutdated: false,
+    });
+    const title = root.querySelector('[data-testid="cloud-folders-protected"]') as HTMLElement;
+    expect(text(title)).toContain('Protected cloud unavailable');
+    expect(text(title)).toContain('the cloud refused its credential');
+    expect(text(root)).not.toContain('nothing it writes reaches the cloud');
   });
 });

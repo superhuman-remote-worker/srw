@@ -65,6 +65,7 @@ from agent.api.session_workspace import (
     protected_workspace_identity,
     protected_workspace_marker,
     protected_mount_payload,
+    remote_cloud_mounts,
 )
 from shared.runtime.core.loader import (
     normalize_delegation_block,
@@ -208,9 +209,11 @@ def apply_datasource_enrichment_to_resolved(
 MEMORY_EMBEDDING_ENV_KEYS = (
     "EMBEDDING_PROVIDER",
     "EMBEDDING_MODEL",
+    "EMBEDDING_SERVED_MODEL",
     "EMBEDDING_BASE_URL",
     "EMBEDDING_API_KEY",
     "RERANK_MODEL",
+    "RERANK_SERVED_MODEL",
     "RERANK_BASE_URL",
     "RERANK_API_KEY",
 )
@@ -233,8 +236,13 @@ def apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
     with tenant-A env_keys followed by an attach with tenant-B env_keys
     absent, ``os.environ`` carries no A values and the singleton is None.
     """
+    from shared.runtime.core.transport_resolution import clear_served_model_env
+
     for k in MEMORY_EMBEDDING_ENV_KEYS:
         os.environ.pop(k, None)
+    # Every served model string, not only the memory ones: each belongs to
+    # the dispatch block that named it, and this pod may have run another.
+    clear_served_model_env()
     from shared.runtime.services import embedding_service as _embedding_module
 
     _embedding_module._embedding_service = None
@@ -254,6 +262,33 @@ def apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
                 os.environ.get("EMBEDDING_MODEL"),
                 os.environ.get("KB_EMBEDDING_MODEL"),
             )
+
+
+def apply_session_whisper_env(env_keys: Optional[Dict[str, Any]]) -> None:
+    """Replace the process speech-to-text transport with this attach's snapshot.
+
+    ``read_file`` transcribes audio with the ``WHISPER_*`` transport it reads
+    from ``os.environ`` (``agent.services.audio_helper``). Same scrub-on-claim
+    rule as the embedding profile: a pod serves one tenant after another, so
+    every ``WHISPER_*`` name is popped before this attach's block is applied.
+    """
+    from shared.runtime.core.transport_resolution import (
+        DISPATCH_ENV_KEY_NAMES,
+        exportable_env_keys,
+    )
+
+    for name in DISPATCH_ENV_KEY_NAMES:
+        if name.startswith("WHISPER_"):
+            os.environ.pop(name, None)
+    exportable, _dropped = exportable_env_keys(env_keys)
+    applied = sorted(name for name in exportable if name.startswith("WHISPER_"))
+    for name in applied:
+        os.environ[name] = exportable[name]
+    if applied:
+        logger.info(
+            "Speech-to-text override applied: model=%s",
+            os.environ.get("WHISPER_MODEL"),
+        )
 
 
 async def strict_cleanup_partial_attach_local_resources(
@@ -430,7 +465,7 @@ class SessionAttachPorts:
     loop_running: Callable[[], bool]
     ensure_loop_started: Callable[[str], bool]
     wire_aux_archiver: Callable[[], None]
-    emit_citation_verdict: Callable[..., Any]
+    emit_citation_event: Callable[..., Any]
     emit_canvas_event: Callable[..., Any]
     # Workspace and configuration collaborators.
     poll_workspace_ready: Callable[..., Awaitable[Optional[Dict[str, Any]]]]
@@ -622,6 +657,96 @@ class SessionAttachCoordinator:
         task = asyncio.create_task(send(), name="cloud-mount-status-report")
         self._report_tasks.add(task)
         task.add_done_callback(self._report_tasks.discard)
+
+    @staticmethod
+    def _remote_cloud_event_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The Virtual folders' rows in the shape the session header reads
+        (``event_rows`` of the sidecar watcher): a bound or ready folder is
+        in the workspace (``mounted``), a failed one is ``unavailable`` with
+        its reason; ``delivery: remote`` tells the two deliveries apart."""
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            failed = row.get("state") == "failed"
+            entry: dict[str, Any] = {
+                "name": row.get("name"),
+                "state": "unavailable" if failed else "mounted",
+                "mount_kind": row.get("kind"),
+                "level": row.get("access"),
+                "connector_id": row.get("mount_id"),
+                "delivery": "remote",
+            }
+            if failed:
+                entry["reason"] = row.get("reason") or "mount_failed"
+            out.append(entry)
+        return out
+
+    def _broadcast_remote_cloud_folders(self, rows: list[dict[str, Any]]) -> None:
+        self._ports.broadcast(
+            "cloud_mount.status",
+            {
+                "mounts": self._remote_cloud_event_rows(rows),
+                "excluded": [],
+                "protected": False,
+                "delivery": "remote",
+            },
+        )
+
+    async def _probe_and_report_remote_cloud_folders(self) -> None:
+        """Probe the Virtual Session's cloud folders once, then publish the
+        outcome: a cockpit event, and the orchestrator's record for this
+        claim's plan when the planner named one. Never raises."""
+        try:
+            rows = await self._session.probe_cloud_remotes()
+        except Exception as exc:
+            self._logger.warning(
+                "Could not probe the cloud folders: %s", type(exc).__name__
+            )
+            return
+        if not rows:
+            return
+        self._broadcast_remote_cloud_folders(rows)
+        plan = getattr(self._session, "cloud_remote_plan", None)
+        thread_id = self._identity.thread_id
+        report_status = getattr(self._client, "report_cloud_mount_status", None)
+        if not (
+            thread_id
+            and isinstance(plan, dict)
+            and plan.get("fingerprint")
+            and plan.get("incarnation")
+            and callable(report_status)
+        ):
+            return
+        try:
+            accepted = await report_status(
+                str(thread_id),
+                fingerprint=str(plan["fingerprint"]),
+                pod_uid=str(plan["incarnation"]),
+                # The record's closed states: a folder that answered its
+                # probe is in the workspace, one that did not is unavailable
+                # with its reason.
+                mounts=[
+                    {
+                        "name": row.get("name"),
+                        "state": (
+                            "unavailable" if row.get("state") == "failed" else "mounted"
+                        ),
+                        **(
+                            {"reason": row.get("reason") or "mount_failed"}
+                            if row.get("state") == "failed"
+                            else {}
+                        ),
+                    }
+                    for row in rows
+                ],
+            )
+            if not accepted:
+                self._logger.warning(
+                    "The orchestrator did not keep the cloud folders' state"
+                )
+        except Exception as exc:
+            self._logger.warning(
+                "Could not report the cloud folders' state: %s", type(exc).__name__
+            )
 
     async def _poll_workspace(self, thread_id: str, **kwargs: Any) -> Any:
         """The readiness poll of this attach, fenced by the ending refusal."""
@@ -1287,6 +1412,20 @@ class SessionAttachCoordinator:
                             )
                     elif not cloud_mount_cfg:
                         cloud_mount_cfg = cloud_mount_payload(ws_info)
+                    if workspace_override is None and (
+                        ws_info.get("cloud_folders_excluded")
+                        or ws_info.get("cloud_remote")
+                    ):
+                        # A lite session has no pod payload, but its cloud
+                        # folders (served by its own backend, the
+                        # cloud_remote form) and the ones its tier left out
+                        # still reach it (setup reads an absent override as
+                        # empty).
+                        workspace_override = {
+                            key: ws_info[key]
+                            for key in ("cloud_folders_excluded", "cloud_remote")
+                            if ws_info.get(key)
+                        }
                 elif protected_cloud:
                     raise ProtectedCloudUnavailable(
                         "protected-cloud workspace authority is unavailable"
@@ -1565,6 +1704,7 @@ class SessionAttachCoordinator:
             else (config_override.get("env_keys") if config_override else None)
         )
         apply_session_embedding_env(_env_keys_src)
+        apply_session_whisper_env(_env_keys_src)
 
         knowledge_bindings = connector_registry().knowledge_bindings(
             connector_deliveries,
@@ -1718,13 +1858,14 @@ class SessionAttachCoordinator:
         # call the same idempotent wiring helper again for rebuilt instances.
         self._ports.wire_aux_archiver()
 
-        # Live citation-verdict push: let the engine's background verifier broadcast
-        # pending→verified/failed so the cockpit citations panel updates in place
-        # rather than only at the next per-turn refresh. Set before the first turn
-        # (so it's wired before the lazily-built CitationEngine is first used).
+        # Live citation push: the engine announces each new citation before
+        # the cite tool returns, and every edit, withdrawal and verdict after,
+        # so the chat's chips resolve while the text streams rather than at
+        # the turn's end. Set before the first turn (so it's wired before the
+        # lazily-built CitationEngine is first used).
         if self._session is not None and self._session.tool_context is not None:
-            self._session.tool_context.citation_verdict_callback = (
-                self._ports.emit_citation_verdict
+            self._session.tool_context.citation_event_callback = (
+                self._ports.emit_citation_event
             )
             self._session.tool_context.canvas_event_callback = (
                 self._ports.emit_canvas_event
@@ -1817,6 +1958,13 @@ class SessionAttachCoordinator:
             if workspace_override
             else None
         )
+        if remote_cloud_mounts(workspace_override):
+            # A Virtual Session's cloud folders are served by its own backend
+            # at cloud/<name>, the outbox included: no mirror of the workspace
+            # root into the session folder beside them (the legacy shim would
+            # push the skills tree and README.md into sessions/<id>).
+            cloud_cfg = None
+            nc_folder = None
         cloud_degraded_hint = False
         if not suppress_disposable_cloud and (
             not cloud_mount_active
@@ -1864,6 +2012,12 @@ class SessionAttachCoordinator:
                     if not protected_cloud:
                         cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
                         nc_folder = nc_folder or ws_info.get("nc_session_folder")
+                        if remote_cloud_mounts(ws_info):
+                            # Served as cloud/<name> by the backend itself (the
+                            # cloud_remote form): the flat session-folder field
+                            # beside the descriptors is not a mirror to build.
+                            cloud_cfg = None
+                            nc_folder = None
                     cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
             except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
                 raise
@@ -2071,6 +2225,19 @@ class SessionAttachCoordinator:
                 sidecar_mounts.start_monitor(
                     lambda report: self._report_sidecar_mounts(sidecar_mounts, report)
                 )
+        remote_rows = getattr(self._session, "cloud_remote_rows", lambda: [])()
+        if remote_rows:
+            # A Virtual Session's cloud folders, served by its backend
+            # (features/cloud_folders_on_virtual_sessions.md § Lifecycle):
+            # the cockpit hears of them now, and one probe per folder runs
+            # off the attach and reports what it found.
+            self._broadcast_remote_cloud_folders(remote_rows)
+            task = asyncio.create_task(
+                self._probe_and_report_remote_cloud_folders(),
+                name="cloud-remote-probe",
+            )
+            self._report_tasks.add(task)
+            task.add_done_callback(self._report_tasks.discard)
 
         # Restore deliberately excludes persisted-but-unadmitted delivery rows:
         # they are executable inbox work, not passive conversation context. Claim
@@ -2206,7 +2373,7 @@ class SessionAttachCoordinator:
         if failed_session is not None:
             tool_context = getattr(failed_session, "tool_context", None)
             if tool_context is not None:
-                tool_context.citation_verdict_callback = None
+                tool_context.citation_event_callback = None
                 tool_context.canvas_event_callback = None
             try:
                 # An exact delivered attach is about to rotate its G and therefore

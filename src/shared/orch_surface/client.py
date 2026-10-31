@@ -23,6 +23,14 @@ from shared.runtime_actor import (
     RuntimeActorContext,
 )
 
+# A Session End/Delete answers only after the orchestrator has joined the
+# workspace handoff (up to 30 s, SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S),
+# waited for the agent's detach (final memory capture + git push, up to a
+# 150 s read) and torn the pod and workspace down. An ordinary End takes about
+# 30 s, the client default, so the read timed out: the tool reported a failure
+# for an End that went on to succeed, and the caller ended it again.
+SESSION_END_TIMEOUT = httpx.Timeout(240.0, connect=30.0)
+
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 DatasourceScopeMode = Literal["all", "projects"]
 DatasourceVisibility = Literal["public", "private"]
@@ -1744,7 +1752,7 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {"limit": limit}
         if status:
             params["status"] = status
-        resp = await self._client.get("/api/agents", params=params)
+        resp = await self._client.get("/api/admin/agents", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1876,7 +1884,7 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._mutation_request("DELETE", f"/api/agents/{agent_id}")
+        resp = await self._mutation_request("DELETE", f"/api/admin/agents/{agent_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -2249,7 +2257,7 @@ class AsyncCockpitClient:
             Dict with cpu, memory, disk, listening_ports, processes,
             network_connections, and agent info
         """
-        resp = await self._client.get(f"/api/agents/{agent_id}/system-info")
+        resp = await self._client.get(f"/api/admin/agents/{agent_id}/system-info")
         resp.raise_for_status()
         return resp.json()
 
@@ -3273,7 +3281,7 @@ class AsyncCockpitClient:
         self,
         config_name: str = "session_base",
         title: str = "Untitled Session",
-        permission_mode: str = "supervised",
+        permission_mode: str | None = None,
         project_id: str | None = None,
         project_ids: list[str] | None = None,
         datasource_ids: list[str] | None = None,
@@ -3305,8 +3313,10 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {
             "config_name": config_name,
             "title": title,
-            "permission_mode": permission_mode,
         }
+        # Omitted means the user's saved default, then the config default.
+        if permission_mode is not None:
+            body["permission_mode"] = permission_mode
         if project_id:
             body["project_id"] = project_id
         if project_ids:
@@ -3372,6 +3382,7 @@ class AsyncCockpitClient:
             "DELETE",
             f"/api/persistent/threads/{thread_id}",
             params={"permanent": permanent},
+            timeout=SESSION_END_TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()

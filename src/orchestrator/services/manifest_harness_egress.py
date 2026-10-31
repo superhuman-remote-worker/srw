@@ -151,8 +151,19 @@ def _selector(selector):
         _fail("selector values must be complete Kubernetes label values.")
 
 
-def validate_harness_egress(value):
+def validate_harness_egress(value, *, setting: str = "MANIFEST_HARNESS_EGRESS"):
     """Return an owned copy or reject the whole policy before any workload effects."""
+    try:
+        return _validate_harness_egress(value)
+    except HarnessEgressConfigurationError as exc:
+        default = "Invalid MANIFEST_HARNESS_EGRESS: "
+        if setting == "MANIFEST_HARNESS_EGRESS":
+            raise
+        detail = str(exc).removeprefix(default)
+        raise HarnessEgressConfigurationError(f"Invalid {setting}: {detail}") from None
+
+
+def _validate_harness_egress(value):
     if isinstance(value, str):
         if len(value) > 128 * 1024:
             _fail("JSON policy exceeds 128 KiB.")

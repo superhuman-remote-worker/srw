@@ -34,7 +34,7 @@ def prepared(thread, model="saved-model"):
             "agent_id": "session",
             "llm": {"model": model, "temperature": 0.2},
             "workspace": {"backend": "sandbox"},
-            "interactive": {"permission_mode": "supervised"},
+            "interactive": {"permission_mode": "read_only"},
         },
         "prompts": {"persona": "The exact authorized persona."},
     }

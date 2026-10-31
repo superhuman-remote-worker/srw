@@ -233,6 +233,72 @@ async def test_cleanup_stop_attestation_requires_exact_runtime_and_pvc_dispositi
 
 
 @pytest.mark.asyncio
+async def test_cleanup_stop_attestation_of_a_disk_purged_by_the_upgrade_abort(
+    provisioner_with_nats,
+    mock_nats_bridge,
+):
+    """E4b: only a thread's retained-disk candidate may expect the disk gone."""
+    from uuid import uuid4
+
+    from orchestrator.services.vm_upgrade_abort_cleanup import (
+        DISK_PURGED_BY_UPGRADE_ABORT,
+    )
+
+    ids = {
+        key: str(uuid4())
+        for key in ("owner_id", "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid")
+    }
+    candidate = {
+        **ids,
+        "owner_kind": "thread",
+        "provision_generation": PROVISION_GENERATION,
+        "purge_disk": False,
+        DISK_PURGED_BY_UPGRADE_ABORT: True,
+    }
+    provisioner_with_nats._current_provision_generation = AsyncMock(
+        return_value=PROVISION_GENERATION
+    )
+    gone = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "runtime_absence_known": True,
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = gone
+
+    proof = await provisioner_with_nats.attest_vm_cleanup_stop(candidate)
+
+    assert proof is not None
+    assert proof["pvc_disposition"] == "purged_by_upgrade_abort"
+    assert DISK_PURGED_BY_UPGRADE_ABORT not in proof
+    # The disk still there contradicts the abort's purge.
+    mock_nats_bridge.query_vm_status.return_value = {
+        **gone,
+        "rootdisk_pvc_uid": ids["pvc_uid"],
+    }
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = gone
+    # Only on a thread's retained-disk candidate, and only as True.
+    for malformed in (
+        {**candidate, "purge_disk": True},
+        {**candidate, DISK_PURGED_BY_UPGRADE_ABORT: False},
+        {
+            **{
+                k: v
+                for k, v in candidate.items()
+                if k not in {"owner_id", "owner_kind"}
+            },
+            "job_id": ids["owner_id"],
+        },
+    ):
+        assert await provisioner_with_nats.attest_vm_cleanup_stop(malformed) is None
+
+
+@pytest.mark.asyncio
 async def test_retained_exact_absence_nats_queries_captured_workspace_pvc(
     provisioner_with_nats, mock_nats_bridge
 ):
@@ -2323,6 +2389,63 @@ class TestCapturedVmTeardown:
                 {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
             ),
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entity_type", ["thread", "job"])
+    async def test_a_thread_vm_found_already_gone_is_recorded_deleted(
+        self, provisioner_with_db, mock_db, entity_type
+    ):
+        """E4b: an End that finds its VM already released (by the upgrade's
+        abort) proves it absent, so its record says deleted, as after a delete."""
+        identity = self._identity()
+        provisioner_with_db._current_provision_generation = AsyncMock(
+            return_value=PROVISION_GENERATION
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe("absent")
+        )
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = True
+        provisioner_with_db._set_context_if_generation = AsyncMock(return_value=True)
+
+        outcome = await provisioner_with_db.release_vm_captured(
+            "owner-1",
+            identity,
+            entity_type=entity_type,
+            purge_disk=False,
+            capture_snapshot=False,
+        )
+
+        assert (outcome.disposition, outcome.deleted) == ("completed", True)
+        if entity_type == "thread":
+            provisioner_with_db._set_context_if_generation.assert_awaited_once_with(
+                "thread", "owner-1", PROVISION_GENERATION, {"status": "deleted"}
+            )
+        else:
+            provisioner_with_db._set_context_if_generation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_thread_vm_gone_but_not_recorded_deleted_is_retried(
+        self, provisioner_with_db, mock_db
+    ):
+        """E4b review: completion waits until the record says deleted."""
+        provisioner_with_db._current_provision_generation = AsyncMock(
+            return_value=PROVISION_GENERATION
+        )
+        provisioner_with_db._probe_vm_teardown_identity = AsyncMock(
+            return_value=self._probe("absent")
+        )
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = True
+        provisioner_with_db._set_context_if_generation = AsyncMock(return_value=False)
+
+        outcome = await provisioner_with_db.release_vm_captured(
+            "owner-1",
+            self._identity(),
+            entity_type="thread",
+            purge_disk=False,
+            capture_snapshot=False,
+        )
+
+        assert (outcome.disposition, outcome.deleted) == ("identity_unknown", False)
 
     @pytest.mark.asyncio
     async def test_started_vm_without_retirement_endpoint_fails_closed(

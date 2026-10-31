@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,8 @@ import pytest
 
 from agent.api.persistent_session import PersistentSession
 from agent.api.session_attach import cloud_mount_payload
+from agent.core.backends.virtual import VirtualWorkspaceBackend
+from shared.runtime.core.backends.object_store import InMemoryObjectStore
 from shared.runtime.core.loader import cloud_mount_system_floor
 from shared.runtime.services.cloud_mount.sidecar import (
     SidecarMountError,
@@ -185,7 +188,7 @@ async def test_a_folder_that_did_not_mount_never_fails_the_attach():
     assert "ln -sfn /cloud " in links
     text = watcher.status()
     assert "refused its credential" in text and "401" not in text
-    assert "workspace/cloud/project: unavailable" in text
+    assert "cloud/project: unavailable" in text
 
 
 @pytest.mark.asyncio
@@ -201,7 +204,7 @@ async def test_a_mount_still_coming_up_stays_pending_and_unlinked():
     # there already, empty and read-only until it mounts.
     links = next(c for c in workspace.commands if "ln -sfn" in c)
     assert "ln -sfn /cloud " in links and "mkdir" not in links.split("SRW")[0][-80:]
-    assert "workspace/cloud/slow: still coming up" in watcher.status()
+    assert "cloud/slow: still coming up" in watcher.status()
 
 
 def test_the_prompt_rows_include_what_was_left_out():
@@ -220,7 +223,7 @@ def test_the_prompt_rows_include_what_was_left_out():
     rows = watcher.unavailable()
     assert rows[0] == {
         "name": "project",
-        "path": "workspace/cloud",
+        "path": "cloud",
         "reason": "not_found",
         "text": "the folder no longer exists in the cloud",
     }
@@ -228,7 +231,7 @@ def test_the_prompt_rows_include_what_was_left_out():
     assert rows[1]["kind"] == "project"
     floor = cloud_mount_system_floor(rows)
     # One folder: it is workspace/cloud itself.
-    assert "- workspace/cloud: the folder no longer exists" in floor
+    assert "- cloud: the folder no longer exists" in floor
     assert "was not attached" in floor and floor.startswith("<cloud_folders>")
     assert cloud_mount_system_floor([]) == "" and cloud_mount_system_floor(None) == ""
 
@@ -259,7 +262,7 @@ def test_the_session_prompt_names_folders_that_did_not_mount():
         }
     ]
     assert "<cloud_folders>" in prompt({"_cloud_mounts_unavailable": rows})
-    assert "workspace/cloud/project" in prompt({"_cloud_mounts_unavailable": rows})
+    assert "cloud/project" in prompt({"_cloud_mounts_unavailable": rows})
     assert "<cloud_folders>" not in prompt({})
 
 
@@ -896,9 +899,10 @@ async def test_without_its_cloud_a_protected_session_keeps_no_link_to_a_dead_ove
     assert unmounts == [{"merged": "/cloud/merged", "strict": stateless}]
     unlink = next(c for c in workspace.commands if "SRW_UNLINK_OK" in c)
     assert "/cloud/merged" in unlink and "readlink" in unlink and "rm -f" in unlink
-    # The error says what the user sees, never a workspace/cloud path.
+    # The error says what the user sees, never the folder's workspace path.
     assert session.cloud_mount_error.startswith("Protected cloud unavailable")
-    assert "workspace/cloud:" not in session.cloud_mount_error
+    assert "workspace/cloud" not in session.cloud_mount_error
+    assert "- cloud" not in session.cloud_mount_error
 
 
 def test_a_drain_that_gave_uploads_up_for_good_says_so(caplog):
@@ -986,13 +990,13 @@ def test_the_prompt_names_every_mounted_folder_and_whose_it_is():
     watcher._start_sync()
     mounted = watcher.mounted()
     assert [(row["path"], row["kind"]) for row in mounted] == [
-        ("workspace/cloud/acme_launch", "project"),
-        ("workspace/cloud/outbox", "cloud_outbox"),
+        ("cloud/acme_launch", "project"),
+        ("cloud/outbox", "cloud_outbox"),
     ]
     floor = cloud_mount_system_floor(watcher.unavailable(), mounted)
-    assert "- workspace/cloud/acme_launch: the project's folder" in floor
+    assert "- cloud/acme_launch: the project's folder" in floor
     assert (
-        "- workspace/cloud/outbox: a folder SRW created for this session and shared "
+        "- cloud/outbox: a folder SRW created for this session and shared "
         "with the user; it is not the project folder (read-write)." in floor
     )
     assert "can't see it yet" not in floor
@@ -1001,12 +1005,9 @@ def test_the_prompt_names_every_mounted_folder_and_whose_it_is():
         '- "Beta cloud folder (abcd1234)" was not attached: the cloud offers no '
         "access to it in this kind of workspace." in floor
     )
-    assert "- workspace/cloud/gamma: it could not be prepared" in floor
+    assert "- cloud/gamma: it could not be prepared" in floor
     status = watcher.status()
-    assert (
-        "workspace/cloud/outbox (/cloud/outbox, read-write): mounted, a folder SRW"
-        in status
-    )
+    assert "cloud/outbox (/cloud/outbox, read-write): mounted, a folder SRW" in status
     assert '"Beta cloud folder (abcd1234)": not mounted' in status
 
 
@@ -1024,13 +1025,9 @@ def test_an_outbox_the_user_cannot_see_yet_says_so():
 
 def test_the_block_is_there_whenever_the_session_has_a_cloud_folder():
     assert cloud_mount_system_floor(None, None) == ""
-    one = [
-        {"name": "outbox", "path": "workspace/cloud", "text": "a folder (read-write)"}
-    ]
+    one = [{"name": "outbox", "path": "cloud", "text": "a folder (read-write)"}]
     floor = cloud_mount_system_floor([], one)
-    assert (
-        floor.startswith("<cloud_folders>") and "- workspace/cloud: a folder" in floor
-    )
+    assert floor.startswith("<cloud_folders>") and "- cloud: a folder" in floor
     assert "are not available:" not in floor
     # A protected session whose cloud is down keeps its own wording.
     down = [
@@ -1082,8 +1079,8 @@ def test_an_in_workspace_mount_set_is_named_for_the_prompt_too():
     )
     mounted, unavailable = _in_workspace_cloud_folders(cfg, manager)
     assert [row["path"] for row in mounted] == [
-        "workspace/cloud/acme",
-        "workspace/cloud/outbox",
+        "cloud/acme",
+        "cloud/outbox",
     ]
     assert "can't see it yet" in mounted[1]["text"]
     assert unavailable[0]["reason"] == "beside_protected"
@@ -1212,14 +1209,14 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
     assert session.config.extra["_cloud_mounts_mounted"] == []
     [row] = session.config.extra["_cloud_mounts_unavailable"]
     assert (row["path"], row["reason"]) == (
-        "workspace/cloud/acme_launch",
+        "cloud/acme_launch",
         "reader_unavailable",
     )
     floor = cloud_mount_system_floor(
         session.config.extra["_cloud_mounts_unavailable"],
         session.config.extra["_cloud_mounts_mounted"],
     )
-    assert "workspace/cloud/acme_launch: its read-only account" in floor
+    assert "cloud/acme_launch: its read-only account" in floor
     # The way the orchestrator hands it over renders the same rows.
     plain = SimpleNamespace(config=_Config(extra={}), protected_cloud_required=False)
     PersistentSession._note_undelivered_cloud_folders(plain, excluded)
@@ -1230,7 +1227,9 @@ async def test_an_in_workspace_set_that_mounts_nothing_starts_no_rclone():
 
 
 @pytest.mark.asyncio
-async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted():
+async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted(
+    caplog,
+):
     """No cloud payload (every folder detached, say): a resident an earlier
     claim mounted is retired all the same, and nothing mounts. A workspace
     without a shell is left alone."""
@@ -1262,6 +1261,21 @@ async def test_a_claim_given_no_cloud_mount_retires_what_an_earlier_one_mounted(
         lambda: PersistentSession._retire_unplanned_cloud_mounts(scratch)
     )
     await PersistentSession._setup_cloud_mount(scratch, None)
+    # The virtual tier has every backend method, but no shell and no home.
+    virtual = SimpleNamespace(
+        thread_id="t1",
+        workspace_manager=SimpleNamespace(
+            backend=VirtualWorkspaceBackend(InMemoryObjectStore()), path="/w"
+        ),
+        protected_cloud_required=False,
+    )
+    virtual._retire_unplanned_cloud_mounts = (
+        lambda: PersistentSession._retire_unplanned_cloud_mounts(virtual)
+    )
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await PersistentSession._setup_cloud_mount(virtual, None)
+    assert caplog.records == []
 
 
 def test_a_workspace_that_can_mount_no_folder_says_so_in_the_prompt():

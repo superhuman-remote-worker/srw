@@ -8,7 +8,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Mapping, NoReturn, Optional
 from uuid import UUID
 
 import httpx
@@ -27,6 +27,10 @@ from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
 )
+from shared.workspace_upgrade import (
+    VM_PROVISIONING_NOT_AVAILABLE,
+    VM_UPGRADE_NOT_RECORDED,
+)
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
@@ -40,6 +44,7 @@ from shared.session_subagent_authority import (
 )
 from shared.session_subagent_batch import session_subagent_batch_delivery_id
 from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
+from shared.workspace_upgrade import WORKSPACE_UPGRADE_SEED_CAPABILITY
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,49 @@ class SessionGrantDenied(Exception):
         self.cleanup_identity = cleanup_identity
 
 
+class WorkspaceUpgradeRouteMissing(RuntimeError):
+    """An orchestrator replica that predates the C2 seed routes answered 404."""
+
+
+class WorkspaceUpgradeRouteRefused(RuntimeError):
+    """A VM upgrade seed route refused (C2); ``code`` is its typed refusal."""
+
+    def __init__(self, status_code: int, code: str | None, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+
+
+class VmUpgradeAbortPending(RuntimeError):
+    """The VM upgrade's abort hasn't finished yet: ask again (E4).
+
+    A 5xx answer (the orchestrator's ``vm_process_zero_unproven`` 503 among
+    them) or no answer at all.
+    """
+
+
+def _raise_workspace_upgrade_route_error(response: Any) -> NoReturn:
+    """Raise for a non-200 answer of a VM upgrade seed route (C2).
+
+    FastAPI's unknown-route answer (404 ``Not Found``) means this replica
+    predates the route (a rolling deploy): ``WorkspaceUpgradeRouteMissing``,
+    which the caller retries. Anything else is ``WorkspaceUpgradeRouteRefused``
+    with the typed code (``{"detail": {"code": ...}}``) when there is one.
+    """
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if response.status_code == 404 and detail == "Not Found":
+        raise WorkspaceUpgradeRouteMissing(str(response.request.url))
+    code = detail.get("code") if isinstance(detail, dict) else None
+    raise WorkspaceUpgradeRouteRefused(
+        response.status_code,
+        str(code) if code else None,
+        f"workspace upgrade seed route answered {response.status_code}: {detail}",
+    )
+
+
 class SessionEnded(Exception):
     """Typed terminal response from the workspace credential boundary."""
 
@@ -117,6 +165,31 @@ class SessionEnding(SessionEnded):
         super().__init__(message)
         self.runtime_generation = runtime_generation
         self.retirement_disposition = retirement_disposition
+
+
+class WorkspaceSnapshotChanged(Exception):
+    """The workspace row changed while the orchestrator built its answer (409).
+
+    Raised only to callers that opt in (the readiness poll). The orchestrator
+    never splices two workspace snapshots into one response; it refuses and
+    the caller reads again. ``code`` is the refusal's code or detail.
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# The 409s the workspace endpoint answers when the workspace changed under one
+# read; the next read starts from a single snapshot. Dict details carry a code,
+# the attestation refusals a plain detail string.
+_WORKSPACE_SNAPSHOT_CHANGED_CODES = frozenset({"workspace_runtime_identity_changed"})
+_WORKSPACE_SNAPSHOT_CHANGED_DETAILS = frozenset(
+    {
+        "Workspace authority changed during attach",
+        "VM workspace authority changed during attach",
+    }
+)
 
 
 class ThreadConfigUpdateDenied(Exception):
@@ -720,6 +793,7 @@ class OrchestratorClient:
             "thread_id": thread_id,
             "session_runtime_generation": provisioned_generation,
             "build_sha": os.environ.get("BUILD_SHA", ""),
+            "image": os.environ.get("AGENT_IMAGE", ""),
             "product_provenance": product_provenance.model_dump(mode="json"),
             # Injected via Kubernetes downward API by agent_provisioner; empty
             # outside of K8s (local dev). The orchestrator persists this on
@@ -840,7 +914,7 @@ class OrchestratorClient:
     async def create_thread(
         self,
         config_name: str = "session_base",
-        permission_mode: str = "supervised",
+        permission_mode: str = "read_only",
         title: str = "Local Session",
     ) -> str | None:
         """Create a thread in the orchestrator DB (agent-facing, no auth).
@@ -1713,12 +1787,16 @@ class OrchestratorClient:
 
         Called by the live upgrade handler when ``_poll_vm_ready`` gives up, so a
         half-provisioned VM (+ its DataVolume + CDI importer pod) doesn't leak
-        with nobody attached. Idempotent server-side; clears ``metadata.vm`` so a
-        later retry isn't blocked by the provisioning-in-progress guard
-        (workspace_tier_upgrade.md Q7).
+        with nobody attached (workspace_tier_upgrade.md Q7). Idempotent
+        server-side: an upgrade from the virtual tier is undone (backend,
+        binding, no ``metadata.vm``); any other install is marked aborted.
 
         Returns:
-            True if the teardown request was accepted, False otherwise.
+            True once the orchestrator has finished the abort, False when it
+            refuses (a 4xx; asking again won't change it).
+
+        Raises:
+            VmUpgradeAbortPending: not finished yet (a 5xx or no answer).
         """
         if not self._client:
             await self.connect()
@@ -1726,16 +1804,19 @@ class OrchestratorClient:
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/abort-vm-upgrade"
         try:
             response = await self._client.post(url)
-            if response.status_code == 200:
-                logger.info(f"VM upgrade aborted/torn down for thread {thread_id}")
-                return True
-            logger.error(
-                f"VM upgrade abort failed: {response.status_code} - {response.text}"
-            )
-            return False
         except Exception as e:
-            logger.error(f"VM upgrade abort error: {e}")
-            return False
+            raise VmUpgradeAbortPending(f"VM upgrade abort unanswered: {e}") from e
+        if response.status_code == 200:
+            logger.info(f"VM upgrade aborted/torn down for thread {thread_id}")
+            return True
+        if response.status_code >= 500:
+            raise VmUpgradeAbortPending(
+                f"VM upgrade abort not finished: {response.status_code} - {response.text}"
+            )
+        logger.error(
+            f"VM upgrade abort refused: {response.status_code} - {response.text}"
+        )
+        return False
 
     async def request_thread_workspace_upgrade(
         self,
@@ -1792,12 +1873,148 @@ class OrchestratorClient:
             logger.error(f"Workspace upgrade request error: {e}")
             return False, None
 
+    def _pinned_identity_headers(self) -> dict[str, str]:
+        """The exact pinned runtime identity the credential routes bind to."""
+        headers: dict[str, str] = {}
+        if self.agent_id:
+            headers["X-Agent-ID"] = self.agent_id
+        if self.session_runtime_generation:
+            headers["X-Session-Runtime-Generation"] = self.session_runtime_generation
+        if self.session_runtime_attach_token:
+            headers["X-Session-Runtime-Attach-Token"] = (
+                self.session_runtime_attach_token
+            )
+        return headers
+
+    async def request_vm_upgrade_for_control(
+        self, thread_id: str, *, template: str | None, control_request_id: str
+    ) -> tuple[bool | None, int | None, str | None]:
+        """Ask for the VM a stateless lane switch's request names (C2).
+
+        ``(accepted, status, detail)``. ``accepted`` is True on a 200 and
+        False on a refusal: a 4xx, or one of the two typed 503s, which say
+        VM provisioning is off (``VM_PROVISIONING_NOT_AVAILABLE``) or that an
+        unexpected error stopped the request before anything was recorded for
+        it (``VM_UPGRADE_NOT_RECORDED``); ``detail`` is then the
+        orchestrator's text, or the message/code of a typed refusal. It is
+        None when the outcome is unknown: no HTTP answer (``status`` None) or
+        any other 5xx, which can arrive after the provision CAS committed. The
+        caller then reads the thread to tell the two apart.
+        """
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/upgrade-to-workspace"
+        )
+        payload: dict[str, str] = {
+            "target_tier": "vm",
+            "control_request_id": control_request_id,
+        }
+        if template:
+            payload["template"] = template
+        try:
+            response = await self._client.post(url, json=payload)
+        except Exception as exc:
+            logger.warning(
+                "VM upgrade request for control %s failed in transport: %s",
+                control_request_id,
+                exc,
+            )
+            return None, None, None
+        if response.status_code == 200:
+            return True, 200, None
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("code")
+        text = str(detail) if detail else None
+        if response.status_code >= 500 and text not in (
+            VM_PROVISIONING_NOT_AVAILABLE,
+            VM_UPGRADE_NOT_RECORDED,
+        ):
+            logger.warning(
+                "VM upgrade request for control %s has no definite answer: %s %s",
+                control_request_id,
+                response.status_code,
+                text,
+            )
+            return None, response.status_code, text
+        logger.warning(
+            "VM upgrade request for control %s refused: %s %s",
+            control_request_id,
+            response.status_code,
+            text,
+        )
+        return False, response.status_code, text
+
+    async def get_workspace_upgrade_seed_source(self, thread_id: str) -> dict:
+        """The old lite workspace a pending VM upgrade still owes (C2)."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/workspace-upgrade/seed-source"
+        )
+        response = await self._client.get(url, headers=self._pinned_identity_headers())
+        if response.status_code == 200:
+            return response.json()
+        _raise_workspace_upgrade_route_error(response)
+
+    async def mark_workspace_upgrade_seeded(
+        self, thread_id: str, *, provision_generation: str, control_request_id: str
+    ) -> None:
+        """Record a verified VM upgrade copy before the swap (C2)."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/workspace-upgrade/seeded"
+        )
+        response = await self._client.post(
+            url,
+            json={
+                "provision_generation": provision_generation,
+                "control_request_id": control_request_id,
+            },
+            headers=self._pinned_identity_headers(),
+        )
+        if response.status_code == 200:
+            return
+        _raise_workspace_upgrade_route_error(response)
+
+    async def mark_workspace_upgrade_interrupted(
+        self, thread_id: str, *, provision_generation: str, control_request_id: str
+    ) -> None:
+        """Record that a VM upgrade's copy can't be made (C2): its source is
+        permanently gone, so no later attach retries it."""
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}"
+            f"/api/agents/threads/{thread_id}/workspace-upgrade/interrupted"
+        )
+        response = await self._client.post(
+            url,
+            json={
+                "provision_generation": provision_generation,
+                "control_request_id": control_request_id,
+            },
+            headers=self._pinned_identity_headers(),
+        )
+        if response.status_code == 200:
+            return
+        _raise_workspace_upgrade_route_error(response)
+
     async def get_thread_workspace(
         self,
         thread_id: str,
         *,
         raise_on_denied: bool = False,
         raise_on_ending: bool = False,
+        raise_on_snapshot_change: bool = False,
     ) -> dict | None:
         """Poll workspace container status for a thread.
 
@@ -1815,7 +2032,9 @@ class OrchestratorClient:
         A 409 ``session_ended`` always raises :class:`SessionEnded`. With
         ``raise_on_ending=True``, a 409 ``session_ending`` (the life's
         retirement has begun) raises :class:`SessionEnding` instead of
-        collapsing to ``None``.
+        collapsing to ``None``. With ``raise_on_snapshot_change=True``, a 409
+        saying the workspace changed during this read raises
+        :class:`WorkspaceSnapshotChanged`, so the caller reads again.
         """
         if not self._client:
             await self.connect()
@@ -1874,8 +2093,28 @@ class OrchestratorClient:
                         runtime_generation=detail.get("session_runtime_generation"),
                         retirement_disposition=detail.get("retirement_disposition"),
                     )
+                code = (
+                    detail.get("code")
+                    if isinstance(detail, dict)
+                    else detail
+                    if isinstance(detail, str)
+                    else None
+                )
+                if raise_on_snapshot_change and (
+                    code in _WORKSPACE_SNAPSHOT_CHANGED_CODES
+                    or code in _WORKSPACE_SNAPSHOT_CHANGED_DETAILS
+                ):
+                    raise WorkspaceSnapshotChanged(
+                        "workspace changed during the read", code=str(code)
+                    )
+                # Only the refusal's code: a 409 detail is never a payload.
+                logger.info(
+                    "Workspace read for thread %s refused: 409 %s",
+                    thread_id,
+                    code if isinstance(code, str) else "(no code)",
+                )
             return None
-        except (SessionGrantDenied, SessionEnded):
+        except (SessionGrantDenied, SessionEnded, WorkspaceSnapshotChanged):
             raise
         except Exception as e:
             logger.debug(f"Failed to get thread workspace: {e}")
@@ -1907,6 +2146,9 @@ class OrchestratorClient:
                 "pod_name": os.environ.get("POD_NAME")
                 or os.environ.get("HOSTNAME", ""),
                 "pod_uid": os.environ.get("POD_UID", ""),
+                # This executor can make a stateless workspace upgrade's copy;
+                # without it, a Session that owes one answers 425.
+                "capabilities": WORKSPACE_UPGRADE_SEED_CAPABILITY,
             },
         )
         if response.status_code == 200:
@@ -1958,6 +2200,94 @@ class OrchestratorClient:
             logger.debug("Failed to report cloud mount status: %s", e)
             return False
         return response.status_code == 200
+
+    def cloud_remote_token_fetcher(
+        self,
+        thread_id: str,
+        *,
+        lease: Any,
+        plan: Mapping[str, Any] | None,
+    ) -> Callable[[str], tuple[str, float]]:
+        """How a Virtual Session's executor fetches the bearer of a cloud
+        folder delivered with the ``oauth_token`` auth kind
+        (features/cloud_folders_on_virtual_sessions.md § Provider neutrality):
+        ``fetch(mount_id) -> (token, expires_in)`` against
+        ``GET /internal/units/{unit_id}/cloud-token``, with the executor's
+        live lease read from ``lease`` (the executor's mutable
+        :class:`~agent.api.lease_context.LeaseHandle`, so a re-claim repoints
+        it) and the plan this delivery serves (``fingerprint``,
+        ``incarnation``). Synchronous on purpose: the rclone store spawns
+        from worker threads. Raises ``CloudTokenUnavailable`` with a closed
+        message (a status code, a transport error's name); the response body
+        is never logged, nor is the token.
+        """
+        from agent.core.backends.cloud_token import CloudTokenUnavailable
+
+        orchestrator_url = self.orchestrator_url
+        plan_body = dict(plan or {})
+
+        def fetch(mount_id: str) -> tuple[str, float]:
+            unit_id = getattr(lease, "unit_id", None)
+            lease_token = int(getattr(lease, "lease_token", 0) or 0)
+            if not unit_id or not lease_token:
+                raise CloudTokenUnavailable("no live claim lease for the token")
+            headers: dict[str, str] = {}
+            internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+            if internal_key:
+                headers["X-Internal-Key"] = internal_key
+            params = {
+                "lease_token": lease_token,
+                "pod_name": (
+                    getattr(lease, "executor_id", None)
+                    or os.environ.get("POD_NAME")
+                    or os.environ.get("HOSTNAME", "")
+                ),
+                "pod_uid": getattr(lease, "pod_uid", None)
+                or os.environ.get("POD_UID", ""),
+                "mount_id": str(mount_id),
+                "fingerprint": str(plan_body.get("fingerprint") or ""),
+                "incarnation": str(plan_body.get("incarnation") or ""),
+            }
+            try:
+                with httpx.Client(timeout=15.0, headers=headers) as client:
+                    response = client.get(
+                        f"{orchestrator_url}/internal/units/{unit_id}/cloud-token",
+                        params=params,
+                    )
+            except httpx.HTTPError as exc:
+                logger.debug(
+                    "Thread %s: the cloud token route was not reachable (%s)",
+                    thread_id,
+                    type(exc).__name__,
+                )
+                raise CloudTokenUnavailable(
+                    f"token route unreachable ({type(exc).__name__})"
+                ) from None
+            if response.status_code != 200:
+                logger.debug(
+                    "Thread %s: the cloud token route answered %s for folder %s",
+                    thread_id,
+                    response.status_code,
+                    mount_id,
+                )
+                raise CloudTokenUnavailable(
+                    f"token route answered {response.status_code}"
+                )
+            try:
+                body = response.json()
+            except ValueError:
+                raise CloudTokenUnavailable("token route answered no JSON") from None
+            token = body.get("token") if isinstance(body, dict) else None
+            expires_in = body.get("expires_in") if isinstance(body, dict) else None
+            if (
+                not isinstance(token, str)
+                or not token
+                or not isinstance(expires_in, (int, float))
+            ):
+                raise CloudTokenUnavailable("token route answered no token")
+            return token, float(expires_in)
+
+        return fetch
 
     async def report_workspace_recovery(
         self,

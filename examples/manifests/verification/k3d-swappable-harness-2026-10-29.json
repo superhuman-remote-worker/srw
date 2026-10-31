@@ -1,0 +1,195 @@
+{
+  "date": "2026-10-29",
+  "plan": "Swappable harness image live check, knowledge-base superpowers/plans/2026-10-28-swappable-harness-image-plan.md Task 20 (spec 2026-10-28-swappable-harness-image-design.md section 7)",
+  "code": "develop cc7d2d9b6 (Tasks 1-19); HEAD did not move during the run; Tilt images built from that tree with no uncommitted tracked changes",
+  "outcome": "DONE_WITH_CONCERNS: dispatch, pod shape, image pairing, the protocol refusal and the cancel path work; the final-tree Claude Code image cannot connect to its workspace on an SRW agent pod (D1); a successful custom-harness job skips Review (D3); SRW's Anthropic transport sends temperature, which the Meta endpoint rejects (D2); the Meta credential no longer has model access (environment)",
+  "stack": {
+    "context": "k3d-srw",
+    "namespace": "srw",
+    "helmRevisions": {
+      "19481": "tilt ci of cc7d2d9b6 with the final-tree digest approved (23:15-23:26Z, 11.5 min, agent image rebuilt)",
+      "19482": "workaround digest added to the approved list (23:49Z)",
+      "19483": "workaround digest removed again (00:07Z)"
+    },
+    "images": {
+      "orchestrator": "srw-registry:5000/srw-orchestrator:tilt-57db8c7ef1f8516f",
+      "agent (default harness)": "srw-registry:5000/srw-agent:tilt-5d8a33fd796e77dc",
+      "cockpit": "srw-registry:5000/srw-cockpit:tilt-cbeec54e05a8653f",
+      "harness (final tree)": "srw-registry:5000/srw-harness-claude-code@sha256:0ef0a5d04bb7e8e95c7323d4e02ea03c2ec178bfe98af430f9d501c3627ac01c",
+      "harness (TEST-ONLY workaround)": "srw-registry:5000/srw-harness-claude-code@sha256:1337b7dadd23ddcb5578109e0716f01af3556bf0abe7664e95f5b7ae0ed29b72 = the final-tree image plus a passwd/group entry for uid/gid 999 (scratchpad Dockerfile, not in the repo); approved only between revisions 19482 and 19483"
+    },
+    "harnessImageBuilt": "podman build -f docker/Dockerfile.harness-claude-code -t localhost:5005/srw-harness-claude-code:t20 . at cc7d2d9b6; podman push --tls-verify=false --digestfile; digest confirmed by the registry's Docker-Content-Digest",
+    "values": "git-ignored deployment/values-local.yaml: the marked 2026-10-28 manifestHosting block kept; its approved claude-code digest changed from b7764015... to 0ef0a5d0... (sha256 of the file e37d37c6... before, 4095de8a... after)",
+    "settings": "STATELESS_WORKER_DEFAULT_ENABLED=false, MAX_AGENTS=3, MIN_AGENTS=0, AGENT_BUFFER=0; MANIFEST_APPROVED_IMAGES carried the final digest after each deploy",
+    "caller": "python3 inside the orchestrator Pod against http://localhost:8085 with X-Internal-Key and X-MCP-User-Id; manifests through POST /api/manifests/apply as dev-user-1 9ce801db-9a96-469e-bef3-c0676c92cd62 (non-admin, holds custom_harness_images); catalog through the Cockpit (test = admin@localhost 6ed1b6f4-...) and /api/admin/providers/* as admin@localhost; Review read in the Cockpit signed in as dev-user-1",
+    "clusterRuntimeFixes": "none new; the 2026-10-28 CoreDNS forward (1.1.1.1 9.9.9.9) still in place"
+  },
+  "manifests": {
+    "cc-harness-t20": "Expert adapted from examples/manifests/claude-code-harness-expert.yaml: adapter srw/v1, image = final digest, config {config_name: worker_base, config: {llm: {model: muse-spark-1.3-contributor}}} (the model is set in the private SRW config leaf; resolve_default_models puts the expert's llm.model above the account/system default)",
+    "cc-harness-t20-openai-chat": "same image, llm.model MiniMax-M3 (endpoint row without routing = openai-chat)",
+    "srw-default-meta-t20 / srw-default-meta-nosampling-t20 / srw-default-gemma-t20": "no image (installed harness), llm.model muse-spark-1.3-contributor / same with temperature, top_p, top_k null / gemma-4-moe; scholar disabled",
+    "cc-harness-t20-wa, -wa-cancel, -wa-scripted": "TEST-ONLY workaround image with muse-spark-1.3-contributor / t20-unreachable / t20-scripted",
+    "jobs": "adapted from examples/manifests/claude-code-harness-job.yaml (sandbox workspace 2 CPU 4Gi 10Gi, completion Reported, maxAttempts 1, timeoutSeconds 3600), task text changed per step"
+  },
+  "checks": {
+    "expertAdmission": {
+      "result": "PASS",
+      "observed": "POST /api/manifests/apply of cc-harness-t20 as dev-user-1 -> 200, resource 687f1db6-c095-4e28-93fe-4ba401efc793 version 1; the Job applies that named it admitted"
+    },
+    "catalogFlip": {
+      "result": "PASS",
+      "observed": "Cockpit https://localhost/admin/models?tab=catalog, select 'API shape for muse-spark-1.3-contributor' offers openai-chat, openai-responses, anthropic-messages; choosing anthropic-messages at 23:27:38Z wrote params_json {routing: {client_protocol: anthropic-messages}}; GET /api/admin/providers/models?capability=chat then showed client_protocol 'anthropic-messages' for row 4a658972-3f2b-417c-875f-9d207a6f492b (was null)"
+    },
+    "jobRow": {
+      "result": "PASS",
+      "observed": "job 4d41fea2-02fd-4f3f-a2a0-00cd3e759919: harness_image = final digest, execution_lane pinned (likewise c364ae25, 4be74fd7, and the workaround jobs with the workaround digest); default-Expert jobs have harness_image NULL"
+    },
+    "customPodShape": {
+      "result": "PASS",
+      "pod": "srw-agent-j-dc6c5930",
+      "observed": "container image = final digest, no command, no args; env AGENT_IMAGE = final digest, AGENT_CONFIG worker_base, AGENT_PORT 8001; envFrom srw-config + srw; probes /health, /health, /ready on 8001; label srw/image-key b917e35ed1447b089cb4f2ba33e68462 = sha256(image)[:32]; srw/purpose job. Default pod srw-agent-j-e5e5fa44 for comparison: image srw-agent:tilt-5d8a..., command [sh, -c, exec python agent.py --config worker_base --port 8001 --host 0.0.0.0], AGENT_IMAGE set, srw/image-key ee51703c... = its sha256"
+    },
+    "agentRowImage": {
+      "result": "PASS",
+      "observed": "agents b7b656f4-f99a-4443-a2e6-b8df8ebed520 (srw-agent-j-9a88507a): status ready, image = final digest, agent_mode worker; c77b52b5 (srw-agent-j-cb3fc15c) and be624918 (srw-agent-j-9a9e878b): status working, image = workaround digest, current_job_id set. Rows are deleted when the harness deregisters"
+    },
+    "jobRunsAndCompletesOnFinalImage": {
+      "result": "FAIL (D1)",
+      "job": "4d41fea2-02fd-4f3f-a2a0-00cd3e759919",
+      "observed": "Provisioned agent srw-agent-j-dc6c5930 for pending job (harness image: final digest) 23:28:40.87Z; harness 'serving on port 8001' 23:28:44.82, 'registered as agent d2b0aff2-...' 23:28:44.86; orchestrator GET /ready 200, 'Pinned recipient Pod became attestable after 3 retries', /job/start accepted 23:28:45.96; 'connecting to the workspace' then 'harness error: ValueError: Unknown local username: set one of LOGNAME, USER, LNAME, or USERNAME in the environment' 23:28:45.96; 'job ... reported' 23:29:05.12, exit 1; jobs.status failed with that message. Same failure for 4be74fd7 in the pairing check."
+    },
+    "jobRunsAndCompletesWithWorkaround": {
+      "result": "PASS (TEST-ONLY workaround image + scripted Anthropic Messages fixture)",
+      "job": "3ee54434-83f4-4002-b476-2cf424dbc14f",
+      "observed": "pod srw-agent-j-c4379b0a, agent b88c572b; registered 00:01:55.55Z, accepted 00:01:57.35, connected, 'starting Claude Code (model t20-scripted)' 00:01:58.39; the fixture logged two streaming POST /v1/messages (4 tools: mcp__ws__Bash/Edit/Read/Write; the second carrying the tool_result; no temperature/top_p/top_k sent by the CLI); 'session ended: success' 00:01:59.02; transcript copied to .srw/claude-code/transcript.jsonl; workspace hello.txt = 'hello from the swappable harness'; 'reported' 00:02:16.27, exit 0; GET /api/jobs/{id} 200 status completed, lane pinned; GET /api/jobs/{id}/frozen: summary 'Created hello.txt in the workspace root containing ...', deliverables ['/home/agent-host/workspace/hello.txt'], confidence 1.0, model t20-scripted, status job_completed, freeze_type job_complete"
+    },
+    "summaryInReview": {
+      "result": "FAIL (D3)",
+      "observed": "The data Review reads (GET /api/jobs/3ee54434.../frozen) has the summary and deliverables, but the job is 'completed', and the Cockpit Review page (signed in as dev-user-1, /jobs/review with the job selected) shows only 'Completed - This job is not awaiting review.'; the Jobs panel shows no summary. The default-image manifest job ec824a47 in the same session lands pending_review and Review shows its summary ('The file pair-default.txt was created ...') and deliverables ['pair-default.txt']."
+    },
+    "podGoneAfterReport": {
+      "result": "PASS",
+      "observed": "srw-agent-j-dc6c5930 exited 1 at 23:29:05 and was gone by 23:31:57; srw-agent-j-c4379b0a exited 0 at 00:02:16, 'Exact claimant pod deletion requested' 00:02:24.74; srw-agent-j-d7e42cd2 deleted 23:45:20; srw-agent-j-5cd4abed, -cb3fc15c, -3a1d4908 likewise within ~60 s"
+    },
+    "cancelMidSession": {
+      "result": "PASS with the TEST-ONLY workaround image only; not reachable on the final image (D1 ends the job ~1 s after accept)",
+      "job": "f8800602-007d-41c2-9c0e-d6aa625e12b1",
+      "observed": "model t20-unreachable (anthropic-messages endpoint http://127.0.0.1:9/v1) keeps the CLI session alive on API retries (the earlier attempt 54508589 showed 10 retries over 185 s before an ECONNREFUSED error); pod srw-agent-j-9a9e878b, agent be624918; 'starting Claude Code' 23:59:27.86Z; PUT /api/jobs/{id}/cancel as dev-user-1 at 23:59:42.864Z; orchestrator POST http://10.42.0.78:8001/job/cancel 200 at 23:59:43.057, 'Agent confirmed cancel'; harness 'session stopped' 23:59:43.047, 'stopped: no completion report', exit 0; DELETE /api/agents/be624918 200; no POST /api/jobs/{id}/complete in the orchestrator log; jobs.status cancelled, no error, no freeze_data; workspace snapshot uploaded and the workspace deleted 23:59:48-49; pod deletion requested 00:00:24.70"
+    },
+    "openaiChatRefusedBeforeStart": {
+      "result": "PASS",
+      "job": "c364ae25-23e1-4c69-9268-4b84403d8bea",
+      "observed": "cold pod srw-agent-j-9a88507a (final digest) registered 23:30:42.92Z; GET /ready 200; 'Dispatch: agent b7b656f4 cannot take job c364ae25: This harness speaks anthropic-messages; the job's model MiniMax-M3 is openai-chat.' at 23:30:44.51; jobs.status failed with that message; the harness log shows no job (only serving + registered), i.e. /job/start was never sent"
+    },
+    "defaultAndCustomQueuedTogether": {
+      "result": "PASS",
+      "jobs": {
+        "default": "ec824a47-c796-4f73-8597-aaffd3670e5e",
+        "custom": "4be74fd7-fc64-4956-a106-a60f99498ebf"
+      },
+      "observed": "one apply with both Jobs at 23:44:01Z; no custom pod existed; 23:44:41.55 'Provisioned agent srw-agent-j-e9e02e64 for pending job ec824a47 (harness image: installed)' (srw-agent:tilt-5d8a...); 23:44:41.59 'Provisioned agent srw-agent-j-d7e42cd2 for pending job 4be74fd7 (harness image: final digest)' (cold start); /job/start 202 to the custom pod 23:44:44.93 and to the default pod 23:44:46.38; ec824a47 ran on agent 532cca60 = srw-agent-j-e9e02e64 (agents.image = srw-agent tag) and reached pending_review 23:48:10; 4be74fd7 ran on srw-agent-j-d7e42cd2 and failed with D1. Earlier, the default job 4d4c8df0 was not given the idle custom pod srw-agent-j-9a88507a; a new default pod was provisioned"
+    },
+    "defaultImageOnFlippedMetaRow": {
+      "result": "FAIL (D2; then environment: the Meta credential lost model access)",
+      "jobs": [
+        "4d4c8df0-6b1a-4a81-8325-5ea46b9272cd",
+        "599aebb0-38cf-44fa-8a08-02319a59f8d8"
+      ],
+      "observed": "agent log 'Created Anthropic LLM: model=muse-spark-1.3-contributor, served=none, base_url=https://api.meta.ai, ... reasoning=none, betas=[context-management-2025-06-27]' (routing and /v1 stripping correct); 'HTTP Request: POST https://api.meta.ai/v1/messages 400'; 'LLM error is permanent (AnthropicInvalidRequestError) ... `temperature` is removed in API version 2026-10-21. Remove `temperature` from the request.'; job failed, not retried. 599aebb0 set temperature/top_p/top_k to null in the Expert: the resolver dropped the nulls (resolved_config llm.temperature 0.0) and the same 400 followed"
+    },
+    "ordinaryDefaultJob": {
+      "result": "PASS on a temporary catalog row (gemma-4-moe on the existing Local endpoint); the stack's own chat models were unusable",
+      "job": "4a5dfc50-8414-4f63-be35-642b64a2c4c4",
+      "observed": "POST /api/jobs (default Expert bd238ff5..., config_override llm.model gemma-4-moe, scholar off, user dev-user-1) -> pinned lane, default pod srw-agent-j-f0c62ed0 (srw-agent image, command kept), POST /complete 23:43:38Z, status pending_review, frozen summary 'Created the file `ordinary.txt` in the workspace root ...', deliverables ['ordinary.txt']. Attempts on the stack's models: f8703c7d on Meta (back on openai-chat) -> 404 model_not_found; 16e8435a on MiniMax-M3 -> 402 insufficient balance (paused llm_unavailable, then cancelled)"
+    }
+  },
+  "defects": {
+    "D1": "The Claude Code image cannot connect to its workspace on an SRW agent pod. The pod spec is SRW's (agent_provisioner.py securityContext runAsUser/runAsGroup 999, readOnlyRootFilesystem), the image's account is uid 10001, and the harness scrubs os.environ to PATH at start (harnesses/claude-code/srw_claude_code_harness/__main__.py scrub_process_environment(keep=['PATH'])), so asyncssh's getpass.getuser() falls back to pwd.getpwuid(999) and fails. Reproduced locally: podman run --passwd=false --user 999:999 ... getpass.getuser() with the environment cleared -> KeyError 'getpwuid(): uid not found: 999'; --user 10001:10001 -> 'harness'. The image smoke test checks getuser() under uid 10001 only.",
+    "D2": "SRW's Anthropic transport (_create_anthropic_llm in shared/runtime/core/loader.py) always sends temperature (and top_p/top_k when set) for a model without a Claude thinking profile; Meta's Anthropic-compatible API rejects temperature (400). No Expert or catalog setting omits it: null sampling values are dropped by config resolution.",
+    "D3": "The Claude Code harness reports goal_achieved true with freeze_data.status job_completed; completion.py maps a job_complete with goal_achieved (no verification) to completed, so a successful custom-harness job never reaches pending_review and the Cockpit Review page shows 'This job is not awaiting review.' SRW's own harness reports the same kind of job into pending_review. Its deliverables are also absolute paths (/home/agent-host/workspace/hello.txt) where SRW's are workspace-relative.",
+    "D4 (minor)": "A custom pod whose job is refused before start (protocol mismatch) stays registered and ready until its 600 s idle exit (srw-agent-j-9a88507a: refused 23:30:44, deregistered 23:40:42, deleted 23:41:18), counting toward MAX_AGENTS and holding the Secret; it is also eligible for another job of the same image."
+  },
+  "observations": [
+    "The default job ec824a47 got a second default pod (srw-agent-j-d6031b56, 23:44:45) because phase 1.5 provisions a default pod each pass until the job is claimed; same as before the feature (job_dispatcher.py at 7b993fdaa)",
+    "On the flipped Meta row the citation verifier still builds an OpenAI chat-completions client against https://api.meta.ai/v1 (CITATION_LLM_* injection does not follow client_protocol)",
+    "PUT /api/jobs/16e8435a.../cancel on a paused (llm_unavailable) job answered 503 'Workspace authority retirement is incomplete' while the job did become cancelled at 23:37:15; a retry answered 200"
+  ],
+  "environment": {
+    "metaCredential": "The owner's Meta key no longer has model access: from the orchestrator Pod (key decrypted in-process, never printed) POST https://api.meta.ai/v1/messages -> 404 'Model not found or access denied' for muse-spark-1.3-contributor and muse-spark-1.3; /v1/chat/completions -> 404 model_not_found; GET /v1/models (Bearer) -> 200 []. The Claude Code CLI reported model_not_found (jobs 9d9a5b6b, f12f3ce9). It worked on 2026-10-28 11:40Z. The owner must renew it before the success path can be shown on a real model.",
+    "minimax": "402 insufficient balance (1008)",
+    "localEndpoint": "https://ai.h4ll.app/v1 serves OpenAI routes only (POST /v1/messages -> 404)"
+  },
+  "temporaryChangesReverted": [
+    "Meta row API shape flipped in the Cockpit, briefly restored for the Step 8 attempt, re-flipped, and restored to its original params_json null at 00:05:23Z (one select to flip again)",
+    "catalog rows gemma-4-moe, t20-unreachable, t20-scripted and endpoints 'T20 unreachable (temporary)', 'T20 scripted Anthropic fixture (temporary)' created and deleted",
+    "Pod, Service and ConfigMap t20-fake-anthropic (scripted Anthropic Messages server run on the final harness image's python) created and deleted",
+    "the workaround digest added to manifestHosting.approvedImages and removed again (revision 19483)"
+  ],
+  "leftInPlace": [
+    "the marked manifestHosting block in deployment/values-local.yaml, now approving the final-tree digest 0ef0a5d0...",
+    "dev-user-1's Account resources: Experts cc-harness-t20, cc-harness-t20-openai-chat, srw-default-meta-t20, srw-default-meta-nosampling-t20, srw-default-gemma-t20, cc-harness-t20-wa, cc-harness-t20-wa-cancel, cc-harness-t20-wa-scripted and their Job resources (DELETE /api/resources answered 409: referenced by saved Jobs or unfinished work)",
+    "jobs 4a5dfc50 and ec824a47 in pending_review with their workspace Pods; default pod srw-agent-j-d6031b56 until scale-down",
+    "registry tags srw-harness-claude-code:t20 and :t20-uid999-workaround; podman images of the same",
+    "the 2026-10-28 CoreDNS forward, dev-user-1's custom_harness_images grant and its claude-code personal secret (untouched)"
+  ],
+  "notCovered": "the success path and the cancel on the final-tree image (D1) and on a real Anthropic-compatible model (credential); the dev run (owner's go)",
+  "re-check after fixes c942108c7..25c2754f5": {
+    "date": "2026-10-29",
+    "code": "develop 25c2754f5 (c942108c7 D1: image account uid/gid 999 and USER/LOGNAME kept through the scrub; a70c35955 D2: no temperature/top_p/top_k for a non-Claude model on the Anthropic shape; 25c2754f5 D3: goal_achieved true only for full autonomy, workspace-relative deliverables); HEAD did not move during the re-check",
+    "outcome": "PASS for every re-run check on the final image with no workaround image (6, 7, 8, 9, 12 as far as the D2 proof goes, 13). New finding D5 in SRW's own agent loop (not part of the fixes).",
+    "stack": {
+      "helmRevision": 19484,
+      "deploy": "one tilt ci --timeout 40m at 00:24-00:27Z (log task-20-tilt-ci-r1.log in the plan workspace), HEAD 25c2754f5",
+      "images": {
+        "orchestrator": "srw-registry:5000/srw-orchestrator:tilt-7c78299f2c6a10b8",
+        "agent": "srw-registry:5000/srw-agent:tilt-b7b3e4d31ac64ff9",
+        "cockpit": "srw-registry:5000/srw-cockpit:tilt-cbeec54e05a8653f",
+        "harness": "srw-registry:5000/srw-harness-claude-code@sha256:82bd27aa20d5c72d2b5ff79a9c01a80aab218f1ec6cdc24c83459c519389514c"
+      },
+      "harnessImageBuilt": "podman build of docker/Dockerfile.harness-claude-code at 25c2754f5 (id: uid=999(harness) gid=999(harness)), pushed with --digestfile; registry Docker-Content-Digest matches",
+      "values": "the single approved entry in the marked manifestHosting block replaced: 0ef0a5d0... -> 82bd27aa... (no second entry); MANIFEST_APPROVED_IMAGES in the orchestrator showed only the new digest",
+      "preparation": "deleted the idle default pod srw-agent-j-d6031b56 (previous build's agent image tilt-5d8a...) before the runs so the default jobs could not land on a pre-fix agent; local tags are not sha- tags, so SRW's stale-SHA drain does not apply on k3d",
+      "model": "scripted Anthropic Messages fixture (Pod/Service t20-fake-anthropic on the new harness image's python). It answers 400 with Meta's message ('`temperature` is removed in API version 2026-10-21. Remove `temperature` from the request.') to any request carrying temperature, top_p or top_k and logs each request's sampling keys (no headers or keys). Temporary endpoint rows 'T20r scripted Anthropic fixture (temporary)' and 'T20r unreachable (temporary)' (http://127.0.0.1:9/v1), model rows t20r-scripted and t20r-unreachable (non-Claude names, so family_of is not claude) flipped to anthropic-messages by PATCH /api/admin/providers/models/{id}, and gemma-4-moe on the existing Local endpoint for check 13",
+      "experts": "dev-user-1: cc-harness-t20r (new digest, t20r-scripted), cc-harness-t20r-cancel (new digest, t20r-unreachable), srw-default-t20r (no image, t20r-scripted); scholar disabled"
+    },
+    "checks": {
+      "6 jobRunsAndCompletesOnFinalImage": {
+        "result": "PASS",
+        "job": "4d68f156-4e1d-44f9-bef4-e1e85fa1151c",
+        "observed": "Provisioned agent srw-agent-j-f5b3547e (harness image = new digest) 00:28:34.49Z; registered as agent 24a475c5 00:28:36.04 (agents row: status working, image = new digest, current_job_id set); GET /ready 200; attestable after 6 retries; POST /job/start 202 00:28:37.85; 'connecting to the workspace' then 'starting Claude Code (model t20r-scripted)' 00:28:38.95 (D1 gone); fixture: 2 streaming POST /v1/messages?beta=true, 4 tools, sampling_keys [] both; 'session ended: success' 00:28:39.91; workspace hello.txt = 'hello from the swappable harness'; POST /api/jobs/{id}/complete 200 00:28:39.998; 'Freeze notification recorded (job_complete -> review_queue)'; harness exit 0 00:28:40.02; DELETE /api/agents/24a475c5 200"
+      },
+      "7 summaryInReview": {
+        "result": "PASS",
+        "observed": "jobs.status pending_review (D3 fixed); GET /api/jobs/{id}/frozen: summary 'Created hello.txt in the workspace root containing ...', deliverables ['hello.txt'] (workspace-relative), confidence 1.0; Cockpit /jobs/review signed in as dev-user-1 lists the job under PENDING REVIEW and shows JOB, SUMMARY, CONFIDENCE 100%, DELIVERABLES hello.txt, Approve / Continue with Feedback (screenshot .playwright-mcp/t20r-review-custom-job.png, gitignored)"
+      },
+      "8 podGoneAfterReport": {
+        "result": "PASS",
+        "observed": "srw-agent-j-f5b3547e exited 0 at 00:28:40, 'Exact claimant pod deletion requested' 00:29:34.37, NotFound by 00:30:00; the cancel run's srw-agent-j-bc65ef94 exited 00:29:54, deletion requested 00:30:34.39"
+      },
+      "9 cancelMidSession": {
+        "result": "PASS",
+        "job": "3dc6a69d-da7d-4a2b-a128-f0d6719b4e48",
+        "observed": "final image, model t20r-unreachable (the CLI retries its API call; transcript shows api_retry attempts 1-5); pod srw-agent-j-bc65ef94, agent f40441e6 (status working, image = new digest); 'starting Claude Code' 00:29:39.28Z; PUT /api/jobs/{id}/cancel as dev-user-1 00:29:54.506Z; orchestrator POST http://10.42.0.101:8001/job/cancel 200 00:29:54.749, 'Agent confirmed cancel'; transcript: harness stop, interrupt_sent, '[Request interrupted by user]', ResultMessage error_during_execution, session_end interrupted true; harness 'session stopped', 'stopped: no completion report', exit 0 00:29:54.78; DELETE /api/agents/f40441e6 200; no POST /api/jobs/{id}/complete; jobs.status cancelled, no error, no freeze_data"
+      },
+      "12 defaultImageOnAnthropicMessagesRow": {
+        "result": "PASS for D2 (the model is reached without the 400); the job cannot finish on the scripted reply",
+        "job": "7a320f31-c2bb-448d-912d-49fb1dac03c6",
+        "observed": "Expert srw-default-t20r (no image) on t20r-scripted; default pod srw-agent-j-5d3bebe7 (agent image tilt-b7b3...); agent 'HTTP Request: POST http://t20-fake-anthropic.srw.svc.cluster.local:8080/v1/messages' (the Anthropic route; the fixture serves no other model route); fixture log: 5080 requests from SRW's agent 00:30:51-00:33:13Z, each non-streaming, 55 tools, sampling_keys [] on every one, zero 400 answers (the same row and fixture answer 400 when temperature is present). How far it got: the fixture answers plain text 'ok' with no tool call, so the agent never left its first strategic todo (Todo state total=4, completed=0) and the job never reached job_complete; it was cancelled at 00:33:13 (job cancelled 00:33:38) and the requests stopped at once"
+      },
+      "13 ordinaryDefaultJob": {
+        "result": "PASS",
+        "job": "3cccdce9-b54a-4183-99ce-c9f4e6daf8d8",
+        "observed": "REST POST /api/jobs as dev-user-1, default Expert, config_override llm.model gemma-4-moe (temporary row on the Local endpoint, openai-chat); default pod with SRW's command; POST /complete 02:44:41Z; pending_review; frozen summary 'Created the file ordinary-recheck.txt containing the required text in the workspace root.', deliverables ['ordinary-recheck.txt']"
+      }
+    },
+    "newFindings": {
+      "D5": "SRW's own agent does not stop on its no-tool-call limit. With a model that answers text without tool calls (job 7a320f31), agent.graph logged 'No-tool-call streak N/3 (model=t20r-scripted, content_sample='ok')' (graph.py:2010) and 'No-tool-call streak exceeded (streak N, model=t20r-scripted): failing job' (graph.py:2040) on every iteration up to streak 4804 / [Iteration 4804], yet the job stayed processing and the agent kept calling the model at about 36 requests per second (5080 requests in 142 s) until the operator cancelled it. Not related to the harness swap; on a paid model this loop spends money quickly.",
+      "cancel503": "PUT /api/jobs/7a320f31.../cancel answered 503 'Workspace authority retirement is incomplete' at 00:33:13 while the job did become cancelled (00:33:38; the pod got POST /job/cancel 200 at 00:33:30), the same behaviour as job 16e8435a in the first run"
+    },
+    "cleanup": {
+      "removed": "fixture Pod/Service/ConfigMap t20-fake-anthropic; model rows t20r-scripted, t20r-unreachable, gemma-4-moe; endpoints 'T20r scripted Anthropic fixture (temporary)', 'T20r unreachable (temporary)'; Job resources t20r-c12-default and t20r-c9-cancel and Experts srw-default-t20r and cc-harness-t20r-cancel (DELETE /api/resources 200; the job rows remain)",
+      "kept": "deployment/values-local.yaml approves only the new digest 82bd27aa... (file sha256 117ee112...); the Meta row is unchanged (params_json null)",
+      "remaining": "Job resource t20r-c6-custom and Expert cc-harness-t20r (409 'Resource is referenced by unfinished work': job 4d68f156 is pending_review); REST job 3cccdce9 pending_review; workspace Pods workspace-4d68f156-4e1 and workspace-3cccdce9-b54 (plus workspace-4a5dfc50-841 and workspace-ec824a47-c79 from the first run); all first-run Experts and Jobs listed above; registry/podman tag srw-harness-claude-code:t20r"
+    }
+  }
+}

@@ -31,7 +31,6 @@ from agent.services.memory import (
     CaptureEvent,
     InjectionBlock,
     MemoryManager,
-    MemoryPayload,
     MemoryRuntime,
     Scored,
     UnknownMemoryPluginError,
@@ -244,13 +243,24 @@ class TestFromConfig:
         with pytest.raises(UnknownMemoryPluginError, match="missing"):
             MemoryManager.from_config(cfg, MemoryRuntime())
 
+    def test_the_old_two_tier_name_binds_the_hybrid_retriever(self):
+        # Stored and frozen configs still name recall_two_tier (D36).
+        from agent.services.memory.plugins.legacy import RecallHybridRetriever
+
+        cfg = MemoryConfig(
+            pipeline=MemoryPipelineConfig(retrievers=["recall_two_tier"])
+        )
+        manager = MemoryManager.from_config(cfg, MemoryRuntime())
+        [(name, retriever)] = manager._retrievers
+        assert name == "recall_two_tier"
+        assert isinstance(retriever, RecallHybridRetriever)
+
     @pytest.mark.asyncio
     async def test_empty_pipeline_binds_noop_manager(self):
         manager = MemoryManager.from_config(MemoryConfig(), MemoryRuntime())
         payload = await manager.assemble(AssembleRequest(query_text="anything"))
         assert payload.blocks == []
         assert payload.stats.errors == []
-        assert payload.messages() == []
         # capture is a no-op too — must not raise
         await manager.capture(CaptureEvent(kind="turn_end"))
         assert manager.extension_tools() == []
@@ -319,7 +329,7 @@ class TestAssemble:
     @pytest.mark.asyncio
     async def test_blocks_carry_their_store_records_in_rank_order(self):
         # Append-only context injection renders its own entries from the
-        # records; the legacy content/messages stay as they were.
+        # records; the manager renders nothing itself.
         mem = make_candidate(kind="memory", text="m-fact", record_id="m1")
         kb1 = make_candidate(kind="knowledge", text="k-one", record_id="k1")
         kb2 = make_candidate(kind="knowledge", text="k-two", record_id="k2")
@@ -335,8 +345,6 @@ class TestAssemble:
         by_kind = {b.kind: b for b in payload.blocks}
         assert by_kind["memory"].records == [mem.record]
         assert by_kind["knowledge"].records == [kb1.record, kb2.record]
-        assert by_kind["memory"].content
-        assert len(by_kind["memory"].messages) == 2
 
     def test_injection_block_records_default_empty(self):
         assert InjectionBlock(kind="memory").records == []
@@ -420,7 +428,6 @@ class TestAssemble:
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.stats.blocks == 1
         assert payload.blocks[0].kind == "exotic"
-        assert payload.blocks[0].messages == []
         assert payload.blocks[0].items[0]["record_id"] == "x1"
 
     @pytest.mark.asyncio
@@ -429,10 +436,10 @@ class TestAssemble:
             MemoryRuntime(), retrievers=[("r", FakeRetriever([make_candidate()]))]
         )
 
-        def _explode(req, items):
+        def _explode(items):
             raise RuntimeError("kernel bug")
 
-        monkeypatch.setattr(manager, "_render_blocks", _explode)
+        monkeypatch.setattr(manager, "_blocks_by_kind", _explode)
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.blocks == []
         assert payload.stats.errors == ["assemble:kernel: RuntimeError: kernel bug"]
@@ -442,17 +449,6 @@ class TestAssemble:
         manager = MemoryManager(MemoryRuntime())
         payload = await manager.assemble(AssembleRequest(query_text="q"))
         assert payload.stats.latency_ms >= 0.0
-
-    def test_payload_messages_flatten_in_block_order(self):
-        ai = AIMessage(content="", tool_calls=[{"name": "x", "args": {}, "id": "1"}])
-        tool = ToolMessage(content="block", tool_call_id="1")
-        payload = MemoryPayload(
-            blocks=[
-                InjectionBlock(kind="memory", messages=[ai, tool]),
-                InjectionBlock(kind="knowledge", messages=[]),
-            ]
-        )
-        assert payload.messages() == [ai, tool]
 
     def test_stats_to_dict_round_trip(self):
         stats = AssembleStats(
@@ -682,23 +678,19 @@ class TestRerankerScorer:
         assert client.calls[0]["json"]["model"] == "qwen3-reranker-8b"
 
     @pytest.mark.asyncio
-    async def test_pinned_stay_first_and_knowledge_passes_through(self):
-        client = FakeRerankClient(scores={"a": 0.2, "b": 0.8})
+    async def test_a_once_pinned_row_is_ranked_and_knowledge_passes_through(self):
+        # The TTL tier is retired (D36): a row an older pod still pins is
+        # ranked like any other memory.
+        client = FakeRerankClient(scores={"a": 0.2, "b": 0.8, "old pin": 0.5})
         scorer = self._scorer(client)
-        pinned = make_scored("working-set note", pinned=True)
+        pinned = make_scored("old pin", pinned=True)
         kb = make_scored("kb note", kind="knowledge")
         items = [pinned, make_scored("a"), kb, make_scored("b")]
 
         out = await scorer.score(AssembleRequest(query_text="q"), items)
 
-        assert [i.candidate.text for i in out] == [
-            "working-set note",
-            "b",
-            "a",
-            "kb note",
-        ]
-        # pinned item was not sent to the endpoint
-        assert client.calls[0]["json"]["documents"] == ["a", "b"]
+        assert [i.candidate.text for i in out] == ["b", "old pin", "a", "kb note"]
+        assert client.calls[0]["json"]["documents"] == ["old pin", "a", "b"]
 
     @pytest.mark.asyncio
     async def test_top_k_tail_keeps_original_order(self):
@@ -995,14 +987,12 @@ class TestRerankerScorer:
                     "model": "rerank-1",
                     "top_k": 32,
                     "timeout": 5,
-                    "keep_pinned_first": False,
                 }
             }
         )
         assert cfg.reranker.model == "rerank-1"
         assert cfg.reranker.top_k == 32
         assert cfg.reranker.timeout == 5.0
-        assert cfg.reranker.keep_pinned_first is False
         assert cfg.reranker.base_url is None
         # defaults when section absent
         # null = the `rerank` catalog pin (RERANK_MODEL) resolves at bind time

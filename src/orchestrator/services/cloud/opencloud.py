@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Mapping
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -34,6 +35,7 @@ from orchestrator.services.cloud._propfind import parse_propfind_entries
 from orchestrator.services.cloud.base import (
     CanaryFixture,
     CloudMountSubject,
+    DataPlaneToken,
     HealthStatus,
     RcloneMountSpec,
     RoReaderGrant,
@@ -100,6 +102,10 @@ _FOLDER_EDITOR_ROLE_WEIGHT = 60  # "Can edit" — subfolder invite
 _FOLDER_EDITOR_ROLE_NAME = "Can edit"
 _AGENT_HOME_SPACE_NAME = "srw-agent-home"
 _TOKEN_CLOCK_SKEW_SECONDS = 30.0
+#: A data-plane token handed to an executor has at least this long left;
+#: a shorter cached one is re-minted first, so the executor's refresh
+#: margin never meets an already-expired bearer.
+_DATA_PLANE_TOKEN_MIN_REMAINING_SECONDS = 120.0
 
 _NO_USER_READER = "no per-user read-only credential exists"
 
@@ -124,8 +130,10 @@ OPENCLOUD_CAPABILITIES = ProviderCapabilities(
             "offered",
             "the orchestrator's Keycloak service account, a member of every "
             "project Space; the workspace holds only its short-lived tokens, "
-            "which reach every project Space while they last",
-            frozenset({"sandbox"}),
+            "which reach every project Space while they last; a Virtual "
+            "Session's executor fetches each token from the orchestrator under "
+            "its claim lease and never holds the client secret",
+            frozenset({"sandbox", "virtual"}),
         ),
         CloudCapability(
             "cloud_folder",
@@ -172,8 +180,9 @@ OPENCLOUD_CAPABILITIES = ProviderCapabilities(
             "offered",
             "a folder SRW creates in its agent-home Space and shares with the "
             "execution's owner; a session's workspace holds short-lived tokens "
-            "of the orchestrator's service account",
-            frozenset({"sandbox"}),
+            "of the orchestrator's service account; a Virtual Session's "
+            "executor fetches them from the orchestrator under its claim lease",
+            frozenset({"sandbox", "virtual"}),
         ),
     ),
 )
@@ -1627,6 +1636,39 @@ class OpenCloudBackend:
                 time.monotonic() + float(expires_in) - _TOKEN_CLOCK_SKEW_SECONDS
             )
             return self._access_token
+
+    async def mint_data_plane_token(self, *, auth: Mapping[str, Any]) -> DataPlaneToken:
+        """The short-lived bearer for an ``auth`` payload of this backend's own
+        mount spec (``SupportsDataPlaneToken``): the service account's token
+        for ``keycloak_client_credentials``, the one the control plane uses,
+        re-minted when less than two minutes of it are left. Impersonation
+        (``keycloak_user_impersonation``) is not minted for a pooled
+        executor; no user-home level is offered on Virtual."""
+        self._ensure_ready()
+        kind = str(auth.get("type") or "")
+        if kind != "keycloak_client_credentials":
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_SUPPORTED,
+                f"no data-plane token is minted for auth kind {kind!r}",
+                backend=self.backend_id,
+            )
+        if (auth.get("client_id") or self._client_id) != self._client_id or (
+            str(auth.get("issuer") or self._keycloak_issuer).rstrip("/")
+            != self._keycloak_issuer
+        ):
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "the auth payload names another client or issuer",
+                backend=self.backend_id,
+            )
+        token = await self._get_service_token()
+        remaining = self._token_expires_at - time.monotonic()
+        if remaining < _DATA_PLANE_TOKEN_MIN_REMAINING_SECONDS:
+            async with self._token_lock:
+                self._access_token = None
+            token = await self._get_service_token()
+            remaining = self._token_expires_at - time.monotonic()
+        return DataPlaneToken(token=token, expires_in=max(0.0, remaining))
 
     async def _graph_get(
         self, path: str, *, params: Optional[dict[str, Any]] = None

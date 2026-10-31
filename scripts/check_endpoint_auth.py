@@ -126,6 +126,9 @@ GATE_NAMES = {
     "require_admin",
     "_require_infrastructure_fleet_admin",
     "is_internal_call",
+    # ``is_internal_call`` minus a delegated ``X-MCP-User-Id``: an MCP user's
+    # call carries the key too and falls through to the user gate after it.
+    "is_internal_service_call",
     "require_approved_user",
     "require_internal",
     "require_internal_or_job_access",
@@ -1126,6 +1129,7 @@ def _classify(
         "require_vm_cleanup_authority": 2,
         "require_vm_inventory_authority": 2,
         "is_internal_call": 2,
+        "is_internal_service_call": 2,
         "require_approved_user": 3,
     }
     primary = sorted(gates, key=lambda g: priority.get(g, 99))[0]
@@ -1141,6 +1145,7 @@ def _classify(
         "require_vm_cleanup_authority",
         "require_vm_inventory_authority",
         "is_internal_call",
+        "is_internal_service_call",
     ):
         return f"internal:{primary}"
     return f"gated:{primary}"

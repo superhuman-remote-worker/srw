@@ -8,7 +8,7 @@ import {WorkspacePickerComponent} from '../../agent-settings/workspace-picker.co
 import type {WorkspaceChoice} from '../../../core/models/workspace-template.model';
 import type {WorkspacePreview} from '../../../core/models/workspace.model';
 import type {WorkspaceCreationView} from '../../../core/models/api.model';
-import {workspaceCreationMessageKey} from '../../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../../core/util/workspace-creation';
 
 /** One suggestion chip, already resolved to the active language. */
 export interface DisplayedSuggestion {
@@ -43,7 +43,7 @@ export interface DisplayedSuggestion {
         <srw-vexillum class="empty-mark" />
       }
       <h2 class="empty-title">{{ titleKey() | transloco }}</h2>
-      <p class="empty-subtitle">{{ subtitleKey() | transloco }}</p>
+      <p class="empty-subtitle">{{ subtitleKey() | transloco: subtitleParams() }}</p>
 
       @if (variant() === 'recovery') {
         <div class="draft-workspace">
@@ -131,6 +131,11 @@ export class ChatEmptyStateComponent {
     this.workspaceCreation() && this.variant() === 'ready' ? workspaceCreationMessageKey(this.workspaceCreation()!) :
     this.variant() === 'recovery' ? 'chat.draft.recoveryBody' :
       this.variant() === 'draft' ? 'chat.draft.subtitle' : 'chat.empty.subtitle',
+  );
+  protected readonly subtitleParams = computed(() =>
+    this.workspaceCreation() && this.variant() === 'ready'
+      ? workspaceCreationMessageParams(this.workspaceCreation()!)
+      : {},
   );
 
   pick(s: DisplayedSuggestion): void {

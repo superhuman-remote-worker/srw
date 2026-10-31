@@ -510,7 +510,7 @@ class TestPureHelperParity:
         assert (
             job_start_bundle.PinnedJobMutationTarget._fields
             == job_mutation_target_module.PinnedJobMutationTarget._fields
-            == ("agent", "recipient")
+            == ("agent", "recipient", "capabilities")
         )
 
     @pytest.mark.parametrize(
@@ -2337,6 +2337,8 @@ class TestDispatchCredentialComposition:
             max_output_tokens=None,
             transport_kind=None,
             subscription_sources=None,
+            served_model_id=None,
+            client_protocol=None,
         )
         resolve = AsyncMock(return_value=meta)
         monkeypatch.setattr(model_registry_module, "resolve_model", resolve)

@@ -1,0 +1,74 @@
+---
+// Landing page. docs/README.md is the index GitHub shows for docs/; on the
+// site the sidebar and this page take that role.
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+
+import temple from '../../../docs/assets/brand/srw-temple-angle-1280.webp';
+import { REPO_URL } from '../site.mjs';
+---
+
+<StarlightPage
+	frontmatter={{
+		title: 'Superhuman Remote Worker',
+		description:
+			'Documentation for SRW, a self-hosted runtime for AI work: experts, workspaces and connectors on your own Kubernetes cluster.',
+		template: 'splash',
+		editUrl: false,
+		hero: {
+			title: 'Superhuman Remote Worker',
+			tagline:
+				'A self-hosted runtime for AI work. Pick an expert, give it a workspace and connectors, and SRW runs it on your Kubernetes cluster — as a live session or an autonomous job.',
+			image: { file: temple, alt: 'The SRW temple mark' },
+			actions: [
+				{ text: 'Get started', link: '/getting-started/', icon: 'right-arrow' },
+				{ text: 'Concepts', link: '/concepts/', variant: 'secondary' },
+				{ text: 'GitHub', link: REPO_URL, variant: 'minimal', icon: 'external' },
+			],
+		},
+	}}
+>
+	<h2>Three bricks and a runtime</h2>
+	<CardGrid>
+		<Card title="Expert" icon="puzzle">
+			A prompt, a model and a set of tools. SRW ships experts for research, development, writing,
+			review and everyday assistance; you can copy and change them or write your own.
+		</Card>
+		<Card title="Workspace" icon="laptop">
+			Where the work happens: no files at all, virtual file tools on object storage, a container
+			pod, or a full KubeVirt virtual machine.
+		</Card>
+		<Card title="Connector" icon="link">
+			What the agent may reach: repositories, databases, MCP servers, credentials, cloud folders
+			and knowledge bases, each bound with an access level you choose.
+		</Card>
+		<Card title="Runtime" icon="rocket">
+			The orchestrator, the agents and the Cockpit web app, installed as one Helm chart. It
+			provisions workspaces, enforces access and keeps an audit trail.
+		</Card>
+	</CardGrid>
+
+	<h2>Where to go next</h2>
+	<CardGrid>
+		<LinkCard
+			title="Get started"
+			href="/getting-started/"
+			description="Install SRW with the generated installer, or run it locally on k3d."
+		/>
+		<LinkCard
+			title="Concepts"
+			href="/concepts/"
+			description="Sessions and jobs, phases, autonomy levels, projects and delegation."
+		/>
+		<LinkCard
+			title="Troubleshooting"
+			href="/troubleshooting/"
+			description="Symptoms, causes and fixes for the problems new installs hit most."
+		/>
+		<LinkCard
+			title="Helm values"
+			href="/reference/helm-values/"
+			description="Every chart value with its type, default and description."
+		/>
+	</CardGrid>
+</StarlightPage>

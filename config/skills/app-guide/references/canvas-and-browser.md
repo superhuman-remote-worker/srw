@@ -33,11 +33,14 @@ viewer.
 For a user asking the agent to open a site, click through a page, or use an
 online service, explain the setup path if browser tools are missing:
 
-1. Open the chat header's **Settings** (sliders icon), or on a narrow screen
-   choose **Settings** from the header's three-dot menu.
-2. In the **Settings** tab, check **Workspace**. A running session can't
-   upgrade to a Container: start a new Container session for the direct
-   browser. A Virtual session can upgrade to a **VM** when VMs are allowed;
+1. Open **Session settings** from the chat header's **More actions** (⋮)
+   menu, or click the model or permission-mode badge in the header.
+2. In the **Settings** tab, check **Workspace**. A Virtual or None session
+   served by the shared executors can upgrade to a **Container** in place
+   (choose **Container** and wait for it to finish); a session whose Container
+   choice says **not available in this session** can't, so start a new
+   Container session for the direct browser. A Virtual or None session can also upgrade to a **VM** in place
+   when VMs are allowed (including one served by the shared executors);
    confirm **Upgrade** and wait for it to finish. This carries existing files
    over and keeps the conversation. There is no live Advanced tab.
 3. Under **Tools**, enable **Browser** if it is off. The direct-browser tools
@@ -103,6 +106,10 @@ an opaque, no-network sandbox with no forms, popups, storage, parent-page
 access, or external and sibling resources; every CSS, script, image, and font
 must be in the one bounded HTML file. It is an isolated artifact, not a live
 workspace application.
+
+A static HTML preview says that it hides scripts and styles. **Download** in
+the Canvas toolbar saves any presented file, so the user can open the page in
+their own browser as it was written.
 
 An Office document is detected from the file itself, so `auto` is enough and
 no other renderer will accept it. On a deployment without the Office editor

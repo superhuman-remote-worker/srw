@@ -1,0 +1,16 @@
+id: s19-number-in-pairs
+title: A fast caller leaves a callback number on a mobile
+why: A mobile number said quickly in groups, inside a message.
+categories: [messages, phone_numbers, names]
+voice: m-young-fast
+condition: mobile
+turns:
+  - say: Bitte sagen Sie Herrn Beispiel, er soll mich zurückrufen, unter null eins fünf zwei, zwei acht acht, eins sieben, drei acht sechs.
+    expect:
+      outcome: message
+      values:
+        - {name: Beispiel, in: request}
+        - {phone: "0152 28817386", in: request}
+    back_office:
+      answer: Herr Beispiel ruft Sie heute noch zurück.
+      after: 4

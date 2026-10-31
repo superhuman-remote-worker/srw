@@ -1,0 +1,36 @@
+# The bench's judge (Qwen3-ASR 0.6B, docker/voice-models/compose.yaml
+# `--profile judge`) on the CPU, for when the GPU is full with a cascade
+# profile's servers. Its own compose project, so the profile's running
+# servers are never touched:
+#
+#   VOICE_MODELS_DIR=~/.cache/srw-voice-models docker compose \
+#     -f docker/voice-models/compose.yaml -f tests/voice_bench/evalset/judge-cpu.yaml \
+#     -p srw-voice-eval-judge --profile judge up -d judge
+#
+# It answers on 127.0.0.1:${VOICE_EVAL_JUDGE_PORT:-18495}; scripts/voice-eval.sh
+# starts and stops it with `judge up|down`.
+services:
+  judge-model:
+    devices: !reset []
+    command: !override
+      - --model
+      - /models/Qwen3-ASR-0.6B-Q8_0.gguf
+      - --mmproj
+      - /models/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-gpu-layers
+      - "0"
+      - --threads
+      - "${VOICE_EVAL_JUDGE_THREADS:-8}"
+      - --parallel
+      - "1"
+      - --ctx-size
+      - "4096"
+    restart: "no"
+  judge:
+    ports: !override
+      - "127.0.0.1:${VOICE_EVAL_JUDGE_PORT:-18495}:8000"
+    restart: "no"

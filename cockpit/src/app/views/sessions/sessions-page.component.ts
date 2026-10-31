@@ -1,4 +1,4 @@
-import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, DestroyRef, inject, linkedSignal, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
 import {TitleCasePipe} from '@angular/common';
@@ -8,14 +8,15 @@ import {environment} from '../../core/environment';
 import {conferenceLauncherCommands} from '../../core/officer/conference';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {classifyResumeError} from '../../core/services/resume-error';
-import {ModelService} from '../../core/services/model.service';
+import {chatModelLabel, ModelService} from '../../core/services/model.service';
 import {SessionListService} from '../../core/services/session-list.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {Thread} from '../../core/models/api.model';
+import {DEFAULT_PERMISSION_MODE} from '../../core/models/permission-mode';
 import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
-import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -109,7 +110,7 @@ const ENDING_POLL_MAX_MS = 15_000;
               @for (group of modelService.models(); track group.group) {
                 <optgroup [label]="group.group">
                   @for (model of group.models; track model) {
-                    <option [value]="model">{{ model }}</option>
+                    <option [value]="model">{{ modelLabel(group, model) }}</option>
                   }
                 </optgroup>
               }
@@ -132,7 +133,7 @@ const ENDING_POLL_MAX_MS = 15_000;
           </app-form-field>
           <app-form-field [label]="'sessions.create.permissionLabel' | transloco">
             <app-select [(value)]="newPermission">
-              <option value="supervised">{{ 'sessions.create.permissionSupervised' | transloco }}</option>
+              <option value="read_only">{{ 'sessions.create.permissionReadOnly' | transloco }}</option>
               <option value="auto_accept">{{ 'sessions.create.permissionAutoAccept' | transloco }}</option>
               <option value="autonomous">{{ 'sessions.create.permissionAutonomous' | transloco }}</option>
             </app-select>
@@ -215,7 +216,7 @@ const ENDING_POLL_MAX_MS = 15_000;
               }
               @if (thread.workspace_creation; as creation) {
                 <div class="session-workspace-creation" [class.attention]="creation.state === 'attention'" role="status">
-                  {{ workspaceCreationMessageKey(creation) | transloco }}
+                  {{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}
                 </div>
               }
               <div class="session-actions">
@@ -585,17 +586,36 @@ const ENDING_POLL_MAX_MS = 15_000;
 })
 export class SessionsPageComponent implements OnInit {
     readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
+    readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
     private readonly http = inject(HttpClient);
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
     readonly modelService = inject(ModelService);
+    /** Option text: the catalog label; the value stays the model id. */
+    readonly modelLabel = chatModelLabel;
     readonly chat = inject(PersistentChatService);
     private readonly transloco = inject(TranslocoService);
     private readonly sessionList = inject(SessionListService);
 
-    threads = signal<Thread[]>([]);
+    /**
+     * The shared list, as this page shows it. Linked rather than copied: the
+     * rail's session menu ends, renames and deletes sessions too and refreshes
+     * only the shared list, so a copy kept cards for sessions already gone.
+     * Still writable, for this page's optimistic edits.
+     */
+    threads = linkedSignal<Thread[]>(() =>
+        this.sessionList.threads()
+            // The server filters children, but keep the mutation-heavy
+            // session controls fail-closed against an older/cached list.
+            .filter(thread => thread.kind !== 'subagent')
+            .map(thread =>
+                thread.runtime_retirement_pending === true
+                    ? { ...thread, status: 'ending' as const }
+                    : thread,
+            ),
+    );
     projects = signal<Project[]>([]);
     loading = signal(true);
     creating = signal(false);
@@ -625,7 +645,7 @@ export class SessionsPageComponent implements OnInit {
     newTitle = '';
     newConfig = 'session_base';
     newModel = this.loadSavedSessionModel();
-    newPermission = 'supervised';
+    newPermission: string = DEFAULT_PERMISSION_MODE;
 
     filteredThreads = () => {
         const filter = this.statusFilter();
@@ -663,25 +683,15 @@ export class SessionsPageComponent implements OnInit {
     /**
      * Re-read the list without the loading placeholder (which would swap the
      * whole list out on every poll), then re-arm or stop the ending poll.
+     * `threads` follows the shared list by itself.
      */
     private async refreshThreads(): Promise<void> {
         // No try/catch: SessionListService.refresh() never rejects — both its
         // success and failure paths resolve, updating its own signals either
         // way (a failed fetch leaves sessionList.threads() as whatever it
-        // already had, so re-reading it below is safe on either outcome).
+        // already had, so the steps below are safe on either outcome).
         await this.sessionList.refresh();
         if (this.destroyed) return;
-        this.threads.set(
-            this.sessionList.threads()
-                // The server filters children, but keep the mutation-heavy
-                // session controls fail-closed against an older/cached list.
-                .filter(thread => thread.kind !== 'subagent')
-                .map(thread =>
-                    thread.runtime_retirement_pending === true
-                        ? { ...thread, status: 'ending' as const }
-                        : thread,
-                ),
-        );
         this.dropSettledDeleteRetries();
         this.syncEndingPoll();
     }
@@ -832,20 +842,12 @@ export class SessionsPageComponent implements OnInit {
     async onRenameThread(thread: Thread, title: string): Promise<void> {
         const previous = thread.title;
         // Optimistic: update the card immediately, revert if the PATCH fails.
-        // This page's own `threads` is a filtered/mapped snapshot of
-        // SessionListService, not a computed over it (see loadThreads), so it
-        // doesn't pick up sessionList.renameLocal below for free — both need
-        // the explicit update, and both revert together on failure.
-        this.threads.update((list) =>
-            list.map((t) => (t.id === thread.id ? {...t, title} : t)),
-        );
+        // Through the shared list, which `threads` follows — the rail shows
+        // the same title.
         this.sessionList.renameLocal(thread.id, title);
         try {
             await this.chat.renameThread(thread.id, title);
         } catch (e) {
-            this.threads.update((list) =>
-                list.map((t) => (t.id === thread.id ? {...t, title: previous} : t)),
-            );
             this.sessionList.renameLocal(thread.id, previous);
             this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
         }

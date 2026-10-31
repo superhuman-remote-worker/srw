@@ -1615,6 +1615,15 @@ def patched_main_subs(monkeypatch):
                 api_key_ref="openai",
                 subscription_sources=("claude",),
             )
+        if model_id == "native-anthropic":
+            return ModelMeta(
+                model_id=model_id,
+                provider="anthropic",
+                family="claude-opus",
+                display_name=model_id,
+                origin="system",
+                api_key_ref="anthropic",
+            )
         return None
 
     monkeypatch.setattr(
@@ -1655,6 +1664,54 @@ def patched_main_subs(monkeypatch):
 
 
 class TestRouteHeaderInjection:
+    @pytest.mark.asyncio
+    async def test_job_dispatch_writes_the_effective_client_protocol(
+        self, patched_main_subs
+    ):
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "claude-opus-5"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        assert result["llm"]["client_protocol"] == "openai-chat"
+
+    @pytest.mark.asyncio
+    async def test_job_dispatch_writes_anthropic_messages_for_an_anthropic_row(
+        self, patched_main_subs
+    ):
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "native-anthropic"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        assert result["llm"]["client_protocol"] == "anthropic-messages"
+
+    @pytest.mark.asyncio
+    async def test_delivered_blob_llm_carries_the_client_protocol(
+        self, patched_main_subs
+    ):
+        """A harness reads ``resolved_config["agent"]["llm"]``, so the value
+        must survive ``inject_blob_credentials``' merge into the blob."""
+        from orchestrator.services.config_resolver import inject_blob_credentials
+
+        blob = {"agent": {"llm": {"model": "native-anthropic"}}}
+        delivered = await inject_blob_credentials(
+            blob,
+            lambda co: job_dispatch_credentials_module.inject_dispatch_credentials(
+                _job(),
+                co,
+                dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
+            ),
+        )
+        assert delivered["agent"]["llm"]["client_protocol"] == "anthropic-messages"
+        assert "client_protocol" not in blob["agent"]["llm"]
+
     @pytest.mark.asyncio
     async def test_claude_sourced_model_gets_visible_thinking_betas(
         self, patched_main_subs

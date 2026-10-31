@@ -20,6 +20,12 @@ when no lock is held), so the planner itself only reads:
   owner without an outbox connector) or no main cloud is active: it
   converts at a later pass. A protected or officer session is left alone
   (slice 5 moves protected).
+* **What Virtual left out** (:func:`restore_virtual_exclusions`). A
+  session created on Virtual records the cloud folders its tier could not
+  serve (``cloud_mount_status.excluded``, detail ``virtual_workspace``).
+  Once it runs on a Container or VM (an upgrade in place), its next new Pod
+  or in-workspace delivery adds exactly those back, authorized again for
+  its owner and its new tier, and drops the record (owner 2026-10-21).
 * **The session's outbox folder** (:func:`create_session_outbox`,
   :func:`prepare_session_outbox`). Admission creates it only when the
   outbox is selected; a failure is recorded on the session
@@ -55,17 +61,24 @@ from orchestrator.services.cloud_connector_mounts import (
     CLOUD_MOUNT_RULE_KEY,
     CLOUD_OUTBOX_KEY,
     CONNECTOR_RULE,
+    VIRTUAL_WORKSPACE_DETAIL,
     outbox_record,
     selected_cloud_connectors,
     selected_ids,
     uses_connector_rule,
+    virtual_workspace_exclusions,
 )
+from orchestrator.services.cloud_mount_status import STATUS_KEY
 from orchestrator.services.connector_drivers.cloud_outbox import CloudOutboxDriver
 from orchestrator.services.officer_metadata import officer_meta_enabled
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
 )
-from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.stateless_workspace_gate import (
+    declared_thread_workspace_backend,
+    thread_metadata_object,
+)
+from shared.backend_kinds import LITE_BACKENDS
 from shared.connectors.platform import CLOUD_OUTBOX, managed_key, project_cloud_key
 
 logger = logging.getLogger(__name__)
@@ -273,6 +286,137 @@ async def convert_to_connector_rule(
         ", ".join(added) or "none",
     )
     return await store.get_thread(thread_id)
+
+
+async def restore_virtual_exclusions(
+    thread: Mapping[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None,
+    store: Any,
+) -> dict[str, Any] | None:
+    """Give a session that moved from Virtual to a Container or VM the cloud
+    folders its creation left out, once; the thread as it now is, or
+    ``None`` when nothing was written.
+
+    Only those its record names (``virtual_workspace``): Virtual never let
+    them attach, so none of them was removed by hand. Each is authorized
+    again for its owner and its new tier and appended to the selection as
+    it is then (``add_thread_datasource_ids``); one the owner may no longer
+    attach is not added. The record is then dropped, since its reason no
+    longer holds. A selection that no longer authorises is tried again at
+    the next pass.
+    """
+    metadata = thread_metadata_object(thread)
+    left_out = virtual_workspace_exclusions(metadata)
+    if not left_out:
+        return None
+    backend = declared_thread_workspace_backend(thread)
+    if backend is None or backend in LITE_BACKENDS:
+        return None
+    from orchestrator.services.datasource_policy import (
+        DatasourceExecutionKindError,
+        DatasourceUnavailableError,
+        DatasourceWorkspaceTierError,
+        authorize_datasource_selection,
+    )
+    from orchestrator.services.thread_mount_rows import durable_project_ids
+
+    thread_id = str(thread["id"])
+    owner_id = str(thread["user_id"]) if thread.get("user_id") else None
+    ids = selected_ids(metadata)
+    project_ids = durable_project_ids(dict(thread), legacy_mounts=mount_rows)
+    candidates = [
+        cid
+        for cid in dict.fromkeys(str(e.get("source_ref") or "") for e in left_out)
+        if cid and cid not in ids
+    ]
+    added: list[str] = []
+    if candidates:
+        allowed = await selected_cloud_connectors(
+            thread, datasource_ids=candidates, project_ids=project_ids, store=store
+        )
+        added = [c.connector_id for c in allowed if c.eligible]
+    if added:
+        owner = await store.get_user(owner_id) if owner_id else None
+        try:
+            added, revisions = await authorize_datasource_selection(
+                store,
+                owner,
+                owner_id,
+                added,
+                project_ids,
+                backend,
+                allow_admin_explicit_override=owner is not None,
+                trusted_system_inheritance=owner is None,
+                execution_kind="session",
+            )
+        except (
+            DatasourceUnavailableError,
+            DatasourceWorkspaceTierError,
+            DatasourceExecutionKindError,
+        ):
+            logger.info(
+                "Session %s: the cloud folders Virtual left out no longer "
+                "authorise; they are restored at a later pass",
+                thread_id,
+            )
+            return None
+        written = await store.add_thread_datasource_ids(
+            thread_id,
+            added,
+            datasource_policy_revisions=revisions,
+            provenance={
+                "virtual_exclusions_restored": {
+                    "effective_work_owner_id": owner_id,
+                    "target_project_ids": project_ids,
+                    "workspace_backend": backend,
+                    "added": added,
+                    "policy_revisions": revisions,
+                    "resolved_at": _now().isoformat(),
+                }
+            },
+        )
+        if written is None:
+            return None
+    await _drop_virtual_exclusions(store, thread_id, metadata)
+    logger.info(
+        "Session %s: restored the cloud folders Virtual left out (added %d: %s)",
+        thread_id,
+        len(added),
+        ", ".join(added) or "none",
+    )
+    return await store.get_thread(thread_id)
+
+
+async def _drop_virtual_exclusions(
+    store: Any, thread_id: str, metadata: Mapping[str, Any]
+) -> None:
+    """The record without what Virtual left out; removed when nothing else
+    is in it. Never raises: the next Pod records its own plan anyway."""
+    setter = getattr(type(store), "set_thread_cloud_mount_status", None)
+    current = metadata.get(STATUS_KEY)
+    if not callable(setter) or not isinstance(current, Mapping):
+        return
+    excluded = [
+        entry
+        for entry in current.get("excluded") or []
+        if not (
+            isinstance(entry, Mapping)
+            and entry.get("detail") == VIRTUAL_WORKSPACE_DETAIL
+        )
+    ]
+    status: dict[str, Any] | None = {**current, "excluded": excluded}
+    if not excluded and not current.get("mounts") and not current.get("fingerprint"):
+        status = None
+    try:
+        await setter(store, thread_id, status)
+    except Exception:
+        logger.warning(
+            "Session %s: could not drop the cloud folders Virtual left out "
+            "from its record",
+            thread_id,
+            exc_info=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -615,4 +759,5 @@ __all__ = [
     "outbox_selected",
     "owner_outbox_id",
     "prepare_session_outbox",
+    "restore_virtual_exclusions",
 ]

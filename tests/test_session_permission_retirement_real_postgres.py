@@ -520,3 +520,34 @@ async def test_approval_wins_row_lock_race_without_expiry_receipt(pg):
     assert status == "approved"
     assert receipt_count == 0
     assert epoch == 3
+
+
+@pytest.mark.asyncio
+async def test_explicit_approval_id_resolves_only_this_sessions_thread(pg, monkeypatch):
+    """N29: a caller-supplied approval id from another thread is not decided."""
+    own_thread = await _seed_thread(pg, queue_token=1, queue_state="leased")
+    other_thread = await _seed_thread(pg, queue_token=1, queue_state="leased")
+    own_request = await _insert_permission(pg, own_thread, 1)
+    other_request = await _insert_permission(pg, other_thread, 1)
+    monkeypatch.setattr(persistent_app, "_session", SimpleNamespace(postgres_conn=pg))
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", str(own_thread))
+
+    foreign = await persistent_app._resolve_pending_permission(
+        "approved", approval_id=str(other_request)
+    )
+    own = await persistent_app._resolve_pending_permission(
+        "denied", approval_id=str(own_request)
+    )
+
+    async with pg.acquire() as conn:
+        statuses = dict(
+            await conn.fetch(
+                "SELECT id, status FROM thread_permission_requests "
+                "WHERE id = ANY($1::uuid[])",
+                [own_request, other_request],
+            )
+        )
+    assert foreign is None
+    assert statuses[other_request] == "pending"
+    assert own is not None and own["status"] == "denied"
+    assert statuses[own_request] == "denied"

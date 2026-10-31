@@ -42,6 +42,7 @@ def test_catalog_keys_and_defaults():
         "catalog_authoring",
         "complete_unmerged_pr",
         "unattended_operations",
+        "custom_harness_images",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
     assert CATALOG["personal_default_experts"]["default"] is True
@@ -65,12 +66,14 @@ def test_catalog_keys_and_defaults():
     # Deny-by-default and NOT backfilled: loops and officers are unbounded
     # unattended spend, and nobody held a key for them before.
     assert CATALOG["unattended_operations"]["default"] is False
+    # Deny-by-default, not backfilled: no one held it before.
+    assert CATALOG["custom_harness_images"]["default"] is False
 
 
 def test_meet_bool_enum_list():
     assert meet(CATALOG["vm_workspace"], True, False) is False
     assert meet(CATALOG["autonomy_ceiling"], "full", "review") == "review"
-    assert meet(CATALOG["permission_mode"], "autonomous", "supervised") == "supervised"
+    assert meet(CATALOG["permission_mode"], "autonomous", "read_only") == "read_only"
     assert meet(CATALOG["model_selection"], None, ["a", "b"]) == ["a", "b"]
     assert meet(CATALOG["model_selection"], ["a", "b"], ["b", "c"]) == ["b"]
 
@@ -195,7 +198,7 @@ def test_session_permission_mode_gated():
     # autonomous (fully unattended) is gated.
     v = evaluate({"interactive": {"permission_mode": "autonomous"}}, DEFAULTS)
     assert len(v) == 1 and "permission_mode" in v[0]
-    assert evaluate({"interactive": {"permission_mode": "supervised"}}, DEFAULTS) == []
+    assert evaluate({"interactive": {"permission_mode": "read_only"}}, DEFAULTS) == []
     assert evaluate({"interactive": {"permission_mode": "auto_accept"}}, DEFAULTS) == []
 
 
@@ -676,6 +679,10 @@ _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP = {
         "gates the terminal job transition against LIVE forge state at "
         "approve_job and the autonomous seal — there is no config fragment "
         "to strip, so evaluate() never reads it"
+    ),
+    "custom_harness_images": (
+        "gates generic Job admission in ManifestExecutionService.admit, not a "
+        "field evaluate() reads on an expert fragment"
     ),
 }
 

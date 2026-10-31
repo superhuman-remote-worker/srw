@@ -54,9 +54,10 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "a reader account allowed to read only this folder; on a VM its credential sits in the workspace's rclone config",
+            "note": "a reader account allowed to read only this folder; on a VM its credential sits in the workspace's rclone config, on a Virtual Session in the executor process, which also refuses writes",
             "workspace_backends": [
               "sandbox",
+              "virtual",
               "vm"
             ],
             "slice": null
@@ -76,17 +77,19 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "a writer account per project member that can read and write only this project's folder",
+            "note": "a writer account per project member that can read and write only this project's folder; on a Virtual Session it is held in the executor process for the session's turns",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           },
           "opencloud": {
             "status": "offered",
-            "note": "the orchestrator's Keycloak service account, a member of every project Space; the workspace holds only its short-lived tokens, which reach every project Space while they last",
+            "note": "the orchestrator's Keycloak service account, a member of every project Space; the workspace holds only its short-lived tokens, which reach every project Space while they last; a Virtual Session's executor fetches each token from the orchestrator under its claim lease and never holds the client secret",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           }
@@ -120,9 +123,10 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "a per-user app token for the user's own files, granted once by the user (Connect your cloud); it cannot be limited to read-only or to one folder",
+            "note": "a per-user app token for the user's own files, granted once by the user (Connect your cloud); it cannot be limited to read-only or to one folder; on a Virtual Session it is held in the pooled executor process and dropped when the session's turns leave it",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           },
@@ -229,17 +233,19 @@
         "cells": {
           "nextcloud": {
             "status": "offered",
-            "note": "a folder SRW creates in the agent-service account's home and shares with the execution's owner; a session mounts it with agent-service's credential (which can still write every project folder, until slice 7b), so not on a root VM",
+            "note": "a folder SRW creates in the agent-service account's home and shares with the execution's owner; a session mounts it with agent-service's credential (which can still write every project folder, until slice 7b), so not on a root VM; a Virtual Session holds that credential in the executor process",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           },
           "opencloud": {
             "status": "offered",
-            "note": "a folder SRW creates in its agent-home Space and shares with the execution's owner; a session's workspace holds short-lived tokens of the orchestrator's service account",
+            "note": "a folder SRW creates in its agent-home Space and shares with the execution's owner; a session's workspace holds short-lived tokens of the orchestrator's service account; a Virtual Session's executor fetches them from the orchestrator under its claim lease",
             "workspace_backends": [
-              "sandbox"
+              "sandbox",
+              "virtual"
             ],
             "slice": null
           }

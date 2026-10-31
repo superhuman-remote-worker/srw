@@ -1,0 +1,39 @@
+# Golden input for tests/test_voice_gateway_asterisk_render.py. The secret
+# files hold throwaway test values.
+sip:
+  port: 5062
+  local_net: [10.42.0.0/16, 192.168.10.0/24]
+  external_address: 192.168.10.50
+rtp:
+  start: 20000
+  end: 20019
+ari:
+  bind: 10.42.0.7:8088
+  user: srw
+  password_file: asterisk-password
+gateway:
+  media_uri: ws://voice-gateway.srw.svc:18441/media
+codecs: [alaw, g722]
+lines:
+  - name: reception
+    mode: register
+    pbx: 192.168.10.2
+    extension: "2000"
+    password_file: line-reception-password
+    connector_id: 00000000-0000-0000-0000-000000000001
+    webhook_secret_file: line-reception-webhook
+  - name: clinic
+    mode: register
+    pbx: pbx.example.internal:5070
+    domain: clinic.example
+    transport: tcp
+    extension: "ai-desk"
+    username: "auth-4711"
+    password_file: line-clinic-password
+    codecs: [ulaw]
+    dtmf_mode: auto_info
+  - name: hotline
+    mode: peer
+    pbx: 192.168.10.3
+    match: [192.168.10.3, 192.168.10.4]
+    extension: "31"

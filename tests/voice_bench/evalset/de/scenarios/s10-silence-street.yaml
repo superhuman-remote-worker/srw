@@ -1,0 +1,14 @@
+id: s10-silence-street
+title: Street noise and silence before the caller speaks
+why: Background noise alone is no turn (no phantom transcript, no reply), then a real question is.
+categories: [silence, facts]
+voice: m-young-fast
+condition: street
+turns:
+  - silence: 6.0
+    expect: {outcome: ignore}
+  - say: Hallo? Ich wollte wissen, ob ich bei Ihnen ein Elektroauto laden kann.
+    when: after_caller
+    expect:
+      outcome: answer
+      values: [{keyword: "lade|45|fünfundvierzig|kilowatt", in: reply}]

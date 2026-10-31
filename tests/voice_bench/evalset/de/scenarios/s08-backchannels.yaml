@@ -1,0 +1,23 @@
+id: s08-backchannels
+title: Backchannels while the voice talks
+why: '"Mhm" and "Ja, ja" over the voice are not turns: no barge-in, no new reply.'
+categories: [facts, backchannels]
+voice: m-middle
+condition: g711a
+turns:
+  - say: Was gibt es bei Ihnen alles zum Frühstück, und bis wann?
+    expect:
+      outcome: answer
+      values: [{keyword: "10:30|1030|zehn uhr dreißig|halb elf", in: reply}]
+  - utterance: bch-01
+    when: during_voice
+    offset: 0.8
+    expect: {outcome: ignore}
+  - say: Und am Wochenende?
+    expect:
+      outcome: answer
+      values: [{keyword: "11|elf", in: reply}]
+  - utterance: bch-03
+    when: during_voice
+    offset: 0.6
+    expect: {outcome: ignore}

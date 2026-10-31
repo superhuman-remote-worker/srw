@@ -5,6 +5,8 @@ Four auth paths, tried in this order:
    transparent. See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md.
 2. Bearer token (OIDC) — Keycloak access token. Transitional during the
    cockpit cutover; will remain for direct API consumers and for tests.
+   Only access tokens issued to an allowed client (``azp``) or for an
+   allowed audience are accepted; see ``security/oidc.py``.
 3. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged).
 4. X-MCP-User-Id + X-Internal-Key — forwarded by the MCP server after
    it has already authenticated the caller via OAuth or API token.
@@ -18,7 +20,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, UTC
 from typing import Any
 
@@ -352,8 +354,9 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             )
             if needs_update.get("is_approved"):
                 # Admitted on this request: the user's own session outbox and
-                # cloud root.
+                # cloud root, and their default project's knowledge vault.
                 await _ensure_user_cloud_connectors(db, user.get("id"))
+                _schedule_default_project_vault(user)
             if needs_update.get("is_admin"):
                 # Promotion to admin: seed max-level grants so the grants data
                 # (and UI) reflect the bypass instead of an empty list that
@@ -388,7 +391,9 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
     if effective_approved:
         # Approved on first login (admin, or a legacy `user` role-holder):
         # pre-provision cloud + Gitea so their first thread/repo finds them,
-        # and give them their session outbox and cloud root.
+        # give them their session outbox and cloud root, and their default
+        # project's knowledge vault (after the Gitea account, which the vault's
+        # owner grant needs).
         await _ensure_user_cloud_connectors(db, user.get("id"))
         asyncio.create_task(
             _ensure_cloud_user(
@@ -402,7 +407,8 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             )
         )
         asyncio.create_task(
-            _ensure_gitea_user(
+            _ensure_gitea_user_then_vault(
+                user,
                 sub=sub,
                 email=email,
                 preferred_username=preferred_username,
@@ -429,21 +435,25 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
 
 
 async def ensure_user_provisioned(user_row: dict) -> None:
-    """Fire cloud + Gitea ensure-user for an approved user from row data.
+    """Fire cloud + Gitea ensure-user and the default project's knowledge vault
+    for an approved user from row data.
 
     Approval-time provisioning for app-side admission. The JIT ensures only
     fire for users approved at first login; an app-side-approved user never
     re-triggers them (the Keycloak ``user`` role is never assigned, so every
     later login takes the existing-user branch). This is therefore the
-    provisioning path for users admitted via the cockpit. Both ensures are
-    idempotent, so re-running for an already-provisioned user is harmless.
+    provisioning path for users admitted via the cockpit. All three ensures
+    are idempotent, so re-running for an already-provisioned user is harmless.
 
-    Best-effort and non-blocking: the two ensures swallow and log their own
-    errors. A row without a ``keycloak_sub`` (admin-created / pre-OIDC) is
-    skipped — it provisions on its owner's first real OIDC login instead.
+    Best-effort and non-blocking: the ensures swallow and log their own
+    errors. A row without a ``keycloak_sub`` (admin-created / pre-OIDC) gets
+    no cloud or Gitea account — it provisions those on its owner's first real
+    OIDC login instead — but its default project's vault is not tied to an
+    identity, so that is ensured either way.
     """
     sub = (user_row.get("keycloak_sub") or "").strip()
     if not sub:
+        _schedule_default_project_vault(user_row)
         return
     email = user_row.get("email") or ""
     display_name = user_row.get("display_name") or (
@@ -460,7 +470,8 @@ async def ensure_user_provisioned(user_row: dict) -> None:
         )
     )
     asyncio.create_task(
-        _ensure_gitea_user(
+        _ensure_gitea_user_then_vault(
+            user_row,
             sub=sub,
             email=email,
             preferred_username=preferred_username,
@@ -587,9 +598,9 @@ def _client_ip(request: Request) -> str | None:
 
 
 # Optional provisioning backends, bound once by application composition
-# (``orchestrator.main``). Two named callables, deliberately not a context
-# object: these helpers run as detached ``asyncio`` tasks with no request scope,
-# so they cannot receive the collaborators through a dependency the way the
+# (``create_app``). Named callables, deliberately not a context object: these
+# helpers run as detached ``asyncio`` tasks with no request scope, so they
+# cannot receive the collaborators through a dependency the way the
 # request-path adapters do.
 #
 # Unbound means "no backend configured", which is the same observable outcome as
@@ -598,17 +609,24 @@ def _client_ip(request: Request) -> str | None:
 # composition bug, not a deployment shape.
 _cloud_router_provider: Callable[[], Any] | None = None
 _forge_provider: Callable[[], Any] | None = None
+# Schedules the knowledge-vault ensure for an admitted user's default project
+# (``default_project_knowledge.schedule_default_project_knowledge`` over the
+# application's provisioning ports). Takes the user row; returns at once.
+_default_project_vault_provider: Callable[[Mapping[str, Any]], Any] | None = None
 
 
 def set_provisioning_backends(
     *,
     cloud_router: Callable[[], Any] | None,
     forge: Callable[[], Any] | None,
+    default_project_vault: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> None:
-    """Bind the optional cloud/forge provisioning backends."""
-    global _cloud_router_provider, _forge_provider
+    """Bind the optional cloud/forge provisioning backends and the
+    default-project vault scheduler."""
+    global _cloud_router_provider, _forge_provider, _default_project_vault_provider
     _cloud_router_provider = cloud_router
     _forge_provider = forge
+    _default_project_vault_provider = default_project_vault
 
 
 def _resolve_provisioning_backend(
@@ -736,6 +754,53 @@ async def _ensure_gitea_user(
         )
     except Exception as e:
         logger.warning("Gitea ensure_user failed for email=%s: %s", email, e)
+
+
+def _schedule_default_project_vault(user: Mapping[str, Any]) -> None:
+    """Ensure an admitted user's default project has its knowledge vault.
+
+    A bare ``kb_write`` lands in the default project, so one without a vault
+    refuses every note. The ensure runs in the background, is a no-op when the
+    vault exists and never fails the login; the startup backfill retries
+    whatever it misses.
+    """
+    schedule = _default_project_vault_provider
+    if schedule is None:
+        logger.warning(
+            "default-project vault provisioning backend is unbound; skipping "
+            "(application composition did not call set_provisioning_backends)"
+        )
+        return
+    try:
+        schedule(user)
+    except Exception as e:
+        logger.warning(
+            "Knowledge vault for user %s's default project not scheduled: %s",
+            user.get("id"),
+            e,
+        )
+
+
+async def _ensure_gitea_user_then_vault(
+    user: Mapping[str, Any],
+    *,
+    sub: str,
+    email: str,
+    preferred_username: str | None,
+    display_name: str,
+) -> None:
+    """The user's Gitea account, then their default project's vault.
+
+    In this order because the vault grants its owner read access by Gitea
+    account, which a first-time user only has once the ensure ran.
+    """
+    await _ensure_gitea_user(
+        sub=sub,
+        email=email,
+        preferred_username=preferred_username,
+        display_name=display_name,
+    )
+    _schedule_default_project_vault(user)
 
 
 async def _get_user_from_mcp_headers(request: Request, db) -> dict:

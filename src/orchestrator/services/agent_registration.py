@@ -115,7 +115,9 @@ class AgentRegistrationDependencies:
     # Guards and audit (orchestrator.security.access, bound by main).
     require_internal: Callable[[Request], Awaitable[None]]
     require_admin: Callable[[Request], Awaitable[dict[str, Any]]]
-    is_internal_call: Callable[[Request], bool]
+    # A valid internal key WITHOUT a delegated user: the agent's own call,
+    # never an MCP user's (``access.is_internal_service_call``).
+    is_internal_service_call: Callable[[Request], bool]
     log_security_event: Callable[..., Awaitable[Any]]
 
     # Import-time flags as callables (§P1).
@@ -216,6 +218,7 @@ async def register_agent(
             agent_mode=registration.agent_mode,
             thread_id=registration.thread_id,
             build_sha=registration.build_sha,
+            image=registration.image,
             product_provenance=registration.product_provenance.model_dump(mode="json"),
             pod_uid=registration.pod_uid,
             completion_commands_enabled=dependencies.completion_commands_enabled(),

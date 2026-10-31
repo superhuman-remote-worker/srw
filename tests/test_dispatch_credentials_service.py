@@ -631,6 +631,18 @@ class TestResolutionPrecedence:
         assert section["provider"] == "openrouter"
 
     @pytest.mark.asyncio
+    async def test_session_section_carries_the_client_protocol(self, patched_main):
+        section: dict = {}
+        await dc.inject_model_credentials(
+            section=section,
+            model_id="router-chat",
+            user_id="u",
+            resolved_keys=dict(USER_KEYS),
+            dependencies=_deps(),
+        )
+        assert section["client_protocol"] == "openai-chat"
+
+    @pytest.mark.asyncio
     async def test_no_key_map_entry_means_no_key(self, patched_main):
         """A provider absent from the map leaves the section keyless, not guessed."""
         section: dict = {}
@@ -764,6 +776,44 @@ class TestResolutionPrecedence:
         assert from_setting["env_keys"]["RERANK_MODEL"] == "builtin-chat"
         assert from_system["env_keys"]["RERANK_MODEL"] == "sys-rerank"
         assert "RERANK_MODEL" not in (unpinned.get("env_keys") or {})
+
+    @pytest.mark.asyncio
+    async def test_whisper_reaches_sessions_like_jobs(self, patched_main):
+        # read_file transcribes audio with WHISPER_*; the job dispatch always
+        # injected it, the Session one never did, so audio failed with
+        # "Missing credentials" (session_unknown_tool_result_needs_admin.md).
+        patched_main.defaults.side_effect = _defaults(whisper="sys-whisper")
+        with patch(
+            "orchestrator.services.capability_credentials.resolve_capability_credentials",
+            AsyncMock(return_value=None),
+        ):
+            persisted = await dc.inject_thread_dispatch_credentials(
+                {"env_keys": {"WHISPER_MODEL": "endpoint-chat"}},
+                user_id="u",
+                project_id="p",
+                user_settings={"default_whisper_model": "builtin-chat"},
+                dependencies=_deps(),
+            )
+            from_setting = await dc.inject_thread_dispatch_credentials(
+                {},
+                user_id="u",
+                project_id="p",
+                user_settings={"default_whisper_model": "builtin-chat"},
+                dependencies=_deps(),
+            )
+            from_system = await dc.inject_thread_dispatch_credentials(
+                {}, user_id="u", project_id="p", user_settings={}, dependencies=_deps()
+            )
+            patched_main.defaults.side_effect = _defaults()
+            unpinned = await dc.inject_thread_dispatch_credentials(
+                {}, user_id="u", project_id="p", user_settings={}, dependencies=_deps()
+            )
+        assert persisted["env_keys"]["WHISPER_MODEL"] == "endpoint-chat"
+        assert persisted["env_keys"]["WHISPER_BASE_URL"] == ENDPOINT_BASE_URL
+        assert persisted["env_keys"]["WHISPER_API_KEY"] == ENDPOINT_KEY
+        assert from_setting["env_keys"]["WHISPER_MODEL"] == "builtin-chat"
+        assert from_system["env_keys"]["WHISPER_MODEL"] == "sys-whisper"
+        assert "WHISPER_MODEL" not in (unpinned.get("env_keys") or {})
 
     @pytest.mark.asyncio
     async def test_nested_roster_slots_are_credentialed_and_inherit_is_skipped(

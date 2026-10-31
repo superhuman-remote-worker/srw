@@ -75,6 +75,7 @@ from shared.run_queue.queries import (
     record_control_seq,
     record_input_seq,
     release_unit,
+    settle_parked_unit,
     unpark_unit,
 )
 from shared.run_queue.types import (
@@ -142,5 +143,6 @@ __all__ = [
     "record_control_seq",
     "record_input_seq",
     "release_unit",
+    "settle_parked_unit",
     "unpark_unit",
 ]

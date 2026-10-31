@@ -1,9 +1,10 @@
-import { ChangeDetectionStrategy, Component, input, output } from '@angular/core';
+import { ChangeDetectionStrategy, Component, inject, input, output } from '@angular/core';
 import { RouterLink } from '@angular/router';
 import { TranslocoPipe } from '@jsverse/transloco';
 import { AppIconComponent } from '../../../ui/icon';
 import { CloudFolderBinding, CloudFolderProblem } from '../../../core/util/cloud-mount-status';
 import { accessLevelLabelKey } from '../../../core/models/platform-connector';
+import { ChatPreferencesService } from '../../../core/services/chat-preferences.service';
 
 /**
  * This session's cloud folders, each with its binding state (main cloud
@@ -16,6 +17,11 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
  * A protected session whose cloud layer did not come up runs with no cloud
  * folder at all (decision 42): one line says the protected cloud is
  * unavailable, and why.
+ *
+ * Its title line folds it to that one line, and the fold holds on this
+ * device (ChatPreferencesService): the notice sits above the transcript in
+ * every session. Folded, it keeps its tone, so a folder that is not
+ * available still shows.
  *
  * Without `folders` (an older caller) it lists only the folders that are not
  * available (connector drivers D7). Its own component, like the cloud review
@@ -31,6 +37,7 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
       <div
         class="cfn"
         [class.cfn--ok]="!problems().length && !agentOutdated()"
+        [class.cfn--folded]="folded()"
         role="status"
         data-testid="cloud-folders-notice"
         [attr.aria-label]="'chat.cloudFolders.regionLabel' | transloco"
@@ -39,17 +46,33 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
           problems().length || agentOutdated() ? 'cloud_off' : 'cloud_done'
         }}</app-icon>
         <div class="cfn__body">
-          @if (protectedCloud() && problems().length) {
-            <p class="cfn__title" data-testid="cloud-folders-protected">
-              {{ 'chat.cloudFolders.protectedTitle' | transloco }}
-              <span class="cfn__sep" aria-hidden="true">·</span>
-              {{ 'chat.cloudFolders.reason.' + problems()[0].reason | transloco }}
-            </p>
+          <button
+            type="button"
+            class="cfn__head"
+            data-cloud-folders-toggle
+            [attr.aria-expanded]="!folded()"
+            (click)="toggleFolded()"
+          >
+            @if (protectedCloud() && problems().length) {
+              <span class="cfn__title" data-testid="cloud-folders-protected">
+                {{ 'chat.cloudFolders.protectedTitle' | transloco }}
+                <span class="cfn__sep" aria-hidden="true">·</span>
+                {{ 'chat.cloudFolders.reason.' + problems()[0].reason | transloco }}
+              </span>
+            } @else {
+              <span class="cfn__title">
+                {{ (problems().length ? 'chat.cloudFolders.title' : 'chat.cloudFolders.regionLabel') | transloco }}
+              </span>
+            }
+            <app-icon size="sm" class="cfn__chevron" aria-hidden="true">{{
+              folded() ? 'expand_more' : 'expand_less'
+            }}</app-icon>
+          </button>
+          @if (folded()) {
+            <!-- Folded: the title line alone. -->
+          } @else if (protectedCloud() && problems().length) {
             <p class="cfn__meta">{{ 'chat.cloudFolders.protectedMeta' | transloco }}</p>
           } @else if (folders().length) {
-            <p class="cfn__title">
-              {{ (problems().length ? 'chat.cloudFolders.title' : 'chat.cloudFolders.regionLabel') | transloco }}
-            </p>
             <ul class="cfn__list">
               @for (folder of folders(); track $index) {
                 <li
@@ -96,7 +119,6 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
               }
             </ul>
           } @else if (problems().length) {
-            <p class="cfn__title">{{ 'chat.cloudFolders.title' | transloco }}</p>
             <ul class="cfn__list">
               @for (problem of problems(); track $index) {
                 <li>
@@ -115,7 +137,7 @@ import { accessLevelLabelKey } from '../../../core/models/platform-connector';
               }
             </ul>
           }
-          @if (agentOutdated()) {
+          @if (agentOutdated() && !folded()) {
             <p class="cfn__meta">{{ 'chat.cloudFolders.agentOutdated' | transloco }}</p>
           }
         </div>
@@ -135,6 +157,13 @@ export class CloudFoldersNoticeComponent {
   /** The protected folder's link to its review: the host points at the
    *  review banner, the one place the review opens from. */
   showReview = output<void>();
+
+  private readonly prefs = inject(ChatPreferencesService);
+  readonly folded = this.prefs.cloudFoldersFolded;
+
+  toggleFolded(): void {
+    this.prefs.setCloudFoldersFolded(!this.folded());
+  }
 
   /** What a mounted folder is ("Project folder", "My cloud"), or null. */
   kindKey(folder: CloudFolderBinding): string | null {

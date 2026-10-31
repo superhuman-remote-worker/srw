@@ -82,6 +82,21 @@ a two-todo tactical phase, reads the verification guide at the completion
 boundary, then returns through `job_complete`. It fails closed the same way when
 a required tool is not bound.
 
+`workspace-command-worker` adds a real shell command without requiring a
+prepared image or an operator-created sentinel. It exclusively creates
+`.srw-a1-gate/<run-id>/sentinel` containing
+`SRW_WORKSPACE_SENTINEL:<run-id>\n`, then verifies the file hash. Replaying the
+command fails without replacing the file. Its next phase requires exit zero and
+the exact run-specific proof from the tool result. The same 90-second completion
+barrier holds `job_complete` until the host has independently checked the real
+workspace/runtime and calls `release-completion`.
+
+Arm this tool-only scenario with `required_responses: 0`; zero ordinary replies
+are allowed only for this scenario. Premature close is refused until the proof
+and terminal-tool stages finish. It is a single-life scenario and cannot be
+entered or left through `advance`; use a fresh run ID for a new case. The command
+is fixed by the fixture; the control API accepts no caller-supplied script.
+
 `prepared-workspace-job` extends that workflow with a real `run_command` call
 over the workspace SSH backend. It checks the prepared executable and the
 per-workspace initialization receipt, then writes an execution marker. Fresh

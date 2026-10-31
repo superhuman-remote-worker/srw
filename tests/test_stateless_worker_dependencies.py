@@ -26,12 +26,12 @@ def test_shared_postgres_checkpointer_dependencies_are_exactly_pinned() -> None:
         requirement
         for requirement in requirements
         if requirement.startswith("langgraph-checkpoint==")
-    ] == ["langgraph-checkpoint==4.1.1"]
+    ] == ["langgraph-checkpoint==4.3.0"]
     assert [
         requirement
         for requirement in requirements
         if requirement.startswith("langgraph-checkpoint-postgres")
-    ] == ["langgraph-checkpoint-postgres==3.1.1"]
+    ] == ["langgraph-checkpoint-postgres==3.1.3"]
     assert [
         requirement
         for requirement in requirements

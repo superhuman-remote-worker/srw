@@ -171,6 +171,8 @@ def test_queue_block_shapes_parked_and_idle():
         "retryable": True,
         "attempts": 3,
         "pending_input": True,
+        # Filled by queue_block_for_thread from the transcript.
+        "unknown_tool_calls": [],
     }
     refused = sqs.queue_block(
         {
@@ -519,7 +521,13 @@ def executor(monkeypatch):
     monkeypatch.setattr(ex, "_quiesce_claim_before_transition", AsyncMock())
     monkeypatch.setattr(ex, "_ack_terminal_claim_loss", AsyncMock())
     monkeypatch.setattr(ex, "_clear_claim_tool_effect", MagicMock())
-    monkeypatch.setattr(ex, "_exact_claim_handle_lost", MagicMock(return_value=True))
+    # The shared handle names every claim these tests release: its loss is
+    # the claim's own (the warm-replica case is pinned on real PostgreSQL).
+    monkeypatch.setattr(
+        ex,
+        "_exact_claim_handle_lost",
+        MagicMock(side_effect=lambda _claim: ex._lease.lost.is_set()),
+    )
     return ex
 
 
@@ -643,6 +651,35 @@ async def test_model_unavailable_parks_at_once_with_the_message(executor, monkey
     assert payload["error"] == message
     assert executor.test_conn.transactions == 1
     executor._clear_claim_tool_effect.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handle_token", [6, 7])
+async def test_model_unavailable_park_skips_only_for_this_claims_own_loss(
+    executor, monkeypatch, handle_token
+):
+    """The refusal comes from the claim bundle, before attach: on a warm
+    replica the shared handle still names the previous claim, which its old
+    fence marked lost. That loss is not this claim's (token 7)."""
+    monkeypatch.setattr(
+        executor,
+        "_exact_claim_handle_lost",
+        te.StatelessTurnExecutor._exact_claim_handle_lost.__get__(executor),
+    )
+    park = AsyncMock(return_value="parked")
+    monkeypatch.setattr(te, "park_unit", park)
+    monkeypatch.setattr(te, "append_system_frame", AsyncMock(return_value=(0, 1)))
+    executor._lease.update(UNIT, handle_token)
+    executor._lease.mark_lost()
+
+    await executor._park_model_unavailable(_claim(attempts=1), "model gone")
+
+    if handle_token == 6:
+        assert park.await_args.kwargs["lease_token"] == 7
+        executor._ack_terminal_claim_loss.assert_not_awaited()
+    else:
+        park.assert_not_awaited()
+        executor._ack_terminal_claim_loss.assert_awaited_once()
 
 
 @pytest.mark.asyncio

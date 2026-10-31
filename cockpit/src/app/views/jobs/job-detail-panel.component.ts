@@ -28,7 +28,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
-import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
+import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {LiveSession} from '../../core/models/live-session.model';
 import {JobLiveSessionPanelComponent} from './job-live-session-panel.component';
 
@@ -37,7 +37,13 @@ export type UsageScope = 'job' | 'subtree';
 
 /** Everything the panel loads lazily for one job, plus its load state. */
 export interface JobDetailState {
+  /** The first load only: there is nothing to show yet, so the panel shows a spinner. */
   loading: boolean;
+  /**
+   * A refresh is in flight. The panel keeps rendering what it has — swapping
+   * the figures for a spinner every poll made an open panel blink.
+   */
+  refreshing?: boolean;
   /** Set only when every lazy call failed — a partial load still renders. */
   error: boolean;
   detail: Job | null;
@@ -86,6 +92,21 @@ export function jobModelLabel(detail: Job | null): string | null {
   const llm = (override as Record<string, unknown> | null)?.['llm'];
   const model = (llm as Record<string, unknown> | null)?.['model'];
   return typeof model === 'string' && model.trim() ? model.trim() : null;
+}
+
+/**
+ * What the panel names a job's expert by.
+ *
+ * A DB (account/global) expert's job stores `config_name: 'worker_base'` — the
+ * framework root, which tells a reader nothing — and identifies the expert
+ * only by id, so the list carries its display name. A bundled expert has no
+ * display name there and keeps its config name; older rows carry neither.
+ */
+export function jobExpertLabel(
+  job: Pick<JobSummary, 'config_name' | 'expert_display_name'>,
+): string | null {
+  const name = job.expert_display_name?.trim();
+  return name || job.config_name || null;
 }
 
 function safeParse(value: string): Record<string, unknown> | null {
@@ -300,7 +321,7 @@ export function failureReason(
         </div>
         <div class="fact">
           <span class="fact-label">{{ 'jobs.detail.expert' | transloco }}</span>
-          <span class="fact-value">{{ job().config_name || '—' }}</span>
+          <span class="fact-value">{{ expertLabel() || '—' }}</span>
         </div>
         <div class="fact">
           <span class="fact-label">{{ 'jobs.detail.model' | transloco }}</span>
@@ -368,7 +389,7 @@ export function failureReason(
       }
       @if (workspaceCreation(); as creation) {
         <section class="recovery-detail" [class.attention]="creation.state === 'attention'" role="status">
-          <strong>{{ workspaceCreationMessageKey(creation) | transloco }}</strong>
+          <strong>{{ workspaceCreationMessageKey(creation) | transloco: workspaceCreationMessageParams(creation) }}</strong>
         </section>
       }
       @if (!workspaceCreation() && failureReason(job()); as failed) {
@@ -941,6 +962,7 @@ export function failureReason(
 export class JobDetailPanelComponent {
   readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
+  readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);
@@ -1086,6 +1108,7 @@ export class JobDetailPanelComponent {
    */
   readonly subtreeJobCount = computed(() => this.data()?.usageSubtree?.job_count ?? 0);
   readonly modelLabel = computed(() => jobModelLabel(this.data()?.detail ?? null));
+  readonly expertLabel = computed(() => jobExpertLabel(this.job()));
 
   readonly durationLabel = computed(() =>
     formatDurationSeconds(this.data()?.progress?.elapsed_seconds),

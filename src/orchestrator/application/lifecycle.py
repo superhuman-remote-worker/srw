@@ -148,7 +148,22 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
         seed_bundled_expert_manifests,
     )
 
+    from orchestrator.services.manifest_approved_images import (
+        ApprovedImagesConfigurationError,
+        validate_approved_images,
+    )
+
     resources.postgres_db.manifest_runtime_image = installed_srw_image()
+    # The approved harness images, read by dispatch to tell a custom-image pod
+    # from a default one. An invalid list approves nothing; admission reports
+    # the same error to whoever submits an approved image.
+    try:
+        resources.postgres_db.manifest_approved_images = validate_approved_images(
+            os.environ.get("MANIFEST_APPROVED_IMAGES", "[]")
+        )
+    except ApprovedImagesConfigurationError as exc:
+        logger.warning("%s No harness image is approved.", exc)
+        resources.postgres_db.manifest_approved_images = ()
     # The datasource write-through describes a row's Connector with the
     # application's own drivers (manifest_connectors).
     resources.postgres_db.connector_drivers = resources.connector_drivers

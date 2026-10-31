@@ -74,8 +74,8 @@ _CLAIM_RACE_ROUNDS = 32
 _ROTATION_ROUNDS = 25
 _EXACT_DEPENDENCIES = {
     "langgraph": "1.2.10",
-    "langgraph-checkpoint": "4.1.1",
-    "langgraph-checkpoint-postgres": "3.1.1",
+    "langgraph-checkpoint": "4.3.0",
+    "langgraph-checkpoint-postgres": "3.1.3",
     "psycopg-pool": "3.3.1",
 }
 

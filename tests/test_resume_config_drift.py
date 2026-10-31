@@ -169,7 +169,7 @@ class TestResumeConfigDrift:
 
         thread = _ended_thread(thread_a)
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -191,7 +191,7 @@ class TestResumeConfigDrift:
                 "id": f"connector:{DS_GONE}",
                 "kind": "connector",
                 "reason": "deleted",
-                "label": "KurortEngine",
+                "label": "WidgetShop",
             }
         ]
         # Nothing was mutated: no write ever reached the thread.
@@ -208,7 +208,7 @@ class TestResumeConfigDrift:
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -237,7 +237,7 @@ class TestResumeConfigDrift:
 
         thread = _ended_thread(thread_a)
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine"),
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop"),
             DriftItem("grant:shell_tools", "grant", "revoked", "shell tools"),
         ]
 
@@ -260,7 +260,7 @@ class TestResumeConfigDrift:
                 "id": f"connector:{DS_GONE}",
                 "kind": "connector",
                 "reason": "deleted",
-                "label": "KurortEngine",
+                "label": "WidgetShop",
             },
             {
                 "id": "grant:shell_tools",
@@ -325,7 +325,7 @@ class TestResumeConfigDrift:
         thread_id = str(thread["id"])
         thread["metadata"] = {"config_drift_ack": {f"connector:{DS_GONE}": "deleted"}}
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -353,7 +353,7 @@ class TestResumeConfigDrift:
         acked_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         thread["metadata"] = {"config_drift_ack": {f"connector:{acked_id}": "deleted"}}
         drift = [
-            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "WidgetShop")
         ]
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -370,7 +370,7 @@ class TestResumeConfigDrift:
                 "id": f"connector:{DS_GONE}",
                 "kind": "connector",
                 "reason": "deleted",
-                "label": "KurortEngine",
+                "label": "WidgetShop",
             }
         ]
         fake_db.resume_thread.assert_not_awaited()
@@ -598,3 +598,25 @@ async def test_retained_creation_wait_preserves_ended_and_does_not_schedule_resu
     assert thread["status"] == "ended"
     assert thread["runtime_generation"] == ENDED_RUNTIME_GENERATION
     fake_db.resume_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_after_a_failed_vm_upgrade_is_a_clear_refusal(
+    user_a, thread_a, fake_db, fake_request
+):
+    """Roadmap item 10: it used to surface the database's 23514 as a 500."""
+    from orchestrator.services.vm_thread_retained_resume import VmUpgradeDiskPurged
+    from tests._b09_control_seams import resume_thread
+
+    thread = _ended_thread(thread_a)
+    thread["execution_lane"] = "pinned"
+    with _patch_caller_and_db(user_a, fake_db):
+        fake_db.resume_thread.side_effect = VmUpgradeDiskPurged()
+        with patch(
+            "orchestrator.services.thread_resume.thread_config_drift", _fake_drift([])
+        ):
+            with pytest.raises(HTTPException) as refused:
+                await resume_thread(str(thread["id"]), fake_request)
+
+    assert refused.value.status_code == 409
+    assert "VM upgrade failed" in refused.value.detail

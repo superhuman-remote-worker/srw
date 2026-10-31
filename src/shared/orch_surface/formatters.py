@@ -12,6 +12,8 @@ import json
 import re
 from typing import Any
 
+from shared.permission_modes import normalize_permission_mode
+
 
 def _mask_url(url: str) -> str:
     """Mask password in a connection URL for safe display."""
@@ -324,6 +326,18 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
     if detail.get("source") == "workspace_recovery_exhausted":
         return [
             "Workspace recovery hold: retries exhausted; workspace and checkpoints "
+            "retained until an explicit Resume or Cancel"
+        ]
+    if detail.get("source") == "workspace_disk_full":
+        from shared.workspace_disk import WorkspaceDiskUsage
+
+        attention = detail.get("attention")
+        usage = WorkspaceDiskUsage.from_dict(
+            attention.get("disk") if isinstance(attention, dict) else None
+        )
+        measured = f" ({usage.describe()})" if usage is not None else ""
+        return [
+            f"Workspace disk full hold{measured}: workspace and checkpoints "
             "retained until an explicit Resume or Cancel"
         ]
     return [
@@ -3196,7 +3210,7 @@ def format_persistent_threads(threads: list[dict[str, Any]]) -> str:
         title = t.get("title", "Untitled")
         status = t.get("status", "unknown")
         config = t.get("config_name", "N/A")
-        mode = t.get("permission_mode", "N/A")
+        mode = normalize_permission_mode(t.get("permission_mode", "N/A"))
         created = t.get("created_at", "")
         last_activity = t.get("last_activity", "")
         turns = t.get("total_turns", 0)

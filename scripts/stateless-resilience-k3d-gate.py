@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 K = ["kubectl", "--context=k3d-srw", "-n", "srw"]
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 _last_overlay = None
 
 
@@ -181,32 +188,9 @@ def current_runtime(*, recovery=False):
 class Gate:
     def __init__(self):
         password = os.environ.get("SRW_K3D_TEST_PASSWORD", "srw-k3d-dev-test")
-        result = command(
-            K
-            + [
-                "exec",
-                "deploy/srw-orchestrator",
-                "-c",
-                "orchestrator",
-                "--",
-                "curl",
-                "-fsS",
-                "-X",
-                "POST",
-                "http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token",
-                "-d",
-                "grant_type=password",
-                "-d",
-                "client_id=admin-cli",
-                "-d",
-                "username=test",
-                "--data-urlencode",
-                f"password={password}",
-                "-d",
-                "scope=openid",
-            ]
-        )
-        self.token = json.loads(result)["id_token"]
+        # An access token of the gates' Keycloak client: `sub`, the realm roles
+        # and the audience the API's Bearer check accepts.
+        self.token = gate_oauth.access_token("test", password, kubectl=K)
 
     def api(self, path, body):
         return json.loads(

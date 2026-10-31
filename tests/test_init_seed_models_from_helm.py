@@ -107,6 +107,8 @@ def _fake_db(*, seeded_providers: list[str] | None = None):
     db.create_model = AsyncMock(
         return_value={"id": "00000000-0000-0000-0000-000000000001"}
     )
+    # A skipped insert asks who holds the id; nobody else does here.
+    db.find_model_by_model_id = AsyncMock(return_value=None)
     return db
 
 

@@ -1,0 +1,33 @@
+# =============================================================================
+# srw-harness-claude-code — the Claude Code harness image
+# =============================================================================
+# A drop-in SRW agent image: registers with the orchestrator, takes one job over
+# the v1 harness API, drives the Claude Code CLI (bundled in the
+# claude-agent-sdk wheel; needs glibc, which slim Debian has) against the job's
+# workspace over SSH, reports and exits. No Node, no git.
+# See harnesses/claude-code/README.md.
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+
+# SRW's agent pod runs every image as uid/gid 999 on a read-only root, whatever
+# the image's USER says, so the account is built for 999. It is a real account
+# and the environment names it: asyncssh asks getpass.getuser() for the local
+# user before every connection and Node tools ask os.userInfo(); an unknown uid
+# with no USER variable fails both.
+RUN groupadd --gid 999 harness \
+    && useradd --uid 999 --gid 999 --home-dir /tmp --no-create-home --shell /usr/sbin/nologin harness
+ENV HOME=/tmp USER=harness LOGNAME=harness
+COPY harnesses/claude-code/requirements.txt /tmp/harness/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/harness/requirements.txt
+# The harness is an ordinary package in site-packages, found by the interpreter
+# on its own: the image needs no PYTHONPATH.
+COPY harnesses/claude-code/pyproject.toml /tmp/harness/pyproject.toml
+COPY harnesses/claude-code/srw_claude_code_harness /tmp/harness/srw_claude_code_harness
+RUN pip install --no-cache-dir --no-deps /tmp/harness && rm -rf /tmp/harness
+# The CLI's local cwd mirrors the workspace root path the model sees.
+RUN mkdir -p /home/agent-host/workspace && chown -R 999:999 /home/agent-host
+USER 999:999
+# Isolated mode (-I): PYTHON* environment variables are ignored and the working
+# directory never joins sys.path, so a Job's env and delivered files cannot make
+# Python load code before the harness. -u keeps output unbuffered, which -I
+# would otherwise leave to the ignored PYTHONUNBUFFERED.
+ENTRYPOINT ["python3", "-I", "-u", "-m", "srw_claude_code_harness"]

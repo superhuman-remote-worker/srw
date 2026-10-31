@@ -28,7 +28,11 @@ def build_push_backend(workspace: dict, *, thread_id: str):
     if backend == "virtual":
         from agent.core.backends.factory import create_lite_backend
 
-        return create_lite_backend(SimpleNamespace(**workspace), job_id=thread_id)
+        # The mirror pushes the workspace prefix; a Session's cloud folders
+        # (further mount entries) are the destination, never the source.
+        return create_lite_backend(
+            SimpleNamespace(**workspace), job_id=thread_id, cloud_folders=False
+        )
     if backend != "sandbox":
         raise ValueError("background push requires a durable stateless workspace")
     from shared.runtime.core.backends.remote import RemoteBackend

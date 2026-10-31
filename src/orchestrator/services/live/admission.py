@@ -24,6 +24,7 @@ import copy
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from fastapi import HTTPException
@@ -31,7 +32,12 @@ from fastapi import HTTPException
 from orchestrator.services.live.instructions import (
     LiveVoice,
     LiveVoiceError,
+    catalog_voice,
+    idle_instruction,
     live_voice_of,
+    with_call_time,
+    with_default_voice,
+    with_engine_rules,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError
 from orchestrator.services.live.store import LiveSessionStore
@@ -122,6 +128,7 @@ async def resolve_live_voice(
     """The live voice of the job's expert, as dispatch will resolve it."""
     from orchestrator.services.config_resolver import resolve_config
     from shared.runtime.core.loader import canonical_config_name
+    from shared.runtime.core.subagent_roster import RosterResolutionError
 
     row = expert_row
     if row is None and expert_id:
@@ -137,12 +144,33 @@ async def resolve_live_voice(
             expert_type="worker",
             db_refs={},
         )
+    except RosterResolutionError as exc:
+        # An authoring error in the merged roster (a `live` block on an entry
+        # that is not `driver: live`): its message names the entry and the fix.
+        raise LiveVoiceError(
+            f"The expert's subagent roster is invalid: {exc}"
+        ) from None
     except Exception as exc:
         logger.warning("Live admission: the expert's config did not resolve (%s)", exc)
         raise LiveVoiceError(
             f"The expert's config could not be resolved ({type(exc).__name__})"
         ) from None
     return live_voice_of(blob.get("agent") or {})
+
+
+async def line_default_voice(db: Any, connector: dict[str, Any]) -> str | None:
+    """The voice the line's ``live_voice`` catalog row names, if any.
+
+    Never fails admission: an unreadable row leaves the built-in default."""
+    model = (connector.get("config") or {}).get("model")
+    if not isinstance(model, str) or not model:
+        return None
+    try:
+        row = await db.resolve_catalog_model(model, capability="live_voice")
+    except Exception:
+        logger.warning("Live admission: the catalog row of %s was not read", model)
+        return None
+    return catalog_voice(row)
 
 
 async def prepare_live_session(
@@ -190,6 +218,10 @@ async def prepare_live_session(
         )
     except LiveVoiceError as exc:
         raise HTTPException(422, str(exc)) from None
+    if not voice.voice_named:
+        voice = with_default_voice(
+            voice, await line_default_voice(dependencies.db, connector)
+        )
     sessions = LiveSessionStore(dependencies.db)
     async with dependencies.db.acquire() as conn:
         session = await sessions.ensure_session(
@@ -219,16 +251,28 @@ async def prepare_live_session(
     )
 
 
-def handoff_body(admission: LiveAdmission, job_id: str) -> dict[str, Any]:
+def handoff_body(
+    admission: LiveAdmission, job_id: str, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """What the line's pod accepts the session with; the instructions end
+    with the engine's delegation rules and the call's date and time (``now``,
+    the handoff by default)."""
     config = admission.connector.get("config") or {}
     voice = admission.voice
+    model = str(config.get("model") or "")
     return {
         "session_id": str(admission.session["id"]),
         "provider_session_id": admission.session["provider_session_id"],
         "job_id": str(job_id),
-        "model": str(config.get("model") or ""),
-        "accept": {"instructions": voice.instructions, "voice": voice.voice},
+        "model": model,
+        "accept": {
+            "instructions": with_call_time(
+                with_engine_rules(voice.instructions, model), now
+            ),
+            "voice": voice.voice,
+        },
         "greeting_instruction": voice.greeting_instruction,
+        "idle_instruction": idle_instruction(model),
         "texts": {"fallback": voice.fallback},
         "limits": {
             "max_duration_s": int(config.get("max_duration_s") or 900),

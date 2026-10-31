@@ -71,7 +71,7 @@ async def _make_thread(database: PostgresDB, *, datasource_ids: list[str]) -> st
 async def test_delete_writes_tombstone_and_scrubs_thread_references(db):
     """The deleted id is named in a tombstone and scrubbed from live threads."""
     survivor_id = await _make_datasource(db, label="Survivor")
-    doomed_name = f"KurortEngine-{uuid4().hex[:8]}"
+    doomed_name = f"WidgetShop-{uuid4().hex[:8]}"
     doomed_row = await db.create_datasource(name=doomed_name, ds_type="generic")
     doomed_id = str(doomed_row["id"])
 

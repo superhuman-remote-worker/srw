@@ -139,6 +139,30 @@ class TestIsInternalCall:
             assert access_module.is_internal_call(req) is True
 
 
+class TestIsInternalServiceCall:
+    """The key alone, never the key with a delegated MCP user (N9)."""
+
+    def test_bare_key_is_a_service_call(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "secret"})
+            assert access_module.is_internal_service_call(req) is True
+
+    def test_key_with_a_delegated_user_is_the_users_call(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "secret", "X-MCP-User-Id": "user-1"})
+            assert access_module.is_internal_service_call(req) is False
+
+    def test_blank_delegated_user_counts_as_absent(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "secret", "X-MCP-User-Id": " "})
+            assert access_module.is_internal_service_call(req) is True
+
+    def test_wrong_key_is_never_a_service_call(self):
+        with patch.object(access_module, "_INTERNAL_KEY", "secret"):
+            req = _make_request({"X-Internal-Key": "wrong"})
+            assert access_module.is_internal_service_call(req) is False
+
+
 class TestRequireInternal:
     @pytest.mark.asyncio
     async def test_raises_401_without_key(self):
@@ -1367,6 +1391,19 @@ class TestDualCallableEndpoints:
         fake_db.get_user = AsyncMock(return_value=user_a)
         # No project_workspace_defaults row: the installation decides the tier.
         fake_db.fetchrow = AsyncMock(return_value=None)
+        # No user_experts kill-switch row: DB Experts are enabled.
+        fake_db.get_system_setting = AsyncMock(return_value=None)
+        # The project's default worker Expert, as a stored row: a plain dict
+        # on the installed harness (no manifest), not an AsyncMock whose
+        # attributes are coroutines.
+        fake_db.get_project_default_expert = AsyncMock(
+            return_value={
+                "id": "33333333-3333-4333-8333-333333333333",
+                "expert_type": "worker",
+                "config": {},
+                "manifest": None,
+            }
+        )
         body = JobCreate(
             description="private datasource attempt",
             thread_id=str(thread_a["id"]),

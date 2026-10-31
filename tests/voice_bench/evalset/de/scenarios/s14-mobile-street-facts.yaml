@@ -1,0 +1,15 @@
+id: s14-mobile-street-facts
+title: Two fact questions from a street on a mobile
+why: Facts still answered, and nothing triggered by the traffic.
+categories: [facts]
+voice: m-young-fast
+condition: street
+turns:
+  - say: Kann ich bei Ihnen mit meinem Hund übernachten?
+    expect:
+      outcome: answer
+      values: [{keyword: "15|fünfzehn", in: reply}]
+  - say: Und darf der Hund mit ins Restaurant?
+    expect:
+      outcome: answer
+      values: [{keyword: "nicht|kein", in: reply}]

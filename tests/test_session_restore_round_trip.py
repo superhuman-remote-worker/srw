@@ -531,9 +531,7 @@ async def _restore_rows(rows: _ThreadRows, config: Any):
 
 
 def _round_trip_config(family: Any) -> Any:
-    return harness._session_config(
-        injections=True, model=family.model, injection_mode="append_only"
-    )
+    return harness._session_config(injections=True, model=family.model)
 
 
 async def _run_session(
@@ -662,7 +660,14 @@ class TestTurnThreeAfterRestore:
             "openai-chat",
             "openai-chat-claude-proxy",
             "anthropic-claude-proxy",
+            "anthropic",
             "glm-5.2",
+            # Turns come back with their native blocks (provider_raw): the
+            # Responses reasoning items and item ids, Gemini's thought parts
+            # and function-call signatures.
+            "responses-openai",
+            "responses-codex",
+            "gemini",
         ],
     )
     async def test_restored_turn_three_matches_the_live_request(

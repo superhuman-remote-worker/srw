@@ -15,6 +15,8 @@ from eval.memory.datasets import LMEQuestion
 from eval.memory.infra import project_uuid, session_uuid
 from eval.memory.ingest import HarnessHandles, _form_query_text
 from eval.memory.metrics import collapse_to_sessions, question_metrics
+from shared.runtime.core.context_entries import memory_handle
+from shared.runtime.services.recall_store import RecallStore
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +83,7 @@ async def answer_retrieval(
     # text — wiring it keeps digest arms honest end-to-end.
     query_text = _form_query_text(handles, [HumanMessage(content=question.question)])
 
-    payload = await manager.assemble(
-        AssembleRequest(
-            query_text=query_text,
-            model=getattr(handles.config.llm, "model", None),
-        )
-    )
+    payload = await manager.assemble(AssembleRequest(query_text=query_text))
 
     job_to_session = {
         session_uuid(handles.run_id, question.question_id, s.session_id): s.session_id
@@ -128,13 +125,15 @@ async def answer_retrieval(
         "question": question.question,
         "answer": question.answer,
         "question_date": question.question_date,
-        # The rendered memory block(s) exactly as production would inject
-        # them — captured here because --cleanup deletes the rows, and the
-        # end-task reader/judge slice needs the context post-hoc.
+        # The memory entry body production would append — captured here
+        # because --cleanup deletes the rows, and the end-task reader/judge
+        # slice needs the context post-hoc.
         "injected_context": "\n\n".join(
-            block.content
+            RecallStore.render_memory_entry(
+                [(record, memory_handle(record.id), False) for record in block.records]
+            )
             for block in payload.blocks
-            if block.kind == "memory" and block.content
+            if block.kind == "memory" and block.records
         ),
         "evidence": sorted(question.evidence_session_ids),
         "ranked_sessions": ranked[:MAX_RANKED_SESSIONS],

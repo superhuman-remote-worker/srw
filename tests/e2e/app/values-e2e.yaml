@@ -64,6 +64,10 @@ cockpit:
     limits: {memory: 384Mi, cpu: 250m}
 
 agent:
+  # The pinned-virtual baseline (README): stateless Sessions are on by default
+  # since 2026-10-21; the stateless-sandbox overlay turns them back on.
+  stateless:
+    enabled: false
   pool:
     minAgents: "0"
     buffer: "0"

@@ -168,6 +168,36 @@ async def test_delayed_mutation_is_sent_once() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_session_end_waits_past_the_servers_end_budget(permanent) -> None:
+    """A Session End takes ~30 s server-side (handoff join up to 30 s, agent
+    detach up to 150 s): the client default of 30 s timed it out, so the tool
+    reported a failure for an End that succeeded and the caller re-sent it."""
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.extensions["timeout"]))
+        return httpx.Response(200, json={"status": "ended"})
+
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.end_persistent_thread("t-1", permanent=permanent)
+        await client.create_job("ordinary mutation")
+    finally:
+        await client.close()
+
+    assert result == {"status": "ended"}
+    end_timeout, ordinary_timeout = seen
+    assert end_timeout["read"] >= 30.0 + 150.0
+    assert end_timeout["connect"] == 30.0
+    # Only the End call is widened; other requests keep the client default.
+    assert ordinary_timeout["read"] == 30.0
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_mutation_timeout_is_not_retried_or_reported_failed() -> None:
     attempts = 0
 

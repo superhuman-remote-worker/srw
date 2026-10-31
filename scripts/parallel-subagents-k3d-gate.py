@@ -7,7 +7,7 @@ Template: scripts/stateless-resilience-k3d-gate.py.
 
 Scenarios (each selectable by flag, run one at a time, in this order):
 
-  --k1  Supervised session; the parent issues N delegate_agent calls; the
+  --k1  Read-only session; the parent issues N delegate_agent calls; the
         executor holding the lease is killed while the approval cards are
         pending. The successor's replayed cards are declined by the script.
         Pass: one final answer, zero child rows and zero child provider calls,
@@ -121,6 +121,7 @@ import copy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -136,6 +137,16 @@ import uuid
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# `test` logs in through the gates' Keycloak client (scripts/k3d_gate_oauth.py):
+# its access token carries `sub`, the realm roles and the audience the API's
+# Bearer check accepts. admin-cli's ID token is no Bearer credential.
+_OAUTH_SPEC = importlib.util.spec_from_file_location(
+    "_k3d_gate_oauth", ROOT / "scripts" / "k3d_gate_oauth.py"
+)
+assert _OAUTH_SPEC is not None and _OAUTH_SPEC.loader is not None
+gate_oauth = importlib.util.module_from_spec(_OAUTH_SPEC)
+_OAUTH_SPEC.loader.exec_module(gate_oauth)
 K = ["kubectl", "--context=k3d-srw", "-n", "srw"]
 EXECUTOR_DEPLOYMENT = "srw-agent-stateless"
 EXECUTOR_SELECTOR = "srw/class=agent-stateless"
@@ -451,16 +462,15 @@ def wait_for(label, probe, *, timeout, interval=2.0):
 # never leaves the pod)
 # ---------------------------------------------------------------------------
 
-_API_PROGRAM = r"""
+_API_PROGRAM = (
+    gate_oauth.LOGIN_SOURCE
+    + r"""
 import json, sys, urllib.error, urllib.parse, urllib.request
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-form = urllib.parse.urlencode({
-    "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
-    "username": envelope["username"], "password": envelope["password"],
-}).encode()
-with opener.open(envelope["token_url"], data=form, timeout=30) as response:
-    token = json.load(response)["id_token"]
+token = gate_access_token(
+    opener, envelope["token_url"], envelope["username"], envelope["password"]
+)
 body = envelope.get("body")
 request = urllib.request.Request(
     "http://localhost:8085" + envelope["path"],
@@ -475,6 +485,7 @@ except urllib.error.HTTPError as error:
     status, text = error.code, error.read().decode("utf-8", "replace")
 print(json.dumps({"status": status, "body": text}))
 """
+)
 
 
 class Api:
@@ -1709,18 +1720,17 @@ def orchestrator_serves_lanes(value: str) -> bool:
 # mode) and keeps that status through later turns, so the detector settles a
 # runtime lost mid-turn as `suspended` instead of `ended`. Commands on stdin:
 # `connect <pod ip>`; output lines: connected/closed/error, never the token.
-_VIEWER_PROGRAM = r"""
+_VIEWER_PROGRAM = (
+    gate_oauth.LOGIN_SOURCE
+    + r"""
 import asyncio, json, sys, urllib.error, urllib.parse, urllib.request
 import websockets
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def session_token():
-    form = urllib.parse.urlencode({
-        "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
-        "username": envelope["username"], "password": envelope["password"],
-    }).encode()
-    with opener.open(envelope["token_url"], data=form, timeout=30) as response:
-        bearer = json.load(response)["id_token"]
+    bearer = gate_access_token(
+        opener, envelope["token_url"], envelope["username"], envelope["password"]
+    )
     request = urllib.request.Request(
         "http://localhost:8085/api/sessions/%s/connection" % envelope["thread"],
         headers={"Authorization": "Bearer " + bearer},
@@ -1766,6 +1776,7 @@ async def main():
         task.cancel()
 asyncio.run(main())
 """
+)
 
 
 class Viewer:
@@ -3739,7 +3750,7 @@ class Gate(PinnedScenarios):
     # -- K1 --------------------------------------------------------------------
     def scenario_k1(self, run):
         n = self.args.k1_calls
-        run.create_session(permission_mode="supervised")
+        run.create_session(permission_mode="read_only")
         run.warm_up(cap=None)
         seq = run.send(
             batch_prompt(

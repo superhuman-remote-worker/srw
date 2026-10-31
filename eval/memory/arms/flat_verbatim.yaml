@@ -5,9 +5,8 @@
 #     check the harness's metric math against the paper's numbers;
 # (2) the cheap smoke arm — no aux-LLM cost, runs the full _S set.
 #
-# Rounds are stored with remaining_turns=0 (never TTL-pinned → pure
-# hybrid retrieval) and dedup is disabled (threshold > 1 can never fire)
-# so the index stays truly flat — a 0.85-cosine merge would silently
+# Rounds are stored directly (pure hybrid retrieval) and dedup is disabled
+# (threshold > 1 can never fire) so the index stays truly flat — a 0.85-cosine merge would silently
 # drop near-duplicate filler rounds and skew the baseline.
 name: flat_verbatim
 description: >

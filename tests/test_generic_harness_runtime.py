@@ -349,32 +349,37 @@ def test_explicit_file_permissions_and_network_grants_are_preserved():
     assert launch.network_policy["spec"]["egress"] == [rule]
 
 
-def test_runtime_envelope_controls_resources_probes_and_argv_without_shell_wrapping():
+def test_runtime_envelope_controls_pull_policy_and_resources_only():
     runtime = {
         "pullPolicy": "Never",
-        "command": ["custom-entrypoint", "literal; argument"],
-        "args": [],
         "resources": {
             "requests": {"cpu": 0.125, "memory": "512Mi"},
             "limits": {"cpu": 4, "memory": "3Gi"},
         },
-        "probes": {
-            "readiness": {
-                "httpGet": {"path": "/ready", "port": 8080},
-                "timeoutSeconds": 2,
-            },
-            "liveness": {"exec": {"command": ["/bin/check"]}, "failureThreshold": 3},
-        },
     }
     launch = plan(runtime)
     container = launch.pod["spec"]["containers"][0]
-    assert container["command"] == runtime["command"]
-    assert container["args"] == []
     assert container["imagePullPolicy"] == "Never"
     assert container["resources"]["requests"]["cpu"] == "0.125"
     assert container["resources"]["limits"]["memory"] == "3Gi"
-    assert container["readinessProbe"] == runtime["probes"]["readiness"]
-    assert container["livenessProbe"] == runtime["probes"]["liveness"]
+    assert not {"command", "args", "readinessProbe", "livenessProbe"} & set(container)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"command": ["custom-entrypoint", "literal; argument"]},
+        {"args": ["-c", "id"]},
+        {"args": []},
+        {"probes": {"readiness": {"httpGet": {"path": "/ready", "port": 8080}}}},
+    ],
+)
+def test_launch_overrides_never_reach_the_container(override):
+    """The image's own ENTRYPOINT and CMD run. The schema has no launch fields;
+    a spec that carries one anyway skipped validation, so the builder fails
+    closed instead of ignoring it."""
+    with pytest.raises(ValueError, match="own entrypoint"):
+        plan(override)
 
 
 def test_remaining_deadline_does_not_reset_whole_job_timeout():
@@ -391,9 +396,7 @@ def test_remaining_deadline_does_not_reset_whole_job_timeout():
         )
 
 
-def test_unsupported_empty_args_without_command_and_reference_adapter_fail_before_effects():
-    with pytest.raises(ValueError, match="explicit command"):
-        plan({"args": []})
+def test_reference_adapter_fails_before_effects():
     with pytest.raises(ValueError, match="dedicated runtime"):
         plan({"adapter": "srw/v1"})
 
@@ -523,12 +526,16 @@ async def test_exit_readiness_and_resolved_image_digest_are_separate_observation
 
 
 @pytest.mark.asyncio
-async def test_readiness_probe_can_report_false_without_changing_process_state():
+async def test_declared_readiness_probe_can_report_false_without_changing_process_state():
+    """A Job cannot declare probes. The workspace runtime declares its own on
+    the pods it builds, and observation reports that probe's state."""
     kube = MemoryKubernetes()
     runtime = kube.runtime()
-    launched = await runtime.launch(
-        plan({"probes": {"readiness": {"exec": {"command": ["check"]}}}})
-    )
+    launch = plan()
+    launch.pod["spec"]["containers"][0]["readinessProbe"] = {
+        "exec": {"command": ["check"]}
+    }
+    launched = await runtime.launch(launch)
     kube.running(ready=False)
     observed = await runtime.observe(IDENTITY, expected_pod_uid=launched.pod_uid)
     assert observed.phase == "Running"

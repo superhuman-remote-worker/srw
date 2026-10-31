@@ -1,5 +1,7 @@
 import {Component, DestroyRef, computed, effect, inject, OnInit, signal} from '@angular/core';
+import {DOCUMENT} from '@angular/common';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {TranslocoPipe} from '@jsverse/transloco';
 import {ActivatedRoute, NavigationEnd, Router, RouterOutlet} from '@angular/router';
 import {filter} from 'rxjs';
 import {SidebarComponent} from './shell/sidebar/sidebar.component';
@@ -28,6 +30,7 @@ import {AppIconComponent} from './ui/icon';
     ViewModeBannerComponent,
     AppPwaBannerComponent,
     AppIconComponent,
+    TranslocoPipe,
   ],
   template: `
     @if (!canvasPopoutRoute()) {
@@ -46,7 +49,18 @@ import {AppIconComponent} from './ui/icon';
         <div class="sidebar-backdrop" (click)="sidebar.collapse()"></div>
       }
       <div class="content-area">
-        @if (pendingApproval()) {
+        @if (userLoadFailed()) {
+          <div class="pending-approval">
+            <div class="pending-approval-card" role="alert">
+              <app-icon size="inherit" class="pending-icon">cloud_off</app-icon>
+              <p>{{ userLoadErrorKey() | transloco }}</p>
+              <div class="load-failed-actions">
+                <button class="pending-logout" (click)="retryUserLoad()">{{ 'workspaces.list.retry' | transloco }}</button>
+                <button class="pending-logout" (click)="userService.logout()">{{ 'nav.logout' | transloco }}</button>
+              </div>
+            </div>
+          </div>
+        } @else if (pendingApproval()) {
           <div class="pending-approval">
             <div class="pending-approval-card">
               <app-icon size="inherit" class="pending-icon">hourglass_empty</app-icon>
@@ -176,6 +190,13 @@ import {AppIconComponent} from './ui/icon';
         color: var(--text-primary);
       }
 
+      .load-failed-actions {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 0.75rem;
+      }
+
       .sidebar-backdrop {
         display: none;
       }
@@ -220,6 +241,7 @@ export class App implements OnInit {
   private readonly router = inject(Router);
   private readonly activatedRoute = inject(ActivatedRoute);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly document = inject(DOCUMENT);
   readonly canvasPopoutRoute = signal(false);
 
   readonly showSidebar = computed(
@@ -243,6 +265,26 @@ export class App implements OnInit {
   readonly pendingApproval = computed(
     () => this.userService.isAuthenticated() && !this.userService.isApproved(),
   );
+
+  /** The bootstrap user read failed: show Retry / Log out, not a blank shell. */
+  readonly userLoadFailed = computed(() => this.userService.loadState() === 'failed');
+
+  /** Proxy answers (502/503/504) mean the orchestrator is down, as does no answer. */
+  readonly userLoadErrorKey = computed(() => {
+    const status = this.userService.loadErrorStatus() ?? 0;
+    if (status === 0 || status === 502 || status === 503 || status === 504) {
+      return 'errors.http.network';
+    }
+    return status >= 500 ? 'errors.http.5xx' : 'errors.http.4xx';
+  });
+
+  /**
+   * Start over: a reload re-runs the bootstrap and the first navigation,
+   * which the auth guard refused while the user could not be loaded.
+   */
+  retryUserLoad(): void {
+    this.document.defaultView?.location.reload();
+  }
 
   constructor() {
     const updateShellMode = () => {

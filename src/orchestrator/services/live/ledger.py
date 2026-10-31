@@ -7,16 +7,21 @@ report collides on the ledger's dedupe key), billed to the job's project and
 owner as an ``llm`` resource priced per ``live-voice-second``.
 
 ``usage_rates`` ships empty (an admin or the price sync fills it), and no
-public price list serves live voice seconds, so an engine's published list
-price (:data:`DEFAULT_RATES`) prices the row while no rate is configured for
-it; a configured rate always wins.
+public price list serves live voice seconds. While no rate is configured for
+the model, the row is priced by the model's catalog row
+(``params.rate_usd_per_minute``: an operator's own rate, 0 for a local
+engine such as a voice gateway profile, which the chart seeds), else by an
+engine's published list price (:data:`DEFAULT_RATES`); a model with neither
+stays unpriced. A configured rate always wins.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from orchestrator.services.usage_ledger import UsageEvent
@@ -28,6 +33,40 @@ UNIT = "live-voice-second"
 #: List prices per voice second (OpenAI: gpt-live-1 is $0.05 per minute,
 #: billed per second).
 DEFAULT_RATES: dict[str, Decimal] = {"gpt-live-1": Decimal("0.05") / Decimal(60)}
+#: A ``live_voice`` catalog row's own price, in ``params`` (USD per minute).
+RATE_PARAM = "rate_usd_per_minute"
+
+
+def catalog_rate(row: Mapping[str, Any] | None) -> Decimal | None:
+    """The per-second rate a ``live_voice`` catalog row names, or ``None``."""
+    params = (row or {}).get("params_json")
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return None
+    value = params.get(RATE_PARAM) if isinstance(params, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        per_minute = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not per_minute.is_finite() or per_minute < 0:
+        return None
+    return per_minute / Decimal(60)
+
+
+async def default_rate(db: Any, model: str) -> Decimal | None:
+    """What prices a session of ``model`` while no rate is configured: its
+    catalog row's rate, else :data:`DEFAULT_RATES`."""
+    try:
+        row = await db.resolve_catalog_model(model, capability="live_voice")
+    except Exception:
+        logger.warning("Live usage: the catalog row of %s was not read", model)
+        row = None
+    rate = catalog_rate(row)
+    return rate if rate is not None else DEFAULT_RATES.get(model)
 
 
 def usage_event(
@@ -72,7 +111,7 @@ async def record_session_usage(ledger: Any, db: Any, session: dict[str, Any]) ->
     event = usage_event(session, job)
     if event is None:
         return 0
-    default = DEFAULT_RATES.get(event.resource)
+    default = await default_rate(db, event.resource)
     if default is not None:
         try:
             configured = await ledger.resolve_rate(

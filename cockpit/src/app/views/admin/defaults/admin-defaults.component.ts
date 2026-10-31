@@ -2,7 +2,7 @@ import {ChangeDetectionStrategy, Component, computed, inject, OnInit} from '@ang
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminProvidersService, DEFAULT_MODEL_KINDS, DefaultModelKind, HelmManagedDefault} from '../../../core/services/admin-providers.service';
 import {HelmManagedBadgeComponent} from '../../../ui/helm-managed-badge/helm-managed-badge.component';
-import {ModelService} from '../../../core/services/model.service';
+import {chatModelLabel, ModelService} from '../../../core/services/model.service';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppFormFieldComponent} from '../../../ui/form-field';
 
@@ -89,7 +89,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     @for (group of modelService.models(); track group.group) {
                       <optgroup [label]="group.group">
                         @for (model of group.models; track model) {
-                          <option [value]="model">{{ model }}</option>
+                          <option [value]="model">{{ modelLabel(group, model) }}</option>
                         }
                       </optgroup>
                     }
@@ -160,6 +160,8 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
 export class AdminDefaultsComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
   readonly modelService = inject(ModelService);
+  /** Option text: the catalog label; the value stays the model id. */
+  readonly modelLabel = chatModelLabel;
   private readonly transloco = inject(TranslocoService);
 
   readonly defaultKinds: DefaultModelKind[] = DEFAULT_MODEL_KINDS;

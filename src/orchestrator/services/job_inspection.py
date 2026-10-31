@@ -207,7 +207,7 @@ async def list_my_active_jobs(
     try:
         if is_admin:
             # Admins get their own in-flight jobs here, not the fleet — the
-            # fleet view is /api/agents. Expressed as an owner filter rather
+            # fleet view is /api/admin/agents. Expressed as an owner filter rather
             # than the visibility OR so it stays own-jobs-only.
             owner_user_id = None
             project_ids = None

@@ -217,6 +217,7 @@ docker_build(
         '.dockerignore',
         'docker/Dockerfile.agent.dev',
         'docker/prepare-tokenizer-cache.py',
+        'docker/assert-agent-contract.sh',
     ],
     ignore=[
         '**/__pycache__',
@@ -288,6 +289,8 @@ docker_build(
         'docker/check-browser-stream.py',
         'docker/assert-browser-stack.sh',
         'docker/assert-workspace-contract.sh',
+        'docker/link-playwright-browsers',
+        'docker/write-agent-environment',
     ],
     ignore=[
         '.git/',
@@ -315,6 +318,8 @@ docker_build(
         'docker/check-browser-stream.py',
         'docker/assert-browser-stack.sh',
         'docker/assert-workspace-contract.sh',
+        'docker/link-playwright-browsers',
+        'docker/write-agent-environment',
     ],
     ignore=[
         '.git/',

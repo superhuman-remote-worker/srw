@@ -198,7 +198,13 @@ async def test_disabled_owner_resume_keeps_protected_job_unchanged(db, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_preflight_uses_explicit_resume_ids_and_exact_physical_predecessor(db):
+@pytest.mark.parametrize("profile_enabled", [False, True])
+async def test_preflight_uses_explicit_resume_ids_and_exact_physical_predecessor(
+    db, monkeypatch, profile_enabled
+):
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_ENABLED", "true" if profile_enabled else "false"
+    )
     state = await accepted_resume(db)
     result = await begin_resume(db, state)
     operation = state["resume"]
@@ -210,6 +216,7 @@ async def test_preflight_uses_explicit_resume_ids_and_exact_physical_predecessor
     assert result["predecessor_cleanup_admission_id"] == str(
         state["retention"].admission_id
     )
+    assert "network_profile" not in result["request"]
 
 
 @pytest.mark.asyncio

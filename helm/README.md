@@ -271,6 +271,11 @@ see [Secret schema](#secret-schema). No test accounts are created.
 
 After install, follow the printed `NOTES.txt` to back up the encryption key.
 
+Jobs and sessions are refused until chat, auxiliary, embedding (4096-dim) and
+rerank models are configured. One OpenRouter API key covers all four: seed it
+with `llm.seed` or add it under **Settings → Administration → Models** after
+login. See [Models](../docs/models.md).
+
 ---
 
 ## Single-origin self-signed HTTPS
@@ -406,7 +411,12 @@ Edit at minimum:
 - `image.{orchestrator,agent,cockpit,mcp,workspace}.tag` → the matching
   `vX.Y.Z` release tag, or set each component's verified `digest`
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
-- `databases.*.externalUrl` → connection strings for managed Postgres, vector
+- `databases.{postgres,vector}.externalHost` / `externalDb` → your managed
+  Postgres and pgvector (user and password come from the Secret);
+  `databases.keycloak.externalUrl` only with the bundled Keycloak
+- `llm.seed` → the Secret holding your OpenRouter key (or set
+  `llm.seed.enabled: false` and add models in Settings → Administration →
+  Models)
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
@@ -505,9 +515,12 @@ in `helm get values` output.
 secrets:
   create: true
   values:
-    OPENAI_API_KEY: "sk-..."
     POSTGRES_PASSWORD: "..."
 ```
+
+Model provider keys do not go into `secrets.values`. In this mode
+`llm.seed.systemApiKeys.<provider>.value` accepts them inline; see
+[Models](../docs/models.md) for the complete OpenRouter seed.
 
 ### Secret schema
 
@@ -830,8 +843,9 @@ empty. SearXNG cannot serve `fetch` at all, so on a keyless install this is
 what gives experts a provider-backed way to read the pages they find. A keyed
 provider that already holds `fetch` (Tavily, Firecrawl) keeps it — there is no
 fetch fallback slot — and Crawl4AI stays in the catalog for an admin to select
-under Admin → Providers. If the token key is missing the hook logs a warning
-and registers nothing rather than failing the release. Like the SearXNG and
+on the **Defaults** tab of **Settings → Administration → Models**. If the
+token key is missing the hook logs a warning and registers nothing rather than
+failing the release. Like the SearXNG and
 Tavily seeds, catalog and default writes are insert-only: later admin changes
 are never repaired or overwritten at boot.
 
@@ -840,8 +854,16 @@ reach public HTTP(S), but RFC1918, cluster/service, link-local/metadata, and
 loopback ranges are excluded. There is no value that deploys either workload
 without this policy.
 
-**LLM provider keys** (any combination, depending on which providers you use):
-- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `TAVILY_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
+**Model provider keys** are not read from this Secret by the chart. A key
+here only reaches the pods' environment and registers no model. Seed it with
+`llm.seed.systemApiKeys` (which can reference any Secret, this one included)
+or add it under **Settings → Administration → Models**; see
+[Models](../docs/models.md). A
+dedicated Secret such as `srw-llm-seed` keeps the key out of the application
+Secret that agent pods load.
+
+**Research keys** (optional):
+- `TAVILY_API_KEY` (registered as a search and fetch provider at startup), `SEMANTIC_SCHOLAR_API_KEY`, `UNPAYWALL_EMAIL`
 
 **Optional integrations:**
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` (when `email.enabled`)
@@ -879,7 +901,6 @@ POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_USER=srw
 VECTOR_POSTGRES_PASSWORD=changeme
 KC_REALM_ADMIN_PASSWORD=changeme
-OPENAI_API_KEY=sk-...
 CLOUD_SERVICE_USER=agent
 CLOUD_SERVICE_PASSWORD=changeme
 ```
@@ -920,8 +941,8 @@ The certificates reach the orchestrator (model discovery, the catalog
 **Test** action, the knowledge-base indexer), every agent pod (inference,
 embeddings, rerank, vision) and every container workspace, whose entrypoint
 adds them to the system store for `curl`, `git` and OpenSSL. VM workspaces do
-not receive them. Then add the API under **Admin → Models** with its `https://`
-address.
+not receive them. Then add the API under **Settings → Administration →
+Models** with its `https://` address.
 
 ---
 
@@ -1146,16 +1167,21 @@ matches the chart's `appVersion`, which exists only for released charts.
 
 ### Container startup stage rollout
 
-`orchestrator.containerStartupStageAuthority.enabled` defaults to `false`
+`orchestrator.containerStartupStageAuthority.enabled` defaults to `true`
 (`CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED`). It admits version-1 container
 startup receipts for Jobs and stateless Sessions. Scheduling waits do not spend
 readiness, image-pull or SSH budgets. The exact Pod's scheduling transition starts
 immutable budgets; authenticated Ready settles the receipt. An expired budget
-leaves an attention state with normal Cancel/End controls. A Job's execution
+leaves an attention state with normal Cancel/End controls. A Job whose workspace
+container exits on its own before its first Ready gets that attention at once,
+with the exit code (`container_exited`); a container the cluster stopped
+(for example `OOMKilled`, an evicted Pod or `ContainerStatusUnknown`) still waits for the budget. A Job's execution
 deadline remains independent and can cancel it while it waits for capacity.
 
-Deploy the capable application and migrations `0309`/`0310` with this value off
-first. Before enabling it in a separate rollout, verify that every pre-bridge
+The capable application and migrations `0309`/`0310` shipped in v0.0.29. An
+installation on v0.0.29 or later can take the default as is. Upgrading from
+v0.0.28 or older, deploy the new version with this value set to `false` first.
+Before enabling it in a separate rollout, verify that every pre-bridge
 orchestrator Pod UID and process is gone, including detached Job workspace
 creators and Session creation callbacks. Ready replica counts, dispatcher drain
 and lease expiry alone do not prove those older writers have stopped. The chart
@@ -1166,6 +1192,17 @@ Turning the switch off stops new adoption while existing version-1 receipts
 continue. After activation, roll back only to a version-1-capable bridge image.
 Existing settled receipts with an unfinished Job remain held for normal Cancel;
 the new observer does not reopen them or issue a second Pod create.
+
+Stateless Session workspace upgrades (`virtual`/`none` → container) need this
+value on: without it a Pod that never becomes Ready has no terminal state, so
+`/connection` doesn't offer the upgrade and a request answers 409. Both are on
+by default; keep them on together. `agent.stateless.enabled: false` keeps
+every Session pinned.
+Stateless Sessions upgrade to a VM by moving to a dedicated agent, so keep
+pinned agent provisioning (the warm pool or fresh Pods) available when
+`agent.stateless.enabled` is on. In production, turn stateless Sessions on
+only after both upgrade slices (container and VM) have landed and startup
+tracking is on.
 
 ### Durable VM workspace recovery rollout
 

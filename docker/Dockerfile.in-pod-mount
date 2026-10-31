@@ -36,7 +36,7 @@ FROM scratch AS opener
 COPY --from=build /out/srw-fuse-opener /srw-fuse-opener
 ENTRYPOINT ["/srw-fuse-opener"]
 
-FROM rclone/rclone:1.74.3@sha256:623378ad0ff3ebd5cebf77720843c0e02edfe46e2d5b5ac6bed54c6371780dfb AS rclone
+FROM rclone/rclone:1.75.2@sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5 AS rclone
 # go-fuse finds fusermount3 on PATH; /usr/local/bin comes first. The setuid
 # original goes, so nothing in this image can mount by itself.
 RUN rm -f /usr/bin/fusermount3 /usr/bin/fusermount

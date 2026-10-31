@@ -16,7 +16,9 @@ from shared.runtime.core import model_registry
 from shared.runtime.core.model_registry import (
     _cap_context_window,
     _catalog_row_to_meta,
+    ModelMeta,
     _endpoint_factory_provider,
+    effective_client_protocol,
 )
 from shared.subscription_routing import (
     ANTHROPIC_BETA_HEADER,
@@ -31,6 +33,7 @@ from shared.subscription_routing import (
     normalize_channel,
     routing_from_params,
     routing_params_block,
+    validate_routing_params,
 )
 
 
@@ -388,3 +391,49 @@ class TestClaudeThinkingVisibilityHeaders:
         assert subscription_request_headers(
             label="codex-proxy", subscription_sources=["claude"]
         )
+
+
+class TestAnthropicMessages:
+    def test_anthropic_messages_selects_the_anthropic_factory(self):
+        row = _catalog_row(
+            params_json={"routing": {"client_protocol": "anthropic-messages"}}
+        )
+        meta = _catalog_row_to_meta(row)
+        assert meta.provider == "anthropic"
+        assert meta.client_protocol == "anthropic-messages"
+
+    def test_effective_protocol_falls_back_to_the_provider(self):
+        def meta(provider, family):
+            return ModelMeta(
+                model_id="m", provider=provider, family=family, display_name="m"
+            )
+
+        assert effective_client_protocol(meta("anthropic", "claude")) == (
+            "anthropic-messages"
+        )
+        assert effective_client_protocol(meta("codex", "gpt")) == "openai-responses"
+        assert effective_client_protocol(meta("openrouter", "x")) == "openai-chat"
+        assert effective_client_protocol(meta("google", "g")) == "google-native"
+
+    def test_a_garbage_stored_protocol_resolves_to_the_provider_default(self):
+        row = _catalog_row(params_json={"routing": {"client_protocol": "grpc"}})
+        assert (
+            effective_client_protocol(_catalog_row_to_meta(row)) == "openai-responses"
+        )
+
+    def test_validate_routing_params_refuses_unknown_and_non_endpoint_rows(self):
+        validate_routing_params(
+            {"routing": {"client_protocol": "anthropic-messages"}},
+            provider_kind="endpoint",
+        )
+        with pytest.raises(ValueError, match="client_protocol"):
+            validate_routing_params(
+                {"routing": {"client_protocol": "grpc"}}, provider_kind="endpoint"
+            )
+        with pytest.raises(ValueError, match="endpoint"):
+            validate_routing_params(
+                {"routing": {"client_protocol": "anthropic-messages"}},
+                provider_kind="system",
+            )
+        validate_routing_params(None, provider_kind="system")
+        validate_routing_params({"max_output_tokens": 5}, provider_kind="system")

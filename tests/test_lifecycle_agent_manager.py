@@ -111,6 +111,55 @@ class TestListInstances:
         assert await mgr.list_instances() == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("image", "approved", "build_sha", "expected_version"),
+        [
+            (None, (), "old", "old"),
+            ("srw-agent:sha-current", (), "old", "old"),
+            # previous release: same repository, old tag, stale build_sha
+            ("srw-agent:sha-previous", (), "old", "old"),
+            (
+                "registry.example/custom:1",
+                ({"image": "registry.example/custom:1"},),
+                "old",
+                None,
+            ),
+            ("registry.example/other:1", (), "old", "ineligible-image"),
+        ],
+    )
+    async def test_version_follows_image_class(
+        self, monkeypatch, image, approved, build_sha, expected_version
+    ):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-current")
+        rows = [
+            {
+                "id": "a1",
+                "hostname": "p1",
+                "status": "ready",
+                "current_job_id": None,
+                "thread_id": None,
+                "metadata": {"build_sha": build_sha},
+                "agent_mode": "worker",
+                "last_heartbeat": None,
+                "image": image,
+            }
+        ]
+        mgr, _, db, _ = _make_manager(pods=[_make_pod("p1")], agent_rows=rows)
+        db.manifest_approved_images = approved
+        with patch(
+            "orchestrator.services.lifecycle.agent_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert inst.version == expected_version
+        from orchestrator.services.lifecycle.reconciler import (
+            InstanceLifecycleReconciler,
+        )
+
+        drifts = InstanceLifecycleReconciler.is_drift(inst, {"current"})
+        assert drifts is (expected_version is not None)
+
+    @pytest.mark.asyncio
     async def test_joins_pod_with_db_row(self):
         pods = [_make_pod("srw-agent-j-x")]
         rows = [

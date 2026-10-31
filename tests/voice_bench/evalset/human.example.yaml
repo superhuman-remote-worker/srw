@@ -1,0 +1,29 @@
+# Template for real human recordings (README.md, "Real recordings").
+#
+# Copy this file to tests/voice_bench/evalset/human/manifest.yaml and put
+# the recordings beside it. The whole human/ folder is gitignored: real
+# voices are personal data and are never committed or published.
+#
+# Every recording needs the speaker's consent for this use (testing SRW's
+# voice system), written down where the owner keeps such records; `consent`
+# says where (not the person's name). Phone numbers, names and addresses the
+# speaker reads should still be the fictional ones from corpus.yaml.
+#
+# file:     audio file next to the manifest (any format ffmpeg reads)
+# text:     exactly what was said (the reference transcript)
+# speaker:  a pseudonymous id ("s01"), never a name
+# consent:  where the consent is recorded
+# category: one of corpus.yaml's categories (default facts)
+# values:   as in corpus.yaml (names, numbers, dates that must survive)
+# phone:    true when it was recorded through a real phone line already;
+#           then it is scored as it is, without the phone conditions
+
+recordings:
+  - id: s01-phone-number
+    file: s01-phone-number.wav
+    text: Meine Nummer ist null drei null, zwei drei eins zwei fünf, vier eins sieben.
+    speaker: s01
+    consent: signed form, test-recordings folder, 2026-10-22
+    category: phone_numbers
+    values: [{phone: "030 23125 417"}]
+    phone: false

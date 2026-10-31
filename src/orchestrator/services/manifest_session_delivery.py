@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE
 from orchestrator.services.manifest_execution_snapshot import (
     object_value,
     rendered_srw_snapshot,
@@ -73,7 +74,9 @@ async def capture_session_delivery(db, thread, resolved, status, *, project_ids)
     prepared = deepcopy(candidate)
     # Materialized controls are overlaid by delivery. Store that same state in
     # both the hydration blob and the permission policy, without live bindings.
-    controls = {"permission_mode": str(thread.get("permission_mode") or "supervised")}
+    controls = {
+        "permission_mode": str(thread.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+    }
     if thread.get("narration_mode") is not None:
         controls["narration_mode"] = str(thread["narration_mode"])
     for key in ("document", "resolved"):

@@ -221,7 +221,8 @@ def _client(admission=None, config=None) -> TestClient:
 class TestRouteInventory:
     def test_the_seven_declarations_keep_their_identity(self):
         """Pins the declarations' identity. The eighth, the GET
-        upgrade-availability route (added 2026-10-07), is pinned here too."""
+        upgrade-availability route (added 2026-10-07), is pinned here too.
+        C2 (2026-10-14) added the workspace-upgrade seed routes."""
         app = FastAPI()
         app.include_router(admission_routes.router)
         app.include_router(config_routes.router)
@@ -268,6 +269,21 @@ class TestRouteInventory:
                 "/api/agents/threads/{thread_id}/upgrade-availability",
                 "GET",
                 "agent_thread_upgrade_availability",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/workspace-upgrade/seed-source",
+                "GET",
+                "agent_vm_upgrade_seed_source",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/workspace-upgrade/seeded",
+                "POST",
+                "agent_vm_upgrade_seeded",
+            ),
+            (
+                "/api/agents/threads/{thread_id}/workspace-upgrade/interrupted",
+                "POST",
+                "agent_vm_upgrade_interrupted",
             ),
         }
         for route in moved:
@@ -328,7 +344,12 @@ class TestCreationPreview:
             "/api/persistent/threads/preview", json={"use_datasource_defaults": True}
         )
         assert response.status_code == 200, response.text
-        assert response.json() == {
+        body = response.json()
+        # The draft's picker names where the tier came from.
+        assert body.pop("workspace_sources")["tier"] == "installation"
+        assert "workspace_template_name" in body
+        body.pop("workspace_template_name")
+        assert body == {
             "project_ids": [],
             "workspace_backend": backend,
             "datasource_ids": (
@@ -684,7 +705,12 @@ class TestInternalConfigRoutes:
         assert response.json()["detail"] == {"code": "vm_provision_authority_changed"}
 
     def test_an_unproven_vm_teardown_is_a_retryable_503(self):
-        deps = _config_deps()
+        installed = {
+            "vm": {"provision_generation": "33333333-3333-4333-8333-333333333333"}
+        }
+        deps = _config_deps(
+            store={"get_thread": AsyncMock(return_value=_thread(metadata=installed))}
+        )
         deps.vm_provisioner.delete_thread_vm = AsyncMock(return_value=False)
         response = _client(config=deps).post(
             f"/api/agents/threads/{THREAD}/abort-vm-upgrade"

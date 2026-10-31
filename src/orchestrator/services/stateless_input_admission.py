@@ -131,7 +131,10 @@ async def admit_stateless_input(
     queued, leased-with-watermark, or deliberately parked.
     """
     from shared.row_identity import _coerce_row_id
-    from orchestrator.services.stateless_queue_state import queue_block
+    from orchestrator.services.stateless_queue_state import (
+        queue_block,
+        unknown_tool_calls_block,
+    )
     from shared.run_queue import (
         LANE_STATELESS,
         UNIT_KIND_SESSION_TURN,
@@ -268,12 +271,14 @@ async def admit_stateless_input(
         # queue_depth comes from unconsumed watermarks, not a process queue.
         wm = await queue_depth_for(conn, unit_id=thread_id)
         queue_state = await queue_state_for(conn, unit_id=thread_id)
+        # Lifecycle block (stateless_turn_resilience.md step 2): the SAME shape
+        # /connection and GET …/queue return, so a parked unit is never
+        # mistaken for a busy pool by the client. Input landing on a park over
+        # unanswered tool calls carries the decision card's calls with it.
+        lifecycle = queue_block(queue_state, thread.get("metadata"))
+        unknown_calls = await unknown_tool_calls_block(conn, thread, lifecycle)
 
     queue_depth = 1 if (wm is not None and wm.has_pending_input) else 0
-    # Lifecycle block (stateless_turn_resilience.md step 2): the SAME shape
-    # /connection and GET …/queue return, so a parked unit is never mistaken
-    # for a busy pool by the client.
-    lifecycle = queue_block(queue_state, thread.get("metadata"))
     logger.info(
         "run_queue enqueue: thread=%s turn=%d input_seq=%d state=%s",
         thread_id,
@@ -295,6 +300,7 @@ async def admit_stateless_input(
             "retryable": lifecycle["retryable"],
             "attempts": lifecycle["attempts"],
             "pending_input": lifecycle["pending_input"],
+            "unknown_tool_calls": unknown_calls,
         },
     }
 

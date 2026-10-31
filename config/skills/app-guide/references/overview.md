@@ -13,7 +13,7 @@ journey_ids:
 
 **Superhuman Remote Worker (SRW)** runs AI agents that do real work for you:
 research, writing, analysis, design, and software development. Agents work in
-isolated environments ranging from instant cloud-backed files to full
+isolated environments ranging from instant file-only workspaces to full
 git-versioned containers and VMs. They can be given scoped access to your data,
 check in with you as much or as little as you choose, and get smarter over time
 through explicit project knowledge and, when enabled and healthy, shared
@@ -67,8 +67,8 @@ providers and models, users, configuration, capability grants, usage and cost).
 2. **Start a session** (Sessions → New Session). The initial application
    default is Assistant, but project, personal, or operator defaults may
    replace it. Ask for something real—research a question or draft a document.
-   Select **Supervised** first if you want every tool call to wait for approval;
-   do not assume it is the deployment's current default.
+   Select **Read-only** first if you want every change and command to wait
+   for approval; do not assume it is the deployment's current default.
 3. **Create a job** (Jobs → New Job): a concrete description, an expert,
    autonomy **Review**. Watch it move Created → Processing, then handle the
    review from the Inbox — approve it or send it back with feedback.
@@ -83,8 +83,8 @@ the **Inbox**. Without those tools, use **Jobs → New Job** yourself.
 
 ## How much autonomy to give
 
-Start with **supervised** sessions and **review**-autonomy jobs: you see
-planned actions and review completion yourself. As trust builds, loosen —
+Start with **read-only** sessions and **review**-autonomy jobs: you approve
+every change and review completion yourself. As trust builds, loosen —
 auto-accept sessions, full-autonomy jobs, then scheduled automations and
 project loops (continuous agent cycles working toward a project goal). Critic
 verification and Scholar research are optional job settings; check the

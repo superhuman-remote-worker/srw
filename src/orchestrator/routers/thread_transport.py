@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from orchestrator.schemas.thread_transport import (
     ThreadInputRequest,
     ThreadInterruptRequest,
+    UnknownToolResultDecisionRequest,
 )
 from orchestrator.security.access import log_security_event
 from orchestrator.services import pinned_forwarding
@@ -374,6 +375,98 @@ async def thread_queue_retry(
         "unit_id": thread_id,
         "state": "queued",
         "park_reason": park_reason,
+    }
+
+
+@router.post("/api/persistent/threads/{thread_id}/queue/unknown-tool-result")
+async def thread_queue_unknown_tool_result(
+    thread_id: str,
+    body: UnknownToolResultDecisionRequest,
+    request: Request,
+    *,
+    dependencies: ThreadTransportDependencies = Depends(
+        get_thread_transport_dependencies
+    ),
+) -> dict[str, Any]:
+    """Owner verb: answer a parked Session's unknown tool results.
+
+    The Session parked because a tool call has no result. ``continue`` records
+    each one as unknown and lets the Session go on; ``stop`` records it as
+    unknown and stopped, and nothing more runs for that request. Input sent
+    after it runs either way. 404 when not parked, 409 ``{code}`` under a
+    correctness hold, with nothing to answer, or when the history stays
+    ambiguous (the operator's unpark remains for those). Audited.
+    """
+    from orchestrator.services.session_unknown_tool_results import (
+        CONTINUE_INPUT,
+        UnknownToolResultRefused,
+        decide_unknown_tool_results,
+    )
+    from orchestrator.services.stateless_queue_state import queue_block_for_thread
+
+    try:
+        UUID(str(thread_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Thread not found") from None
+    store = dependencies.store
+    user, thread = await dependencies.require_thread_owner(request, store, thread_id)
+    async with store.acquire() as conn:
+        try:
+            outcome = await decide_unknown_tool_results(
+                conn, thread_id=thread_id, decision=body.decision
+            )
+        except UnknownToolResultRefused as refused:
+            raise HTTPException(
+                status_code=refused.status, detail={"code": refused.code}
+            ) from None
+    logger.info(
+        "run_queue unknown tool results (owner): unit=%s decision=%s calls=%d state=%s",
+        thread_id,
+        body.decision,
+        len(outcome.call_ids),
+        outcome.state,
+    )
+    await log_security_event(
+        store,
+        resource_type="thread",
+        event_type="queue_unknown_tool_result",
+        user=user,
+        resource_id=thread_id,
+        detail=(
+            f"owner decision={body.decision} calls={len(outcome.call_ids)} "
+            f"state={outcome.state}"
+        ),
+        request=request,
+    )
+    continue_input: dict[str, Any] | None = None
+    if outcome.needs_continue_input:
+        # Nothing else is waiting: resume the way a person would, by saying so.
+        # The decision is already durable; a failed admission only leaves the
+        # Session idle, ready for the owner's own message.
+        try:
+            lane_thread = await pinned_forwarding.load_thread_for_owner(
+                thread_id, user, store=store
+            )
+            continue_input = await admit_stateless_input(
+                lane_thread,
+                CONTINUE_INPUT,
+                None,
+                dependencies=dependencies.stateless_input,
+            )
+        except Exception:
+            logger.warning(
+                "unknown tool results: Continue input not admitted (unit=%s)",
+                thread_id,
+                exc_info=True,
+            )
+    async with store.acquire() as conn:
+        block = await queue_block_for_thread(conn, thread)
+    return {
+        "thread_id": thread_id,
+        "decision": body.decision,
+        "answered_calls": outcome.call_ids,
+        "continue_input": continue_input,
+        "queue": block,
     }
 
 

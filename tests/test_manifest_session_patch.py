@@ -30,7 +30,7 @@ def frozen(workspace=None):
         "llm": {"model": "gpt-4o", "temperature": 0.3, "top_p": 0.73},
         "limits": {"context_threshold_tokens": 54321},
         "workspace": workspace or {"backend": "none"},
-        "interactive": {"permission_mode": "supervised"},
+        "interactive": {"permission_mode": "read_only"},
         "autonomy": "review",
         "tools": {"shell": []},
     }
@@ -261,3 +261,124 @@ async def test_a_bare_tier_upgrade_binds_only_the_new_backend(target):
     assert prepared["resolved"]["spec"]["execution"]["workspace"] == {
         "template": {"inline": {"backend": target}}
     }
+
+
+# The llm block a session on MiniMax-M3 freezes: the `minimax-m3` family's
+# matrix values (top_p, extra_body.reasoning_split) next to the base's
+# reasoning_level, as config/model_config_matrix.yaml resolves them.
+MINIMAX_M3_LLM = {
+    "model": "MiniMax-M3",
+    "provider": "openai",
+    "base_url": "https://api.minimax.io/v1",
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "reasoning_level": "high",
+    "max_output_tokens": 65536,
+    "model_max_context_tokens": 1000000,
+    "multimodal": True,
+    "parallel_tool_calls": True,
+    "extra_body": {"reasoning_split": True},
+}
+SWAP_TO_CLAUDE = {
+    "llm": {
+        "model": "claude-opus-5-5",
+        "provider": "anthropic",
+        "base_url": None,
+        "api_key": None,
+    }
+}
+
+
+def frozen_on(llm):
+    current, _ = frozen()
+    runtime = current["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"]
+    for section in ("resolved", "policy"):
+        target = runtime["config"][section]
+        target = target["agent"] if section == "resolved" else target
+        target["llm"] = deepcopy(llm)
+    return current
+
+
+async def swap(current, override, metadata=None):
+    prepared, delta = await prepare_srw_session_patch(
+        settings_db(), current, {"id": WORK}, metadata or {}, [], deepcopy(override)
+    )
+    blob, _ = srw_snapshot_config(prepared)
+    return blob["agent"]["llm"], delta
+
+
+@pytest.mark.asyncio
+async def test_a_swap_to_another_family_drops_the_old_familys_matrix_settings():
+    llm, delta = await swap(frozen_on(MINIMAX_M3_LLM), SWAP_TO_CLAUDE)
+
+    assert llm["model"] == "claude-opus-5-5"
+    # Only MiniMax's matrix defines these; Claude's API refuses both.
+    assert "extra_body" not in llm
+    assert "top_p" not in llm
+    # The pinned runtime's merge clears them too.
+    assert delta["llm"]["extra_body"] is None
+    assert delta["llm"]["top_p"] is None
+    # Keys the new family defines are re-derived as before.
+    assert llm["max_output_tokens"] == 65536
+    assert llm["model_max_context_tokens"] == 1000000
+    assert llm["reasoning_level"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_a_swap_off_muse_returns_reasoning_level_to_the_loader_default():
+    muse = {
+        "model": "muse-spark-1.3-contributor",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "reasoning_level": "medium",
+        "max_output_tokens": 131072,
+        "model_max_context_tokens": 1048576,
+    }
+    llm, _ = await swap(frozen_on(muse), SWAP_TO_CLAUDE)
+
+    assert "reasoning_level" not in llm
+    typed = load_agent_config_from_dict(
+        {"agent_id": "session", "display_name": "Session", "llm": llm}
+    )
+    assert typed.llm.reasoning_level == "high"
+    assert "top_p" not in llm
+
+
+@pytest.mark.asyncio
+async def test_a_value_that_is_not_the_matrix_value_survives_the_swap():
+    authored = {**MINIMAX_M3_LLM, "top_p": 0.8, "extra_body": {"foo": 1}}
+    llm, _ = await swap(frozen_on(authored), SWAP_TO_CLAUDE)
+
+    assert llm["top_p"] == 0.8
+    assert llm["extra_body"] == {"foo": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_value_the_user_pinned_or_sends_survives_the_swap():
+    pinned = {"config_override": {"llm": {"top_p": 0.95}}}
+    override = deepcopy(SWAP_TO_CLAUDE)
+    override["llm"]["extra_body"] = {"reasoning_split": True}
+    llm, _ = await swap(frozen_on(MINIMAX_M3_LLM), override, metadata=pinned)
+
+    assert llm["top_p"] == 0.95
+    assert llm["extra_body"] == {"reasoning_split": True}
+
+
+@pytest.mark.asyncio
+async def test_a_swap_within_the_family_keeps_the_familys_settings():
+    llm, _ = await swap(
+        frozen_on({**MINIMAX_M3_LLM, "model": "MiniMax-M2.7"}),
+        {"llm": {"model": "MiniMax-M3"}},
+    )
+
+    assert llm["extra_body"] == {"reasoning_split": True}
+    assert llm["top_p"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_a_cosmetic_llm_change_clears_nothing():
+    llm, _ = await swap(frozen_on(MINIMAX_M3_LLM), {"llm": {"temperature": 0.7}})
+
+    assert llm["extra_body"] == {"reasoning_split": True}
+    assert llm["top_p"] == 0.95
+    assert llm["temperature"] == 0.7

@@ -15,7 +15,7 @@ import { pickOwnDefaultProject } from '../util/own-default-project';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
 import { newRequestId } from '../util/request-id';
-import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadProtectedSource, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView, WorkspaceUpgradeView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
 // defeat the @defer that keeps the review surface lazy.
@@ -39,12 +39,19 @@ import {
   parseSubagentRecoveryContinuation,
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
+import { parseToolResultState } from '../models/tool-result-state.model';
 import { TranslocoService } from '@jsverse/transloco';
+import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
 import { WorkspacePreview } from '../models/workspace.model';
+import {
+  DEFAULT_PERMISSION_MODE,
+  normalizePermissionMode,
+  type PermissionMode,
+} from '../models/permission-mode';
 import { choiceBackend, choiceRequestFields } from '../../views/workspaces/workspace-template-utils';
 import { ApiService } from './api.service';
-import type { SessionQueueState } from '../models/api.model';
+import type { SessionQueueState, SessionUnknownToolResultDecision } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
@@ -75,6 +82,14 @@ import {
   cloudFolderStateFromEvent,
   cloudFolderStateFromStatus,
 } from '../util/cloud-mount-status';
+import {
+  advanceUpgradeProgress,
+  resumeUpgradeProgress,
+  startUpgradeProgress,
+  UpgradeProgress,
+  UpgradeStep,
+  upgradeStepForPhase,
+} from './workspace-upgrade-progress';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -126,8 +141,6 @@ function isCommittedCanvasControl(
   );
 }
 
-/** Session title from a landing draft's first message: first line, collapsed
- *  whitespace, capped at 60 chars (on a word boundary when one is near). */
 /** Reader-facing name for a workspace tier id: `vm` -> "VM", `sandbox` -> "container". */
 export function workspaceTierLabel(tier: string): string {
   if (tier === 'vm') return 'VM';
@@ -135,6 +148,15 @@ export function workspaceTierLabel(tier: string): string {
   return tier;
 }
 
+/** Server refusals of a control shown in the user's language; any other
+ *  detail is shown as the server wrote it. */
+const CONTROL_REFUSAL_KEYS: Readonly<Record<string, string>> = {
+  "This Session's workspace can't be upgraded in place. Start a new Session with a container workspace.":
+    'chat.workspaceUpgrade.notPossible',
+};
+
+/** Session title from a landing draft's first message: first line, collapsed
+ *  whitespace, capped at 60 chars (on a word boundary when one is near). */
 export function draftTitleFrom(message: string): string {
   const line = message.split('\n')[0].replace(/\s+/g, ' ').trim();
   if (!line) return 'Untitled Session';
@@ -262,7 +284,7 @@ export interface ToolCallInfo {
   /** Tool category from the registry (e.g. workspace, git, research). */
   category?: string;
   /**
-   * Supervised approval outcome, if this call passed through a permission
+   * Approval outcome, if this call passed through a permission
    * gate. Persisted on the backend so it survives history reload.
    * Absent for autonomous / auto-accepted calls.
    */
@@ -303,14 +325,15 @@ export interface SessionTask {
 }
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
-export type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
+export type { PermissionMode };
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 type DurableControl =
   | { method: 'mode.set'; mode: PermissionMode }
   | { method: 'narration.set'; mode: NarrationMode }
   | { method: 'workspace.undo' }
-  | { method: 'compact'; focus?: string; boundary_message_id?: string };
+  | { method: 'compact'; focus?: string; boundary_message_id?: string }
+  | { method: 'upgrade-to-workspace'; target_tier?: 'sandbox' | 'vm'; template?: string };
 
 type DurableScalarControl = Extract<DurableControl, { method: 'mode.set' | 'narration.set' }>;
 
@@ -325,12 +348,31 @@ const SLASH_COMMAND_VERBS: Record<string, readonly string[]> = {
   '/compact': ['compact'],
   '/undo': ['undo', 'workspace.undo'],
   '/auto': ['mode.set'],
+  '/readonly': ['mode.set'],
+  // Hidden alias of /readonly (the mode was called `supervised` until
+  // 2026-10): it still works, the palette never lists it.
   '/supervised': ['mode.set'],
   '/autonomous': ['mode.set'],
   '/silent': ['narration.set'],
   '/verbose': ['narration.set'],
   '/upgrade-workspace': ['upgrade-to-workspace'],
 };
+
+/** Typed `workspace_upgrade.failed` codes (C2): translated copy, never backend text. */
+const WORKSPACE_UPGRADE_FAILURE_KEYS: Record<string, string> = {
+  upgrade_cancelled: 'chat.workspaceUpgrade.failed.upgradeCancelled',
+  upgrade_refused: 'chat.workspaceUpgrade.failed.upgradeRefused',
+  upgrade_failed: 'chat.workspaceUpgrade.failed.upgradeFailed',
+  upgrade_interrupted: 'chat.workspaceUpgrade.failed.upgradeInterrupted',
+  upgrade_already_running: 'chat.workspaceUpgrade.failed.upgradeAlreadyRunning',
+};
+
+/** Container upgrade failures that End, then Resume, can retry (C1). */
+const RETRYABLE_UPGRADE_FAILURES: ReadonlySet<string> = new Set([
+  'pull_deadline',
+  'readiness_deadline',
+  'ssh_deadline',
+]);
 
 /** Owner rejection codes with a specific explanation (the fallback is the
  *  generic `chat.control.ownerRejected`). */
@@ -401,7 +443,10 @@ export function describeAppliedConfig(
     parts.push(`${label} tools ${enabled ? 'enabled' : 'disabled'}`);
   }
   const interactive = applied['interactive'] as Record<string, unknown> | undefined;
-  if (interactive?.['permission_mode']) parts.push(`mode → ${interactive['permission_mode']}`);
+  if (interactive?.['permission_mode']) {
+    const mode = interactive['permission_mode'];
+    parts.push(`mode → ${normalizePermissionMode(mode) ?? mode}`);
+  }
   if (interactive?.['narration_mode']) parts.push(`narration → ${interactive['narration_mode']}`);
   for (const name of datasources?.added ?? []) {
     parts.push(`connector "${name}" attached`);
@@ -484,7 +529,7 @@ export type ControlTransport = 'websocket' | 'rest' | 'unavailable';
 type ControlCapabilityMap = Record<string, 'websocket' | 'rest'>;
 type ControlOptionsMap = Record<
   string,
-  { version: number; modes?: string[]; requires_idle?: boolean }
+  { version: number; modes?: string[]; requires_idle?: boolean; targets?: string[] }
 >;
 
 interface RewindExpected {
@@ -681,8 +726,11 @@ interface SessionStateSnapshot extends Record<string, unknown> {
  *
  * All state is exposed as Angular signals for reactive UI updates.
  */
-/** A citation created during a persistent session (engine-backed). The marker
- *  the agent emits inline — `[<id>]` — is `id`; the chat resolves it to this. */
+/** A citation created during a persistent session (engine-backed). The handle
+ *  the agent writes inline — `[^c<id>]`, or `[<id>]` in sessions from before
+ *  2026-10-28 — names `id`; the chat resolves it to this. Same shape from
+ *  `GET /threads/{id}/citations` and the live `citation.*` frames
+ *  (`CitationEngine.wire_row`). */
 export interface ThreadCitation {
   id: number;
   claim: string;
@@ -690,9 +738,22 @@ export interface ThreadCitation {
   source_name: string;
   source_type: string;
   source_identifier: string | null;
+  /** pending | verified | failed (shown "Unverified") | unverified (shown "Not checked"). */
   verification_status: string;
   confidence: string;
   created_at: string;
+  /** The quoted evidence (verbatim quote, else the agent's context text). */
+  quote?: string | null;
+  locator?: Record<string, unknown> | null;
+  extraction_method?: string | null;
+  /** quote_not_found | not_supported | source_unavailable | not_checked. */
+  verification_reason?: string | null;
+  verification_notes?: string | null;
+  /** The passage the check found in the source. */
+  matched_text?: string | null;
+  /** Set when the agent withdrew the citation; the record stays. */
+  withdrawn_at?: string | null;
+  withdrawn_reason?: string | null;
   /** Cloud-document citation (cite_document w/ snapshot-anchor): can drift-check. */
   has_cloud_anchor?: boolean;
   /** A backed-up original copy exists → "view original" can stream it. */
@@ -901,11 +962,53 @@ export class PersistentChatService {
     });
 
     // A /compact (or "Summarize up to here") asked for mid-response runs once
-    // the session is idle again — see requestCompaction().
+    // the session is idle again — see requestCompaction(). A workspace
+    // upgrade asked for mid-response waits the same way.
     effect(() => {
       const busy = this.isStreaming() || this.isAwaitingTurn();
       if (busy) return;
-      untracked(() => this._flushDeferredCompaction());
+      untracked(() => {
+        this._flushDeferredCompaction();
+        this._flushDeferredWorkspaceUpgrade();
+      });
+    });
+
+    // A failed stateless upgrade (C1): announce it once per thread, on load or
+    // live, through the same path as workspace_upgrade.failed.
+    effect(() => {
+      const failed = this.workspaceUpgradeFailed();
+      const threadId = this.threadId();
+      if (!failed || !threadId) return;
+      untracked(() => this._announceWorkspaceUpgradeFailure(threadId));
+    });
+
+    // The Session read's upgrade phases (C1 and C2): on load an upgrade still
+    // running shows its card, and each read moves the card on.
+    effect(() => {
+      const view = this.workspaceUpgrade();
+      untracked(() => this._followWorkspaceUpgradeView(view));
+    });
+
+    // The upgrade card lives exactly as long as the upgrade is in progress.
+    effect(() => {
+      const inProgress = this.workspaceUpgradeInProgress();
+      untracked(() => {
+        const progress = this.workspaceUpgradeProgress();
+        if (!inProgress) {
+          if (progress) this.workspaceUpgradeProgress.set(null);
+          return;
+        }
+        if (!progress) {
+          const now = Date.now();
+          this.workspaceUpgradeProgress.set(
+            resumeUpgradeProgress(this.workspaceUpgrade(), now) ??
+              startUpgradeProgress(inProgress.tier, inProgress.template ?? null, now),
+          );
+        } else if (inProgress.tier !== 'next' && inProgress.tier !== progress.tier) {
+          // A bare upgrade's tier is the server's: .started names it.
+          this.workspaceUpgradeProgress.set({...progress, tier: inProgress.tier});
+        }
+      });
     });
 
     // Stamp the start of an awaiting stretch and tick a 1 s clock while it
@@ -1063,10 +1166,14 @@ export class PersistentChatService {
     if (!u || u.threadId == null) return null;
     return u.threadId === this.threadId() ? u : null;
   });
-  /** Engine citations for this session, keyed by citation id (the agent emits
-   *  the id as the inline `[N]` marker). Drives inline resolution +
-   *  source popover (see CitationRefDirective). Loaded on connect + per turn. */
+  /** Engine citations for this session, keyed by citation id (the agent writes
+   *  a handle inline; the chat numbers each answer's chips and resolves them
+   *  to a row for the popover, see CitationRefDirective). Loaded on connect and
+   *  at each turn's end, and upserted live from `citation.*` frames, which
+   *  arrive before the agent can write the handle. */
   readonly citationsByCid = signal<Map<number, ThreadCitation>>(new Map());
+  /** A citation the popover asked the citations panel to show. */
+  readonly citationFocus = signal<number | null>(null);
   readonly citationsLoaded = signal(false);
 
   /**
@@ -1151,7 +1258,7 @@ export class PersistentChatService {
   }
 
   // --- Permission state ---
-  readonly permissionMode = signal<PermissionMode>('supervised');
+  readonly permissionMode = signal<PermissionMode>(DEFAULT_PERMISSION_MODE);
   /** Every gate currently awaiting a decision. A parallel tool batch puts
    *  all of its calls here at once so one card can list them —
    *  knowledge-base/knowledge/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
@@ -1181,8 +1288,16 @@ export class PersistentChatService {
    *  `_poll_workspace_ready` takes no progress_cb — so on the sandbox path
    *  (the only tier request_workspace_upgrade asks for) `elapsed` stays
    *  undefined and the spinner is silent. Fine: a sandbox is a container
-   *  spawn, not a VM cold-import. */
-  readonly workspaceUpgradeInProgress = signal<{ tier: string; elapsed?: number } | null>(null);
+   *  spawn, not a VM cold-import. `template` is a named template's, for the
+   *  upgrade card's title. */
+  readonly workspaceUpgradeInProgress = signal<{
+    tier: string;
+    elapsed?: number;
+    template?: string;
+  } | null>(null);
+  /** The upgrade card's steps and their times; set exactly while
+   *  `workspaceUpgradeInProgress` is. */
+  readonly workspaceUpgradeProgress = signal<UpgradeProgress | null>(null);
   /** A live agent-initiated upgrade offer (workspace_upgrade.needed), or null.
    *  Drives the inline offer card. Live-only: nothing replays it after a
    *  reload, and re-offering then would be wrong anyway — the agent's turn is
@@ -1317,6 +1432,27 @@ export class PersistentChatService {
   );
   readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
   readonly workspaceCreation = signal<WorkspaceCreationView | null>(null);
+  /** The Session read's in-place upgrade state (stateless C1; C2 shares it).
+   *  Unknown phases are carried through; only `failed` is acted on here. */
+  readonly workspaceUpgrade = signal<WorkspaceUpgradeView | null>(null);
+  readonly workspaceUpgradeFailed = computed(() => this.workspaceUpgrade()?.phase === 'failed');
+  private workspaceUpgradeFailureAnnounced: string | null = null;
+  /** A read has shown this upgrade running, so a read without one means the
+   *  server finished it. Before that (a pinned container upgrade has no
+   *  phases) only the agent's frames end the card. */
+  private workspaceUpgradeSeenOnServer = false;
+  /** workspace_upgrade.complete ended the card; a read older than the copy's
+   *  end must not bring it back. Cleared by the first read without it. */
+  private workspaceUpgradeEndedByFrame = false;
+  /** The VM line owed for the upgrade being admitted: posted on its 202,
+   *  dropped on a refusal (a refused try used to leave its line). */
+  private pendingUpgradeAnnouncement: {template?: string} | null = null;
+  /** An upgrade asked for mid-response, sent when the session is idle. */
+  private deferredWorkspaceUpgrade: {
+    threadId: string;
+    tier: 'sandbox' | 'vm' | null;
+    template?: string;
+  } | null = null;
 
   /** Bind an IDE response to this view, including same-thread Resume. A late
    *  ready response cannot restore the idle view of a terminal retirement. */
@@ -1538,6 +1674,31 @@ export class PersistentChatService {
     void this._pollQueueState();
     return 'refused';
   }
+
+  /**
+   * The owner's answer to a parked unit's unknown tool results
+   * (session_unknown_tool_result_needs_admin.md): POST the decision, then
+   * reload the transcript, which now holds a result row per call and, for
+   * Continue with nothing else waiting, the server-admitted "Continue." turn.
+   * A refusal is toasted with the server's code and the block re-read.
+   */
+  async decideUnknownToolResult(decision: SessionUnknownToolResultDecision): Promise<'ok' | 'refused'> {
+    const tid = this.threadId();
+    if (!tid) return 'refused';
+    const outcome = await firstValueFrom(this.api.decideUnknownToolResult(tid, decision));
+    if (this.threadId() !== tid) return 'refused';
+    if (outcome.kind === 'ok') {
+      if (outcome.queue) this._applyQueueState(tid, outcome.queue);
+      if (outcome.continued || outcome.queue?.state === 'queued') {
+        this.pendingTurnCount.update((c) => Math.max(c, 1));
+      }
+      void this._reloadAfterRewind();
+      return 'ok';
+    }
+    this.toast.danger(this.transloco.translate('chat.unknownResult.failed', { code: outcome.code }));
+    void this._pollQueueState();
+    return 'refused';
+  }
   /**
    * Single-flight guard for _flushOutbox — one POST in flight **per thread**,
    * not per tab. `turn_id` is per-thread, so two different threads can never
@@ -1711,7 +1872,7 @@ export class PersistentChatService {
   private sseOpenedWithCursor = false;
   // The DB-authoritative REST snapshot was applied for this connection.
   // A socketless /connection response may unblock the composer only after
-  // this is true; otherwise a supervised gate could be live but invisible.
+  // this is true; otherwise an approval gate could be live but invisible.
   private sessionSnapshotLoaded = false;
   private sessionSnapshotFailed = false;
   // Journal high-water covered by the durable snapshot. Replay starts from
@@ -1779,6 +1940,10 @@ export class PersistentChatService {
     controls: ControlCapabilityMap;
     options: ControlOptionsMap;
   } | null>(null);
+  /** The lane switch this tab already followed (C2), keyed by request. */
+  private laneSwitchHandled: string | null = null;
+  /** ~2 minutes of 425s (250 ms … 4 s backoff) before an upgrade gives up. */
+  private static readonly WORKSPACE_UPGRADE_MAX_425_ATTEMPTS = 30;
   /** Socket-sent config updates awaiting their `config.changed` ack (or a
    *  matching error frame), keyed by request_id. Settled by the frame
    *  reducer, by the ack timeout, or by disconnect(). */
@@ -2214,6 +2379,8 @@ export class PersistentChatService {
     this.pendingPermissions.set([]);
     this.permissionResolutionFailures.clear();
     this.workspaceUpgradeInProgress.set(null);
+    this.workspaceUpgradeSeenOnServer = false;
+    this.workspaceUpgradeEndedByFrame = false;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(false);
     this.pendingRewindRequestId = null;
@@ -2442,6 +2609,9 @@ export class PersistentChatService {
       this.cloudSessionUrl.set(null);
       this.sshHandle.set(null);
       this.workspaceCreation.set(null);
+      this.workspaceUpgrade.set(null);
+      this.workspaceUpgradeFailureAnnounced = null;
+      this.laneSwitchHandled = null;
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -2459,6 +2629,7 @@ export class PersistentChatService {
       this.runningTools.set([]);
       this.citationsByCid.set(new Map());
       this.citationsLoaded.set(false);
+      this.citationFocus.set(null);
       if (!preserveReviewPlane) {
         this._protectedCloud.set(false);
         this.cloudFolderProblems.set([]);
@@ -2601,14 +2772,27 @@ export class PersistentChatService {
       // Keep the reviewed IDs explicit at create so later auto-attach edits
       // cannot add a connector the user did not see here.
       const preview = await firstValueFrom(
-        this.http.post<{project_ids: string[]; workspace_backend: string; datasource_ids: string[]}>(
+        this.http.post<{
+          project_ids: string[];
+          workspace_backend: string;
+          workspace_sources?: {tier: string | null; template: string | null} | null;
+          workspace_template_name?: string | null;
+          datasource_ids: string[];
+        }>(
           `${environment.apiUrl}/persistent/threads/preview`, body,
         ),
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       this.draftProjectIds = preview.project_ids;
       this.draftProjectId.set(preview.project_ids[0] ?? null);
-      this.draftWorkspacePreview.set({backend: preview.workspace_backend, source: 'default', binding: null});
+      // Its sources let the picker say a Container is the cloud folders'.
+      this.draftWorkspacePreview.set({
+        backend: preview.workspace_backend,
+        source: 'default',
+        binding: null,
+        ...(preview.workspace_sources ? {sources: preview.workspace_sources} : {}),
+        template_name: preview.workspace_template_name ?? null,
+      });
       this.draftDatasourceIds.set(preview.datasource_ids);
     } catch (err) {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
@@ -2774,22 +2958,38 @@ export class PersistentChatService {
    */
   /**
    * Fetch the engine citations for this session (job_id == thread_id) and
-   * index them by citation id for inline [N] resolution. Best-effort — a
-   * failure just leaves markers unresolved (restored to literal text).
+   * index them by citation id for inline handle resolution. Reads every page:
+   * a session's citations are not capped at the endpoint's page size. Rows a
+   * live frame upserted while the fetch ran are kept. Best-effort — a failure
+   * just leaves handles unresolved.
    */
   private async loadCitations(threadId: string): Promise<void> {
+    const pageSize = 500;
     try {
-      const resp = await firstValueFrom(
-        this.http.get<{ citations: ThreadCitation[] }>(
-          `${environment.apiUrl}/persistent/threads/${threadId}/citations`,
-        ),
-      );
       const map = new Map<number, ThreadCitation>();
-      for (const c of resp?.citations ?? []) {
-        map.set(c.id, c);
+      for (let offset = 0; ; offset += pageSize) {
+        const resp = await firstValueFrom(
+          this.http.get<{ citations: ThreadCitation[]; total?: number }>(
+            `${environment.apiUrl}/persistent/threads/${threadId}/citations`,
+            { params: { limit: pageSize, offset } },
+          ),
+        );
+        const page = resp?.citations ?? [];
+        for (const c of page) {
+          map.set(c.id, c);
+        }
+        const total = typeof resp?.total === 'number' ? resp.total : 0;
+        if (page.length < pageSize || offset + page.length >= total) break;
+        if (this.threadId() !== threadId) return;
       }
       if (this.threadId() === threadId) {
-        this.citationsByCid.set(map);
+        this.citationsByCid.update((live) => {
+          // A frame can land between the fetch and here; it is newer.
+          for (const [cid, c] of live) {
+            if (!map.has(cid)) map.set(cid, c);
+          }
+          return map;
+        });
         this.citationsLoaded.set(true);
       }
     } catch {
@@ -2799,6 +2999,20 @@ export class PersistentChatService {
         this.citationsLoaded.set(true);
       }
     }
+  }
+
+  /** Upsert one live citation row; false when `raw` is not a row. */
+  private _upsertCitation(raw: unknown): boolean {
+    if (!raw || typeof raw !== 'object') return false;
+    const row = raw as ThreadCitation;
+    const cid = Number(row.id);
+    if (!Number.isSafeInteger(cid) || cid <= 0) return false;
+    this.citationsByCid.update((m) => {
+      const next = new Map(m);
+      next.set(cid, { ...m.get(cid), ...row, id: cid });
+      return next;
+    });
+    return true;
   }
 
   /**
@@ -3084,8 +3298,15 @@ export class PersistentChatService {
           ? thread.execution_lane
           : null,
       );
+      if (thread.execution_lane === 'pinned' && this.controlSocket === 'none') {
+        // C2: another tab (or a lost 202) switched this Session to the pinned
+        // lane. The frame may be covered by the snapshot, so the read is the
+        // robust signal. Idempotent via laneSwitchHandled.
+        this._switchToPinnedTransport(threadId, 'lane-read');
+      }
       this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
       this.workspaceCreation.set(thread.workspace_creation ?? null);
+      this.workspaceUpgrade.set(thread.workspace_upgrade ?? null);
       if (!lifecycleOnly) {
         this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
         this.protectedSource.set(thread.protected_source ?? null);
@@ -4213,6 +4434,27 @@ export class PersistentChatService {
     return true;
   }
 
+  /** C2: the orchestrator moved this session to the pinned lane for a VM
+   *  upgrade (the 202's `transport_changed`, or the journaled
+   *  `session.lane_changed` frame every tab sees). Idempotent per request:
+   *  drop the socketless declaration, hold the composer (`sessionReady`
+   *  false keeps input in the outbox), and reconnect through the normal
+   *  pinned path: /connection 425 → /prepare → WebSocket. */
+  private _switchToPinnedTransport(threadId: string, key: string): void {
+    if (this.threadId() !== threadId || this.laneSwitchHandled === key) return;
+    if (this.executionLane() === 'pinned' && this.controlSocket === 'websocket') return;
+    this.laneSwitchHandled = key;
+    this.controlCapabilities.set(null);
+    this.controlSocket = 'unknown';
+    this.executionLane.set('pinned');
+    this._queueState.set(null);
+    this.sessionReady.set(false);
+    this.startupPhase.set('provisioning');
+    this.workspaceUpgradeInProgress.set({ tier: 'vm' });
+    this._systemMessage(this.transloco.translate('chat.workspaceUpgrade.movingToVm'));
+    void this._openControlWs(threadId);
+  }
+
   private _installControlTransport(threadId: string, connection: ConnectionPayload): void {
     if (!this._controlPlaneAllowed(threadId)) return;
     const exactRuntimeContract = connection?.pinned_runtime_generation_contract === 1;
@@ -4802,9 +5044,9 @@ export class PersistentChatService {
     }
 
     const subscription = response$.subscribe({
-      next: () => {
+      next: (body: unknown) => {
         settledSynchronously = true;
-        this._finishDurableControlAdmission(item);
+        this._finishDurableControlAdmission(item, body);
       },
       error: (err: unknown) => {
         settledSynchronously = true;
@@ -4824,7 +5066,7 @@ export class PersistentChatService {
     }
   }
 
-  private _finishDurableControlAdmission(item: DurableControlOutboxItem): void {
+  private _finishDurableControlAdmission(item: DurableControlOutboxItem, body?: unknown): void {
     if (this.durableControlInFlight !== item) return;
     this.durableControlSubscription?.unsubscribe();
     this.durableControlSubscription = null;
@@ -4832,8 +5074,31 @@ export class PersistentChatService {
     if (this.durableControlOutbox[0] === item) {
       this.durableControlOutbox.shift();
     }
-    // Deliberately ignore the response body. Only the owner's durable
-    // journal acknowledgement is authoritative client state.
+    const admission = body as { transport_changed?: unknown; request_id?: unknown } | null | undefined;
+    if (item.request.method === 'upgrade-to-workspace' && admission?.transport_changed === true) {
+      this._switchToPinnedTransport(
+        item.threadId,
+        String(admission.request_id ?? item.request.client_request_id),
+      );
+    }
+    if (item.request.method === 'upgrade-to-workspace' && this.pendingUpgradeAnnouncement) {
+      const announcement = this.pendingUpgradeAnnouncement;
+      this.pendingUpgradeAnnouncement = null;
+      if (item.threadId === this.threadId()) {
+        this._announceWorkspaceUpgradeProvisioning(announcement);
+        this._advanceWorkspaceUpgrade('starting');
+      }
+    }
+    if (item.request.method === 'upgrade-to-workspace' && item.threadId === this.threadId()) {
+      // The create starts now: show its startup line without waiting 5 s.
+      void this.loadThreadMeta(item.threadId, this.connectGeneration, {
+        fresh: true,
+        lifecycleOnly: true,
+      });
+    }
+    // The response body is read only for `transport_changed` (the lane switch
+    // above). Everything else is the owner's durable journal acknowledgement,
+    // which stays the authoritative client state.
     this._flushDurableControlOutbox();
   }
 
@@ -4843,7 +5108,13 @@ export class PersistentChatService {
     this.durableControlSubscription = null;
     this.durableControlInFlight = null;
 
+    const upgradeRetriesExhausted =
+      item.request.method === 'upgrade-to-workspace' &&
+      (err as { status?: unknown })?.status === 425 &&
+      item.attempts >= PersistentChatService.WORKSPACE_UPGRADE_MAX_425_ATTEMPTS;
+
     if (
+      !upgradeRetriesExhausted &&
       this._isRetryableDurableControlFailure(err) &&
       !this.intentionalClose &&
       this.threadId() === item.threadId &&
@@ -4866,13 +5137,23 @@ export class PersistentChatService {
       this.durableControlOutbox.shift();
     }
     this.durableControlAwaitingAck.delete(item.request.client_request_id);
+    if (item.request.method === 'upgrade-to-workspace') {
+      this.workspaceUpgradeInProgress.set(null);
+      this.continueAfterUpgrade.set(false);
+      this.pendingUpgradeAnnouncement = null;
+    }
     if (!this.intentionalClose && this.threadId() === item.threadId) {
       const detail = (err as { error?: { detail?: unknown }; message?: unknown })?.error?.detail;
+      const known = typeof detail === 'string' ? CONTROL_REFUSAL_KEYS[detail] : undefined;
       this._setDurableControlError(
         { method: item.request.method, ordinal: item.ordinal },
-        typeof detail === 'string'
-          ? this.sanitizeError(detail)
-          : this.transloco.translate('chat.control.admissionFailed'),
+        upgradeRetriesExhausted
+          ? this.transloco.translate('chat.control.upgradeBusy')
+          : known
+            ? this.transloco.translate(known)
+            : typeof detail === 'string'
+              ? this.sanitizeError(detail)
+              : this.transloco.translate('chat.control.admissionFailed'),
       );
     }
     this._flushDurableControlOutbox();
@@ -5170,6 +5451,7 @@ export class PersistentChatService {
     // the composer stuck on "working" after a teardown.
     this.pendingTurnCount.set(0);
     this.deferredCompaction = null;
+    this.deferredWorkspaceUpgrade = null;
     if (this.controlWsReconnectTimer) {
       clearTimeout(this.controlWsReconnectTimer);
       this.controlWsReconnectTimer = null;
@@ -5257,8 +5539,14 @@ export class PersistentChatService {
     // frames only ever arrive over that socket (_ws_send, not _broadcast),
     // so leaving it set would spin forever against the wrong thread.
     this.workspaceUpgradeInProgress.set(null);
+    this.workspaceUpgradeSeenOnServer = false;
+    this.workspaceUpgradeEndedByFrame = false;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(false);
+    this.pendingUpgradeAnnouncement = null;
+    // So is the tier: the settings pane sets it from the next thread's own
+    // config, and a stale one made it filter that thread's connectors.
+    this.workspaceTier.set(null);
     this.sessionTitle.set(null);
     this.modelName.set(null);
     this.isOfficerThread.set(false);
@@ -5270,6 +5558,9 @@ export class PersistentChatService {
     this.threadStatus.set(null);
     this.workspaceLifecycle.set(null);
     this.workspaceCreation.set(null);
+    this.workspaceUpgrade.set(null);
+    this.workspaceUpgradeFailureAnnounced = null;
+    this.laneSwitchHandled = null;
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
     this.retirementPermanent.set(false);
@@ -5475,7 +5766,11 @@ export class PersistentChatService {
       if (this._isStatelessEndBusyError(err) && !force) {
         // The stateless turn/unit is still leased or has pending input or
         // control. `force` stops the unfinished turn; declining ends nothing.
-        const proceed = confirm(this.transloco.translate('sessions.confirmEndStatelessBusy'));
+        // A failed upgrade leaves its control pending, so End is "busy" without
+        // any running turn; the user was told to End — don't ask about a turn.
+        const proceed =
+          this.workspaceUpgradeFailed() ||
+          confirm(this.transloco.translate('sessions.confirmEndStatelessBusy'));
         return proceed ? this.endSession(true) : 'kept';
       }
       if (this.executionLane() === 'stateless' && this._isRetryableEndFence(err)) {
@@ -5883,9 +6178,17 @@ export class PersistentChatService {
         // Upload may outlive a CLOSED stream, End, navigation or a successor
         // connect. Keep the unaccepted item queued; no G1 send may slip into
         // G2 while owner/stream/binding recovery is still unresolved.
+        //
+        // A flush that began with no generation installed is not a G1 send.
+        // /connection marks the session ready before it installs the runtime
+        // it names, so the first flush of a connect starts with none; an
+        // upload then spans that install (a new session's first message with
+        // a file). Within the same connect, the first generation to arrive is
+        // the runtime this item was waiting for.
+        const runtimeSwitched =
+          runtimeAtPost !== null && this.sessionRuntimeGeneration !== runtimeAtPost;
         if (!this.sessionReady() || !this._controlPlaneAllowed(tidAtPost) ||
-            this.connectGeneration !== connectAtPost ||
-            this.sessionRuntimeGeneration !== runtimeAtPost) {
+            this.connectGeneration !== connectAtPost || runtimeSwitched) {
           if (this.threadId() === tidAtPost && this.outboxIds().has(item.localId)) {
             this.outboxStalled.set(true);
           }
@@ -6400,8 +6703,9 @@ export class PersistentChatService {
       case '/auto':
         this.setMode('auto_accept');
         return true;
-      case '/supervised':
-        this.setMode('supervised');
+      case '/readonly':
+      case '/supervised': // hidden legacy alias, never listed in the palette
+        this.setMode('read_only');
         return true;
       case '/autonomous':
         this.setMode('autonomous');
@@ -6506,15 +6810,17 @@ export class PersistentChatService {
 
   /** Approve every pending gate. Each decision carries its own approval_id:
    *  the no-id REST fallback resolves "most-recent-pending", which is the
-   *  wrong gate when a batch is open. */
-  approveAll(): void {
+   *  wrong gate when a batch is open. Settles once every decision has been
+   *  answered (accepted, refused or failed); it never rejects. */
+  approveAll(): Promise<void> {
     const pending = this.pendingPermissions();
+    const decisions: Promise<void>[] = [];
     for (const req of pending) {
       if (req.approvalId) {
         // Durable REST decisions are ack-driven: keep the card until
         // permission.resolved proves which decision won (another tab
         // may race us, or a committed response may be masked).
-        this._resolvePermission(req, 'approve');
+        decisions.push(this._resolvePermission(req, 'approve'));
         continue;
       }
       this.pendingPermissions.update((list) => list.filter((item) => item.id !== req.id));
@@ -6524,8 +6830,9 @@ export class PersistentChatService {
         decision: 'approved',
         timestamp: Date.now(),
       });
-      this._resolvePermission(req, 'approve');
+      decisions.push(this._resolvePermission(req, 'approve'));
     }
+    return Promise.all(decisions).then(() => undefined);
   }
 
   /** Deny every pending gate. */
@@ -6547,17 +6854,23 @@ export class PersistentChatService {
     }
   }
 
+  /** Send one decision. Settles when its REST answer arrives (at once on the
+   *  socket path); it never rejects. */
   private _resolvePermission(
     pending: PermissionRequest | null,
     decision: 'approve' | 'deny',
-  ): void {
+  ): Promise<void> {
     const threadId = this.threadId();
     if (threadId && pending?.approvalId) {
       this._clearPermissionResolutionFailure(pending.id);
       const url =
         `${environment.apiUrl}/persistent/threads/${threadId}` + `/approve/${pending.approvalId}`;
+      let settle: () => void = () => undefined;
+      const answered = new Promise<void>((resolve) => (settle = resolve));
       this.http.post(url, { decision }).subscribe({
+        complete: () => settle(),
         error: (err: unknown) => {
+          settle();
           const status = (err as { status?: number })?.status;
           if (status === 404 || status === 409) {
             // Gone/already decided — a stale card from replay or a
@@ -6596,9 +6909,10 @@ export class PersistentChatService {
           );
         },
       });
-      return;
+      return answered;
     }
     this._sendControl({ method: decision });
+    return Promise.resolve();
   }
 
   private _clearPermissionResolutionFailure(toolCallId: string): void {
@@ -7255,6 +7569,26 @@ export class PersistentChatService {
     tier: 'sandbox' | 'vm' | null,
     opts: {thenContinue?: boolean; template?: string} = {},
   ): void {
+    const inFlight = this.workspaceUpgradeInProgress();
+    if (inFlight) {
+      // One upgrade at a time, whatever the transport: a second control is
+      // refused (409, or the agent's "already running"), and on the socket
+      // arming it would cancel the running upgrade's progress and continue —
+      // after a stateless lane switch the running upgrade is a VM one.
+      // Its card is showing; a VM repeats its line.
+      if (this.controlTransport('upgrade-to-workspace') === 'websocket') {
+        if (inFlight.tier === 'vm') {
+          this._systemMessage('Provisioning a VM workspace (requires approval), please wait...');
+        }
+      } else {
+        this._announceWorkspaceUpgradeProvisioning();
+      }
+      return;
+    }
+    if (this.controlTransport('upgrade-to-workspace') === 'rest') {
+      this._requestDurableWorkspaceUpgrade(tier, opts);
+      return;
+    }
     if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
       // No transport on this session (queue-served sessions have none yet):
       // refuse before arming the in-progress state, and say so.
@@ -7269,12 +7603,184 @@ export class PersistentChatService {
     if (!this._sendControl(control)) return;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
-    this.workspaceUpgradeInProgress.set({tier: tier ?? (opts.template ? 'vm' : 'next')});
-    this._systemMessage(
-      tier === 'vm' || opts.template
-        ? 'Provisioning a VM workspace (requires approval), please wait...'
-        : 'Provisioning workspace, please wait...',
+    this.workspaceUpgradeInProgress.set({
+      tier: tier ?? (opts.template ? 'vm' : 'next'),
+      ...(opts.template ? {template: opts.template} : {}),
+    });
+    // The upgrade card shows the progress; a VM also needs an approval.
+    if (tier === 'vm' || opts.template) {
+      this._systemMessage('Provisioning a VM workspace (requires approval), please wait...');
+    }
+  }
+
+  /** Whether this session can carry an upgrade to `tier` right now.
+   *  Pinned (socket): VM only — container upgrades are refused in-process.
+   *  Stateless (REST): exactly the targets `/connection` declared. */
+  upgradeTargetAvailable(tier: 'sandbox' | 'vm'): boolean {
+    const transport = this.controlTransport('upgrade-to-workspace');
+    if (transport === 'websocket') return tier === 'vm';
+    if (transport !== 'rest') return false;
+    const threadId = this.threadId();
+    const declared = this.controlCapabilities();
+    const targets =
+      declared && declared.threadId === threadId
+        ? declared.options['upgrade-to-workspace']?.targets ?? []
+        : [];
+    return targets.includes(tier === 'vm' ? 'vm' : 'container');
+  }
+
+  workspaceUpgradeFailureText(): string {
+    const view = this.workspaceUpgrade();
+    if (view?.target_tier === 'vm') {
+      return this.transloco.translate(
+        WORKSPACE_UPGRADE_FAILURE_KEYS[view.reason_code ?? ''] ??
+          'chat.workspaceUpgrade.failed.upgradeFailed',
+      );
+    }
+    const creation = this.workspaceCreation();
+    const reasonKey = creation ? workspaceCreationMessageKey(creation) : 'workspaceCreation.unknown';
+    // A deadline can pass for a transient reason, and Resume after End starts
+    // the upgrade's container again. A bad image or configuration would only
+    // fail again.
+    const retryable = RETRYABLE_UPGRADE_FAILURES.has(creation?.reason_code ?? '');
+    return this.transloco.translate(
+      retryable ? 'chat.workspaceUpgrade.failedStartupRetry' : 'chat.workspaceUpgrade.failedStartup',
+      {
+        reason: this.transloco.translate(
+          reasonKey,
+          creation ? workspaceCreationMessageParams(creation) : {},
+        ),
+      },
     );
+  }
+
+  /** One Session read's upgrade phase (C1, C2): shows, moves on or ends the card. */
+  private _followWorkspaceUpgradeView(view: WorkspaceUpgradeView | null): void {
+    const step = view ? upgradeStepForPhase(view.phase) : null;
+    if (!view || !step) {
+      // A failure has its own announcer. No upgrade at all after one was seen
+      // running means the server finished it; the done frame normally ends
+      // the card first, and this ends it when that frame was missed (a
+      // dropped stream, another tab's upgrade).
+      this.workspaceUpgradeEndedByFrame = false;
+      if (!view && this.workspaceUpgradeSeenOnServer) {
+        this.workspaceUpgradeSeenOnServer = false;
+        const inProgress = this.workspaceUpgradeInProgress();
+        if (inProgress) {
+          if (inProgress.tier === 'sandbox' || inProgress.tier === 'vm') {
+            this.workspaceTier.set(inProgress.tier);
+          }
+          this.workspaceUpgradeInProgress.set(null);
+        }
+      }
+      return;
+    }
+    if (this.workspaceUpgradeEndedByFrame) return;
+    this.workspaceUpgradeSeenOnServer = true;
+    if (!this.workspaceUpgradeInProgress()) {
+      // On load, or another tab's upgrade: the card resumes from this read.
+      this.workspaceUpgradeInProgress.set({tier: view.target_tier});
+      return;
+    }
+    this._advanceWorkspaceUpgrade(step);
+  }
+
+  private _advanceWorkspaceUpgrade(step: UpgradeStep): void {
+    const inProgress = this.workspaceUpgradeInProgress();
+    if (!inProgress) return;
+    const now = Date.now();
+    const progress =
+      this.workspaceUpgradeProgress() ??
+      startUpgradeProgress(inProgress.tier, inProgress.template ?? null, now);
+    this.workspaceUpgradeProgress.set(advanceUpgradeProgress(progress, step, now));
+  }
+
+  private _announceWorkspaceUpgradeFailure(threadId: string): void {
+    if (this.workspaceUpgradeFailureAnnounced === threadId) return;
+    this.workspaceUpgradeFailureAnnounced = threadId;
+    this.workspaceUpgradeInProgress.set(null);
+    this.pendingWorkspaceOffer.set(null);
+    this.continueAfterUpgrade.set(false);
+    this._systemMessage(this.workspaceUpgradeFailureText());
+  }
+
+  private _requestDurableWorkspaceUpgrade(
+    tier: 'sandbox' | 'vm' | null,
+    opts: {thenContinue?: boolean; template?: string},
+  ): void {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (this.workspaceUpgradeInProgress()) {
+      // A second control would come back 409, and that failure clears the
+      // first upgrade's progress and auto-continue. Its card is showing.
+      this._announceWorkspaceUpgradeProvisioning();
+      return;
+    }
+    // A named template's tier is the server's call; anything else must be a
+    // declared target here (C1 declares container; C2 adds vm).
+    const wanted = tier ?? (opts.template ? null : 'sandbox');
+    if (wanted && !this.upgradeTargetAvailable(wanted)) {
+      this.error.set(
+        this.transloco.translate(
+          wanted === 'vm' ? 'chat.control.vmUpgradeUnavailable' : 'chat.control.upgradeUnavailable',
+        ),
+      );
+      return;
+    }
+    this.pendingWorkspaceOffer.set(null);
+    this.continueAfterUpgrade.set(opts.thenContinue === true);
+    if (this.isStreaming() || this.isAwaitingTurn()) {
+      const alreadyDeferred = this.deferredWorkspaceUpgrade?.threadId === threadId;
+      this.deferredWorkspaceUpgrade = {threadId, tier, template: opts.template};
+      if (!alreadyDeferred) {
+        this._systemMessage(this.transloco.translate('chat.control.upgradeDeferred'));
+      }
+      return;
+    }
+    this._dispatchDurableWorkspaceUpgrade(tier, opts.template);
+  }
+
+  private _dispatchDurableWorkspaceUpgrade(tier: 'sandbox' | 'vm' | null, template?: string): void {
+    const control: DurableControl = {method: 'upgrade-to-workspace'};
+    if (tier) control.target_tier = tier;
+    if (template) control.template = template;
+    // Set before sending: the admission (or refusal) may settle synchronously.
+    const inProgress = this.workspaceUpgradeInProgress();
+    const announcement = this.pendingUpgradeAnnouncement;
+    if (tier === 'vm') {
+      // The 202 (or the lane_changed frame) says "moving to a VM".
+      this.workspaceUpgradeInProgress.set({tier: 'vm'});
+    } else if (!tier && template) {
+      // A named template's tier is the server's call.
+      this.workspaceUpgradeInProgress.set({tier: 'next', template});
+      this.pendingUpgradeAnnouncement = {template};
+    } else {
+      this.workspaceUpgradeInProgress.set({tier: 'sandbox'});
+      this.pendingUpgradeAnnouncement = {};
+    }
+    if (!this._sendDurableControl(control)) {
+      this.workspaceUpgradeInProgress.set(inProgress);
+      this.pendingUpgradeAnnouncement = announcement;
+    }
+  }
+
+  /** The line for the upgrade in flight (or being dispatched): only a VM's,
+   *  which says the session reconnects first. The upgrade card (title and
+   *  steps) shows everything else. */
+  private _announceWorkspaceUpgradeProvisioning(opts: {template?: string} = {}): void {
+    if (!opts.template && this.workspaceUpgradeInProgress()?.tier === 'vm') {
+      this._systemMessage(this.transloco.translate('chat.workspaceUpgrade.movingToVm'));
+    }
+  }
+
+  private _flushDeferredWorkspaceUpgrade(): void {
+    const deferred = this.deferredWorkspaceUpgrade;
+    if (!deferred) return;
+    this.deferredWorkspaceUpgrade = null;
+    if (deferred.threadId !== this.threadId() || !this._controlPlaneAllowed(deferred.threadId)) {
+      return;
+    }
+    this._dispatchDurableWorkspaceUpgrade(deferred.tier, deferred.template);
   }
 
   /** Decline a live upgrade offer. Local only — the agent isn't told anything
@@ -7350,8 +7856,10 @@ export class PersistentChatService {
             this.error.set(null);
           }
         }
-        if (params['permission_mode']) {
-          this.permissionMode.set(params['permission_mode'] as PermissionMode);
+        // Stored rows and old agents may still say `supervised`.
+        const snapshotMode = normalizePermissionMode(params['permission_mode']);
+        if (snapshotMode) {
+          this.permissionMode.set(snapshotMode);
         }
         if (params['narration_mode']) {
           this.narrationMode.set(params['narration_mode'] as NarrationMode);
@@ -7400,7 +7908,7 @@ export class PersistentChatService {
         if ('running_tools' in params || 'running_tool' in params) {
           this.runningTools.set(parseRunningTools(params));
         }
-        // Pending supervised gates: re-render the approval card a
+        // Pending approval gates: re-render the approval card a
         // dropped stream (or a reload) would otherwise strand, leaving
         // the gate unanswerable. Same presence-check discipline as
         // running_tool. See the backend welcome frame.
@@ -7662,12 +8170,20 @@ export class PersistentChatService {
         break;
       }
 
+      case 'citation.created':
+      case 'citation.updated': {
+        // A cite tool wrote a row (before it returned, so before the agent
+        // can write the handle), or an edit/withdrawal changed one. Upsert it
+        // so the chip resolves while the text streams.
+        this._upsertCitation(params['citation']);
+        break;
+      }
+
       case 'citation.verdict': {
-        // The aux verifier flipped a citation pending→verified/failed.
-        // Patch it in place so the citations panel + inline [N] popover
-        // update live, instead of waiting for the next per-turn
-        // loadCitations(). No-op if the citation isn't loaded yet — the
-        // turn-boundary refresh will pick up its already-final status.
+        // A check landed. Newer agents send the whole row; older ones only
+        // the status, which patches a citation already loaded (the
+        // turn-boundary refresh picks up the rest).
+        if (this._upsertCitation(params['citation'])) break;
         const cid = Number(params['citation_id']);
         const status =
           typeof params['verification_status'] === 'string'
@@ -7842,7 +8358,8 @@ export class PersistentChatService {
       case 'mode.changed':
         this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'mode.set'));
         if (coveredBySnapshot) break;
-        this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
+        // Journaled frames from before the rename say `supervised`.
+        this.permissionMode.set(normalizePermissionMode(params['mode']) ?? DEFAULT_PERMISSION_MODE);
         break;
 
       case 'narration.changed':
@@ -7856,7 +8373,8 @@ export class PersistentChatService {
           params['method'] === 'mode.set' ||
           params['method'] === 'narration.set' ||
           params['method'] === 'workspace.undo' ||
-          params['method'] === 'compact'
+          params['method'] === 'compact' ||
+          params['method'] === 'upgrade-to-workspace'
             ? params['method']
             : null;
         const rejectedMarker = rejectedMethod
@@ -7864,13 +8382,19 @@ export class PersistentChatService {
           : null;
         if (coveredBySnapshot) break;
         const code = typeof params['error_code'] === 'string' ? params['error_code'] : '';
+        if (rejectedMethod === 'upgrade-to-workspace') {
+          this.workspaceUpgradeInProgress.set(null);
+          this.continueAfterUpgrade.set(false);
+        }
         const messageKey =
           CONTROL_REJECTION_KEYS[code] ??
-          (rejectedMethod === 'compact'
-            ? 'chat.control.compactRejected'
-            : rejectedMethod === 'workspace.undo'
-              ? 'chat.control.undoRejected'
-              : 'chat.control.ownerRejected');
+          (rejectedMethod === 'upgrade-to-workspace' && this.executionLane() === 'pinned'
+            ? 'chat.control.vmUpgradeRetry'
+            : rejectedMethod === 'compact'
+              ? 'chat.control.compactRejected'
+              : rejectedMethod === 'workspace.undo'
+                ? 'chat.control.undoRejected'
+                : 'chat.control.ownerRejected');
         this._setDurableControlError(
           rejectedMarker ?? {
             method: rejectedMethod,
@@ -7888,8 +8412,9 @@ export class PersistentChatService {
         if (!coveredBySnapshot && params['temperature'] != null) {
           this.temperature.set(params['temperature'] as number);
         }
-        if (!coveredBySnapshot && params['permission_mode']) {
-          this.permissionMode.set(params['permission_mode'] as PermissionMode);
+        const changedMode = coveredBySnapshot ? null : normalizePermissionMode(params['permission_mode']);
+        if (changedMode) {
+          this.permissionMode.set(changedMode);
         }
         // Transcript stamp (live_session_settings.md, principle 5):
         // the ack is broadcast + journaled, so every viewer — live or
@@ -8165,6 +8690,18 @@ export class PersistentChatService {
         );
         break;
 
+      case 'session.lane_changed': {
+        // A socketless tab must follow even a snapshot-covered frame: the
+        // switch bumps the journal epoch, so the replayed frame is always
+        // covered by the reloaded /state cursor.
+        if (coveredBySnapshot && this.controlSocket !== 'none') break;
+        const tid = this.threadId();
+        if (tid && params['to'] === 'pinned') {
+          this._switchToPinnedTransport(tid, String(params['control_request_id'] ?? ''));
+        }
+        break;
+      }
+
       case 'workspace_upgrade.needed': {
         // The agent called request_workspace_upgrade — offer the upgrade
         // (HITL: a human accepts before anything provisions). The inline
@@ -8180,12 +8717,12 @@ export class PersistentChatService {
         // live, and they can't accumulate.
         const tier = (params['target_tier'] as string) || 'sandbox';
         const reason = (params['reason'] as string) || 'shell/git tools needed';
-        if (tier === 'sandbox' && this.controlTransport('upgrade-to-workspace') === 'websocket') {
-          // An older agent still offers a container on a pinned session,
-          // where accepting can only fail: keep the ask in scroll-back, but
-          // raise no card.
+        if (!this.upgradeTargetAvailable(tier === 'vm' ? 'vm' : 'sandbox')) {
+          // A target this session can't carry (an older agent's container
+          // offer on a pinned session, where accepting can only fail): keep
+          // the ask in scroll-back, but raise no card.
           this._systemMessage(
-            `The agent requested a container workspace, which isn't available in this session: ${reason}`,
+            `The agent requested a ${workspaceTierLabel(tier)} workspace, which isn't available in this session: ${reason}`,
           );
           break;
         }
@@ -8198,42 +8735,63 @@ export class PersistentChatService {
       }
 
       case 'workspace_upgrade.started':
+        this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'upgrade-to-workspace'));
         this.workspaceUpgradeInProgress.update(
           (p) =>
             !p || p.tier === 'next'
               ? { ...p, tier: (params['target_tier'] as string) || 'sandbox' }
               : p,
         );
-        this._systemMessage('Provisioning workspace, please wait...');
+        // The upgrade card shows it; no chat line.
+        this._advanceWorkspaceUpgrade('starting');
         break;
 
       case 'workspace_upgrade.progress': {
         // Heartbeat during a slow (cold) VM provision so a multi-minute
         // wait isn't a silent black box (workspace_tier_upgrade.md Q7).
-        // The agent emits this ~once a minute while polling readiness.
+        // The agent emits this ~once a minute while polling readiness; the
+        // upgrade card's own clock shows the wait.
         const elapsed = params['elapsed_s'] as number | undefined;
         const tier = (params['target_tier'] as string) || 'workspace';
-        this.workspaceUpgradeInProgress.set({ tier, elapsed });
-        this._systemMessage(
-          typeof elapsed === 'number'
-            ? `Still provisioning the ${tier} workspace (${elapsed}s elapsed)…`
-            : `Still provisioning the ${tier} workspace…`,
-        );
+        this.workspaceUpgradeInProgress.update((p) => ({
+          ...(p?.template ? { template: p.template } : {}),
+          tier,
+          elapsed,
+        }));
+        this._advanceWorkspaceUpgrade('starting');
         break;
       }
 
       case 'workspace_upgrade.complete': {
+        this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'upgrade-to-workspace'));
+        // A read from before the copy ended may still say "copying".
+        this.workspaceUpgradeEndedByFrame = true;
+        this.workspaceUpgradeSeenOnServer = false;
         const seeded = params['seeded_files'] as number | undefined;
-        const seededNote = typeof seeded === 'number' ? ` ${seeded} file(s) carried over.` : '';
         const tier = (params['target_tier'] as string) || '';
         if (tier) this.workspaceTier.set(tier);
         this.workspaceUpgradeInProgress.set(null);
         this.pendingWorkspaceOffer.set(null);
-        const sudoNote = tier === 'vm' ? ' Running on a VM — sudo is now available.' : '';
         this._systemMessage(
-          `Workspace ready — shell, git, and file tools are now available.` +
-            `${sudoNote}${seededNote}`,
+          [
+            this.transloco.translate('chat.workspaceUpgrade.ready'),
+            tier === 'vm' ? this.transloco.translate('chat.workspaceUpgrade.readySudo') : '',
+            typeof seeded === 'number'
+              ? this.transloco.translate('chat.workspaceUpgrade.readySeeded', { count: seeded })
+              : '',
+          ]
+            .filter(Boolean)
+            .join(' '),
         );
+        const skipped = params['skipped_files'];
+        if (Array.isArray(skipped) && skipped.length > 0) {
+          // Over the upload ceiling: the copy left them in the old storage.
+          this._systemMessage(
+            this.transloco.translate('chat.workspaceUpgrade.skippedFiles', {
+              files: skipped.map(String).join(', '),
+            }),
+          );
+        }
         // Read-and-clear before the send (mirrors consume_freeze_request)
         // so a repeated .complete — the server short-circuits an
         // already-satisfied tier straight to this frame — can't send the
@@ -8252,16 +8810,31 @@ export class PersistentChatService {
         break;
       }
 
-      case 'workspace_upgrade.failed':
-        this.workspaceUpgradeInProgress.set(null);
+      case 'workspace_upgrade.failed': {
+        this._takeDurableControlAck(params, 'upgrade-to-workspace');
+        const errorCode = typeof params['error_code'] === 'string' ? params['error_code'] : '';
+        if (errorCode !== 'upgrade_already_running') {
+          // "Already running" refuses only the second upgrade: the running
+          // one keeps its progress and its auto-continue.
+          this.workspaceUpgradeInProgress.set(null);
+          this.continueAfterUpgrade.set(false);
+        }
         // Don't fall back to re-offering: the reason is stale and the
         // pane still has the button.
         this.pendingWorkspaceOffer.set(null);
-        this.continueAfterUpgrade.set(false);
-        this._systemMessage(
-          `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
-        );
+        const failureKey = WORKSPACE_UPGRADE_FAILURE_KEYS[errorCode];
+        if (failureKey) {
+          // C2's durable path: typed copy, and the load-time projection must
+          // not announce the same failure again.
+          this.workspaceUpgradeFailureAnnounced = this.threadId();
+          this._systemMessage(this.transloco.translate(failureKey));
+        } else {
+          this._systemMessage(
+            `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
+          );
+        }
         break;
+      }
 
       case 'tasks.updated':
         if (!coveredBySnapshot) {
@@ -8718,6 +9291,19 @@ export function parseRunningTools(params: Record<string, unknown>): RunningToolI
   return single ? [single] : [];
 }
 
+/**
+ * Whether a tool result read back from history is the tool's own failure
+ * report. History rows carry no `is_error` (only the live `tool.completed`
+ * frame does), so the replay applies the agent's rule (`_is_returned_error`
+ * in persistent_graph.py): the result starts with `Error:`, or it is the
+ * runtime's `Tool execution error:` for a tool that raised. Only the leading
+ * prefix counts, so a log that mentions an error stays a success.
+ */
+export function isReturnedToolError(result: string): boolean {
+  const head = result.trimStart();
+  return head.startsWith('Error:') || head.startsWith('Tool execution error:');
+}
+
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
   const turns: Turn[] = [];
   const turnByNumber = new Map<number, AssistantTurn>();
@@ -8841,7 +9427,8 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       const tc = toolCallById.get(callId);
       if (!tc) continue;
       tc.result = m.content ?? '';
-      tc.resultStatus = 'ok';
+      const failed = isReturnedToolError(tc.result);
+      tc.resultStatus = failed ? 'error' : 'ok';
       // That recovery's marker says what became of the child; the result
       // text is for the model and is never parsed. Each result row decides
       // afresh, like the text it carries: a later unmarked result for the
@@ -8849,10 +9436,15 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       const recovery = parseSubagentRecoveryResult(m.metrics, callId);
       if (recovery) tc.recovery = recovery;
       else delete tc.recovery;
+      // A row that says the result is unknown or that the call never ran
+      // (session_unknown_tool_result_needs_admin.md) is no "completed".
+      const resultState = parseToolResultState(m.metrics, callId);
+      if (resultState) tc.resultState = resultState;
+      else delete tc.resultState;
       // Don't clobber a 'denied' decision recorded on the AI side. A
       // recovered declined call is that same refusal.
       const refused = tc.decision === 'denied' || recovery?.class === 'declined';
-      tc.status = refused ? 'denied' : 'completed';
+      tc.status = refused ? 'denied' : failed ? 'error' : 'completed';
       continue;
     }
 
@@ -8925,6 +9517,10 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
           // The AI row that carried the call: calls sharing it were issued in
           // one model response, which is what makes a delegate fan-out.
           messageKey: m.id,
+          // Until its result row turns up below: a call with none must not
+          // read "completed". A refused or unanswered gate never ran, and
+          // its own status already says so.
+          ...(decision === 'denied' || decision === 'expired' ? {} : {resultState: 'missing' as const}),
         };
         turn.events.push(event);
         if (tc.id) toolCallById.set(tc.id, event);

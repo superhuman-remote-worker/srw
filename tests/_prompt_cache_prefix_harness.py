@@ -11,8 +11,8 @@ of ``httpx`` (and of ``httpx2`` when installed), so the provider SDKs SRW
 builds (OpenAI through ``ReasoningChatOpenAI``, Anthropic, google-genai) run
 unchanged up to the socket. Every transformation between graph state
 ``messages`` and the request body is therefore inside the measurement: the
-execute node's transient tail (``graph.py``), the session loop's per-call
-injection (``persistent_graph.py``), ``fold_system_messages``,
+execute node's context entries and carrier fold (``graph.py``), the session
+loop's (``persistent_graph.py``), ``fold_system_messages``,
 ``mark_anthropic_cache_breakpoints`` and each SDK's message conversion. The
 fake provider answers in the provider's own wire format (JSON for the worker's
 ``ainvoke``, SSE for the session's ``astream``), so the assistant messages that
@@ -27,10 +27,8 @@ Which step of the script to answer is derived from the request itself (the
 number of distinct ``STEPnn`` markers it carries), so a retried request gets
 the same answer instead of advancing the script.
 
-``injection_mode`` (``context_management.injection_mode``, WP2) selects how the
-context reaches the request: ``legacy`` rebuilds the per-request tail,
-``append_only`` appends typed context entries to the history once and folds
-them into their carrier (D27).
+Context reaches the request as typed context entries, appended to the history
+once and folded into their carrier (D27); nothing is re-sent per request.
 """
 
 from __future__ import annotations
@@ -58,6 +56,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     RemoveMessage,
+    SystemMessage,
     ToolMessage,
 )
 
@@ -230,8 +229,13 @@ class Family:
 FAMILIES: Dict[str, Family] = {
     f.id: f
     for f in (
-        # GPT on first-party OpenAI Chat Completions.
-        Family("openai-chat", "openai_chat", "gpt-5.6-sol", "openai", None, "high"),
+        # GPT on first-party OpenAI Chat Completions: a non-reasoning model,
+        # since OpenAI's own reasoning models take the Responses route there.
+        Family("openai-chat", "openai_chat", "gpt-4.1", "openai"),
+        # GPT-5.6 on first-party OpenAI: the Responses route the openai factory
+        # takes for o-series/gpt-5*/gpt-6* (Chat Completions rejects their
+        # function tools once a reasoning effort applies).
+        Family("responses-openai", "responses", "gpt-5.6-sol", "openai", None, "high"),
         # Claude through the subscription proxy on its OpenAI-compatible route:
         # Chat Completions plus the explicit cache_control breakpoints SRW
         # moves every request. Kill-switch fallback since the native route.
@@ -658,20 +662,23 @@ class FakeProvider:
 # ---------------------------------------------------------------------------
 
 JOB_ID = "prefix-invariance-job"
+#: The memory block the removed per-request tail rendered from
+#: ``MEMORY_FACTS``. No request may carry it: memory reaches a request only as
+#: a typed context entry rendered from the records.
 MEMORY_TEXT = (
     "--- Recalled Memories ---\n"
     "- [factual] The release checklist lives in docs/release.md.\n"
     "- [procedural] Summaries go to summary.md in the workspace root."
-)
-KNOWLEDGE_TEXT = (
-    "--- Project Knowledge ---\n"
-    "## Release process\nReleases are cut on Fridays after the smoke test."
 )
 ACTIVE_SUBAGENTS = (
     "<active_subagents>\n"
     "- reviewer-ab12: running (background)\n"
     "Reports push automatically; do not poll.\n"
     "</active_subagents>"
+)
+#: The tools node's progress nudge (``graph.py``), as ``nudges`` appends it.
+PROGRESS_NUDGE = (
+    "OBSERVATION: 5 tool calls since the last file write or todo completion."
 )
 GUIDANCE = [
     {
@@ -776,19 +783,19 @@ class SummaryStatsStore:
 class RecordingMemoryManager:
     """MemoryManager seam stub with a memory + knowledge payload.
 
-    The rendered blocks (``content`` / ``messages``, what legacy mode
-    injects) are fixed. ``InjectionBlock.records`` carry the store rows
-    behind them (what append_only plans from, WP2 spec §C): fixed, or with
-    ``churn`` seven memories (a drip-feed past the per-entry cap) and a
-    memory and the note that change on later requests.
+    ``InjectionBlock.records`` carry the store rows the planner renders its
+    entries from (WP2 spec §C): fixed, or with ``churn`` seven memories (a
+    drip-feed past the per-entry cap) and a memory and the note that change
+    on later requests.
 
-    append_only retrieves asynchronously (WP3): ``start_retrieval`` /
-    ``take_retrieval`` model the manager's single-flight task. With
-    ``lag=0`` a retrieval has finished before the request that started it
-    takes its result in (the graphs start early and take in late), so each
-    request plans from its own payload, as the synchronous path did. With
-    ``lag=1`` it finishes only once the next request is being built: its
-    result reaches the request after the one that started it (D6, D8).
+    Retrieval is asynchronous (WP3): ``start_retrieval`` /
+    ``take_retrieval`` model the manager's single-flight task, and
+    ``assemble_requests`` records the request of every retrieval started.
+    With ``lag=0`` a retrieval has finished before the request that started
+    it takes its result in (the graphs start early and take in late), so
+    each request plans from its own payload. With ``lag=1`` it finishes only
+    once the next request is being built: its result reaches the request
+    after the one that started it (D6, D8).
 
     ``runtime.recall_store`` answers the memory summary's read (D35); the
     summary is given only where ``memory_search`` is bound too.
@@ -802,7 +809,6 @@ class RecordingMemoryManager:
         )
         self.assemble_requests: List[Any] = []
         self.captures: List[Any] = []
-        self.payload = self._payload(0)
         self._in_flight: Optional[Any] = None
         self._finished: Optional[Any] = None
         # Idle-time prefetch (WP4): what the session's turn end found, the
@@ -812,34 +818,23 @@ class RecordingMemoryManager:
         self.durable_pending_id: Optional[str] = None
 
     def _payload(self, call: int) -> Any:
-        from agent.core.knowledge_injection import create_knowledge_injection_messages
-        from agent.core.memory_injection import create_memory_injection_messages
         from agent.services.memory import AssembleStats, InjectionBlock, MemoryPayload
 
         blocks = [
             InjectionBlock(
                 kind="memory",
-                content=MEMORY_TEXT,
-                messages=list(create_memory_injection_messages(MEMORY_TEXT)),
                 token_count=40,
                 items=[{"record_id": "m1", "token_count": 40}],
                 records=memory_records(churn=self.churn, call=call),
             ),
             InjectionBlock(
                 kind="knowledge",
-                content=KNOWLEDGE_TEXT,
-                messages=list(create_knowledge_injection_messages(KNOWLEDGE_TEXT)),
                 token_count=20,
                 items=[{"record_id": "k1", "token_count": 20}],
                 records=knowledge_records(churn=self.churn, call=call),
             ),
         ]
         return MemoryPayload(blocks=blocks, stats=AssembleStats(blocks=len(blocks)))
-
-    async def assemble(self, req: Any) -> Any:
-        self.payload = self._payload(len(self.assemble_requests))
-        self.assemble_requests.append(req)
-        return self.payload
 
     def start_retrieval(self, req: Any) -> bool:
         from agent.services.memory import RetrievalResult
@@ -848,16 +843,16 @@ class RecordingMemoryManager:
             # lag=1: the retrieval started for the previous request has
             # finished by the time this one is built.
             self._finished, self._in_flight = self._in_flight, None
-        self.payload = self._payload(len(self.assemble_requests))
+        payload = self._payload(len(self.assemble_requests))
         self.assemble_requests.append(req)
-        result = RetrievalResult(payload=self.payload, seq=len(self.assemble_requests))
+        result = RetrievalResult(payload=payload, seq=len(self.assemble_requests))
         if self.lag:
             self._in_flight = result
         else:
             self._finished = result
         return True
 
-    def take_retrieval(self) -> Optional[Any]:
+    def take_retrieval(self, conversation: Any = None) -> Optional[Any]:
         result, self._finished = self._finished, None
         prefetched, self._prefetched = self._prefetched, None
         if prefetched is not None:
@@ -922,8 +917,9 @@ class WorkerContextManager:
 
     ``arm_overflow`` makes the next full-request count exceed every limit, so
     the execute node takes its Layer-1 safety path: a forced
-    ``ensure_within_limits`` and a rebuild of the request with the transient
-    tail re-anchored. The forced compaction is a no-op here (nothing is
+    ``ensure_within_limits`` and a rebuild of the request, its context
+    entries re-planned against the compacted history and folded into their
+    carriers. The forced compaction is a no-op here (nothing is
     evicted), which isolates the rebuild from compaction itself; a real
     compaction is an accepted, one-off cache miss.
     """
@@ -961,7 +957,8 @@ class OverflowOnce:
 
     That exception is what sends the execute node into its Layer-0 emergency
     compaction: a forced ``ensure_within_limits``, then a rebuild of the
-    request with the transient tail re-anchored, then a retry. No real client
+    request with its context entries re-planned and re-folded, then a retry.
+    No real client
     raises it today (``ReasoningChatOpenAI`` turns a Layer-0 overflow into a
     synthetic HTTP 413), so it is raised here, at the LLM boundary, before the
     provider sees the request. Only the retried request reaches the wire.
@@ -1014,9 +1011,9 @@ async def run_worker_scenario(
     safety_rebuild_at: Optional[int] = None,
     emergency_rebuild_at: Optional[int] = None,
     churn: bool = False,
-    injection_mode: str = "legacy",
     memory_lag: int = 0,
     memory_search: bool = True,
+    nudges: bool = False,
 ) -> List[Captured]:
     """Run the tactical tool loop through ``create_execute_node``.
 
@@ -1031,22 +1028,23 @@ async def run_worker_scenario(
     list, and ``todo_complete`` is the real tool, so its results carry the
     full updated list and the todo change is real. Without it the todo list
     is empty and ``todo_complete`` is answered by the stand-in, so no todo
-    text reaches any request. ``"context"`` is the rest of the per-turn tail
+    text reaches any request. ``"context"`` is the other context sources
     (memory and knowledge, citation feedback, supervisor guidance, active
-    subagents), which WP2 moves into the history.
+    subagents), appended to the history as typed context entries (WP2).
 
     ``safety_rebuild_at`` makes request k take the Layer-1 safety rebuild;
     ``emergency_rebuild_at`` makes it take the Layer-0 emergency rebuild.
     ``churn`` makes the memory seam return more memories than one entry
     takes and change a memory and the note later (see
-    ``RecordingMemoryManager``). ``injection_mode`` is the worker's
-    ``context_management.injection_mode``; ``memory_lag`` how many requests
-    late an append_only retrieval result arrives (``RecordingMemoryManager``).
+    ``RecordingMemoryManager``). ``memory_lag`` is how many requests late a
+    retrieval result arrives (``RecordingMemoryManager``).
     Supervisor guidance is pending on two consecutive requests, as the
     heartbeat inbox keeps an entry until the ack lands;
     ``delivered_guidance_ids`` is carried into state. ``memory_search``
     binds the memory tool with the context sources, which brings the
-    up-front memory summary (D35) in append_only mode.
+    up-front memory summary (D35). ``nudges`` appends :data:`PROGRESS_NUDGE`
+    after each tool round, as the tools node appends its progress nudge: a
+    ``SystemMessage`` in state.
     """
     from shared.runtime.core.loader import create_llm, load_agent_config
     from shared.runtime.services.guardrails import format_nudge
@@ -1075,7 +1073,6 @@ async def run_worker_scenario(
     workspace.initialize()
     config = load_agent_config(WORKER_CONFIG_PATH)
     config.llm = llm_config
-    config.context_management.injection_mode = injection_mode
     todo = TodoManager(workspace, model_name=llm_config.model)
     todo.is_strategic_phase = False
     todo.phase_number = 2
@@ -1189,6 +1186,8 @@ async def run_worker_scenario(
                         content=str(output), tool_call_id=call["id"], name=call["name"]
                     )
                 )
+            if nudges:
+                state["messages"].append(SystemMessage(content=PROGRESS_NUDGE))
     expected_forced = int(safety_rebuild_at is not None) + int(overflow is not None)
     if context_mgr.forced_rebuilds != expected_forced:
         raise AssertionError(
@@ -1198,23 +1197,20 @@ async def run_worker_scenario(
         raise AssertionError("the Layer-0 emergency rebuild did not run")
     if context_on and memory_service.assemble_requests == []:
         raise AssertionError("the memory seam was never consulted")
-    _check_summary_reads(memory_service, injection_mode, tool_names or ())
+    _check_summary_reads(memory_service, tool_names or ())
     if todos_on and todo.all_complete() is not True:
         raise AssertionError("the scripted todo changes did not run")
     return provider.requests
 
 
 def _check_summary_reads(
-    memory_service: Optional[RecordingMemoryManager],
-    injection_mode: str,
-    tool_names: Any,
+    memory_service: Optional[RecordingMemoryManager], tool_names: Any
 ) -> None:
-    """The memory summary is read once per run where it applies, else never."""
+    """The memory summary is read once per run where ``memory_search`` is
+    bound, else never."""
     if memory_service is None:
         return
-    expected = int(
-        injection_mode == "append_only" and MEMORY_SEARCH_TOOL_NAME in tool_names
-    )
+    expected = int(MEMORY_SEARCH_TOOL_NAME in tool_names)
     calls = memory_service.runtime.recall_store.calls
     if calls != expected:
         raise AssertionError(
@@ -1232,9 +1228,7 @@ CHARTER = {
 }
 
 
-def _session_config(
-    *, injections: bool, model: str, injection_mode: str = "legacy"
-) -> MagicMock:
+def _session_config(*, injections: bool, model: str) -> MagicMock:
     """MagicMock config in the style of the persistent-graph tests."""
     from shared.runtime.core.skill_resolution import APP_GUIDE_LOADER_TOOL
 
@@ -1261,7 +1255,6 @@ def _session_config(
     config.memory.project_scoped = False
     config.memory.max_memories_per_entry = 5
     config.context_management.max_summary_length = 10_000
-    config.context_management.injection_mode = injection_mode
     config.officer.enabled = False
     config.officer.conference = injections  # charter injection
     config.officer.max_actions_per_wake = 100
@@ -1284,7 +1277,6 @@ async def run_session_scenario(
     *,
     sources: frozenset,
     monkeypatch: Any,
-    injection_mode: str = "legacy",
     memory_lag: int = 0,
     memory_search: bool = True,
     memory_prefetch: bool = False,
@@ -1293,14 +1285,13 @@ async def run_session_scenario(
 
     Sessions never carried a todo list; ``"context"`` in ``sources`` switches
     on the charter, memory and knowledge, active subagents and the App Guide
-    turn boundary. ``injection_mode`` is the session config's
-    ``context_management.injection_mode``: ``append_only`` plans from the
-    payload's ``InjectionBlock.records`` (memory and knowledge) with
+    turn boundary. The loop plans from the payload's
+    ``InjectionBlock.records`` (memory and knowledge) with
     ``memory.max_memories_per_entry = 5`` and appends each kind once (the
     turn boundary once per user turn). ``memory_lag=1`` makes the turn-one
     retrieval finish only when turn two starts its own. ``memory_search``
     binds the memory tool with the context sources, which brings the
-    up-front memory summary (D35) in append_only mode. ``memory_prefetch``
+    up-front memory summary (D35). ``memory_prefetch``
     wires the idle-time prefetch (WP4): turn one's end finds
     :data:`PREFETCH_FACT`, which turn two's first request takes in.
     """
@@ -1370,9 +1361,7 @@ async def run_session_scenario(
         llm_with_tools=llm_with_tools,
         tools=tools,
         context_manager=context_manager,
-        config=_session_config(
-            injections=injections, model=family.model, injection_mode=injection_mode
-        ),
+        config=_session_config(injections=injections, model=family.model),
         system_prompt="You are the SRW session assistant under test.",
         callbacks=callbacks,
         messages=[],
@@ -1381,7 +1370,7 @@ async def run_session_scenario(
     )
     if errors:
         raise AssertionError(f"session turn reported errors: {errors}")
-    _check_summary_reads(memory_service, injection_mode, [tool.name for tool in tools])
+    _check_summary_reads(memory_service, [tool.name for tool in tools])
     if len(provider.requests) != len(SESSION_SCRIPT):
         raise AssertionError(
             f"expected {len(SESSION_SCRIPT)} requests, got {len(provider.requests)}"
@@ -1649,9 +1638,6 @@ VARIANTS: Dict[str, frozenset] = {
     "control": frozenset(),
 }
 
-#: ``context_management.injection_mode`` values the gate runs.
-INJECTION_MODES = ("legacy", "append_only")
-
 # Request 2 is the one after the first todo change, mid-loop.
 SCENARIOS: Dict[str, Dict[str, Any]] = {
     "worker-tool-loop": {"kind": "worker"},
@@ -1671,14 +1657,13 @@ async def run_scenario(
     sources: frozenset,
     workdir: Path,
     monkeypatch: Any,
-    injection_mode: str = "legacy",
     memory_lag: int = 0,
     memory_prefetch: bool = False,
 ) -> Tuple[List[Captured], frozenset]:
     """Run one scenario; return the captured requests and the turn-end steps.
 
-    ``memory_lag`` (append_only): how many requests late a memory retrieval
-    result arrives; 0 serves each request from its own retrieval.
+    ``memory_lag``: how many requests late a memory retrieval result
+    arrives; 0 serves each request from its own retrieval.
     ``memory_prefetch`` (sessions): run the idle-time prefetch at turn end.
     """
     spec = dict(SCENARIOS[name])
@@ -1687,7 +1672,6 @@ async def run_scenario(
             family,
             sources=sources,
             monkeypatch=monkeypatch,
-            injection_mode=injection_mode,
             memory_lag=memory_lag,
             memory_prefetch=memory_prefetch,
         )
@@ -1697,7 +1681,6 @@ async def run_scenario(
         sources=sources,
         workdir=workdir,
         monkeypatch=monkeypatch,
-        injection_mode=injection_mode,
         memory_lag=memory_lag,
         **spec,
     )

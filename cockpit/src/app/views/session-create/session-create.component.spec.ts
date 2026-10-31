@@ -181,6 +181,7 @@ describe('SessionCreateComponent framework defaults', () => {
     const prefillTools = vi.fn();
     fixture.componentInstance.agentSettings = {
       getOverrides: vi.fn().mockReturnValue({}),
+      hasDatasourceSelection: () => false,
       toolsGroup: {prefillFromConfig: prefillTools},
     } as any;
 
@@ -481,6 +482,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
 
     fixture.componentInstance.agentSettings = {
       getOverrides: vi.fn().mockReturnValue({}),
+      hasDatasourceSelection: () => false,
       prefillFromConfig: (config: Record<string, unknown>) => modelGroup.prefillFromConfig(config),
     } as any;
 
@@ -715,6 +717,7 @@ describe('SessionCreateComponent tool preview', () => {
       prefillFromConfig: vi.fn(),
       prefillFromResolvedToolset: prefill,
       hasToolEdits: () => false,
+      hasDatasourceSelection: () => false,
     } as never;
 
     component.toggleExpert({
@@ -738,6 +741,7 @@ describe('SessionCreateComponent tool preview', () => {
       prefillFromConfig: vi.fn(),
       prefillFromResolvedToolset: prefill,
       hasToolEdits: () => true,
+      hasDatasourceSelection: () => false,
     } as never;
 
     component.toggleExpert({
@@ -761,6 +765,49 @@ describe('SessionCreateComponent tool preview', () => {
       expert_id: null,
       project_id: 'proj-1',
     });
+  });
+
+  it('predicts the tier from the connectors Start sends, once the user changed them', () => {
+    // Unticked cloud folders keep a default Session Virtual; the server must
+    // see the list admission judges. Untouched, it predicts the defaults.
+    const {fixture, api} = setup(ANSWER);
+    const component = fixture.componentInstance;
+    let touched = false;
+    component.agentSettings = {
+      getOverrides: vi.fn().mockReturnValue({}),
+      prefillFromResolvedToolset: vi.fn(),
+      hasToolEdits: () => false,
+      hasDatasourceSelection: () => touched,
+      getSelectedDatasourceIds: () => ['kb-1'],
+    } as never;
+
+    component.onSettingsChange();
+    expect(api.previewToolGroups.mock.calls.at(-1)![0]).not.toHaveProperty('datasource_ids');
+
+    touched = true;
+    component.onSettingsChange();
+    expect(api.previewToolGroups.mock.calls.at(-1)![0].datasource_ids).toEqual(['kb-1']);
+  });
+
+  it('keeps cloud folders selectable on a default Virtual tier a cloud folder takes to a Container', () => {
+    const virtual = {
+      ...ANSWER,
+      workspace: {
+        backend: 'virtual',
+        source: 'default',
+        binding: null,
+        sources: {tier: 'installation', template: 'builtin'},
+        template_name: null,
+        cloud_folders_take_container: true,
+      },
+    };
+    const {fixture} = setup(virtual as never);
+    const component = fixture.componentInstance;
+    component.loadToolPreview();
+    expect(component.cloudFoldersTakeContainer()).toBe(true);
+    // A tier the user chose is theirs: a cloud folder can't change it.
+    component.onWorkspaceChoice({kind: 'none'});
+    expect(component.cloudFoldersTakeContainer()).toBe(false);
   });
 
   it('keeps one project: selecting another replaces it, and "No project" clears it', () => {
@@ -788,6 +835,7 @@ describe('SessionCreateComponent tool preview', () => {
       prefillFromConfig: vi.fn(),
       prefillFromResolvedToolset: prefill,
       hasToolEdits: () => false,
+      hasDatasourceSelection: () => false,
     } as never;
 
     component.selectProject('proj-1');
@@ -889,6 +937,7 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
       toolsGroup: {prefillFromConfig: vi.fn()},
       setSessionModelOverride,
       hasToolEdits: () => false,
+      hasDatasourceSelection: () => false,
       prefillFromResolvedToolset: vi.fn(),
     } as never;
   }

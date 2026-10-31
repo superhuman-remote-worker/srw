@@ -88,6 +88,26 @@ _check "agent-chromium runs"       /usr/local/bin/agent-chromium --headless --no
 # it like any other load-bearing binary.
 _check "Xvfb present"              command -v Xvfb
 
+# The agent's own Playwright looks in ~/.cache/ms-playwright, not in
+# /opt/playwright where the image installs the browsers. link-playwright-browsers
+# links them there (at every container start, once in the VM build). Link into
+# an empty home and launch Playwright's default browser from it: without the
+# links Playwright downloads its own copy, or fails without network.
+_playwright_default_folder() {
+    local home status
+    home=$(mktemp -d)
+    env -u PLAYWRIGHT_BROWSERS_PATH -u XDG_CACHE_HOME HOME="$home" \
+        /usr/local/bin/link-playwright-browsers \
+        && env -u PLAYWRIGHT_BROWSERS_PATH -u XDG_CACHE_HOME HOME="$home" \
+            python3 -c 'from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    p.chromium.launch().close()'
+    status=$?
+    rm -rf "$home"
+    return "$status"
+}
+_check "Playwright finds the image's browsers" _playwright_default_folder
+
 # Exercises the actual browser-use/CDP stream seam, including loading, active
 # target handoff, viewer limits, and a zero-viewer restart. The program owns and
 # removes all of its temporary state so this is safe inside an image-build RUN.
@@ -100,8 +120,10 @@ if [ "$fail" -ne 0 ]; then
 ERROR: workspace browser stack incomplete (see MISSING above).
 
 Every workspace image must install all of:
-  - playwright (pin from .playwright-version) + chromium, symlinked to
-    /usr/local/bin/agent-chromium
+  - playwright (pin from .playwright-version) + chromium in /opt/playwright,
+    symlinked to /usr/local/bin/agent-chromium
+  - docker/link-playwright-browsers -> /usr/local/bin/link-playwright-browsers,
+    chmod +x, run as the workspace user (container entrypoint, VM stage2)
   - browser-use, CAPPED <0.13.0 (0.13 dropped Playwright for pure CDP and
     breaks the browser-exec daemon)
   - docker/browser-exec -> /usr/local/bin/browser-exec, chmod +x
@@ -109,7 +131,7 @@ Every workspace image must install all of:
 
 Container: docker/Dockerfile.workspace
 VM:        docker/agent-vm-base/scripts/provision-stage1.sh (pip deps, chromium)
-           docker/agent-vm-base/scripts/provision-stage2.sh (browser-exec)
+           docker/agent-vm-base/scripts/provision-stage2.sh (browser-exec, browser links)
 EOF
     exit 1
 fi

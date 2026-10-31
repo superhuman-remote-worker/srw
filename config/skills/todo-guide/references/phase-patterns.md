@@ -28,10 +28,14 @@ Turn a rough plan into a concrete, sequenced breakdown.
 - "Update `plan.md` with the detailed breakdown for the next 2 phases"
 
 ### 3. Execution — produce one specific section or artifact
-- "Write `output/chapter2.md` §2.1 (Market Analysis) from `documents/market_*.pdf`"
-- "Write `output/chapter2.md` §2.2 (Competitor Landscape) citing phase-3 findings"
-- "Add citations to all claims in `output/chapter2.md` using `cite_web`/`cite_document`"
-- "Verify `output/chapter2.md`: all sections present, all claims cited, 800–1200 words"
+- "Write `output/chapter2.md` §2.1 (Market Analysis) from `documents/market_*.pdf`, citing each claim as you write it"
+- "Write `output/chapter2.md` §2.2 (Competitor Landscape) from the phase-3 findings, citing as you go"
+- "Fix or withdraw the unverified citations of `output/chapter2.md` (`list_citations` with status `failed`; `edit_citation` / `withdraw_citation`)"
+- "Verify `output/chapter2.md`: all sections present, every sourced claim carries a handle, 800–1200 words"
+
+Citing is part of writing a section, not a todo of its own: a separate "add
+citations" pass afterwards produces sections whose claims never get their
+handles (the bookmark effect).
 
 ### 4. Batch processing — repetitive operations over many items
 Process N similar items without a strategic review between each (go to 5–7 todos).
@@ -67,9 +71,9 @@ Studies (3 cities), Recommendations, Conclusion."*
 - **Strategic 2:** review research, elaborate the plan with specific sections.
 - **Tactical 2 — Case-study research (5):** one search per city, save per-city notes, record findings.
 - **Strategic 3:** review notes, plan the writing phases.
-- **Tactical 3 — Write Intro + Background (5):** create `output/paper.md` structure; write Introduction (300–400 w); write Background (600–800 w); add citations; verify sections / word counts / citations.
+- **Tactical 3 — Write Intro + Background (5):** create `output/paper.md` structure; write Introduction (300–400 w), citing as you go; write Background (600–800 w), citing as you go; fix or withdraw the unverified citations; verify sections / word counts / citations.
 - **Tactical 4…N — one section (or two closely-related ones) per phase**, same shape.
-- **Tactical N — Final integration (5):** write Recommendations + Conclusion; generate the references list; full read-through for flow; verify all `instructions.md` requirements (page count, citation count, sections).
+- **Tactical N — Final integration (5):** write Recommendations + Conclusion, citing as you go; fix or withdraw any unverified citation left; full read-through for flow (the footnote definitions are appended at delivery); verify all `instructions.md` requirements (page count, citation count, sections).
 
 The pattern: **research → elaborate → write one section per phase → integrate**,
 with a strategic review between each, and a verification todo closing every

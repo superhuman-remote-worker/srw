@@ -1,0 +1,19 @@
+id: s16-family-relative
+title: Counts and a relative start date in one sentence
+why: Two adults, three children, from the day after tomorrow, four nights.
+categories: [back_office, counts, dates_times]
+voice: m-older-slow
+condition: g711a
+turns:
+  - say: Wir sind zwei Erwachsene und drei Kinder und bräuchten ab übermorgen ein Familienzimmer für vier Nächte.
+    expect:
+      outcome: delegate
+      values:
+        - {number: 2, in: request}
+        - {number: 3, in: request}
+        - {number: 4, in: request}
+        - {date: übermorgen, in: request}
+        - {keyword: familienzimmer, in: request}
+    back_office:
+      answer: Ab übermorgen ist ein Familienzimmer für vier Nächte frei, 179 Euro pro Nacht.
+      after: 6

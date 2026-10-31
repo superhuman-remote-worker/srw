@@ -90,6 +90,18 @@ _TERMINAL_THREAD_STATUSES = frozenset({"ended"})
 _REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
 _REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
 
+# Job statuses whose workspace Pod may be released while its PVC keeps the
+# work. 'reviewing' stays out: its critic rides the parent's Pod (see above).
+_IDLE_POD_RELEASE_JOB_STATUSES = frozenset(
+    {"paused", "pending_review", "waiting_for_reply"}
+)
+# IDE projections with no live IDE. Any other value (active, ready, restoring,
+# cleanup_pending, or one this module does not know) is live access and keeps
+# the workspace Pod.
+_INACTIVE_IDE_STATUSES = frozenset(
+    {None, "expired", "failed", "stopped", "superseded", "deleted"}
+)
+
 # PVC names the backstop sweep owns, by owner kind. The create side is the
 # source of truth — ``_pvc_name_for`` in container_provisioner.py (workspace
 # pod, both kinds) and the session-agent claim in agent_provisioner.py — so
@@ -189,6 +201,20 @@ def paused_within_grace(metadata: dict[str, Any]) -> bool:
         return False
     age = _paused_age_seconds(metadata)
     return age is None or age < paused_grace_seconds()
+
+
+def idle_pod_release_seconds() -> float:
+    """Idle time after which a PVC-backed job workspace releases its Pod.
+
+    ``WORKSPACE_IDLE_POD_RELEASE_SECONDS``. Zero, a negative value or an
+    unparseable one disables the release.
+    """
+    try:
+        return max(
+            0.0, float(os.environ.get("WORKSPACE_IDLE_POD_RELEASE_SECONDS", "0"))
+        )
+    except ValueError:
+        return 0.0
 
 
 def infra_transient_retry_pending(metadata: dict[str, Any]) -> bool:
@@ -394,6 +420,13 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_attempts"] = ws_ctx.get("snapshot_attempts") or 0
                     snap = ctx.get("snapshot") or {}
                     metadata["snapshot_status"] = snap.get("status")
+                    metadata["job_assigned_agent"] = (
+                        row.get("assigned_agent_id") is not None
+                    )
+                    ide_ctx = ctx.get("ide_session")
+                    metadata["ide_status"] = (
+                        ide_ctx.get("status") if isinstance(ide_ctx, dict) else None
+                    )
                     if self._completion_lifecycle is not None:
                         metadata["execution_lane"] = (
                             row.get("execution_lane") or "pinned"
@@ -532,12 +565,47 @@ class WorkspaceInstanceManager:
             reapable = thread_status in _REAPABLE_THREAD_STATUSES
         if not reapable:
             return False
+        if self._idle_pod_release_applies(inst):
+            return True
         # A dirty Kubernetes runtime cannot become reapable without a durable,
         # renewable capture authority. Otherwise repeated refused snapshots
         # eventually hit give_up() and turn safe containment into delayed loss.
         if inst.metadata.get("pod_ip") and await self.is_dirty(inst):
             return False
         return True
+
+    def _idle_pod_release_applies(self, inst: Instance) -> bool:
+        """Whether an idle job's Pod may go while its PVC keeps the work.
+
+        Nothing is captured, so the Kubernetes capture containment above does
+        not apply. For a non-terminal job ``delete`` admits a ``deleted`` +
+        preserve intent: the exact Pod UID and its Service go and the claim
+        stays. The dispatcher treats ``deleted`` as needs-create, and
+        ``create_workspace`` reattaches the claim by its deterministic name on
+        resume or dispatch. Job files are reviewed through Gitea, not the Pod.
+        Process state and anything outside the PVC mount are lost, as when a
+        session ends.
+        """
+        release_after = idle_pod_release_seconds()
+        if release_after <= 0:
+            return False
+        labels = inst.metadata.get("labels") or {}
+        if "srw/thread-id" in labels or inst.metadata.get("thread_status") is not None:
+            return False
+        if inst.metadata.get("job_status") not in _IDLE_POD_RELEASE_JOB_STATUSES:
+            return False
+        # A parked pinned agent still drives this workspace: phase approval
+        # resumes it in-process without re-checking the Pod.
+        if inst.metadata.get("job_assigned_agent") is not False:
+            return False
+        if inst.metadata.get("volume_ephemeral", True):
+            return False
+        if inst.metadata.get("ide_status") not in _INACTIVE_IDE_STATUSES:
+            return False
+        if inst.metadata.get("pod_uid") is None:
+            return False
+        age = _paused_age_seconds(inst.metadata)
+        return age is not None and age >= release_after
 
     def _is_terminal(self, inst: Instance) -> bool:
         """Bound work is finished (vs merely paused) — nothing to preserve
@@ -631,6 +699,10 @@ class WorkspaceInstanceManager:
         # Job path: no turn counter.
         if self._is_terminal(inst):
             return inst.metadata.get("snapshot_status") != "available"
+        # The idle Pod release keeps the PVC, which holds everything worth
+        # saving, so there is nothing to snapshot first.
+        if self._idle_pod_release_applies(inst):
+            return False
         return True
 
     async def is_state_ephemeral(self, inst: Instance) -> bool:
@@ -1258,6 +1330,13 @@ class WorkspaceInstanceManager:
             logger.info(
                 "Reaped workspace %s settled as suspended from its durable snapshot",
                 inst.id,
+            )
+        elif not reclaim_shared_resources and inst.metadata.get("job_status"):
+            logger.info(
+                "Released workspace Pod %s of %s job %s; its PVC stays for resume",
+                inst.id,
+                inst.metadata.get("job_status"),
+                inst.bound_to,
             )
         return True
 

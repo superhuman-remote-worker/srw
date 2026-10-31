@@ -1,3 +1,8 @@
+---
+title: Local Kubernetes with k3d
+description: Run the SRW Helm chart on a single-node k3d cluster for evaluation and development, with smoke tests, lifecycle and troubleshooting.
+---
+
 # Local Kubernetes with k3d
 
 This guide runs the SRW Helm chart on a single-node k3d cluster. It exercises
@@ -74,9 +79,14 @@ cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 ```
 
-Add at least one of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GROQ_API_KEY`
-under `secrets.values`. A Tavily key is optional and enables the corresponding
-web-search tools.
+Paste an [OpenRouter](https://openrouter.ai/keys) API key into
+`llm.seed.systemApiKeys.openrouter.value` near the end of the file. The file
+already declares a chat model, the Qwen3 embedding and reranker models, and
+their defaults on that key, which is everything SRW needs before it accepts
+sessions and jobs. [Models](models.md) explains the roles and how to use other
+providers. A key left empty is skipped: paste it later and run the upgrade
+command from [Daily lifecycle](#daily-lifecycle). A Tavily key under `secrets.values` is optional and enables the
+corresponding web-search tools.
 
 The copied file is gitignored because it may contain real provider keys. Its
 remaining credentials are fixed development values. Never reuse it for a
@@ -280,9 +290,12 @@ session. The UI should advance through thread creation, agent provisioning,
 runtime startup, and WebSocket connection. Send a short prompt and confirm a
 streamed reply.
 
-The platform path can be healthy even if the reply reports an invalid provider
-key. Correct the key in `deployment/values-local.yaml`, then run the upgrade
-command below.
+If session creation reports that the system is not ready, the model setup is
+incomplete: usually the OpenRouter key was empty at install. The platform path
+can also be healthy while the reply reports an invalid provider key. In both
+cases, correct the key in `deployment/values-local.yaml` and run the upgrade
+command below. The local file marks the key `reconcile: true`, so the upgrade
+replaces the stored key.
 
 Confirm that agent and workspace pods were created when the selected workspace
 requires them:
@@ -353,6 +366,69 @@ kubectl --context k3d-srw --namespace srw create secret generic \
 Then configure the `vm` and `vmController` values described in
 [VM workspaces on your cluster](../helm/README.md#vm-workspaces-on-your-cluster).
 VMs add substantial CPU, memory, and disk requirements.
+
+### Test a VM image change
+
+CI builds the VM image in two stages: a heavy stage1 base, and stage2
+(`docker/agent-vm-base/scripts/provision-stage2.sh` and the shared `docker/`
+scripts it uploads). To try a stage2 change on k3d before pushing, build stage2
+on the published develop base and serve it from the local registry. The disks
+are about 9 GB each; `input/`, `output/` and the sudo gate binaries are
+gitignored.
+
+1. Download the stage1 base into `docker/agent-vm-base/input/`. GHCR often
+   drops long downloads and `docker pull` then starts over; `curl -C -`
+   resumes:
+
+   ```bash
+   cd docker/agent-vm-base
+   REPO=superhuman-remote-worker/srw-agent-vm-base-stage1
+   LAYER=$(docker manifest inspect ghcr.io/$REPO:experimental | jq -c '.layers[0]')
+   DIGEST=$(jq -r .digest <<<"$LAYER"); SIZE=$(jq -r .size <<<"$LAYER")
+   while [ "$(stat -c %s stage1.tar.gz 2>/dev/null || echo 0)" -lt "$SIZE" ]; do
+     TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:$REPO:pull" | jq -r .token)
+     curl -sfL -C - -H "Authorization: Bearer $TOKEN" -o stage1.tar.gz \
+       "https://ghcr.io/v2/$REPO/blobs/$DIGEST" || true
+   done
+   echo "${DIGEST#sha256:}  stage1.tar.gz" | sha256sum -c -
+   tar -xzf stage1.tar.gz && mkdir -p input \
+     && mv disk/agent-vm-base-stage1.qcow2 input/ && rm -r disk stage1.tar.gz
+   ```
+
+2. Build the sudo gate binaries into `files/sudo-gated-bin` and
+   `files/sudo_gate.so` with the commands of the `build-sudo-gate` job in
+   `.github/workflows/develop.yml`. Copies left from an earlier build are stale.
+3. Remove any old `output/`, then run `packer init stage2.pkr.hcl` and
+   `packer build stage2.pkr.hcl`. If the host's QEMU won't start (for example
+   "Failed to initialize io_uring: Cannot allocate memory"), run the build in
+   Ubuntu 24.04 as CI does, with the static `packer` binary and its plugins
+   copied into the directory. Mount all of `docker/`: the template uploads the
+   shared scripts from `../`.
+
+   ```bash
+   cp "$(command -v packer)" . && cp -r ~/.config/packer/plugins packer-plugins
+   docker run --rm --device /dev/kvm --ulimit memlock=-1:-1 -v "$PWD/..":/build:z \
+     ubuntu:24.04 bash -c 'apt-get update -qq \
+       && apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage \
+       && cd /build/agent-vm-base \
+       && PACKER_PLUGIN_PATH=$PWD/packer-plugins ./packer build stage2.pkr.hcl'
+   ```
+
+   The build runs both shared gates inside the VM. Remove the copied `packer`
+   and `packer-plugins` afterwards; the container leaves `output/` owned by root.
+4. Wrap the disk and push it to the cluster's registry:
+
+   ```bash
+   docker build -f Dockerfile.containerDisk -t localhost:5005/srw-agent-vm-base:local-test .
+   docker push localhost:5005/srw-agent-vm-base:local-test
+   ```
+
+5. Set `vmController.defaultVmImage: srw-registry:5000/srw-agent-vm-base:local-test`
+   in `deployment/values-local.yaml`. Tilt re-applies Helm when the file
+   changes. The first VM imports the image into a golden disk, which takes a few
+   minutes. Start a session with `workspace.backend: vm`; until its guest has
+   booted, sending input returns "Session not active". Restore the previous
+   `defaultVmImage` when you're done.
 
 ## Daily lifecycle
 

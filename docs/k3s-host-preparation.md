@@ -1,3 +1,8 @@
+---
+title: Prepare a shared Linux host for SRW on K3s
+description: Prepare K3s on a server that also runs other services, has several network interfaces, or keeps application volumes on a separate disk.
+---
+
 # Prepare a shared Linux host for SRW on K3s
 
 Use this guide **before starting K3s** when a server also runs Podman Quadlets,

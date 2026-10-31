@@ -1482,6 +1482,21 @@ class TestReconcileOrphans:
         await store.reconcile_orphans(uuid.uuid4(), [])
         assert datetime.timedelta(hours=1) in mock_db.fetch.call_args[0]
 
+    @pytest.mark.asyncio
+    async def test_generated_connector_notes_are_never_orphans(self):
+        # A ds-* connector note is pathless by design and in no tree; reaping
+        # it archived every connector note in a project with a vault.
+        from shared.runtime.services.knowledge_store import (
+            GENERATED_PATHLESS_NOTE_TYPES,
+        )
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.reconcile_orphans(uuid.uuid4(), [])
+        assert "note_type <> ALL($4::text[])" in mock_db.fetch.call_args[0][0]
+        assert list(GENERATED_PATHLESS_NOTE_TYPES) in mock_db.fetch.call_args[0]
+        assert "datasource" in GENERATED_PATHLESS_NOTE_TYPES
+
 
 # =============================================================================
 # search_chunks() — the slice-3 PR4 retrieval cutover (RRF over knowledge_chunks)

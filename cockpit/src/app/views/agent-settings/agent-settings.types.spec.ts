@@ -1,11 +1,39 @@
 import {describe, it, expect} from 'vitest';
 import {
+  AUTONOMY_LEVELS,
   defaultModelOptionLabel,
   detectModelFamily,
+  liveUpgradeState,
   resolveEffectiveModels,
   resolveMatrixForModel,
 } from './agent-settings.types';
 import type {EffectiveModels} from '../../core/models/api.model';
+import de from '../../../assets/i18n/de-DE.json';
+import en from '../../../assets/i18n/en.json';
+
+// should_freeze_at_boundary (src/agent/core/phase.py) freezes `partial` after
+// the first strategic phase and `guided` after every strategic phase; neither
+// freezes after a tactical one.
+describe('autonomy level descriptions follow the freeze rule', () => {
+  const describedAs = (value: string) =>
+    AUTONOMY_LEVELS.find((level) => level.value === value)?.description;
+
+  it('Guided freezes after strategic phases, not tactical ones', () => {
+    expect(describedAs('guided')).toBe('Freezes after every strategic phase and at job completion');
+    expect(en.agentSettings.autonomy.guided.description).toBe(describedAs('guided'));
+    expect(de.agentSettings.autonomy.guided.description).toBe(
+      'Stoppt nach jeder strategischen Phase und beim Job-Abschluss',
+    );
+  });
+
+  it('Partial freezes after the first strategic phase only', () => {
+    expect(describedAs('partial')).toBe('Freezes after the first strategic phase and at job completion');
+    expect(en.agentSettings.autonomy.partial.description).toBe(describedAs('partial'));
+    expect(de.agentSettings.autonomy.partial.description).toBe(
+      'Stoppt nach der ersten strategischen Phase und beim Job-Abschluss',
+    );
+  });
+});
 
 describe('detectModelFamily — Muse Spark 1.3', () => {
   it.each(['', 'meta/', 'openrouter/meta/'])(
@@ -296,5 +324,35 @@ describe('defaultModelOptionLabel', () => {
     expect(defaultModelOptionLabel('Base default', null)).toBe('Base default');
     expect(defaultModelOptionLabel('Base default', undefined)).toBe('Base default');
     expect(defaultModelOptionLabel('Project default', '')).toBe('Project default');
+  });
+});
+
+describe('liveUpgradeState', () => {
+  it('is available when any other tier is ok', () => {
+    expect(liveUpgradeState('virtual', {sandbox: 'ok', vm: 'needsApproval', none: 'downgrade'})).toBe('available');
+  });
+
+  it('names the stateless lane, where every upgrade is refused for this session', () => {
+    // The settings pane's map for a stateless `virtual` session today.
+    expect(liveUpgradeState('virtual', {
+      sandbox: 'sessionUnsupported',
+      vm: 'sessionUnsupported',
+      none: 'downgrade',
+    })).toBe('sessionUnsupported');
+  });
+
+  it('prefers approval over a session refusal: approval is the one the user can act on', () => {
+    // A pinned `virtual` session without the VM grant.
+    expect(liveUpgradeState('virtual', {sandbox: 'sessionUnsupported', vm: 'needsApproval', none: 'downgrade'}))
+      .toBe('needsApproval');
+  });
+
+  it('calls a VM the highest tier', () => {
+    expect(liveUpgradeState('vm', {sandbox: 'downgrade', virtual: 'downgrade', none: 'downgrade'})).toBe('highest');
+  });
+
+  it('reads absent entries as refused, like the tier row', () => {
+    expect(liveUpgradeState('none', {})).toBe('unsupported');
+    expect(liveUpgradeState(null, {})).toBe('unsupported');
   });
 });

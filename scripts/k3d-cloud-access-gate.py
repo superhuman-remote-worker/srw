@@ -29,6 +29,14 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               write is staged at turn end and listed by cloud-diff; apply puts
               it in Nextcloud; End revokes the grant and Resume re-engages
               under the same selected id
+  plain_end   a protected session on Container (minimal) and one on the
+              default container, each with a staged write, ended the way the
+              cockpit's End button ends it (no ``force``): the thread ends,
+              the grant is revoked, the workspace Pod goes and the agent is
+              released, with no retirement retry in the agent's log; a third
+              on Container (minimal) without /etc/mtab can't unmount, and each
+              retry must reach the workspace and name /etc/mtab before deleting
+              the agent Pod settles it
   default     PATCH p's link {access: protected}: a session that names no
               level is protected (origin link_default); one with an explicit
               read_write is not; the link is reset
@@ -151,6 +159,8 @@ PLAN = (
     "protected mode and the in-pod plane are on",
     "accounts: a second account and an OAuth client (scripts/k3d-main-cloud-gate.py)",
     "chip: protected from datasource_access, through staging, apply, End and Resume",
+    "plain_end: a plain End (no force) of a protected session with a staged write, "
+    "on Container (minimal) and on the default container",
     "default: a project link's protected default, and an explicit level over it",
     "exclusion: a second folder beside a protected one; two protected folders",
     "cross: another project's folder for its editor, viewer and a non-member; "
@@ -244,7 +254,7 @@ class AccessGate:
         status, applied = 0, None
         for _attempt in range(2):
             status, diff = self.d7.api.call(
-                "GET", f"/api/agents/threads/{thread}/cloud-diff"
+                "GET", f"/api/persistent/threads/{thread}/cloud-diff"
             )
             if status != 200 or not any(
                 f.get("path") == filename for f in (diff.get("files") or [])
@@ -252,7 +262,7 @@ class AccessGate:
                 return status, diff
             status, applied = self.d7.api.call(
                 "POST",
-                f"/api/agents/threads/{thread}/cloud-diff/apply",
+                f"/api/persistent/threads/{thread}/cloud-diff/apply",
                 {"epoch": diff.get("epoch")},
             )
             if not (
@@ -453,7 +463,7 @@ class AccessGate:
 
         def staged() -> dict[str, Any] | None:
             status, body = self.d7.api.call(
-                "GET", f"/api/agents/threads/{thread}/cloud-diff"
+                "GET", f"/api/persistent/threads/{thread}/cloud-diff"
             )
             files = (body.get("files") or []) if status == 200 else []
             return body if any(f.get("path") == filename for f in files) else None
@@ -489,6 +499,202 @@ class AccessGate:
             and resumed.get("selected_mount_id") == source.get("id")
             and resumed.get("engage_attempt") != grant.get("engage_attempt"),
             f"end {status} resume {status_resume}",
+        )
+
+    def plain_end(self) -> None:
+        p = self.projects["p"][0] if "p" in self.projects else self.project("p")
+        folder = self.folder(p)
+        minimal = {
+            "workspace": {
+                "template": {
+                    "ref": {
+                        "name": "container-minimal",
+                        "scope": {"kind": "Catalog", "name": "shared"},
+                    }
+                }
+            },
+            # The template names the workspace; the sandbox override would
+            # replace it.
+            "config_override": {},
+        }
+        for label, extra, without_mtab in (
+            ("plain-end-minimal", minimal, False),
+            ("plain-end", {}, False),
+            # An image without /etc/mtab: the first unmount fails as it did on
+            # dev, and the retry has to settle the End.
+            ("plain-end-no-mtab", minimal, True),
+        ):
+            try:
+                self._plain_end(label, p, folder, extra, without_mtab=without_mtab)
+            except GateError as exc:
+                self.report.check(f"{label}: completed", False, str(exc))
+
+    def _plain_end(
+        self,
+        label: str,
+        p: str,
+        folder: str,
+        extra: dict[str, Any],
+        *,
+        without_mtab: bool,
+    ) -> None:
+        status, created = self.create(
+            label,
+            {
+                "project_id": p,
+                "datasource_ids": [folder],
+                "datasource_access": {folder: "protected"},
+                **extra,
+            },
+        )
+        if status not in (200, 201):
+            raise d7.GateError(
+                f"{label} session -> HTTP {status}: {str(created)[:300]}"
+            )
+        thread = self.threads[label][0]
+        self.wait_grant(thread, "active")
+        session = self.session(label, thread)
+        self.d7.turn(session)
+        wait_for(
+            "the overlay at /cloud/merged",
+            lambda: d7.top_mounts(
+                self.d7.inspect(session.pod).get("mountinfo", "")
+            ).get("/cloud/merged", ("",))[0]
+            == "fuse.fuse-overlayfs",
+            timeout=self.args.turn_timeout,
+            interval=5,
+        )
+        filename = f"{self.gate_id}-{label}.txt"
+        self.d7.as_agent(session.pod, f"printf staged > /cloud/merged/{filename}")
+        self.d7.turn(session)
+        # The summary carries counts, not paths; the session wrote one file.
+        wait_for(
+            "the staged write",
+            lambda: sql(
+                "SELECT coalesce((staged_summary->'counts'->>'added')::int, 0) "
+                f">= 1 FROM cloud_ro_mounts WHERE thread_id = {lit(thread)}"
+            )
+            == "t",
+            timeout=self.args.turn_timeout,
+            interval=10,
+        )
+        agent = sql(
+            "SELECT a.hostname FROM threads t JOIN agents a ON a.id = t.agent_id "
+            f"WHERE t.id = {lit(thread)}"
+        )
+        if without_mtab:
+            d7.command(
+                d7.K
+                + ["exec", session.pod, "-c", d7.WORKSPACE_CONTAINER, "--"]
+                + ["rm", "-f", "/etc/mtab"]
+            )
+
+        # The cockpit's End button sends no force; it adds force only after a
+        # turn_in_flight refusal. Wait out a turn still running instead.
+        def ended() -> int | None:
+            status, body = self.d7.api.call(
+                "DELETE", f"/api/persistent/threads/{thread}", timeout=400
+            )
+            if status in (200, 202, 204):
+                return status
+            if status == 409 and "turn_in_flight" in str(body):
+                return None
+            raise d7.GateError(f"plain End -> HTTP {status}: {str(body)[:300]}")
+
+        wait_for("the plain End", ended, timeout=self.args.turn_timeout, interval=5)
+        retries = 0
+        mtab_refusal = False
+        closed_socket = False
+        detail = ""
+
+        def read_agent_log() -> None:
+            nonlocal retries, mtab_refusal, closed_socket
+            if not agent:
+                return
+            rc, out, _err = d7.run(d7.K + ["logs", agent, "--tail=2000"], timeout=60)
+            if rc == 0:
+                retries = max(
+                    retries, out.count("Exact local retirement quiescence failed")
+                )
+                mtab_refusal = mtab_refusal or "failed to open /etc/mtab" in out
+                closed_socket = closed_socket or "Socket is closed" in out
+
+        def settled() -> bool:
+            nonlocal detail
+            read_agent_log()
+            state = sql(f"SELECT status FROM threads WHERE id = {lit(thread)}")
+            grant = (self.grant(thread) or {}).get("status")
+            pods = json.loads(
+                d7.command(
+                    d7.K
+                    + ["get", "pods", "-l", f"srw/thread-id={thread}", "-o", "json"]
+                )
+            )["items"]
+            agent_phase = ""
+            if agent:
+                rc, out, _err = d7.run(
+                    d7.K + ["get", "pod", agent, "-o", "jsonpath={.status.phase}"],
+                    timeout=60,
+                )
+                agent_phase = out if rc == 0 else "gone"
+            bound = sql(f"SELECT count(*) FROM agents WHERE thread_id = {lit(thread)}")
+            detail = (
+                f"thread={state} grant={grant} workspace_pods={len(pods)} "
+                f"agent={agent or '-'}:{agent_phase or '-'} bound={bound} "
+                f"retries={retries}"
+            )
+            return (
+                state == "ended"
+                and grant == "revoked"
+                and not pods
+                and (agent_phase != "Running" or bound == "0")
+            )
+
+        if without_mtab:
+            # Without /etc/mtab nothing unprivileged can unmount the overlay, so
+            # the End can't settle by itself. Each retry must still reach the
+            # workspace and report the cause. ``force`` alone changes nothing
+            # for an End already under way (it only lets an End through a
+            # running turn), and a permanent delete waits like the End does:
+            # deleting the agent Pod is what clears it (the stale-agent reaper
+            # does that by itself after about eleven minutes on k3d).
+            def retrying() -> bool:
+                read_agent_log()
+                return retries >= 3
+
+            try:
+                wait_for(f"{label} retrying", retrying, timeout=300, interval=10)
+                looping = True
+            except GateError:
+                looping = False
+            self.report.check(
+                f"{label}: each retry reaches the workspace and names /etc/mtab "
+                "(no closed SFTP channel)",
+                looping and mtab_refusal and not closed_socket,
+                f"retries={retries} mtab_refusal={mtab_refusal} "
+                f"closed_socket={closed_socket}",
+            )
+            if not agent:
+                raise d7.GateError(f"{label}: no agent is bound to delete")
+            d7.command(d7.K + ["delete", "pod", agent, "--wait=false"])
+        try:
+            wait_for(f"{label} settled", settled, timeout=600, interval=10)
+            ok = True
+        except GateError:
+            ok = False
+        if without_mtab:
+            self.report.check(
+                f"{label}: deleting the agent Pod settles the End: the thread "
+                "ends, the grant is revoked and the workspace Pod goes",
+                ok,
+                detail,
+            )
+            return
+        self.report.check(
+            f"{label}: a plain End ends the thread, revokes the grant, removes "
+            "the workspace Pod and releases the agent, without a retirement retry",
+            ok and retries == 0,
+            detail,
         )
 
     def default(self) -> None:
@@ -884,7 +1090,14 @@ class AccessGate:
         return problems
 
     def run(self) -> int:
-        every = (self.chip, self.default, self.exclusion, self.cross, self.alias)
+        every = (
+            self.chip,
+            self.plain_end,
+            self.default,
+            self.exclusion,
+            self.cross,
+            self.alias,
+        )
         phases = tuple(
             phase
             for phase in every
@@ -924,7 +1137,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phases",
         nargs="*",
-        choices=("chip", "default", "exclusion", "cross", "alias"),
+        choices=("chip", "plain_end", "default", "exclusion", "cross", "alias"),
         help="run only these phases (exclusion needs p, made by chip or default)",
     )
     parser.add_argument(

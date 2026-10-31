@@ -2,13 +2,19 @@
 
 Answers "is the memory system worth it?" with the instrument we already have:
 the same pinned task set, one variable per arm, replicates, server-computed
-report. Four arms over the memory pipeline (everything else identical):
+report. Five arms over the memory pipeline (everything else identical):
 
   off          no auto-injection at all, no extraction. KB tools stay callable
                (the agent can still kb_search on its own — pull, not push).
   kb-only      KB notes auto-injected (top-5), no memory retrieval/extraction.
   memory-only  memory retrieval + extraction (current stack), no KB injection.
-  current      the defaults — memory + KB, reranker/gate/bounded, ingestion.
+  current      the defaults — memory + KB, reranker/gate/bounded, ingestion; a
+               job's own memory is not injected while its source turns are
+               still in context (same_conversation: skip_in_context, D38).
+  allow-own    the defaults, but a job's own memory stays eligible while its
+               source is in context (memory.retrieval.same_conversation:
+               allow, the default before 2026-10-29). Campaigns before then
+               ran the opposite pair: current = allow, skip-own = skip.
 
 Why one project (and one bench run) PER ARM: memory and KB notes are
 project-scoped — every job in a project reads what earlier jobs wrote — so
@@ -17,6 +23,28 @@ a fresh project and its own single-arm run; `report` joins the runs. Inside
 an arm, replicates run sequentially (max_in_flight 1 by default) so replicate
 k sees whatever replicates < k left behind — that IS the cross-job effect
 under test, so compare replicate 1 vs 3 within the memory arms too.
+
+Chain mode measures that cross-job effect on purpose, with different tasks
+instead of repeats of one: a chain is a fresh project in which a fixed
+sequence of related tasks runs one job at a time, so job k can only gain from
+what jobs < k left in project memory and the knowledge base. Each arm runs
+`--chains` chains whose task orders rotate (A,B,C / B,C,A / C,A,B), so every
+task appears at every position once per arm; the arms start on different
+rotations, so time of day does not line up with order. The server's bench
+sweeper shuffles a run's tasks, so the order is kept here: every step is its
+own single-task run in the chain's project, and `chain-tick` submits the next
+step when the previous run is done. Run `chain-tick` periodically (it is
+idempotent); a paused job holds its lane until it is resumed. A job that cannot
+be resumed (e.g. held after a lost executor) is cancelled by hand, and
+`chain-restart` reruns its chain from step 1 in a fresh project, so nothing
+the broken job left in memory or the knowledge base reaches the rerun.
+
+    python bench/ablation.py chain-submit --name xjob-01 --tasks-file F \
+        --order L1,L2,L3 --arms off,kb-only,current --model M
+    python bench/ablation.py chain-tick --name xjob-01
+    python bench/ablation.py chain-status --name xjob-01
+    python bench/ablation.py chain-restart --name xjob-01 --arm current --chain 2 \
+        --reason "executor lost in a rollout"
 
 Metrics (per task x arm, medians across clean replicates): completion
 (deliverable gate), wall minutes, main-call count, median prompt tokens,
@@ -54,14 +82,13 @@ from submit import load_tasks  # noqa: E402
 BENCH_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BENCH_DIR / "runs"
 
-# The default writer list from config/worker_base.yaml `memory.pipeline`.
+# The default writer list from config/overlays/worker.yaml `memory.pipeline`.
 # deep_merge replaces lists wholesale, so an arm that keeps extraction must
 # restate it. Keep in sync with the YAML when the default pipeline changes.
 DEFAULT_WRITERS = [
     "interval_extractor",
     "phase_boundary_extractor",
     "pre_compaction_extractor",
-    "memory_assembler",
     "compaction_memory",
     "queued_memory",
 ]
@@ -71,6 +98,10 @@ DEFAULT_WRITERS = [
 # a no-op manager (nothing retrieved, capture() has no writers) and the legacy
 # direct-store blocks stay skipped. `memory.enabled: false` additionally skips
 # RecallStore construction (no store => todo_complete queues nothing either).
+# None of this reaches KB note injection: a job's own project KB is always a
+# knowledge binding, and graph.py injects bound KBs through its own retrieval,
+# ignoring the pipeline's knowledge block. So `off` and `kb-only` both push KB
+# notes and differ in no effective setting; no config key turns that path off.
 ARMS: dict[str, dict] = {
     "off": {
         "memory": {
@@ -97,7 +128,7 @@ ARMS: dict[str, dict] = {
     "memory-only": {
         "memory": {
             "pipeline": {
-                "retrievers": ["recall_two_tier"],
+                "retrievers": ["recall_hybrid"],
                 "scorers": ["reranker"],
                 "policies": ["gate", "bounded"],
                 "writers": list(DEFAULT_WRITERS),
@@ -105,6 +136,7 @@ ARMS: dict[str, dict] = {
         }
     },
     "current": {},
+    "allow-own": {"memory": {"retrieval": {"same_conversation": "allow"}}},
 }
 
 AUX_CALL_TYPES = ("memory_extraction", "memory_assembly", "auxiliary", "summarization")
@@ -343,8 +375,69 @@ def job_token_split(job_id: str) -> dict[str, int]:
     return totals
 
 
+def chain_report(state: dict, as_json: bool) -> None:
+    """Per job of a chain campaign, then per arm: the first job of a chain
+    against the later ones, which are the jobs that can use project memory."""
+    splits: dict[str, dict] = state.setdefault("token_splits", {})
+    rows = []
+    for arm, lane in state["arms"].items():
+        for index, chain in enumerate(lane["chains"]):
+            for pos, step in enumerate(chain["steps"], 1):
+                jid = step.get("job_id")
+                done = step.get("final_status") in ("completed", "failed", "cancelled")
+                if jid and done and not splits.get(jid):
+                    splits[jid] = job_token_split(jid)
+                rows.append(
+                    {
+                        "arm": arm,
+                        "chain": index + 1,
+                        "pos": pos,
+                        "task": step["task"],
+                        "job_id": jid,
+                        "status": step.get("final_status") or "running",
+                        **(splits.get(jid or "") or {}),
+                    }
+                )
+    save_state(state["name"], state)
+    if as_json:
+        print(json.dumps({"state": state, "rows": rows}, indent=2, default=str))
+        return
+    print(f"== chain campaign {state['name']}  model {state['model']}")
+    print(
+        f"{'arm':12s} {'c':>2s} {'pos':>3s} {'task':26s} {'job':8s} {'status':10s} "
+        f"{'calls':>6s} {'main-in':>12s} {'aux-in':>11s}"
+    )
+    for r in rows:
+        print(
+            f"{r['arm']:12s} {r['chain']:>2d} {r['pos']:>3d} {r['task']:26s} "
+            f"{(r['job_id'] or '-')[:8]:8s} {r['status']:10s} "
+            f"{r.get('main_calls', 0):>6,d} {r.get('main_in', 0):>12,d} {r.get('aux_in', 0):>11,d}"
+        )
+    print()
+    print(
+        f"{'arm':12s} {'first-job main-in (median)':>27s} {'later-job main-in (median)':>27s}"
+    )
+    for arm in state["arms"]:
+        first = [
+            r["main_in"]
+            for r in rows
+            if r["arm"] == arm and r["pos"] == 1 and r.get("main_in")
+        ]
+        later = [
+            r["main_in"]
+            for r in rows
+            if r["arm"] == arm and r["pos"] > 1 and r.get("main_in")
+        ]
+        print(
+            f"{arm:12s} {_fmt(_median(first), 0):>27s} {_fmt(_median(later), 0):>27s}"
+        )
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     state = load_state(args.name)
+    if state.get("mode") == "chain":
+        chain_report(state, args.json)
+        return
     arms = [a for a, ref in state["arms"].items() if ref.get("run_id")]
     reports = {
         arm: get(f"/api/bench/runs/{state['arms'][arm]['run_id']}/report")
@@ -458,6 +551,194 @@ def cmd_report(args: argparse.Namespace) -> None:
     )
 
 
+# ----------------------------------------------------------------- chain ---
+
+
+def chain_orders(order: list[str], chains: int) -> list[list[str]]:
+    """The rotations of ``order``, one per chain: A,B,C / B,C,A / C,A,B ..."""
+    return [order[k % len(order) :] + order[: k % len(order)] for k in range(chains)]
+
+
+def cmd_chain_submit(args: argparse.Namespace) -> None:
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    unknown = [a for a in arms if a not in ARMS]
+    if unknown:
+        raise SystemExit(f"unknown arm(s) {unknown}; known: {sorted(ARMS)}")
+    order = [t.strip() for t in args.order.split(",") if t.strip()]
+    load_tasks(Path(args.tasks_file), set(order))  # fails on an unknown id
+    if state_path(args.name).exists() and not args.force:
+        raise SystemExit(
+            f"{state_path(args.name)} exists — pick a new --name (campaigns are "
+            "immutable) or pass --force to overwrite the local state file"
+        )
+    orders = chain_orders(order, args.chains)
+    state = {
+        "name": args.name,
+        "mode": "chain",
+        "model": args.model,
+        "tasks_file": str(Path(args.tasks_file).resolve()),
+        "tasks": order,
+        "lane": args.lane,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "arms": {},
+    }
+    print(
+        f"campaign {args.name}: {len(arms)} arm(s) x {args.chains} chain(s) x "
+        f"{len(order)} step(s) = {len(arms) * args.chains * len(order)} jobs; "
+        f"model {args.model}; one job at a time per arm"
+    )
+    for i, arm in enumerate(arms):
+        chains = [
+            {"order": orders[(k + i) % len(orders)], "project_id": None, "steps": []}
+            for k in range(args.chains)
+        ]
+        state["arms"][arm] = {"chains": chains}
+        print(
+            f"  arm {arm:12s} chains {' | '.join(','.join(c['order']) for c in chains)}"
+            f"  config_override = {json.dumps(ARMS[arm])}"
+        )
+    if args.dry_run:
+        return
+    state["user_id"] = caller_id()
+    save_state(args.name, state)
+    chain_tick(state)
+    print(f"state: {state_path(args.name)}")
+
+
+def _run_outcome(run_id: str) -> tuple[str | None, dict]:
+    """``(run status, the run's single ledger entry or {})``."""
+    run = get(f"/api/bench/runs/{run_id}")
+    run = run.get("run") or run
+    ledger = run.get("state") or []
+    if isinstance(ledger, dict):
+        ledger = ledger.get("submissions") or []
+    return run.get("status"), (ledger[0] if ledger else {})
+
+
+def _submit_step(state: dict, arm: str, chain_index: int, chain: dict) -> None:
+    task_id = chain["order"][len(chain["steps"])]
+    if not chain["project_id"]:
+        attempt = len(chain.get("abandoned") or [])
+        chain["project_id"] = create_project(
+            state["name"],
+            f"{arm}-c{chain_index + 1}" + (f"r{attempt}" if attempt else ""),
+            state["user_id"],
+            f"Cross-job chain '{state['name']}', arm '{arm}', chain "
+            f"{chain_index + 1}: {', '.join(chain['order'])}. Throwaway bench project.",
+        )
+        save_state(state["name"], state)
+    tasks = load_tasks(Path(state["tasks_file"]), {task_id})
+    spec = {
+        "name": f"{state['name']}/{arm}/c{chain_index + 1}/{len(chain['steps']) + 1}",
+        "tasks": tasks,
+        "replicates": 1,
+        "max_in_flight": 1,
+        "arms": [
+            {
+                "name": arm,
+                "model": state["model"],
+                "config_override": copy.deepcopy(ARMS[arm]),
+                **({"execution_lane": state["lane"]} if state.get("lane") else {}),
+            }
+        ],
+        "project_id": chain["project_id"],
+    }
+    run = post("/api/bench/runs", spec)
+    run_id = run.get("id") or run.get("run_id") or (run.get("run") or {}).get("id")
+    chain["steps"].append({"task": task_id, "run_id": str(run_id)})
+    save_state(state["name"], state)
+    print(
+        f"  {arm:12s} chain {chain_index + 1} step {len(chain['steps'])} "
+        f"{task_id} -> run {str(run_id)[:8]} (project {chain['project_id'][:8]})"
+    )
+
+
+def chain_tick(state: dict) -> bool:
+    """Advance every arm's lane by at most one step; True when all are finished."""
+    finished = True
+    for arm, lane in state["arms"].items():
+        for index, chain in enumerate(lane["chains"]):
+            steps = chain["steps"]
+            if steps and not steps[-1].get("final_status"):
+                status, entry = _run_outcome(steps[-1]["run_id"])
+                if entry.get("job_id"):
+                    steps[-1]["job_id"] = entry["job_id"]
+                if status == "cancelled":
+                    steps[-1]["final_status"] = "run_cancelled"
+                elif status == "done":
+                    steps[-1]["final_status"] = entry.get("final_status") or "done"
+                save_state(state["name"], state)
+                if not steps[-1].get("final_status"):
+                    job_status = entry.get("last_status")
+                    if entry.get("job_id"):
+                        job = get(f"/api/jobs/{entry['job_id']}")
+                        job_status = (job.get("job") or job).get("status")
+                    note = "  <- PAUSED, resume it" if job_status == "paused" else ""
+                    print(
+                        f"  {arm:12s} chain {index + 1} step {len(steps)} "
+                        f"{steps[-1]['task']} job {str(entry.get('job_id'))[:8]} "
+                        f"{job_status}{note}"
+                    )
+                    finished = False
+                    break
+            if any(s.get("final_status") == "run_cancelled" for s in steps):
+                continue
+            if len(steps) < len(chain["order"]):
+                _submit_step(state, arm, index, chain)
+                finished = False
+                break
+    return finished
+
+
+def cmd_chain_tick(args: argparse.Namespace) -> None:
+    state = load_state(args.name)
+    if chain_tick(state):
+        print("all chains finished")
+
+
+def cmd_chain_restart(args: argparse.Namespace) -> None:
+    state = load_state(args.name)
+    lane = state["arms"].get(args.arm)
+    if lane is None or not 1 <= args.chain <= len(lane["chains"]):
+        raise SystemExit(f"no chain {args.chain} in arm {args.arm!r}")
+    chain = lane["chains"][args.chain - 1]
+    if chain["steps"] and not chain["steps"][-1].get("final_status"):
+        status, entry = _run_outcome(chain["steps"][-1]["run_id"])
+        if status not in {"done", "cancelled"}:
+            raise SystemExit(
+                f"step {len(chain['steps'])} run is still {status}; cancel its job first"
+            )
+        chain["steps"][-1]["final_status"] = entry.get("final_status") or status
+    chain.setdefault("abandoned", []).append(
+        {
+            "project_id": chain["project_id"],
+            "steps": chain["steps"],
+            "reason": args.reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    chain["project_id"] = None
+    chain["steps"] = []
+    save_state(args.name, state)
+    print(
+        f"{args.arm} chain {args.chain}: set aside, restarts from step 1 on the next tick"
+    )
+
+
+def cmd_chain_status(args: argparse.Namespace) -> None:
+    state = load_state(args.name)
+    for arm, lane in state["arms"].items():
+        for index, chain in enumerate(lane["chains"]):
+            steps = " ".join(
+                f"{s['task']}:{(s.get('job_id') or '-')[:8]}:{s.get('final_status') or 'running'}"
+                for s in chain["steps"]
+            )
+            print(
+                f"{arm:12s} c{index + 1} project {(chain['project_id'] or '-')[:8]} "
+                f"{','.join(chain['order'])}  {steps}"
+            )
+
+
 # ------------------------------------------------------------------ main ---
 
 
@@ -507,6 +788,39 @@ def main() -> None:
         p = sub.add_parser(name, help=help_)
         p.add_argument("--name", required=True)
         p.set_defaults(fn=fn)
+
+    c = sub.add_parser(
+        "chain-submit", help="one project per chain; tasks run in a fixed order"
+    )
+    c.add_argument("--name", required=True)
+    c.add_argument("--tasks-file", default=str(BENCH_DIR / "tasks.yaml"))
+    c.add_argument(
+        "--order", required=True, help="comma-separated task ids, chain 1's order"
+    )
+    c.add_argument("--chains", type=int, default=3, help="chains per arm")
+    c.add_argument("--arms", default="off,kb-only,current")
+    c.add_argument("--model", default="gemma-4-moe")
+    c.add_argument("--lane", choices=["pinned", "stateless"], default=None)
+    c.add_argument("--force", action="store_true")
+    c.add_argument("--dry-run", action="store_true")
+    c.set_defaults(fn=cmd_chain_submit)
+
+    for name, fn, help_ in (
+        ("chain-tick", cmd_chain_tick, "submit each lane's next step when it is due"),
+        ("chain-status", cmd_chain_status, "every chain's steps and jobs"),
+    ):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("--name", required=True)
+        p.set_defaults(fn=fn)
+
+    cr = sub.add_parser(
+        "chain-restart", help="set a chain's steps aside and rerun it in a new project"
+    )
+    cr.add_argument("--name", required=True)
+    cr.add_argument("--arm", required=True)
+    cr.add_argument("--chain", type=int, required=True, help="1-based chain number")
+    cr.add_argument("--reason", required=True)
+    cr.set_defaults(fn=cmd_chain_restart)
 
     r = sub.add_parser("report", help="joined per-task x arm report")
     r.add_argument("--name", required=True)

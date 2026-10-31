@@ -1,7 +1,9 @@
 """Curated model catalogue request contracts and capability vocabulary."""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from shared.subscription_routing import validate_routing_params
 
 
 LLM_MODEL_CAPABILITIES = (
@@ -94,6 +96,16 @@ class CatalogModelCreate(BaseModel):
         ),
     )
     model_id: str = Field(..., min_length=1, max_length=500)
+    served_model_id: str | None = Field(
+        None,
+        max_length=500,
+        description=(
+            "The name sent to the provider when it differs from model_id "
+            "(e.g. model_id 'claude-opus-5-5-api' serving 'claude-opus-5-5'). "
+            "model_id must then be this name plus a suffix of the same "
+            "family. Null or empty sends model_id."
+        ),
+    )
     display_label: str = Field(..., min_length=1, max_length=200)
     capabilities: list[CatalogCapabilityLiteral] = Field(
         ...,
@@ -139,6 +151,11 @@ class CatalogModelCreate(BaseModel):
             raise ValueError(problem)
         return value
 
+    @model_validator(mode="after")
+    def _routing_block_is_valid(self) -> "CatalogModelCreate":
+        validate_routing_params(self.params_json, provider_kind=self.provider_kind)
+        return self
+
 
 class CatalogModelUpdate(BaseModel):
     """Partial update — only fields explicitly set in the request body are
@@ -148,6 +165,7 @@ class CatalogModelUpdate(BaseModel):
     provider_kind: Literal["system", "endpoint"] | None = None
     provider_ref: str | None = Field(None, min_length=1)
     model_id: str | None = Field(None, min_length=1, max_length=500)
+    served_model_id: str | None = Field(None, max_length=500)
     display_label: str | None = Field(None, min_length=1, max_length=200)
     capabilities: list[CatalogCapabilityLiteral] | None = Field(None, min_length=1)
     family: str | None = Field(None, min_length=1)
@@ -163,4 +181,14 @@ class CatalogModelUpdate(BaseModel):
         problem = live_voice_capability_problem(value)
         if problem:
             raise ValueError(problem)
+        return value
+
+    @field_validator("params_json")
+    @classmethod
+    def _routing_block_is_valid(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        # The row's provider_kind is not in a partial body; the service
+        # re-checks the endpoint-only rule against the stored row.
+        validate_routing_params(value)
         return value

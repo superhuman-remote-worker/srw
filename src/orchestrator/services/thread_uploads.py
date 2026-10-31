@@ -77,9 +77,11 @@ from orchestrator.services.ssh_helpers import _fingerprint_host_key
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
 )
+from orchestrator.services import workspace_binding
 from orchestrator.services.workspace_binding import (
     VirtualBackingUnavailable,
     resolve_virtual_thread_backing,
+    virtual_thread_backing_id,
 )
 from orchestrator.services.blocking_effect import (
     joined_async_call,
@@ -2097,6 +2099,81 @@ async def purge_attested_pinned_virtual_workspace(
         logger.warning(
             "Failed to purge pinned virtual workspace for thread %s: %s",
             thread.get("id"),
+            exc,
+        )
+        return False
+
+
+def recorded_virtual_upgrade_bindings(
+    metadata: dict[str, Any], *, vm: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """The virtual bindings a Session's records still name as an old workspace.
+
+    C1 keeps ``workspace_container.seed_from`` until its copy is verified; C2
+    keeps ``vm.upgrade_seed.source``; a pinned VM upgrade records
+    ``vm.upgrade_source`` (and before E3 kept ``_workspace_binding`` beside the
+    VM). ``vm`` overrides the metadata's, for a retirement that captured it.
+    """
+
+    def _get(value: Any, *path: str) -> Any:
+        for key in path:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(key)
+        return value
+
+    vm_state = vm if vm is not None else _get(metadata, "vm")
+    candidates = [
+        _get(metadata, "workspace_container", "seed_from", "binding"),
+        _get(vm_state, "upgrade_seed", "source", "binding"),
+        _get(vm_state, "upgrade_source", "binding"),
+        _get(metadata, "_workspace_binding"),
+    ]
+    return [
+        binding
+        for binding in candidates
+        if isinstance(binding, dict) and binding.get("kind") == "virtual"
+    ]
+
+
+async def purge_virtual_workspace_leftover(
+    thread: dict[str, Any],
+    *,
+    recorded_bindings: Iterable[dict[str, Any]] = (),
+) -> bool:
+    """Purge the ``threads/<id>/`` prefix a Session left in the virtual store.
+
+    A workspace upgrade (Virtual to Container or VM) copies the files and keeps
+    the old prefix as its fallback, so the Session's own virtual purge, which
+    runs only while it is still virtual, never removes it. The prefix derives
+    from the thread id, so this purges it even where no record of the upgrade
+    survives (C1 clears its seed marker once the copy is verified). The caller
+    holds the permanent delete's lifecycle fence. A recorded binding naming a
+    different store fails closed, as the virtual purge does.
+    """
+
+    spec = workspace_binding.virtual_workspace_rclone_spec()
+    if not spec or spec.get("type") == "memory":
+        # No durable store, so nothing can have been left in one.
+        return True
+    thread_id = str(thread.get("id") or "")
+    expected = virtual_thread_backing_id(thread_id, spec)
+    if any(
+        isinstance(binding, dict) and binding.get("backing_id") != expected
+        for binding in recorded_bindings
+    ):
+        return False
+    if workspace_binding.shutil.which("rclone") is None:
+        return False
+    target = _VirtualTarget(spec=spec, prefix=f"threads/{thread_id}/")
+    try:
+        return bool(await _joined_blocking_call(_virtual_purge_prefix, target))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to purge the old virtual workspace of thread %s: %s",
+            thread_id,
             exc,
         )
         return False

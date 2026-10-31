@@ -5,14 +5,19 @@ verification state and remaining rollout decisions.
 
 Read [resources.yaml](resources.yaml), [referenced-job.yaml](referenced-job.yaml),
 then [project.yaml](project.yaml) for the basic composition.
-[inline-job.yaml](inline-job.yaml) describes an ordinary image with no SRW hooks;
+[inline-job.yaml](inline-job.yaml) describes an approved image with no SRW hooks (its image
+reference is a placeholder for one you approved);
+[claude-code-harness-job.yaml](claude-code-harness-job.yaml) runs the Claude Code harness image
+([README](../../harnesses/claude-code/README.md)) against a sandbox workspace and an env connector;
 [retained-job.yaml](retained-job.yaml) selects an existing workspace instance. Images, credentials,
 scopes and instance IDs in these examples are illustrative.
 
 [native-process-job.yaml](native-process-job.yaml) and
 [native-workspace-job.yaml](native-workspace-job.yaml) are executable examples for
-an enabled native Kubernetes host. The latter requires the updated SRW workspace image
-and an available StorageClass; its harness runs in a separate container over SSH.
+an enabled native Kubernetes host once their placeholder image reference is replaced
+with an image you approved. The latter shows an
+independently initialized, retained workspace; it requires the updated SRW workspace
+image and an available StorageClass, and a harness image that works in it over SSH.
 
 SRW stores, authorizes and resolves versioned resources through one configuration
 API. Manifest Jobs and existing UI/MCP requests use immutable execution
@@ -490,6 +495,47 @@ manifestHosting:
           port: 53
 ```
 
+An image under generic hosting that calls public services (a model API,
+downloads) needs DNS and HTTPS. SRW-adapter harness images, such as the Claude
+Code image, run under the agent pod's network rules instead (see
+[Build a harness image](../../docs/harness-images.md)). Without DNS and HTTPS a
+generic image fails at its first request. The rules below allow both, but no
+private, shared, link-local or reserved range:
+
+```yaml
+manifestHosting:
+  harnessEgress:
+    # DNS: the cluster DNS pods.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS to public addresses only: private, shared, loopback, link-local
+    # (cloud metadata), multicast and reserved ranges are left out.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - {protocol: TCP, port: 443}
+```
+
+Specific CIDRs (a model gateway, storage, dataset hosts) are tighter than
+`0.0.0.0/0`. Plain `http://` downloads also need TCP 80.
+
 Helm serializes this setting into `MANIFEST_HARNESS_EGRESS` and rolls the
 orchestrator when it changes. These rules apply to every generic harness on that
 installation; manifests cannot enlarge them through private settings or connector
@@ -506,6 +552,97 @@ omitted/empty destinations or ports are unrestricted for that dimension, and an
 explicit `{}` rule allows all egress. CIDR exclusions must be strictly contained
 subnets. Configuring egress does not enable generic hosting or waive the separate
 startup-isolation verification requirement.
+
+### Approved harness images
+
+Generic hosting runs only images the operator has approved.
+`manifestHosting.approvedImages` is a list of `{name, image, description}` entries.
+Each `image` is digest-pinned (`repo[:tag]@sha256:<64 hex>`) and a Job's
+`runtime.image` must equal it exactly. The list binds administrators too: approving
+an image is the review step, and the default `[]` runs no generic image. Helm
+serializes the list into `MANIFEST_APPROVED_IMAGES`; an invalid list makes generic
+admission return `503 HostingConfigurationInvalid` before workload effects.
+
+```yaml
+manifestHosting:
+  approvedImages:
+    - name: claude-code
+      image: ghcr.io/superhuman-remote-worker/srw-harness-claude-code@sha256:<digest>
+      description: Claude Code harness
+```
+
+An Expert with `adapter: srw/v1` can name an approved image as its runtime. The
+Job then runs as an ordinary SRW agent pod of that image: no `command`, `args`,
+`env` or probes, one cold pod per Job, no warm pool, Jobs only. The image must
+speak the v1 harness API, described in
+[Build a harness image](../../docs/harness-images.md). The pair
+[`claude-code-harness-expert.yaml`](claude-code-harness-expert.yaml) and
+[`claude-code-harness-job.yaml`](claude-code-harness-job.yaml) shows it.
+
+Any other image is refused with `422`: "Generic hosting runs only images on the
+installation's approved list (manifestHosting.approvedImages)."
+
+Running an approved image also needs the `custom_harness_images` capability grant
+(Admin → Grants). It is denied by default, resolves user, then project, then global,
+and administrators bypass it. Without it admission returns `403`: "Running approved
+harness images requires the 'custom_harness_images' capability grant. Ask an
+administrator to grant it (Admin → Grants)."
+
+### Approved images on unverified clusters
+
+Without `manifestHosting.networkIsolationVerified: true`, generic hosting is
+unavailable and admission returns `503 HostingCapabilityUnavailable`. An operator can
+instead set `manifestHosting.allowApprovedImagesWithoutVerifiedIsolation: true`
+(`MANIFEST_ALLOW_APPROVED_IMAGES_WITHOUT_VERIFIED_ISOLATION`). Setting it accepts
+these risks:
+
+- On such a cluster a new pod can reach in-cluster destinations, such as other pods
+  and Services, before NetworkPolicy enforcement catches up. Connections opened in
+  that window can survive after enforcement starts, as the k3d result above shows.
+- The setting enables the whole generic hosting path, not only the approved harness
+  image. A generic Job's workspace image, which the user submitting the Job chooses,
+  and its initialization commands also start in that window. Image approval covers
+  the harness image (`runtime.image`) only: WorkspaceTemplate images are not checked
+  against `approvedImages`.
+
+The approved list and the `custom_harness_images` grant still decide which harness
+images run and who may submit generic Jobs. With both values false hosting stays
+unavailable.
+
+### Workspace egress
+
+A workspace-attached run gets DNS plus the public internet with private ranges
+excluded. `manifestHosting.workspaceEgress` adds NetworkPolicy egress rules for
+private destinations, in the same schema as `harnessEgress`
+(`MANIFEST_WORKSPACE_EGRESS`). The rules are additive to the public default,
+validated like `harnessEgress` (invalid rules return `503 HostingConfigurationInvalid`)
+and read by new attempts. Manifests cannot enlarge them.
+
+They are installation-wide, so every generic workspace can reach every listed
+destination. Isolate runs from each other with per-run credentials for those
+services. Use namespace and pod selectors for in-cluster databases and `ipBlock` for
+host or LAN addresses:
+
+```yaml
+manifestHosting:
+  workspaceEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: graph-db
+          podSelector:
+            matchLabels:
+              app: neo4j
+      ports:
+        - protocol: TCP
+          port: 7687
+    - to:
+        - ipBlock:
+            cidr: 10.18.2.105/32
+      ports:
+        - protocol: TCP
+          port: 7474
+```
 
 Authored network profiles and VM/virtual workspaces for generic harnesses
 currently fail admission explicitly. Preparation/cache builds are supported by
@@ -540,18 +677,11 @@ API and persists execution/attempt state in PostgreSQL. The Cilium service gate
 below exercises that complete path with real pods and retained storage. Runtime
 configuration never passes through the SRW reference harness loader.
 
-The Kubernetes backend follows these launch rules:
-
-| `command` | `args` | Process launch |
-|---|---|---|
-| Omitted | Omitted | Image ENTRYPOINT and CMD |
-| Omitted | Nonempty array | Image ENTRYPOINT with supplied arguments |
-| Array | Omitted or array | Supplied command, followed only by supplied arguments |
-| Omitted | Empty array | Rejected at execution admission; clearing CMD requires an explicit command |
-
-These rules follow [containerd's Kubernetes argument handling](https://github.com/containerd/containerd/blob/main/internal/cri/opts/spec_opts.go).
-The portable schema permits the last shape, but this backend cannot honor it
-without first resolving image entrypoint metadata. SRW adds no shell wrapper.
+The image's own `ENTRYPOINT` and `CMD` run. The runtime has no `command`, `args`
+or `probes` fields: a manifest that sets one fails validation (`UnknownField` at
+the runtime path) before admission, and the pod builder refuses them too.
+`config`, `env`, `resources` and connectors work as before. SRW adds no shell
+wrapper.
 
 When supplied, opaque config, task and binding descriptors are mounted read-only
 at `/run/srw/config.json`, `/run/srw/task.json` and `/run/srw/bindings.json`, with
@@ -905,5 +1035,4 @@ also passed after the cleanup-capture lock correction. It exercised sandbox and
 virtual Jobs, existing Job API selection, Session configuration updates and
 End/Resume, and sandbox/virtual/no-workspace Sessions, including exact cleanup.
 
-The [readiness page](v1-readiness.md) records the subsequent integration fixes,
-complete regression runs and MCP/harness acceptance state.
+The [readiness page](v1-readiness.md) lists the later local acceptance records.

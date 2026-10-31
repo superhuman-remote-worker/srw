@@ -34,6 +34,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.services.config_overrides import deep_merge_dicts as _deep_merge_dicts
 from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.container_provisioner import (
@@ -86,6 +87,24 @@ class SessionAttachPayloadDependencies:
     thread_project_ids: Any
     store: Any
     capture_session_config: Any = None
+
+
+def _with_declared_lite_backend(config_override: Any, thread: Any) -> Any:
+    """Name the thread's lite backend in an override that names no backend."""
+    if config_override is not None and not isinstance(config_override, dict):
+        return config_override
+    workspace = (config_override or {}).get("workspace")
+    if workspace is not None and (
+        not isinstance(workspace, dict) or workspace.get("backend")
+    ):
+        return config_override
+    declared = declared_thread_workspace_backend(thread)
+    if declared not in LITE_BACKENDS:
+        return config_override
+    return {
+        **(config_override or {}),
+        "workspace": {**(workspace or {}), "backend": declared},
+    }
 
 
 async def assemble_session_attach_payload(
@@ -141,18 +160,6 @@ async def assemble_session_attach_payload(
     _thread_accepts_runtime = dependencies.thread_accepts_runtime
     _thread_project_ids = dependencies.thread_project_ids
     postgres_db = dependencies.store
-    # Lite tiers (virtual/none) carry no SSH endpoint. For `virtual` we attach
-    # the object-store mounts here — deployment-sourced credentials, in-flight
-    # only (never persisted to the thread row), keyed under threads/<id>/.
-    # A misconfigured `virtual` deployment refuses the attach with a clear log.
-    try:
-        config_override = _inject_lite_workspace_config(
-            config_override, prefix=f"threads/{thread_id}/"
-        )
-    except LiteWorkspaceConfigError as exc:
-        logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
-        return None
-
     # Orchestrator-resolved config for the warm-pool agent: this is the expert
     # delivery channel the warm path lacked (the 3-minute-stall bug). Re-resolve
     # on every attach (no freeze). None when experts are off / resolve fails →
@@ -176,6 +183,22 @@ async def assemble_session_attach_payload(
             thread_id,
             _thread.get("status"),
         )
+        return None
+
+    # Lite tiers (virtual/none) carry no SSH endpoint. For `virtual` we attach
+    # the object-store mounts here — deployment-sourced credentials, in-flight
+    # only (never persisted to the thread row), keyed under threads/<id>/.
+    # A caller that names no backend (/prepare's warm attach sends {}) gets the
+    # thread's own lite backend: the resolved snapshot keeps `backend` but never
+    # the mounts, so without it a virtual Session attaches with none.
+    # A misconfigured `virtual` deployment refuses the attach with a clear log.
+    config_override = _with_declared_lite_backend(config_override, _thread)
+    try:
+        config_override = _inject_lite_workspace_config(
+            config_override, prefix=f"threads/{thread_id}/"
+        )
+    except LiteWorkspaceConfigError as exc:
+        logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
         return None
 
     _meta = _thread.get("metadata") or {}
@@ -285,7 +308,9 @@ async def assemble_session_attach_payload(
     # layer that migration SQL cannot resolve; those rows keep the resolved
     # value until creation/control materializes one.
     interactive_scalars = {
-        "permission_mode": str(_thread.get("permission_mode") or "supervised"),
+        "permission_mode": normalize_permission_mode(
+            str(_thread.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+        ),
     }
     if _thread.get("narration_mode") is not None:
         interactive_scalars["narration_mode"] = str(_thread["narration_mode"])

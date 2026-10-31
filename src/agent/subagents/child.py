@@ -509,7 +509,14 @@ def overlay_live_llm(child_llm: Any, live: Any) -> Any:
         return child_llm
     changed = getattr(live, "model", None) not in (None, child_llm.model)
     updates: Dict[str, Any] = {}
-    for key in ("model", "provider", "base_url", "api_key", "model_max_context_tokens"):
+    for key in (
+        "model",
+        "provider",
+        "base_url",
+        "api_key",
+        "model_max_context_tokens",
+        "served_model",
+    ):
         value = getattr(live, key, None)
         if value is not None or changed:
             updates[key] = value

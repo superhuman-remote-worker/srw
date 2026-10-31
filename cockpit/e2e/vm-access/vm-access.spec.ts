@@ -128,7 +128,7 @@ test('asleep pinned session keeps its IDE access action without a connected agen
   await page.route(url => url.pathname === `/api/persistent/threads/${THREAD_ID}`, route =>
     route.fulfill({json: {
       id: THREAD_ID, thread_id: THREAD_ID, title: 'Retained pinned session',
-      status: 'suspended', config_name: 'session_base', permission_mode: 'supervised',
+      status: 'suspended', config_name: 'session_base', permission_mode: 'read_only',
       user_id: '55555555-5555-4555-8555-555555555555',
       total_turns: 1, total_tokens: 10, created_at: '2026-09-24T07:00:00Z',
       last_activity: '2026-09-24T07:00:00Z', metadata: {},
@@ -136,7 +136,7 @@ test('asleep pinned session keeps its IDE access action without a connected agen
     }}));
   await page.route(url => url.pathname === `/api/persistent/threads/${THREAD_ID}/state`, route =>
     route.fulfill({json: {
-      thread_id: THREAD_ID, permission_mode: 'supervised', narration_mode: 'auto',
+      thread_id: THREAD_ID, permission_mode: 'read_only', narration_mode: 'auto',
       turn_count: 1, turn_in_flight: false, message_count: 0,
       model: null, temperature: null, running_tool: null, pending_permissions: [],
       event_cursor: {epoch: 1, seq: 0}, replay_cursor: {epoch: 1, seq: 0},

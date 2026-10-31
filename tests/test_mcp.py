@@ -40,7 +40,7 @@ def _make_thread(
     title="Test Session",
     status="active",
     config_name="defaults",
-    permission_mode="supervised",
+    permission_mode="read_only",
     project_id=None,
     agent_id=None,
     total_turns=5,
@@ -150,7 +150,7 @@ class TestFormatPersistentThreadDetail:
         assert "Dev Session" in result
         assert "active" in result
         assert "defaults" in result
-        assert "supervised" in result
+        assert "read_only" in result
 
     def test_shows_project_and_agent(self):
         thread = _make_thread(project_id="proj-123", agent_id="agent-456")
@@ -391,7 +391,8 @@ class TestAsyncCockpitClientPersistentThreads:
             assert url == "/api/persistent/threads"
             assert body["config_name"] == "session_base"
             assert body["title"] == "Untitled Session"
-            assert body["permission_mode"] == "supervised"
+            # Omitted, so the user's saved default applies.
+            assert "permission_mode" not in body
             # Optional fields should NOT be in body
             assert "project_id" not in body
             assert "datasource_ids" not in body
@@ -825,7 +826,7 @@ class TestMcpPersistentThreadTools:
         mock_client.create_persistent_thread.assert_awaited_once_with(
             config_name="defaults",
             title="Test",
-            permission_mode="supervised",
+            permission_mode=None,
             project_id=None,
             project_ids=None,
             datasource_ids=None,

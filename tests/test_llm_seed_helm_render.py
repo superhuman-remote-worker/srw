@@ -426,3 +426,39 @@ def test_defaults_mapping_form_without_model_is_dropped(tmp_path: Path) -> None:
         tmp_path, {"defaults": {"chat": {"reconcile": True}, "vision": {"model": ""}}}
     )
     assert payload.get("defaults") in (None, {})
+
+
+def test_served_model_id_renders_for_endpoint_and_system_models(tmp_path: Path) -> None:
+    # A model id names one catalog row; `servedModelId` is how a second
+    # provider's row sends the same name upstream under its own id.
+    payload = _render_seed_payload(
+        tmp_path,
+        {
+            "systemEndpoints": [
+                {
+                    "label": "Proxy",
+                    "baseUrl": "https://proxy.example/v1",
+                    "models": [
+                        {
+                            "id": "claude-opus-5-5-proxy",
+                            "servedModelId": "claude-opus-5-5",
+                            "capabilities": ["chat"],
+                        },
+                        {"id": "plain", "capabilities": ["chat"]},
+                    ],
+                }
+            ],
+            "systemModels": [
+                {
+                    "provider": "anthropic",
+                    "id": "claude-opus-5-5-api",
+                    "servedModelId": "claude-opus-5-5",
+                    "capabilities": ["chat"],
+                }
+            ],
+        },
+    )
+    endpoint_models = payload["systemEndpoints"][0]["models"]
+    assert endpoint_models[0]["servedModelId"] == "claude-opus-5-5"
+    assert "servedModelId" not in endpoint_models[1]
+    assert payload["systemModels"][0]["servedModelId"] == "claude-opus-5-5"

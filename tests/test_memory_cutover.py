@@ -31,6 +31,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime.core.context_entries import (
+    FOLDED_KEY,
+    entry_kind,
+    is_context_entry,
+)
 from shared.runtime.core.loader import (
     InstructionFileEntry,
     QueryConfig,
@@ -49,11 +54,11 @@ from shared.runtime.llm.exceptions import ContextOverflowError
 from agent.managers import TodoManager, PlanManager
 from agent.services.memory import (
     AssembleStats,
-    Candidate,
     InjectionBlock,
     MemoryManager,
     MemoryPayload,
     MemoryRuntime,
+    RetrievalResult,
 )
 from agent.tools.context import ToolContext
 from shared.runtime.core.message_markers import is_compaction_summary
@@ -79,52 +84,68 @@ PERSISTENT_CONFIG_PATH = str(REPO_ROOT / "config" / "session_base.yaml")
 class RecordingManager:
     """Manager stub for wiring tests — records calls, returns a fixed payload.
 
-    The call sites only depend on the seam API (assemble/capture), so a
-    recorder proves the wiring without re-testing seam internals.
+    The call sites only depend on the seam API, so a recorder proves the
+    wiring without re-testing seam internals. The graphs retrieve
+    asynchronously (WP3): ``start_retrieval`` finishes at once here, so the
+    request that started a retrieval takes its result in.
     """
 
     def __init__(self, payload: Optional[MemoryPayload] = None) -> None:
         self.payload = payload or MemoryPayload()
         self.assemble_requests: List[Any] = []
         self.captures: List[Any] = []
+        self._finished: Optional[RetrievalResult] = None
 
     async def assemble(self, req: Any) -> MemoryPayload:
         self.assemble_requests.append(req)
         return self.payload
 
+    def start_retrieval(self, req: Any) -> bool:
+        self.assemble_requests.append(req)
+        self._finished = RetrievalResult(payload=self.payload)
+        return True
+
+    def take_retrieval(self, conversation: Any = None) -> Optional[RetrievalResult]:
+        result, self._finished = self._finished, None
+        return result
+
+    def retrieval_stats(self) -> dict:
+        return {"started": len(self.assemble_requests)}
+
     async def capture(self, event: Any) -> None:
+        self.captures.append(event)
+
+    def capture_nowait(self, event: Any) -> None:
         self.captures.append(event)
 
 
 def make_payload(
     memory_text: str = "MEMBLOCK", knowledge_text: str = "KBBLOCK"
 ) -> MemoryPayload:
-    """A payload with real injection pairs (the production message shapes)."""
-    from agent.core.knowledge_injection import create_knowledge_injection_messages
-    from agent.core.memory_injection import create_memory_injection_messages
+    """A payload with a memory block and a knowledge block carrying the
+    fixture records the planner renders its entries from. An empty text
+    leaves that block out."""
 
     blocks: List[InjectionBlock] = []
     if memory_text:
         blocks.append(
             InjectionBlock(
                 kind="memory",
-                content=memory_text,
-                messages=list(create_memory_injection_messages(memory_text)),
                 token_count=26,
                 items=[
                     {"record_id": "m1", "token_count": 12},
                     {"record_id": "m2", "token_count": 14},
                 ],
+                records=make_memories(),
             )
         )
     if knowledge_text:
         blocks.append(
             InjectionBlock(
                 kind="knowledge",
-                content=knowledge_text,
-                messages=list(create_knowledge_injection_messages(knowledge_text)),
                 token_count=0,
                 items=[{"record_id": "k1", "token_count": 0}],
+                records=make_notes(),
             )
         )
     return MemoryPayload(blocks=blocks, stats=AssembleStats(blocks=len(blocks)))
@@ -197,12 +218,11 @@ class TestPipelineDefaults:
     def test_worker_defaults(self, worker_config):
         m = worker_config.memory
         assert m.manager_enabled is True  # cutover flag on (Phase-1 closure)
-        assert m.pipeline.retrievers == ["recall_two_tier", "kb_notes"]
+        assert m.pipeline.retrievers == ["recall_hybrid", "kb_notes"]
         assert m.pipeline.writers == [
             "interval_extractor",
             "phase_boundary_extractor",
             "pre_compaction_extractor",
-            "memory_assembler",
             "compaction_memory",
             "queued_memory",
         ]
@@ -210,7 +230,7 @@ class TestPipelineDefaults:
     def test_persistent_defaults(self, persistent_config):
         m = persistent_config.memory
         assert m.manager_enabled is True
-        assert m.pipeline.retrievers == ["recall_two_tier", "kb_notes"]
+        assert m.pipeline.retrievers == ["recall_hybrid", "kb_notes"]
         assert m.pipeline.writers == [
             "persistent_interval_extractor",
             "pre_compaction_extractor",
@@ -319,8 +339,6 @@ class TestWorkerConstruction:
         # Matrix-resolved prompts threaded from the graph factory
         assert isinstance(runtime.extraction_prompt, str)
         assert runtime.extraction_prompt
-        assert isinstance(runtime.assembler_prompt, str)
-        assert runtime.assembler_prompt
         assert runtime.job_id == workspace_manager.job_id
         # GATE B: ingestion is on in the defaults, so the verdict service
         # attaches to the store during construction.
@@ -393,7 +411,6 @@ class TestPersistentConstruction:
         assert runtime.knowledge_store is session.knowledge_store
         assert runtime.auxiliary_llm is aux_marker
         assert runtime.extraction_prompt == "EXTRACT-PROMPT"
-        assert runtime.assembler_prompt is None  # persistent: no assembler
         assert runtime.retrieval_timeout == 5.0  # legacy per-call guard
         assert runtime.job_id == session.thread_id
         assert runtime.project_ids == []
@@ -436,7 +453,6 @@ def _make_execute_node(config, workspace_manager, todo_manager, ctx, service, mg
         auxiliary_llm=MagicMock(),
         summarization_prompt="summarize",
         memory_extraction_prompt="extract",
-        memory_assembler_prompt="assemble",
         tool_context=ctx,
         tool_names=None,
         memory_service=service,
@@ -458,10 +474,6 @@ def _worker_state():
 @pytest.fixture
 def execute_env(worker_config, workspace_manager):
     """Real config/managers, mock LLM, recording manager, legacy-store spies."""
-    # The recording manager serves the synchronous ``assemble`` path these
-    # tests pin, i.e. the legacy injection mode; the bundled default is
-    # append_only (tests/test_execute_prepared_layout.py covers that layout).
-    worker_config.context_management.injection_mode = "legacy"
     todo_manager = TodoManager(workspace_manager)
     todo_manager.add("Do the task")
 
@@ -580,11 +592,16 @@ class TestWorkerExecuteWiring:
 
         requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
 
-        # Delivery turn: the block is returned in state ahead of the response
-        # and the ledger records the concrete phase instance.
+        # Delivery turn: the block is returned in state ahead of the context
+        # entries this request appended and the response, and the ledger
+        # records the concrete phase instance.
         assert is_protected_message(first["messages"][0])
         assert marker in first["messages"][0].content
-        assert isinstance(first["messages"][1], AIMessage)
+        assert [entry_kind(m) for m in first["messages"][1:3]] == [
+            "memory",
+            "knowledge",
+        ]
+        assert isinstance(first["messages"][3], AIMessage)
         assert first["phase_instruction_injections"] == [
             "2:tactical:skills/research-guide/SKILL.md"
         ]
@@ -597,14 +614,10 @@ class TestWorkerExecuteWiring:
         # Second turn: nothing re-delivered, ledger untouched.
         assert "phase_instruction_injections" not in second
         assert not any(is_protected_message(m) for m in second["messages"])
-        # It is history: it sits before the transient tail (the memory pair
-        # payload; the todo list is no longer part of the tail, D17).
-        payload_idx = requests[1].index(env["service"].payload.messages()[0])
-        block_idx = next(
-            i for i, m in enumerate(requests[1]) if is_protected_message(m)
-        )
-        assert block_idx < payload_idx
-        assert requests[1][block_idx] is state["messages"][1]
+        # It is history, and the carrier of the entries turn one appended
+        # after it (folded, D27); the todo list is not sent (D17).
+        block = next(m for m in requests[1] if is_protected_message(m))
+        assert block.additional_kwargs[FOLDED_KEY] == ["memory", "knowledge"]
         assert not any(
             str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
             for request in requests
@@ -660,9 +673,9 @@ class TestWorkerExecuteWiring:
         self, execute_env
     ):
         """Acceptance (b): the block is never re-billed. Across two consecutive
-        tactical turns the request grows only by the new messages; the prefix
-        up to and including the block is byte-identical, and the tail is the
-        same block of transients."""
+        tactical turns the second request is the first one, byte for byte
+        (the block carries the first turn's folded entries), followed by the
+        new messages."""
         env = execute_env
         body = "PHASE BODY " * 50
         _bind_phase_start(env, body)
@@ -689,21 +702,20 @@ class TestWorkerExecuteWiring:
         def chars(messages) -> int:
             return sum(len(str(getattr(m, "content", ""))) for m in messages)
 
-        new_messages = first["messages"][1:]  # response (+ any reminder)
+        # The entries appended on turn one ride the block in both requests;
+        # the response (+ any reminder) is what is new.
+        new_messages = [m for m in first["messages"][1:] if not is_context_entry(m)]
         assert chars(req2) - chars(req1) == chars(new_messages)
         assert _count_text(req1, body) == 1
         assert _count_text(req2, body) == 1
 
-        # [system, task, block] is the stable prefix; then the new messages;
-        # then the unchanged transient tail.
-        prefix = 3
-        assert [m.content for m in req2[:prefix]] == [m.content for m in req1[:prefix]]
-        assert is_protected_message(req1[prefix - 1])
-        assert [m.content for m in req2[prefix : prefix + len(new_messages)]] == [
+        # [system, task, block] is the whole first request; the second one
+        # starts with it unchanged and appends the new messages.
+        assert len(req1) == 3
+        assert is_protected_message(req1[-1])
+        assert [m.content for m in req2[: len(req1)]] == [m.content for m in req1]
+        assert [m.content for m in req2[len(req1) :]] == [
             m.content for m in new_messages
-        ]
-        assert [m.content for m in req2[prefix + len(new_messages) :]] == [
-            m.content for m in req1[prefix:]
         ]
 
     @pytest.mark.asyncio
@@ -850,21 +862,25 @@ class TestWorkerExecuteWiring:
 
         service = env["service"]
 
-        # -- assemble request: legacy worker query formation
+        # -- retrieval request (started off the request path): the worker
+        # query formation
         assert len(service.assemble_requests) == 1
         req = service.assemble_requests[0]
         assert req.query_text == "Do the task phase 2 tactical"
         assert req.task_frame.top_todo == "Do the task"
         assert req.task_frame.phase_number == 2
         assert req.task_frame.is_strategic is False
-        assert req.model == env["config"].llm.model
 
-        # -- transient block spliced at the tail (after the conversation, for
-        # prompt-cache prefix stability): the payload pairs end the request;
+        # -- the payload's records go in as context entries, folded into the
+        # request's last message and returned in state before the response;
         # no todo message (the list is history, D17)
         prepared = env["llm"].ainvoke.call_args[0][0]
-        payload_msgs = service.payload.messages()
-        assert prepared[-len(payload_msgs) :] == payload_msgs
+        assert prepared[-1].additional_kwargs[FOLDED_KEY] == ["memory", "knowledge"]
+        assert [entry_kind(m) for m in result["messages"][:2]] == [
+            "memory",
+            "knowledge",
+        ]
+        assert isinstance(result["messages"][2], AIMessage)
         assert not any(
             isinstance(m, HumanMessage)
             and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
@@ -872,10 +888,10 @@ class TestWorkerExecuteWiring:
         )
 
         # -- legacy direct-store path skipped entirely
-        env["ctx"].recall_store.decrement_ttl.assert_not_called()
         env["ctx"].recall_store.retrieve.assert_not_called()
 
-        # -- audit fed from the payload's memory block (+ stats tap)
+        # -- audit fed from the payload's memory block (+ stats tap), with
+        # what the plan appended
         audit_calls = [
             c
             for c in auditor.audit_step.call_args_list
@@ -886,17 +902,17 @@ class TestWorkerExecuteWiring:
         assert data["count"] == 2
         assert data["total_tokens"] == 26
         assert "stats" in data
+        assert (data["appended"], data["present"]) == (2, 0)
 
-        # -- one turn_end capture with the legacy fields
+        # -- one turn_end capture
         assert [e.kind for e in service.captures] == ["turn_end"]
         event = service.captures[0]
         assert event.turn_count == 1
         assert event.phase == 2
-        assert event.extra["current_injection_text"] == "MEMBLOCK"
+        assert event.extra == {}
 
         # -- interval state stays writer-internal (no checkpointed keys)
         assert "last_observed_turn" not in result
-        assert "last_assembled_turn" not in result
         assert result["turn_count"] == 1
 
     @pytest.mark.asyncio
@@ -1155,25 +1171,22 @@ class TestPersistentTurnWiring:
         )
         assert result.interrupted is False
 
-        # -- assemble request: latest HumanMessage, main model threaded
+        # -- retrieval request (started off the request path): the latest
+        # HumanMessage
         assert len(service.assemble_requests) == 1
-        req = service.assemble_requests[0]
-        assert req.query_text == "user query"
-        assert req.model == "test-model"
+        assert service.assemble_requests[0].query_text == "user query"
 
-        # -- payload anchored at the tail (after the last Human/Tool message —
-        # here the sole HumanMessage), so the synthetic function-call pairs
-        # always follow a real user turn (Gemini's native API 400s on a leading
-        # functionCall) and the stable history prefix stays cache-reusable —
-        # see _injection_anchor_index.
+        # -- the payload's records go in as context entries after the user
+        # message: history from now on, folded into it for the provider (D27),
+        # so the request is the system prompt and that one carrier
         prepared = captured_prepared[0]
-        payload_msgs = service.payload.messages()
         assert isinstance(prepared[0], SystemMessage)
-        assert prepared[1].content == "user query"
-        assert prepared[2 : 2 + len(payload_msgs)] == payload_msgs
+        assert len(prepared) == 2
+        assert prepared[1].additional_kwargs[FOLDED_KEY] == ["memory", "knowledge"]
+        assert str(prepared[1].content).startswith("user query")
+        assert [entry_kind(m) for m in messages[2:4]] == ["memory", "knowledge"]
 
         # -- legacy direct-store blocks skipped
-        recall_spy.decrement_ttl.assert_not_called()
         recall_spy.retrieve.assert_not_called()
         kb_spy.hybrid_search.assert_not_called()
 
@@ -1410,20 +1423,15 @@ class TestTeardownWiring:
 # ---------------------------------------------------------------------------
 
 
-class _ExoticRetriever:
-    """A future-shaped retriever with an unrenderable kind."""
-
-    async def retrieve(self, req):
-        return [Candidate(kind="graph_paths", text="A→B", record=object())]
-
-
 class TestStripRecognitionB10:
     @pytest.mark.asyncio
     async def test_all_injected_messages_are_strip_recognized(self):
-        """Every message assemble() emits must be recognized by the
-        summarization-exclusion predicate — compaction strips injected
-        pairs and re-injects fresh ones, so an unrecognized injection
+        """Every entry the planner makes from a payload must be recognized by
+        the summarization-exclusion predicate — an unrecognized injection
         would survive into summaries and duplicate forever."""
+        from agent.core.context_injection import ContextSources, plan_context_entries
+        from agent.services.memory import AssembleRequest
+
         runtime = MemoryRuntime(
             recall_store=make_recall_mock(make_memories()),
             knowledge_store=make_kb_mock(make_notes()),
@@ -1432,41 +1440,33 @@ class TestStripRecognitionB10:
         manager = MemoryManager(
             runtime,
             retrievers=[
-                ("recall_two_tier", _make_recall_retriever(runtime)),
+                ("recall_hybrid", _make_recall_retriever(runtime)),
                 ("kb_notes", _make_kb_retriever(runtime)),
             ],
         )
-        from agent.services.memory import AssembleRequest
+        payload = await manager.assemble(AssembleRequest(query_text="anything"))
+        records = {block.kind: block.records for block in payload.blocks}
 
-        payload = await manager.assemble(
-            AssembleRequest(query_text="anything", model=None)
+        planned = plan_context_entries(
+            [HumanMessage(content="anything")],
+            ContextSources(
+                memory_records=records["memory"],
+                knowledge_records=records["knowledge"],
+            ),
+            model=None,
+            max_memories=5,
         )
-
-        msgs = payload.messages()
-        assert len(msgs) == 4  # memory pair + knowledge pair
-        for msg in msgs:
+        assert [entry_kind(m) for m in planned.entries] == ["memory", "knowledge"]
+        for msg in planned.entries:
             assert is_workspace_injection_message(msg), (
                 f"Injection message not strip-recognized: {msg!r}"
             )
 
-    @pytest.mark.asyncio
-    async def test_unrenderable_kinds_contribute_no_messages(self):
-        """An exotic candidate kind yields a provenance-only block — the
-        payload still contains only strip-recognized messages."""
-        manager = MemoryManager(
-            MemoryRuntime(), retrievers=[("exotic", _ExoticRetriever())]
-        )
-        from agent.services.memory import AssembleRequest
-
-        payload = await manager.assemble(AssembleRequest(query_text="q"))
-        assert payload.stats.candidates_total == 1
-        assert payload.messages() == []
-
 
 def _make_recall_retriever(runtime):
-    from agent.services.memory.plugins.legacy import RecallTwoTierRetriever
+    from agent.services.memory.plugins.legacy import RecallHybridRetriever
 
-    return RecallTwoTierRetriever(runtime.recall_store)
+    return RecallHybridRetriever(runtime.recall_store)
 
 
 def _make_kb_retriever(runtime):

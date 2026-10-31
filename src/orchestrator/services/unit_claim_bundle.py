@@ -66,7 +66,12 @@ from orchestrator.services.session_class_policy import require_stateless_workspa
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
 )
+from orchestrator.services.stateless_workspace_upgrade import (
+    workspace_upgrade_container_ready,
+    workspace_upgrade_seed_spec,
+)
 from orchestrator.services.vm_provisioner import vm_provisioner
+from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.runtime.core.loader import canonical_config_name
 from shared.session_pending_memory import (
     SESSION_PENDING_MEMORY_KEY,
@@ -83,6 +88,11 @@ from shared.workspace_contract import (
     resolve_workspace_contract,
     resolve_workspace_runtime,
     workspace_runtime_authority_digest,
+)
+from shared.workspace_upgrade import (
+    WORKSPACE_UPGRADE_SEED_CAPABILITY,
+    WORKSPACE_UPGRADE_SEED_KEY,
+    workspace_upgrade_seed_from,
 )
 
 logger = logging.getLogger(__name__)
@@ -444,6 +454,11 @@ async def _attest_recoverable_vm(owner: Any, *, dependencies: Any) -> Any:
         raise _WorkspaceRecoveryRefusal(exc.detail, exc.recovery_code) from exc
 
 
+def parse_claimant_capabilities(raw: str | None) -> frozenset[str]:
+    """The claimant's declared capabilities (comma-separated query value)."""
+    return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
+
+
 async def claim_bundle_for_unit(
     unit_id: str,
     *,
@@ -451,6 +466,7 @@ async def claim_bundle_for_unit(
     pod_name: str,
     pod_uid: str,
     dependencies: UnitClaimBundleDependencies,
+    claimant_capabilities: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     try:
         return await _assemble_claim_bundle(
@@ -459,6 +475,7 @@ async def claim_bundle_for_unit(
             pod_name=pod_name,
             pod_uid=pod_uid,
             dependencies=dependencies,
+            claimant_capabilities=claimant_capabilities,
         )
     except _WorkspaceRecoveryRefusal as exc:
         if not workspace_recovery_enabled() or dependencies.recovery_store is None:
@@ -485,6 +502,7 @@ async def _assemble_claim_bundle(
     pod_name: str,
     pod_uid: str,
     dependencies: UnitClaimBundleDependencies,
+    claimant_capabilities: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Claim bundle for a leased stateless unit — internal (agent executor).
 
@@ -505,7 +523,10 @@ async def _assemble_claim_bundle(
 
     Errors: 401 bad internal key; 403 token mismatch / not leased (single
     generic detail); 404 unit row absent; 409 not a session unit, thread not
-    on the stateless lane, or attach assembly refused (generic reason).
+    on the stateless lane, or attach assembly refused (generic reason); 425 a
+    Session that still owes its workspace-upgrade copy, to a claimant that
+    didn't declare ``workspace_upgrade_seed.v1`` or before the upgrade's
+    container is Ready.
     """
     from shared.run_queue import (
         LANE_STATELESS,
@@ -1061,6 +1082,37 @@ async def _assemble_claim_bundle(
     # performs the same check before writing, but correctness cannot depend on
     # every producer having done so.
     require_stateless_workspace(thread)
+    # C1: a row that still owes its upgrade copy answers 425 until it can be
+    # served. 425 is a transient release (turn_executor.
+    # _TRANSIENT_BUNDLE_STATUSES): it re-queues with a capped backoff and
+    # never spends the park budget. Rolling deploy: only an executor that can
+    # make the copy gets the row.
+    upgrade_seed_from = workspace_upgrade_seed_from(thread.get("metadata"))
+    upgrade_seed: dict[str, Any] | None = None
+    if upgrade_seed_from is not None:
+        if WORKSPACE_UPGRADE_SEED_CAPABILITY not in claimant_capabilities:
+            raise HTTPException(
+                status_code=425,
+                detail="Claimant cannot seed an upgraded workspace",
+            )
+        # The upgrade's control wakes the queue right after admission, long
+        # before Ready writes the binding; the attach assembly would refuse
+        # each such claim with a 409, which counts toward the park budget.
+        if not workspace_upgrade_container_ready(thread.get("metadata")):
+            raise HTTPException(
+                status_code=425,
+                detail="Workspace upgrade is still creating the container",
+            )
+        # Built from this pre-lock row, before any credential is assembled or
+        # the claim is stamped, so a refusal leaves no effect behind; the
+        # final lock only proves ``seed_from`` unchanged.
+        try:
+            upgrade_seed = workspace_upgrade_seed_spec(unit_id, upgrade_seed_from)
+        except (LiteWorkspaceConfigError, ValueError) as exc:
+            logger.error("claim-bundle: upgrade seed source unavailable: %s", exc)
+            raise HTTPException(
+                status_code=409, detail="Attach assembly refused"
+            ) from exc
 
     # Derive the assembly inputs exactly the way the resume dispatcher does
     # (resume_thread._reprovision): the stored override from metadata (secrets
@@ -1182,6 +1234,8 @@ async def _assemble_claim_bundle(
                     and str(final_queue["state"] or "") == "leased"
                     and int(final_queue["lease_token"] or 0) == int(lease_token)
                     and str(final_queue["leased_by"] or "") == claimant_pod
+                    # The seed spec above came from the pre-lock row.
+                    and workspace_upgrade_seed_from(final_metadata) == upgrade_seed_from
                 )
                 if lease_still_current:
                     stamped = await conn.fetchval(
@@ -1279,4 +1333,8 @@ async def _assemble_claim_bundle(
         # must not change the attach fingerprint (a warm session reads it
         # from here too, since a warm turn re-reads nothing else).
         bundle[SESSION_PENDING_MEMORY_KEY] = pending_memory
+    if upgrade_seed is not None:
+        # Beside ``attach``: inside it, an older agent's _attach_session
+        # would fail every claim; beside it, the attach fingerprint ignores it.
+        bundle[WORKSPACE_UPGRADE_SEED_KEY] = upgrade_seed
     return bundle

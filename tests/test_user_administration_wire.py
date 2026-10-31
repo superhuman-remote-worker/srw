@@ -6,7 +6,8 @@ PEPs, ``tests/test_user_management.py`` the store). The behaviors pinned here
 are the ones a handler move can quietly change:
 
 * which routes are admin-only versus merely authenticated — creation, deletion,
-  approval and every grant write are admin; listing and profile edits are not;
+  approval and every grant write are admin; listing is not, and a profile
+  edit is the caller's own or an admin's (it never writes the e-mail);
 * grant values are validated against the catalog **before** the store is
   touched, so a malformed enum is a 400 now instead of a dispatch-time crash;
 * an approval provisions the user and settles the pending-approval notification;
@@ -344,6 +345,52 @@ def test_update_user_is_authenticated_not_admin():
     resp = wire.client.put(f"/api/users/{USER_ID}", json={"display_name": "New"})
     assert resp.status_code == 200
     assert resp.json() == {"status": "updated"}
+
+
+OTHER_USER_ID = "00000000-0000-0000-0000-0000000000c2"
+
+
+def test_a_non_admin_cannot_edit_another_users_profile():
+    """N22: any approved user could rewrite any user's profile and e-mail."""
+    wire = _wire(admin_gate=_deny())
+    resp = wire.client.put(
+        f"/api/users/{OTHER_USER_ID}", json={"display_name": "Mallory"}
+    )
+    assert resp.status_code == 403
+    wire.store.update_user.assert_not_awaited()
+
+
+def test_a_self_edit_skips_the_admin_gate():
+    gate = AsyncMock(side_effect=HTTPException(status_code=403))
+    wire = _wire(admin_gate=gate)
+    resp = wire.client.put(
+        f"/api/users/{USER_ID.upper()}", json={"avatar_color": "#000000"}
+    )
+    assert resp.status_code == 200
+    gate.assert_not_awaited()
+    assert wire.store.update_user.await_args.kwargs["user_id"] == USER_ID.upper()
+
+
+def test_an_admin_can_edit_another_users_profile():
+    gate = AsyncMock(return_value={**ADMIN, "real_is_admin": True})
+    wire = _wire(user={**ADMIN, "real_is_admin": True}, admin_gate=gate)
+    resp = wire.client.put(f"/api/users/{OTHER_USER_ID}", json={"display_name": "Ada"})
+    assert resp.status_code == 200
+    gate.assert_awaited_once()
+    assert wire.store.update_user.await_args.kwargs["user_id"] == OTHER_USER_ID
+
+
+def test_a_profile_edit_never_writes_the_email():
+    """E-mail is Keycloak's and links an unlinked row at first login."""
+    wire = _wire()
+    resp = wire.client.put(
+        f"/api/users/{USER_ID}",
+        json={"display_name": "New", "email": "admin@victim.example"},
+    )
+    assert resp.status_code == 200
+    kwargs = wire.store.update_user.await_args.kwargs
+    assert "email" not in kwargs
+    assert kwargs["display_name"] == "New"
 
 
 def test_a_store_failure_on_list_is_a_500():

@@ -50,6 +50,7 @@ from shared.session_subagent_batch import (
     not_started_result_text,
 )
 from tests._fanout_gate import set_session_fanout
+from tests._warm_asgi_routes import warm_asgi_routes
 from tests.test_session_delegation_shutdown_pinned_pg import (  # noqa: F401
     REPORT,
     _child_rows,
@@ -204,6 +205,7 @@ async def _lifecycle_client(stack, authority: dict) -> OrchestratorClient:
             headers={"X-Internal-Key": "batch-recovery-internal-key"},
         )
     )
+    await warm_asgi_routes(main.app)
     return client
 
 

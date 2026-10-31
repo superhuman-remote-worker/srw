@@ -31,6 +31,8 @@ COMPONENTS = (
     "driver-mcp-front",
     "driver-git-swap",
     "driver-gpt-live-sip",
+    "voice-gateway",
+    "asterisk",
     "fuse-opener",
 )
 # Images that another component's job builds from the same inputs. They share

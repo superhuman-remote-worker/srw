@@ -170,6 +170,14 @@ def job_dispatch_dependencies(
             preparation_composition.job_start_bundle_dependencies,
             resources,
         ),
+        # A trigger on a replica that is not the leader NOTIFYs the leader's
+        # loop, which LISTENs while it leads.
+        request_leader_dispatch=functools.partial(
+            job_dispatcher.request_leader_dispatch, resources.postgres_db
+        ),
+        listen_for_dispatch_requests=functools.partial(
+            job_dispatcher.listen_for_dispatch_requests, resources.postgres_db
+        ),
     )
 
 
@@ -431,6 +439,9 @@ def job_admission_config_dependencies(
         ),
         preview_expert_refusals=partial(preview_expert_refusals, resources.postgres_db),
         srw_image=partial(manifest_experts.trusted_srw_image, resources.postgres_db),
+        approved_images=partial(
+            manifest_experts.approved_srw_images, resources.postgres_db
+        ),
     )
 
 

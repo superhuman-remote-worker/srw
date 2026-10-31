@@ -25,14 +25,53 @@ is a flat key space, a few POSIX semantics are approximated; each such
 ``supports_shell`` is False and there is no ``$HOME`` concept — ``write_home_file``
 and ``resolve_home_path`` inherit the base ``NotImplementedError`` (the lite
 tier excludes shell/git/repository datasources by construction; §7).
+
+Cloud folders (``features/cloud_folders_on_virtual_sessions.md`` § Agent)
+-------------------------------------------------------------------------
+
+A Session's attached cloud connectors arrive as further entries of
+``workspace.mounts``; each becomes a :class:`CloudRemote` in this backend's
+**mount table**, reachable under ``cloud/<name>`` from the file-tools root,
+the path a Container's FUSE mount has. Resolution is first-segment: ``cloud``
+is a read-only virtual directory listing the bound folders, ``cloud/<name>/…``
+addresses that folder's own store with the rest of the path as the key, and
+everything else is the workspace prefix as before. What differs for a cloud
+path, by design:
+
+- it is **always live**: the scoped metadata index (``begin_read_cache``)
+  covers the workspace prefix only, and no cloud op consults or updates it;
+- **directories are real** where the provider has them: ``mkdir`` creates a
+  folder through the store and never writes a ``.keep`` object into a user's
+  cloud; ``is_dir``/``exists``/``list_dir`` cost one bounded call;
+- **listings, walks and searches are bounded**: ``walk`` stops after
+  :data:`DEFAULT_CLOUD_WALK_ENTRIES` files, ``search_files`` after
+  :data:`DEFAULT_CLOUD_SEARCH_FILES` candidates, and both say so
+  (:class:`BoundedListing`); a root-wide search that would span the cloud
+  folders is refused until a path names one;
+- a **``read_only`` folder refuses writes here** as assistance (the credential
+  is the guarantee), naming the folder and the level;
+- **read-modify-write is checked**: a read remembers the object's version
+  token, ``append_file`` writes with that precondition, and a whole-file
+  write is refused when the object changed since this backend read it
+  (:class:`CloudFileChanged`); every mutation is journalled with the version
+  before and after (``cloud_changes``);
+- **moves and copies across stores** are a download and an upload through
+  this process; a directory across stores is refused, naming both folders.
 """
 
 import fnmatch
 import logging
 import posixpath
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Optional
 
 from shared.runtime.core.workspace_backend import WorkspaceBackend, search_excludes
-from shared.runtime.core.backends.object_store import InMemoryObjectStore, ObjectStore
+from shared.runtime.core.backends.object_store import (
+    InMemoryObjectStore,
+    ObjectStat,
+    ObjectStore,
+    ObjectVersionMismatch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +87,29 @@ DEFAULT_MAX_READ_BYTES = 50 * 1024 * 1024  # 50 MiB
 # search_files bounds (the hydration guard). Files larger than this are skipped
 # for content search; name/path matching is unaffected.
 DEFAULT_SEARCH_FILE_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+# The folder under the file-tools root that holds every bound cloud folder:
+# ``cloud/<name>``, the same path a Container's mount has.
+CLOUD_ROOT = "cloud"
+
+# How many files one ``search_files`` under a cloud folder considers (ruling 6
+# of the feature note): the result then says it was truncated.
+DEFAULT_CLOUD_SEARCH_FILES = 200
+
+# How many files a ``walk`` or size probe under a cloud folder lists before it
+# stops and says so; a user's cloud is not a workspace.
+DEFAULT_CLOUD_WALK_ENTRIES = 2000
+
+# A walk under a cloud folder never descends deeper than this.
+CLOUD_WALK_MAX_DEPTH = 32
+
+# The state names of a cloud folder on this tier (the status record and the
+# prompt rows use them, the Container's are ``mounted``/``pending``/
+# ``unavailable``): ``bound`` = the descriptor arrived and the store exists,
+# ``ready`` = one probe of the remote's root answered, ``failed`` = it did not.
+CLOUD_STATE_BOUND = "bound"
+CLOUD_STATE_READY = "ready"
+CLOUD_STATE_FAILED = "failed"
 
 # Extensions skipped during content search (binary / non-text payloads).
 _BINARY_SEARCH_EXTS = frozenset(
@@ -85,6 +147,75 @@ _BINARY_SEARCH_EXTS = frozenset(
 )
 
 
+class CloudFolderError(ValueError):
+    """A file operation on a cloud folder that the backend refuses on
+    purpose; the message is written for the agent (a tool error)."""
+
+
+class CloudFolderReadOnly(CloudFolderError):
+    """A write under a folder bound at the ``read_only`` level."""
+
+
+class CloudFileChanged(CloudFolderError):
+    """A read-modify-write found the cloud file at another version than the
+    one this backend read; nothing was written."""
+
+
+class BoundedListing(list):
+    """A ``list`` result of a bounded cloud operation that also says whether
+    the bound was hit (``truncated``), how many entries were considered
+    (``scanned``) and what the bound was (``limit``). A plain list for every
+    consumer that does not care."""
+
+    truncated: bool = False
+    scanned: int = 0
+    limit: Optional[int] = None
+
+
+@dataclass
+class CloudRemote:
+    """One cloud folder bound into the backend's mount table.
+
+    Attributes:
+        name: The folder's name under ``cloud/`` (``outbox``, the project's
+            slug, ``my_cloud``), the sidecar plan's ``workspace_name``.
+        path: Its path from the file-tools root (``cloud/<name>``).
+        store: The folder's own object store; keys are relative to the
+            folder's root (``""`` is the root).
+        access: ``read_write`` or ``read_only`` (refused here as assistance).
+        kind: The connector's ``mount_kind`` (``cloud_outbox``, ``project``,
+            ``user_root``), for the prompt rows.
+        mount_id: The connector id, for the status record.
+        shared: For an outbox, whether SRW could share it with the user yet.
+        state: :data:`CLOUD_STATE_BOUND`, ``ready`` or ``failed``.
+        reason: A closed reason code when ``failed``.
+    """
+
+    name: str
+    path: str
+    store: ObjectStore
+    access: str = "read_write"
+    kind: str = ""
+    mount_id: str = ""
+    shared: Optional[bool] = None
+    state: str = CLOUD_STATE_BOUND
+    reason: Optional[str] = None
+    detail: Optional[str] = field(default=None, repr=False)
+
+    @property
+    def read_only(self) -> bool:
+        return self.access == "read_only"
+
+    def key_prefix(self, key: str) -> str:
+        """The listing prefix of the folder at ``key`` (``""`` for the root)."""
+        return f"{key}/" if key else ""
+
+
+# The route target for the ``cloud`` directory itself (and an unknown name
+# under it): a virtual, read-only directory that lists the bound folders.
+_CLOUD_DIR = object()
+
+
 class VirtualWorkspaceBackend(WorkspaceBackend):
     """WorkspaceBackend backed by explicit object-store ops under a key prefix.
 
@@ -95,6 +226,12 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             prefix means the whole store is the workspace (rare; for tests).
         max_read_bytes: Single-object read ceiling.
         search_file_bytes: Per-file content-search ceiling.
+        cloud_remotes: The cloud folders bound under ``cloud/<name>`` (see the
+            module docstring); none by default.
+        cloud_search_files: How many files a search under a cloud folder
+            considers before it stops and says so.
+        cloud_walk_entries: How many files a walk under a cloud folder lists
+            before it stops and says so.
     """
 
     def __init__(
@@ -104,6 +241,9 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         *,
         max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
         search_file_bytes: int = DEFAULT_SEARCH_FILE_BYTES,
+        cloud_remotes: Optional[Iterable[CloudRemote]] = None,
+        cloud_search_files: int = DEFAULT_CLOUD_SEARCH_FILES,
+        cloud_walk_entries: int = DEFAULT_CLOUD_WALK_ENTRIES,
     ):
         self._store = object_store
         self._prefix = self._normalize_prefix(prefix)
@@ -113,6 +253,23 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         # Scoped metadata index — see begin_read_cache(). None = inactive,
         # which is the default and the state during all normal tool work.
         self._index: dict[str, int] | None = None
+        # The mount table: name -> remote, in binding order.
+        self._remotes: dict[str, CloudRemote] = {}
+        for remote in cloud_remotes or ():
+            if remote.name in self._remotes:
+                raise ValueError(f"cloud folder {remote.name!r} is bound twice")
+            if not remote.name or "/" in remote.name or remote.name in (".", ".."):
+                raise ValueError(f"cloud folder name {remote.name!r} is not valid")
+            self._remotes[remote.name] = remote
+        self._cloud_search_files = cloud_search_files
+        self._cloud_walk_entries = cloud_walk_entries
+        # (folder name, key) -> the version token of the last read, so a
+        # read-modify-write can tell that someone else wrote in between.
+        self._cloud_versions: dict[tuple[str, str], Optional[str]] = {}
+        #: Every mutation under ``cloud/`` this backend performed: dicts of
+        #: ``path``, ``name``, ``mount_id``, ``op``, ``version_before``,
+        #: ``version_after`` and ``bytes`` (the change record's agent half).
+        self.cloud_changes: list[dict[str, Any]] = []
 
     # =========================================================================
     # Path / prefix math (escape-proof by construction — no real filesystem)
@@ -162,6 +319,104 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             return key[len(self._prefix) :]
         return key
 
+    # -------------------------------------------------------------- routing
+
+    def _route(self, relative_path: str) -> tuple[Any, str]:
+        """``(target, rest)`` for a path: ``target`` is ``None`` for the
+        workspace prefix (``rest`` = the normalized path), a
+        :class:`CloudRemote` (``rest`` = the key inside it, ``""`` for its
+        root) or :data:`_CLOUD_DIR` for ``cloud`` itself and an unknown name
+        under it (``rest`` = what followed ``cloud/``). Escapes are rejected
+        before matching. Without bound folders every path is the workspace's.
+        """
+        norm = self._normalize_rel(relative_path)
+        if not self._remotes:
+            return None, norm
+        if norm == CLOUD_ROOT:
+            return _CLOUD_DIR, ""
+        if not norm.startswith(CLOUD_ROOT + "/"):
+            return None, norm
+        rest = norm[len(CLOUD_ROOT) + 1 :]
+        name, _sep, inside = rest.partition("/")
+        remote = self._remotes.get(name)
+        if remote is None:
+            return _CLOUD_DIR, rest
+        return remote, inside
+
+    @property
+    def cloud_remotes(self) -> list[CloudRemote]:
+        """The bound cloud folders, in binding order."""
+        return list(self._remotes.values())
+
+    def _cloud_paths_text(self) -> str:
+        return ", ".join(remote.path for remote in self._remotes.values())
+
+    def _no_such_folder(self, relative_path: str, rest: str) -> CloudFolderError:
+        name = rest.partition("/")[0]
+        return CloudFolderError(
+            f"'{relative_path}' is not in a cloud folder of this session: there "
+            f"is no '{CLOUD_ROOT}/{name}'. The cloud folders are: "
+            f"{self._cloud_paths_text()}."
+        )
+
+    @staticmethod
+    def _refuse_read_only(remote: CloudRemote, verb: str, relative_path: str) -> None:
+        if remote.read_only:
+            raise CloudFolderReadOnly(
+                f"{remote.path} is a read-only cloud folder (level read_only): "
+                f"cannot {verb} '{relative_path}'. Its account may only read "
+                f"this folder; save your work in the workspace or in a "
+                f"read-write folder instead."
+            )
+
+    def _cloud_kind(self, remote: CloudRemote, key: str) -> str:
+        """``"file"``, ``"dir"`` or ``"absent"`` for ``key`` in ``remote``:
+        one ``stat`` (which knows folders on a remote that has them) and, when
+        that says nothing, one listing for a flat store."""
+        if key == "":
+            return "dir"
+        info = remote.store.stat(key)
+        if info is not None:
+            return "dir" if info.is_dir else "file"
+        if remote.store.list_dir(remote.key_prefix(key)):
+            return "dir"
+        return "absent"
+
+    def _journal(
+        self,
+        remote: CloudRemote,
+        relative_path: str,
+        op: str,
+        before: Optional[ObjectStat],
+        after: Optional[ObjectStat],
+        size: int,
+    ) -> None:
+        entry = {
+            "path": relative_path,
+            "name": remote.name,
+            "mount_id": remote.mount_id,
+            "op": op,
+            "version_before": before.version if before is not None else None,
+            "version_after": after.version if after is not None else None,
+            "bytes": size,
+        }
+        self.cloud_changes.append(entry)
+        logger.info(
+            "cloud folder change: %s %s (%d bytes, version %s -> %s)",
+            op,
+            relative_path,
+            size,
+            entry["version_before"],
+            entry["version_after"],
+        )
+
+    def _remember_version(
+        self, remote: CloudRemote, key: str, info: Optional[ObjectStat]
+    ) -> None:
+        self._cloud_versions[(remote.name, key)] = (
+            info.version if info is not None else None
+        )
+
     # =========================================================================
     # Scoped metadata index
     # =========================================================================
@@ -180,6 +435,9 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
     # the only writer that could invalidate it is another process touching
     # the same prefix mid-attach — whose write is picked up by the first
     # uncached op after the scope closes.
+    #
+    # Cloud folders are never indexed: a user's folder is live, large and
+    # written by others; every cloud op below talks to its store directly.
 
     def begin_read_cache(self) -> None:
         """Open the scoped metadata index (idempotent). One store op."""
@@ -247,6 +505,10 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
     # =========================================================================
 
     def read_file(self, path: str, binary: bool = False) -> str | bytes:
+        target, rest = self._route(path)
+        if target is not None:
+            data = self._cloud_read(target, rest, path)
+            return data if binary else data.decode("utf-8")
         key = self._object_key(path)
         size = self._store.head(key)
         if size is None:
@@ -266,34 +528,133 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             return data
         return data.decode("utf-8")
 
+    def _cloud_read(self, target: Any, rest: str, path: str) -> bytes:
+        if target is _CLOUD_DIR:
+            if rest == "":
+                raise ValueError(f"Not a file: {path}")
+            raise FileNotFoundError(
+                f"File not found: {path} (the cloud folders are: "
+                f"{self._cloud_paths_text()})"
+            )
+        remote: CloudRemote = target
+        if rest == "":
+            raise ValueError(f"Not a file: {path}")
+        info = remote.store.stat(rest)
+        if info is None:
+            if remote.store.list_dir(remote.key_prefix(rest)):
+                raise ValueError(f"Not a file: {path}")
+            raise FileNotFoundError(f"File not found: {path}")
+        if info.is_dir:
+            raise ValueError(f"Not a file: {path}")
+        if info.size > self._max_read_bytes:
+            raise ValueError(
+                f"File '{path}' is {info.size} bytes, exceeds the read limit of "
+                f"{self._max_read_bytes} bytes; work on a part of it (a section "
+                f"copied into the workspace) instead"
+            )
+        data = remote.store.get(rest)
+        self._remember_version(remote, rest, info)
+        return data
+
     def write_file(self, path: str, content: str | bytes) -> None:
-        norm = self._normalize_rel(path)
+        target, rest = self._route(path)
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        if target is not None:
+            return self._cloud_write(target, rest, path, data)
+        norm = rest
         if norm == "":
             raise ValueError("Cannot write to the workspace root as a file")
         # Refuse to clobber a directory with a file (matches POSIX semantics;
         # cheap because is_dir is a single prefix probe).
         if self.is_dir(path):
             raise ValueError(f"Is a directory: {path}")
-        data = content.encode("utf-8") if isinstance(content, str) else content
         self._store.put(self._prefix + norm, data)
         self._index_put(self._prefix + norm, len(data))
 
+    def _cloud_write(self, target: Any, rest: str, path: str, data: bytes) -> None:
+        if target is _CLOUD_DIR:
+            if rest == "":
+                raise CloudFolderError(
+                    f"Cannot write to '{CLOUD_ROOT}' itself: it only holds the "
+                    f"cloud folders {self._cloud_paths_text()}"
+                )
+            raise self._no_such_folder(path, rest)
+        remote: CloudRemote = target
+        if rest == "":
+            raise ValueError(
+                f"Cannot write to the cloud folder {remote.path} as a file"
+            )
+        self._refuse_read_only(remote, "write", path)
+        before = remote.store.stat(rest)
+        if before is not None and before.is_dir:
+            raise ValueError(f"Is a directory: {path}")
+        expected = self._cloud_versions.get((remote.name, rest))
+        if (
+            before is not None
+            and expected is not None
+            and before.version is not None
+            and before.version != expected
+        ):
+            raise CloudFileChanged(
+                f"{path} changed in the cloud since you read it; read it again "
+                f"before writing. Nothing was written."
+            )
+        remote.store.put(rest, data)
+        after = remote.store.stat(rest)
+        self._remember_version(remote, rest, after)
+        self._journal(remote, path, "write", before, after, len(data))
+
     def append_file(self, path: str, content: str) -> None:
+        target, rest = self._route(path)
+        addition = content.encode("utf-8") if isinstance(content, str) else content
+        if target is not None:
+            return self._cloud_append(target, rest, path, addition)
         # Read-modify-write: not atomic. Safe under single-writer-per-prefix.
-        norm = self._normalize_rel(path)
+        norm = rest
         if norm == "":
             raise ValueError("Cannot append to the workspace root")
         key = self._prefix + norm
-        addition = content.encode("utf-8") if isinstance(content, str) else content
         existing = self._store.get(key) if self._store.head(key) is not None else b""
         self._store.put(key, existing + addition)
         self._index_put(key, len(existing) + len(addition))
+
+    def _cloud_append(self, target: Any, rest: str, path: str, addition: bytes) -> None:
+        if target is _CLOUD_DIR:
+            if rest == "":
+                raise CloudFolderError(f"Cannot append to '{CLOUD_ROOT}' itself")
+            raise self._no_such_folder(path, rest)
+        remote: CloudRemote = target
+        if rest == "":
+            raise ValueError(f"Cannot append to the cloud folder {remote.path}")
+        self._refuse_read_only(remote, "append to", path)
+        before = remote.store.stat(rest)
+        if before is not None and before.is_dir:
+            raise ValueError(f"Is a directory: {path}")
+        existing = remote.store.get(rest) if before is not None else b""
+        try:
+            after = remote.store.put_if_match(
+                rest,
+                existing + addition,
+                before.version if before is not None else None,
+            )
+        except ObjectVersionMismatch:
+            raise CloudFileChanged(
+                f"{path} changed in the cloud while you were appending to it; "
+                f"read it again and retry. Nothing was written."
+            ) from None
+        self._remember_version(remote, rest, after)
+        self._journal(remote, path, "append", before, after, len(addition))
 
     def exists(self, path: str) -> bool:
         return self.is_file(path) or self.is_dir(path)
 
     def is_file(self, path: str) -> bool:
-        norm = self._normalize_rel(path)
+        target, rest = self._route(path)
+        if target is _CLOUD_DIR:
+            return False
+        if target is not None:
+            return self._cloud_kind(target, rest) == "file"
+        norm = rest
         if norm == "":
             return False  # the root is a directory, never a file
         key = self._prefix + norm
@@ -302,7 +663,12 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         return self._store.head(key) is not None
 
     def is_dir(self, path: str) -> bool:
-        norm = self._normalize_rel(path)
+        target, rest = self._route(path)
+        if target is _CLOUD_DIR:
+            return rest == ""
+        if target is not None:
+            return self._cloud_kind(target, rest) == "dir"
+        norm = rest
         if norm == "":
             return True  # the workspace root always exists as a directory
         # A directory exists iff some object lives under "<prefix><norm>/".
@@ -319,7 +685,10 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         return [(info.key, info.size) for info in self._store.list(prefix)]
 
     def list_dir(self, path: str = "", pattern: str = "*") -> list[str]:
-        norm = self._normalize_rel(path)
+        target, rest = self._route(path)
+        if target is not None:
+            return self._cloud_list_dir(target, rest, path, pattern)
+        norm = rest
         if norm != "" and not self.is_dir(path):
             # Matches the filesystem backend: a file path lists itself; a
             # non-existent path lists nothing.
@@ -339,6 +708,10 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
                 dirs.add(head)
             elif head != _DIR_MARKER:  # hide the empty-dir marker
                 files.add(head)
+        if norm == "" and self._remotes:
+            # The bound cloud folders live under ``cloud/`` at the root.
+            files.discard(CLOUD_ROOT)
+            dirs.add(CLOUD_ROOT)
 
         results: list[str] = []
         for name in files:
@@ -349,6 +722,33 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
                 results.append(rel_root + name + "/")
         return sorted(results)
 
+    def _cloud_list_dir(
+        self, target: Any, rest: str, path: str, pattern: str
+    ) -> list[str]:
+        if target is _CLOUD_DIR:
+            if rest != "":
+                return []
+            return sorted(
+                f"{CLOUD_ROOT}/{name}/"
+                for name in self._remotes
+                if fnmatch.fnmatch(name, pattern)
+            )
+        remote: CloudRemote = target
+        kind = self._cloud_kind(remote, rest)
+        norm = self._normalize_rel(path)
+        if kind == "file":
+            return [norm]
+        if kind == "absent":
+            return []
+        prefix = remote.key_prefix(rest)
+        results: list[str] = []
+        for entry in remote.store.list_dir(prefix):
+            name = entry.key[len(prefix) :]
+            if not name or "/" in name or not fnmatch.fnmatch(name, pattern):
+                continue
+            results.append(f"{norm}/{name}/" if entry.is_dir else f"{norm}/{name}")
+        return sorted(results)
+
     def walk(self, path: str = "") -> list[str]:
         """Flat recursive listing of every file under ``path`` (relative to the
         workspace root), via the object store's recursive ``list``.
@@ -357,13 +757,69 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         here collapses to a single level — the flat store already knows every
         key under the prefix in one call (``workspace_tier_upgrade.md`` §4.2
         S3a, the seed source).
+
+        The workspace root's walk never enters the cloud folders (they are
+        not the workspace's files: the upgrade seed and the attach sweeps
+        must not copy or scan a user's cloud). A walk that names a cloud
+        path is bounded (:data:`DEFAULT_CLOUD_WALK_ENTRIES`) and the result,
+        a :class:`BoundedListing`, says when it stopped.
         """
+        target, rest = self._route(path)
+        if target is not None:
+            listing = self._cloud_walk(target, rest, path)
+            out = BoundedListing(rel for rel, _size in listing)
+            out.truncated, out.scanned, out.limit = (
+                listing.truncated,
+                listing.scanned,
+                listing.limit,
+            )
+            return out
         out: list[str] = []
         for key, _size in self._list_keys(self._dir_prefix(path)):
             if posixpath.basename(key) == _DIR_MARKER:
                 continue  # hide the empty-dir markers
             out.append(self._strip_prefix(key))
         return sorted(out)
+
+    def _cloud_walk(
+        self, target: Any, rest: str, path: str, *, limit: Optional[int] = None
+    ) -> BoundedListing:
+        """``(relative path, size)`` of the files under a cloud path, breadth
+        first through one-level listings, at most ``limit`` of them."""
+        cap = self._cloud_walk_entries if limit is None else limit
+        out = BoundedListing()
+        out.limit = cap
+        if target is _CLOUD_DIR:
+            if rest != "":
+                return out
+            roots = [(remote, "") for remote in self._remotes.values()]
+        else:
+            remote: CloudRemote = target
+            kind = self._cloud_kind(remote, rest)
+            if kind == "absent":
+                return out
+            if kind == "file":
+                info = remote.store.stat(rest)
+                out.append((self._normalize_rel(path), info.size if info else 0))
+                out.scanned = 1
+                return out
+            roots = [(remote, rest)]
+        for remote, start in roots:
+            queue: list[tuple[str, int]] = [(remote.key_prefix(start), 0)]
+            while queue:
+                prefix, depth = queue.pop(0)
+                for entry in remote.store.list_dir(prefix):
+                    if entry.is_dir:
+                        if depth + 1 <= CLOUD_WALK_MAX_DEPTH:
+                            queue.append((entry.key + "/", depth + 1))
+                        continue
+                    if len(out) >= cap:
+                        out.truncated = True
+                        return out
+                    rel = f"{remote.path}/{entry.key}" if entry.key else remote.path
+                    out.append((rel, entry.size))
+                    out.scanned += 1
+        return out
 
     def list_files_with_sizes(self, path: str = "") -> list[tuple[str, int]]:
         """``walk()`` that keeps each file's size — still ONE store round trip.
@@ -373,6 +829,9 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         walks directories and then stats files one by one pays ~30 spawns
         per turn; this primitive collapses the local half of that to one.
         """
+        target, rest = self._route(path)
+        if target is not None:
+            return self._cloud_walk(target, rest, path)
         out: list[tuple[str, int]] = []
         for key, size in self._list_keys(self._dir_prefix(path)):
             if posixpath.basename(key) == _DIR_MARKER:
@@ -387,6 +846,11 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         case_sensitive: bool = False,
         exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
+        target, rest = self._route(path)
+        if target is not None or (self._remotes and rest == ""):
+            return self._cloud_search(
+                target, rest, path, query, case_sensitive, exclude_dirs
+            )
         # Bounded literal content search (hydration guard): binary extensions
         # skipped, per-file byte cap. Name/path search is implicit via list_dir.
         if self.is_file(path):
@@ -424,8 +888,64 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
                     )
         return results
 
+    def _cloud_search(
+        self,
+        target: Any,
+        rest: str,
+        path: str,
+        query: str,
+        case_sensitive: bool,
+        exclude_dirs: list[str] | None,
+    ) -> list[dict]:
+        if target is None or (target is _CLOUD_DIR and rest == ""):
+            # A root-wide search would span every cloud folder (ruling 6):
+            # the mount guard refuses the same on a Container.
+            raise CloudFolderError(
+                "search_files needs a path in this session: name a workspace "
+                "folder or file (for example 'notes'), or one cloud folder such "
+                f"as {next(iter(self._remotes.values())).path}; a search of the "
+                "whole workspace would span the cloud folders "
+                f"({self._cloud_paths_text()}), which are not scanned as a whole."
+            )
+        results = BoundedListing()
+        if target is _CLOUD_DIR:
+            return results  # an unknown name under cloud/: nothing to search
+        remote: CloudRemote = target
+        listing = self._cloud_walk(remote, rest, path, limit=self._cloud_search_files)
+        results.truncated, results.scanned, results.limit = (
+            listing.truncated,
+            listing.scanned,
+            listing.limit,
+        )
+        root = self._normalize_rel(path)
+        needle = query if case_sensitive else query.lower()
+        for rel, size in listing:
+            name = posixpath.basename(rel)
+            if posixpath.splitext(name)[1].lower() in _BINARY_SEARCH_EXTS:
+                continue
+            below = rel[len(root) + 1 :] if rel.startswith(root + "/") else ""
+            if search_excludes(below, exclude_dirs):
+                continue
+            if size > self._search_file_bytes:
+                continue
+            key = rel[len(remote.path) + 1 :]
+            try:
+                content = remote.store.get(key).decode("utf-8")
+            except (UnicodeDecodeError, FileNotFoundError):
+                continue
+            for i, line in enumerate(content.splitlines(), 1):
+                hay = line if case_sensitive else line.lower()
+                if needle in hay:
+                    results.append(
+                        {"path": rel, "line_number": i, "line": line.strip()}
+                    )
+        return results
+
     def mkdir(self, path: str) -> None:
-        norm = self._normalize_rel(path)
+        target, rest = self._route(path)
+        if target is not None:
+            return self._cloud_mkdir(target, rest, path)
+        norm = rest
         if norm == "":
             return  # root always exists; nothing to create
         # Flat store has no real directories: drop a hidden marker so the
@@ -445,7 +965,27 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         self._store.put(marker, b"")
         self._index_put(marker, 0)
 
+    def _cloud_mkdir(self, target: Any, rest: str, path: str) -> None:
+        if target is _CLOUD_DIR:
+            if rest == "":
+                return  # ``cloud`` always exists while folders are bound
+            raise self._no_such_folder(path, rest)
+        remote: CloudRemote = target
+        if rest == "":
+            return  # the folder's root exists
+        self._refuse_read_only(remote, "create a directory at", path)
+        kind = self._cloud_kind(remote, rest)
+        if kind == "file":
+            raise ValueError(f"Not a directory: {path}")
+        if kind == "dir":
+            return
+        # A real folder on the provider; never a marker object in a user's cloud.
+        remote.store.mkdir(remote.key_prefix(rest))
+
     def delete_file(self, path: str) -> bool:
+        target, rest = self._route(path)
+        if target is not None:
+            return self._cloud_delete_file(target, rest, path)
         if self.is_file(path):
             self._store.delete(self._object_key(path))
             self._index_drop(self._object_key(path))
@@ -460,8 +1000,36 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             return True
         return False
 
+    def _cloud_delete_file(self, target: Any, rest: str, path: str) -> bool:
+        if target is _CLOUD_DIR:
+            if rest == "":
+                raise CloudFolderError(f"Cannot delete '{CLOUD_ROOT}' itself")
+            return False
+        remote: CloudRemote = target
+        if rest == "":
+            raise CloudFolderError(
+                f"Cannot delete the cloud folder {remote.path} itself"
+            )
+        kind = self._cloud_kind(remote, rest)
+        if kind == "absent":
+            return False
+        self._refuse_read_only(remote, "delete", path)
+        if kind == "file":
+            before = remote.store.stat(rest)
+            remote.store.delete(rest)
+            self._cloud_versions.pop((remote.name, rest), None)
+            self._journal(remote, path, "delete", before, None, 0)
+            return True
+        if remote.store.list_dir(remote.key_prefix(rest)):
+            raise ValueError(f"Cannot delete non-empty directory: {path}")
+        remote.store.rmdir(remote.key_prefix(rest))
+        return True
+
     def delete_directory(self, path: str) -> bool:
-        norm = self._normalize_rel(path)
+        target, rest = self._route(path)
+        if target is not None:
+            return self._cloud_delete_directory(target, rest, path)
+        norm = rest
         if norm == "":
             raise ValueError("Cannot delete workspace root directory")
         if not self.is_dir(path):
@@ -475,7 +1043,37 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             deleted = True
         return deleted
 
+    def _cloud_delete_directory(self, target: Any, rest: str, path: str) -> bool:
+        if target is _CLOUD_DIR:
+            if rest == "":
+                raise CloudFolderError(f"Cannot delete '{CLOUD_ROOT}' itself")
+            return False
+        remote: CloudRemote = target
+        if rest == "":
+            raise CloudFolderError(
+                f"Cannot delete the cloud folder {remote.path} itself; delete "
+                f"what is inside it instead"
+            )
+        kind = self._cloud_kind(remote, rest)
+        if kind == "absent":
+            return False
+        if kind == "file":
+            raise ValueError(f"Not a directory: {path}")
+        self._refuse_read_only(remote, "delete", path)
+        count = remote.store.delete_tree(remote.key_prefix(rest))
+        for key in [k for k in self._cloud_versions if k[0] == remote.name]:
+            if key[1].startswith(rest + "/"):
+                self._cloud_versions.pop(key, None)
+        self._journal(remote, path, "delete_tree", None, None, count)
+        return True
+
     def move(self, src: str, dst: str) -> None:
+        s_target, s_rest = self._route(src)
+        d_target, d_rest = self._route(dst)
+        if s_target is not None or d_target is not None:
+            return self._cloud_transfer(
+                s_target, s_rest, src, d_target, d_rest, dst, delete_source=True
+            )
         if not self.exists(src):
             raise FileNotFoundError(f"Source not found: {src}")
         if self.is_file(src):
@@ -498,6 +1096,12 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
             self._index_put(new_key, size)
 
     def copy(self, src: str, dst: str) -> None:
+        s_target, s_rest = self._route(src)
+        d_target, d_rest = self._route(dst)
+        if s_target is not None or d_target is not None:
+            return self._cloud_transfer(
+                s_target, s_rest, src, d_target, d_rest, dst, delete_source=False
+            )
         if not self.exists(src):
             raise FileNotFoundError(f"Source not found: {src}")
         if self.is_dir(src) and not self.is_file(src):
@@ -508,7 +1112,96 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         if size is not None:
             self._index_put(dst_key, size)
 
+    def _cloud_transfer(
+        self,
+        s_target: Any,
+        s_rest: str,
+        src: str,
+        d_target: Any,
+        d_rest: str,
+        dst: str,
+        *,
+        delete_source: bool,
+    ) -> None:
+        """``move``/``copy`` when at least one side is a cloud path. Within one
+        store the store copies (server-side where it can); across stores the
+        bytes go through this process, one file at a time; a directory across
+        stores is refused, naming both folders."""
+        verb = "move" if delete_source else "copy"
+        for target, rest, shown in ((s_target, s_rest, src), (d_target, d_rest, dst)):
+            if target is _CLOUD_DIR:
+                if rest == "":
+                    raise CloudFolderError(f"Cannot {verb} '{CLOUD_ROOT}' itself")
+                raise self._no_such_folder(shown, rest)
+            if isinstance(target, CloudRemote) and rest == "":
+                raise CloudFolderError(
+                    f"Cannot {verb} the cloud folder {target.path} itself"
+                )
+        if isinstance(d_target, CloudRemote):
+            self._refuse_read_only(d_target, f"{verb} into", dst)
+        if delete_source and isinstance(s_target, CloudRemote):
+            self._refuse_read_only(s_target, "move out of", src)
+        if not self.exists(src):
+            raise FileNotFoundError(f"Source not found: {src}")
+        src_is_file = self.is_file(src)
+        if s_target is d_target:
+            remote: CloudRemote = s_target
+            if src_is_file:
+                before_dst = remote.store.stat(d_rest)
+                remote.store.copy(s_rest, d_rest)
+                after = remote.store.stat(d_rest)
+                self._journal(
+                    remote, dst, verb, before_dst, after, after.size if after else 0
+                )
+                if delete_source:
+                    remote.store.delete(s_rest)
+                    self._cloud_versions.pop((remote.name, s_rest), None)
+                return
+            if not delete_source:
+                raise ValueError(
+                    f"Cannot copy directory: {src}. Use move for directories."
+                )
+            listing = self._cloud_walk(remote, s_rest, src)
+            if listing.truncated:
+                raise CloudFolderError(
+                    f"'{src}' holds more than {listing.limit} files; move a "
+                    f"smaller folder or the files themselves"
+                )
+            for rel, _size in listing:
+                key = rel[len(remote.path) + 1 :]
+                new_key = d_rest + key[len(s_rest) :]
+                remote.store.copy(key, new_key)
+                remote.store.delete(key)
+                self._cloud_versions.pop((remote.name, key), None)
+            remote.store.rmdir(remote.key_prefix(s_rest))
+            self._journal(remote, dst, "move_tree", None, None, len(listing))
+            return
+        if not src_is_file:
+            raise CloudFolderError(
+                f"Cannot {verb} the directory '{src}' to '{dst}': they are in "
+                f"different places ({self._place(s_target)} and "
+                f"{self._place(d_target)}); {verb} the files one by one"
+            )
+        data = self.read_file(src, binary=True)
+        self.write_file(dst, data)
+        if delete_source:
+            self.delete_file(src)
+
+    @staticmethod
+    def _place(target: Any) -> str:
+        return target.path if isinstance(target, CloudRemote) else "the workspace"
+
     def stat(self, path: str) -> int:
+        target, rest = self._route(path)
+        if target is not None:
+            if target is _CLOUD_DIR:
+                listing = self._cloud_walk(target, rest, path)
+            else:
+                info = target.store.stat(rest) if rest else None
+                if info is not None and not info.is_dir:
+                    return info.size
+                listing = self._cloud_walk(target, rest, path)
+            return sum(size for _rel, size in listing)
         key = self._object_key(path)
         if self._index is not None:
             size = self._index.get(key)
@@ -526,20 +1219,100 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         return total if found else 0
 
     def resolve_path(self, relative_path: str) -> str:
-        # Canonical form for a virtual workspace is the full object key.
+        # Canonical form for a virtual workspace is the full object key; for
+        # a cloud path it is the path itself, the name the user knows.
+        target, rest = self._route(relative_path)
+        if target is not None:
+            return self._normalize_rel(relative_path)
         return self._object_key(relative_path)
+
+    # =========================================================================
+    # Cloud folder state
+    # =========================================================================
+
+    def cloud_folders(self) -> list[dict[str, Any]]:
+        """One row per bound cloud folder, the status record's shape:
+        ``name``, ``path``, ``kind``, ``access``, ``mount_id``, ``shared``,
+        ``state`` (``bound``/``ready``/``failed``), ``reason`` and
+        ``delivery: "remote"``."""
+        return [
+            {
+                "name": remote.name,
+                "path": remote.path,
+                "kind": remote.kind,
+                "access": remote.access,
+                "mount_id": remote.mount_id,
+                "shared": remote.shared,
+                "state": remote.state,
+                "reason": remote.reason,
+                "delivery": "remote",
+            }
+            for remote in self._remotes.values()
+        ]
+
+    def probe_cloud_folders(self) -> list[dict[str, Any]]:
+        """One bounded listing of each folder's root: ``ready`` when it
+        answers, ``failed`` with a closed reason when it does not. Never
+        raises; meant to run off the turn (the session reports the rows)."""
+        for remote in self._remotes.values():
+            try:
+                remote.store.list_dir("")
+            except Exception as exc:  # the provider's error is logged, never shown
+                remote.state = CLOUD_STATE_FAILED
+                remote.reason = "mount_failed"
+                remote.detail = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "cloud folder %s did not answer: %s", remote.path, remote.detail
+                )
+            else:
+                remote.state = CLOUD_STATE_READY
+                remote.reason = None
+                remote.detail = None
+        return self.cloud_folders()
 
     # =========================================================================
     # Lifecycle
     # =========================================================================
 
+    def with_max_read_bytes(self, max_read_bytes: int) -> "VirtualWorkspaceBackend":
+        """A reader over the same store and prefix with another read ceiling.
+
+        Shares the (already connected) store: never ``disconnect`` it, that
+        would close the live workspace's transport. The workspace upgrade's
+        seed reads through one with the upload ceiling (C2).
+        """
+        return VirtualWorkspaceBackend(
+            self._store,
+            self._prefix,
+            max_read_bytes=max_read_bytes,
+            search_file_bytes=self._search_file_bytes,
+            cloud_remotes=self._remotes.values(),
+            cloud_search_files=self._cloud_search_files,
+            cloud_walk_entries=self._cloud_walk_entries,
+        )
+
     def connect(self) -> None:
         self._store.connect()
+        for remote in self._remotes.values():
+            try:
+                remote.store.connect()
+            except Exception as exc:
+                remote.state = CLOUD_STATE_FAILED
+                remote.reason = "mount_failed"
+                remote.detail = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "cloud folder %s could not be bound: %s", remote.path, remote.detail
+                )
         self._connected = True
 
     def disconnect(self) -> None:
         try:
             self._store.close()
+            for remote in self._remotes.values():
+                try:
+                    remote.store.close()
+                except Exception:
+                    logger.debug("cloud folder %s did not close", remote.path)
         finally:
             self._connected = False
 

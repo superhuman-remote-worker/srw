@@ -136,7 +136,7 @@ def _undo_receipt(request: ControlRequest) -> ControlReceipt:
 def stateless_owner(monkeypatch):
     session = SimpleNamespace(
         postgres_conn=_pool(),
-        permission_mode="supervised",
+        permission_mode="read_only",
         narration_mode="auto",
         undo_turn=AsyncMock(),
     )
@@ -405,7 +405,7 @@ async def test_journal_failure_blocks_without_ram_or_permission_side_effects(
         with pytest.raises(pa.ControlInboxBlocked):
             await pa._drain_thread_controls(lease_token=9)
 
-    assert stateless_owner.permission_mode == "supervised"
+    assert stateless_owner.permission_mode == "read_only"
     apply_request.assert_not_called()
     retire_permissions.assert_not_awaited()
     finalize.assert_not_awaited()
@@ -448,7 +448,7 @@ async def test_finalize_failure_blocks_without_ram_or_permission_side_effects(
         with pytest.raises(pa.ControlInboxBlocked, match="watermark_gap"):
             await pa._drain_thread_controls(lease_token=9)
 
-    assert stateless_owner.permission_mode == "supervised"
+    assert stateless_owner.permission_mode == "read_only"
     apply_request.assert_not_called()
     retire_permissions.assert_not_awaited()
 
@@ -457,7 +457,7 @@ async def test_finalize_failure_blocks_without_ram_or_permission_side_effects(
 @pytest.mark.parametrize(
     ("receipt_method", "receipt_mode"),
     [
-        ("mode.set", "supervised"),
+        ("mode.set", "read_only"),
         ("narration.set", "autonomous"),
     ],
 )
@@ -496,7 +496,7 @@ async def test_full_receipt_mismatch_blocks_before_finalize_or_apply(
         with pytest.raises(pa.ControlInboxBlocked, match="does not match"):
             await pa._drain_thread_controls(lease_token=9)
 
-    assert stateless_owner.permission_mode == "supervised"
+    assert stateless_owner.permission_mode == "read_only"
     journal.assert_not_awaited()
     finalize.assert_not_awaited()
     apply_request.assert_not_called()

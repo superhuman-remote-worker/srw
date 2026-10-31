@@ -1,7 +1,12 @@
 """Regression checks for the MCP job-creation/dispatch contract."""
 
 import ast
+import importlib
+import os
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from shared.orch_surface.formatters import format_created_job
 from shared.orch_surface.jobs import get_descriptor
@@ -79,3 +84,43 @@ def test_workspace_reader_promises_committed_gitea_state():
 
     assert "Gitea-backed" in doc
     assert "committed state" in doc
+
+
+def _mcp_server():
+    os.environ.setdefault("MCP_TRANSPORT", "stdio")
+    return importlib.import_module("mcp_server.server")
+
+
+@pytest.mark.asyncio
+async def test_workspace_reader_describes_a_binary_file_instead_of_its_base64():
+    server = _mcp_server()
+    client = AsyncMock()
+    client.get_workspace_file.return_value = {
+        "path": "output/report.pdf",
+        "content": "JVBERi0xLjcK4uPP0w==",
+        "encoding": "base64",
+        "size": 14,
+    }
+
+    with patch.object(server, "_get_client", return_value=client):
+        rendered = await server.get_workspace_file("job-1", "output/report.pdf")
+
+    assert "Binary file, 14 bytes" in rendered
+    assert "JVBERi0" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_workspace_reader_shows_text_unchanged():
+    server = _mcp_server()
+    client = AsyncMock()
+    client.get_workspace_file.return_value = {
+        "path": "plan.md",
+        "content": "# Plan",
+        "encoding": "utf-8",
+        "size": 6,
+    }
+
+    with patch.object(server, "_get_client", return_value=client):
+        rendered = await server.get_workspace_file("job-1", "plan.md")
+
+    assert rendered == "Workspace file: plan.md (job job-1)\n---\n# Plan"

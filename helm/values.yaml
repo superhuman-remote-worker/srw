@@ -142,6 +142,23 @@ manifestHosting:
   # Explicitly select the provider/gateway and any needed DNS destination.
   # Rules apply to new attempts. Cancel active attempts for immediate revocation.
   harnessEgress: []
+  # Harness images admins may run through generic manifest Jobs, as
+  # {name, image, description}. Images must be digest-pinned (repo[:tag]@sha256:...).
+  # The list binds administrators too: [] runs no generic image.
+  approvedImages: []
+  # Opt-in for a cluster that fails the network-isolation gate
+  # (networkIsolationVerified: false); read the risks in
+  # examples/manifests/README.md first. A new pod can reach in-cluster
+  # destinations until NetworkPolicy enforcement catches up, and connections
+  # opened in that window can survive after it starts. This enables the whole
+  # generic hosting path, not only approved harness images: user-chosen
+  # workspace images and their initialization commands also start in that
+  # window, and WorkspaceTemplate images are not covered by approvedImages.
+  allowApprovedImagesWithoutVerifiedIsolation: false
+  # Extra NetworkPolicy egress rules for workspace-attached harness runs, same
+  # shape as harnessEgress. Additive to the public-internet default and
+  # installation-wide (per-run credentials isolate runs from each other).
+  workspaceEgress: []
 
 # =============================================================================
 # Connector drivers: service-plane hosting (connector drivers D5)
@@ -237,10 +254,11 @@ connectors:
     # allowed: the cluster's nodes (kube-apiserver, kubelet, etcd) and its
     # load balancers. Empty uses the `except` lists of the workspace tiers
     # named in privateTiers (workspace.networkPolicy.tiers), so a driver pod
-    # reaches no more than that tier's workspaces do. Those defaults are one
-    # installation's ranges: the orchestrator refuses to host unless its own
-    # node's address is refused to driver pods, so set the cluster's node
-    # ranges here (k3d: the docker network) when they differ.
+    # reaches no more than that tier's workspaces do. The default home-allowed
+    # tier names only the k3s pod/service ranges, not the nodes: the
+    # orchestrator refuses to host unless its own node's address is refused
+    # to driver pods, so set the cluster's node and load-balancer ranges here
+    # (k3d: the docker network) or add them to that tier's `except`.
     refusedCidrs: []
     # -- Pin AAAA answers too (dual-stack clusters only).
     ipv6: false
@@ -479,13 +497,19 @@ connectors:
     # session over, holds the session's sideband, journals it and serves the
     # job's voice subagent. Needs servicePods.enabled and a live_voice
     # catalog model (llm.seed: an OpenAI endpoint plus a gpt-live-1 row with
-    # capabilities [live_voice]). CI stamps tag and digest.
+    # capabilities [live_voice], or a profile of SRW's own voice gateway on
+    # the customer's phone system: voiceGateway). CI stamps tag and digest.
     gptLiveSip:
       enabled: false
       image:
         repository: ghcr.io/superhuman-remote-worker/srw-driver-gpt-live-sip
         tag: latest
         digest: ""
+      # -- The phone lines' local time zone (an IANA name such as
+      # Europe/Vienna, America/New_York or UTC): the voice is told the call's
+      # date, weekday and time in it, and the next two weeks' dates, so it
+      # works out "next Monday" without asking the back office.
+      timezone: Europe/Berlin
     # -- SRW's connector driver certificate authority (C3): signs each TLS
     # driver pod's certificate; workspaces trust it for the driver's URL
     # only. Generated once at install and kept (resource-policy keep) when
@@ -550,12 +574,14 @@ orchestrator:
   # generation admitted before the flag closes may finish without stranding
   # its process-zero/maintenance fence.
   workspaceCleanupReconciliationEnabled: false
-  # -- Admit container startup v1 receipts only after the capable bridge and
-  # migrations 0309/0310 are deployed and all pre-bridge orchestrator processes
-  # and their in-flight creators are gone. Disable to stop new adoption;
-  # existing v1 work continues. Roll back only to a v1-capable image.
+  # -- On by default: admits container startup v1 receipts (the capable bridge
+  # and migrations 0309/0310 shipped in v0.0.29). Upgrading from v0.0.28 or
+  # older, set it false for that upgrade and enable it in a second rollout once
+  # every pre-bridge orchestrator process and in-flight creator is gone (README,
+  # "Container startup stage rollout"). Disable to stop new adoption; existing
+  # v1 work continues. Roll back only to a v1-capable image.
   containerStartupStageAuthority:
-    enabled: false
+    enabled: true
   # -- One-release coordinated cutover for the 0197/0198 workspace lifecycle
   # authority epoch. Keep true while advancing the ServiceAccount generation:
   # the namespace RoleBinding revokes the predecessor account and Recreate
@@ -678,20 +704,22 @@ orchestrator:
   # (SESSION_SUBAGENT_FANOUT_LANES unset) is off, so a run outside this chart
   # stays opt-in.
   sessionSubagentFanoutLanes: "stateless,pinned"
-  # -- Additional exact Git host or host:port endpoints trusted for external
-  # OKF KB datasources. The built-in public-provider set remains enabled.
-  # Wildcards, IP literals, and localhost are rejected. Example:
+  # -- Extra exact Git host or host:port endpoints trusted for external OKF KB
+  # datasources, comma-separated. github.com, gitlab.com, bitbucket.org and
+  # codeberg.org are always trusted. While gitea.enabled, the chart also
+  # trusts its Gitea: the public host (git.<global.domain>,
+  # global.hostnames.git or gitea.externalUrl) and the in-cluster endpoint
+  # (<fullname>-gitea:3000, or gitea.internalUrl). Any other host fails
+  # closed. Wildcards, IP literals and localhost are rejected; a derived
+  # localhost or IP host (local k3d's git.localhost) is left out. Example:
   # "gitea.example.com,gitea.internal:3000"
-  # Gitea, so an external OKF KB connector can reach a repo hosted here.
-  # Without this only github.com/gitlab.com/bitbucket.org/codeberg.org are
-  # trusted and the connector fails closed. Exact host:port, no wildcards.
   #
-  # NOTE the public HTTPS name, not srw-gitea:3000. Token/password auth is
-  # refused over plain http (kb_git_source.validate_git_auth_configuration),
-  # and the in-cluster service exposes only port 3000 over http — so a private
-  # repo can only be reached via the TLS ingress. Keep both entries: the
-  # in-cluster name still serves a public (credential-less) repo.
-  kbGitAllowedHosts: "git.srw.works,srw-gitea:3000"
+  # Token/password auth is refused over plain http
+  # (kb_git_source.validate_git_auth_configuration) and the in-cluster
+  # endpoint serves http only, so a private repo on the bundled Gitea is read
+  # through its public HTTPS host. The in-cluster endpoint still serves a
+  # public (credential-less) repo.
+  kbGitAllowedHosts: ""
   # -- Optional OpenSSH known_hosts content for external OKF KB deploy-key
   # remotes. Non-empty content switches SSH from accept-new to strict pinning.
   kbGitSshKnownHosts: ""
@@ -1037,21 +1065,26 @@ agent:
   networkPolicy:
     # -- DEFAULT OFF (opt-in). External LLM/Keycloak/Tavily work over the 443
     # wildcard out of the box, but a deployment whose LLM, Keycloak, or cloud
-    # lives on an RFC1918 address (in-cluster other-namespace, or the home LAN)
+    # lives on a private address (in-cluster other-namespace, or the LAN)
     # MUST add an `extraEgress` carve-out before enabling, or agents lose model
-    # access. See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
+    # access. The policy has no rule for the bundled Gitea yet, whose API the
+    # agent's repository tools (pull requests) call, so add one there too.
+    # See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
     enabled: false
-    # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow. Cluster
-    # CIDRs + home LAN + link-local/metadata denied by default (prod-safe,
-    # matches the workspace `internet-only` tier); in-cluster services stay
-    # reachable only via the explicit podSelector rules in the template.
+    # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow: every
+    # private, shared (CGNAT), loopback and link-local/metadata range, so the
+    # cluster's pods, services, nodes and load balancers and the LAN are all
+    # denied whatever ranges this cluster uses (matches the workspace
+    # `internet-only` tier). In-cluster services stay reachable only via the
+    # explicit podSelector rules in the template.
     except:
-      - 10.0.50.0/24       # K3s nodes
-      - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
-      - 10.42.0.0/16       # pod CIDR
-      - 10.43.0.0/16       # service CIDR
-      - 192.168.178.0/24   # home LAN
-      - 169.254.0.0/16     # link-local / cloud-metadata
+      - 0.0.0.0/8          # "this" network
+      - 10.0.0.0/8         # RFC 1918 (k3s pod/service CIDRs 10.42/10.43 included)
+      - 100.64.0.0/10      # shared address space (CGNAT)
+      - 127.0.0.0/8        # loopback
+      - 169.254.0.0/16     # link-local / cloud metadata
+      - 172.16.0.0/12      # RFC 1918 (docker and k3d networks included)
+      - 192.168.0.0/16     # RFC 1918
     # -- Extra egress rules appended verbatim to the policy (raw NetworkPolicy
     # egress entries). Use for an in-cluster LLM in another namespace
     # (namespaceSelector) or a LAN LLM/Keycloak/cloud endpoint (ipBlock) that
@@ -1065,7 +1098,9 @@ agent:
     #         port: 8000
     extraEgress: []
   # -- Agent pool sizing (AgentProvisioner) — this is the agent COUNT, not DB
-  # connections (see dbPool below).
+  # connections (see dbPool below). An install with phone lines needs a warm
+  # agent per line that may ring at once (buffer and minAgents; see
+  # voiceGateway): a live job waits for an agent like any job.
   pool:
     maxAgents: "10"
     minAgents: "2"
@@ -1101,11 +1136,12 @@ agent:
   # plane: the pods carry distinct class labels so the agent Service/PDB,
   # reap/scale sweeps, and per-session routing never touch them.
   stateless:
-    # -- DEFAULT OFF (prod-safe). This renders the executor pool and opens
-    # stateless admission for supported session workspace tiers. Disabled
-    # preserves pinned session behavior. VM/remote tiers remain pinned/refused
-    # even when enabled.
-    enabled: false
+    # -- On by default. This renders the executor pool and opens stateless
+    # admission for supported session workspace tiers; their Sessions upgrade
+    # in place to a container (needs orchestrator.containerStartupStageAuthority,
+    # also on by default) or to a VM (a dedicated agent). Off keeps every
+    # Session pinned. VM/remote tiers remain pinned/refused even when enabled.
+    enabled: true
     # -- Warm floor of executor pods (§5.8: interactive floor ≥ 2). KEDA/HPA
     # autoscaling is a later, separately-gated addition.
     replicas: 2
@@ -1529,6 +1565,28 @@ auth:
     # token before its `exp` claim. 60s avoids the rare clock-skew window
     # where the validator reuses a token KC has already rejected.
     accessTokenRefreshSkewSeconds: 60
+  # -- Which Keycloak tokens the orchestrator accepts as `Authorization: Bearer`
+  # credentials (and as the access token behind a cookie session). Every
+  # client of the realm gets tokens with the same signature and issuer, so a
+  # token must also be an access token (`typ: Bearer`, never an ID token) and
+  # either name an allowed client in `azp` or carry an allowed audience in
+  # `aud`; anything else is refused with a logged reason. The BFF client
+  # (auth.bff.clientId) and the cockpit SPA client (keycloak.cockpitClientId,
+  # or keycloak.bootstrap.cockpitClientId when set) are always allowed.
+  oidc:
+    # -- More client ids whose access tokens are accepted (`azp`), e.g. a
+    # first-party CLI client of your own. Never list a client whose tokens are
+    # held elsewhere (Gitea, Nextcloud, OpenCloud, admin-cli): its holder could
+    # then call this API as the user.
+    extraAllowedClients: []
+    # -- Audiences whose access tokens are accepted (`aud`). `orchestrator-api`
+    # is the bundled realm's bearer-only client for this API: a client given a
+    # hardcoded audience mapper for it gets in without being listed above. Do
+    # not give `orchestrator-api` client roles, or Keycloak's audience-resolve
+    # mapper adds it to every full-scope client's tokens. `account` and `*` are
+    # ignored: nearly every token carries `account`.
+    allowedAudiences:
+      - orchestrator-api
 
 # =============================================================================
 # SSH Gateway — user-facing SSH into session workspaces
@@ -3116,8 +3174,9 @@ nextcloud:
   #
   # Only the first install reads this. An installed Nextcloud keeps the
   # database its config.php names, so an existing SQLite install stays on
-  # SQLite next to an empty Postgres until it is converted with
-  # `occ db:convert-type`; the Pod does not wait for Postgres in that case.
+  # SQLite next to an empty Postgres until scripts/nextcloud-sqlite-to-postgres.py
+  # converts it (README: never a raw `occ db:convert-type`, which reuses the ids
+  # of deleted rows); the Pod does not wait for Postgres in that case.
   database:
     type: postgres
   # Nextcloud's background jobs (cron.php every 5 minutes) run in a `cron`
@@ -3469,6 +3528,13 @@ workspace:
   # today's retain-on-idle behavior. See
   # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
   reclaimOnIdle: false
+  # -- Idle Pod release for Kubernetes job workspaces, in seconds. A job left in
+  # pending_review, waiting_for_reply or paused with no agent and no live IDE
+  # for this long gives up its workspace Pod; its PVC keeps the files, and the
+  # next resume or dispatch recreates the Pod on the same claim. 0 disables.
+  # Needs orchestrator.workspaceCleanupReconciliationEnabled, like every
+  # automatic workspace cleanup.
+  idlePodReleaseSeconds: 86400
   # -- Capacity guard for PVC-backed workspaces (Phase 3a). Renders a
   # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
   # total storage and the count of workspace PVCs of that class. At the cap, new
@@ -3526,36 +3592,46 @@ workspace:
     # If set, the orchestrator init seeder bumps this user's default
     # project to `network_tier='home-allowed'` on first boot (idempotent,
     # one-way: never moves a project off home-allowed). Intended for
-    # operator/homelab installs where the cluster admin needs their own
-    # workspaces to reach the home LAN. Leave empty in SaaS deployments.
+    # self-hosted installs where the cluster admin needs their own
+    # workspaces to reach the LAN. Leave empty in multi-tenant deployments.
     operatorHomeAllowedEmail: ""
     # The closed set of named tiers. Order is irrelevant; the orchestrator
     # references each tier by name. The set must stay in sync with the
     # CHECK constraint in 0016_project_network_tier.sql — widening here
     # without a migration leaves stranded label values.
+    #
+    # Helm replaces a list as a whole: an overlay that changes one tier's
+    # `except` redeclares both tiers.
     tiers:
       - name: internet-only
-        # Default tier. Public internet TCP 80/443/22 (ipBlock-bounded),
-        # cluster CIDRs + home LAN + link-local denied. The orchestrator
-        # treats this as the implicit fallback for pods lacking the
-        # network-tier label (legacy/pre-migration).
+        # Default tier. Public internet TCP 80/443/22 (ipBlock-bounded):
+        # every private, shared (CGNAT), loopback and link-local/metadata
+        # range is denied, so the cluster's pods, services, nodes and load
+        # balancers and the LAN are unreachable whatever ranges this cluster
+        # uses. The orchestrator treats this as the implicit fallback for
+        # pods lacking the network-tier label (legacy/pre-migration).
         except:
-          - 10.0.50.0/24       # K3s nodes
-          - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
-          - 10.42.0.0/16       # pod CIDR
-          - 10.43.0.0/16       # service CIDR
-          - 192.168.178.0/24   # home LAN
-          - 169.254.0.0/16     # link-local / cloud-metadata
+          - 0.0.0.0/8          # "this" network
+          - 10.0.0.0/8         # RFC 1918 (k3s pod/service CIDRs 10.42/10.43 included)
+          - 100.64.0.0/10      # shared address space (CGNAT)
+          - 127.0.0.0/8        # loopback
+          - 169.254.0.0/16     # link-local / cloud metadata
+          - 172.16.0.0/12      # RFC 1918 (docker and k3d networks included)
+          - 192.168.0.0/16     # RFC 1918
       - name: home-allowed
-        # Operator/homelab tier: home LAN added back to the allowlist.
-        # Cluster CIDRs + link-local stay denied (in-cluster services
-        # remain reachable only via the explicit podSelector rules below).
+        # Self-hosted tier: private and LAN addresses are reachable, the
+        # cluster's own pod and service ranges and link-local/metadata stay
+        # denied (in-cluster services remain reachable only via the explicit
+        # podSelector rules). The defaults are the k3s pod/service CIDRs.
+        # On another distribution, replace them with the cluster's ranges.
+        # Add the node and load-balancer ranges too, or a home-allowed
+        # workspace reaches the nodes' SSH and HTTP(S) ports.
         except:
-          - 10.0.50.0/24       # K3s nodes
-          - 10.0.51.0/24       # MetalLB IPs
-          - 10.42.0.0/16       # pod CIDR
-          - 10.43.0.0/16       # service CIDR
-          - 169.254.0.0/16     # link-local / cloud-metadata
+          - 0.0.0.0/8          # "this" network
+          - 10.42.0.0/16       # k3s pod CIDR
+          - 10.43.0.0/16       # k3s service CIDR
+          - 127.0.0.0/8        # loopback
+          - 169.254.0.0/16     # link-local / cloud metadata
     # -- Extra egress rules appended verbatim to EVERY tier policy (raw
     # NetworkPolicy egress entries). Intended for deployment-specific holes
     # the cluster-CIDR hardening would otherwise close — e.g. local k3d adds
@@ -3745,6 +3821,202 @@ codexProxy:
       cpu: "1000m"
 
 # =============================================================================
+# Local phone lines: the voice gateway and the Asterisk addon
+# =============================================================================
+# Phone calls on the customer's own phone system (PBX), answered by SRW's own
+# engine instead of OpenAI's GPT-Live (docs/voice-gateway.md). Both off by
+# default. The path of one call:
+#
+#   PBX --SIP/RTP--> asterisk --ARI + audio--> voiceGateway --webhook--> orchestrator
+#                                               ^                        (automation -> live job)
+#                    phone-line driver pod -----+ (accept, transfer, hang up, events)
+#
+# * A phone line is a connector of srw.gpt-live-sip/v1
+#   (connectors.drivers.gptLiveSip, needs connectors.servicePods) whose model
+#   is one of the gateway's profiles: the gateway is that model's live_voice
+#   endpoint, seeded by llm.seed (voiceGateway.catalog).
+# * Each line here names that connector and its webhook secret (the same
+#   whsec_ value the connector holds); the phone system sees an extension
+#   (mode register) or sends calls to Asterisk's address (mode peer).
+# * The driver pod reaches the gateway's in-cluster Service: the Service
+#   admits srw.gpt-live-sip/v1's pods (annotation srw.io/driver-egress) and
+#   the pod's egress is pinned to the gateway's pods, whatever the line's
+#   project network tier.
+# * Back office: every call is a live job that needs an agent at once. Size
+#   agent.pool so a warm agent waits per line that may ring at the same time
+#   (agent.pool.buffer and minAgents of at least the number of lines, with
+#   maxAgents above them plus what jobs and chat use): reservedJobSlots does
+#   not hold a slot for a new job, and a chat session can take a warm agent.
+#   Without one, the caller hears the line's no-job fallback until an agent
+#   starts.
+# * Model servers (STT, voice LLM, TTS) are not part of the chart: a profile
+#   names OpenAI-compatible URLs, like any catalog endpoint.
+voiceGateway:
+  enabled: false
+  # -- SRW's voice gateway image (docker/Dockerfile.voice-gateway); also
+  # renders Asterisk's config. CI stamps tag and digest.
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-voice-gateway
+    tag: latest
+    digest: ""
+    pullPolicy: IfNotPresent
+  # -- A Secret with `api-key` (the gateway's Bearer key, which the seeded
+  # live_voice endpoint carries) and `asterisk-password` (ARI and the audio
+  # connection). Empty: the chart generates both once and keeps them
+  # (resource-policy keep). Name one to manage them in Vault/ESO.
+  existingSecret: ""
+  # -- The phone lines (local_voice_gateway.md §4.4). Per line:
+  #   name           lowercase letters, digits, dashes (at most 31)
+  #   mode           register (an extension on the PBX) or peer (the PBX sends
+  #                  calls to Asterisk's address; no registration)
+  #   pbx            the phone system's host[:port]
+  #   transport      udp (default) or tcp
+  #   extension      the extension the line registers as (register), or the
+  #                  user it calls the PBX as (peer, for transfers)
+  #   username       digest user, when the PBX's auth ID differs
+  #   passwordSecret {name, key}: the extension's SIP password (register)
+  #   connectorId    the SRW phone-line connector this line's calls go to
+  #   webhookSecret  {name, key}: that connector's webhook secret (whsec_...)
+  #   match          peer: addresses the PBX calls from (default: pbx)
+  #   domain, codecs, dtmfMode: per line, rarely needed
+  # Example:
+  #   - name: reception
+  #     mode: register
+  #     pbx: 192.0.2.10
+  #     extension: "2000"
+  #     passwordSecret: {name: srw-voice-lines, key: reception-sip-password}
+  #     connectorId: 00000000-0000-0000-0000-000000000001
+  #     webhookSecret: {name: srw-voice-lines, key: reception-webhook-secret}
+  lines: []
+  # -- The engines a line's catalog model can name, passed to the gateway as
+  # they are (keys as the gateway reads them; src/voice_gateway). Each
+  # profile is one live_voice catalog row (its name is the model id). The
+  # cascade engine names OpenAI-compatible STT, LLM and TTS stages; the image
+  # carries Silero VAD v6.2.3 at /opt/srw-voice/models/silero_vad-v6.2.3.onnx.
+  # A stage's key is a file: mount it with profileSecrets.
+  #   cascade-cpu:
+  #     engine: cascade
+  #     language: de
+  #     stt: {base_url: "http://stt.voice.svc:8000/v1", model: Systran/faster-whisper-small}
+  #     llm: {base_url: "http://llm.voice.svc:8080/v1", model: gemma-4-12b-it}
+  #     tts: {base_url: "http://tts.voice.svc:8000/v1", model: de_DE-mls-medium, voice: "10"}
+  #     turn: {vad_model_file: /opt/srw-voice/models/silero_vad-v6.2.3.onnx}
+  #   echo:
+  #     engine: echo        # plays the caller back: a line test without models
+  profiles: {}
+  # -- Secret keys mounted as files for profiles (a hosted stage's API key):
+  # each {name, secretName, key} lands at /run/srw-voice/profiles/<name>,
+  # which the profile names as its api_key_file.
+  profileSecrets: []
+  # -- An Asterisk of your own instead of the addon (asterisk.enabled false):
+  # its ARI base URL. It needs the asterisk.ari user and app, the
+  # `asterisk-password`, and its media connection pointed at this release's
+  # <release>-voice-gateway-media Service.
+  ari:
+    url: ""
+  # -- Seconds accept waits for a call's audio to start before it fails.
+  mediaTimeoutSeconds: 5
+  # -- Seconds the target rings when the PBX refused a transfer and Asterisk
+  # dials the target itself.
+  dialTimeoutSeconds: 30
+  # -- Extra sources (CIDRs) the media listener admits besides the Asterisk
+  # pods: a hostNetwork Asterisk the gateway does not run beside (its node's
+  # address on the pod network), or an Asterisk of your own.
+  mediaSourceCidrs: []
+  # -- The gateway's live_voice catalog rows, seeded by llm.seed's Job (also
+  # when llm.seed.enabled is false: then only these): one endpoint at the
+  # gateway's Service with its API key, one row per profile (model id = the
+  # profile's name, capabilities [live_voice]). Insert-only like the rest of
+  # the seed: rows an admin changed stay as they are, and a profile whose name
+  # another provider's row already holds is skipped.
+  catalog:
+    seed: true
+    endpointLabel: "SRW voice gateway"
+    # -- Per profile (optional): displayName, ratePerMinuteUsd (what a call
+    # minute costs on the usage ledger; default 0, a local engine) and voice
+    # (the voice an expert that names none gets).
+    models: {}
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  # -- A rollout ends the calls in progress (handed-over calls survive): the
+  # old gateway gets this long to close them.
+  terminationGracePeriodSeconds: 30
+  nodeSelector: {}
+  tolerations: []
+  # -- Default: beside Asterisk when it runs on hostNetwork.
+  affinity: {}
+
+# -- SRW's Asterisk addon (srw-asterisk: Asterisk 22 LTS, GPL-2.0, its own
+# process and image): registers each voiceGateway line at the phone system
+# and hands its calls to the gateway. Needs voiceGateway.enabled.
+asterisk:
+  enabled: false
+  # -- docker/Dockerfile.asterisk. CI stamps tag and digest.
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-asterisk
+    tag: latest
+    digest: ""
+    pullPolicy: IfNotPresent
+  # -- How the phone system reaches Asterisk (SIP and RTP):
+  #   hostNetwork   on a pinned node's own addresses (nodeSelector is required):
+  #                 the usual answer for VoIP on Kubernetes. NetworkPolicy does
+  #                 not reach a hostNetwork pod: ARI (ari.port) listens on the
+  #                 node's address, guarded by its password only, so keep it
+  #                 off the LAN with the node's firewall.
+  #   loadBalancer  at one LoadBalancer IP (MetalLB or a cloud LB):
+  #                 externalAddress is that IP; Asterisk advertises it to
+  #                 everything outside localNets (plus the cluster ranges).
+  network:
+    mode: hostNetwork
+    # -- The address the phone system reaches Asterisk at, when it is not the
+    # node's own (NAT, or the LoadBalancer IP). Needs localNets on hostNetwork.
+    externalAddress: ""
+    # -- Networks Asterisk reaches without that address translation.
+    localNets: []
+    # -- Who may send SIP and RTP (CIDRs, e.g. the PBX's address): the
+    # LoadBalancer's source ranges and Asterisk's ingress policy. Empty: any.
+    allowedSources: []
+    loadBalancer:
+      ip: ""
+      class: ""
+      annotations: {}
+  sip:
+    port: 5060
+  # -- Two ports per concurrent call (10000-10099: 50 calls).
+  rtp:
+    start: 10000
+    end: 10099
+  # -- Offered to the phone system, in this order; Asterisk converts each to
+  # 16 kHz audio for the gateway.
+  codecs: [alaw, ulaw, g722]
+  # -- auto: RFC 4733 when offered, else in-band, SIP INFO always. auto_info
+  # (no in-band) when the caller's speech could read as digits.
+  dtmfMode: auto
+  ari:
+    port: 8088
+    user: srw
+    app: srw-voice
+  # -- The websocket_client.conf entry for each call's audio.
+  mediaConnection: srw-gateway
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  terminationGracePeriodSeconds: 30
+  # -- hostNetwork: the node whose address the phone system reaches.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
 # Test-only Infrastructure
 # =============================================================================
 # Throwaway services that back integration tests. Everything under `test.` is
@@ -3819,7 +4091,14 @@ llm:
   # by a post-install / post-upgrade Job. Insert-only: existing rows in
   # system_api_keys and llm_endpoints (user_id IS NULL) are NEVER
   # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
-  # to bring the stack up empty and configure providers via Admin → Providers.
+  # to bring the stack up empty and configure models in the Cockpit
+  # (Settings → Administration → Models).
+  #
+  # Jobs and sessions are refused (503) until the chat, auxiliary, embedding
+  # and rerank capabilities each have an enabled model and a default pin, and
+  # the embedding model must return 4096-dimensional vectors. The smallest
+  # seed that satisfies that is one OpenRouter key plus three catalog rows —
+  # see the systemModels and defaults examples below and docs/models.md.
   #
   # The Job is a post-upgrade hook that waits on the orchestrator's health
   # endpoint, so it also renders only while `orchestrator.replicas` is above
@@ -3847,10 +4126,10 @@ llm:
     # is populated by Vault; in non-ESO mode the operator creates it by hand.
     #
     # systemApiKeys:
-    #   openai:
+    #   openrouter:                       # the one-key setup, see docs/models.md
     #     secretName: "srw-llm-seed"
-    #     key: "openai_api_key"
-    #   anthropic:
+    #     key: "openrouter_api_key"
+    #   anthropic:                        # optional extra chat provider
     #     secretName: "srw-llm-seed"
     #     key: "anthropic_api_key"
     #
@@ -3859,10 +4138,12 @@ llm:
     # inline as `value:` instead of secretName/key. Inline values are
     # gathered into one dedicated Secret that only the seed Job reads —
     # never the shared application Secret that agent pods inherit — and the
-    # seeder encrypts them at rest. The render fails in any other mode.
+    # seeder encrypts them at rest. The render fails in any other mode. An
+    # empty value is skipped (together with the systemModels that need it),
+    # so a template can ship the entry and the key can follow on an upgrade.
     #
-    #   openai:
-    #     value: "sk-..."
+    #   openrouter:
+    #     value: "sk-or-v1-..."
     systemApiKeys: {}
 
     # -- Optional: system-scoped OpenAI-compatible endpoints (vLLM, Ollama,
@@ -3877,11 +4158,16 @@ llm:
     #
     # `capability` on each model is optional and defaults to `chat`. Set it
     # to `embedding`, `rerank`, `vision`, `auxiliary`, or `whisper` to route
-    # the row to the matching slot in Admin → Providers → Defaults. A single endpoint
-    # can back multiple capabilities (e.g., Groq serving chat + whisper, or
-    # OpenRouter serving chat + embedding) by listing the same `apiKeyRef`
-    # once and adding one model row per physical model — a single row can
-    # claim multiple capabilities via `capabilities: [...]` (see below).
+    # the row to the matching slot in Admin → Models → Defaults. A single
+    # endpoint can back multiple capabilities (e.g., a vLLM host serving chat,
+    # a 4096-dim embedding model and a reranker) by listing the same
+    # `apiKeyRef` once and adding one model row per physical model — a single
+    # row can claim multiple capabilities via `capabilities: [...]` (see
+    # below). An embedding row must return 4096-dimensional vectors; a rerank
+    # row needs the Cohere-shaped `POST <baseUrl>/rerank` route. OpenRouter
+    # itself is better seeded as a provider key (systemApiKeys +
+    # systemModels below): chat then uses SRW's OpenRouter client, which
+    # sends OpenRouter's reasoning settings and rotates comma-separated keys.
     #
     # systemEndpoints:
     #   - label: "Local Gemma"
@@ -3939,13 +4225,49 @@ llm:
     #   chat-capable row. Use it for known multimodal models so the same
     #   physical row also surfaces in the vision dropdown.
     #
-    # systemModels:
+    # OpenRouter model ids carry the `openrouter/` routing prefix
+    # (`openrouter/<vendor>/<model>`); SRW strips it before calling
+    # OpenRouter. Admin → Models adds the prefix for you, the seed does not.
+    #
+    # A model id names ONE catalog row across every provider (and every
+    # endpoint above): the seed skips an entry whose id another provider
+    # already holds and logs why. To offer the same model through a second
+    # provider, give the row its own id and set `servedModelId` to the name
+    # that provider expects. The id must be that name plus a suffix of the
+    # same family:
+    #
     #   - provider: "anthropic"
-    #     id: "claude-opus-4-7"
-    #     displayName: "Claude Opus 4.7"
+    #     id: "claude-opus-5-5-api"                # what pins and experts name
+    #     servedModelId: "claude-opus-5-5"         # what Anthropic is sent
+    #
+    # The one-key setup (docs/models.md): one OpenRouter key serves all four
+    # required capabilities. Any chat model with tool calling works for chat +
+    # auxiliary; the embedding model must return 4096-dim vectors (Qwen3
+    # Embedding 8B does; OpenAI's text-embedding-3-large returns 3072 and
+    # cannot be used). OpenAI, Anthropic and Groq keys can serve chat, but
+    # none of them offers a 4096-dim embedding or a /rerank route.
+    #
+    # systemModels:
+    #   - provider: "openrouter"
+    #     id: "openrouter/anthropic/claude-sonnet-5.5"
+    #     displayName: "Claude Sonnet 5.5 (OpenRouter)"
+    #     capabilities: [chat, auxiliary]
+    #   - provider: "openrouter"
+    #     id: "openrouter/qwen/qwen3-embedding-8b"
+    #     displayName: "Qwen3 Embedding 8B (OpenRouter)"
+    #     capability: embedding                     # singleton: [embedding]
+    #   - provider: "openrouter"
+    #     id: "openrouter/qwen/qwen3-reranker-8b"
+    #     displayName: "Qwen3 Reranker 8B (OpenRouter)"
+    #     capability: rerank                        # POST /api/v1/rerank
+    #
+    # Further chat rows from other provider keys:
+    #
+    #   - provider: "anthropic"
+    #     id: "claude-opus-5-5"
+    #     displayName: "Claude Opus 5.5"
     #     capabilities: [chat, auxiliary, vision]   # multimodal → all three
-    #     family: "claude-opus"
-    #     contextWindow: 200000
+    #     contextWindow: 1000000
     #     reasoningLevel: null
     #   - provider: "openai"
     #     id: "gpt-4o"
@@ -3953,10 +4275,6 @@ llm:
     #     capability: chat                          # auto-expands to [chat, aux]
     #     multimodal: true                          # +vision
     #     family: "gpt-4o"
-    #   - provider: "openai"
-    #     id: "text-embedding-3-large"
-    #     displayName: "OpenAI Embedding (Large)"
-    #     capability: embedding                     # singleton: [embedding]
     #   - provider: "openai"
     #     id: "gpt-5-mini"
     #     capabilities: [chat, auxiliary]
@@ -3995,12 +4313,12 @@ llm:
     # display label, i.e. the only one when you seed one model per
     # capability. Declare a kind here to choose among several.
     #
-    # defaults:
-    #   chat: "claude-opus-4-7"
-    #   auxiliary: "gpt-4o"
-    #   vision: "claude-opus-4-7"
-    #   embedding: "text-embedding-3-large"
-    #   rerank: "qwen3-reranker-8b"
+    # defaults:                         # the one-key OpenRouter setup above
+    #   chat: "openrouter/anthropic/claude-sonnet-5.5"
+    #   auxiliary: "openrouter/anthropic/claude-sonnet-5.5"
+    #   embedding: "openrouter/qwen/qwen3-embedding-8b"
+    #   rerank: "openrouter/qwen/qwen3-reranker-8b"
+    #   vision: "claude-opus-5-5"       # optional; by default unset uses chat
     defaults: {}
 
     # -- Reconcile: Helm as the source of truth, opted into PER ENTRY. Every
@@ -4181,7 +4499,7 @@ ide:
   sessionIdleTimeout: "30"
   sessionMaxLifetime: "240"
   maxConcurrentPerUser: "2"
-  codeServerImage: "codercom/code-server:latest"
+  codeServerImage: "codercom/code-server:4.143.1"
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets

@@ -62,7 +62,10 @@ from shared.runtime.core.loader import (
     ROSTER_INHERIT_MARKER,
     canonical_config_name,
 )
-from shared.runtime.core.model_registry import UnknownModelError
+from shared.runtime.core.model_registry import (
+    UnknownModelError,
+    effective_client_protocol,
+)
 from shared.runtime.core.transport_resolution import (
     env_endpoint_names,
     provider_base_url,
@@ -337,6 +340,16 @@ async def inject_model_credentials(
         # sentinel the provider/base_url/api_key swap path uses.
         section["extra_headers"] = _route_headers or None
 
+    # The name the provider is sent when the catalog row's differs from the
+    # id. Always the catalog's, never a caller's: usage is priced under the
+    # id, so a caller-chosen name could run one model at another row's rate.
+    # `None` clears it on a session hot swap, like `extra_headers` above.
+    section["served_model"] = meta.served_model_id if meta is not None else None
+    # The API shape the model is called with; `None` clears it on a swap.
+    section["client_protocol"] = (
+        effective_client_protocol(meta) if meta is not None else None
+    )
+
     if transport_complete and not (meta is not None and meta.endpoint_id):
         return None
 
@@ -390,6 +403,10 @@ async def inject_env_key_credentials(
 ) -> None:
     """Populate ``env_keys`` with ``{PREFIX}_MODEL/_BASE_URL/_API_KEY``.
 
+    ``{PREFIX}_MODEL`` stays the catalog id (sessions persist it and resolve it
+    again on resume); ``{PREFIX}_SERVED_MODEL`` carries the name the provider
+    is sent, and is absent when that is the id itself.
+
     Sibling of :func:`inject_model_credentials` for capabilities that travel as
     flat env vars (vision, whisper, tts, ...) rather than structured config
     sections. Endpoint-backed models (origin in {'custom','system','catalog'}
@@ -410,6 +427,7 @@ async def inject_env_key_credentials(
     if env_keys.get(f"{prefix}_API_KEY") and any(
         env_keys.get(name) for name in env_endpoint_names(prefix)
     ):
+        env_keys.pop(f"{prefix}_SERVED_MODEL", None)
         return
 
     meta = None
@@ -419,6 +437,13 @@ async def inject_env_key_credentials(
         )
     except UnknownModelError:
         meta = None
+    # Set or dropped on every resolution, like the section's `served_model`: a
+    # reused block (a resumed session) must not keep a previous row's name.
+    # The agent clears the process copy before each export for the same reason.
+    if meta is not None and meta.served_model_id:
+        env_keys[f"{prefix}_SERVED_MODEL"] = meta.served_model_id
+    else:
+        env_keys.pop(f"{prefix}_SERVED_MODEL", None)
 
     if (
         meta is not None
@@ -919,6 +944,26 @@ async def inject_thread_dispatch_credentials(
             user_id=user_id,
             resolved_keys=resolved_keys,
             capability="rerank",
+            dependencies=dependencies,
+        )
+    # Speech-to-text for read_file on audio (WHISPER_MODEL / _BASE_URL /
+    # _API_KEY), resolved like the job dispatch: the persisted block, then the
+    # user's pin, then the admin default for the ``whisper`` capability.
+    whisper_model = env_keys_block.get("WHISPER_MODEL") or user_settings.get(
+        "default_whisper_model"
+    )
+    if not whisper_model:
+        whisper_model = await dependencies.store.resolve_default_for_capability(
+            "whisper"
+        )
+    if whisper_model:
+        await inject_env_key_credentials(
+            env_keys=env_keys_block,
+            prefix="WHISPER",
+            model_id=whisper_model,
+            user_id=user_id,
+            resolved_keys=resolved_keys,
+            capability="whisper",
             dependencies=dependencies,
         )
     if include_kb_profile:

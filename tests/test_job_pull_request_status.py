@@ -37,9 +37,9 @@ def _job_with_pr(job: dict) -> dict:
             {
                 "pull_request": {
                     "forge": "github",
-                    "repo": "Knaeckebrothero/KurortEngine",
+                    "repo": "Acme/WidgetShop",
                     "number": 1,
-                    "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+                    "url": "https://github.com/Acme/WidgetShop/pull/1",
                     "head": "design/hotel-rheinland-theme",
                     "base": "main",
                 }
@@ -51,9 +51,9 @@ def _job_with_pr(job: dict) -> dict:
 def _repository() -> dict:
     return {
         "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-        "name": "KurortEngine",
+        "name": "WidgetShop",
         "type": "repository",
-        "connection_url": "https://github.com/Knaeckebrothero/KurortEngine.git",
+        "connection_url": "https://github.com/Acme/WidgetShop.git",
         "config": {"forge": "github"},
         "credentials": {"token": "server-only-token"},
     }
@@ -93,7 +93,7 @@ class TestJobPullRequestStatusEndpoint:
         fake_db.resolve_datasources_for_job = AsyncMock(return_value=[_repository()])
         live = {
             "number": 1,
-            "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+            "url": "https://github.com/Acme/WidgetShop/pull/1",
             "state": "open",
             "head": "design/hotel-rheinland-theme",
             "base": "main",
@@ -118,12 +118,12 @@ class TestJobPullRequestStatusEndpoint:
         target, number = read_status.await_args.args
         assert number == 1
         assert target.forge == "github"
-        assert target.owner == "Knaeckebrothero"
-        assert target.repo == "KurortEngine"
+        assert target.owner == "Acme"
+        assert target.repo == "WidgetShop"
         assert target.token == "server-only-token"
         assert result == {
             "forge": "github",
-            "repo": "Knaeckebrothero/KurortEngine",
+            "repo": "Acme/WidgetShop",
             **live,
         }
         assert "server-only-token" not in str(result)

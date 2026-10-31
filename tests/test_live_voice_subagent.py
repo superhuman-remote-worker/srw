@@ -7,6 +7,7 @@ job's lease) and the orchestrator's journal of the session, in one fake.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -390,6 +391,106 @@ class TestLiveSubagent:
         waited = await runtime.wait_agent(handle, 10)
         assert waited["result"] == "ready"  # never surfaced as a live question
         assert "[follow_up] Please call me back." in report_of(runtime, handle)
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_a_later_answer_covers_the_earlier_pieces(self, tmp_path, pod):
+        # The owner's call 2026-10-22: a caller who paused was cut off ("Montag
+        # bis"), and the rest ("Mittwoch") came as the next question.
+        sid = pod.open_session()
+        ctx = parent_with_session(tmp_path, pod, sid, answer_timeout_s=0.4)
+        runtime = runtime_for(ctx, ledger=StrictLedger())
+        handle = await start_voice(runtime)
+        await pod.wait_for(lambda: pod.session(sid).attached == 1)
+        pod.say(sid, "caller", "Five people, three nights from Monday, Monday to")
+        first = pod.delegate(sid)
+        pod.say(sid, "assistant", "One moment, I'll check.")
+        pod.say(sid, "caller", "Wednesday, probably.")
+        second = pod.delegate(sid)
+        await pod.wait_for(lambda: len(runtime._background[handle].questions) == 2)
+
+        waited = await runtime.wait_agent(handle, 10)
+        assert waited["question"]["delegation_id"] == first
+        # The other pieces come with their words, so one answer can take
+        # all of them in.
+        (other,) = waited["other_open_questions"]
+        assert other["delegation_id"] == second
+        assert "Wednesday" in other["request"]
+        assert "settles the open ones asked before it" in waited["how_to_answer"]
+
+        answered = await runtime.message_agent(
+            handle, "Monday to Wednesday: two rooms are free.", reply_to=second
+        )
+        assert answered == {
+            "handle": handle,
+            "result": "answered",
+            "reply_to": second,
+            "covered": [first],
+        }
+        await asyncio.sleep(0.8)  # past answer_timeout_s
+        # Only the answer went to the voice; the earlier piece never expired
+        # into a "noted" follow-up after it.
+        assert [a["delegation_id"] for a in pod.session(sid).appends] == [second]
+        assert (await runtime.wait_agent(handle, 0.1))["result"] == "timeout"
+
+        pod.close(sid)
+        await runtime.wait_agent(handle, 10)
+        report = report_of(runtime, handle)
+        assert "[covered]" in report and "answered with a later question" in report
+        assert "## Follow-ups" not in report
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_an_earlier_answer_leaves_the_later_piece_open(self, tmp_path, pod):
+        sid = pod.open_session()
+        ctx = parent_with_session(tmp_path, pod, sid)
+        runtime = runtime_for(ctx, ledger=StrictLedger())
+        handle = await start_voice(runtime)
+        await pod.wait_for(lambda: pod.session(sid).attached == 1)
+        pod.say(sid, "caller", "Five people from Monday to")
+        first = pod.delegate(sid)
+        pod.say(sid, "caller", "Wednesday, probably.")
+        second = pod.delegate(sid)
+        await pod.wait_for(lambda: len(runtime._background[handle].questions) == 2)
+        await runtime.wait_agent(handle, 10)
+        answered = await runtime.message_agent(
+            handle, "Five people need two rooms.", reply_to=first
+        )
+        assert "covered" not in answered
+        waited = await runtime.wait_agent(handle, 10)
+        assert waited["result"] == "question"
+        assert waited["question"]["delegation_id"] == second
+        await runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_a_resume_reads_covered_pieces_from_the_journal(self, tmp_path, pod):
+        sid = pod.open_session()
+        pod.say(sid, "caller", "Five people from Monday to")
+        first = pod.delegate(sid)
+        pod.say(sid, "caller", "Wednesday, probably.")
+        second = pod.delegate(sid)
+        pod.journal_row(
+            sid,
+            {
+                "event_id": "answer-2",
+                "kind": "answer",
+                "speaker": "job",
+                "text": "Two rooms are free.",
+                "delegation_id": second,
+            },
+        )
+        ctx = parent_with_session(tmp_path, pod, sid)
+        runtime = runtime_for(ctx, ledger=StrictLedger())
+        handle = await start_voice(runtime)
+        await pod.wait_for(lambda: pod.session(sid).attached == 1)
+        driver = runtime._background[handle].driver
+        await pod.wait_for(lambda: first in driver.questions)
+        assert driver.questions[first]["status"] == "covered"
+        assert runtime._background[handle].questions == []  # none to answer
+        pod.close(sid)
+        waited = await runtime.wait_agent(handle, 10)
+        assert waited["result"] == "ready"  # nothing to answer again
+        assert "[covered] Five people from Monday to" in report_of(runtime, handle)
         await runtime.close()
 
     @pytest.mark.asyncio

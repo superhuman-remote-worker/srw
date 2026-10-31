@@ -16,7 +16,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call as mock_call, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call as mock_call, patch
 from uuid import uuid4
 
 import pytest
@@ -54,6 +54,7 @@ from agent.api.session_attach import session_backend_is_lite, session_backend_is
 from agent.api.session_workspace import poll_workspace_ready
 from agent.core.context import summary_text
 from shared.runtime.core.message_markers import is_compaction_summary
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 
 
 async def _handle_api_interrupt(request):
@@ -2181,7 +2182,7 @@ class TestGenerateTitle:
     async def test_injected_context_is_not_sampled(self):
         """Injected context (memory, charter, App Guide boundary) is filtered
         before the 10-message sample: it is not what the session is about."""
-        from agent.core.knowledge_injection import create_charter_injection_messages
+        from tests._legacy_injection_rows import create_charter_injection_messages
         from shared.runtime.core.context_entries import make_context_entry
 
         charter_ai, charter_tool = create_charter_injection_messages("CHARTER_TEXT")
@@ -2677,7 +2678,59 @@ class TestPollWorkspaceReady:
                 raise_on_denied=True,
                 session_runtime_generation=None,
             )
-        client.get_thread_workspace.assert_called_once_with("tid", raise_on_denied=True)
+        client.get_thread_workspace.assert_called_once_with(
+            "tid", raise_on_denied=True, raise_on_snapshot_change=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_reads_again_when_the_workspace_changed_during_a_read(self):
+        """A read the workspace changed under is refused with a 409 and the next
+        read answers from one snapshot; the poll must not treat it as "no
+        workspace" (knowledge-base/knowledge/issues/
+        protected_session_attach_races_its_workspace_create.md)."""
+        from agent.api.orchestrator_client import WorkspaceSnapshotChanged
+
+        client = AsyncMock()
+        client.get_thread_workspace = AsyncMock(
+            side_effect=[
+                WorkspaceSnapshotChanged(
+                    "changed", code="workspace_runtime_identity_changed"
+                ),
+                {"status": "creating"},
+                {"status": "ready", "pod_ip": "1.2.3.4"},
+            ]
+        )
+
+        with patch("agent.api.session_workspace.asyncio.sleep", new_callable=AsyncMock):
+            result = await poll_workspace_ready(
+                client, "tid", timeout=30, session_runtime_generation=None
+            )
+
+        assert result is not None
+        assert result["pod_ip"] == "1.2.3.4"
+        assert client.get_thread_workspace.await_count == 3
+        for call in client.get_thread_workspace.await_args_list:
+            assert call.kwargs["raise_on_snapshot_change"] is True
+
+    @pytest.mark.asyncio
+    async def test_waits_on_pending_until_the_workspace_is_ready(self):
+        """A "pending" workspace (a create on its way) is waited on, unlike "none"."""
+        client = AsyncMock()
+        client.get_thread_workspace = AsyncMock(
+            side_effect=[
+                {"status": "pending"},
+                {"status": "creating"},
+                {"status": "ready", "pod_ip": "1.2.3.4"},
+            ]
+        )
+
+        with patch("agent.api.session_workspace.asyncio.sleep", new_callable=AsyncMock):
+            result = await poll_workspace_ready(
+                client, "tid", timeout=30, session_runtime_generation=None
+            )
+
+        assert result is not None
+        assert client.get_thread_workspace.await_count == 3
 
     @pytest.mark.asyncio
     async def test_returns_vm_config_when_ready(self):
@@ -3007,6 +3060,28 @@ class TestPollVmReady:
 
         result = await _poll_vm_ready(client, "tid", timeout=5)
         assert result == {"ssh_host": "10.0.0.5", "ssh_port": 2222}
+
+    @pytest.mark.asyncio
+    async def test_returns_the_attested_vm_identity_when_ready(self):
+        """A pinned owner's ready payload names the VM End must later prove."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "vm_status": "ready",
+            "vm_ssh_host": "10.0.0.5",
+            "vm_ssh_port": 22,
+            "workspace_generation": "generation-1",
+            "workspace_runtime_incarnation": "launcher-pod-1",
+            "workspace_ssh_host_key_fingerprint": "SHA256:abc",
+        }
+
+        result = await _poll_vm_ready(client, "tid", timeout=5)
+        assert result == {
+            "ssh_host": "10.0.0.5",
+            "ssh_port": 22,
+            "workspace_generation": "generation-1",
+            "workspace_runtime_incarnation": "launcher-pod-1",
+            "workspace_ssh_host_key_fingerprint": "SHA256:abc",
+        }
 
     @pytest.mark.asyncio
     async def test_returns_none_on_failed(self):
@@ -4459,38 +4534,6 @@ async def test_ambiguous_begin_never_reopens_without_exact_proof(lifecycle_mode)
 
 
 # ---------------------------------------------------------------------------
-# 3.10 permission_check() logic (tested via closure behavior)
-# ---------------------------------------------------------------------------
-
-
-class TestPermissionCheck:
-    """Tests the permission_check closure behavior.
-
-    Since permission_check is a local function inside ws_chat, we test
-    the logic patterns directly.
-    """
-
-    def test_autonomous_returns_true_immediately(self):
-        """In autonomous mode, all tools approved without WS event."""
-        # Simulate the logic
-        mode = "autonomous"
-        assert mode == "autonomous"  # would return True
-
-    def test_auto_accept_approves_non_shell_tools(self):
-        """auto_accept approves any tool not in shell set."""
-        shell_tools = {"run_command", "shell_execute", "shell_read"}
-        assert "web_search" not in shell_tools
-        assert "read_file" not in shell_tools
-
-    def test_auto_accept_asks_for_shell_tools(self):
-        """auto_accept falls through for shell tools."""
-        shell_tools = {"run_command", "shell_execute", "shell_read"}
-        assert "run_command" in shell_tools
-        assert "shell_execute" in shell_tools
-        assert "shell_read" in shell_tools
-
-
-# ---------------------------------------------------------------------------
 # 3.11 on_tool_result truncation
 # ---------------------------------------------------------------------------
 
@@ -4589,16 +4632,6 @@ class TestWSMessageRouting:
         content = data.get("content", "")
         assert not content  # would not be queued
 
-    def test_valid_modes(self):
-        """Valid mode set values."""
-        valid_modes = ("supervised", "auto_accept", "autonomous")
-        for mode in valid_modes:
-            assert mode in valid_modes
-
-    def test_invalid_mode_rejected(self):
-        """Invalid mode not in valid set."""
-        assert "invalid" not in ("supervised", "auto_accept", "autonomous")
-
 
 # ---------------------------------------------------------------------------
 # 3.15 _handle_vm_upgrade()
@@ -4663,6 +4696,8 @@ class TestHandleWorkspaceUpgradeVm:
         sess.shell_owner_token = None
         sess.config.extra = {"shell": {}}
         sess.workspace_manager.backend = backend
+        # The swap reads the thread for a pending lane-switch marker (C2).
+        sess.postgres_conn.get_thread = AsyncMock(return_value=None)
         return sess
 
     @pytest.mark.asyncio
@@ -4916,7 +4951,7 @@ class TestHandleWorkspaceUpgradeVm:
             ),
             patch(
                 "agent.core.backends.seed.seed_workspace",
-                side_effect=lambda src, dst: seeded.set() or 0,
+                side_effect=lambda src, dst, **_kw: seeded.set() or 0,
             ),
         ):
             seeded = threading.Event()
@@ -4943,6 +4978,7 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
         sess.shell_owner_token = None
         sess.config.extra = {"shell": {}}
         sess.workspace_manager.backend = backend
+        sess.postgres_conn.get_thread = AsyncMock(return_value=None)
         return sess
 
     @pytest.mark.asyncio
@@ -5147,6 +5183,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         session.workspace_manager.backend = old_backend
         session.swap_backend = MagicMock()
         session.resetup_tools_for_backend = MagicMock()
+        session.postgres_conn.get_thread = AsyncMock(return_value=None)
         new_backend = MagicMock()
         new_backend.connect = MagicMock()
         remote_module = MagicMock()
@@ -5170,7 +5207,8 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         assert new_backend.supports_canvas_presentation is False
         assert new_backend.supports_canvas_live_apps is False
         assert new_backend.supports_canvas_shared_browser is False
-        session.swap_backend.assert_called_once_with(new_backend)
+        session.swap_backend.assert_called_once()
+        assert session.swap_backend.call_args.args == (new_backend,)
         session.resetup_tools_for_backend.assert_called_once()
 
     @pytest.mark.asyncio
@@ -5965,6 +6003,39 @@ class TestTerminateSession:
         )
 
     @pytest.mark.asyncio
+    async def test_a_lost_workspace_does_not_fail_the_detach(self):
+        """Asking a gone workspace whether a repository exists must not fail
+        the detach of a settled turn: the executor would park the Session as
+        a crash after a tool effect, with nothing the owner can do
+        (session_unknown_tool_result_needs_admin.md, k3d 2026-10-31)."""
+        import agent.api.persistent_app as mod
+
+        mod._loop_task = None
+        mod._session_identity._thread_id = "t-lost"
+        mod._event_writer = None
+        mod._session_termination.terminating = False
+        mod._session_termination.max_sessions_per_process = 0
+        fake_session = _retirement_session_mock()
+        fake_session.workspace_sync = None
+        git_mgr = MagicMock()
+        type(git_mgr).is_active = PropertyMock(
+            side_effect=WorkspaceUnavailableError("workspace gone")
+        )
+        fake_session.workspace_manager = MagicMock(git_manager=git_mgr)
+        fake_session.cleanup = AsyncMock()
+        mod._session = fake_session
+
+        with (
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
+        ):
+            await mod._session_termination.terminate("test")
+
+        git_mgr.commit.assert_not_called()
+        fake_session.cleanup.assert_awaited_once()
+        assert mod._session is None
+
+    @pytest.mark.asyncio
     async def test_mark_thread_false_preserves_shell_for_ownership_handoff(self):
         import agent.api.persistent_app as mod
 
@@ -6118,7 +6189,7 @@ class TestAttachSessionEventJournalFailure:
             shell_owner_token=61,
             stateless_warm_reuse_safe=False,
             tool_context=SimpleNamespace(
-                citation_verdict_callback=MagicMock(),
+                citation_event_callback=MagicMock(),
                 canvas_event_callback=MagicMock(),
             ),
             cleanup=AsyncMock(),
@@ -6151,7 +6222,7 @@ class TestAttachSessionEventJournalFailure:
             def __init__(self, *args, **kwargs):
                 self.postgres_conn = fake_db
                 self.tool_context = SimpleNamespace(
-                    citation_verdict_callback=None,
+                    citation_event_callback=None,
                 )
                 self.cleanup = AsyncMock()
                 instances.append(self)
@@ -6210,7 +6281,7 @@ class TestAttachSessionEventJournalFailure:
             preserve_shell=True,
             preserve_workspace_daemons=False,
         )
-        assert instances[0].tool_context.citation_verdict_callback is None
+        assert instances[0].tool_context.citation_event_callback is None
         writer_cls.assert_not_called()
         broadcast.assert_not_called()
         assert mod._session is None
@@ -6445,6 +6516,73 @@ class TestAttachSessionProtectedCloudFailClose:
         # The legacy translation ran (webdav_url built from nc_folder).
         _, kwargs = build_sync.call_args
         assert "Sessions/thread-1" in kwargs["cloud_cfg"]["webdav_url"]
+
+
+class TestAttachSessionRemoteCloudFolders:
+    """A Virtual Session's cloud folders arrive as remote descriptors (the
+    cloud_remote form) and its outbox is cloud/outbox itself: the legacy
+    nc_session_folder shim must not mirror the workspace root into that same
+    folder beside them (dev, 2026-10-29: the shim pushed skills/, README.md
+    and .srw/ into sessions/<id>)."""
+
+    @pytest.mark.asyncio
+    async def test_remote_folders_turn_the_legacy_shim_off(self):
+        import agent.api.persistent_app as mod
+
+        workspace_override = {
+            "remote": {"host": "10.42.0.10"},
+            "nc_session_folder": "Sessions/thread-1",
+            "cloud_mount": None,
+            "cloud_sync": None,
+            "protected_cloud": False,
+            "cloud_remote": {
+                "mounts": [
+                    {
+                        "name": "outbox",
+                        "path": "cloud/outbox",
+                        "mount_kind": "cloud_outbox",
+                        "access": "read_write",
+                    }
+                ],
+                "plan": {"fingerprint": "f" * 64, "incarnation": "c" * 32},
+            },
+        }
+        fake_agent = SimpleNamespace(
+            config=object(),
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=None,
+            vector_conn=None,
+        )
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+        fake_session_cls = TestAttachSessionProtectedCloudFailClose._fake_session_cls()
+
+        mod._session = None
+        mod._session_identity._thread_id = None
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(mod, "PersistentSession", fake_session_cls),
+            patch.object(
+                session_workspace,
+                "poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(mod, "_build_sync_coordinator") as build_sync,
+            patch.object(mod, "_restore_session_messages", new=AsyncMock()),
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod._session_termination, "start_watchdogs"),
+        ):
+            try:
+                await mod._session_attach.attach("thread-1")
+            finally:
+                mod._session = None
+                mod._session_identity._thread_id = None
+
+        build_sync.assert_not_called()
 
 
 class TestAttachSessionProtectedCloudSingletonIsolation:
@@ -6830,7 +6968,7 @@ class TestHandlePersistentWebsocketReadiness:
         session = MagicMock()
         session.llm_with_tools = MagicMock()
         session.protected_cloud_ready.return_value = True
-        session.permission_mode = "supervised"
+        session.permission_mode = "read_only"
         session.narration_mode = "auto"
         session.turn_count = 7
         session.messages = []
@@ -6903,7 +7041,7 @@ class TestHandlePersistentWebsocketReadiness:
         ]
         session = MagicMock()
         session.llm_with_tools = MagicMock()
-        session.permission_mode = "supervised"
+        session.permission_mode = "read_only"
         session.narration_mode = "auto"
         session.turn_count = 7
         session.messages = []
@@ -7801,6 +7939,19 @@ class TestHandleConfigUpdateEnrichmentGate:
                 "credential-bearing-keys tuple."
             )
 
+    def test_hot_swap_replaces_the_served_model_of_each_touched_slot(self):
+        """A served model string belongs to the model it came with: the swap
+        clears the old one of every slot the block touches before applying."""
+        from inspect import getsource
+        from agent.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert "EMBEDDING_SERVED_MODEL" in src
+        assert "RERANK_SERVED_MODEL" in src
+        assert src.index("clear_served_model_env(") < src.index(
+            "os.environ[k] = str(new_env_block[k])"
+        )
+
     def test_gate_checks_tool_updates_before_local_reload(self):
         from inspect import getsource
 
@@ -7967,6 +8118,50 @@ class TestHandleConfigUpdateEnrichmentGate:
         assert "_embedding_module._embedding_service = None" in src
 
 
+class TestSessionArchiveModelName:
+    """llm_requests names the catalog row of a served-model call (rule 9)."""
+
+    async def _archive(self, monkeypatch, llm_config, echoed):
+        import agent.api.persistent_app as mod
+
+        recorded = []
+        monkeypatch.setattr(
+            "agent.core.archiver.archive_llm_request",
+            lambda **kw: recorded.append(kw),
+        )
+        session = SimpleNamespace(turn_count=4, config=SimpleNamespace(llm=llm_config))
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
+        mod._loop_archive_llm_call(
+            [HumanMessage(content="hi")],
+            AIMessage(content="x"),
+            {"model": echoed, "latency_ms": 5},
+        )
+        for _ in range(100):
+            if recorded:
+                break
+            await asyncio.sleep(0.01)
+        return recorded[0]["model"]
+
+    @pytest.mark.asyncio
+    async def test_served_model_row_is_archived_under_its_catalog_id(self, monkeypatch):
+        from shared.runtime.core.loader import LLMConfig
+
+        cfg = LLMConfig(model="claude-opus-5-5-api", served_model="claude-opus-5-5")
+        assert await self._archive(monkeypatch, cfg, "claude-opus-5-5") == (
+            "claude-opus-5-5-api"
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_a_served_model_the_echo_is_kept(self, monkeypatch):
+        from shared.runtime.core.loader import LLMConfig
+
+        cfg = LLMConfig(model="gpt-4o")
+        assert await self._archive(monkeypatch, cfg, "gpt-4o-2024-08-06") == (
+            "gpt-4o-2024-08-06"
+        )
+
+
 class TestHandleConfigUpdateAckProtocol:
     """P0.3 of live_session_settings.md: request_id correlation, broadcast
     ack with the applied fragment, and surfaced 4xx denial detail."""
@@ -8052,7 +8247,7 @@ class TestHandleConfigUpdateAckProtocol:
 
         src = getsource(_handle_config_update)
         assert src.index("update_thread_config(") < src.index(
-            "_session.permission_mode = pm"
+            "_session.permission_mode = normalize_permission_mode(pm)"
         )
 
     def test_scrub_secret_values_drops_api_keys_recursively(self):
@@ -8264,9 +8459,11 @@ class TestAttachSessionRebinds:
         assert set(MEMORY_EMBEDDING_ENV_KEYS) == {
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
+            "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
             "RERANK_MODEL",
+            "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
         }

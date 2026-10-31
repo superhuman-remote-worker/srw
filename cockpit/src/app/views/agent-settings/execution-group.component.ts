@@ -8,6 +8,7 @@ import {
   AUTONOMY_LEVELS,
   CRITIC_ROUND_OPTIONS,
   IMAGE_QUALITY_TIERS,
+  liveUpgradeState,
   PERMISSION_MODES,
   readConfigPath,
   pinResolvedValue,
@@ -18,6 +19,7 @@ import {
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
 import type {GrantCatalog} from '../../core/models/api.model';
+import {DEFAULT_PERMISSION_MODE, normalizePermissionMode} from '../../core/models/permission-mode';
 
 /** See ExecutionGroupComponent.section. */
 export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspace';
@@ -117,7 +119,7 @@ export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspa
               @if (prog.elapsed) { ({{ prog.elapsed }}s) }
             </span>
           } @else {
-            <span class="field-hint">{{ 'agentSettings.execution.tierHint' | transloco }}</span>
+            <span class="field-hint">{{ tierHintKey() | transloco }}</span>
           }
         </div>
       }
@@ -565,10 +567,19 @@ export class ExecutionGroupComponent {
     });
   });
 
-  /** False when every tier is refused (a `none` session today). */
-  readonly anyTierReachable = computed(() =>
-    this.liveTierOptions().some((t) => !t.disabled && t.value !== this.liveTier()),
-  );
+  /** Whether the session can move tier at all, and why not. */
+  readonly liveUpgrade = computed(() => liveUpgradeState(this.liveTier(), this.tierReachability()));
+
+  /** False when every tier is refused (a stateless session, a VM, `none`). */
+  readonly anyTierReachable = computed(() => this.liveUpgrade() === 'available');
+
+  /** What an upgrade does while one is open; otherwise why there is none. */
+  readonly tierHintKey = computed(() => {
+    const state = this.liveUpgrade();
+    return state === 'available'
+      ? 'agentSettings.execution.tierHint'
+      : `agentSettings.execution.tierFixed.${state}`;
+  });
 
   /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
   readonly canUseVm = computed(() => {
@@ -592,9 +603,11 @@ export class ExecutionGroupComponent {
   readonly resolvedAutonomy = computed(() =>
     (readConfigPath(this.config(), 'autonomy') as string) ?? 'review'
   );
-  readonly resolvedPermissionMode = computed(() =>
-    (readConfigPath(this.config(), 'interactive.permission_mode') as string) ?? 'supervised'
-  );
+  readonly resolvedPermissionMode = computed<string>(() => {
+    // A stored config may still spell read_only `supervised`.
+    const raw = readConfigPath(this.config(), 'interactive.permission_mode');
+    return normalizePermissionMode(raw) ?? (raw as string | undefined) ?? DEFAULT_PERMISSION_MODE;
+  });
   readonly resolvedNarrationMode = computed(() =>
     (readConfigPath(this.config(), 'interactive.narration_mode') as string) ?? 'auto'
   );

@@ -199,7 +199,7 @@ def _format_session_context(
     )
     if cloud_mount.get("active"):
         lines.append(
-            f"  Cloud workspace entry: {cloud_mount.get('workspace_entry', '/workspace/cloud')}"
+            f"  Cloud workspace entry: {cloud_mount.get('workspace_entry', 'cloud')}"
         )
     # Everything a create_job config_override needs to be written without
     # guessing: the model IDs this deployment actually routes, and the grants

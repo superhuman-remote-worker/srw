@@ -302,27 +302,48 @@ refusal. Those paths retry it.
 ### Upgrades
 
 An upgrade moves to the tier it asks for, or to the next one up: a running
-Session goes to a VM; a Job goes from `none` or `virtual` to a container, and
+pinned Session goes to a VM, and a stateless `virtual` or `none` Session goes
+to a container; a Job goes from `none` or `virtual` to a container, and
 from a container to a VM. It gets that tier's default template from the lookup
 above, unless it names a template.
 
 | Trigger | Result |
 | --- | --- |
-| `/upgrade-workspace vm` in a Session | a VM from the default VM template |
-| `/upgrade-workspace <template name>` in a Session | that template. SRW looks for the name in the Session's Project, then in your Account, then in the shared Catalog. In a running Session it must be a VM template. |
-| `/upgrade-workspace` without an argument | a VM from the default VM template (a running Session can't move to a container) |
+| `/upgrade-workspace vm` in a pinned Session | a VM from the default VM template |
+| `/upgrade-workspace <template name>` in a pinned Session | that template. SRW looks for the name in the Session's Project, then in your Account, then in the shared Catalog. In a pinned Session it must be a VM template. |
+| `/upgrade-workspace` without an argument in a pinned Session | a VM from the default VM template (a pinned Session can't move to a container) |
 | The agent's approval request (it needs `sudo`) | a VM from the default VM template |
 | The agent's upgrade request in a `virtual` or `none` Session | a VM from the default VM template, offered only when SRW would accept it |
 | A Job frozen for a VM (`POST /api/jobs/{id}/upgrade-to-vm`) | a VM from the default VM template |
+| `/upgrade-workspace` or `/upgrade-workspace container` in a stateless `virtual`/`none` Session | a container from the default container template (needs startup tracking) |
+| `/upgrade-workspace <container template>` in a stateless `virtual`/`none` Session | that template |
+| `/upgrade-workspace vm` or `/upgrade-workspace <vm template>` in a stateless `virtual`/`none` Session | a VM from the defaults chain's VM template (or that template), after the Session moves to a dedicated agent |
+| The agent's upgrade request in a stateless `virtual`/`none` Session | a container where SRW offers one, else a VM; offered only when SRW would accept it |
 | A running `virtual` or `none` Job that needs a container | a container from the default container template |
 
-- **Container upgrades of a running Session are unavailable.**
-  `/upgrade-workspace container` answers in the chat without sending anything,
-  the Settings pane marks Container "not available in this session", and a
-  container template name is refused with "Container upgrades of a running
-  Session are unavailable; start a new Session with this template." Start a
-  new Session with the container you need. `/upgrade-workspace` without an
-  argument goes to a VM.
+- **Container upgrades.** A stateless `virtual` or `none` Session moves to a
+  container in place; the template's image and sizes apply. It needs
+  `orchestrator.containerStartupStageAuthority.enabled`, otherwise the
+  request gets 409 "Upgrading this Session needs workspace startup tracking,
+  which this installation doesn't have turned on." A pinned Session can't
+  move to a container ("Container upgrades aren't available in this
+  session…"); start a new Session with the container you need.
+- **VM upgrades of a stateless Session.** A stateless `virtual` or `none`
+  Session moves to a VM in place. The request is admitted only while the
+  Session is idle (otherwise it is retried); the Session then moves to a
+  dedicated agent, which provisions the VM and copies the files over. With VM
+  provisioning off the request gets 409 "VM workspaces aren't available on
+  this installation." Nothing switches back if the VM never starts: the
+  Session keeps working until its agent restarts; End it and start a new one.
+  The copy takes every file up to the 100 MB upload limit; a larger file
+  stays in the old storage prefix, and the upgrade's completion message names
+  it. If the dedicated agent is lost before the copy is recorded, the next one
+  copies again before the Session is ready, leaving out files under a cloud
+  folder (they stay in the cloud). The old storage prefix stays.
+  Startup tracking is required for container upgrades, not for VM upgrades.
+- **If the container never becomes ready**, the Session shows "Workspace
+  upgrade failed" with the startup reason. Nothing switches back: End it and
+  start a new one. The files stay in the old storage.
 - **Refusals.**
   - A template that isn't a higher tier than the current one: 400 "An upgrade
     must move to a higher tier than the current one."
@@ -330,7 +351,8 @@ above, unless it names a template.
     can't use a template that keeps its workspace; start new work with this
     template."
   - An unknown name: 404 "No template named 'x' is available here."
-  - As before: a VM upgrade while VMs are off, a stateless Session (409), and a
+  - As before: a VM upgrade while VMs are off, a VM target on a stateless Session while VM
+    provisioning is off (409), and a
     Session admitted from a manifest are refused, and nothing moves down a tier.
 - **Work without an owner** (internal Jobs, their subjobs, agent child threads)
   upgrades without a template, as before. Naming a template for it answers 409
@@ -362,6 +384,7 @@ step by step.
 | code-server on port 38080 with `auth: password` and the `HASHED_PASSWORD` value SRW injects; without that value it must not start | the Session IDE, and recovery after an aborted attach |
 | `rclone` 1.70.0 or later, `fusermount3`, `mountpoint`, `fuse-overlayfs` 1.13 or later, `/cloud` owned by `agent-host` | the cloud mount (trusted images only) |
 | No `sudo` | the sudo policy |
+| `/etc/environment` with the directories the image adds to `PATH`, and its `PIP_BREAK_SYSTEM_PACKAGES` and `npm_config_prefix` if it sets them | the agent's shell: SSH sessions start with a fresh environment, without the image's `ENV` |
 
 SRW base images contain `/usr/local/bin/assert-workspace-contract`. Run it as the
 last step of your own build to check your image:
@@ -383,16 +406,30 @@ An Expert whose instructions assume Node, a compiler or a database client fails
 on `srw-workspace-minimal` with "command not found". Use `srw-workspace`, or add
 what you need in your own image.
 
-**Install system-wide in your own Dockerfile.** The base images set `PIP_TARGET`
-and `npm_config_prefix` to directories under `/home/agent-host`, so that the
-workspace user can install packages without root. The workspace volume is
-mounted over that directory, so anything your build installs there is hidden.
-Unset the variable for build-time installs:
+The agent can install more itself, without root. `pip install` puts packages in
+its home directory, on the workspace volume, and pip inside a virtualenv works as
+usual. Where Node.js is installed, `npm install -g` uses `~/.npm-global`, whose
+`bin` is on the agent's `PATH`. A Playwright script uses the image's Chromium without downloading it,
+as long as it uses the image's Playwright version; a project that pins another
+version downloads its own browser into the home directory. VM workspaces behave
+the same way.
+
+**Install system-wide in your own Dockerfile.** The base images let the
+workspace user install packages without root: pip installs into its user
+directory, and `npm_config_prefix` points npm's global installs to a directory
+under `/home/agent-host`. The workspace volume is mounted over that directory,
+so anything your build installs there is hidden. pip run as root installs
+system-wide; for npm, unset the variable:
 
 ```dockerfile
-RUN env -u PIP_TARGET pip install --break-system-packages <package>
+RUN pip install --break-system-packages <package>
 RUN env -u npm_config_prefix npm install -g <package>
 ```
+
+**Pass your `ENV` settings on to the agent.** Its SSH sessions don't inherit the
+image's environment. After your `ENV` lines, run
+`RUN /usr/local/bin/write-agent-environment NAME ...` with the names you set; it
+copies them and `PATH` into `/etc/environment`.
 
 - **Use images only from authors you trust.** The image runs with the workspace
   owner's secrets: the credential connectors attached to the work and its
@@ -518,8 +555,9 @@ pulled when it first starts (see below). Startup-stage tracking is Helm
   becomes ready for another reason, the Job stays **Created** with no error
   until you cancel it or its execution deadline passes. Examples:
   - an image without the workspace contract whose container keeps running but
-    never opens sshd;
-  - a container that exits, when startup-stage tracking is on, or the Job was
+    never opens sshd (with startup-stage tracking on, a Job shows specific
+    attention instead; see the paragraph below);
+  - a container that exits, when startup-stage tracking is off, or the Job was
     restored or recreated over a kept volume;
   - resources no node can fit, when no `LimitRange` rejects them.
 
@@ -530,11 +568,24 @@ pulled when it first starts (see below). Startup-stage tracking is Helm
 
   Without startup-stage tracking, its workspace stays `creating` and the Jobs
   list shows "Checking an older workspace creation; completion evidence is
-  unavailable." With it, the Jobs list names the stage: a scheduling wait while
-  no node fits, or "Workspace needs attention: it didn't become ready in time.
-  If it uses your own image, check that the image keeps running: build it FROM
-  an SRW base image and don't override its ENTRYPOINT or USER." once a
-  scheduled pod's readiness budget has passed.
+  unavailable." With it, the Jobs list names the stage:
+  - a scheduling wait while no node fits;
+  - within seconds of the container exiting on its own: "Workspace needs
+    attention: its container exited with code `<code>` before it was ready. A
+    workspace image must keep running SRW's SSH server: build it FROM an SRW
+    base image and don't override its ENTRYPOINT or USER." A container that
+    keeps running but never opens SRW's SSH server gets the same message after
+    a few minutes, once the liveness check stops it (about two minutes, then
+    code 137 or 143; this is not an out-of-memory kill, which is reported as
+    `OOMKilled`). Only Jobs get this message: a Session whose image exits
+    reaches the next message after its budget;
+  - once a scheduled pod's readiness budget has passed: "Workspace needs
+    attention: it didn't become ready in time. If it uses your own image, check
+    that the image keeps running SRW's SSH server: build it FROM an SRW base
+    image and don't override its ENTRYPOINT or USER. The cluster may also have
+    stopped it, for example when it ran out of memory: try a template with more
+    memory." This also covers a container the cluster stopped (for example
+    `OOMKilled`, an evicted Pod or `ContainerStatusUnknown`).
 
   Check the pod's status and events with `kubectl describe pod
   workspace-<first 12 characters of the Job ID>` in the workspace namespace.
@@ -631,8 +682,8 @@ and `rclone mount` fail in its shell. See
 - A Job's separate IDE pod still runs the installation image, so its terminal
   lacks your image's tools. Sessions run code-server inside the workspace, which
   your image must provide.
-- A running Session can't upgrade to a container with `/upgrade-workspace`
-  (see [Upgrades](#upgrades)).
+- A pinned Session can't upgrade to a container with `/upgrade-workspace`; a
+  stateless `virtual` or `none` Session can (see [Upgrades](#upgrades)).
 - A workspace created from a built-in template keeps its image across releases,
   including work that got `container-full` because it named no workspace. Only
   the plain backend, used when the built-ins are turned off, follows the

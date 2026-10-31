@@ -16,6 +16,10 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
 import {RailAccountMenuComponent} from '../rail-account-menu/rail-account-menu.component';
+import {RailSessionMenuComponent} from '../rail-session-menu/rail-session-menu.component';
+import {AppToastService} from '../../ui/toast';
+import {ErrorMessageService} from '../../core/services/error-message.service';
+import type {Thread} from '../../core/models/api.model';
 
 /**
  * What the rail body shows. `main` everywhere except where the rail is taken
@@ -68,7 +72,7 @@ function pathOf(url: string): string {
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, NgTemplateOutlet, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, RailAccountMenuComponent],
+  imports: [RouterLink, RouterLinkActive, NgTemplateOutlet, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, RailAccountMenuComponent, RailSessionMenuComponent],
   template: `
     <nav class="sidebar" id="sidebar-rail" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
@@ -169,9 +173,29 @@ function pathOf(url: string): string {
             @for (group of sessionGroups(); track group.label) {
               <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
               @for (t of group.threads; track t.id) {
-                <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active">
-                  {{ t.title }}
-                </a>
+                @if (renamingId() === t.id) {
+                  <input #renameInput class="rail-rename" type="text" maxlength="200"
+                         [value]="t.title"
+                         [attr.aria-label]="'common.rename' | transloco"
+                         (keydown.enter)="commitRename(t, $any($event.target).value)"
+                         (keydown.escape)="$event.stopPropagation(); cancelRename()"
+                         (blur)="commitRename(t, $any($event.target).value)">
+                } @else {
+                  <!-- Right-click or ⋯ opens the session's menu
+                       (rail-session-menu.component.ts). -->
+                  <div class="rail-row" [class.menu-open]="sessionMenu.isOpenFor(t.id)">
+                    <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active"
+                       (contextmenu)="sessionMenu.onContextMenu($event, t)">
+                      {{ t.title }}
+                    </a>
+                    <button type="button" class="rail-row-more" aria-haspopup="menu"
+                            [attr.aria-expanded]="sessionMenu.isOpenFor(t.id)"
+                            [attr.aria-label]="'nav.sessionMenu.options' | transloco"
+                            (click)="sessionMenu.toggleFor(t, $any($event.currentTarget))">
+                      <app-icon size="md">more_horiz</app-icon>
+                    </button>
+                  </div>
+                }
               }
             }
 
@@ -195,6 +219,7 @@ function pathOf(url: string): string {
       <div class="sidebar-footer">
         <app-rail-account-menu />
       </div>
+      <app-rail-session-menu #sessionMenu (renameRequested)="startRename($event)" />
     </nav>
   `,
   styles: [
@@ -539,6 +564,77 @@ function pathOf(url: string): string {
         font-weight: 600;
       }
 
+      /* A session row: the link, and its ⋯ button laid over the link's right
+         end. Siblings, since a button can't sit inside a link. The button
+         shows on hover, on keyboard focus, on the open session and while its
+         menu is open; the title's ellipsis makes room for it then. */
+      .rail-row {
+        position: relative;
+      }
+
+      .rail-row:hover .rail-item,
+      .rail-row.menu-open .rail-item {
+        background: var(--surface-0);
+        color: var(--text-primary);
+      }
+
+      .rail-row:hover .rail-item,
+      .rail-row:focus-within .rail-item,
+      .rail-row.menu-open .rail-item,
+      .rail-row .rail-item.active {
+        padding-right: 36px;
+      }
+
+      .rail-row-more {
+        position: absolute;
+        top: 50%;
+        right: 12px;
+        transform: translateY(-50%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: none;
+        border-radius: var(--radius-control);
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        opacity: 0;
+        transition:
+          opacity 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .rail-row:hover .rail-row-more,
+      .rail-row:focus-within .rail-row-more,
+      .rail-row.menu-open .rail-row-more,
+      .rail-item.active + .rail-row-more {
+        opacity: 1;
+      }
+
+      .rail-row-more:hover,
+      .rail-row.menu-open .rail-row-more {
+        color: var(--text-primary);
+      }
+
+      /* Rename in place: the row becomes its input, at the row's size. */
+      .rail-rename {
+        display: block;
+        box-sizing: border-box;
+        width: calc(100% - 16px);
+        margin: 0 8px;
+        padding: 7px 11px;
+        border: 1px solid var(--accent-color);
+        border-radius: var(--radius-control);
+        outline: none;
+        background: var(--surface-0);
+        color: var(--text-primary);
+        font: inherit;
+        font-size: 13px;
+      }
+
       /* sessionGroups() is [] both for "no sessions yet" and "no matches" —
          this is the copy that tells them apart. */
       .rail-empty {
@@ -605,11 +701,28 @@ function pathOf(url: string): string {
         .rail-nav,
         .rail-back,
         .rail-item,
+        .rail-rename,
         .rail-search,
         .rail-see-all {
           min-height: 44px;
           padding: 10px 14px;
           gap: 12px;
+        }
+      }
+
+      /* Nothing hovers on a touch screen, so the ⋯ stays out, at thumb size.
+         A long press opens the same menu where the browser fires
+         contextmenu for it — iOS Safari doesn't. */
+      @media (hover: none) {
+        .rail-row .rail-item {
+          padding-right: 48px;
+        }
+
+        .rail-row-more {
+          right: 8px;
+          width: 36px;
+          height: 36px;
+          opacity: 1;
         }
       }
 
@@ -643,6 +756,8 @@ export class SidebarComponent {
   private readonly sessions = inject(SessionListService);
   private readonly userService = inject(UserService);
   private readonly actionCenter = inject(ActionCenterService);
+  private readonly toast = inject(AppToastService);
+  private readonly errors = inject(ErrorMessageService);
 
   /**
    * The URL as of the last completed navigation. Before the first one ends,
@@ -791,6 +906,43 @@ export class SidebarComponent {
   clearFilter(): void {
     this.filterText.set('');
     this.filterInput?.nativeElement.focus();
+  }
+
+  /** The session whose row is its rename input (the session menu's Rename). */
+  readonly renamingId = signal<string | null>(null);
+
+  // Dynamic, like filterInput: the input exists only while a row is renaming.
+  @ViewChild('renameInput') private readonly renameInput?: ElementRef<HTMLInputElement>;
+
+  startRename(thread: Thread): void {
+    this.renamingId.set(thread.id);
+    // Focus + select once the @if has swapped the row for its input —
+    // backwards, so a title longer than the rail shows its start, not its end.
+    setTimeout(() => {
+      const el = this.renameInput?.nativeElement;
+      el?.focus();
+      el?.setSelectionRange(0, el.value.length, 'backward');
+    });
+  }
+
+  cancelRename(): void {
+    this.renamingId.set(null);
+  }
+
+  /** Enter or blur. Optimistic, reverted if the server refuses — as on /sessions. */
+  async commitRename(thread: Thread, value: string): Promise<void> {
+    // Enter removes the input, which then blurs: commit once.
+    if (this.renamingId() !== thread.id) return;
+    this.renamingId.set(null);
+    const title = value.trim();
+    if (!title || title === thread.title) return;
+    this.sessions.renameLocal(thread.id, title);
+    try {
+      await this.chatService.renameThread(thread.id, title);
+    } catch (e) {
+      this.sessions.renameLocal(thread.id, thread.title);
+      this.toast.danger(this.errors.translate(e, 'errors.sessions.renameFailed'));
+    }
   }
 
   constructor() {

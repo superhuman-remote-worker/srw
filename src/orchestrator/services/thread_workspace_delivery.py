@@ -55,6 +55,7 @@ from orchestrator.services import cloud_mount_status, connector_credential_lease
 from orchestrator.services.cloud_connector_mounts import (
     outbox_attached,
     uses_connector_rule,
+    virtual_workspace_exclusions,
 )
 from orchestrator.services.cloud_mount_sidecar import (
     PLAN_CONTEXT_KEY,
@@ -158,6 +159,12 @@ class ThreadWorkspaceDeliveryDependencies:
     # (``DeploymentSettings.session_subagent_fanout``), read per payload. Off
     # when a composition does not wire it.
     session_subagent_fanout: Any = lambda _lane: False
+    # ``cloud_remote_plan.resolve_cloud_remote_plan`` behind the session's
+    # cloud preparation (``application.workspace.cloud_remote_planner``): a
+    # Virtual Session's cloud folders as remote descriptors for its executor
+    # (features/cloud_folders_on_virtual_sessions.md). A composition without
+    # it delivers a Virtual Session no cloud folder, as before.
+    plan_cloud_remotes: Any = None
     # ``thread_mount_rows.resolve_thread_datasource_delivery``: datasources
     # plus the hidden connector SSH identities from one authorization. A
     # composition without it delivers ``resolve_thread_datasources`` alone,
@@ -733,6 +740,16 @@ async def agent_get_thread_workspace_locked(
     workspace_backend = _thread_workspace_backend(thread)
     if workspace_backend == "vm" and not isinstance(vm, dict):
         raise HTTPException(409, "VM workspace authority is malformed")
+    if (
+        entry_protected_marker == "on"
+        and workspace_backend == "sandbox"
+        and str(ws.get("status") or "") not in {"ready", "failed"}
+    ):
+        # A protected attach takes a ready workspace with its protected mount,
+        # or a credential-free wait; anything else ends it. A workspace still
+        # on its way once the engage is done (a warm agent is bound in that
+        # instant, before the Pod exists) is a wait, never "ready" + creating.
+        return _protected_workspace_wait_payload(state="engaging")
     if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
         workspace_status = str(ws.get("status") or "")
         restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
@@ -903,6 +920,20 @@ async def agent_get_thread_workspace_locked(
                 "_canvas_workspace_generation": None,
                 WORKSPACE_RUNTIME_INCARNATION_KEY: None,
             }
+    elif (
+        thread.get("execution_lane") == "pinned"
+        and workspace_backend == "sandbox"
+        and str(ws.get("status") or "none") == "none"
+        and getattr(container_provisioner, "is_available", False) is True
+        and getattr(container_provisioner, "in_cluster", False) is True
+    ):
+        # A pinned Kubernetes workspace has no row until its create task writes
+        # one, and that task runs beside the agent's binding: a warm agent can
+        # read here first. "none" tells the agent this session has no
+        # workspace, and it fails the attach; the create is on its way, so
+        # answer "pending" (response-local), which it waits on. The durable row
+        # is untouched for the final read below.
+        ws = {**ws, "status": "pending"}
     pinned_k8s_attestation = await _attest_pinned_thread_k8s_workspace(
         thread_id,
         thread,
@@ -1076,6 +1107,9 @@ async def agent_get_thread_workspace_locked(
         )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
     cloud_mount_sidecar_cfg: dict[str, Any] | None = None
+    # A Virtual Session's cloud folders as remote descriptors (the
+    # ``cloud_remote`` form): the executor serves them under cloud/<name>.
+    cloud_remote_cfg: dict[str, Any] | None = None
     # The attached cloud folders named while none mounts: the ones this
     # deployment's sync does not deliver, or every one an in-workspace mount
     # set left out.
@@ -1124,20 +1158,85 @@ async def agent_get_thread_workspace_locked(
             # live write path on a thread the user marked protected).
             cloud_sync_cfg = None
         elif _cloud_workspace_driver() == "rclone_mount":
-            # rclone requested but unavailable/unsupported: fall back to the
-            # regular session folder only. Do not eagerly clone thread_mounts
-            # such as a default user home; that is the startup failure this
-            # driver is meant to avoid.
-            cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
+            remote_plan = None
+            if (
+                workspace_backend == "virtual"
+                and dependencies.plan_cloud_remotes is not None
+            ):
+                # A Virtual Session's cloud folders, served by its executor
+                # through explicit operations (the cloud_remote form); the
+                # plan is recorded per delivery, the agent's probe completes
+                # it. Never holds the delivery back.
+                try:
+                    remote_plan = await dependencies.plan_cloud_remotes(
+                        thread, mount_rows=mount_rows
+                    )
+                except Exception:
+                    logger.warning(
+                        "Thread %s: its cloud folders were not planned for the "
+                        "Virtual workspace; this delivery serves none",
+                        thread_id,
+                        exc_info=True,
+                    )
+                    remote_plan = None
+            if remote_plan is not None:
+                # The same plan delivered again (the agent reads its workspace
+                # more than once per claim, and every claim reads it) keeps
+                # the record it has, incarnation and reported states
+                # included, so the executor's probe lands on it; a changed
+                # plan starts a fresh record.
+                previous = cloud_mount_status.recorded_remote_plan(metadata)
+                if (
+                    previous is not None
+                    and previous.get("fingerprint") == remote_plan.fingerprint
+                ):
+                    from dataclasses import replace as _replace
+
+                    remote_plan = _replace(
+                        remote_plan, incarnation=previous["runtime_incarnation"]
+                    )
+                else:
+                    await cloud_mount_status.record_remote_plan(
+                        postgres_db,
+                        thread_id,
+                        cloud_mount_status.remote_status(
+                            remote_plan.record, remote_plan.incarnation
+                        ),
+                    )
+                cloud_folders_excluded = [
+                    *cloud_folders_excluded,
+                    *remote_plan.excluded,
+                ]
+            if remote_plan is not None and remote_plan.entries:
+                # The outbox reaches the agent as cloud/outbox itself: the
+                # legacy mirror of the workspace into the session folder is
+                # not built beside it.
+                cloud_remote_cfg = remote_plan.agent_payload()
+                cloud_sync_cfg = None
+            else:
+                # rclone requested but unavailable/unsupported: fall back to
+                # the regular session folder only. Do not eagerly clone
+                # thread_mounts such as a default user home; that is the
+                # startup failure this driver is meant to avoid.
+                cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=[])
+            # A Virtual Session's creation left out what its tier could not
+            # serve at the requested level: named from its record.
+            cloud_folders_excluded = [
+                *cloud_folders_excluded,
+                *virtual_workspace_exclusions(metadata),
+            ]
         else:
             cloud_sync_cfg = _build_agent_cloud_sync(thread, mount_rows=mount_rows)
             # The sync driver delivers no connector's cloud folder: each one
             # attached is named, for the agent and the session header,
             # rather than silently missing (main cloud, fix-up 3).
             if dependencies.cloud_sync_exclusions is not None:
-                cloud_folders_excluded = await dependencies.cloud_sync_exclusions(
-                    thread, mount_rows=mount_rows
-                )
+                cloud_folders_excluded = [
+                    *await dependencies.cloud_sync_exclusions(
+                        thread, mount_rows=mount_rows
+                    ),
+                    *virtual_workspace_exclusions(metadata),
+                ]
                 await cloud_mount_status.record_sync_exclusions(
                     postgres_db, thread_id, metadata, cloud_folders_excluded
                 )
@@ -1163,6 +1262,7 @@ async def agent_get_thread_workspace_locked(
         and not cloud_mount_cfg
         and not cloud_mount_sidecar_cfg
         and not cloud_sync_cfg
+        and not cloud_remote_cfg
         and (
             metadata.get("protected_cloud")
             or (expects_sync_target and not thread.get("nc_session_folder"))
@@ -1673,12 +1773,16 @@ async def agent_get_thread_workspace_locked(
         # Raw project repository payload for internal session tools. Public
         # repository routes intentionally redact clone credentials.
         "repositories": repositories_payload,
-        # Nextcloud session folder (legacy; preserved one release for back-compat)
+        # Nextcloud session folder (legacy; preserved one release for back-compat).
+        # Withheld beside remote descriptors too: a Virtual Session's outbox
+        # is cloud/outbox itself, and the agent's legacy shim would mirror the
+        # workspace root into that same folder.
         "nc_session_folder": (
             None
             if suppress_disposable_cloud
             or final_protected_marker != "off"
             or cloud_mount_sidecar_cfg is not None
+            or cloud_remote_cfg is not None
             else final_thread.get("nc_session_folder")
         ),
         # Structured cloud-sync config (backend + webdav URL + auth).
@@ -1687,6 +1791,11 @@ async def agent_get_thread_workspace_locked(
         # Structured lazy cloud mount config. Mutually exclusive with
         # cloud_sync for the same thread response.
         "cloud_mount": cloud_mount_cfg,
+        # A Virtual Session's cloud folders as remote descriptors (the
+        # cloud_remote form, features/cloud_folders_on_virtual_sessions.md):
+        # ``mounts`` the executor appends to its workspace mounts, ``plan``
+        # the record its probe reports against. In-flight only.
+        "cloud_remote": (cloud_remote_cfg if final_protected_marker == "off" else None),
         # The in-pod plane's mounts (D7): no credential, only where each
         # mount is and how to read its state. An older agent ignores the key
         # and, seeing no cloud_mount, cloud_sync or session folder, runs with

@@ -539,16 +539,19 @@ echo "{_OVERLAY_OK}"
         identity = shlex.quote(self._identity_path)
         terminal_check = (
             f'''if mountpoint -q {merged}; then
-  echo "{_OVERLAY_FAILED} rc=6 (overlay remained mounted)"
+  echo "{_OVERLAY_FAILED} rc=6 (overlay remained mounted: ${{unmount_error:-no error output}})"
   exit 6
 fi'''
             if strict
             else ""
         )
+        # fusermount3's own message names the cause (an unprivileged unmount
+        # needs /etc/mtab, for one); keep it for the failure report.
         return f"""#!/usr/bin/env bash
 set +e
+unmount_error=""
 if mountpoint -q {merged}; then
-  fusermount3 -u {merged} 2>/dev/null || fusermount -u {merged} 2>/dev/null
+  unmount_error="$(fusermount3 -u {merged} 2>&1)" || fusermount -u {merged} 2>/dev/null
 fi
 if mountpoint -q {merged}; then
   fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
@@ -665,7 +668,7 @@ if _srw_mount_present; then
   timeout 10 fusermount3 -uz "$merged" >/dev/null 2>&1 || timeout 10 fusermount -uz "$merged" >/dev/null 2>&1 || true
 fi
 if _srw_mount_present; then
-  timeout 10 sudo -n umount -l -- "$merged" >/dev/null 2>&1 || true
+  timeout 10 umount -l -- "$merged" >/dev/null 2>&1 || timeout 10 sudo -n umount -l -- "$merged" >/dev/null 2>&1 || true
 fi
 ! _srw_mount_present || exit 88
 ! _srw_any_merged_overlay || exit 85

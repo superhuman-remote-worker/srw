@@ -131,7 +131,7 @@ test('owners see only their exact Job and session wait, with no fleet budget', a
 
   await page.route(url => url.pathname === '/api/persistent/threads', route => route.fulfill({json: {
     threads: [{id: THREAD_ID, title: 'Owner pinned session', kind: 'session',
-      status: 'created', config_name: 'session_base', permission_mode: 'supervised',
+      status: 'created', config_name: 'session_base', permission_mode: 'read_only',
       user_id: USER_ID, created_at: '2026-09-24T04:00:00Z',
       last_activity: '2026-09-24T04:00:00Z', total_turns: 0, total_tokens: 0,
       vm_creation: {...creation, wait: {kind: 'count', since: null,

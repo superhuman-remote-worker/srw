@@ -67,6 +67,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException, Request
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
@@ -729,6 +730,202 @@ async def frozen_protected_source(
     return source
 
 
+async def _cloud_rows_a_container_gets(
+    request_body: ThreadCreateRequest,
+    user: dict[str, Any],
+    *,
+    effective_project_ids: list[str],
+    dependencies: ThreadAdmissionDependencies,
+) -> list[dict[str, Any]]:
+    """The cloud connectors this request's selection holds on a Container
+    and not on a Virtual Session.
+
+    A Virtual Session serves a cloud folder and the session outbox itself
+    (features/cloud_folders_on_virtual_sessions.md), so the two tiers differ
+    only where the requested level is not offered on Virtual: a ``protected``
+    folder, or a provider the Virtual delivery does not serve yet. Only those
+    rows make a defaulted Virtual a Container (owner 2026-10-28, ruling 8).
+    """
+    try:
+        container_ids = (
+            await _select_thread_datasources(
+                request_body,
+                user,
+                thread_backend="sandbox",
+                effective_project_ids=effective_project_ids,
+                dependencies=dependencies,
+            )
+        )[0]
+    except HTTPException:
+        # A refused selection is refused again, on the tier it really gets.
+        return []
+    if not container_ids:
+        return []
+    try:
+        virtual_ids = set(
+            (
+                await _select_thread_datasources(
+                    request_body,
+                    user,
+                    thread_backend="virtual",
+                    effective_project_ids=effective_project_ids,
+                    dependencies=dependencies,
+                )
+            )[0]
+        )
+    except HTTPException:
+        virtual_ids = set()
+    from orchestrator.services.cloud_connector_mounts import cloud_mount_driver
+    from shared.connectors.platform import project_cloud_key
+
+    rows = await dependencies.store.resolve_datasources_for_thread(
+        datasource_ids=container_ids
+    )
+    cloud_rows = [row for row in rows or [] if cloud_mount_driver(row) is not None]
+    if not cloud_rows:
+        return []
+    # The level each connector is asked for: ``datasource_access``, the
+    # execution's connector refs, and the legacy ``protected_cloud`` flag
+    # (the project's own folder at protected), as the create resolves them.
+    requested: dict[str, str] = dict(request_body.datasource_access or {})
+    if request_body.execution is not None:
+        requested.update(
+            connector_access_requests(request_body.execution, container_ids)
+        )
+    own_key = (
+        project_cloud_key(effective_project_ids[0])
+        if request_body.protected_cloud and len(effective_project_ids) == 1
+        else None
+    )
+    # The owner's main-cloud provider, when the deployment has one: an outbox
+    # names no provider itself, and whether Virtual serves it is the
+    # provider's cell in the matrix.
+    router = dependencies.main_cloud_router
+    provider: str | None = None
+    if getattr(router, "active_instance_id", None) is not None:
+        try:
+            provider = getattr(router.for_owner(user), "backend_id", None) or None
+        except Exception:
+            provider = None
+    virtual = AccessContext(
+        workspace_backend="virtual",
+        protected_mode_enabled=dependencies.is_protected_cloud_mode_enabled(),
+        execution="session",
+        main_cloud_backend=provider,
+    )
+    left_out: list[dict[str, Any]] = []
+    for row in cloud_rows:
+        connector_id = str(row.get("id"))
+        if connector_id not in virtual_ids:
+            left_out.append(row)  # the tier refuses the connector itself
+            continue
+        driver = cloud_mount_driver(row)
+        offered = driver.offered_access(row, virtual) if driver is not None else ()
+        wanted = requested.get(connector_id)
+        if wanted is None and own_key is not None and row.get("managed_key") == own_key:
+            wanted = PROTECTED
+        if not offered or (wanted is not None and wanted not in offered):
+            left_out.append(row)
+    return left_out
+
+
+async def _container_allowed(
+    user: dict[str, Any],
+    *,
+    effective_project_ids: list[str],
+    dependencies: ThreadAdmissionDependencies,
+) -> bool:
+    """Whether this install runs containers and the owner may use one."""
+    provisioners = (dependencies.container_provisioner, dependencies.docker_provisioner)
+    if not any(getattr(p, "is_available", False) for p in provisioners):
+        return False
+    try:
+        await dependencies.enforce_session_create_grants(
+            {"workspace": {"backend": "sandbox"}},
+            user_id=str(user["id"]),
+            project_ids=effective_project_ids,
+        )
+    except HTTPException:
+        return False
+    return True
+
+
+async def cloud_folders_need_a_container(
+    user: dict[str, Any],
+    *,
+    project_id: str | None,
+    datasource_ids: list[str] | None = None,
+    datasource_access: dict[str, str] | None = None,
+    dependencies: ThreadAdmissionDependencies,
+) -> bool:
+    """Whether a default Session in ``project_id`` gets a Container for its
+    cloud connectors.
+
+    The New Session form's prediction of the rule in
+    ``resolve_thread_creation_plan``, for the connectors the form will
+    submit: ``datasource_ids`` once its user changed them, else the
+    defaults its picker starts from, and ``datasource_access`` the levels
+    it asks for (a ``protected`` folder is what still needs a Container,
+    features/cloud_folders_on_virtual_sessions.md).
+    """
+    request_body = (
+        ThreadCreateRequest(
+            project_id=project_id,
+            use_datasource_defaults=True,
+            datasource_access=datasource_access or None,
+        )
+        if datasource_ids is None
+        else ThreadCreateRequest(
+            project_id=project_id,
+            datasource_ids=list(datasource_ids),
+            datasource_access=datasource_access or None,
+        )
+    )
+    try:
+        effective_project_ids = await dependencies.authorize_thread_project_ids(
+            user, thread_creation_project_ids(request_body, user)
+        )
+    except HTTPException:
+        # The create is refused anyway; the form names no tier for it.
+        return False
+    return bool(
+        await _cloud_rows_a_container_gets(
+            request_body,
+            user,
+            effective_project_ids=effective_project_ids,
+            dependencies=dependencies,
+        )
+    ) and await _container_allowed(
+        user,
+        effective_project_ids=effective_project_ids,
+        dependencies=dependencies,
+    )
+
+
+async def cloud_folders_can_take_a_container(
+    user: dict[str, Any],
+    *,
+    project_id: str | None,
+    dependencies: ThreadAdmissionDependencies,
+) -> bool:
+    """Whether a cloud folder would take a default Session in ``project_id``
+    to a Container: the tier runs here and its owner may use it. The New
+    Session form keeps its cloud folders selectable on a Virtual default
+    then, since ticking one changes the tier rather than being refused."""
+    request_body = ThreadCreateRequest(project_id=project_id)
+    try:
+        effective_project_ids = await dependencies.authorize_thread_project_ids(
+            user, thread_creation_project_ids(request_body, user)
+        )
+    except HTTPException:
+        return False
+    return await _container_allowed(
+        user,
+        effective_project_ids=effective_project_ids,
+        dependencies=dependencies,
+    )
+
+
 async def resolve_thread_creation_plan(
     request_body: ThreadCreateRequest,
     user: dict[str, Any],
@@ -845,11 +1042,15 @@ async def resolve_thread_creation_plan(
     selection = None
     if inline_expert is not None:
         from orchestrator.services.inline_expert import admit_inline_expert
+        from orchestrator.services.manifest_experts import approved_srw_images
 
         # Validated before the create-time policy resolve below, so that view
         # and the INSERT's snapshot read the same gated definition.
         selected_expert_row = admit_inline_expert(
-            inline_expert, role="session", trusted_image=dependencies.srw_image()
+            inline_expert,
+            role="session",
+            trusted_image=dependencies.srw_image(),
+            approved_images=approved_srw_images(dependencies.store),
         )
     try:
         if (
@@ -867,7 +1068,15 @@ async def resolve_thread_creation_plan(
                 is_admin=bool(user.get("is_admin")),
             )
             selected_expert_row = selection.expert
-            require_srw_expert_configuration(selected_expert_row, interactive=True)
+            from orchestrator.services.manifest_experts import approved_srw_images
+
+            # A saved Expert on an approved custom image runs jobs only.
+            require_srw_expert_configuration(
+                selected_expert_row,
+                interactive=True,
+                trusted_image=dependencies.srw_image(),
+                approved_images=approved_srw_images(dependencies.store),
+            )
             selected_expert_id = str(selection.expert["id"])
             project_expert_override = selection.project_override
             config_name = "session_base"
@@ -895,6 +1104,62 @@ async def resolve_thread_creation_plan(
         config_override=config_override,
         account_defaults=account_defaults,
     )
+    # A Session whose own cloud folders would attach only on a Container gets
+    # one when its tier came from the defaults (owner 2026-10-21, narrowed
+    # 2026-10-28): Virtual serves its folders itself now, so only a folder
+    # requested at a level Virtual cannot serve (``protected``) upgrades it.
+    # Kept Virtual, it records what it left out, so nothing goes silently.
+    cloud_rows: list[dict[str, Any]] = []
+    if (
+        backend_from_override(
+            bind_execution_workspace(config_override, selected_workspace)
+        )
+        == "virtual"
+    ):
+        # A Virtual the request chose leaves out its defaults' cloud folders
+        # even when it lists its connectors: the cockpit always sends a list,
+        # and greys out what a chosen Virtual can't serve. A list beside a
+        # defaulted tier is the user's own choice (owner 2026-10-21).
+        chosen_with_list = "workspace" in request_body.model_fields_set and (
+            "datasource_ids" in request_body.model_fields_set
+            or request_body.execution is not None
+        )
+        cloud_rows = await _cloud_rows_a_container_gets(
+            ThreadCreateRequest(use_datasource_defaults=True)
+            if chosen_with_list
+            else request_body,
+            user,
+            effective_project_ids=effective_project_ids,
+            dependencies=dependencies,
+        )
+    if (
+        cloud_rows
+        and workspace_selection is not None
+        and "workspace" not in request_body.model_fields_set
+        and await _container_allowed(
+            user,
+            effective_project_ids=effective_project_ids,
+            dependencies=dependencies,
+        )
+    ):
+        from shared.workspace_defaults import Upgrade
+
+        selected_workspace, workspace_selection = await select_execution_workspace(
+            dependencies.store,
+            user,
+            project_id=primary_project_id,
+            role="session",
+            workspace=None,
+            supplied=False,
+            config_override=config_override,
+            account_defaults=account_defaults,
+            upgrade=Upgrade(current="virtual", requested="container"),
+        )
+        workspace_selection["sources"] = {
+            **workspace_selection["sources"],
+            "tier": "cloud_connectors",
+        }
+        cloud_rows = []
     config_override = bind_execution_workspace(config_override, selected_workspace)
 
     # Resolve the complete create-time policy view.  This is also the source
@@ -1127,9 +1392,10 @@ async def resolve_thread_creation_plan(
 
     # Keep the threads.permission_mode column in sync with the mode the
     # fully resolved config will load (request > expert > account > base).
-    effective_permission_mode = (effective_create_config.get("interactive") or {}).get(
-        "permission_mode"
-    ) or "supervised"
+    effective_permission_mode = normalize_permission_mode(
+        (effective_create_config.get("interactive") or {}).get("permission_mode")
+        or DEFAULT_PERMISSION_MODE
+    )
     effective_narration_mode = (effective_create_config.get("interactive") or {}).get(
         "narration_mode"
     ) or "auto"
@@ -1241,6 +1507,20 @@ async def resolve_thread_creation_plan(
     # it in the thread INSERT transaction together with the opening event,
     # even on the pinned lane, so no reconciler can observe a created review
     # thread before its exact delivery constraint exists.
+    left_out = [
+        row
+        for row in cloud_rows
+        if str(row.get("id")) not in set(selected_thread_datasource_ids)
+    ]
+    if left_out:
+        from orchestrator.services.cloud_connector_mounts import (
+            virtual_workspace_exclusion,
+        )
+        from orchestrator.services.cloud_mount_status import STATUS_KEY, sync_status
+
+        metadata_patch[STATUS_KEY] = sync_status(
+            [virtual_workspace_exclusion(row) for row in left_out]
+        )
     create_kwargs["initial_metadata"] = metadata_patch
 
     return ThreadCreationPlan(
@@ -1986,6 +2266,8 @@ __all__ = [
     "ThreadAdmissionStore",
     "ThreadCreationPlan",
     "build_session_config_override",
+    "cloud_folders_can_take_a_container",
+    "cloud_folders_need_a_container",
     "commit_thread_creation",
     "create_thread",
     "list_threads",

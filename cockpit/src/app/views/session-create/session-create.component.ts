@@ -143,6 +143,7 @@ interface ExpertDetail extends Expert {
           mode="session"
           [workspacePicker]="true"
           [pickerBackend]="pickerBackend()"
+          [cloudFoldersTakeContainer]="cloudFoldersTakeContainer()"
           [config]="workspaceConfig()"
           [resolvedToolset]="toolPreview()"
           [readsResolvedToolset]="true"
@@ -418,6 +419,11 @@ export class SessionCreateComponent implements OnInit {
   readonly selectedProjectId = computed(() => [...this.selectedProjectIds()][0] ?? null);
   readonly workspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
   readonly pickerBackend = computed(() => choiceBackend(this.workspaceChoice(), this.toolPreview()?.workspace));
+  /** The default tier is one a cloud folder takes to a Container: ticking one
+   *  changes the tier, so cloud folders stay selectable while it is Virtual. */
+  readonly cloudFoldersTakeContainer = computed(
+    () => this.workspaceChoice().kind === 'default' && !!this.toolPreview()?.workspace?.cloud_folders_take_container,
+  );
 
   onWorkspaceChoice(choice: WorkspaceChoice): void {
     this.workspaceChoice.set(choice);
@@ -928,12 +934,18 @@ export class SessionCreateComponent implements OnInit {
     // different expert layer from the create it previews would be this
     // series' defect in the surface built to prevent it.
     const {configName, expertId} = this.expertRouting(expert);
+    // The connectors Start would send, once the user changed them: a cloud
+    // folder among them takes a default Session to a Container, and none
+    // keeps it Virtual. Until then the server predicts from the defaults
+    // (the list may not have loaded yet).
+    const settings = this.agentSettings;
     this.api.previewToolGroups({
-      config_override: this.agentSettings?.getOverrides() ?? {},
+      config_override: settings?.getOverrides() ?? {},
       ...choiceRequestFields(this.workspaceChoice()),
       config_name: configName,
       expert_id: expertId ?? null,
       project_id: this.selectedProjectId(),
+      ...(settings?.hasDatasourceSelection() ? {datasource_ids: settings.getSelectedDatasourceIds()} : {}),
     }).subscribe((preview) => {
       if (serial !== this.toolPreviewSerial) return;
       this.loadingWorkspacePreview.set(false);
@@ -1061,8 +1073,8 @@ export class SessionCreateComponent implements OnInit {
 
     // Only send permission_mode when the user actually picked a per-session
     // override; omitting it lets the backend fall back to the user's saved
-    // default, then the config default. Sending a hardcoded 'supervised' here
-    // would clobber that saved default and forced every session to Supervised.
+    // default, then the config default. Sending a hardcoded 'read_only' here
+    // would clobber that saved default and force every session to Read-only.
     const permissionMode = (configOverride['interactive'] as any)?.['permission_mode'] ?? null;
     if (permissionMode) body['permission_mode'] = permissionMode;
 

@@ -1,0 +1,209 @@
+// Citation chips and their popover (citation engine overhaul §6.2).
+//
+// `citationExtension` marks every handle (`[^c1241]`) as a plain-text
+// `.citation-ref`; `CitationRefDirective` turns the ones it resolves into
+// numbered chips and opens `.citation-popover` (rendered to document.body).
+// Global because chips appear in chat prose, reasoning and tool cards, and the
+// popover outside any component. A marker the directive never touched stays
+// plain text, not an empty superscript.
+//
+// Pending never looks verified (KeyCite-style): neutral and dashed until a
+// check lands. Unverified warns; withdrawn is struck through.
+
+@use 'variables' as v;
+
+.citation-ref.resolved,
+.citation-ref.flagged,
+.citation-ref.loading {
+  display: inline-block;
+  min-width: 1.4em;
+  margin: 0 1px;
+  padding: 0.12em 0.32em;
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  font-size: 0.7em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: center;
+  vertical-align: super;
+  cursor: pointer;
+}
+
+.citation-ref.resolved:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+.citation-ref.state-pending {
+  color: var(--text-secondary);
+  background: var(--surface-2);
+  border-style: dashed;
+  border-color: var(--border-color);
+}
+
+.citation-ref.state-verified {
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+}
+
+.citation-ref.state-failed {
+  color: var(--warning);
+  background: var(--warning-tint);
+  border-color: var(--warning);
+}
+
+.citation-ref.state-unchecked {
+  color: var(--text-muted);
+  background: var(--surface-2);
+}
+
+.citation-ref.state-withdrawn {
+  color: var(--text-muted);
+  background: transparent;
+  border-color: var(--border-color);
+  text-decoration: line-through;
+}
+
+// A [^c…] handle this session has no citation for: shown, flagged.
+.citation-ref.flagged {
+  color: var(--danger);
+  border-style: dashed;
+  border-color: var(--danger);
+  cursor: help;
+}
+
+.citation-ref.loading {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.citation-popover {
+  position: fixed;
+  z-index: 1290; // just under the tooltip ($z-tooltip 1300)
+  max-height: min(70vh, 480px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: var(--surface-1, var(--panel-bg));
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-surface);
+  box-shadow: var(--shadow-md);
+  font-family: v.$font-family-base;
+  font-size: v.$font-size-sm;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.citation-popover .cpop-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.citation-popover .cpop-num {
+  flex: 0 0 auto;
+  vertical-align: baseline;
+  cursor: default;
+}
+
+.citation-popover .cpop-source {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.citation-popover a.cpop-source {
+  color: var(--info);
+  text-decoration: none;
+}
+
+.citation-popover a.cpop-source:hover {
+  text-decoration: underline;
+}
+
+.citation-popover .cpop-state {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-tag);
+  font-size: v.$font-size-xs;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+}
+
+.citation-popover .cpop-state--verified {
+  color: var(--success);
+  background: var(--success-tint);
+}
+
+.citation-popover .cpop-state--failed {
+  color: var(--warning);
+  background: var(--warning-tint);
+}
+
+.citation-popover .cpop-where {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+}
+
+.citation-popover .cpop-note {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-tag);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: v.$font-size-xs;
+}
+
+.citation-popover .cpop-note--failed {
+  color: var(--text-primary);
+  background: var(--warning-tint);
+}
+
+.citation-popover .cpop-field {
+  margin-top: 8px;
+}
+
+.citation-popover .cpop-label {
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.citation-popover .cpop-passage .cpop-value {
+  padding-left: 8px;
+  border-left: 2px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.citation-popover .cpop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 10px;
+}
+
+.citation-popover .cpop-action {
+  min-height: 0;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--info);
+  font: inherit;
+  font-size: v.$font-size-xs;
+  cursor: pointer;
+}
+
+.citation-popover .cpop-action:hover {
+  text-decoration: underline;
+}
+
+.citation-popover .cpop-action:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}

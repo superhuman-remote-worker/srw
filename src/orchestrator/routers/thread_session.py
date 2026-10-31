@@ -35,6 +35,18 @@ from orchestrator.services.session_runtime_admission import (
 )
 from orchestrator.services.session_state_snapshot import build_session_state_snapshot
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.stateless_vm_upgrade_handoff import (
+    begin_stateless_vm_upgrade_handoff,
+)
+from orchestrator.services.stateless_workspace_upgrade import (
+    PINNED_TRANSPORT_REFUSAL,
+    StatelessWorkspaceUpgradeDependencies,
+    check_stateless_vm_upgrade,
+    latest_workspace_upgrade_request,
+    prepare_stateless_workspace_upgrade,
+    resolve_upgrade_target,
+    workspace_upgrade_view,
+)
 from orchestrator.services.thread_control_inbox import (
     ControlAdmissionError,
     ControlAdmissionNotReady,
@@ -44,6 +56,7 @@ from orchestrator.services.thread_control_inbox import (
 from orchestrator.services.thread_mount_rows import durable_project_ids
 from orchestrator.services.thread_projection import redact_thread_metadata
 from orchestrator.services.vm_idle_public import read_vm_idle_states
+from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +76,7 @@ class ThreadSessionDependencies:
     resolve_session_config: Callable[..., Awaitable[dict[str, Any] | None]]
     enforce_session_create_grants: Callable[..., Awaitable[Any]]
     tool_view: session_tool_view.SessionToolViewDependencies
+    workspace_upgrade: StatelessWorkspaceUpgradeDependencies | None = None
 
 
 def get_thread_session_dependencies(request: Request) -> ThreadSessionDependencies:
@@ -123,6 +137,15 @@ async def get_thread(
         None
         if thread.get("status") in {"ended", "suspended"}
         else creations.get(UUID(thread_id))
+    )
+    result["workspace_upgrade"] = (
+        None
+        if thread.get("status") in {"ended", "suspended"}
+        else workspace_upgrade_view(
+            thread,
+            result["workspace_creation"],
+            latest_request=await latest_workspace_upgrade_request(store, thread),
+        )
     )
     if not result.get("ssh_handle"):
         try:
@@ -272,7 +295,7 @@ async def submit_thread_control(
     nor a journal frame: the current lease owner (or exact reciprocal pinned
     binding) applies the request and journals the result with its own allocator.
     """
-    from shared.run_queue import LANE_STATELESS
+    from shared.run_queue import LANE_PINNED, LANE_STATELESS
 
     started = time.perf_counter()
     store = dependencies.store
@@ -338,9 +361,65 @@ async def submit_thread_control(
             if existing is None:
                 raise
 
+    workspace_upgrade: dict[str, Any] | None = None
+    vm_upgrade = False
+    upgrade_dependencies = dependencies.workspace_upgrade
+    if body.method == WORKSPACE_UPGRADE_VERB and existing is None:
+        # Pre-admission checks outside the row locks (lane, target, startup
+        # tracking, protection, grants, provisioner, template); admission
+        # re-proves the row facts under them. A committed UUID skips them,
+        # like mode.set's grant check above.
+        if upgrade_dependencies is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Workspace upgrades aren't available in this session.",
+            )
+        if thread.get("execution_lane") != LANE_STATELESS:
+            raise HTTPException(status_code=409, detail=PINNED_TRANSPORT_REFUSAL)
+        # Dispatch by target before admission (C1/C2 settled difference 3): a
+        # VM target switches lanes and must not wake the stateless queue.
+        target = await resolve_upgrade_target(
+            store, thread, target_tier=body.target_tier, template_name=body.template
+        )
+        if target == "vm":
+            await check_stateless_vm_upgrade(
+                store,
+                thread,
+                template_name=body.template,
+                vm_provisioner=upgrade_dependencies.vm_provisioner,
+                enforce_workspace_upgrade_grants=(
+                    upgrade_dependencies.enforce_workspace_upgrade_grants
+                ),
+                session_grant_violations=upgrade_dependencies.session_grant_violations,
+                session_endpoint_violations=(
+                    upgrade_dependencies.session_endpoint_violations
+                ),
+            )
+            vm_upgrade = True
+        else:
+            workspace_upgrade = await prepare_stateless_workspace_upgrade(
+                store,
+                thread,
+                target_tier=body.target_tier,
+                template_name=body.template,
+                dependencies=upgrade_dependencies,
+            )
+
     actor_id = str(user.get("id") or user.get("sub") or "rest_client")
-    try:
-        admitted = await admit_thread_control(
+
+    async def _admit() -> Any:
+        if vm_upgrade:
+            # C2: one transaction records the request for the first pinned
+            # owner and switches the lane; it never wakes the stateless queue.
+            return await begin_stateless_vm_upgrade_handoff(
+                store,
+                thread_id=thread_id,
+                owner_user_id=thread_owner_id,
+                client_request_id=body.client_request_id,
+                payload=control_payload,
+                requested_by=actor_id,
+            )
+        return await admit_thread_control(
             store,
             thread_id=thread_id,
             owner_user_id=thread_owner_id,
@@ -350,7 +429,32 @@ async def submit_thread_control(
             requested_by=actor_id,
             expected_runtime_generation=body.session_runtime_generation,
             require_pinned_runtime_generation=require_control_generation,
+            workspace_upgrade=workspace_upgrade,
         )
+
+    try:
+        if workspace_upgrade is not None or vm_upgrade:
+            # The upgrade takes the stateless lifecycle lock that End, Resume,
+            # uploads and the ensure scheduler hold (lock order: lifecycle ->
+            # threads -> run_queue), so an upload resolved to the old prefix
+            # finishes first and a racing End is serialized.
+            try:
+                async with store.stateless_session_workspace_ensure_lock(
+                    thread_id, wait=True
+                ) as lifecycle_owner:
+                    if not lifecycle_owner:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Stateless workspace lifecycle lock unavailable",
+                        )
+                    admitted = await _admit()
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Stateless workspace lifecycle lock timed out",
+                ) from exc
+        else:
+            admitted = await _admit()
     except ControlAdmissionNotReady as exc:
         # Registration intentionally keeps the exact pinned-owner capability
         # closed until its writer and first inbox drain are ready.  A control
@@ -359,6 +463,14 @@ async def submit_thread_control(
         raise HTTPException(status_code=425, detail=str(exc)) from exc
     except ControlAdmissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if (
+        workspace_upgrade is not None
+        and upgrade_dependencies is not None
+        and not admitted.duplicate
+    ):
+        # After the lock is released: the ensure task takes it itself.
+        upgrade_dependencies.schedule_stateless_workspace_ensure(thread_id)
 
     await log_security_event(
         store,
@@ -369,6 +481,19 @@ async def submit_thread_control(
         detail=f"verb={body.method} request_seq={admitted.request_seq}",
         request=request,
     )
+    if vm_upgrade and not admitted.duplicate:
+        await log_security_event(
+            store,
+            resource_type="thread",
+            event_type="session_lane_changed",
+            user=user,
+            resource_id=thread_id,
+            detail=(
+                "from=stateless to=pinned reason=vm_upgrade "
+                f"request_seq={admitted.request_seq}"
+            ),
+            request=request,
+        )
     logger.info(
         "session-control admission: thread=%s verb=%s seq=%d duplicate=%s total=%.3fs",
         thread_id,
@@ -377,7 +502,7 @@ async def submit_thread_control(
         admitted.duplicate,
         time.perf_counter() - started,
     )
-    return {
+    response: dict[str, Any] = {
         "accepted": True,
         "request_id": str(admitted.id),
         "client_request_id": str(admitted.client_request_id),
@@ -391,6 +516,14 @@ async def submit_thread_control(
             else None
         ),
     }
+    if body.method == WORKSPACE_UPGRADE_VERB:
+        # C2: the sending tab reconnects through the pinned path. A same-UUID
+        # retry after the switch finds the Session already pinned.
+        response["transport_changed"] = bool(
+            vm_upgrade
+            or (existing is not None and thread.get("execution_lane") == LANE_PINNED)
+        )
+    return response
 
 
 @router.get("/api/persistent/threads/{thread_id}/resolved-config")

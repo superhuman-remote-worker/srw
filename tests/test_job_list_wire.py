@@ -47,6 +47,8 @@ def row(**fields):
         "completion_outcome_kind": None,
         "origin": "user",
         "config_name": None,
+        "expert_id": None,
+        "expert_display_name": None,
         "assigned_agent_id": None,
         "user_id": UUID(USER),
         "project_id": UUID(PROJECT),
@@ -184,6 +186,7 @@ async def test_job_list_reads_one_authorized_startup_batch(wire):
         "state": "waiting_capacity",
         "reason_code": "scheduler_unschedulable",
         "readiness_deadline_at": None,
+        "exit_code": None,
     }
     wire.result.jobs[0]["status"] = "processing"
     wire.result.jobs.append(row(id=UUID(CHILD), is_display_root=False))
@@ -210,6 +213,7 @@ async def test_terminal_job_cannot_render_a_stale_startup_view(wire):
             "state": "starting",
             "reason_code": "scheduled",
             "readiness_deadline_at": STAMP,
+            "exit_code": None,
         }
     }
     assert (await get(wire)).json()["jobs"][0]["workspace_creation"] is None

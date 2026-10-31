@@ -8,6 +8,7 @@
       "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "service",
+      "form_planes": {},
       "delivery_forms": [
         "mcp_client"
       ],

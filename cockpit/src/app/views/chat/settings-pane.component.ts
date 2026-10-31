@@ -19,6 +19,7 @@ import {
     toolsFragment,
 } from '../agent-settings/resolved-toolset';
 import {deepMergeConfig} from '../agent-settings/config-merge';
+import {tierHiddenAttachedIds} from '../agent-settings/datasources-group.component';
 import {
     SESSION_DELEGATION_CAP,
     sessionDelegationCapValue,
@@ -157,6 +158,11 @@ const LIVE_ATTACH_REFUSED_TYPES: ReadonlySet<string> = new Set([
         <p class="upgrade-body">
           {{ pendingTierCopy() + '.body' | transloco }}
         </p>
+        @if (vmReconnectNote()) {
+          <p class="upgrade-body">
+            {{ 'chat.settingsPane.upgradeConfirm.vmReconnect' | transloco }}
+          </p>
+        }
         <p class="upgrade-body irreversible">
           {{ 'chat.settingsPane.upgradeConfirm.irreversible' | transloco }}
         </p>
@@ -351,8 +357,8 @@ export class SettingsPaneComponent {
      *
      * The ladder is one-way and partial: `virtual → sandbox|vm`, `sandbox → vm`.
      * Downgrade is an explicit non-goal (workspace_tier_upgrade.md §"Non-goals")
-     * and `none` has no durable anchor to seed from, so a `none` session can
-     * reach nothing at all — the row renders static text in that case.
+     * and `none` reaches a container only where the session declares one
+     * (stateless); otherwise it reaches nothing and the row renders static text.
      *
      * Every refusal carries a reason so it renders in the option itself rather
      * than arriving as a rejected click.
@@ -376,23 +382,32 @@ export class SettingsPaneComponent {
                 map['virtual'] = 'downgrade';
                 map['none'] = 'downgrade';
                 break;
-            // `none`, or a tier this build does not know: nothing reachable,
+            case 'none':
+                // Nothing to seed in place on the pinned lane; a stateless
+                // session's container upgrade starts it fresh (C1), and its VM
+                // upgrade goes through the lane switch (C2). A pinned none
+                // session stays as it is (owner, 2026-10-14).
+                if (this.chat.upgradeTargetAvailable('sandbox')) {
+                    map['sandbox'] = 'ok';
+                    map['vm'] = vm;
+                } else if (
+                    this.chat.controlTransport('upgrade-to-workspace') === 'rest' &&
+                    this.chat.upgradeTargetAvailable('vm')
+                ) {
+                    map['vm'] = vm;
+                }
+                break;
+            // A tier this build does not know: nothing reachable,
             // so the row falls back to static text.
         }
-        // A session with no upgrade transport (the stateless lane) can move
-        // nowhere, whatever the ladder allows: say so in the option instead
-        // of refusing after the confirmation dialog.
-        const upgradeTransport = this.chat.controlTransport('upgrade-to-workspace');
-        if (upgradeTransport === 'unavailable') {
-            for (const [tier, state] of Object.entries(map)) {
-                if (state === 'ok' || state === 'needsApproval') map[tier] = 'sessionUnsupported';
+        // Each move must be one this session can carry: the pinned socket
+        // carries VM only (the offer fix); the stateless REST control carries
+        // the targets /connection declares (C1: container; C2 adds VM).
+        for (const tier of ['sandbox', 'vm'] as const) {
+            const state = map[tier];
+            if ((state === 'ok' || state === 'needsApproval') && !this.chat.upgradeTargetAvailable(tier)) {
+                map[tier] = 'sessionUnsupported';
             }
-        }
-        // A pinned session (socket transport) refuses container upgrades
-        // before provisioning (persistent_app.py _handle_workspace_upgrade),
-        // so the option says so instead of failing after the confirmation.
-        if (upgradeTransport === 'websocket' && map['sandbox'] === 'ok') {
-            map['sandbox'] = 'sessionUnsupported';
         }
         return map;
     });
@@ -403,6 +418,11 @@ export class SettingsPaneComponent {
      *  reachable, so only those two have confirmation copy. */
     readonly pendingTierCopy = computed(() =>
         `chat.settingsPane.upgradeConfirm.${this.pendingTier() ?? 'sandbox'}`,
+    );
+
+    /** A stateless session's VM upgrade reconnects to a dedicated agent first (C2). */
+    readonly vmReconnectNote = computed(
+        () => this.pendingTier() === 'vm' && this.chat.executionLane() === 'stateless',
     );
 
     /** A tier the user picked in the settings row. Re-checked here rather than
@@ -618,14 +638,22 @@ export class SettingsPaneComponent {
 
     /** The full desired selection: the picker's checked set plus attached ids
      *  the picker doesn't show (kb hidden entries, revoked-visibility rows,
-     *  eligible-fetch failures) — those must survive every dispatch, or an
-     *  unrelated toggle would silently detach them. Sorted for stable
-     *  comparison. */
+     *  eligible-fetch failures) or that a lite tier leaves out — those must
+     *  survive every dispatch, or an unrelated toggle would silently detach
+     *  them. Sorted for stable comparison. */
     private canonicalDatasourceIds(): string[] {
         const groupIds = this.settings()?.getSelectedDatasourceIds() ?? [];
         const pickerIds = new Set(this.pickerDatasources().map((ds) => ds.id));
         const hidden = this.attachedIds().filter((id) => !pickerIds.has(id));
-        return [...new Set([...groupIds, ...hidden])].sort();
+        // An unavailable placeholder stays detachable by an explicit uncheck.
+        const tierHidden = tierHiddenAttachedIds(
+            this.pickerDatasources().filter((ds) => !ds.unavailable),
+            this.attachedIds(),
+            this.isLiteBackend(),
+            this.connectorDrivers.drivers(),
+            this.workspaceTier(),
+        );
+        return [...new Set([...groupIds, ...hidden, ...tierHidden])].sort();
     }
 
     /** Flatten the pane's tracked surface into path → value. Tool groups

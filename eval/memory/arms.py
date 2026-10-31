@@ -32,11 +32,11 @@ class IngestionOptions:
 
     seam: production-faithful — replay each session through
         MemoryManager.capture() (turn_end per round + session_end), with
-        the per-turn read path (assemble()) on by default so TTL decay
-        and access-resets accrue exactly as in a live session.
+        the per-turn read path (assemble()) on by default so access
+        stats accrue exactly as in a live session.
     verbatim: no extraction LLM — each user-assistant round is stored
-        directly via RecallStore.store() with remaining_turns=0 (never
-        TTL-pinned), making question-time retrieval pure hybrid search
+        directly via RecallStore.store(), making question-time retrieval
+        pure hybrid search
         over a flat round-granularity index. This is the cheap smoke arm
         AND the published-baseline reproduction arm (LongMemEval round
         granularity).

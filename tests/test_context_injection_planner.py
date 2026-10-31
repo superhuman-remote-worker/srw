@@ -25,7 +25,6 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-import agent.core.context_injection as planner_module
 from agent.core.context_injection import (
     ContextSources,
     Item,
@@ -42,7 +41,7 @@ from agent.core.citation_feedback_injection import (
     format_citation_feedback_resolved,
     format_failed_citations,
 )
-from agent.core.memory_injection import create_memory_injection_messages
+from tests._legacy_injection_rows import create_memory_injection_messages
 from shared.runtime.core.context_entries import (
     INJECTION_KINDS,
     PERSIST_ROLE_CONTEXT,
@@ -52,7 +51,6 @@ from shared.runtime.core.context_entries import (
     entry_body,
     entry_meta,
     fold_context_entries,
-    is_append_only,
     is_context_entry,
     knowledge_item_key,
     make_context_entry,
@@ -95,7 +93,7 @@ def note(note_id: str, content: str, title: str = "", kb=KB) -> KnowledgeRecord:
     )
 
 
-def citation(cid: str, claim: str = "The sky is green.") -> SimpleNamespace:
+def citation(cid: int, claim: str = "The sky is green.") -> SimpleNamespace:
     return SimpleNamespace(
         id=cid,
         claim=claim,
@@ -432,23 +430,22 @@ class TestCitationState:
     def test_change_then_clear_then_quiet(self):
         history = base_history()
 
-        first = plan(history, ContextSources(failed_citations=[citation("c1")]))
+        first = plan(history, ContextSources(failed_citations=[citation(1)]))
         entry = only(first, "citation")
-        assert entry_body(entry) == format_failed_citations([citation("c1")])
+        assert entry_body(entry) == format_failed_citations([citation(1)])
         assert entry_meta(entry)["hash"] == digest(entry_body(entry))
         history += first.entries
 
         # Same failed set: nothing.
         assert (
-            plan(history, ContextSources(failed_citations=[citation("c1")])).entries
-            == []
+            plan(history, ContextSources(failed_citations=[citation(1)])).entries == []
         )
 
         # Changed set: the new full rendering.
         changed = plan(
-            history, ContextSources(failed_citations=[citation("c1"), citation("c2")])
+            history, ContextSources(failed_citations=[citation(1), citation(2)])
         )
-        assert "[c2]" in only(changed, "citation").content
+        assert "[^c2]" in only(changed, "citation").content
         history += changed.entries
 
         # Cleared: the cleared rendering, once.
@@ -460,8 +457,8 @@ class TestCitationState:
         assert plan(history, ContextSources(failed_citations=[])).entries == []
 
         # Failing again: the full rendering again.
-        again = plan(history, ContextSources(failed_citations=[citation("c3")]))
-        assert "[c3]" in only(again, "citation").content
+        again = plan(history, ContextSources(failed_citations=[citation(3)]))
+        assert "[^c3]" in only(again, "citation").content
 
 
 class TestSubagentState:
@@ -693,6 +690,46 @@ class TestGuidance:
         assert planned.entries == []
 
 
+# --- Permission mode (tool_permission_tiers.md, D13) --------------------------------
+
+
+class TestPermissionMode:
+    def test_no_source_appends_nothing(self):
+        assert plan(base_history(), ContextSources()).entries == []
+
+    def test_told_once_at_session_start(self):
+        planned = plan(base_history(), ContextSources(permission_mode="read_only"))
+
+        assert kinds(planned) == ["permission_mode"]
+        assert "Permission mode: Read-only." in planned.entries[0].content
+
+    def test_not_repeated_while_unchanged(self):
+        history = base_history()
+        history += plan(history, ContextSources(permission_mode="read_only")).entries
+
+        assert plan(history, ContextSources(permission_mode="read_only")).entries == []
+
+    def test_the_legacy_spelling_is_the_same_state(self):
+        history = base_history()
+        history += plan(history, ContextSources(permission_mode="supervised")).entries
+
+        assert plan(history, ContextSources(permission_mode="read_only")).entries == []
+
+    def test_a_change_is_told(self):
+        history = base_history()
+        history += plan(history, ContextSources(permission_mode="read_only")).entries
+
+        changed = plan(history, ContextSources(permission_mode="auto_accept"))
+
+        assert kinds(changed) == ["permission_mode"]
+        assert "Permission mode: Auto-accept." in changed.entries[0].content
+
+    def test_an_unknown_mode_appends_nothing(self):
+        assert (
+            plan(base_history(), ContextSources(permission_mode="bogus")).entries == []
+        )
+
+
 # --- Whole plans ----------------------------------------------------------------------
 
 
@@ -702,9 +739,10 @@ def _all_sources(turn: int = 4) -> ContextSources:
         memory_summary=SUMMARY,
         memory_records=[mem(1), mem(2)],
         knowledge_records=[note("n1", "kb body")],
-        failed_citations=[citation("c1")],
+        failed_citations=[citation(1)],
         guidance=[guidance("g1", "Steer.")],
         subagents=SUBAGENTS,
+        permission_mode="read_only",
         turn_boundary=BOUNDARY,
         turn=turn,
     )
@@ -848,13 +886,6 @@ class TestWholePlan:
         assert "charter" in kinds(planned) and "knowledge" in kinds(planned)
         assert planned.memory_appended == 0
 
-    def test_is_append_only_is_re_exported(self):
-        assert planner_module.is_append_only is is_append_only
-        config = SimpleNamespace(
-            context_management=SimpleNamespace(injection_mode="append_only")
-        )
-        assert planner_module.is_append_only(config)
-
 
 @pytest.mark.parametrize("kind", ["memory", "knowledge", "guidance"])
 def test_item_kinds_never_list_an_item_twice_in_one_entry(kind):
@@ -871,3 +902,46 @@ def test_item_kinds_never_list_an_item_twice_in_one_entry(kind):
         i["key"] for i in entry_meta(only(plan(base_history(), sources), kind))["items"]
     ]
     assert len(keys) == len(set(keys)) == 2
+
+
+class TestSessionLoopReadsTheMode:
+    def test_reads_the_callback(self):
+        from types import SimpleNamespace
+
+        from agent.persistent_graph import _current_permission_mode
+
+        assert _current_permission_mode(
+            SimpleNamespace(current_permission_mode=lambda: "auto_accept")
+        ) == ("auto_accept")
+
+    def test_no_callback_or_a_failing_one_leaves_the_section_alone(self):
+        from types import SimpleNamespace
+
+        from agent.persistent_graph import _current_permission_mode
+
+        def boom():
+            raise RuntimeError("gone")
+
+        assert _current_permission_mode(SimpleNamespace()) is None
+        assert (
+            _current_permission_mode(SimpleNamespace(current_permission_mode=boom))
+            is None
+        )
+        assert (
+            _current_permission_mode(
+                SimpleNamespace(current_permission_mode=lambda: None)
+            )
+            is None
+        )
+
+    def test_the_session_app_wires_its_live_mode(self):
+        from unittest.mock import patch
+
+        import agent.api.persistent_app as pa
+
+        with patch.object(pa, "_session", None):
+            assert pa._loop_current_permission_mode() is None
+        with patch.object(
+            pa, "_session", type("S", (), {"permission_mode": "read_only"})()
+        ):
+            assert pa._loop_current_permission_mode() == "read_only"

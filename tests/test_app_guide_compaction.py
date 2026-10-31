@@ -9,8 +9,14 @@ from shared.runtime.core.skill_resolution import (
     managed_product_guide_system_floor,
     managed_product_guide_turn_boundary,
 )
-from agent.core.memory_injection import create_memory_injection_messages
-from agent.persistent_graph import _inject_context_pairs
+from agent.core.context_injection import ContextSources, plan_context_entries
+from shared.runtime.core.context_entries import (
+    FOLDED_KEY,
+    entry_body,
+    entry_kind,
+    fold_context_entries,
+)
+from shared.runtime.services.recall_store import MemoryRecord
 from agent.tools.context import ToolContext
 from agent.tools.product_help import create_product_help_tools
 
@@ -81,10 +87,10 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
     assert "topic from the actual user request" in current_floor
     assert 'topic_id="index"' in current_floor
 
-    # Resume-time memory is tail-injected after the user's current question.
-    # A transient HumanMessage must follow it with a current-digest freshness
-    # boundary so historical workspace/product facts cannot become the most
-    # recent instruction.
+    # Resume-time memory is appended as a context entry after the user's
+    # current question. A turn-boundary entry must follow it with a
+    # current-digest freshness boundary so historical workspace/product facts
+    # cannot become the most recent instruction.
     current_boundary = managed_product_guide_turn_boundary(
         catalog,
         [APP_GUIDE_LOADER_TOOL],
@@ -94,19 +100,36 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
         *compacted,
         HumanMessage(content="What can this SRW session do now?"),
     ]
-    recalled = list(create_memory_injection_messages("Old workspace notes"))
-    _inject_context_pairs(
+    planned = plan_context_entries(
         prepared,
-        recalled,
-        "",
-        "",
-        product_guide_turn_boundary=current_boundary,
+        ContextSources(
+            memory_records=[MemoryRecord(id=None, content="Old workspace notes")],
+            turn_boundary=current_boundary,
+            turn=7,
+        ),
+        model=None,
+        max_memories=5,
     )
-    assert isinstance(prepared[-2], ToolMessage)
-    assert prepared[-2].content == "Old workspace notes"
-    assert isinstance(prepared[-1], HumanMessage)
-    assert prepared[-1].content == current_boundary
+    assert [entry_kind(entry) for entry in planned.entries] == [
+        "memory",
+        "turn_boundary",
+    ]
+    assert "Old workspace notes" in entry_body(planned.entries[0])
+    assert entry_body(planned.entries[1]) == current_boundary.strip()
     assert catalog["menu"][0]["bundle_digest"] in current_boundary
+
+    # The request folds both entries into the user's question, the boundary
+    # last, so it is the newest text the model reads.
+    request = fold_context_entries([*prepared, *planned.entries])
+    assert len(request) == len(prepared)
+    carrier = request[-1]
+    assert isinstance(carrier, HumanMessage)
+    assert carrier.additional_kwargs[FOLDED_KEY] == ["memory", "turn_boundary"]
+    assert carrier.content.startswith("What can this SRW session do now?")
+    assert carrier.content.index("Old workspace notes") < carrier.content.index(
+        current_boundary.strip()
+    )
+    assert carrier.content.endswith(str(planned.entries[1].content))
 
     current_jobs = reader.invoke({"topic_id": "jobs"})
     assert "[product guide topic: jobs]" in current_jobs

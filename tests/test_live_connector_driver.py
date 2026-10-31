@@ -181,6 +181,29 @@ class TestValidateConfig:
         assert normalized.config["no_job_fallback_s"] == value
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "key, high",
+        [
+            ("greeting_delay_ms", 10000),
+            ("greeting_retry_ms", 30000),
+            ("idle_nudge_ms", 30000),
+            ("idle_nudge_max", 5),
+        ],
+    )
+    async def test_the_greeting_timing_the_pod_reads_is_offered(self, key, high):
+        """drivers/gpt-live-sip reads these (config.go); an engine that speaks
+        an exact greeting at once (SRW's voice gateway) takes 0 for the
+        greeting, and 0 turns the quiet-line nudge off."""
+        for value in (0, high):
+            normalized = await _validate({"model": "gpt-live-1", key: value})
+            assert normalized.config[key] == value
+        for value in (-1, high + 1, True, 1.5, "0", None):
+            error = await _refused({"model": "gpt-live-1", key: value})
+            assert error.status_code == 400 and key in error.detail
+        schema = GPT_LIVE_SIP_SPEC.config_schema["properties"][key]
+        assert (schema["minimum"], schema["maximum"]) == (0, high)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("target", ["sip:+4969123@pbx.test", "tel:+4969123"])
     async def test_a_sip_or_tel_transfer_target(self, target):
         normalized = await _validate({"model": "gpt-live-1", "transfer_target": target})

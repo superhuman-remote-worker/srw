@@ -11,10 +11,12 @@ are written down here before the move is relied on.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -28,7 +30,7 @@ from orchestrator.routers.job_repo import (
     list_repo_tags,
     router as job_repo_router,
 )
-from orchestrator.services import job_repo_reads
+from orchestrator.services import gitea as gitea_mod, job_repo_reads
 from tests._mounted_router import mount_router
 from tests._route_inventory import mounted_route_objects
 
@@ -43,7 +45,7 @@ def _forge(**over):
     forge = SimpleNamespace(
         is_initialized=True,
         list_contents=AsyncMock(return_value=[{"name": "a.py", "type": "file"}]),
-        get_file_content=AsyncMock(return_value="hello"),
+        get_file_bytes=AsyncMock(return_value=b"hello"),
         get_commits_between=AsyncMock(return_value={"total_commits": 1, "commits": []}),
         get_commits=AsyncMock(return_value=[{"sha": "abc"}]),
         get_diff=AsyncMock(return_value="--- a\n+++ b\n"),
@@ -207,11 +209,71 @@ class TestGetRepoFile:
 
         assert await get_repo_file(
             _request(), JOB_ID, path="a.py", ref=None, dependencies=deps
-        ) == {"path": "a.py", "content": "hello", "size": 5}
+        ) == {"path": "a.py", "content": "hello", "encoding": "utf-8", "size": 5}
+        deps.repo_reads.forge.get_file_bytes.assert_awaited_once_with(
+            REPO, "a.py", ref=BRANCH
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_binary_file_is_served_base64_not_a_404(self):
+        # A PDF deliverable: the header is ASCII but the body bytes are not
+        # UTF-8, which used to read as "not found".
+        pdf = b"%PDF-1.7\n\xe2\xe3\xcf\xd3\n\x00\xff\x89"
+        deps = _deps(forge=_forge(get_file_bytes=AsyncMock(return_value=pdf)))
+
+        result = await get_repo_file(
+            _request(), JOB_ID, path="output/report.pdf", ref=None, dependencies=deps
+        )
+
+        assert result == {
+            "path": "output/report.pdf",
+            "content": base64.b64encode(pdf).decode("ascii"),
+            "encoding": "base64",
+            "size": len(pdf),
+        }
+        assert base64.b64decode(result["content"]) == pdf
+
+    @pytest.mark.asyncio
+    async def test_a_binary_file_through_the_real_gitea_client_is_not_a_404(self):
+        # The original bug lived in the client: its UTF-8 decode raised, the
+        # broad except returned None, and the route said "not found".
+        blob = b"SQLite format 3\x00\x10\x00\x01\x01\x00@  \x00\x00\x00\x02\xff\xfe"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"type": "file", "content": base64.b64encode(blob).decode()},
+            )
+
+        client = gitea_mod.GiteaClient.__new__(gitea_mod.GiteaClient)
+        client._initialized = True
+        client._url = "http://gitea"
+        client._user = "srw"
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        deps = _deps(forge=client)
+
+        result = await get_repo_file(
+            _request(), JOB_ID, path="output/shop.db", ref=None, dependencies=deps
+        )
+
+        assert result["encoding"] == "base64"
+        assert result["size"] == len(blob)
+        assert base64.b64decode(result["content"]) == blob
+
+    @pytest.mark.asyncio
+    async def test_utf8_text_keeps_its_character_length_as_size(self):
+        text = "Größe: 3 €"
+        deps = _deps(
+            forge=_forge(get_file_bytes=AsyncMock(return_value=text.encode("utf-8")))
+        )
+
+        assert await get_repo_file(
+            _request(), JOB_ID, path="notes.md", ref=None, dependencies=deps
+        ) == {"path": "notes.md", "content": text, "encoding": "utf-8", "size": 10}
 
     @pytest.mark.asyncio
     async def test_a_missing_file_is_a_404_naming_the_path(self):
-        deps = _deps(forge=_forge(get_file_content=AsyncMock(return_value=None)))
+        deps = _deps(forge=_forge(get_file_bytes=AsyncMock(return_value=None)))
 
         with pytest.raises(HTTPException) as exc:
             await get_repo_file(
@@ -225,11 +287,11 @@ class TestGetRepoFile:
 
     @pytest.mark.asyncio
     async def test_an_empty_file_is_served_not_treated_as_missing(self):
-        deps = _deps(forge=_forge(get_file_content=AsyncMock(return_value="")))
+        deps = _deps(forge=_forge(get_file_bytes=AsyncMock(return_value=b"")))
 
         assert await get_repo_file(
             _request(), JOB_ID, path="empty", ref=None, dependencies=deps
-        ) == {"path": "empty", "content": "", "size": 0}
+        ) == {"path": "empty", "content": "", "encoding": "utf-8", "size": 0}
 
 
 class TestListRepoCommits:

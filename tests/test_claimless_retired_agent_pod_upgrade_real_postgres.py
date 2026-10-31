@@ -910,6 +910,11 @@ async def test_upgrade_from_upstream_0305_adds_only_the_reconciled_files(
         assert await _catalog(history) == catalog_before
 
         await _run_as_owner(history, MIGRATIONS)
+        # The store's connections prepared ``SELECT * FROM agents`` before the
+        # upgrade; 0559 adds a column to agents, and a stale plan used inside
+        # a transaction raises InvalidCachedStatementError instead of
+        # re-preparing. An orchestrator migrates before it opens its pool.
+        await store._pool.expire_connections()
         upgraded = await _ledger(history)
         names_before = {row["filename"] for row in before}
         assert [row for row in upgraded if row["filename"] in names_before] == before

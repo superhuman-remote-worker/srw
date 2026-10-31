@@ -25,6 +25,7 @@ def receipt(**changes):
         "ready_budget_seconds": None,
         "pull_budget_seconds": None,
         "ssh_budget_seconds": None,
+        "startup_exit_code": None,
         "secret_claim_token": "must-never-leave",
         **changes,
     }
@@ -48,6 +49,7 @@ def test_unscheduled_public_shape_has_no_deadline_or_authority(state, reason):
         "state": state,
         "reason_code": reason,
         "readiness_deadline_at": None,
+        "exit_code": None,
     }
 
 
@@ -79,6 +81,7 @@ def test_scheduled_public_hard_deadline_does_not_include_ssh(state, reason):
         "state": state,
         "reason_code": reason,
         "readiness_deadline_at": SCHEDULED + timedelta(seconds=300),
+        "exit_code": None,
     }
 
 
@@ -97,3 +100,68 @@ def test_scheduled_public_hard_deadline_does_not_include_ssh(state, reason):
 )
 def test_malformed_or_inactive_v1_receipt_is_not_projected(change):
     assert public_workspace_creation_view(receipt(**change)) is None
+
+
+def test_legacy_open_receipt_projects_a_null_exit_code():
+    view = public_workspace_creation_view(
+        receipt(
+            startup_protocol_version=None,
+            startup_stage=None,
+            startup_state=None,
+            startup_reason_code=None,
+        )
+    )
+    assert view == {
+        "stage": "scheduling",
+        "state": "observing",
+        "reason_code": "observation_pending",
+        "readiness_deadline_at": None,
+        "exit_code": None,
+    }
+
+
+@pytest.mark.parametrize("code", [3, 0])
+def test_container_exited_projects_only_its_integer_exit_code(code):
+    view = public_workspace_creation_view(
+        receipt(
+            startup_stage="readiness",
+            startup_state="attention",
+            startup_reason_code="container_exited",
+            startup_exit_code=code,
+            scheduled_at=SCHEDULED,
+            ready_budget_seconds=180,
+            pull_budget_seconds=300,
+            ssh_budget_seconds=40,
+        )
+    )
+    assert view == {
+        "stage": "readiness",
+        "state": "attention",
+        "reason_code": "container_exited",
+        "readiness_deadline_at": SCHEDULED + timedelta(seconds=300),
+        "exit_code": code,
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"startup_reason_code": "container_exited", "startup_exit_code": None},
+        {"startup_reason_code": "container_exited", "startup_exit_code": True},
+        {"startup_reason_code": "container_exited", "startup_exit_code": "3"},
+        {"startup_reason_code": "invalid_image", "startup_exit_code": 3},
+        {"startup_reason_code": "container_stopped", "startup_exit_code": None},
+    ],
+    ids=["no-code", "bool-code", "text-code", "code-on-invalid", "unknown-reason"],
+)
+def test_malformed_or_unknown_exit_shapes_are_not_projected(change):
+    row = receipt(
+        startup_stage="readiness",
+        startup_state="attention",
+        scheduled_at=SCHEDULED,
+        ready_budget_seconds=180,
+        pull_budget_seconds=None,
+        ssh_budget_seconds=40,
+        **change,
+    )
+    assert public_workspace_creation_view(row) is None

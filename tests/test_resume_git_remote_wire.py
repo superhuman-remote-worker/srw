@@ -114,6 +114,13 @@ async def test_worker_ready_endpoints_advertise_resolved_resume(monkeypatch):
 
     assert primary_response.capabilities["resolved_config_resume"] is True
     assert dual_response.capabilities["resolved_config_resume"] is True
+    # SRW's own harness declares the full set of harness capabilities, so the
+    # orchestrator's capability checks never refuse it.
+    for capability in ("jobs", "pause", "steer"):
+        assert primary_response.capabilities[capability] is True
+        assert dual_response.capabilities[capability] is True
+    assert dual_response.capabilities["sessions"] is True
+    assert "sessions" not in primary_response.capabilities
 
 
 @pytest.mark.asyncio

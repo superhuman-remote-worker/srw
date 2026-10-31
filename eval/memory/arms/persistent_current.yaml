@@ -3,13 +3,12 @@
 #
 # Ingestion replays every haystack session through the seam (capture
 # turn_end/session_end + the per-turn read path), so the elapsed
-# extraction gate, TTL pinning/decay, and dedup all behave exactly as a
-# live session. Costs real auxiliary-LLM calls per session — start with
+# extraction gate and dedup behave exactly as a live session. Costs real auxiliary-LLM calls per session — start with
 # --limit 10..20.
 name: persistent_current
 description: >
   Seam replay of config/session_base.yaml (persistent writer set,
-  recall_two_tier + kb_notes read path) — the current system's baseline.
+  recall_hybrid + kb_notes read path) — the current system's baseline.
 base_config: session_base
 
 # The committed session_base auxiliary.model points at the cluster

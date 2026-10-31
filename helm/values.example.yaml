@@ -58,16 +58,17 @@ gitea:
   internalUrl: "https://git.internal.example.com"
   externalUrl: "https://git.internal.example.com"
 
-# Exact self-hosted Git endpoints approved for orchestrator-side OKF datasource
-# reads. Public github.com/gitlab.com/bitbucket.org/codeberg.org are built in.
+# Extra exact Git endpoints approved for orchestrator-side OKF datasource
+# reads. github.com/gitlab.com/bitbucket.org/codeberg.org and the Gitea above
+# are trusted already. Example: "gitlab.internal.example.com"
 orchestrator:
-  kbGitAllowedHosts: "git.internal.example.com"
+  kbGitAllowedHosts: ""
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
-  # First deploy the capable bridge with this off. Enable only after proving
-  # all pre-bridge processes/creators are gone; existing v1 work continues off.
+  # On by default. Upgrading from v0.0.28 or older: set it false for that
+  # upgrade, then enable it once all pre-bridge processes/creators are gone.
   containerStartupStageAuthority:
-    enabled: false
+    enabled: true
   vmProvisioning:
     creationRetryEnabled: false
     rootdiskStallTimeoutSeconds: 2700
@@ -120,16 +121,25 @@ collabora:
 # Databases — external managed instances. See README for required Secret keys.
 # -----------------------------------------------------------------------------
 databases:
+  # The DSN is composed from these parts; the user and password come from the
+  # Secret (POSTGRES_USER / POSTGRES_PASSWORD), never from a URL here.
   postgres:
     enabled: true
     internal: false
     # HA: must be a direct/session-mode endpoint — NOT a transaction-mode pooler
     # (PgBouncer/pgcat txn mode breaks the leader-election session advisory lock).
-    externalUrl: "postgres://srw:<pw>@pg.example.com:5432/srw"
+    externalHost: "pg.example.com"
+    externalPort: 5432
+    externalDb: "srw"
+    sslMode: "require"
   vector:
     enabled: true
     internal: false
-    externalUrl: "postgresql://srw:<pw>@pg.example.com:5432/srw_vector"
+    # Needs the pgvector extension.
+    externalHost: "pg.example.com"
+    externalPort: 5432
+    externalDb: "srw_vector"
+    sslMode: "require"
   # Dedicated Postgres for the bundled Keycloak. Only relevant when keycloak.internal=true.
   # When the customer brings an external IdP (the recommended setup above), this block is ignored.
   keycloak:
@@ -178,7 +188,7 @@ s3:
   snapshotRetentionDays: "90"
 
 # -----------------------------------------------------------------------------
-# Disable home-cluster-only components.
+# Disable the optional admin and mesh tools.
 # -----------------------------------------------------------------------------
 headscale:
   enabled: false
@@ -190,18 +200,41 @@ codexProxy:
   enabled: false
 
 # -----------------------------------------------------------------------------
-# LLM defaults — provider keys live in the secret. The orchestrator reads the
-# active model catalog from the database (system_api_keys + llm_endpoints),
-# seeded post-install via Admin → Providers in the UI.
+# Models — the catalog lives in the database. Jobs and Sessions are refused
+# until chat, auxiliary, embedding and rerank each have an enabled model and a
+# default, and the embedding model must return 4096-dimensional vectors. One
+# OpenRouter key covers all four (docs/models.md). The seed Job below inserts
+# them at install; set enabled: false to add models in Admin → Models instead.
+# Create the key's Secret before installing:
+#   kubectl -n <ns> create secret generic srw-llm-seed \
+#     --from-literal=openrouter_api_key=sk-or-v1-...
+# See values.yaml `llm.seed.*` for endpoints, other providers and reconcile.
 # -----------------------------------------------------------------------------
 llm:
-  baseUrl: "https://api.openai.com/v1"
-  visionModel: "gpt-4o-mini"
-  embeddingModel: "qwen3-embedding-8b"
-  # Optional: seed system endpoints declaratively at install time.
-  # See values.yaml `llm.seed.*` for schema.
   seed:
-    enabled: false
+    enabled: true
+    systemApiKeys:
+      openrouter:
+        secretName: "srw-llm-seed"
+        key: "openrouter_api_key"
+    systemModels:
+      - provider: "openrouter"
+        id: "openrouter/anthropic/claude-sonnet-5.5"
+        displayName: "Claude Sonnet 5.5 (OpenRouter)"
+        capabilities: [chat, auxiliary]
+      - provider: "openrouter"
+        id: "openrouter/qwen/qwen3-embedding-8b"
+        displayName: "Qwen3 Embedding 8B (OpenRouter)"
+        capability: embedding
+      - provider: "openrouter"
+        id: "openrouter/qwen/qwen3-reranker-8b"
+        displayName: "Qwen3 Reranker 8B (OpenRouter)"
+        capability: rerank
+    defaults:
+      chat: "openrouter/anthropic/claude-sonnet-5.5"
+      auxiliary: "openrouter/anthropic/claude-sonnet-5.5"
+      embedding: "openrouter/qwen/qwen3-embedding-8b"
+      rerank: "openrouter/qwen/qwen3-reranker-8b"
 
 # -----------------------------------------------------------------------------
 # Ingress — set to match your cluster's ingress controller and cert-manager.

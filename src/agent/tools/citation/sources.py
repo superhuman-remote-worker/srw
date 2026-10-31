@@ -7,15 +7,20 @@ Integrates with CitationEngine for verified, persistent citations.
 import json
 import logging
 import re
-import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, get_args
+from typing import Any, Dict, List, Literal, Optional, Union, get_args
 
 from langchain_core.tools import tool
 
 from agent.tools.context import ToolContext
 
+from shared.citation_handles import (
+    format_handle,
+    format_source_ref,
+    parse_citation_ref,
+    parse_source_ref,
+)
 from shared.tool_catalog.definitions import (
     CITATION_TOOLS_METADATA as CITATION_TOOLS_METADATA,
 )
@@ -34,10 +39,9 @@ logger = logging.getLogger(__name__)
 # prose is therefore invisible — see
 # knowledge-base/knowledge/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
 #
-# Spelled literally rather than derived from the enums so these signatures stay
-# importable when the engine is absent (the @tool decorator evaluates
-# annotations at load time, before each tool body's availability check).
-# tests/test_citation_tool_vocabularies.py asserts they stay in sync.
+# Spelled literally rather than derived from the enums so these signatures do
+# not import the engine at load time (the @tool decorator evaluates
+# annotations). tests/test_tool_vocabularies.py asserts they stay in sync.
 ExtractionMethodValue = Literal[
     "direct_quote", "paraphrase", "inference", "aggregation", "negative"
 ]
@@ -50,55 +54,11 @@ SearchScopeValue = Literal["content", "annotations", "all"]
 BibliographyStyleValue = Literal["bibtex", "harvard", "ieee", "apa", "inline"]
 TagActionValue = Literal["add", "remove"]
 
-
-# Tool metadata for registry
-# Phase availability: domain tools are tactical-only
-
-
-def _format_stub_document_citation(
-    citation_id: str,
-    document_path: str,
-    page: Optional[int],
-    section: Optional[str],
-    text: str,
-) -> str:
-    """Format citation result for stub/fallback mode."""
-    return f"""Citation Created (Stub Mode)
-
-Citation ID: {citation_id}
-Source Type: Document
-Document: {document_path}
-Page: {page or "N/A"}
-Section: {section or "N/A"}
-
-Quoted Text:
-"{text[:500]}{"..." if len(text) > 500 else ""}"
-
-Note: CitationEngine not available. Citation stored in stub mode only.
-Use this citation_id when writing requirements."""
-
-
-def _format_stub_web_citation(
-    citation_id: str,
-    url: str,
-    title: Optional[str],
-    accessed_date: str,
-    text: str,
-) -> str:
-    """Format web citation result for stub/fallback mode."""
-    return f"""Web Citation Created (Stub Mode)
-
-Citation ID: {citation_id}
-Source Type: Web
-URL: {url}
-Title: {title or "Untitled"}
-Accessed: {accessed_date}
-
-Content:
-"{text[:500]}{"..." if len(text) > 500 else ""}"
-
-Note: CitationEngine not available. Citation stored in stub mode only.
-Use this citation_id when writing requirements."""
+#: A citation as the agent names it: the handle the cite tool returned
+#: (``[^c1241]``) or its number. Parsed by ``parse_citation_ref``.
+CitationRef = Union[str, int]
+#: A source as the tools print it (``S12``) or its number.
+SourceRef = Union[str, int]
 
 
 #: Postgres enum type name -> the vocabulary the caller should have been offered.
@@ -161,6 +121,61 @@ def _verbatim_or_none(text: str, extraction_method: str) -> Optional[str]:
     return text[:500] if len(text) < 1000 else None
 
 
+#: What each status means to the agent, in the cite tools' first line.
+_STATUS_SENTENCES = {
+    "pending": "verification pending",
+    "verified": "verified",
+    "failed": "UNVERIFIED",
+    "unverified": "not checked",
+}
+
+
+def _status_phrase(status: str, withdrawn: bool = False) -> str:
+    phrase = _STATUS_SENTENCES.get(status, status)
+    return f"{phrase}, WITHDRAWN" if withdrawn else phrase
+
+
+def _locator_text(locator: Optional[Dict[str, Any]]) -> str:
+    if not locator:
+        return ""
+    parts = [
+        f"{k} {v}"
+        for k, v in locator.items()
+        if v and k not in ("accessed_at", "title")
+    ]
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _created_output(
+    result: Any, source_line: str, extra_lines: Optional[List[str]] = None
+) -> str:
+    """The cite tools' result: the handle first, then what to do with it.
+
+    Kept short on purpose (E4): the agent needs the handle, the state and the
+    next step, not "Similarity Score: N/A".
+    """
+    handle = format_handle(result.citation_id)
+    status = result.verification_status.value
+    if status == "failed":
+        head = f"Citation {handle} created but UNVERIFIED: {result.verification_notes}"
+        tail = (
+            f"Fix it with edit_citation (it is checked again), or withdraw it "
+            f"with withdraw_citation and leave {handle} out of your text."
+        )
+    else:
+        head = f"Citation {handle} created; {_status_phrase(status)}."
+        if status == "unverified" and result.verification_notes:
+            head += f" {result.verification_notes}"
+        tail = (
+            f"Write {handle} right after the claim it supports, copied exactly. "
+            "Readers see it as a numbered footnote; never write a number yourself."
+        )
+    lines = [head, f"Source: {source_line}"]
+    lines.extend(extra_lines or [])
+    lines += ["", tail]
+    return "\n".join(lines)
+
+
 def create_source_tools(context: ToolContext) -> List[Any]:
     """Create citation tools with injected context.
 
@@ -186,8 +201,9 @@ def create_source_tools(context: ToolContext) -> List[Any]:
         """Create a verified citation for document content.
 
         Registers the document as a source (if not already registered) and creates
-        a citation linking your claim to the quoted text. The citation is verified
-        against the source content using an LLM.
+        a citation linking your claim to the quoted text. A direct quote is
+        checked against the document at once; whether it supports the claim is
+        checked in the background.
 
         Tip: Use search_library first to find relevant evidence across all sources,
         then cite the specific passage with this tool.
@@ -209,20 +225,10 @@ def create_source_tools(context: ToolContext) -> List[Any]:
             confidence: Your self-assessment of how well the source backs the claim
 
         Returns:
-            Citation ID and verification status. Use [N] format in your text.
+            The citation handle, e.g. [^c1241]. Write it right after the claim,
+            copied exactly; readers see a numbered footnote.
         """
         try:
-            # Try to use CitationEngine
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                # Fallback to stub behavior
-                citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
-                logger.warning("CitationEngine not installed, using stub mode")
-                return _format_stub_document_citation(
-                    citation_id, document_path, page, section, text
-                )
-
             # Register source and create citation
             cloud_anchor = None
             try:
@@ -252,8 +258,7 @@ def create_source_tools(context: ToolContext) -> List[Any]:
                 return f"Error: Document not found at {document_path}"
             except Exception as e:
                 # Registration failed for a real reason (extraction, embedding,
-                # remote fetch, …) — the engine IS available, so report the
-                # actual error instead of the misleading "not available" stub.
+                # remote fetch, …): report the actual error.
                 logger.warning(f"Could not register document source: {e}")
                 return (
                     f"Error: could not register document source '{document_path}': {e}"
@@ -275,42 +280,23 @@ def create_source_tools(context: ToolContext) -> List[Any]:
                 quote_context=text,
                 locator=locator,
                 verbatim_quote=_verbatim_or_none(text, extraction_method),
-                relevance_reasoning=f"Evidence from source document supporting: {effective_claim[:100]}",
                 confidence=confidence,
                 extraction_method=extraction_method,
             )
 
-            # Format result for agent
-            status = result.verification_status.value
-            citation_ref = f"[{result.citation_id}]"
-            similarity = (
-                f"{result.similarity_score:.2f}" if result.similarity_score else "N/A"
-            )
-
-            output = f"""Citation Created
-
-Citation ID: {citation_ref}
-Source Type: Document
-Document: {document_path}
-Page: {page or "N/A"}
-Section: {section or "N/A"}
-Status: {status.upper()}
-Similarity Score: {similarity}
-"""
+            extra = []
             if cloud_anchor:
                 if cloud_anchor.get("snapshot_blob_key"):
-                    output += (
-                        "Cloud-anchored: yes "
-                        "(original snapshotted for drift detection)\n"
+                    extra.append(
+                        "Cloud-anchored: yes (original snapshotted for drift detection)"
                     )
                 else:
-                    output += "Cloud-anchored: yes (live pointer recorded)\n"
-            if result.verification_notes:
-                output += f"\nNote: {result.verification_notes}"
-
-            output += f"\n\nUse {citation_ref} when referencing this information in your text."
-
-            return output
+                    extra.append("Cloud-anchored: yes (live pointer recorded)")
+            return _created_output(
+                result,
+                f"{format_source_ref(source_id)} {document_path}{_locator_text(locator)}",
+                extra,
+            )
 
         except Exception as e:
             logger.error(f"Citation creation error: {e}")
@@ -329,8 +315,9 @@ Similarity Score: {similarity}
         """Create a verified citation for web content.
 
         Registers the URL as a source (fetching and archiving its content) and creates
-        a citation linking your claim to the quoted text. The citation is verified
-        against the archived content using an LLM.
+        a citation linking your claim to the quoted text. A direct quote is
+        checked against the archived page at once; whether it supports the
+        claim is checked in the background.
 
         Tip: Use search_library first to find relevant evidence across all sources,
         then cite the specific passage with this tool.
@@ -352,22 +339,13 @@ Similarity Score: {similarity}
             confidence: Your self-assessment of how well the source backs the claim
 
         Returns:
-            Citation ID and verification status. Use [N] format in your text.
+            The citation handle, e.g. [^c1241]. Write it right after the claim,
+            copied exactly; readers see a numbered footnote.
         """
         try:
             # Use today's date if not provided
             if not accessed_date:
                 accessed_date = datetime.utcnow().strftime("%Y-%m-%d")
-
-            # Try to use CitationEngine
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
-                logger.warning("CitationEngine not installed, using stub mode")
-                return _format_stub_web_citation(
-                    citation_id, url, title, accessed_date, text
-                )
 
             # Register source and create citation
             try:
@@ -375,9 +353,7 @@ Similarity Score: {similarity}
                     url, name=title
                 )
             except Exception as e:
-                # Registration failed for a real reason — the engine IS
-                # available, so report the actual error instead of the
-                # misleading "not available" stub.
+                # Registration failed for a real reason: report the actual error.
                 logger.warning(f"Could not register web source: {e}")
                 return f"Error: could not register web source '{url}': {e}"
 
@@ -401,34 +377,15 @@ Similarity Score: {similarity}
                 quote_context=text,
                 locator=locator,
                 verbatim_quote=_verbatim_or_none(text, extraction_method),
-                relevance_reasoning=f"Content from web source supporting: {effective_claim[:100]}",
                 confidence=confidence,
                 extraction_method=extraction_method,
             )
 
-            # Format result
-            status = result.verification_status.value
-            citation_ref = f"[{result.citation_id}]"
-            similarity = (
-                f"{result.similarity_score:.2f}" if result.similarity_score else "N/A"
+            label = f"{title} — {url}" if title else url
+            return _created_output(
+                result,
+                f"{format_source_ref(source_id)} {label} (accessed {accessed_date})",
             )
-
-            output = f"""Web Citation Created
-
-Citation ID: {citation_ref}
-Source Type: Web
-URL: {url}
-Title: {title or "Untitled"}
-Accessed: {accessed_date}
-Status: {status.upper()}
-Similarity Score: {similarity}
-"""
-            if result.verification_notes:
-                output += f"\nNote: {result.verification_notes}"
-
-            output += f"\n\nUse {citation_ref} when referencing this information in your text."
-
-            return output
 
         except Exception as e:
             logger.error(f"Web citation error: {e}")
@@ -440,17 +397,13 @@ Similarity Score: {similarity}
 
         Shows document, web, database, and custom sources that have been
         registered for citations in the current job. Sources from other jobs
-        are not visible.
+        are not visible. Source ids are printed as S12; they are not citation
+        handles and never go in your text.
 
         Returns:
             Formatted list of sources with IDs and types
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed. No sources available."
-
             engine = context.get_citation_engine()
             # list_sources() now filters by job_id from context automatically
             sources = await engine.list_sources()
@@ -460,7 +413,9 @@ Similarity Score: {similarity}
 
             lines = [f"Registered Sources ({len(sources)} total):", ""]
             for source in sources:
-                lines.append(f"  [{source.id}] {source.type.value}: {source.name}")
+                lines.append(
+                    f"  {format_source_ref(source.id)} {source.type.value}: {source.name}"
+                )
 
             return "\n".join(lines)
 
@@ -469,45 +424,39 @@ Similarity Score: {similarity}
             return f"Error listing sources: {str(e)}"
 
     @tool
-    async def get_citation(citation_id: int) -> str:
+    async def get_citation(citation_id: CitationRef) -> str:
         """Get details about a specific citation from this job.
 
         Retrieves the full citation record including claim, source, verification
-        status, and similarity score. Only citations belonging to the current job
-        are accessible.
+        status and, when it is not verified, why. Only citations belonging to
+        the current job are accessible.
 
         Args:
-            citation_id: The numeric citation ID (without brackets)
+            citation_id: The citation handle, e.g. [^c1241]
 
         Returns:
             Detailed citation information, or not found if citation doesn't exist
             or belongs to another job
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed."
-
+            cid = parse_citation_ref(citation_id)
             engine = context.get_citation_engine()
             # get_citation() now filters by job_id from context automatically
-            citation = await engine.get_citation(citation_id)
+            citation = await engine.get_citation(cid)
 
+            handle = format_handle(cid)
             if not citation:
-                return f"Citation [{citation_id}] not found."
+                return f"Citation {handle} not found."
 
             source = await engine.get_source(citation.source_id)
+            source_ref = format_source_ref(citation.source_id)
+            if source is not None:
+                source_line = f"{source_ref} {source.name} ({source.type.value})"
+            else:
+                source_line = f"{source_ref} (no longer available)"
 
-            similarity = (
-                f"{citation.similarity_score:.2f}"
-                if citation.similarity_score
-                else "N/A"
-            )
-            source_name = source.name if source else "Unknown"
-            source_type = f" ({source.type.value})" if source else ""
-
-            output = f"Citation [{citation_id}]\n"
-            output += f"\nSource: [{source.id}] {source_name}{source_type}"
+            output = f"Citation {handle}\n"
+            output += f"\nSource: {source_line}"
 
             if citation.locator:
                 loc_parts = [
@@ -543,30 +492,43 @@ Similarity Score: {similarity}
             if citation.relevance_reasoning:
                 output += f"\nReasoning: {citation.relevance_reasoning}"
 
-            output += f"\n\nStatus: {citation.verification_status.value.upper()} | Confidence: {citation.confidence.value} | Similarity: {similarity}"
-
+            status = _status_phrase(
+                citation.verification_status.value, citation.withdrawn_at is not None
+            )
+            output += f"\n\nStatus: {status} | Confidence: {citation.confidence.value}"
+            if citation.similarity_score is not None:
+                output += f" | Similarity: {citation.similarity_score:.2f}"
+            if citation.verification_reason:
+                output += f"\nReason: {citation.verification_reason}"
             if citation.verification_notes:
                 output += f"\nNotes: {citation.verification_notes}"
+            if citation.withdrawn_at is not None:
+                output += (
+                    f"\nWithdrawn: {citation.withdrawn_reason or 'no reason given'}"
+                )
 
             return output
 
+        except ValueError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
             logger.error(f"Error getting citation: {e}")
             return f"Error getting citation: {str(e)}"
 
     @tool
     async def list_citations(
-        source_id: Optional[int] = None,
+        source_id: Optional[SourceRef] = None,
         status: Optional[VerificationStatusValue] = None,
     ) -> str:
         """List citations created by this job.
 
-        Shows citation IDs, claims (truncated), verification status, and source.
-        Optionally filter by source ID or verification status. Citations from
+        Shows citation handles, claims (truncated), verification status, and
+        source. Optionally filter by source or verification status ('failed'
+        is shown as UNVERIFIED, 'unverified' as not checked). Citations from
         other jobs are not visible.
 
         Args:
-            source_id: Filter by source ID (optional)
+            source_id: Filter by source, e.g. S12 (optional)
             status: Filter by verification status: pending, verified, failed,
                 unverified (optional)
 
@@ -574,16 +536,13 @@ Similarity Score: {similarity}
             Formatted list of citations for the current job
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed. No citations available."
-
             engine = context.get_citation_engine()
             # list_citations() now filters by job_id from context automatically
             # Pass filters directly to engine for efficiency
             citations = await engine.list_citations(
-                source_id=source_id,
+                source_id=parse_source_ref(source_id)
+                if source_id is not None
+                else None,
                 verification_status=status,
             )
 
@@ -596,20 +555,25 @@ Similarity Score: {similarity}
             for c in citations:
                 claim_preview = c.claim[:50] + "..." if len(c.claim) > 50 else c.claim
                 confidence = f" ({c.confidence.value})" if c.confidence else ""
-                status_str = c.verification_status.value.upper()
+                status_str = _status_phrase(
+                    c.verification_status.value, c.withdrawn_at is not None
+                )
                 lines.append(
-                    f'  [{c.id}] {status_str}{confidence} — Source [{c.source_id}] "{claim_preview}"'
+                    f"  {format_handle(c.id)} {status_str}{confidence} — "
+                    f'{format_source_ref(c.source_id)} "{claim_preview}"'
                 )
 
             return "\n".join(lines)
 
+        except ValueError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
             logger.error(f"Error listing citations: {e}")
             return f"Error listing citations: {str(e)}"
 
     @tool
     async def edit_citation(
-        citation_id: int,
+        citation_id: CitationRef,
         claim: Optional[str] = None,
         verbatim_quote: Optional[str] = None,
         quote_context: Optional[str] = None,
@@ -620,15 +584,16 @@ Similarity Score: {similarity}
     ) -> str:
         """Edit fields of an existing citation belonging to this job.
 
-        When content fields (claim, verbatim_quote, quote_context) are changed,
-        verification_status is automatically reset to 'pending' and previous
-        verification results are cleared, since the old verification is no
-        longer valid.
+        Use it to fix a citation that failed verification: point it at a
+        better passage, quote the source exactly, or correct the claim. When
+        claim, verbatim_quote or quote_context change, the old verdict is
+        cleared and the citation is checked again. The handle stays the same.
 
-        Only citations belonging to the current job can be edited.
+        Only citations belonging to the current job can be edited, and a
+        withdrawn citation cannot be.
 
         Args:
-            citation_id: The numeric citation ID (without brackets)
+            citation_id: The citation handle, e.g. [^c1241]
             claim: The assertion being supported
             verbatim_quote: Exact quote from source
             quote_context: Context around the quote
@@ -638,14 +603,10 @@ Similarity Score: {similarity}
             locator: Location reference as JSON string (e.g., '{"page": 5, "section": "3.2"}')
 
         Returns:
-            "ok: edited citation [N]" on success, "error: {reason}" on failure
+            "ok: edited citation [^c1241]" on success, "error: {reason}" on failure
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "error: CitationEngine not installed"
-
+            cid = parse_citation_ref(citation_id)
             engine = context.get_citation_engine()
 
             # Build kwargs for edit, only including non-None values
@@ -676,14 +637,17 @@ Similarity Score: {similarity}
             )
 
             # Route through the engine (vector store). Job-scoped ownership and
-            # the verification-status reset on content change are handled there.
-            # (Previously this hit context.db = the main app DB, where citations
-            # do not live — a cross-database mis-target.)
-            await engine.edit_citation(citation_id=citation_id, **kwargs)
+            # the new check on a content change are handled there.
+            await engine.edit_citation(citation_id=cid, **kwargs)
 
-            result = f"ok: edited citation [{citation_id}]"
+            result = f"ok: edited citation {format_handle(cid)}"
             if content_changed:
-                result += " (verification_status reset to 'pending')"
+                edited = await engine.get_citation(cid)
+                status = edited.verification_status.value if edited else "pending"
+                if status == "failed" and edited is not None:
+                    result += f" — still UNVERIFIED: {edited.verification_notes}"
+                else:
+                    result += f" ({_status_phrase(status)})"
             return result
 
         except ValueError as e:
@@ -696,8 +660,36 @@ Similarity Score: {similarity}
             return f"error: {str(e)}"
 
     @tool
+    async def withdraw_citation(citation_id: CitationRef, reason: str) -> str:
+        """Withdraw a citation you no longer use, keeping its record.
+
+        For a citation that failed verification and cannot be fixed, or one
+        you dropped from your text. Nothing is deleted: the record and its
+        verdict stay, and readers see it struck through. Remove its handle from
+        your text as well. To fix a citation instead, use edit_citation.
+
+        Args:
+            citation_id: The citation handle, e.g. [^c1241]
+            reason: Why it is withdrawn (one sentence)
+
+        Returns:
+            "ok: withdrew citation [^c1241]" on success, "error: {reason}" on failure
+        """
+        try:
+            cid = parse_citation_ref(citation_id)
+            engine = context.get_citation_engine()
+            await engine.withdraw_citation(cid, reason)
+            handle = format_handle(cid)
+            return f"ok: withdrew citation {handle}. Remove {handle} from your text."
+        except ValueError as e:
+            return f"error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error withdrawing citation: {e}")
+            return f"error: {str(e)}"
+
+    @tool
     async def annotate_source(
-        source_id: int,
+        source_id: SourceRef,
         content: str,
         type: AnnotationTypeValue = "note",
         page: Optional[str] = None,
@@ -708,7 +700,7 @@ Similarity Score: {similarity}
         summaries, questions, or critiques. Annotations are per-job.
 
         Args:
-            source_id: The numeric source ID
+            source_id: The source, e.g. S12
             content: The annotation text
             type: Annotation type: note, highlight, summary, question, critique (default: note)
             page: Optional page/section reference (e.g., "p.12", "§ 3.1")
@@ -717,23 +709,20 @@ Similarity Score: {similarity}
             Confirmation with annotation ID, or error message
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed."
-
+            sid = parse_source_ref(source_id)
             engine = context.get_citation_engine()
             annotation = await engine.annotate_source(
-                source_id=source_id,
+                source_id=sid,
                 content=content,
                 annotation_type=type or "note",
                 page_reference=page,
             )
 
             return (
-                f"Annotation [{annotation.id}] created\n"
+                f"Annotation {annotation.id} created\n"
                 f"Type: {annotation.annotation_type.value}\n"
-                f"Source: [{source_id}]" + (f"\nPage: {page}" if page else "")
+                f"Source: {format_source_ref(sid)}"
+                + (f"\nPage: {page}" if page else "")
             )
 
         except ValueError as e:
@@ -744,7 +733,7 @@ Similarity Score: {similarity}
 
     @tool
     async def get_annotations(
-        source_id: int,
+        source_id: SourceRef,
         type: Optional[AnnotationTypeValue] = None,
     ) -> str:
         """Get annotations for a source in the current job.
@@ -753,30 +742,27 @@ Similarity Score: {similarity}
         attached to a source. Optionally filter by annotation type.
 
         Args:
-            source_id: The numeric source ID
+            source_id: The source, e.g. S12
             type: Optional filter: note, highlight, summary, question, critique
 
         Returns:
             Formatted list of annotations, or message if none found
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed."
-
+            sid = parse_source_ref(source_id)
             engine = context.get_citation_engine()
             annotations = await engine.get_annotations(
-                source_id=source_id,
+                source_id=sid,
                 annotation_type=type,
             )
 
+            source_ref = format_source_ref(sid)
             if not annotations:
                 filter_msg = f" of type '{type}'" if type else ""
-                return f"No annotations{filter_msg} found for source [{source_id}]."
+                return f"No annotations{filter_msg} found for source {source_ref}."
 
             lines = [
-                f"Annotations for source [{source_id}] ({len(annotations)} total):",
+                f"Annotations for source {source_ref} ({len(annotations)} total):",
                 "",
             ]
             for ann in annotations:
@@ -785,18 +771,20 @@ Similarity Score: {similarity}
                 )
                 page_str = f" (p.{ann.page_reference})" if ann.page_reference else ""
                 lines.append(
-                    f"  [{ann.id}] {ann.annotation_type.value}{page_str}: {preview}"
+                    f"  {ann.id}. {ann.annotation_type.value}{page_str}: {preview}"
                 )
 
             return "\n".join(lines)
 
+        except ValueError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
             logger.error(f"Error getting annotations: {e}")
             return f"Error getting annotations: {str(e)}"
 
     @tool
     async def tag_source(
-        source_id: int,
+        source_id: SourceRef,
         tags: str,
         action: TagActionValue = "add",
     ) -> str:
@@ -806,7 +794,7 @@ Similarity Score: {similarity}
         Provide tags as a comma-separated string.
 
         Args:
-            source_id: The numeric source ID
+            source_id: The source, e.g. S12
             tags: Comma-separated tag strings (e.g., "compliance, GoBD, retention")
             action: "add" (default) or "remove"
 
@@ -814,11 +802,7 @@ Similarity Score: {similarity}
             Current list of tags for the source, or error message
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed."
-
+            sid = parse_source_ref(source_id)
             engine = context.get_citation_engine()
             tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
@@ -829,20 +813,16 @@ Similarity Score: {similarity}
             # fall through to "add" — that silently did the *opposite* of a
             # remove request and still reported "Added".
             if action == "remove":
-                current_tags = await engine.remove_tags(
-                    source_id=source_id, tags=tag_list
-                )
+                current_tags = await engine.remove_tags(source_id=sid, tags=tag_list)
                 verb = "Removed"
             elif action == "add":
-                current_tags = await engine.tag_source(
-                    source_id=source_id, tags=tag_list
-                )
+                current_tags = await engine.tag_source(source_id=sid, tags=tag_list)
                 verb = "Added"
             else:
                 return f"error: invalid action '{action}'. Use 'add' or 'remove'."
 
             return (
-                f"{verb} tags on source [{source_id}]\n"
+                f"{verb} tags on source {format_source_ref(sid)}\n"
                 f"Current tags: {', '.join(current_tags) if current_tags else '(none)'}"
             )
 
@@ -865,7 +845,9 @@ Similarity Score: {similarity}
 
         Find evidence across all registered sources. Returns results with
         explainable evidence labels (HIGH/MEDIUM/LOW). Use this to find
-        supporting evidence before creating citations.
+        supporting evidence before creating citations. Results name their
+        source as S12; a source id is not a citation, so cite the passage with
+        cite_document or cite_web and write the handle that returns.
 
         Args:
             query: Natural language query or keywords to search for
@@ -879,11 +861,6 @@ Similarity Score: {similarity}
             Formatted search results with evidence labels and source references
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed."
-
             engine = context.get_citation_engine()
 
             # Parse tags from comma-separated string
@@ -912,7 +889,7 @@ Similarity Score: {similarity}
             ]
 
             for i, r in enumerate(results.results, 1):
-                source_ref = f"[{r.source_id}] {r.source_name}"
+                source_ref = f"{format_source_ref(r.source_id)} {r.source_name}"
                 page_str = f", {r.page_reference}" if r.page_reference else ""
                 preview = (
                     r.chunk_text[:300] + "..."
@@ -944,12 +921,15 @@ Similarity Score: {similarity}
         Produces a bibliography from all citations in the current job, or from
         a specific subset. Can write directly to a file (e.g., references.bib)
         or return the formatted text. When writing to an existing file, only
-        new entries are appended — duplicates are skipped.
+        new entries are appended — duplicates are skipped. A delivered Markdown
+        document gets its footnote definitions appended automatically; use
+        this for a separate references file.
 
         Args:
             style: Format style: "bibtex" (default), "harvard", "ieee", "apa", "inline"
-            citation_ids: Comma-separated citation IDs to include (e.g., "1,3,7").
-                          If omitted, includes all citations for the current job.
+            citation_ids: Comma-separated citation handles to include
+                (e.g., "[^c1241], [^c1242]"). If omitted, includes all citations
+                for the current job.
             output_path: Workspace-relative path to write (e.g., "references.bib").
                          If omitted, returns the formatted text directly.
 
@@ -957,11 +937,6 @@ Similarity Score: {similarity}
             Formatted bibliography text, or write confirmation with counts
         """
         try:
-            try:
-                from agent.citation_engine import CitationEngine  # noqa: F401
-            except ImportError:
-                return "CitationEngine not installed."
-
             engine = context.get_citation_engine()
             effective_style = style or "bibtex"
 
@@ -970,10 +945,12 @@ Similarity Score: {similarity}
                 ids = []
                 for part in citation_ids.split(","):
                     part = part.strip()
-                    if part.isdigit():
-                        ids.append(int(part))
-                    else:
-                        return f"Error: invalid citation ID '{part}' — must be numeric"
+                    if not part:
+                        continue
+                    try:
+                        ids.append(parse_citation_ref(part))
+                    except ValueError:
+                        return f"Error: invalid citation handle '{part}' — use e.g. [^c1241]"
 
                 entries = []
                 for cid in ids:
@@ -981,10 +958,12 @@ Similarity Score: {similarity}
                         entry = await engine.format_citation(cid, effective_style)
                         entries.append(entry)
                     except ValueError as e:
-                        entries.append(f"% Error for citation {cid}: {e}")
+                        entries.append(
+                            f"% Error for citation {format_handle(cid)}: {e}"
+                        )
             else:
                 # All citations for this job
-                all_citations = await engine.list_citations()
+                all_citations = await engine.list_citations(include_withdrawn=False)
                 if not all_citations:
                     return "No citations found. Use cite_document or cite_web first."
                 entries = []
@@ -993,7 +972,9 @@ Similarity Score: {similarity}
                         entry = await engine.format_citation(c.id, effective_style)
                         entries.append(entry)
                     except ValueError as e:
-                        entries.append(f"% Error for citation {c.id}: {e}")
+                        entries.append(
+                            f"% Error for citation {format_handle(c.id)}: {e}"
+                        )
 
             if not entries:
                 return "No entries generated."
@@ -1066,6 +1047,7 @@ Similarity Score: {similarity}
         get_citation,
         list_citations,
         edit_citation,
+        withdraw_citation,
         annotate_source,
         get_annotations,
         tag_source,

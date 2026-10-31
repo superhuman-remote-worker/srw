@@ -1,0 +1,19 @@
+# A slow back office (local_voice_gateway.md §9.9, the owner's test call):
+# one delegated question against the fictional Hotel Beispielhof, for
+# timelines of what the caller hears while the answer takes a while. The
+# gateway runs on the host (`scripts/voice-bench.sh addon up --line <line>`),
+# `srw_driver.py` plays the back office with a canned answer after its
+# `answer_delay`, and with `status` a line it sends the voice first. Compare
+# a cascade profile with and without `hold_after_secs`.
+number: "107"
+hangup_after: 50
+lines:
+  - at: 12
+    utterance: d01-availability   # Haben Sie vom zwölften bis vierzehnten März noch ein Doppelzimmer frei?
+expect:
+  - name: greeting
+    to: 12
+    keywords: ["beispielhof"]
+  - name: answer
+    from: 14
+    keywords: ["frei"]

@@ -183,7 +183,6 @@ memory:
       - interval_extractor           # Worker in-loop observer (modulo gate)
       - phase_boundary_extractor     # Extraction at archive_phase
       - pre_compaction_extractor     # Chunked extraction of the evicted slice before compaction
-      - memory_assembler             # TTL curation every assembler_interval turns
       - compaction_memory            # Store compaction summaries
       - queued_memory                # Flush todo_complete-queued memories
 
@@ -191,8 +190,6 @@ auxiliary:
   tasks:
     curate_knowledge:
       verdict: true          # OKF KB slice 2 PR2 — adjudicate each curator write (ADD/UPDATE/SUPERSEDE/DISCARD) against existing notes before it lands. Fires only where the curator runs (loops); cost-guarded to neighbours >= review_floor. See knowledge-base/knowledge/features/okf_knowledge_base.md §11.1.
-    assemble_memories:
-      enabled: true
 
 # Verification — auto-spawn a critic job after job_complete to review deliverables.
 # The critic either approves the job or resumes it with feedback.

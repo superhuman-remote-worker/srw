@@ -1,0 +1,60 @@
+# =============================================================================
+# srw-voice-whisper-vulkan — whisper.cpp's server on a Vulkan GPU
+# =============================================================================
+# The cascade-gpu test profile's STT (local_voice_gateway.md §6.2, WP4):
+# whisper.cpp v1.9.5 (MIT) built from the GitHub source archive of the release
+# tag (sha256 pinned, the same archive as the WP0 bench's CPU image) with the
+# Vulkan backend, so it runs on AMD, Intel and NVIDIA cards alike. The server
+# answers OpenAI's /v1/audio/transcriptions (form fields file, language,
+# prompt, temperature, response_format; "model" is ignored). The model is NOT
+# in the image: docker/voice-models/models.py fetches it and compose mounts it.
+#
+# No audio on disk: without --convert the server decodes the upload in memory
+# and never writes it; it logs no transcripts (--print-realtime is off).
+#
+#   docker build -f docker/voice-models/Dockerfile.whisper-vulkan \
+#       -t srw-voice-whisper-vulkan:1.9.5 docker/voice-models
+# =============================================================================
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS build
+
+ARG WHISPER_CPP_VERSION=1.9.5
+ARG WHISPER_CPP_SHA256=ff1a9053feb509ff9d7729703355541ae9690073a6b1c40eb692c962e0dc1720
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake ca-certificates curl libvulkan-dev glslc; \
+    rm -rf /var/lib/apt/lists/*
+# ggml-vulkan's CMake also wants the SPIR-V headers.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends spirv-headers; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src
+RUN set -eux; \
+    curl -fsSLo whisper.tar.gz \
+        "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v${WHISPER_CPP_VERSION}.tar.gz"; \
+    echo "${WHISPER_CPP_SHA256}  whisper.tar.gz" | sha256sum -c -; \
+    tar xzf whisper.tar.gz; \
+    cd "whisper.cpp-${WHISPER_CPP_VERSION}"; \
+    # Portable x86-64-v3 CPU code (the image may run on another machine);
+    # the heavy work runs on the GPU through Vulkan.
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON \
+        -DGGML_FMA=ON -DGGML_F16C=ON -DWHISPER_BUILD_TESTS=OFF \
+        -DWHISPER_BUILD_SERVER=ON > /tmp/cmake.log; \
+    cmake --build build -j"$(nproc)" --target whisper-server > /tmp/build.log 2>&1 \
+        || { tail -60 /tmp/build.log; exit 1; }; \
+    install -m 0755 build/bin/whisper-server /usr/local/bin/whisper-server
+
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libgomp1 libvulkan1 mesa-vulkan-drivers; \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/whisper-server /usr/local/bin/whisper-server
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["whisper-server"]

@@ -124,8 +124,15 @@ def _runtime_ops() -> SimpleNamespace:
 
 
 @pytest.fixture(autouse=True)
-def _restore_runtime_globals():
-    """Real attach/teardown mutate process globals; restore every one."""
+def _restore_runtime_globals(monkeypatch):
+    """Real attach/teardown mutate process globals; restore every one.
+
+    ``monkeypatch`` is undone before the restore, as in the conftest's
+    ``_isolate_persistent_session_runtime``: the restore clears the input
+    owner's ``vars()`` and drops non-function module globals, so a later undo
+    would fail on the instance attributes it deletes (pytest >= 9.2) and leave
+    the patched module functions deleted for the next test.
+    """
 
     import types
 
@@ -142,6 +149,7 @@ def _restore_runtime_globals():
         if isinstance(value, (dict, set, list))
     }
     yield
+    monkeypatch.undo()
     for name in [n for n in vars(pa) if n not in saved and not n.startswith("__")]:
         if not isinstance(
             getattr(pa, name), (types.ModuleType, types.FunctionType, type)

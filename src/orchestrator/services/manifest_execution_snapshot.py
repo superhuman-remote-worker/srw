@@ -17,6 +17,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE
 from orchestrator.services.manifest_store import ManifestStore, decoded
 from shared.manifests.resolution import content_revision
 
@@ -209,12 +210,19 @@ async def prepare_srw_snapshot(
     runner_kind: str = "user",
     expert_row: dict | None = None,
     workspace_selection: dict | None = None,
+    harness_image: str | None = None,
 ) -> dict:
     """Render the complete SRW configuration while the insertion is locked.
 
     The caller binds ``db`` to its active transaction before entering. Account
     defaults, the selected Expert and roster references are captured once. Live
     connector credentials and workspace endpoints are deliberately absent.
+
+    ``harness_image`` is the approved image job admission selected for the
+    Expert (``None``: the installed harness). Every job creation path reaches
+    this funnel, so an Expert's custom image is recorded only when admission
+    chose it; a path that bypassed admission is refused, never run on the
+    installed image instead.
     """
     from orchestrator.services import session_config_resolution as session_config
     from orchestrator.services.config_resolver import resolve_config
@@ -226,7 +234,10 @@ async def prepare_srw_snapshot(
         resolve_runner_grants,
         user_experts_enabled,
     )
-    from orchestrator.services.manifest_experts import installed_srw_image
+    from orchestrator.services.manifest_experts import (
+        approved_srw_images,
+        trusted_srw_image,
+    )
     from orchestrator.services.manifest_projects import project_expert_for_execution
     from orchestrator.services.config_overrides import validated_config_name
     from shared.runtime.core.capability_grants import evaluate
@@ -235,6 +246,7 @@ async def prepare_srw_snapshot(
     )
     from shared.runtime.core.model_registry import resolve_model
     from shared.runtime.core.skill_resolution import filter_bound_skills
+    from shared.runtime.core.subagent_roster import RosterResolutionError
 
     if workspace_selection is not None:
         from orchestrator.services.manifest_workspace_selection import (
@@ -263,13 +275,31 @@ async def prepare_srw_snapshot(
     if expert_id and expert is None:
         raise HTTPException(409, "The selected Expert is no longer available.")
     from orchestrator.services.manifest_runtime_ownership import (
+        custom_srw_image,
         require_srw_expert_configuration,
     )
 
-    trusted_image = getattr(db, "manifest_runtime_image", None) or installed_srw_image()
+    trusted_image = trusted_srw_image(db)
     require_srw_expert_configuration(
-        expert, interactive=role == "session", trusted_image=trusted_image
+        expert,
+        interactive=role == "session",
+        trusted_image=trusted_image,
+        approved_images=approved_srw_images(db),
     )
+    custom_image = (
+        custom_srw_image(
+            expert["manifest"]["spec"]["runtime"], trusted_image=trusted_image
+        )
+        if expert is not None and expert.get("manifest")
+        else None
+    )
+    if harness_image != custom_image:
+        raise HTTPException(
+            422,
+            "This Expert's harness image runs only through job admission."
+            if custom_image is not None
+            else "The selected Expert does not name this harness image.",
+        )
     if expert is not None:
         expert = deepcopy(expert)
         expert["config"] = validate_srw_authored_fragment(expert.get("config"))
@@ -356,17 +386,23 @@ async def prepare_srw_snapshot(
         else None
     )
     capture: dict[str, Any] = {}
-    blob = resolve_config(
-        base_config_name=config_name,
-        base_defaults=defaults,
-        expert_row=expert,
-        project_overrides=project_override,
-        request_override=requested,
-        expert_type=role,
-        capture=capture,
-        skills=skills,
-        db_refs=refs,
-    )
+    try:
+        blob = resolve_config(
+            base_config_name=config_name,
+            base_defaults=defaults,
+            expert_row=expert,
+            project_overrides=project_override,
+            request_override=requested,
+            expert_type=role,
+            capture=capture,
+            skills=skills,
+            db_refs=refs,
+        )
+    except RosterResolutionError as exc:
+        # The fragments above passed one layer at a time; a merged roster
+        # entry that breaks the live voice contract is refused here (a
+        # `live` block on an entry that is not `driver: live`).
+        raise HTTPException(422, str(exc)) from exc
     filter_bound_skills(blob)
     policy = capture["merged_fragment"]
     if await user_experts_enabled(dependencies=deps):
@@ -402,7 +438,7 @@ async def prepare_srw_snapshot(
         description=description,
         datasource_ids=datasource_ids,
         policy_revisions=policy_revisions,
-        image=trusted_image,
+        image=custom_image or trusted_image,
         dependencies=dependencies,
         asset_name=(expert or {}).get("harness_asset_name"),
     )
@@ -525,6 +561,71 @@ def rendered_srw_snapshot(
     }
 
 
+# Settings-matrix keys `_apply_settings_matrix` routes outside `llm` (or never
+# applies there); it re-derives or removes those itself on every pass.
+_MATRIX_KEYS_OUTSIDE_LLM = frozenset(
+    {
+        "limits",
+        "image_tokens",
+        "pdf_render_dpi",
+        "shell_mode",
+        "session_max_concurrent",
+        "summarization_sampling",
+    }
+)
+
+
+def previous_family_llm_resets(
+    frozen_llm: dict,
+    override_llm: dict,
+    *,
+    pinned: set[str],
+    deployment_dir: str | None = None,
+) -> dict[str, None]:
+    """``llm`` keys a model swap must clear so the old family's values go.
+
+    The frozen ``llm`` block already carries the previous family's matrix
+    values. A swap merges onto it and the new family's matrix then overwrites
+    only the keys that family defines, so a key only the old family defines
+    (MiniMax's ``extra_body.reasoning_split``, a ``top_p`` Claude refuses next
+    to ``temperature``) survived into every later turn.
+
+    A key is cleared when the old family's matrix defines it, the new
+    family's does not, and its frozen value is still the matrix value. A
+    value that differs was authored by the Expert or the user and stays, as
+    do keys this request sets and keys the thread's persisted override pins.
+    Clearing is an explicit ``None``: the merge drops the key and the loader
+    default applies, as on a fresh resolve for the new model.
+    """
+    from shared.runtime.core.loader import resolve_model_settings
+
+    old_model = frozen_llm.get("model")
+    new_model = override_llm.get("model")
+    if not old_model or not new_model or new_model == old_model:
+        return {}
+    old_settings = resolve_model_settings(old_model, deployment_dir)
+    new_settings = resolve_model_settings(new_model, deployment_dir)
+    return {
+        key: None
+        for key, value in old_settings.items()
+        if key not in _MATRIX_KEYS_OUTSIDE_LLM
+        and key not in new_settings
+        and key not in override_llm
+        and key not in pinned
+        and value is not None
+        and frozen_llm.get(key) == value
+    }
+
+
+def _persisted_llm_pins(metadata: dict) -> set[str]:
+    """``llm`` keys the thread's own persisted override sets to a value."""
+    persisted = metadata.get("config_override") if isinstance(metadata, dict) else None
+    llm = persisted.get("llm") if isinstance(persisted, dict) else None
+    if not isinstance(llm, dict):
+        return set()
+    return {key for key, value in llm.items() if value is not None}
+
+
 async def prepare_srw_session_patch(
     db: Any,
     current: dict,
@@ -549,12 +650,27 @@ async def prepare_srw_session_patch(
     _, deployment_dir = resolve_config_path(
         private.get("asset_name") or private["config_name"]
     )
+    override_llm = config_override.get("llm")
+    if isinstance(override_llm, dict):
+        resets = previous_family_llm_resets(
+            blob["agent"].get("llm") or {},
+            override_llm,
+            pinned=_persisted_llm_pins(metadata),
+            deployment_dir=deployment_dir,
+        )
+        if resets:
+            config_override = {
+                **config_override,
+                "llm": {**override_llm, **resets},
+            }
     updated, policy, delivery_override = patch_frozen_session(
         blob, policy, config_override, deployment_dir=deployment_dir
     )
     # Ordered controls are an independent authority; the saved policy must
     # check the same current values that the next attach will deliver.
-    interactive = {"permission_mode": thread.get("permission_mode") or "supervised"}
+    interactive = {
+        "permission_mode": thread.get("permission_mode") or DEFAULT_PERMISSION_MODE
+    }
     if thread.get("narration_mode") is not None:
         interactive["narration_mode"] = thread["narration_mode"]
     for fragment in (updated["agent"], policy):

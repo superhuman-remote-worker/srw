@@ -80,3 +80,111 @@ class TestNonLiteRejected:
         cfg = SimpleNamespace(backend="sandbox", mounts=None)
         with pytest.raises(ValueError, match="non-lite backend"):
             create_lite_backend(cfg, job_id="job-1")
+
+
+class TestVirtualCloudFolders:
+    """Entries after the first mount are cloud folders under ``cloud/<name>``
+    (features/cloud_folders_on_virtual_sessions.md § Agent)."""
+
+    def _cfg(self, *entries):
+        return SimpleNamespace(
+            backend="virtual",
+            mounts=[
+                {
+                    "name": "workspace",
+                    "rclone_spec": {"type": "memory"},
+                    "prefix": "threads/t/",
+                },
+                *entries,
+            ],
+        )
+
+    def test_each_entry_becomes_a_folder_over_its_own_store(self):
+        b = create_lite_backend(
+            self._cfg(
+                {
+                    "name": "outbox",
+                    "mount_id": "c-1",
+                    "mount_kind": "cloud_outbox",
+                    "access": "read_write",
+                    "shared": False,
+                    "rclone_spec": {"type": "memory", "config": {}, "root": ""},
+                },
+                {
+                    "name": "cloud/proj",
+                    "mount_id": "c-2",
+                    "mount_kind": "project",
+                    "access": "read_only",
+                    "rclone_spec": {"type": "memory"},
+                },
+            ),
+            job_id="t",
+        )
+        assert b.root == "threads/t/"
+        rows = b.cloud_folders()
+        assert [
+            (r["name"], r["path"], r["access"], r["kind"], r["mount_id"]) for r in rows
+        ] == [
+            ("outbox", "cloud/outbox", "read_write", "cloud_outbox", "c-1"),
+            ("proj", "cloud/proj", "read_only", "project", "c-2"),
+        ]
+        assert rows[0]["shared"] is False and rows[1]["shared"] is None
+        b.write_file("cloud/outbox/r.md", "r")
+        b.write_file("r.md", "w")
+        stores = [r.store for r in b.cloud_remotes]
+        assert stores[0] is not stores[1]
+        assert stores[0].get("r.md") == b"r" and stores[1].list("") == []
+
+    def test_cloud_folders_false_binds_the_workspace_only(self):
+        cfg = self._cfg({"name": "outbox", "rclone_spec": {"type": "memory"}})
+        b = create_lite_backend(cfg, job_id="t", cloud_folders=False)
+        assert b.cloud_remotes == []
+        assert b.list_dir("") == []
+
+    def test_an_entry_without_a_name_or_type_is_refused(self):
+        with pytest.raises(ValueError, match="no usable name"):
+            create_lite_backend(
+                self._cfg({"rclone_spec": {"type": "memory"}}), job_id="t"
+            )
+        with pytest.raises(ValueError, match="no rclone remote type"):
+            create_lite_backend(self._cfg({"name": "x", "rclone_spec": {}}), job_id="t")
+
+    def test_rclone_folders_get_distinct_remote_aliases(self):
+        from shared.runtime.core.backends.rclone import RcloneObjectStore
+
+        b = create_lite_backend(
+            self._cfg(
+                {
+                    "name": "outbox",
+                    "rclone_spec": {
+                        "type": "webdav",
+                        "config": {
+                            "url": "https://c/remote.php/dav",
+                            "user": "svc",
+                            "pass": "x",
+                        },
+                        "root": "sessions/t",
+                    },
+                },
+                {
+                    "name": "my_cloud",
+                    "rclone_spec": {
+                        "type": "webdav",
+                        "config": {
+                            "url": "https://c/remote.php/dav",
+                            "user": "me",
+                            "pass": "y",
+                        },
+                        "root": "",
+                    },
+                },
+            ),
+            job_id="t",
+        )
+        stores = [r.store for r in b.cloud_remotes]
+        assert all(isinstance(s, RcloneObjectStore) for s in stores)
+        envs = [s._env_overlay for s in stores]
+        assert "RCLONE_CONFIG_CLOUD_OUTBOX_PASS" in envs[0]
+        assert "RCLONE_CONFIG_CLOUD_MY_CLOUD_PASS" in envs[1]
+        assert stores[0]._remote_path("r.md") == "cloud_outbox:sessions/t/r.md"
+        assert stores[1]._remote_path("r.md") == "cloud_my_cloud:r.md"

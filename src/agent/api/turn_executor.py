@@ -92,6 +92,11 @@ from agent.api.session_input import (
     INTERRUPT_CAUSE_LEASE_LOST,
     INTERRUPT_CAUSE_SHUTDOWN,
 )
+from agent.api.workspace_upgrade_seed import (
+    claim_bundle_workspace_upgrade_seed,
+    seed_upgraded_workspace,
+)
+from agent.core.thread_messages import content_text
 from shared.event_journal import append_system_frame, bump_epoch
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
@@ -126,6 +131,7 @@ from shared.run_queue import (
     transient_release_backoff_seconds,
 )
 from shared.session_permission_retirement import retire_stale_stateless_permissions
+from shared.session_tool_debt import SESSION_TOOL_DEBT_SQL
 from shared.session_pending_memory import (
     SESSION_PENDING_MEMORY_KEY,
     valid_pending_memory,
@@ -464,72 +470,9 @@ SELECT NOT EXISTS (
 )
 """
 
-# Consumption is an input watermark, not proof that an external command
-# finished. A successor must inspect all live debt before restore can repair
-# an unanswered call out of model context. Delegation-only batches retain
-# their existing child-ledger recovery; mixed batches remain ambiguous.
-_SESSION_TOOL_DEBT_SQL = """
-SELECT EXISTS (
-    SELECT 1 FROM thread_messages AS malformed_row
-     WHERE malformed_row.thread_id = $1::uuid
-       AND malformed_row.role = 'ai'
-       AND malformed_row.rewound_at IS NULL
-       AND malformed_row.tool_calls IS NOT NULL
-       AND jsonb_typeof(malformed_row.tool_calls) IS DISTINCT FROM 'array'
-) OR EXISTS (
-    -- A result identifies a call by turn/id, not an occurrence. Duplicate
-    -- same-turn IDs cannot prove which physical effect that result settled.
-    SELECT 1
-      FROM thread_messages AS duplicate_row
-     CROSS JOIN LATERAL jsonb_array_elements(
-         CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
-              THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
-     ) AS duplicate_call
-     WHERE duplicate_row.thread_id = $1::uuid
-       AND duplicate_row.role = 'ai'
-       AND duplicate_row.rewound_at IS NULL
-     GROUP BY duplicate_row.turn_number, duplicate_call ->> 'id'
-    HAVING COUNT(*) > 1 AND BOOL_OR(EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-            CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
-                 THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
-        ) AS sibling
-        WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
-    ))
-) OR EXISTS (
-    SELECT 1
-      FROM thread_messages AS call_row
-     CROSS JOIN LATERAL jsonb_array_elements(
-         CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
-              THEN call_row.tool_calls ELSE '[]'::jsonb END
-     ) AS tool_call
-     WHERE call_row.thread_id = $1::uuid
-       AND call_row.role = 'ai'
-       AND call_row.rewound_at IS NULL
-       AND (
-           jsonb_typeof(tool_call -> 'id') IS DISTINCT FROM 'string'
-           OR BTRIM(COALESCE(tool_call ->> 'id', '')) = ''
-           OR NOT EXISTS (
-               SELECT 1 FROM thread_messages AS result_row
-                WHERE result_row.thread_id = call_row.thread_id
-                  AND result_row.role = 'tool'
-                  AND result_row.rewound_at IS NULL
-                  AND result_row.seq > call_row.seq
-                  AND result_row.turn_number IS NOT DISTINCT FROM call_row.turn_number
-                  AND result_row.tool_call_id = tool_call ->> 'id'
-           )
-       )
-       AND EXISTS (
-           SELECT 1 FROM jsonb_array_elements(
-               CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
-                    THEN call_row.tool_calls ELSE '[]'::jsonb END
-           ) AS sibling
-            WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
-               OR jsonb_typeof(sibling -> 'id') IS DISTINCT FROM 'string'
-               OR BTRIM(COALESCE(sibling ->> 'id', '')) = ''
-       )
-)
-"""
+# The transcript-side tool-debt definition lives in shared.session_tool_debt
+# (the orchestrator's owner decision reads the same rows).
+_SESSION_TOOL_DEBT_SQL = SESSION_TOOL_DEBT_SQL
 
 _SESSION_TOOL_DEBT_AUTHORITY_SQL = (
     """
@@ -619,12 +562,7 @@ def _message_text(msg: Any) -> str:
     """Best-effort text of a message's content (list content is flattened
     exactly like ``_serialize_message_row`` does at persist time, so a
     restored row's stored content compares equal)."""
-    content = getattr(msg, "content", None)
-    if isinstance(content, list):
-        return " ".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
-        )
-    return content if isinstance(content, str) else str(content or "")
+    return content_text(getattr(msg, "content", None))
 
 
 def attach_fingerprint(attach: Dict[str, Any]) -> str:
@@ -1007,6 +945,9 @@ _DETERMINISTIC_RELEASE_REASONS = frozenset(
         # takes the shutdown release. A DB blip can end the loop too, which is
         # why the budget is max_attempts such failures, not one.
         "loop_died",
+        # The upgraded workspace can't receive its files (object store, SFTP
+        # or Git): bounded, so a Session that can never copy parks visibly.
+        "workspace_upgrade_seed_failed",
     }
 )
 _TRANSIENT_RELEASE_REASONS = frozenset(
@@ -4400,6 +4341,29 @@ class StatelessTurnExecutor:
                 timing["interrupt_recovery"],
             )
 
+        # A stateless workspace upgrade (C1) still owes its file copy: make it
+        # before any control or input runs, on the container just attached.
+        upgrade_seed = claim_bundle_workspace_upgrade_seed(bundle)
+        if upgrade_seed is not None:
+            try:
+                await seed_upgraded_workspace(
+                    pa._session, upgrade_seed, thread_id=unit_id, lease_token=token
+                )
+            except LeaseLostError:
+                self._lease.mark_lost()
+                await self._detach_cached_session("lease_lost_during_upgrade_seed")
+                return
+            except Exception as e:
+                logger.warning(
+                    "workspace upgrade seed failed for unit %s: %s",
+                    unit_id,
+                    e,
+                    exc_info=True,
+                )
+                await self._detach_cached_session("workspace_upgrade_seed_failed")
+                await self._release(claim, reason="workspace_upgrade_seed_failed")
+                return
+
         # Controls are consumed only by the exact serving owner. The initial
         # drain is synchronous so a control-only claim cannot take either
         # no-input completion edge; the watcher then stays live for mid-turn
@@ -5649,6 +5613,15 @@ class StatelessTurnExecutor:
             # A previous cached owner may still be resident. No validated
             # bundle/attach will retire it on this refusal, so do not accept
             # another owner after an unproven claim or predecessor authority.
+            # The executor stays stopped (pod unready) until it is replaced;
+            # say so, or the pod just goes quiet.
+            logger.error(
+                "session tool-history admission refused: unit=%s token=%d — "
+                "this claim's authority or the predecessor's claim record is "
+                "unproven; stopping this executor until the pod is replaced",
+                claim.unit_id,
+                claim.lease_token,
+            )
             self.request_stop()
             return False
         if not row["unresolved"]:
@@ -5698,6 +5671,12 @@ class StatelessTurnExecutor:
             release_reason="unresolved_predecessor_tool",
         )
         if outcome is None and not clear:
+            logger.error(
+                "session tool-debt park lost its authority: unit=%s token=%d; "
+                "stopping this executor until the pod is replaced",
+                claim.unit_id,
+                claim.lease_token,
+            )
             self.request_stop()
         # A real late result may clear the debt under the same locked claim.
         # A lost commit response is the existing idempotent parked outcome,
@@ -6030,7 +6009,12 @@ class StatelessTurnExecutor:
             reason=f"release_{reason}",
             claim=claim,
         )
-        if self._lease.lost.is_set():
+        # Only a loss of this exact claim skips the release. Before attach the
+        # shared handle still names the previous warm claim, whose old fence
+        # marks it lost once the queue moved on; skipping on that left this
+        # live lease to expire into a counted reaper steal. A claim that is
+        # really gone makes the token-guarded release a no-op.
+        if self._exact_claim_handle_lost(claim):
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s "
                 "skipped after local ownership loss",
@@ -6038,8 +6022,7 @@ class StatelessTurnExecutor:
                 claim.lease_token,
                 reason,
             )
-            if self._exact_claim_handle_lost(claim):
-                await self._ack_terminal_claim_loss(claim)
+            await self._ack_terminal_claim_loss(claim)
             return
 
         deterministic = _release_is_deterministic(reason)
@@ -6121,15 +6104,17 @@ class StatelessTurnExecutor:
             reason="release_model_unavailable",
             claim=claim,
         )
-        if self._lease.lost.is_set():
+        # As in _release: the refusal comes before attach, while the shared
+        # handle may still name the previous warm claim. Only this claim's own
+        # loss skips the park; a gone claim makes the token-guarded park a no-op.
+        if self._exact_claim_handle_lost(claim):
             logger.info(
                 "run_queue release: unit=%s token=%d reason=model_unavailable "
                 "skipped after local ownership loss",
                 claim.unit_id,
                 claim.lease_token,
             )
-            if self._exact_claim_handle_lost(claim):
-                await self._ack_terminal_claim_loss(claim)
+            await self._ack_terminal_claim_loss(claim)
             return
         error_text = message[:_LAST_ERROR_CHARS]
 

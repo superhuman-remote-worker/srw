@@ -9,13 +9,20 @@ re-exports these names unchanged (its tests import them from there).
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Mapping, Optional
 
 from shared.runtime.llm.reasoning_chat import extract_reasoning_text_from_block
 from shared.runtime.core.context_entries import SRW_INJECTION_KEY
-from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT, PERSIST_ROLE_EVENT
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
+from shared.tool_result_state import (
+    TOOL_RESULT_STATE_KEY,
+    TOOL_RESULT_STATES,
+    tool_result_state_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,35 +81,235 @@ _ROLE_MAP = {
 }
 
 
-#: provider_raw key for an Anthropic turn's native content blocks.
+#: provider_raw key for a message's list content as the provider got it: an
+#: assistant turn's native blocks, the parts of a tool's image row. JSON text
+#: where jsonb would reorder the keys of a block (:func:`_jsonb_text`).
+NATIVE_CONTENT_KEY = "content"
+#: The key Anthropic turns were stored under before every provider's turn
+#: was; restore still reads it.
 ANTHROPIC_CONTENT_KEY = "anthropic_content"
-_ANTHROPIC_NATIVE_BLOCKS = frozenset({"thinking", "redacted_thinking", "tool_use"})
+#: additional_kwargs a provider SDK reads back when it formats the turn:
+#: langchain-google-genai keeps each function call's thought signature here,
+#: by tool-call id.
+_REPLAYED_KWARGS = ("__gemini_function_call_thought_signatures__",)
+#: Replay Responses item ids only this long: OpenAI stores responses 30 days.
+RESPONSES_ITEM_RETENTION = timedelta(days=25)
 
 
-def _anthropic_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
-    """The native content blocks of an Anthropic turn, for ``provider_raw``.
+def _native_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
+    """The provider-native form of an assistant turn, for ``provider_raw``.
 
     ``content`` stores the flattened text, which a restore cannot replay as the
-    turn the provider produced: its thinking blocks (with their signatures)
-    are gone and the text block becomes a string, so the next request no longer
-    starts with the previous one (a cache miss at that turn) and the model
-    loses its earlier reasoning. The blocks and the producing model are kept
-    here and restored by ``_db_rows_to_lc_messages``.
+    turn the provider produced: Anthropic's thinking blocks (with their
+    signatures), the Responses API's reasoning items and item ids, and
+    Gemini's thought parts and signatures are gone, so the next request no
+    longer starts with the previous one (a cache miss at that turn) and the
+    model loses its earlier reasoning. The blocks (in their key order), the
+    producing model and provider, and the kwargs the provider's SDK replays
+    are kept here and restored by :func:`native_ai_fields`. A plain-text turn
+    needs none of it.
     """
     content = getattr(msg, "content", None)
-    if not isinstance(content, list):
+    kwargs = getattr(msg, "additional_kwargs", None) or {}
+    replayed = {k: kwargs[k] for k in _REPLAYED_KWARGS if kwargs.get(k)}
+    if not isinstance(content, list) and not replayed:
         return None
     metadata = getattr(msg, "response_metadata", None) or {}
-    # A text-only Claude turn (adaptive thinking skipped) is a list too.
-    if metadata.get("model_provider") != "anthropic" and not any(
-        isinstance(b, dict) and b.get("type") in _ANTHROPIC_NATIVE_BLOCKS
-        for b in content
-    ):
+    raw: Dict[str, Any] = {}
+    model = metadata.get("model_name") or metadata.get("model")
+    if model:
+        raw["model"] = model
+    if metadata.get("model_provider"):
+        raw["provider"] = metadata["model_provider"]
+    if isinstance(content, list):
+        raw[NATIVE_CONTENT_KEY] = _stored_content(
+            [b for b in content if isinstance(b, (dict, str))]
+        )
+    if replayed:
+        raw["additional_kwargs"] = replayed
+    return raw
+
+
+def _aware(value: Any) -> Optional[datetime]:
+    """A row's ``created_at`` as an aware datetime; ``None`` without one."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
         return None
-    return {
-        ANTHROPIC_CONTENT_KEY: [b for b in content if isinstance(b, (dict, str))],
-        "model": metadata.get("model_name") or metadata.get("model"),
-    }
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _item_ids_expired(
+    provider_raw: Mapping[str, Any], content: list, created_at: Any
+) -> bool:
+    """Whether a Responses turn's item ids may point at a response OpenAI no
+    longer stores.
+
+    Replayed, every later request fails ("Item with id ... not found"), and
+    after that long the prompt cache is gone too. Claude's and Gemini's blocks
+    are self-contained and never expire; a row without its time counts as
+    young.
+    """
+    if provider_raw.get("provider") != "openai":
+        return False
+    if not any(isinstance(block, dict) and block.get("id") for block in content):
+        return False
+    created = _aware(created_at)
+    return (
+        created is not None
+        and datetime.now(timezone.utc) - created > RESPONSES_ITEM_RETENTION
+    )
+
+
+def native_ai_fields(provider_raw: Any, created_at: Any = None) -> Dict[str, Any]:
+    """The ``AIMessage`` fields a row's ``provider_raw`` restores.
+
+    ``content`` is the turn's native blocks, ``response_metadata`` names the
+    model and provider that produced it (the provider boundary sanitizer and
+    each SDK's formatting read them), and ``additional_kwargs`` holds what the
+    SDK replays. Empty for a row without the envelope (a plain-text turn, or
+    one stored before it existed): the row's text is the content. Empty as
+    well for a Responses turn whose row (``created_at``) is older than
+    :data:`RESPONSES_ITEM_RETENTION`: it comes back as its text and calls, as
+    before the envelope. Shared by the session restore and the
+    child-transcript restore.
+    """
+    if not isinstance(provider_raw, dict):
+        return {}
+    fields: Dict[str, Any] = {}
+    content = _native_content(provider_raw)
+    if content is not None and _item_ids_expired(provider_raw, content, created_at):
+        return {}
+    if content is not None:
+        fields["content"] = content
+    metadata: Dict[str, Any] = {}
+    if provider_raw.get("model"):
+        metadata["model_name"] = provider_raw["model"]
+    if provider_raw.get("provider"):
+        metadata["model_provider"] = provider_raw["provider"]
+    if metadata:
+        fields["response_metadata"] = metadata
+    kwargs = provider_raw.get("additional_kwargs")
+    if isinstance(kwargs, dict):
+        replayed = {k: kwargs[k] for k in _REPLAYED_KWARGS if kwargs.get(k)}
+        if replayed:
+            fields["additional_kwargs"] = replayed
+    return fields
+
+
+#: tool_calls entry key: the call's arguments as JSON text.
+ARGUMENTS_KEY = "arguments"
+
+
+def content_text(content: Any) -> str:
+    """The text the ``content`` column stores for a message's content.
+
+    Only text-bearing parts of list content join. Joining every part stored a
+    [thinking, tool_use] turn as " ", which a restore replays as a
+    whitespace-only text block that Anthropic rejects, and a tool's image row
+    as its text plus a trailing space.
+    """
+    if isinstance(content, list):
+        parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
+        return " ".join(part for part in parts if part)
+    return content if isinstance(content, str) else str(content or "")
+
+
+def _jsonb_key_order(value: Any) -> Any:
+    """``value`` with every object's keys in the order jsonb returns them:
+    shorter keys first, keys of one length in byte order."""
+    if isinstance(value, dict):
+        return {
+            key: _jsonb_key_order(value[key])
+            for key in sorted(
+                value, key=lambda k: (len(str(k).encode()), str(k).encode())
+            )
+        }
+    if isinstance(value, list):
+        return [_jsonb_key_order(item) for item in value]
+    return value
+
+
+def _jsonb_text(value: Any) -> Optional[str]:
+    """``value`` as JSON text, when a jsonb column would reorder its keys.
+
+    ``tool_calls`` and ``provider_raw`` are jsonb columns, which keep no key
+    order, and the provider clients send what a restore hands them in its
+    order: a tool call's ``args`` serialised with ``json.dumps``, a turn's
+    native blocks (an Anthropic thinking block, a Responses item, a Gemini
+    part) as they are. A restored value whose keys came back reordered sends
+    other bytes than the live one: a cache miss from that message on. The
+    text keeps the order; ``None`` when jsonb keeps it too.
+    """
+    text = json.dumps(value)
+    if text == json.dumps(_jsonb_key_order(value)):
+        return None
+    return text
+
+
+def _arguments_text(args: Any) -> Optional[str]:
+    """A tool call's arguments as JSON text, when jsonb would reorder them
+    (:func:`_jsonb_text`); ``args`` stays for every other reader."""
+    if not isinstance(args, dict):
+        return None
+    return _jsonb_text(args)
+
+
+def _stored_content(content: list) -> Any:
+    """List content for ``provider_raw``: as it is, or as JSON text where
+    jsonb would reorder it (read back by :func:`_native_content`)."""
+    text = _jsonb_text(content)
+    return content if text is None else text
+
+
+def _native_content(provider_raw: Any) -> Optional[list]:
+    """A row's list content from ``provider_raw``, in the live key order.
+
+    Stored as JSON text or as the list (:func:`_stored_content`); an Anthropic
+    turn stored before every provider's turn was has its blocks under
+    ``anthropic_content``. ``None`` for a row without it, or with unreadable
+    text: the row's text is the content then.
+    """
+    if not isinstance(provider_raw, Mapping):
+        return None
+    for key in (NATIVE_CONTENT_KEY, ANTHROPIC_CONTENT_KEY):
+        value = provider_raw.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                logger.debug("Unreadable stored %s of a thread_messages row", key)
+                value = None
+        if isinstance(value, list):
+            return value
+    return None
+
+
+def restored_tool_call_args(call: Mapping[str, Any]) -> Any:
+    """A stored tool call's ``args``, in the key order the live call had."""
+    text = call.get(ARGUMENTS_KEY)
+    if isinstance(text, str):
+        try:
+            return json.loads(text)
+        except ValueError:
+            logger.debug("Unreadable stored arguments of tool call %s", call.get("id"))
+    return call.get("args", {})
+
+
+def restored_human_content(row: Mapping[str, Any]) -> Any:
+    """The content of a human or event row as the live history held it.
+
+    A tool's image row keeps its parts (text, image) in ``provider_raw``, as
+    an assistant turn keeps its blocks; the ``content`` column holds their
+    text only, for the transcript.
+    """
+    parts = _native_content(row.get("provider_raw"))
+    if parts:
+        return parts
+    return row.get("content") or ""
 
 
 def _serialize_message_row(
@@ -149,6 +356,9 @@ def _serialize_message_row(
                 "args": t.get("args"),
                 "id": t.get("id"),
             }
+            arguments = _arguments_text(t.get("args"))
+            if arguments is not None:
+                entry[ARGUMENTS_KEY] = arguments
             decision = (tool_decisions or {}).get(t.get("id") or "")
             if decision:
                 entry["decision"] = decision
@@ -156,17 +366,23 @@ def _serialize_message_row(
     # Extract reasoning content + tool-call back-reference BEFORE we flatten
     # Anthropic's list-of-dicts content (which drops the thinking blocks).
     thinking = _extract_thinking(msg) if role == "ai" else None
-    provider_raw = _anthropic_provider_raw(msg) if role == "ai" else None
+    provider_raw = _native_provider_raw(msg) if role == "ai" else None
     tool_call_id = getattr(msg, "tool_call_id", None) if role == "tool" else None
-    # Normalize content for Anthropic list-of-dicts format
-    # Only text-bearing parts join: a [thinking, tool_use] turn persisted as
-    # " ", which a restore replays as a whitespace-only text block that
-    # Anthropic rejects.
     if isinstance(content, list):
-        parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in content]
-        content = " ".join(part for part in parts if part)
-    # Attach metrics only to AI messages (not tool results)
+        if role in ("human", PERSIST_ROLE_EVENT):
+            # A tool's image row: the image and the text parts as the live
+            # history holds them, so a restore sends what the live loop sends
+            # (the image included) and a context entry folds in as a part.
+            provider_raw = {NATIVE_CONTENT_KEY: _stored_content(content)}
+        content = content_text(content)
+    # Attach the turn metrics only to AI messages. A tool result carries one
+    # thing there: the marker of a result that does not report what the call
+    # did (shared/tool_result_state.py).
     msg_metrics = metrics if role == "ai" else None
+    if role == "tool" and tool_call_id:
+        state = getattr(msg, "additional_kwargs", {}).get(TOOL_RESULT_STATE_KEY)
+        if state in TOOL_RESULT_STATES:
+            msg_metrics = tool_result_state_metrics(state, tool_call_id)
     row: Dict[str, Any] = {
         "id": getattr(msg, "id", None),
         "role": role,
@@ -207,8 +423,15 @@ async def _persist_one_message(
 
 
 __all__ = [
+    "ARGUMENTS_KEY",
+    "NATIVE_CONTENT_KEY",
+    "RESPONSES_ITEM_RETENTION",
     "_ROLE_MAP",
     "_extract_thinking",
     "_persist_one_message",
     "_serialize_message_row",
+    "content_text",
+    "native_ai_fields",
+    "restored_human_content",
+    "restored_tool_call_args",
 ]

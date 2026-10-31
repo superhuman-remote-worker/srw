@@ -161,6 +161,24 @@ def test_errors_identify_document_and_path_without_echoing_values():
     assert issue.document == 2
     assert issue.path == "/spec/runtime"
     assert "PRIVATE-SENTINEL" not in str(issue)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("command", ["/bin/sh"]),
+        ("args", ["-c", "id"]),
+        ("probes", {"liveness": {"exec": {"command": ["true"]}}}),
+    ],
+)
+def test_runtime_has_no_launch_override_fields(field, value):
+    """An image starts with its own entrypoint. Nothing an author writes can
+    replace it, so the fields do not exist rather than being refused later."""
+    doc = resource(spec={"runtime": {"image": "example/worker:1", field: value}})
+    issue = error_code(
+        "UnknownField", parse_documents, json.dumps([doc]), format="json"
+    )
+    assert issue.path == "/spec/runtime"
     error = error_code(
         "DuplicateKey",
         parse_documents,

@@ -75,27 +75,23 @@ HMAC authentication and an amd64 SRW-compatible VM image. Build/publish the
 CI. Deploy the chart, orchestrator and controller from the same revision before
 enabling preparation. The default is disabled.
 
-Main dev enabled offline preparation through Fleet on 2026-09-13, using chart
-`0.0.999` and its published controller/builder images. Its startup network-policy
-check allowed both public and private traffic, so online preparation remains
-disabled there. Offline commands still run with libguestfs `--no-network`.
-The [main-dev acceptance](verification/main-dev-prepared-srw-2026-09-13.json)
+On a multi-node K3s cluster, the startup network-policy check allowed both
+public and private traffic, so online preparation stays disabled there unless
+the preparation Pod firewall described below is enabled. Offline commands still
+run with libguestfs `--no-network`. An offline acceptance run on such a cluster
 passed cold preparation, fresh cache reuse, retained handoff, build failure,
 running-builder cancellation and cleanup through MCP and the real SRW harness.
 The successful Jobs verified their prepared tool and workspace files through SSH.
 The sample cold Job took 16m43s from admission to completion; the cache-hit Job
-took 4m29s, including its independent disk clone and VM boot. This run did not
-repeat a full nested SRW/Tilt deployment.
+took 4m29s, including its independent disk clone and VM boot.
 
-The 2026-09-14 release candidate adds the preparation Pod firewall described
-below. Its [offline](verification/k3d-pod-firewall-prepared-srw-2026-09-14.json)
-and [online](verification/k3d-online-prepared-srw-2026-09-14.json) local k3d gates
+With the preparation Pod firewall, the
+[offline](verification/k3d-pod-firewall-prepared-srw-2026-09-14.json) and
+[online](verification/k3d-online-prepared-srw-2026-09-14.json) local k3d gates
 both passed all six MCP/VM/harness cases and cleanup. Online Jobs executed a
 package downloaded during preparation, including cache reuse and retained-disk
-handoff. Production firewall Pods also passed startup checks on all five main
-nodes in owned test namespaces. The candidate has not yet replaced main's
-installed chart/runtime; main therefore remains offline. See the
-[release verification record](verification/release-contract-2026-09-14.json).
+handoff. Firewall Pods also passed startup checks on every node of a five-node
+K3s cluster in owned test namespaces.
 
 ```yaml
 vm:
@@ -131,7 +127,8 @@ key or Connector credentials. Networking is off by default. Package downloads
 require `network.enabled: true` and `network.enforcementVerified: true` after the
 operator verifies isolation from the first application packet, including new Pod
 startup. Merely having a NetworkPolicy object is insufficient; both the local
-k3d K3s profile and main dev allowed startup traffic before enforcing the policy.
+k3d K3s profile and a multi-node K3s cluster allowed startup traffic before
+enforcing the policy.
 
 The optional `network.podFirewall: true` profile installs default-deny rules in
 each builder Pod before preparation starts. A separate trusted init container

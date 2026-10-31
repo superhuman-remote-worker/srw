@@ -5,9 +5,11 @@
 [![Main CI](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml/badge.svg)](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml)
 [![Latest tag](https://img.shields.io/github/v/tag/superhuman-remote-worker/srw?label=release)](https://github.com/superhuman-remote-worker/srw/tags)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-9c2832)](LICENSE)
+[![Status: public beta](https://img.shields.io/badge/status-public%20beta-5b4a8b)](docs/versioning.md)
 
 [Website](https://superhuman-remote-worker.com/) ·
-[Documentation](docs/README.md) ·
+[Documentation](https://docs.superhuman-remote-worker.com/) ·
+[Get started](docs/getting-started.md) ·
 [Helm install](helm/README.md)
 
 [![SRW — A complete agent platform, under your control. Travertine banner with a three-pillar Roman temple.](docs/assets/readme-hero.png)](https://superhuman-remote-worker.com/)
@@ -39,10 +41,12 @@ The model is replaceable. The execution, memory, permissions, observability,
 and recovery layers around it are the product.
 
 > [!IMPORTANT]
-> SRW is under active development and can execute model-generated code. Start
-> with disposable data and supervised or review-gated workflows. Read the
-> [security model](docs/security-model.md) before connecting valuable systems or
-> enabling unattended work.
+> SRW is a public beta. Run one deployment per organisation, for users you
+> trust: it is single-tenant, and the separation between users and projects
+> on one deployment is not yet a hardened security boundary. SRW executes
+> model-generated code. Start with disposable data and supervised or
+> review-gated workflows, and read the [security model](docs/security-model.md)
+> before connecting valuable systems or enabling unattended work.
 
 ## The mental model
 
@@ -88,23 +92,39 @@ manage citations, and delegate work to other agents.
 
 ## Quick start
 
-SRW deploys through Helm to Kubernetes. The supported local evaluation path
-runs the same chart on a single-node [k3d](https://k3d.io) cluster.
+SRW installs as one Helm chart on Kubernetes: a fresh Linux machine running
+k3s, or a cluster you already have.
+
+1. Open the configurator at <https://superhuman-remote-worker.com/configure>.
+   The form runs in your browser, and your answers stay there. It writes your
+   Helm values, the Secrets, an `install.sh` and a runbook.
+2. Follow [Get started](docs/getting-started.md). It covers the requirements,
+   the install and the first login, then adding models and running a first
+   session and job.
+
+A single k3s node needs at least **8 vCPU and 16 GiB RAM**. You also need an
+[OpenRouter](https://openrouter.ai/keys) API key: that one key covers the
+chat, embedding and rerank models SRW requires (see [Models](docs/models.md)).
+
+### Run from a clone on k3d
+
+To develop SRW or evaluate changes to it, run the same chart on a single-node
+[k3d](https://k3d.io) cluster from a clone.
 
 You need a Linux host with at least **8 vCPU and 16 GiB RAM**, plus Docker,
 `kubectl`, Helm 3.12+, k3d, OpenSSL, and an SSH client. The default multi-host
-local profile also needs `mkcert`; the single-origin profile does not. You need
-an API key for at least one configured LLM provider. See the
-[complete local prerequisites](docs/local-kubernetes.md#prerequisites) before
-starting.
+local profile also needs `mkcert`; the single-origin profile does not. Bring
+the same OpenRouter key. See the
+[complete local prerequisites](docs/local-kubernetes.md#prerequisites)
+before starting.
 
 ```bash
 git clone https://github.com/superhuman-remote-worker/srw.git
 cd srw
 
-# Add at least one OPENAI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY.
-# Optionally declare providers, models and default pins under `llm.seed`
-# so a rebuilt cluster needs no Settings → Models setup.
+# Paste your OpenRouter key into llm.seed.systemApiKeys.openrouter.value.
+# The file already seeds a chat model, the Qwen embedding and reranker, and
+# their defaults from that key (docs/models.md covers other providers).
 cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 
@@ -170,9 +190,17 @@ setting:
 | Workspace | Best for | Boundary and limitations |
 |---|---|---|
 | **Virtual** | Fast, durable file work | Cloud-backed files without a workspace process; no shell, git, or interactive browser |
-| **Container** | General coding, browser, and shell work | Separate pod and filesystem, but shares the node kernel; FUSE-enabled deployments may run the workspace privileged |
+| **Container** | General coding, browser, and shell work | Separate pod and filesystem, but shares the node kernel; runs privileged by default (see below) |
 | **VM** | Work requiring a stronger boundary or gated root access | Separate guest kernel through QEMU/KubeVirt; higher startup and resource cost |
 | **None** | Conversation and tools that need no files | No workspace files, shell, browser, or git |
+
+Container workspaces on SRW's own images run privileged by default, with
+seccomp `Unconfined`, so rclone can mount cloud folders with FUSE. A Session
+whose cloud folders come from the in-pod plane's sidecars runs unprivileged. To
+run no privileged workspace, set `workspace.fuse.enabled: false` and
+`cloud.rcloneMount.allowContainer: false`; a Container Session then gets its
+outbox but no mounted cloud folders. See the
+[security model](docs/security-model.md#workspace-boundaries).
 
 Managed Sessions default to Virtual; workers default to Container (`sandbox`).
 Explicit workspace selections and Project/account defaults take precedence over
@@ -249,7 +277,8 @@ vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 
 | Goal | Start here |
 |---|---|
-| Evaluate SRW on one Linux machine | [Local Kubernetes with k3d](docs/local-kubernetes.md) |
+| Install SRW on a server or cluster | [Get started](docs/getting-started.md) |
+| Run SRW from a clone on one Linux machine | [Local Kubernetes with k3d](docs/local-kubernetes.md) |
 | Install or operate the Helm chart | [Helm chart guide](helm/README.md) |
 | Understand components and lifecycles | [Architecture](docs/architecture.md) |
 | Understand isolation and trust boundaries | [Security model](docs/security-model.md) |
@@ -257,7 +286,7 @@ vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 | Configure experts | [Expert configuration](config/README.md) |
 | Try the v1alpha1 resource configuration contract | [Manifest examples and preview](examples/manifests/README.md) |
 | Connect to a session workspace over SSH | [SSH access](ssh-access.md) |
-| Browse all public documentation | [Documentation index](docs/README.md) |
+| Browse all public documentation | [docs.superhuman-remote-worker.com](https://docs.superhuman-remote-worker.com/) |
 
 ## Contributing
 

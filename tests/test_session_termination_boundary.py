@@ -17,7 +17,7 @@ from agent.api.session_termination import (
 )
 
 
-def owner(*, session=None, officer=None, stateless=False):
+def owner(*, session=None, officer=None, stateless=False, **ports):
     identity = SimpleNamespace(
         thread_id="captured",
         session_generation="generation",
@@ -44,6 +44,7 @@ def owner(*, session=None, officer=None, stateless=False):
         session_type=SimpleNamespace,
         idle_timeout_error=TimeoutError,
     )
+    values.update(ports)
     return SessionTerminationCoordinator(
         SessionTerminationPorts(**values),
         logger=logging.getLogger(__name__),
@@ -184,3 +185,53 @@ def test_native_notice_does_not_latch_no_watchdog_officer_or_stateless_life():
         runtime.ws_connected_event = asyncio.Event()
         assert runtime.note_native_first_use(life) is None
         assert not runtime.ws_connected_event.is_set()
+
+
+def _end_after_abort(abort_task):
+    """A pinned owner whose Begin is recorded; End stops right after it."""
+    runtime = owner(session=object(), vm_upgrade_abort=lambda: abort_task)
+    order: list = []
+
+    async def begin(**_kwargs):
+        order.append("begin")
+        return False
+
+    runtime.begin_retirement = begin
+    return runtime, order
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_end_begins_only_after_a_pending_vm_upgrade_abort():
+    """E4 part 2: the abort can make the row virtual again before Begin."""
+    release = asyncio.Event()
+    order: list = []
+
+    async def abort():
+        await release.wait()
+        order.append("abort")
+
+    abort_task = asyncio.create_task(abort())
+    runtime, begun = _end_after_abort(abort_task)
+    end = asyncio.create_task(runtime._terminate_inner("archive"))
+    await asyncio.sleep(0.05)
+    assert begun == [] and not end.done()
+
+    release.set()
+    with pytest.raises(session_termination.EventJournalUnavailable):
+        await end
+    assert order == ["abort"] and begun == ["begin"]
+
+
+@pytest.mark.asyncio
+async def test_the_wait_for_a_vm_upgrade_abort_is_bounded(monkeypatch):
+    monkeypatch.setattr(session_termination, "_VM_UPGRADE_ABORT_END_WAIT_S", 0.05)
+    abort_task = asyncio.create_task(asyncio.Event().wait())
+    runtime, begun = _end_after_abort(abort_task)
+
+    with pytest.raises(session_termination.EventJournalUnavailable):
+        await asyncio.wait_for(runtime._terminate_inner("archive"), 5)
+
+    assert begun == ["begin"]
+    # End's side-task quiesce owns the cancel, not the bounded wait.
+    assert not abort_task.done()
+    abort_task.cancel()

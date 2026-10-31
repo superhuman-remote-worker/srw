@@ -53,7 +53,9 @@ _SERVER_OWNED_CREATE_CONTEXT_KEYS = _SERVER_OWNED_OFFICER_CONTEXT_KEYS | {
 }
 
 
-@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
+@descriptor(
+    effect="external", group="job_control", plane="job_control", caller_defaults=_ALL
+)
 async def approve_job(
     client: AsyncCockpitClient, caller: CallerCtx, job_id: str
 ) -> str:
@@ -77,7 +79,9 @@ async def approve_job(
         return format_action_error("approve", job_id, error)
 
 
-@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
+@descriptor(
+    effect="external", group="job_control", plane="job_control", caller_defaults=_ALL
+)
 async def resume_job_with_feedback(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -109,7 +113,9 @@ async def resume_job_with_feedback(
         return format_action_error("resume", job_id, error)
 
 
-@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
+@descriptor(
+    effect="external", group="job_control", plane="job_control", caller_defaults=_ALL
+)
 async def cancel_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) -> str:
     """Cancel a running job.
 
@@ -131,7 +137,9 @@ async def cancel_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str)
         return format_action_error("cancel", job_id, error)
 
 
-@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
+@descriptor(
+    effect="write", group="job_control", plane="job_control", caller_defaults=_ALL
+)
 async def pause_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) -> str:
     """Pause a running job.
 
@@ -153,7 +161,9 @@ async def pause_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str) 
         return format_action_error("pause", job_id, error)
 
 
-@descriptor(group="job_control", plane="job_control", caller_defaults=_ALL)
+@descriptor(
+    effect="external", group="job_control", plane="job_control", caller_defaults=_ALL
+)
 async def create_job(
     client: AsyncCockpitClient,
     caller: CallerCtx,
@@ -316,6 +326,7 @@ async def create_job(
 
 
 @descriptor(
+    effect="external",
     group="job_control",
     plane="job_control",
     caller_defaults=_MCP,
@@ -347,6 +358,7 @@ async def delete_job(client: AsyncCockpitClient, caller: CallerCtx, job_id: str)
 
 
 @descriptor(
+    effect="write",
     group="job_control",
     plane="job_control",
     caller_defaults=_MCP,
@@ -384,6 +396,7 @@ async def assign_job(
 
 
 @descriptor(
+    effect="write",
     group="job_control",
     plane="job_control",
     caller_defaults=_MCP,
@@ -433,6 +446,7 @@ async def promote_job(
 
 
 @descriptor(
+    effect="external",
     group="job_control",
     plane="job_control",
     # Officer default per officer_supervision_surface §3.1: replying on a
@@ -493,6 +507,7 @@ _OFFICER_IDENTITY_ERROR = (
 
 
 @descriptor(
+    effect="external",
     group="job_control",
     plane="job_control",
     # officer_message_routing.md §4: bounded officer inbox actions. Officer +
@@ -551,6 +566,7 @@ async def reply_to_job_message(
 
 
 @descriptor(
+    effect="external",
     group="job_control",
     plane="job_control",
     caller_defaults=_MCP_OFFICER,
@@ -606,6 +622,7 @@ async def escalate_job_message(
 
 
 @descriptor(
+    effect="external",
     group="job_control",
     plane="job_control",
     caller_defaults=_MCP_OFFICER,
@@ -657,6 +674,7 @@ async def acknowledge_job_message(
 
 
 @descriptor(
+    effect="external",
     group="job_control",
     plane="job_control",
     caller_defaults=_MCP_OFFICER,

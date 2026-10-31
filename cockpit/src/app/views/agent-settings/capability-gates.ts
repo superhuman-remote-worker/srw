@@ -3,6 +3,7 @@
  * imports so it is unit-testable in isolation. Mirrors the backend PDP semantics
  * (src/core/capability_grants.py): restrict-only, deny-by-default for bools. */
 import type {GrantCatalog} from '../../core/models/api.model';
+import {normalizePermissionMode} from '../../core/models/permission-mode';
 
 type Grants = Record<string, unknown> | null;
 
@@ -20,8 +21,13 @@ export function allowedEnumOptions(
   catalog: GrantCatalog,
 ): string[] {
   if (grants === null) return all;
-  const order = catalog[key]?.order ?? all;
-  const ceiling = grants[key];
+  let order = catalog[key]?.order ?? all;
+  let ceiling = grants[key];
+  if (key === 'permission_mode') {
+    // Grant rows (and an older catalog) may still spell read_only `supervised`.
+    order = order.map((o) => normalizePermissionMode(o) ?? o);
+    ceiling = normalizePermissionMode(ceiling) ?? ceiling;
+  }
   if (typeof ceiling !== 'string' || !order.includes(ceiling)) return all;
   const max = order.indexOf(ceiling);
   return all.filter((o) => !order.includes(o) || order.indexOf(o) <= max);

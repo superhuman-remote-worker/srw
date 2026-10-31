@@ -969,6 +969,8 @@ export interface CatalogModel {
   provider_kind: CatalogProviderKind;
   provider_ref: string;
   model_id: string;
+  /** The name sent to the provider when it differs from `model_id`; null = the id itself. */
+  served_model_id?: string | null;
   display_label: string;
   capabilities: CatalogCapability[];
   family: string;
@@ -987,12 +989,21 @@ export interface CatalogModel {
   source?: HelmProvenanceSource | null;
   managed_by_helm?: boolean;
   helm_drift?: boolean;
+  /** API shape stored on the row; null when the row sets none (always for provider-anchored rows). */
+  client_protocol: string | null;
+  /** API shape the agent really calls the model with: the stored one, else the one its provider or transport implies. Read-only, computed server-side. */
+  effective_client_protocol?: string;
+  subscription_sources?: string[];
+  routing_needs_review?: boolean;
 }
 
 export interface CatalogModelCreateRequest {
   provider_kind: CatalogProviderKind;
   provider_ref: string;
   model_id: string;
+  /** Upstream model name when it differs from `model_id` (which must then be
+   * this name plus a `-suffix`). Omit for the id itself. */
+  served_model_id?: string | null;
   display_label: string;
   /** Capabilities the row claims. Required, non-empty. */
   capabilities: CatalogCapability[];
@@ -1008,6 +1019,7 @@ export interface CatalogModelUpdateRequest {
   provider_kind?: CatalogProviderKind;
   provider_ref?: string;
   model_id?: string;
+  served_model_id?: string | null;
   display_label?: string;
   capabilities?: CatalogCapability[];
   family?: string;
@@ -2181,6 +2193,7 @@ export interface Thread {
   /** Bounded progress for this exact pinned VM creation source. */
   vm_creation?: VMCreationView | null;
   workspace_creation?: WorkspaceCreationView | null;
+  workspace_upgrade?: WorkspaceUpgradeView | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;
@@ -2493,9 +2506,18 @@ export interface WorkspaceCreationView {
     | 'observation_pending' | 'scheduler_unschedulable' | 'scheduling_other'
     | 'scheduled' | 'invalid_image' | 'invalid_configuration'
     | 'pull_deadline' | 'readiness_deadline' | 'ssh_deadline'
-    | 'legacy_receipt_held' | 'insufficient_capacity';
+    | 'legacy_receipt_held' | 'insufficient_capacity' | 'container_exited';
   /** Frozen boot/pull hard boundary. SSH authentication has a separate grace. */
   readiness_deadline_at: string | null;
+  /** The workspace container's exit code; set only for readiness/attention/container_exited. */
+  exit_code: number | null;
+}
+
+/** A Session's in-place workspace upgrade (stateless lane; C1 and C2). */
+export interface WorkspaceUpgradeView {
+  target_tier: 'sandbox' | 'vm';
+  phase: 'requested' | 'provisioning' | 'copying' | 'failed';
+  reason_code?: string | null;
 }
 
 /** VM compute state beside the human wait or Job/session status. */
@@ -2614,6 +2636,8 @@ export interface ExpertExportBundle {
   name?: string;
   display_name?: string;
   description?: string;
+  icon?: string;
+  color?: string;
   expert_type?: string;
   tags?: string[];
   config: Record<string, unknown>;
@@ -2825,7 +2849,7 @@ export type DiffRejectOutcome<T> =
 
 /**
  * Staged protected-cloud diff summary for a thread (GET
- * .../agents/threads/{id}/cloud-diff). `epoch` must be threaded back into
+ * /api/persistent/threads/{id}/cloud-diff). `epoch` must be threaded back into
  * apply/reject as an optimistic-concurrency pin. All-zero/epoch-0/empty
  * `files` (never null from the endpoint) means nothing has been staged yet.
  */
@@ -3299,6 +3323,17 @@ export interface SessionQueueState {
   retryable: boolean;
   attempts: number;
   pending_input: boolean;
+  /** Tool calls whose result is unknown (a parked unit only): the owner's
+   * Continue / Stop decision answers them. Empty or absent otherwise. */
+  unknown_tool_calls?: SessionUnknownToolCall[];
+}
+
+/** A tool call that started but has no recorded result. `args` is null when
+ * the payload is too large to show. */
+export interface SessionUnknownToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown> | null;
 }
 
 /** One parked unit as listed on GET /api/admin/capacity. */
@@ -3394,4 +3429,11 @@ export interface RunQueueUnparkResult {
 /** POST /api/persistent/threads/{id}/queue/retry, folded to a discriminated outcome. */
 export type SessionQueueRetryOutcome =
   | { kind: 'ok'; state: string }
+  | { kind: 'refused'; status: number; code: string };
+
+/** The owner's answer to a parked unit's unknown tool results. */
+export type SessionUnknownToolResultDecision = 'continue' | 'stop';
+
+export type SessionUnknownToolResultOutcome =
+  | { kind: 'ok'; queue: SessionQueueState | null; continued: boolean }
   | { kind: 'refused'; status: number; code: string };

@@ -37,6 +37,17 @@ def test_operator_settings_are_rendered():
     assert env["WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS"] == "900"
 
 
+def test_the_ide_image_is_a_pinned_release():
+    # The IDE pod gets the workspace and its credentials; a mutable tag would
+    # let every pod restart run whatever upstream pushed last.
+    documents = render()
+    env = _env(documents, _orchestrator(documents))
+    repository, _, tag = env["CODE_SERVER_IMAGE"].rpartition(":")
+    assert repository == "codercom/code-server"
+    assert tag not in {"", "latest"}
+    assert all(part.isdigit() for part in tag.split("."))
+
+
 @pytest.mark.parametrize("value", ["30", "7200", "1.5"])
 def test_pull_timeout_rejects_out_of_range_values(value):
     with pytest.raises(subprocess.CalledProcessError):

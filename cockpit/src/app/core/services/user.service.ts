@@ -1,9 +1,12 @@
 import {Injectable, signal, computed, inject} from '@angular/core';
-import {HttpClient} from '@angular/common/http';
-import {catchError, of} from 'rxjs';
+import {HttpClient, HttpErrorResponse} from '@angular/common/http';
+import {catchError, firstValueFrom, of} from 'rxjs';
 import {User} from '../models/api.model';
 import {environment} from '../environment';
 import {SessionService} from './session.service';
+
+/** The bootstrap user load: still running, done, or failed (API down / error). */
+export type UserLoadState = 'loading' | 'loaded' | 'failed';
 
 /**
  * Manages user identity.
@@ -43,17 +46,39 @@ export class UserService {
   // User Profile
   // ===========================================================================
 
-  /** Fetch current user profile from the orchestrator (JIT-provisioned from OIDC). */
-  loadCurrentUser(): void {
-    this.http
-      .get<{ user: User }>(`${this.baseUrl}/auth/me`)
-      .pipe(catchError(() => of(null)))
-      .subscribe((res) => {
-        if (res?.user) {
-          this.currentUser.set(res.user);
-          this.session.authenticated.set(true);
-        }
-      });
+  /**
+   * Where the bootstrap `/auth/me` read stands. `failed` means the API
+   * answered with an error or not at all, and the shell shows a Retry /
+   * Log out card instead of rendering blank. A 401 is not a failure: the
+   * auth interceptor is already redirecting to the BFF login.
+   */
+  readonly loadState = signal<UserLoadState>('loading');
+
+  /** HTTP status of the failed load (0 when the API was unreachable). */
+  readonly loadErrorStatus = signal<number | null>(null);
+
+  /**
+   * Fetch the current user profile from the orchestrator (JIT-provisioned
+   * from OIDC). Resolves true once the user is loaded.
+   */
+  async loadCurrentUser(): Promise<boolean> {
+    try {
+      const res = await firstValueFrom(this.http.get<{user: User}>(`${this.baseUrl}/auth/me`));
+      if (res?.user) {
+        this.currentUser.set(res.user);
+        this.session.authenticated.set(true);
+        this.loadErrorStatus.set(null);
+        this.loadState.set('loaded');
+        return true;
+      }
+      this.loadErrorStatus.set(200);
+    } catch (err) {
+      const status = err instanceof HttpErrorResponse ? err.status : 0;
+      if (status === 401) return false;
+      this.loadErrorStatus.set(status);
+    }
+    this.loadState.set('failed');
+    return false;
   }
 
   /** Log out via the BFF (revoke server-side session + KC RP-initiated logout). */

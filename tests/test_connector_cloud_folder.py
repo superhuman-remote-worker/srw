@@ -145,11 +145,15 @@ class TestSpec:
 
     def test_it_mounts_into_sessions_and_only_srw_creates_one(self):
         spec = CLOUD_FOLDER_SPEC
+        # Two forms, one per plane: the sidecar mounts it for a Container, the
+        # agent process reaches it for a Virtual Session (cloud_remote).
         assert (spec.legacy_type, spec.plane, spec.delivery_forms) == (
             "cloud_folder",
             "in_pod",
-            ("cloud_mount",),
+            ("cloud_mount", "cloud_remote"),
         )
+        assert spec.plane_for("cloud_mount") == "in_pod"
+        assert spec.plane_for("cloud_remote") == "harness"
         assert spec.executions == ("session",)
         assert spec.user_creatable is False
         assert spec.publishable is False

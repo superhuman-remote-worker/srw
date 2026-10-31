@@ -99,6 +99,16 @@ LEGACY_TOOL_NAME_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
+#: Tool names that moved to another category, keyed by the category they left.
+#: ``use_skill`` was a ``workspace`` member until 2026-10-15, when it became the
+#: ``skills`` category so a rewritten ``workspace`` list could no longer drop
+#: it (knowledge-base/knowledge/features/skills_tool_category.md D5). Stored
+#: layers and requests that still name it under ``workspace`` are rewritten
+#: layer-locally by :func:`_move_relocated_tool_names`.
+RELOCATED_TOOL_NAMES: dict[str, dict[str, str]] = {
+    "workspace": {"use_skill": "skills"},
+}
+
 #: A ``true`` a STORED layer may still carry for a category that has since
 #: become enumerate-only, and the exact list it means.  ``tools.delegation:
 #: true`` was legal (it expanded to ``[spawn_subagent]``) until U3 WP4 made
@@ -137,6 +147,64 @@ def _log_legacy_tool_names_once(
         source,
         sorted(set(renamed.values())),
     )
+
+
+def _move_relocated_tool_names(tools: dict[str, Any], *, source: str) -> dict[str, Any]:
+    """Rewrite a layer's ``tools`` mapping for :data:`RELOCATED_TOOL_NAMES`.
+
+    Layer-local, like every other normalisation here. A name listed in its old
+    category (bare list or ``only``) leaves it and is granted in its new one,
+    unless this layer already says something about the new category, which
+    then wins. A name in an old category's ``except`` asked for the tool to be
+    off, so the new category becomes ``[]`` (again unless the layer sets it);
+    an ``except`` left empty is ``true``. Returns ``tools`` itself when nothing
+    moves.
+    """
+    moved: dict[str, list[str]] = {}
+    out = dict(tools)
+    for old_category, relocations in RELOCATED_TOOL_NAMES.items():
+        value = out.get(old_category)
+        if isinstance(value, (list, tuple)):
+            listed, key, granted = list(value), None, True
+        elif isinstance(value, dict) and isinstance(value.get("only"), (list, tuple)):
+            listed, key, granted = list(value["only"]), "only", True
+        elif isinstance(value, dict) and isinstance(value.get("except"), (list, tuple)):
+            listed, key, granted = list(value["except"]), "except", False
+        else:
+            continue
+        hits = [name for name in listed if name in relocations]
+        if not hits:
+            continue
+        kept = [name for name in listed if name not in relocations]
+        if key is None:
+            out[old_category] = kept
+        elif key == "only":
+            out[old_category] = {**value, "only": kept} if kept else []
+        else:
+            out[old_category] = {**value, "except": kept} if kept else True
+        for name in hits:
+            new_category = relocations[name]
+            moved.setdefault(new_category, []).append(name)
+            if new_category in tools:
+                continue
+            current = out.setdefault(new_category, [])
+            if granted and name not in current:
+                current.append(name)
+    if not moved:
+        return tools
+    log_key = (source, "relocated", tuple(sorted(moved)))
+    if log_key not in _ALIAS_LOG_SEEN:
+        if len(_ALIAS_LOG_SEEN) >= _ALIAS_LOG_SEEN_MAX:
+            _ALIAS_LOG_SEEN.clear()
+        _ALIAS_LOG_SEEN.add(log_key)
+        logger.info(
+            "config: %s names %s under an old tool category; moved to %s "
+            "(see skills_tool_category.md D5)",
+            source,
+            sorted(n for names in moved.values() for n in names),
+            sorted(moved),
+        )
+    return out
 
 
 def _expand_legacy_true(category: str, *, source: str) -> list[str]:
@@ -424,6 +492,7 @@ def normalize_tool_policy(fragment: Any, *, source: str = "config-layer") -> Any
     if not isinstance(tools, dict):
         return fragment
 
+    tools = _move_relocated_tool_names(tools, source=source)
     known = config_tool_categories()
     normalized: dict[str, Any] = {}
     for key, value in tools.items():
@@ -517,6 +586,7 @@ def validate_tool_override_fragment(
             f"{type(tools).__name__} ({tools!r})."
         )
 
+    tools = _move_relocated_tool_names(tools, source=source)
     known = config_tool_categories()
     accepted: dict[str, list[str]] = {}
     claimed_by: dict[str, str] = {}

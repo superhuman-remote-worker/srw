@@ -10,8 +10,11 @@ The SQL is proven in ``test_live_sessions_postgres.py``.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -40,18 +43,30 @@ from orchestrator.services.live.admission import (
     refuse_session_contradictions,
 )
 from orchestrator.services.live.instructions import (
+    CALL_TIME_CHARS,
     DEFAULT_FALLBACK,
     DEFAULT_VOICE,
+    GPT_LIVE_IDLE_INSTRUCTION,
+    GPT_LIVE_RULES,
+    IDLE_INSTRUCTION,
     LIVE_VOICE_RULES,
     MAX_GREETING_CHARS,
     MAX_INSTRUCTION_CHARS,
     LiveVoice,
     LiveVoiceError,
     build_live_voice,
+    call_time_section,
+    catalog_voice,
     find_live_entry,
     greeting_instruction,
+    idle_instruction,
+    is_gpt_live,
+    live_timezone,
     live_voice_of,
     session_instructions,
+    with_call_time,
+    with_default_voice,
+    with_engine_rules,
 )
 from orchestrator.services.live.pods import LivePodClient, LivePodError, pod_endpoint
 from shared.runtime.live.contract import MAX_APPEND_CHARS, SessionStatus
@@ -113,8 +128,12 @@ class TestSessionInstructions:
             logging.WARNING, logger="orchestrator.services.live.instructions"
         ):
             text = session_instructions(persona, "F" * MAX_INSTRUCTION_CHARS, entry="v")
-        assert len(text) == MAX_INSTRUCTION_CHARS
+        # Room stays for the engine's rules and the date the handoff adds.
+        reserve = len("\n\n") + len(GPT_LIVE_RULES) + CALL_TIME_CHARS
+        assert len(text) == MAX_INSTRUCTION_CHARS - reserve
         assert text.endswith(LIVE_VOICE_RULES)
+        full = with_call_time(with_engine_rules(text, "gpt-live-1"))
+        assert len(full) <= MAX_INSTRUCTION_CHARS
         assert any("Truncating the facts" in r.getMessage() for r in caplog.records)
 
     def test_facts_within_the_budget_are_kept_whole(self, caplog):
@@ -126,6 +145,123 @@ class TestSessionInstructions:
     def test_a_persona_over_the_budget_is_refused(self):
         with pytest.raises(LiveVoiceError, match="instruction budget"):
             session_instructions("P" * MAX_INSTRUCTION_CHARS, "")
+
+
+class TestEngineRules:
+    """GPT-Live delegates only through ``<|SpawnThinking|>``; the gateway's
+    LLM would read the token as text (receptionist_expert T9/T10)."""
+
+    @pytest.mark.parametrize(
+        "model, gpt_live",
+        [
+            ("gpt-live-1", True),
+            (" GPT-Live-2 ", True),
+            ("cascade-gpu-rocm", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_which_lines_are_gpt_live(self, model, gpt_live):
+        assert is_gpt_live(model) is gpt_live
+
+    def test_a_gpt_live_line_gets_the_delegation_rules_after_srw_s(self):
+        text = with_engine_rules(f"P\n\n{LIVE_VOICE_RULES}", "gpt-live-1")
+        assert text.endswith(GPT_LIVE_RULES)
+        assert text.index("## Rules") < text.index("## Delegating")
+        assert "<|SpawnThinking|>" in GPT_LIVE_RULES
+
+    def test_another_engine_gets_none(self):
+        assert with_engine_rules("P", "cascade-gpu-rocm") == "P"
+        assert "SpawnThinking" not in IDLE_INSTRUCTION
+
+    def test_the_idle_instruction_per_engine(self):
+        assert idle_instruction("gpt-live-1") == GPT_LIVE_IDLE_INSTRUCTION
+        assert idle_instruction("cascade-gpu-rocm") == IDLE_INSTRUCTION
+        assert "<|SpawnThinking|>" in GPT_LIVE_IDLE_INSTRUCTION
+
+    def test_the_idle_instructions_are_steering_not_exact_words(self):
+        # An append with "exactly" and quotes is spoken verbatim by the
+        # gateway (prompt.exact_words); the pod clips appends.
+        for text in (IDLE_INSTRUCTION, GPT_LIVE_IDLE_INSTRUCTION):
+            assert "exactly" not in text.lower()
+            assert len(text) <= MAX_APPEND_CHARS
+
+
+#: A Thursday afternoon in Berlin (CEST, UTC+2), the week before the clocks
+#: go back.
+CALL_START = datetime(2026, 10, 22, 12, 15, tzinfo=timezone.utc)
+
+
+class TestCallTime:
+    def test_the_start_in_berlin_and_the_next_two_weeks_by_weekday(self, monkeypatch):
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        text = with_call_time("RULES", CALL_START)
+        assert text == (
+            "RULES\n\n## Date and time\n"
+            "The call started on Thursday, 22 October 2026, at 14:15 "
+            "(time zone Europe/Berlin).\n"
+            "The next two weeks: Friday 23 October (tomorrow); "
+            "Saturday 24 October (the day after tomorrow); "
+            "Sunday 25 October; Monday 26 October; Tuesday 27 October; "
+            "Wednesday 28 October; Thursday 29 October; Friday 30 October; "
+            "Saturday 31 October; Sunday 1 November; Monday 2 November; "
+            "Tuesday 3 November; Wednesday 4 November; Thursday 5 November."
+        )
+
+    def test_the_deployment_names_the_time_zone(self, monkeypatch):
+        monkeypatch.setenv("LIVE_TIMEZONE", "America/New_York")
+        text = with_call_time("", CALL_START)
+        assert (
+            "on Thursday, 22 October 2026, at 08:15 (time zone America/New_York)"
+            in text
+        )
+        monkeypatch.setenv("LIVE_TIMEZONE", "UTC")
+        assert "at 12:15 (time zone UTC)" in with_call_time("", CALL_START)
+
+    def test_a_late_call_is_already_the_next_day_locally(self, monkeypatch):
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        late = datetime(2026, 12, 31, 23, 30, tzinfo=timezone.utc)
+        text = with_call_time("", late)
+        assert "on Friday, 1 January 2027, at 00:30 (time zone Europe/Berlin)" in text
+        assert "The next two weeks: Saturday 2 January (tomorrow);" in text
+
+    def test_an_unknown_time_zone_falls_back_to_berlin_with_a_warning(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("LIVE_TIMEZONE", "Mars/Olympus")
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.live.instructions"
+        ):
+            assert live_timezone().key == "Europe/Berlin"
+        assert any("LIVE_TIMEZONE" in r.getMessage() for r in caplog.records)
+
+    def test_the_section_fits_its_reserve(self, monkeypatch):
+        # The longest weekday and month names, in every month of a year.
+        for month in range(1, 13):
+            start = datetime(2026, month, 28, 23, 59, tzinfo=timezone.utc)
+            assert len(call_time_section(start)) + 2 <= CALL_TIME_CHARS
+
+    def test_without_a_time_it_is_now(self, monkeypatch):
+        monkeypatch.setenv("LIVE_TIMEZONE", "UTC")
+        text = with_call_time("")
+        today = datetime.now(timezone.utc)
+        assert f"{today.day} " in text and str(today.year) in text
+
+    def test_the_voice_test_harness_appends_the_same_section(self, monkeypatch):
+        # scripts/voice_cascade_testset.py reads it from this module's source
+        # (the voice venv cannot import the orchestrator).
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        path = Path(__file__).resolve().parents[1] / "scripts"
+        spec = importlib.util.spec_from_file_location(
+            "voice_cascade_testset_under_test", path / "voice_cascade_testset.py"
+        )
+        testset = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(testset)
+        assert testset.call_time_section(CALL_START) == call_time_section(
+            CALL_START.astimezone(live_timezone())
+        )
+        last = testset.instructions().rsplit("\n\n## Date and time\n", 1)[1]
+        assert last.startswith("The call started on ")
 
 
 class TestGreeting:
@@ -193,6 +329,39 @@ class TestBuildLiveVoice:
     def test_an_unusable_entry_is_refused(self, entry, message):
         with pytest.raises(LiveVoiceError, match=message):
             build_live_voice("voice", entry)
+
+
+class TestDefaultVoice:
+    """The expert's voice, else the line's catalog row's ``params.voice``
+    (Admin → Models offers it), else GPT-Live's ``marin``."""
+
+    def test_an_unnamed_voice_is_the_built_in_default(self):
+        voice = build_live_voice("voice", _entry())
+        assert (voice.voice, voice.voice_named) == (DEFAULT_VOICE, False)
+        named = build_live_voice("voice", _entry(voice="cedar"))
+        assert (named.voice, named.voice_named) == ("cedar", True)
+
+    @pytest.mark.parametrize(
+        "row, expected",
+        [
+            ({"params_json": {"adapter": "openai-live", "voice": " de-1 "}}, "de-1"),
+            ({"params_json": '{"voice": "de-1"}'}, "de-1"),
+            ({"params_json": {"voice": "  "}}, None),
+            ({"params_json": {"voice": 3}}, None),
+            ({"params_json": "not json"}, None),
+            ({"params_json": None}, None),
+            (None, None),
+        ],
+    )
+    def test_the_catalog_rows_voice(self, row, expected):
+        assert catalog_voice(row) == expected
+
+    def test_the_catalog_default_applies_only_without_the_experts_voice(self):
+        unnamed = build_live_voice("voice", _entry())
+        assert with_default_voice(unnamed, "de-1").voice == "de-1"
+        assert with_default_voice(unnamed, None).voice == DEFAULT_VOICE
+        named = build_live_voice("voice", _entry(voice="cedar"))
+        assert with_default_voice(named, "de-1").voice == "cedar"
 
 
 class TestEntryFiles:
@@ -425,6 +594,76 @@ class TestRefuseSessionContradictions:
 
 
 # =============================================================================
+# resolve_live_voice against the real resolver
+# =============================================================================
+
+
+def _desk_row(config: dict[str, Any]) -> dict[str, Any]:
+    """A DB expert on the bundled receptionist, as a manifest saves it."""
+    return {
+        "name": "example-desk",
+        "expert_type": "worker",
+        "harness_config_name": "receptionist",
+        "harness_asset_name": "receptionist",
+        "config": config,
+        "prompts": {},
+    }
+
+
+class TestResolveLiveVoice:
+    @pytest.mark.asyncio
+    async def test_a_partial_override_keeps_the_inherited_live_entry(self):
+        """The expert sets only `voice.live.{greeting, facts}`; the voice is
+        the receptionist's entry with its organisation's greeting and facts."""
+        row = _desk_row(
+            {
+                "subagents": {
+                    "roster": {
+                        "voice": {
+                            "live": {
+                                "greeting": "Hello, this is Example's AI assistant.",
+                                "facts": "Example is open Monday to Friday.",
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        voice = await admission.resolve_live_voice(
+            SimpleNamespace(),
+            config_name="worker_base",
+            expert_id=None,
+            expert_row=row,
+            config_override=None,
+        )
+        assert voice.entry == "voice"
+        assert "Hello, this is Example's AI assistant." in voice.greeting_instruction
+        assert "Example is open Monday to Friday." in voice.instructions
+        assert "You are the receptionist" in voice.instructions
+        assert voice.voice == "marin"
+
+    @pytest.mark.asyncio
+    async def test_a_live_block_without_a_live_driver_is_refused_by_name(self):
+        row = _desk_row(
+            {
+                "subagents": {
+                    "default": "desk",
+                    "roster": {"desk": {"live": {"greeting": GREETING}}},
+                }
+            }
+        )
+        with pytest.raises(LiveVoiceError) as refused:
+            await admission.resolve_live_voice(
+                SimpleNamespace(),
+                config_name="worker_base",
+                expert_id=None,
+                expert_row=row,
+                config_override=None,
+            )
+        assert "subagents.roster.desk.live: requires driver: live" in str(refused.value)
+
+
+# =============================================================================
 # prepare_live_session and the INSERT-transaction bind
 # =============================================================================
 
@@ -532,6 +771,36 @@ class TestPrepareLiveSession:
         assert voice_resolved.await_args.kwargs["config_override"] == {
             "autonomy": "full"
         }
+
+    @pytest.mark.asyncio
+    async def test_an_unnamed_voice_takes_the_lines_catalog_voice(self, monkeypatch):
+        monkeypatch.setattr(
+            admission,
+            "resolve_live_voice",
+            AsyncMock(return_value=_voice(voice=DEFAULT_VOICE, voice_named=False)),
+        )
+        db = _Db(connector=_connector(model="cascade-cpu"), rows=[_session_row()])
+        db.resolve_catalog_model = AsyncMock(
+            return_value={"params_json": {"adapter": "openai-live", "voice": "10"}}
+        )
+        result, _ = await _prepare(db)
+        assert result.voice.voice == "10"
+        db.resolve_catalog_model.assert_awaited_once_with(
+            "cascade-cpu", capability="live_voice"
+        )
+        # An unreadable row never fails the call: the built-in default stays.
+        db = _Db(connector=_connector(), rows=[_session_row()])
+        db.resolve_catalog_model = AsyncMock(side_effect=RuntimeError("down"))
+        result, _ = await _prepare(db)
+        assert result.voice.voice == DEFAULT_VOICE
+
+    @pytest.mark.asyncio
+    async def test_the_experts_voice_needs_no_catalog_lookup(self, voice_resolved):
+        db = _Db(connector=_connector(), rows=[_session_row()])
+        db.resolve_catalog_model = AsyncMock()
+        result, _ = await _prepare(db)
+        assert result.voice.voice == "cedar"
+        db.resolve_catalog_model.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_existing_ringing_session_is_reused(self, voice_resolved):
@@ -647,15 +916,22 @@ def _admission_for(
 
 
 class TestHandoffBody:
-    def test_defaults(self):
-        body = handoff_body(_admission_for(), JOB)
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("LIVE_TIMEZONE", raising=False)
+        body = handoff_body(_admission_for(), JOB, now=CALL_START)
         assert body == {
             "session_id": SESSION,
             "provider_session_id": "rtc_1",
             "job_id": JOB,
             "model": "gpt-live-1",
-            "accept": {"instructions": "INSTRUCTIONS", "voice": "cedar"},
+            "accept": {
+                "instructions": with_call_time(
+                    with_engine_rules("INSTRUCTIONS", "gpt-live-1"), CALL_START
+                ),
+                "voice": "cedar",
+            },
             "greeting_instruction": "GREET",
+            "idle_instruction": GPT_LIVE_IDLE_INSTRUCTION,
             "texts": {"fallback": "FALLBACK"},
             "limits": {"max_duration_s": 900, "no_job_fallback_s": 8},
             "transfer_target": None,
@@ -675,6 +951,24 @@ class TestHandoffBody:
         body = handoff_body(_admission_for(connector), JOB)
         assert body["model"] == ""
         assert body["limits"] == {"max_duration_s": 900, "no_job_fallback_s": 8}
+        assert body["idle_instruction"] == IDLE_INSTRUCTION
+        assert "SpawnThinking" not in body["accept"]["instructions"]
+
+    def test_the_instructions_end_with_the_handoff_s_date(self):
+        # The voice's facts and rules stay first: the date changes per call.
+        body = handoff_body(_admission_for(), JOB)
+        instructions = body["accept"]["instructions"]
+        assert instructions.startswith(
+            f"INSTRUCTIONS\n\n{GPT_LIVE_RULES}\n\n## Date and time\n"
+        )
+        assert "The next two weeks: " in instructions
+
+    def test_a_gateway_line_gets_no_gpt_live_rules(self):
+        connector = _connector(model="cascade-gpu-rocm")
+        body = handoff_body(_admission_for(connector), JOB)
+        instructions = body["accept"]["instructions"]
+        assert instructions.startswith("INSTRUCTIONS\n\n## Date and time\n")
+        assert body["idle_instruction"] == IDLE_INSTRUCTION
 
 
 def _sessions(transition_result=(True, {"status": "active"})) -> SimpleNamespace:

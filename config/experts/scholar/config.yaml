@@ -102,7 +102,7 @@ spec:
             phases: [strategic]
             read_scope: phase
             max_read_age_turns: 20
-          # Reference every claim inline as [N] (cite-and-place, not cite-and-forget).
+          # Reference every claim inline with its [^c…] handle (cite-and-place, not cite-and-forget).
           - skill: cite-as-you-write
             trigger: before_tool:cite_web
             enforce: true
@@ -165,6 +165,7 @@ spec:
             - get_citation
             - list_citations
             - edit_citation
+            - withdraw_citation
             - annotate_source
             - get_annotations
             - tag_source

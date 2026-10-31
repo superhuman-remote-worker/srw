@@ -88,6 +88,10 @@ _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
         # jobs §4.2); a seeded one would point a job at another's call.
         "live_session",
         "telephony",
+        # The IDE proxy routes to ide_session.pod_ip/host; only the IDE
+        # session service writes it, after it started the IDE pod. A seeded
+        # one would aim the proxy (and its credentials) at any address.
+        "ide_session",
     }
 )
 

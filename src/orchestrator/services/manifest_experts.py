@@ -6,16 +6,18 @@ Compatibility callers receive a projection of the reference harness's private
 settings; arbitrary harness settings never enter that projection or its loader.
 """
 
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 import json
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from orchestrator.services.manifest_approved_images import approved_image_entry
 from orchestrator.services.manifest_store import ManifestStore, decoded
 from shared.manifests import parse_documents, preview_documents
 from shared.manifests.resolution import content_revision
@@ -57,6 +59,57 @@ def trusted_srw_image(store: Any) -> str:
     return installed_srw_image()
 
 
+def approved_srw_images(store: Any) -> tuple[dict[str, Any], ...]:
+    """The installation's approved harness images the application bound to its
+    store at startup (validated MANIFEST_APPROVED_IMAGES); ``()`` when unset."""
+    images = getattr(store, "manifest_approved_images", None)
+    if isinstance(images, (tuple, list)):
+        return tuple(images)
+    return ()
+
+
+HarnessImageClass = Literal["default", "custom", "ineligible"]
+
+
+def image_repository(image: str) -> str:
+    """``image`` without its ``@digest`` and its ``:tag`` (a colon after the
+    last ``/``; a registry port is not a tag)."""
+    reference = image.split("@", 1)[0]
+    colon = reference.rfind(":")
+    if colon > reference.rfind("/"):
+        reference = reference[:colon]
+    return reference
+
+
+def harness_image_class(
+    image: str | None,
+    *,
+    approved: Iterable[Mapping[str, Any]],
+    installed: str,
+) -> tuple[HarnessImageClass, str | None]:
+    """Classify an agent pod's reported image or a job's ``harness_image``.
+
+    - ``("default", None)``: no image, the installed image, or another tag of
+      the installed image's repository. A pod of the previous release reports
+      its old tag after an upgrade; it stays a default pod, so the stale-build
+      skip and the drain keep applying to it.
+    - ``("custom", image)``: an image on the approved list other than the
+      installed one. It serves only jobs whose harness image equals it. The
+      approved list wins over the repository rule: an operator who approves a
+      pinned build of the SRW repository gets that build.
+    - ``("ineligible", image)``: anything else. It serves no job at all, so an
+      image taken off the approved list (or an approved list that failed
+      validation) never turns its pods into default pods.
+    """
+    if not image or image == installed:
+        return "default", None
+    if approved_image_entry(approved, image) is not None:
+        return "custom", image
+    if image_repository(image) == image_repository(installed):
+        return "default", None
+    return "ineligible", image
+
+
 def _object(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         value = json.loads(value)
@@ -65,6 +118,52 @@ def _object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("Expert private settings must be JSON objects")
     return deepcopy(value)
+
+
+def refuse_contradicting_extends(
+    config: Any,
+    *,
+    config_name: str | None,
+    expert_type: str | None = None,
+    layers: Any = (),
+) -> None:
+    """422 when an authored Expert's ``$extends`` names a base other than its own.
+
+    The base is ``config_name`` (absent: the role's root); the private config
+    and layers merge onto it and never follow a ``$extends`` of their own. A
+    ``$extends`` that restates the base stays allowed. Save paths only: stored
+    rows still resolve exactly as before (the resolver drops the key).
+    """
+    from shared.runtime.core.expert_resolution import extends_contradiction
+
+    fragments = [("config", config)]
+    if isinstance(layers, list):
+        fragments += [(f"layers[{index}]", layer) for index, layer in enumerate(layers)]
+    for label, fragment in fragments:
+        message = extends_contradiction(
+            fragment, config_name, expert_type=expert_type, label=label
+        )
+        if message:
+            raise HTTPException(422, message)
+
+
+def refuse_contradicting_spec_extends(
+    spec: Any, *, expert_type: str | None = None
+) -> None:
+    """:func:`refuse_contradicting_extends` for an authored Expert manifest spec
+    (an applied document, a Project's inline Expert or a Job's inline Expert)."""
+    runtime = spec.get("runtime") if isinstance(spec, dict) else None
+    if not isinstance(runtime, dict) or runtime.get("adapter") != SRW_HARNESS_ADAPTER:
+        return
+    private = runtime.get("config")
+    if not isinstance(private, dict):
+        return
+    refuse_contradicting_extends(
+        private.get("config"),
+        config_name=private.get("config_name"),
+        expert_type=expert_type,
+        layers=private.get("layers", ()),
+    )
 
 
 def expert_resource_name(row: dict[str, Any]) -> str:

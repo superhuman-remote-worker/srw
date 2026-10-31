@@ -5,6 +5,7 @@ import {
     canComposeDuringSession,
     canSendMessage,
     clearDraft,
+    codeFenceLanguage,
     composeDenyPrefill,
     countTurnsAfter,
     describeAttachmentRejection,
@@ -13,6 +14,7 @@ import {
     filterRewindCandidates,
     formatPermissionArgs,
     permissionApproveKey,
+    permissionNoteKey,
     permissionTitleKey,
     formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
@@ -490,6 +492,18 @@ describe('permissionApproveKey', () => {
     });
 });
 
+describe('permissionNoteKey', () => {
+    it('warns that an approved subagent runs unattended', () => {
+        expect(permissionNoteKey('delegate_agent')).toBe('chat.permission.childRunsUnattended');
+        expect(permissionNoteKey('message_agent')).toBe('chat.permission.childRunsUnattended');
+    });
+
+    it('adds nothing for any other tool', () => {
+        expect(permissionNoteKey('write_file')).toBeNull();
+        expect(permissionNoteKey('run_command')).toBeNull();
+    });
+});
+
 describe('formatPermissionArgs', () => {
     it('renders a single string arg as "key: value"', () => {
         expect(formatPermissionArgs({file_path: 'src/app.ts'})).toBe('file_path: src/app.ts');
@@ -540,24 +554,35 @@ describe('formatPermissionArgs', () => {
 });
 
 /**
- * approveAndAutoAccept() sets the mode BEFORE approving so a call that
- * immediately follows the just-approved batch (the agent continuing its
- * turn) lands under auto_accept instead of re-prompting. Invoked via
- * .call() against a bare `{chat}` stand-in rather than a constructed
- * component — the class is never mounted in specs (see test-setup.ts),
- * but this method only ever touches `this.chat`, so no other
+ * approveAndAutoAccept() approves the batch once, and switches to
+ * auto_accept only after every approval has been answered. Switching first
+ * let the agent's next gate retire the cards auto_accept runs freely, so the
+ * approvals still in flight for them answered 409 ("already decided").
+ * Invoked via .call() against a bare `{chat}` stand-in rather than a
+ * constructed component — the class is never mounted in specs (see
+ * test-setup.ts), but this method only ever touches `this.chat`, so no other
  * constructor/DI surface is needed to exercise the real, shipped method.
  */
 describe('approveAndAutoAccept', () => {
-    it('sets auto_accept mode before approving the batch', () => {
+    it('approves once, then switches the mode after the approvals answered', async () => {
         const calls: string[] = [];
+        let answer: () => void = () => undefined;
         const chat = {
             setMode: vi.fn((mode: string) => calls.push(`setMode:${mode}`)),
-            approveAll: vi.fn(() => calls.push('approveAll')),
+            approveAll: vi.fn(() => {
+                calls.push('approveAll');
+                return new Promise<void>((resolve) => (answer = resolve));
+            }),
         };
         const host = {chat} as unknown as PersistentChatComponent;
-        PersistentChatComponent.prototype.approveAndAutoAccept.call(host);
-        expect(calls).toEqual(['setMode:auto_accept', 'approveAll']);
+        const done = PersistentChatComponent.prototype.approveAndAutoAccept.call(host);
+        await Promise.resolve();
+        // The mode must not reach the agent while an approval is in flight.
+        expect(calls).toEqual(['approveAll']);
+        answer();
+        await done;
+        expect(calls).toEqual(['approveAll', 'setMode:auto_accept']);
+        expect(chat.approveAll).toHaveBeenCalledTimes(1);
     });
 });
 
@@ -992,6 +1017,98 @@ describe('shouldPin', () => {
         // would yank the user to the bottom of the history they just opened.
         expect(shouldPin(true, true)).toBe(false);
         expect(shouldPin(false, true)).toBe(false);
+    });
+});
+
+describe('codeFenceLanguage', () => {
+    it('keeps the characters language names use', () => {
+        expect(codeFenceLanguage('language-python')).toBe('python');
+        expect(codeFenceLanguage('hljs language-c++')).toBe('c++');
+        expect(codeFenceLanguage('language-c#')).toBe('c#');
+        expect(codeFenceLanguage('language-objective-c')).toBe('objective-c');
+        expect(codeFenceLanguage('language-foo_bar.v2')).toBe('foo_bar.v2');
+    });
+
+    it('drops every other character from a model-written info string', () => {
+        expect(codeFenceLanguage('language-<img/src=x/onerror=alert(1)>')).toBe(
+            'imgsrcxonerroralert1',
+        );
+        expect(codeFenceLanguage('language-"><b>x</b>')).toBe('bxb');
+    });
+
+    it('caps the label and is empty without a language class', () => {
+        expect(codeFenceLanguage(`language-${'a'.repeat(100)}`)).toHaveLength(32);
+        expect(codeFenceLanguage('xlanguage-python')).toBe('');
+        expect(codeFenceLanguage('hljs')).toBe('');
+        expect(codeFenceLanguage(null)).toBe('');
+        expect(codeFenceLanguage(undefined)).toBe('');
+    });
+});
+
+describe('collapseCodeBlocks', () => {
+    /**
+     * Run the private pass over a container holding one tall code block. jsdom
+     * has no layout, so the block's scrollHeight is faked past the 200px fold.
+     */
+    function collapse(codeClass: string, expandHint = 'Click to expand'): HTMLElement {
+        const container = document.createElement('div');
+        const body = document.createElement('div');
+        body.className = 'message-body';
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.setAttribute('class', codeClass);
+        code.textContent = 'print(1)';
+        pre.appendChild(code);
+        Object.defineProperty(pre, 'scrollHeight', {value: 500});
+        body.appendChild(pre);
+        container.appendChild(body);
+
+        const host = {
+            messagesContainer: {nativeElement: container},
+            transloco: {translate: () => expandHint},
+        };
+        (
+            PersistentChatComponent.prototype as unknown as {
+                collapseCodeBlocks(this: typeof host): void;
+            }
+        ).collapseCodeBlocks.call(host);
+        return container;
+    }
+
+    it('sets a hostile fence language as text, with no injected element', () => {
+        const container = collapse('language-<img/src=x/onerror=alert(1)>');
+
+        const summary = container.querySelector('details.code-collapse > summary')!;
+        expect(summary).not.toBeNull();
+        expect(summary.querySelector('img')).toBeNull();
+        expect(Array.from(summary.children).map((c) => c.className)).toEqual([
+            'code-collapse-icon',
+            'code-collapse-label',
+            'code-collapse-hint',
+        ]);
+        for (const span of Array.from(summary.children)) {
+            expect(span.children).toHaveLength(0);
+        }
+        expect(summary.querySelector('.code-collapse-label')!.textContent).toBe(
+            'imgsrcxonerroralert1',
+        );
+        // The whole wrapper holds only what the pass built plus the original block.
+        expect(
+            Array.from(container.querySelectorAll('details *')).map((e) => e.tagName),
+        ).toEqual(['SUMMARY', 'SPAN', 'SPAN', 'SPAN', 'PRE', 'CODE']);
+    });
+
+    it('sets the expand hint as text too', () => {
+        const container = collapse('language-ts', '<b>expand</b>');
+        const hint = container.querySelector('.code-collapse-hint')!;
+        expect(hint.textContent).toBe('<b>expand</b>');
+        expect(hint.querySelector('b')).toBeNull();
+        expect(container.querySelector('.code-collapse-label')!.textContent).toBe('ts');
+    });
+
+    it('labels a block without a usable language as code', () => {
+        const container = collapse('language-<>');
+        expect(container.querySelector('.code-collapse-label')!.textContent).toBe('code');
     });
 });
 

@@ -3,6 +3,7 @@
  */
 
 import type {EffectiveModels} from '../../core/models/api.model';
+import type {PermissionMode} from '../../core/models/permission-mode';
 import {JOB_TOOL_GROUP_CATEGORIES} from '../../core/tools/job-surface.generated';
 
 /**
@@ -35,6 +36,8 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
   { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
+  // Not in the job list: a worker that keeps the default read gates binds use_skill regardless.
+  { key: 'skills', label: 'Skills', icon: 'auto_stories', description: 'Ability to load skills from your skill catalog. Off means the agent sees no skill list' },
   ...JOB_TOOL_GROUP_CATEGORIES,
   { key: 'orchestrator', label: 'SRW Projects', icon: 'hub', description: 'Ability to inspect SRW projects, repositories, session context, and workspace upgrades' },
   { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to look up experts and skills. Read-only — the row below is what creates them' },
@@ -82,8 +85,8 @@ export const ALL_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const AUTONOMY_LEVELS = [
   { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
   { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },
-  { value: 'partial', label: 'Partial', description: 'Freezes at phase boundaries and job completion' },
-  { value: 'guided', label: 'Guided', description: 'Freezes after every tactical phase' },
+  { value: 'partial', label: 'Partial', description: 'Freezes after the first strategic phase and at job completion' },
+  { value: 'guided', label: 'Guided', description: 'Freezes after every strategic phase and at job completion' },
   { value: 'dependent', label: 'Dependent', description: 'Freezes after every phase (strategic and tactical)' },
 ] as const;
 
@@ -103,12 +106,23 @@ export const CRITIC_ROUND_OPTIONS = [
   { value: 0, label: 'Unlimited' },
 ] as const;
 
-/** Permission mode options for sessions. */
+/** Permission mode options for sessions, most to least restrictive. The values
+ *  are `core/models/permission-mode.ts`'s; the UI renders the i18n copy under
+ *  `agentSettings.permissionModes.<value>`, these strings are its English twin. */
 export const PERMISSION_MODES = [
-  { value: 'supervised', label: 'Supervised', description: 'Agent asks for approval before executing commands' },
-  { value: 'auto_accept', label: 'Auto-accept', description: 'Auto-approve most actions, flag risky ones' },
-  { value: 'autonomous', label: 'Autonomous', description: 'Agent runs without asking for approval' },
-] as const;
+  {
+    value: 'read_only',
+    label: 'Read-only',
+    description:
+      'Reads, searches and browses freely. Asks before changing anything, acting outside the workspace, or running commands.',
+  },
+  {
+    value: 'auto_accept',
+    label: 'Auto-accept',
+    description: 'Changes workspace files freely. Asks before irreversible or outbound actions and commands.',
+  },
+  { value: 'autonomous', label: 'Autonomous', description: 'Runs every tool without asking.' },
+] as const satisfies readonly { value: PermissionMode; label: string; description: string }[];
 
 /** Image-quality tiers: resolution of images delivered to the model. Higher =
  *  more visual detail + more image tokens. Mirrors backend
@@ -147,6 +161,41 @@ export type TierReachability =
   | 'needsApproval'
   | 'unsupported'
   | 'sessionUnsupported';
+
+/**
+ * Whether a running session can move tier at all, and the reason when it
+ * can't. `available` means at least one tier is `ok`; otherwise the most
+ * actionable refusal wins, and a session whose every other tier is a
+ * downgrade is on the `highest` tier.
+ *
+ * The live pane's upgrade copy follows this rather than assuming the ladder
+ * is open: a session that can move nowhere (the stateless lane today, a VM, a
+ * `none` session) must not be told it can upgrade. It reads the same
+ * reachability the tier row renders, so when a lane gains the verb the copy
+ * comes back on its own.
+ */
+export type LiveUpgradeState =
+  | 'available'
+  | 'needsApproval'
+  | 'sessionUnsupported'
+  | 'highest'
+  | 'unsupported';
+
+export function liveUpgradeState(
+  liveTier: string | null,
+  reachability: Record<string, TierReachability>,
+): LiveUpgradeState {
+  // Same fail-closed reading as the tier row: an absent entry is refused.
+  const others = WORKSPACE_BACKENDS
+    .map((b) => b.value as string)
+    .filter((tier) => tier !== liveTier)
+    .map((tier) => reachability[tier] ?? 'unsupported');
+  if (others.includes('ok')) return 'available';
+  if (others.includes('needsApproval')) return 'needsApproval';
+  if (others.includes('sessionUnsupported')) return 'sessionUnsupported';
+  if (others.every((s) => s === 'downgrade')) return 'highest';
+  return 'unsupported';
+}
 
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {

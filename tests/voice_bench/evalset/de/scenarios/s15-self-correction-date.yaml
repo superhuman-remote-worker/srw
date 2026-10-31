@@ -1,0 +1,18 @@
+id: s15-self-correction-date
+title: The caller corrects a date mid-sentence
+why: The corrected date reaches the back office, and the voice never confirms the wrong one.
+categories: [back_office, dates_times]
+voice: f-older-slow
+condition: g711a
+turns:
+  - say: Ich hätte gern ein Einzelzimmer für den zwölften, nein, für den dreizehnten November.
+    expect:
+      outcome: delegate
+      values:
+        - {date: "13.11.", in: request}
+        - {date: "13.11.", in: reply}
+      absent:
+        - {date: "12.11.", in: reply}
+    back_office:
+      answer: Am 13. November ist ein Einzelzimmer frei, 89 Euro mit Frühstück.
+      after: 5

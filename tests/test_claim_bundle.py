@@ -2082,6 +2082,317 @@ async def test_upgraded_lite_claim_refused_before_credentials_or_assembly(
     assert db.datasource_lock_calls == []
 
 
+SEED_FROM = {"backend": "virtual", "prefix": f"threads/{UNIT_ID}/", "binding": None}
+SEED_CAPABLE = frozenset({"workspace_upgrade_seed.v1"})
+S3_STORE = {"type": "s3", "root": "srw-workspaces", "config": {"endpoint": "e"}}
+
+
+def _seed_pending_thread(seed_from=SEED_FROM, *, status="ready"):
+    """An upgraded Session that still owes its copy: Ready (the binding and
+    endpoint the Ready step writes) unless ``status`` names an earlier step."""
+    metadata = {
+        "config_override": {
+            "llm": {"model": "m"},
+            "workspace": {"backend": "sandbox"},
+        },
+    }
+    if status == "ready":
+        metadata["_workspace_binding"] = {
+            "generation": WORKSPACE_GENERATION,
+            "kind": "remote",
+            "backing_id": "k8s-pvc:agent-workspaces:pvc-uid",
+            "ssh_host_key_fingerprint": WORKSPACE_FINGERPRINT,
+        }
+        container = {
+            "status": "ready",
+            "provisioner": "k8s",
+            "pod_ip": "10.0.0.8",
+            "pod_port": 22,
+            "pod_name": "ws-thread-bbbbbbbb-bbb",
+            "namespace": "agent-workspaces",
+            "_runtime_incarnation": WORKSPACE_RUNTIME,
+            "_canvas_workspace_generation": WORKSPACE_GENERATION,
+        }
+    else:
+        container = {
+            "status": status,
+            "provisioner": "k8s",
+            "_runtime_creation": {
+                "generation": "33333333-3333-4333-8333-333333333333",
+                "mode": "create",
+                "attempted": True,
+                "replaces_uid": None,
+            },
+        }
+    container["seed_from"] = seed_from
+    metadata["workspace_container"] = container
+    return _thread(metadata=metadata)
+
+
+@pytest.mark.asyncio
+async def test_seed_pending_bundle_refuses_a_claimant_without_the_capability(
+    monkeypatch,
+):
+    """Review Focus 5: an old executor gets a transient 425 before any
+    credential assembly, so a new executor seeds the copy."""
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_seed_pending_thread())
+    _, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as refused:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=sessions_composition.unit_claim_bundle_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+    assert refused.value.status_code == 425
+    assert refused.value.detail == "Claimant cannot seed an upgraded workspace"
+    assembly.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "created", "creating"])
+async def test_an_upgrade_whose_container_is_not_ready_is_a_transient_425_before_any_effect(
+    monkeypatch, status
+):
+    """F1: until Ready writes ``_workspace_binding`` the attach assembly
+    refuses the claim with a 409, which the executor counts toward the park
+    budget. A pending upgrade answers 425 instead (a transient release that
+    never parks) before any credential, assembly, lock or stamp."""
+    from orchestrator import main as orch_main
+
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: S3_STORE,
+    )
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_seed_pending_thread(status=status),
+    )
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as refused:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            claimant_capabilities=SEED_CAPABLE,
+            dependencies=sessions_composition.unit_claim_bundle_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+
+    assert refused.value.status_code == 425
+    assert refused.value.detail == "Workspace upgrade is still creating the container"
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+    thread_mount_rows_module.thread_project_ids.assert_not_awaited()
+    assert db.datasource_lock_calls == []
+    db.conn.fetchval.assert_not_awaited()
+    db.conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_ready_upgrade_bundle_carries_the_old_workspace_beside_attach(
+    monkeypatch,
+):
+    from orchestrator import main as orch_main
+
+    spec = {"type": "s3", "root": "srw-workspaces", "config": {"endpoint": "e"}}
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: spec,
+    )
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_seed_pending_thread())
+    _patch(monkeypatch, orch_main, db)
+
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        claimant_capabilities=frozenset({"workspace_upgrade_seed.v1"}),
+        dependencies=sessions_composition.unit_claim_bundle_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
+
+    seed = out["workspace_upgrade_seed"]
+    assert seed["version"] == 1
+    assert seed["seed_from"] == SEED_FROM
+    assert seed["workspace"]["mounts"][0]["prefix"] == f"threads/{UNIT_ID}/"
+    assert "workspace_upgrade_seed" not in out["attach"]
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_bundle_carries_no_seed(monkeypatch):
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=sessions_composition.unit_claim_bundle_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
+    assert "workspace_upgrade_seed" not in out
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, frozenset()),
+        ("", frozenset()),
+        ("workspace_upgrade_seed.v1", frozenset({"workspace_upgrade_seed.v1"})),
+        (" a , b,,", frozenset({"a", "b"})),
+    ],
+)
+def test_parse_claimant_capabilities(raw, expected):
+    assert unit_claim_bundle.parse_claimant_capabilities(raw) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capabilities", [None, "other,workspace_upgrade_seed.v1"])
+async def test_the_route_hands_the_declared_capabilities_to_the_bundle(
+    monkeypatch, capabilities
+):
+    from orchestrator import main as orch_main
+    from orchestrator.routers import unit_claim as unit_claim_router
+
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: S3_STORE,
+    )
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_seed_pending_thread())
+    _patch(monkeypatch, orch_main, db)
+    request = MagicMock()
+    request.app.state.unit_claim_bundle_dependencies_factory = functools.partial(
+        sessions_composition.unit_claim_bundle_dependencies,
+        orch_main.app.state.resources,
+    )
+
+    call = unit_claim_router.internal_unit_claim_bundle(
+        UNIT_ID, request, 7, POD_NAME, POD_UID, capabilities
+    )
+    if capabilities is None:
+        with pytest.raises(HTTPException) as refused:
+            await call
+        assert refused.value.status_code == 425
+    else:
+        assert (await call)["workspace_upgrade_seed"]["seed_from"] == SEED_FROM
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store", ["moved", "unconfigured"])
+async def test_a_seed_source_the_current_store_cannot_serve_is_refused_before_any_effect(
+    monkeypatch, store
+):
+    """R10: the copy source is proven from the pre-lock row, before any
+    credential is assembled, the claim is stamped or a lease is delivered. A
+    binding minted against another object store would otherwise copy 0 files
+    and clear the marker silently."""
+    from orchestrator import main as orch_main
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+
+    old_store = {**S3_STORE, "root": "old-bucket"}
+    seed_from = {
+        **SEED_FROM,
+        "binding": {
+            "kind": "virtual",
+            "backing_id": virtual_thread_backing_id(UNIT_ID, old_store),
+        },
+    }
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: S3_STORE if store == "moved" else None,
+    )
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_seed_pending_thread(seed_from))
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as refused:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            claimant_capabilities=SEED_CAPABLE,
+            dependencies=sessions_composition.unit_claim_bundle_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+
+    assert refused.value.status_code == 409
+    assert refused.value.detail == "Attach assembly refused"
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+    db.conn.fetchval.assert_not_awaited()
+    db.conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["cleared", "appeared"])
+async def test_a_seed_source_that_changes_before_the_claim_lock_stamps_nothing(
+    monkeypatch, change
+):
+    """R10: the seed spec comes from the pre-lock row, so under the row lock the
+    claim proves the copy source is unchanged, exactly like the other row facts
+    it re-reads there; otherwise the generic lease refusal and no stamp."""
+    from orchestrator import main as orch_main
+
+    monkeypatch.setattr(
+        "orchestrator.services.virtual_workspace.virtual_workspace_rclone_spec",
+        lambda: S3_STORE,
+    )
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_seed_pending_thread() if change == "cleared" else _thread(),
+    )
+    _, assembly = _patch(monkeypatch, orch_main, db)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_assembly(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return {"thread_id": UNIT_ID, "datasources": {"secret": "in-flight"}}
+
+    assembly.side_effect = _slow_assembly
+    request_task = asyncio.create_task(
+        unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            claimant_capabilities=SEED_CAPABLE,
+            dependencies=sessions_composition.unit_claim_bundle_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    if change == "cleared":
+        del db._thread["metadata"]["workspace_container"]["seed_from"]
+    else:
+        db._thread["metadata"] = _seed_pending_thread()["metadata"]
+    release.set()
+
+    with pytest.raises(HTTPException) as exc:
+        await request_task
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Lease validation failed"
+    db.conn.fetchval.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_assembly_refusal_is_generic_409(monkeypatch):
     from orchestrator import main as orch_main

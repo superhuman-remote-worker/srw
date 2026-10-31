@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Link the image's Playwright browsers into Playwright's default folder.
+# =============================================================================
+#
+# Both workspace images install Playwright's browsers once, in /opt/playwright:
+# part of the image, read-only for the agent, and always the build the image's
+# own Playwright expects. The agent's Playwright looks in ~/.cache/ms-playwright
+# instead, which is on the workspace volume. This links each browser there, so
+# a Playwright script finds the image's browsers without PLAYWRIGHT_BROWSERS_PATH,
+# and a project that pins another Playwright version still downloads its own
+# build next to the links, onto the volume.
+#
+# Runs as the workspace user: at every container start (workspace-entrypoint.sh)
+# and once in the VM image build (provision-stage2.sh). Safe to repeat:
+#   - a link whose target is gone (an image upgrade replaced that build) is
+#     removed;
+#   - a real directory of the same name, downloaded earlier, is left alone;
+#   - the image's Playwright registrations are copied into .links, so an install
+#     by another Playwright version keeps the linked browsers instead of
+#     deleting them as unused.
+#
+# Usage: link-playwright-browsers [SOURCE]   (default /opt/playwright)
+# =============================================================================
+set -euo pipefail
+shopt -s nullglob
+
+source_dir="${1:-/opt/playwright}"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright"
+
+[ -d "$source_dir" ] || exit 0
+mkdir -p "$cache_dir/.links"
+
+for entry in "$cache_dir"/*; do
+    if [ -L "$entry" ] && [ ! -e "$entry" ]; then
+        case "$(readlink "$entry")" in
+            "$source_dir"/*) rm -f "$entry" ;;
+        esac
+    fi
+done
+
+for browser in "$source_dir"/*/; do
+    browser="${browser%/}"
+    target="$cache_dir/$(basename "$browser")"
+    if [ -L "$target" ] || [ ! -e "$target" ]; then
+        ln -sfn "$browser" "$target"
+    fi
+done
+
+for registration in "$source_dir"/.links/*; do
+    if [ -f "$registration" ]; then
+        cp -f "$registration" "$cache_dir/.links/"
+    fi
+done

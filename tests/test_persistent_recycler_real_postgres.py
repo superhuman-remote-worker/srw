@@ -4849,6 +4849,215 @@ async def test_pinned_vm_provision_generation_is_installed_under_exact_actor(db)
     assert unchanged["provision_generation"] == context["provision_generation"]
 
 
+def _upgrade_left_virtual_binding():
+    """The object-store binding a virtual Session holds when it upgrades."""
+    return {
+        "kind": "virtual",
+        "backing_id": "rclone:" + "3e" * 32,
+        "generation": str(uuid4()),
+        "ssh_host_key_fingerprint": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["virtual", "remote"])
+async def test_pinned_vm_upgrade_install_drops_only_the_virtual_tier_binding(db, kind):
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    ids = await _seed(db)
+    binding = _upgrade_left_virtual_binding()
+    backend = "virtual"
+    if kind == "remote":
+        binding.update(
+            kind="remote",
+            backing_id="k8s-pvc:workspace",
+            ssh_host_key_fingerprint="SHA256:" + "A" * 43,
+        )
+        backend = "sandbox"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=jsonb_set(jsonb_set(metadata,"
+            "'{config_override,workspace,backend}', to_jsonb($3::text), true),"
+            "'{_workspace_binding}', $2::jsonb, true) WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            json.dumps(binding),
+            backend,
+        )
+    before = await db.get_thread(ids["thread"])
+    context = VMProvisioner._fresh_provision_ctx()
+    context["status"] = "provisioning"
+
+    assert await db.begin_pinned_thread_vm_provisioning(
+        ids["thread"],
+        expected_runtime_generation=str(before["runtime_generation"]),
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        expected_vm_context=None,
+        provision_context=context,
+    )
+    metadata = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert metadata["config_override"]["workspace"]["backend"] == "vm"
+    if kind == "virtual":
+        assert "_workspace_binding" not in metadata
+    else:
+        assert metadata["_workspace_binding"] == binding
+
+
+_VIRTUAL_CONTRACT = {
+    "version": 1,
+    "requested_backend": "virtual",
+    "assigned_backend": "virtual",
+    "assignment_source": "session_default",
+}
+
+
+async def _install_vm_upgrade(db, *, kind="virtual"):
+    """A pinned Session of ``kind``'s tier installs a VM for an upgrade."""
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    # No bound agent: Begin refuses the default fixture's agent shape.
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    binding = _upgrade_left_virtual_binding()
+    backend = "virtual"
+    if kind == "remote":
+        binding.update(
+            kind="remote",
+            backing_id="k8s-pvc:workspace",
+            ssh_host_key_fingerprint="SHA256:" + "A" * 43,
+        )
+        backend = "sandbox"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=jsonb_set(jsonb_set(jsonb_set(metadata,"
+            "'{config_override,workspace,backend}', to_jsonb($3::text), true),"
+            "'{_workspace_binding}', $2::jsonb, true),"
+            "'{_workspace_contract}', $4::jsonb, true) WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            json.dumps(binding),
+            backend,
+            json.dumps(
+                {
+                    **_VIRTUAL_CONTRACT,
+                    "requested_backend": backend,
+                    "assigned_backend": backend,
+                }
+            ),
+        )
+    before = await db.get_thread(ids["thread"])
+    context = VMProvisioner._fresh_provision_ctx()
+    context["status"] = "provisioning"
+    assert await db.begin_pinned_thread_vm_provisioning(
+        ids["thread"],
+        expected_runtime_generation=str(before["runtime_generation"]),
+        expected_agent_id=None,
+        expected_attach_token=None,
+        expected_vm_context=None,
+        provision_context=context,
+    )
+    return ids, binding, _json(before["metadata"]), context["provision_generation"]
+
+
+async def _release_upgrade_vm(db, thread_id, generation):
+    """What the abort's VM release records: the VM's process zero."""
+    assert await db.record_managed_repository_workspace_process_zero(
+        thread_id,
+        owner_kind="thread",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=generation,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_vm_upgrade_install_keeps_what_an_abort_restores(db):
+    """E4 part 1: only an upgrade from the virtual tier records its source."""
+    ids, binding, before, _ = await _install_vm_upgrade(db)
+    vm = _json((await db.get_thread(ids["thread"]))["metadata"])["vm"]
+    assert vm["upgrade_source"] == {
+        "backend": "virtual",
+        "workspace": before["config_override"]["workspace"],
+        "workspace_contract": _VIRTUAL_CONTRACT,
+        "binding": binding,
+    }
+
+    ids, _, _, _ = await _install_vm_upgrade(db, kind="remote")
+    vm = _json((await db.get_thread(ids["thread"]))["metadata"])["vm"]
+    assert "upgrade_source" not in vm
+
+
+@pytest.mark.asyncio
+async def test_an_aborted_vm_upgrade_leaves_a_plain_virtual_session(db):
+    """E4 part 1: after the undo, End takes the virtual path (dev 06f21b14)."""
+    ids, binding, before, generation = await _install_vm_upgrade(db)
+    await _release_upgrade_vm(db, ids["thread"], generation)
+
+    assert await db.undo_thread_vm_upgrade(
+        ids["thread"], provision_generation=generation
+    )
+
+    metadata = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert "vm" not in metadata
+    assert metadata["config_override"] == before["config_override"]
+    assert metadata["_workspace_contract"] == _VIRTUAL_CONTRACT
+    assert metadata["_workspace_binding"] == binding
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    assert retirement["context"]["workspace_backend"] == "virtual"
+    async with db.acquire() as conn:
+        protocol = await conn.fetchval(
+            "SELECT public.pinned_retirement_external_cleanup_expected("
+            "$1::jsonb,$2::uuid,$3::uuid)->>'workspace_cleanup_protocol'",
+            json.dumps(retirement["context"]),
+            UUID(retirement["generation"]),
+            UUID(retirement["token"]),
+        )
+    assert protocol == "virtual_backing_zero_v1"
+    # Repeating it changes nothing: the VM record is gone.
+    assert not await db.undo_thread_vm_upgrade(
+        ids["thread"], provision_generation=generation
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["ending", "other_generation", "remote_source"])
+async def test_the_vm_upgrade_undo_refuses_anything_but_that_install(db, case):
+    ids, _, _, generation = await _install_vm_upgrade(
+        db, kind="remote" if case == "remote_source" else "virtual"
+    )
+    if case == "ending":
+        # End begins once the VM is up, before the abort's release finishes.
+        vm_uid = str(uuid4())
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',"
+                "metadata->'vm' || $2::jsonb) WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "identity_provision_generation": generation,
+                        "identity_authenticated": True,
+                        "vm_uid": vm_uid,
+                        "_runtime_incarnation": vm_uid,
+                        "rootdisk_pvc_uid": str(uuid4()),
+                    }
+                ),
+            )
+        retirement = await db.begin_pinned_thread_retirement(
+            ids["thread"], permanent=False
+        )
+        assert retirement.get("token"), retirement
+    await _release_upgrade_vm(db, ids["thread"], generation)
+    if case == "other_generation":
+        generation = str(uuid4())
+    unchanged = _json((await db.get_thread(ids["thread"]))["metadata"])
+
+    assert not await db.undo_thread_vm_upgrade(
+        ids["thread"], provision_generation=generation
+    )
+
+    assert _json((await db.get_thread(ids["thread"]))["metadata"]) == unchanged
+
+
 @pytest.mark.asyncio
 async def test_pinned_vm_provision_cas_loses_after_retirement_begin(db):
     from orchestrator.services.vm_provisioner import VMProvisioner
@@ -5033,6 +5242,82 @@ async def test_pinned_vm_retirement_uses_credential_process_zero_release(db):
     provisioner.delete_vm_captured.assert_not_awaited()
     current = await db.get_thread(ids["thread"])
     assert "vm" not in _json(current["metadata"])
+    assert await db.pinned_retirement_external_cleanup_complete(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_vm_retirement_releases_past_the_virtual_binding_an_upgrade_left(
+    db,
+):
+    """End captured the old object-store binding next to the upgrade's VM."""
+
+    import orchestrator.main as orch_main
+    from orchestrator.services.vm_provisioner import VMTeardownResult
+
+    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str(uuid4())
+    vm_uid = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata=jsonb_set(jsonb_set(jsonb_set(metadata,"
+            "'{config_override,workspace,backend}', '\"vm\"'::jsonb, true),"
+            "'{vm}', $2::jsonb, true), '{_workspace_binding}', $3::jsonb, true) "
+            "WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "provision_generation": generation,
+                    "identity_provision_generation": generation,
+                    "identity_authenticated": True,
+                    "vm_uid": vm_uid,
+                    "_runtime_incarnation": vm_uid,
+                    "rootdisk_pvc_uid": str(uuid4()),
+                }
+            ),
+            json.dumps(_upgrade_left_virtual_binding()),
+        )
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement["context"]["workspace_binding"]["kind"] == "virtual"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+
+    async def release_vm(thread_id, identity, **_kwargs):
+        assert identity.vm_uid == vm_uid
+        assert await db.record_managed_repository_workspace_process_zero(
+            thread_id,
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=generation,
+        )
+        assert await db.merge_thread_vm_context_if_provision_generation(
+            thread_id, generation, {"status": "deleted"}
+        )
+        return VMTeardownResult("completed", True)
+
+    provisioner = MagicMock()
+    provisioner.lifecycle_available = True
+    provisioner.release_vm_captured = AsyncMock(side_effect=release_vm)
+    with (
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(vm_provisioner_module, "vm_provisioner", provisioner),
+    ):
+        await controls_composition.pinned_retirement_operations(
+            orch_main.app.state.resources
+        ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
+
+    provisioner.release_vm_captured.assert_awaited_once()
+    metadata = _json((await db.get_thread(ids["thread"]))["metadata"])
+    assert "vm" not in metadata and "_workspace_binding" not in metadata
     assert await db.pinned_retirement_external_cleanup_complete(
         ids["thread"],
         runtime_generation=retirement["generation"],

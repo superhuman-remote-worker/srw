@@ -48,6 +48,10 @@ authoring error surfaces: expert save → 422, a bundled config → the boot or
 the test fails); ``"drop"`` — the entry is dropped, logged, and recorded in
 ``data["_roster_warnings"]`` (dispatch never fails a job over its roster). A
 UUID ref with no prefetched row is dropped + recorded under BOTH policies.
+One exception: a merged entry that breaks the live voice contract (a ``live``
+block without ``driver: live``, a malformed ``live`` block) raises
+:class:`LiveEntryError` under BOTH policies — an authoring contradiction the
+save could not see, not a reference gone stale (see the class).
 """
 
 from __future__ import annotations
@@ -209,6 +213,13 @@ def validate_roster_fragment(subagents: Any) -> Set[str]:
 
     ``subagents.default`` naming no entry is NOT an error here, matching the
     resolver, which only records it.
+
+    The block is one authored layer, not the merged roster: an entry may
+    override part of an entry it inherits (``voice: {live: {greeting: ...}}``
+    on an expert extending the receptionist). Its ``live`` keys are checked
+    as far as it sets them; that the merged entry is a live voice entry
+    (``driver: live``) is checked where the layers merge, in
+    :func:`_resolve_entry`.
     """
     if not isinstance(subagents, dict):
         raise RosterResolutionError(
@@ -234,7 +245,7 @@ def validate_roster_fragment(subagents: Any) -> Set[str]:
                 f"subagents.roster.{name}: entry must be a mapping (inline keys or "
                 f"{{$ref: <expert>}}), got {type(raw).__name__}"
             )
-        _validate_live_entry(name, raw)
+        _validate_live_entry(name, raw, resolved=False)
         if "$ref" not in raw:
             continue
         ref = raw.get("$ref")
@@ -257,54 +268,81 @@ _LIVE_TEXT_KEYS = ("fallback", "follow_up", "goodbye")
 _LIVE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-def _validate_live_entry(name: str, raw: Dict[str, Any]) -> None:
+class LiveEntryError(RosterResolutionError):
+    """A resolved roster entry breaks the live voice contract: a ``live``
+    block without ``driver: live``, or a malformed ``live`` block once every
+    layer has merged.
+
+    Raised by the resolver under BOTH ``on_missing`` policies. ``drop`` exists
+    for references that go stale after the save (a deleted DB expert, an
+    uninstalled bundled one); this is an authoring contradiction that only the
+    merge can see — a fragment may override part of an inherited live entry,
+    so the save checks the fragment alone (:func:`validate_roster_fragment`).
+    Dropping the entry instead would admit work whose expert silently lost the
+    entry its author wrote, where the save used to refuse it."""
+
+
+def _validate_live_entry(name: str, raw: Dict[str, Any], *, resolved: bool) -> None:
     """The shape of a live voice entry (``driver: live`` + ``live``).
 
     Mirrors ``$defs/subagentRosterEntry`` in ``config/schema.json``. The
     orchestrator builds the voice's instructions from the ``live`` block and
     reads a ``persona_file`` / ``facts_file`` from the expert's directory, so a
     file is a bare name there; its prose must be plain text like a persona.
+
+    ``resolved=False`` checks one authored layer (the save, the admission
+    gate): a layer may override part of an entry it inherits — a DB expert
+    extending the receptionist sets only ``live.greeting`` and ``live.facts``
+    — so a ``live`` block without ``driver`` is allowed there, while a
+    ``driver`` it does set must be ``live`` and the ``live`` keys it does set
+    must be well formed. ``resolved=True`` checks the merged entry
+    (:func:`_resolve_entry`): there, every layer has landed and a ``live``
+    block requires ``driver: live``. Raises :class:`LiveEntryError`.
     """
     where = f"subagents.roster.{name}"
     driver = raw.get("driver")
     if driver is not None and str(driver) != LIVE_DRIVER:
-        raise RosterResolutionError(
+        raise LiveEntryError(
             f"{where}.driver: {driver!r} is not a driver (the only one is "
             f"{LIVE_DRIVER!r}; omit it for an LLM subagent)"
         )
     live = raw.get("live")
     if live is None:
         return
-    if driver != LIVE_DRIVER:
-        raise RosterResolutionError(f"{where}.live: requires driver: {LIVE_DRIVER}")
+    if resolved and driver != LIVE_DRIVER:
+        raise LiveEntryError(
+            f"{where}.live: requires driver: {LIVE_DRIVER} — the resolved entry "
+            "is not a live voice entry. Set driver: live on it, or override "
+            "only the live keys of an entry that already is one"
+        )
     if not isinstance(live, dict):
-        raise RosterResolutionError(
+        raise LiveEntryError(
             f"{where}.live: expected a mapping, got {type(live).__name__}"
         )
     for text_key, file_key in (("persona", "persona_file"), ("facts", "facts_file")):
         if live.get(text_key) is not None and live.get(file_key) is not None:
-            raise RosterResolutionError(
+            raise LiveEntryError(
                 f"{where}.live: give {text_key} or {file_key}, not both"
             )
         file_name = live.get(file_key)
         if file_name is not None and (
             not isinstance(file_name, str) or not _LIVE_FILE_RE.match(file_name)
         ):
-            raise RosterResolutionError(
+            raise LiveEntryError(
                 f"{where}.live.{file_key}: a file name in the expert's directory, "
                 f"got {file_name!r}"
             )
     for key in ("persona", "facts", "greeting", "voice"):
         value = live.get(key)
         if value is not None and not isinstance(value, str):
-            raise RosterResolutionError(f"{where}.live.{key}: expected a string")
+            raise LiveEntryError(f"{where}.live.{key}: expected a string")
     timeout = live.get("answer_timeout_s")
     if timeout is not None and (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
         or not 1 <= timeout <= 600
     ):
-        raise RosterResolutionError(
+        raise LiveEntryError(
             f"{where}.live.answer_timeout_s: seconds between 1 and 600"
         )
     texts = live.get("texts")
@@ -313,14 +351,14 @@ def _validate_live_entry(name: str, raw: Dict[str, Any]) -> None:
             key not in _LIVE_TEXT_KEYS or not isinstance(value, str)
             for key, value in texts.items()
         ):
-            raise RosterResolutionError(
+            raise LiveEntryError(
                 f"{where}.live.texts: a mapping of strings with keys "
                 f"{', '.join(_LIVE_TEXT_KEYS)}"
             )
     try:
         validate_live_voice_placeholders({"roster": {name: raw}})
     except ValueError as exc:
-        raise RosterResolutionError(str(exc)) from None
+        raise LiveEntryError(str(exc)) from None
 
 
 def _lookup_row(db_refs: Dict[str, Any], ref: str) -> Optional[Dict[str, Any]]:
@@ -533,6 +571,11 @@ def _resolve_entry(ctx: _Context, name: str, raw: Any) -> Dict[str, Any]:
         merged = deep_merge(merged, {"llm": ctx.roster_llm})
     merged = deep_merge(merged, overrides)
 
+    # The live voice contract holds for the merged entry: the authored layers
+    # were checked one at a time, and a layer may override part of a live
+    # entry it inherits, but the result must be a live voice entry.
+    _validate_live_entry(name, merged, resolved=True)
+
     # Depth 1 (D7): neither a referenced expert nor an inline entry gets a
     # roster of its own.
     nested = merged.pop("subagents", None)
@@ -600,6 +643,7 @@ def resolve_subagent_roster(
             names and per-expert matrix overrides against it.
         on_missing: ``"raise"`` (authoring errors surface) or ``"drop"``
             (never fail the caller; drop + log + ``_roster_warnings``).
+            A :class:`LiveEntryError` raises under both.
 
     A missing ``subagents`` key is left missing (the dataclass default
     covers it); a present one is rewritten to the canonical
@@ -657,7 +701,7 @@ def resolve_subagent_roster(
             except _DroppedEntry as exc:
                 warnings.append(str(exc))
             except RosterResolutionError as exc:
-                if on_missing == "raise":
+                if on_missing == "raise" or isinstance(exc, LiveEntryError):
                     raise
                 warnings.append(f"{exc} — entry dropped")
         warnings.extend(ctx.warnings)

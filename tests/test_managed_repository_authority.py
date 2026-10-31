@@ -1076,3 +1076,26 @@ async def test_primary_authority_reads_the_full_row_when_repo_name_is_missing(
     assert result == {"id": "authority-1"}
     db.get_job.assert_awaited_once_with("job-1")
     assert seen and seen[0]["repo_name"] == "job-12345678"
+
+
+@pytest.mark.asyncio
+async def test_a_thread_without_a_managed_repository_attaches_without_git_transport() -> (
+    None
+):
+    """C1 probe: an upgraded stateless Session has no repo_name, so its first
+    container attach carries no repository authority at all."""
+    db = MagicMock()
+    db.reserve_managed_repository_authority = AsyncMock()
+    gitea = MagicMock()
+    thread = {
+        "id": "11111111-2222-4333-8444-555555555555",
+        "project_id": None,
+        "metadata": {"workspace_container": {"status": "ready", "provisioner": "k8s"}},
+    }
+
+    primary_url, rendered, credentials = await authorize_thread_repository_transport(
+        db, gitea, thread, None, backend="sandbox"
+    )
+
+    assert (primary_url, rendered, credentials) == (None, None, [])
+    db.reserve_managed_repository_authority.assert_not_awaited()

@@ -41,7 +41,7 @@ def fixture():
     document = json.loads(FIXTURE.read_text())
     assert document["synthetic_only"] is True
     assert document["producer_versions"]["langgraph-checkpoint"] == "4.1.1"
-    assert version("langgraph-checkpoint") == "4.1.1"
+    assert version("langgraph-checkpoint") == "4.3.0"
     return document
 
 

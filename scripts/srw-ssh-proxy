@@ -3,8 +3,8 @@
 
 Two modes:
 
-    ProxyCommand srw-ssh-proxy --stdio api.srw.works
-    srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.works   # for JetBrains Gateway
+    ProxyCommand srw-ssh-proxy --stdio api.srw.example.com
+    srw-ssh-proxy --listen 127.0.0.1:2222 api.srw.example.com   # for JetBrains Gateway
 
 Standard library only, deliberately: a helper with dependencies reintroduces
 the install problem that ruled out websocat (see task-1-brief.md). Python has
@@ -934,7 +934,7 @@ def _report_error(exc: BaseException) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="srw-ssh-proxy")
-    parser.add_argument("host", help="API hostname, e.g. api.srw.works")
+    parser.add_argument("host", help="API hostname, e.g. api.srw.example.com")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--stdio", action="store_true", help="for ProxyCommand")
     group.add_argument("--listen", metavar="ADDR:PORT", help="for JetBrains Gateway")

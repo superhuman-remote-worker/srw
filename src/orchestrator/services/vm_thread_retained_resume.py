@@ -8,7 +8,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from orchestrator.services.vm_resource_reservation_store import _json
 from orchestrator.services.vm_thread_network import verified_source
 from orchestrator.services.vm_thread_retained_disk_purge import _lock_owner
+from orchestrator.services.vm_upgrade_abort_cleanup import upgrade_abort_purged_disk
 from shared.vm_network_profile import reusable_profile_evidence
+
+
+class VmUpgradeDiskPurged(Exception):
+    """The Session's own aborted VM upgrade purged the disk Resume would retain."""
 
 
 async def lock_owner_on_conn(conn, thread_id):
@@ -78,6 +83,10 @@ async def predecessor_on_conn(conn, thread):
         )
     ):
         raise RuntimeError("Retained Session Resume predecessor is unproven")
+    # A failed VM upgrade's own abort purged the disk (E4b), so End proved it
+    # gone, not retained: say so instead of failing the retained-disk check.
+    if await upgrade_abort_purged_disk(conn, cleanup):
+        raise VmUpgradeDiskPurged()
     await conn.fetchval(
         "SELECT public.validate_vm_thread_retained_compute($1)",
         cleanup["cleanup_admission_id"],

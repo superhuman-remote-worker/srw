@@ -3763,9 +3763,31 @@ BEGIN
     THEN
         old_workspace := '{}'::JSONB;
     END IF;
+    IF source_kind = 'thread' AND TG_OP = 'UPDATE'
+       AND public.stateless_lite_upgrade_replaces_end_stamp(
+           to_jsonb(OLD), to_jsonb(NEW)
+       )
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
     IF TG_OP = 'DELETE' AND source_kind = 'thread'
        AND public.stateless_virtual_permanent_delete_is_authority_free(
            source_id, old_state
+       )
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
+    -- A Job whose Pod the cluster refused holds only that error (0560).
+    IF source_kind = 'job'
+       AND public.job_workspace_creation_error_is_authority_free(old_workspace)
+    THEN
+        old_workspace := '{}'::JSONB;
+    END IF;
+    -- A Session whose only Pod create the cluster refused has no Pod once
+    -- End settled that creation (0561).
+    IF source_kind = 'thread'
+       AND public.stateless_unpublished_creation_settled_without_pod(
+           source_id, old_state, FALSE
        )
     THEN
         old_workspace := '{}'::JSONB;
@@ -8825,6 +8847,25 @@ $$;
 
 
 --
+-- Name: freeze_container_startup_exit_code(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.freeze_container_startup_exit_code() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.startup_exit_code IS NOT NULL
+       AND NEW.startup_exit_code IS DISTINCT FROM OLD.startup_exit_code THEN
+        RAISE EXCEPTION 'container startup exit code is immutable'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_stage_authority';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: grant_pinned_retained_creation_resume(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12850,6 +12891,48 @@ $$;
 
 
 --
+-- Name: job_workspace_creation_error_is_authority_free(jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_workspace_creation_error_is_authority_free(workspace jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT COALESCE(
+        jsonb_typeof(workspace) = 'object'
+        AND jsonb_typeof(workspace -> 'error') = 'string'
+        AND workspace - ARRAY['error', 'status'] = '{}'::JSONB
+        AND COALESCE(jsonb_typeof(workspace -> 'status'), 'string') = 'string',
+        FALSE
+    );
+$$;
+
+
+--
+-- Name: job_workspace_creation_reclaimed_without_pod(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_workspace_creation_reclaimed_without_pod(requested_job_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT COALESCE((
+        SELECT r.settled_at IS NOT NULL
+           AND r.phase = 'aborted'
+           AND r.result_kind = 'aborted'
+           AND r.pod_uid IS NULL
+           AND r.runtime_incarnation IS NULL
+           AND r.cancel_resource_policy = 'terminal_reclaim'
+           AND r.cancel_cleanup_completed_at IS NOT NULL
+          FROM public.managed_repository_workspace_creation_reservations AS r
+         WHERE r.owner_kind = 'job'
+           AND r.owner_id = requested_job_id
+           AND r.scope = 'workspace_container'
+         ORDER BY r.reservation_generation DESC
+         LIMIT 1
+    ), FALSE);
+$$;
+
+
+--
 -- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -14284,6 +14367,32 @@ $$;
 
 
 --
+-- Name: pinned_canonical_virtual_binding(jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_canonical_virtual_binding(binding jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $_$
+    SELECT CASE
+        WHEN jsonb_typeof(binding) IS DISTINCT FROM 'object' THEN false
+        ELSE COALESCE(
+            binding ?& ARRAY['generation', 'kind', 'backing_id', 'ssh_host_key_fingerprint']
+            AND binding - ARRAY['generation', 'kind', 'backing_id', 'ssh_host_key_fingerprint']
+                = '{}'::jsonb
+            AND binding->'kind' = '"virtual"'::jsonb
+            AND jsonb_typeof(binding->'backing_id') = 'string'
+            AND binding->>'backing_id' ~ '^rclone:[0-9a-f]{64}$'
+            AND jsonb_typeof(binding->'generation') = 'string'
+            AND binding->>'generation'
+                ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            AND binding->'ssh_host_key_fingerprint' = 'null'::jsonb,
+            false
+        )
+    END
+$_$;
+
+
+--
 -- Name: thread_agent_warm_binding_protections; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -14372,7 +14481,7 @@ CREATE TABLE public.threads (
     project_id uuid,
     agent_id uuid,
     status character varying(20) DEFAULT 'created'::character varying NOT NULL,
-    permission_mode character varying(20) DEFAULT 'supervised'::character varying NOT NULL,
+    permission_mode character varying(20) DEFAULT 'read_only'::character varying NOT NULL,
     config_name character varying(100),
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     last_activity timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
@@ -14430,7 +14539,7 @@ CREATE TABLE public.threads (
     CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
     CONSTRAINT threads_runtime_retirement_stage_receipt_shape CHECK (((runtime_retirement_stage_receipt IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_stage_receipt) = 'object'::text)))),
     CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
-    CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
+    CONSTRAINT valid_permission_mode_v2 CHECK (((permission_mode)::text = ANY ((ARRAY['read_only'::character varying, 'supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
     CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
 );
 
@@ -14912,7 +15021,12 @@ BEGIN
             ELSE 'external_none_v1'
         END;
     ELSIF backend IN ('vm', 'remote') THEN
-        IF workspace_evidence OR binding_evidence THEN
+        -- A Session upgraded from the virtual tier keeps the binding of its
+        -- old object-store files. Nothing runs behind it; the VM teardown is
+        -- still the whole cleanup.
+        IF workspace_evidence OR (binding_evidence AND NOT (
+            backend = 'vm' AND public.pinned_canonical_virtual_binding(binding)
+        )) THEN
             RETURN NULL;
         END IF;
         workspace_protocol := CASE
@@ -15267,7 +15381,9 @@ BEGIN
        OR NULLIF(vm->>'vm_uid','') IS NULL
        OR (vm->>'_runtime_incarnation' IS NOT NULL AND vm->>'_runtime_incarnation' IS DISTINCT FROM vm->>'vm_uid')
        OR (owner_row.runtime_retirement_permanent AND NULLIF(vm->>'rootdisk_pvc_uid','') IS NULL)
-       OR COALESCE(context->'workspace_binding','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+       OR (COALESCE(context->'workspace_binding','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
+           AND NOT (context->>'workspace_backend' = 'vm'
+                    AND public.pinned_canonical_virtual_binding(context->'workspace_binding')))
        OR COALESCE(context->'workspace_provision_intent','null'::jsonb) NOT IN ('null'::jsonb,'{}'::jsonb)
        OR public.pinned_retirement_external_cleanup_expected(context, owner_row.runtime_generation,
             owner_row.runtime_retirement_token)->>'workspace_cleanup_protocol' IS DISTINCT FROM 'workspace_actuator_zero_v1'
@@ -16146,6 +16262,15 @@ BEGIN
             MESSAGE = 'Stateless workspace projection must match the thread runtime generation';
     END IF;
 
+    -- A resumed lite Session's upgrade replaces End's stamp (0558).
+    IF source_kind = 'thread' AND TG_OP = 'UPDATE'
+       AND public.stateless_lite_upgrade_replaces_end_stamp(
+           to_jsonb(OLD), to_jsonb(NEW)
+       )
+    THEN
+        old_state := jsonb_set(old_state, '{workspace_container}', '{}'::JSONB);
+    END IF;
+
     FOREACH scope_name IN ARRAY ARRAY['workspace_container', 'ide'] LOOP
         IF scope_name = 'ide' AND source_kind <> 'job' THEN
             CONTINUE;
@@ -16819,6 +16944,21 @@ BEGIN
         IF source_kind = 'job' AND scope_name = 'workspace_container'
            AND runtime_state - 'last_activity' = '{}'::JSONB
            AND jsonb_typeof(runtime_state -> 'last_activity') = 'string' THEN
+            CONTINUE;
+        END IF;
+        -- A Job whose Pod the cluster refused holds only that error, once its
+        -- creation settled with no Pod and reclaimed its storage (0560).
+        IF source_kind = 'job' AND scope_name = 'workspace_container'
+           AND public.job_workspace_creation_error_is_authority_free(runtime_state)
+           AND public.job_workspace_creation_reclaimed_without_pod(OLD.id) THEN
+            CONTINUE;
+        END IF;
+        -- A Session whose only Pod create the cluster refused, once End
+        -- settled that creation with no Pod and reclaimed its storage (0561).
+        IF source_kind = 'thread' AND scope_name = 'workspace_container'
+           AND public.stateless_unpublished_creation_settled_without_pod(
+               OLD.id, source_state, TRUE
+           ) THEN
             CONTINUE;
         END IF;
         runtime_uid := runtime_state ->> '_runtime_incarnation';
@@ -20237,6 +20377,72 @@ $$;
 
 
 --
+-- Name: stateless_lite_upgrade_replaces_end_stamp(jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_lite_upgrade_replaces_end_stamp(old_row jsonb, new_row jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT COALESCE(
+        old_row->>'execution_lane' = 'stateless'
+        AND new_row->>'execution_lane' = 'stateless'
+        AND old_row->>'status' IN ('created', 'active', 'awaiting_user')
+        AND new_row->>'status' = old_row->>'status'
+        AND new_row->>'runtime_generation' = old_row->>'runtime_generation'
+        AND old_row->'runtime_retirement_token' = 'null'::JSONB
+        AND new_row->'runtime_retirement_token' = 'null'::JSONB
+        AND old_row #> '{metadata,workspace_container}'
+            = '{"volume_reclaimed": false}'::JSONB
+        AND old_row #>> '{metadata,config_override,workspace,backend}'
+            IN ('virtual', 'none')
+        AND new_row #>> '{metadata,config_override,workspace,backend}'
+            = 'sandbox'
+        AND jsonb_typeof(new_row #> '{metadata,workspace_container}') = 'object'
+        AND (new_row #> '{metadata,workspace_container}') - ARRAY[
+                'status',
+                'provisioner',
+                '_runtime_creation',
+                'upgrade_config',
+                'upgrade_sources',
+                'seed_from'
+            ] = '{}'::JSONB
+        AND new_row #> '{metadata,workspace_container,status}'
+            = '"pending"'::JSONB
+        AND new_row #> '{metadata,workspace_container,provisioner}'
+            = '"k8s"'::JSONB
+        AND new_row #> '{metadata,workspace_container,_runtime_creation}'
+            = jsonb_build_object(
+                'generation', new_row->'runtime_generation',
+                'mode', 'create',
+                'attempted', FALSE,
+                'replaces_uid', NULL
+            )
+        AND jsonb_typeof(new_row #> '{metadata,workspace_container,seed_from}')
+            = 'object'
+        AND COALESCE(old_row #> '{metadata,vm}', 'null'::JSONB)
+            IN ('null'::JSONB, '{}'::JSONB)
+        AND COALESCE(new_row #> '{metadata,vm}', 'null'::JSONB)
+            IN ('null'::JSONB, '{}'::JSONB)
+        AND NOT (old_row->'metadata') ?| ARRAY[
+            '_stateless_workspace_retirement_pending',
+            '_stateless_workspace_retirement_settled',
+            '_stateless_claim_retirement',
+            '_stateless_claim_losses',
+            '_stateless_claim_loss_hold'
+        ]
+        AND NOT (new_row->'metadata') ?| ARRAY[
+            '_stateless_workspace_retirement_pending',
+            '_stateless_workspace_retirement_settled',
+            '_stateless_claim_retirement',
+            '_stateless_claim_losses',
+            '_stateless_claim_loss_hold'
+        ],
+        FALSE
+    );
+$$;
+
+
+--
 -- Name: stateless_none_workspace_outcome_is_authority_free(jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -20680,6 +20886,53 @@ EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
     RETURN FALSE;
 END;
 $_$;
+
+
+--
+-- Name: stateless_unpublished_creation_settled_without_pod(uuid, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_unpublished_creation_settled_without_pod(requested_thread uuid, requested_state jsonb, require_reclaimed boolean) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT COALESCE((
+        SELECT jsonb_typeof(requested_state -> 'workspace_container') = 'object'
+           AND requested_state #>> '{workspace_container,provisioner}' = 'k8s'
+           AND requested_state #>> '{workspace_container,_runtime_incarnation}'
+               IS NULL
+           AND COALESCE(requested_state -> '_workspace_binding', '{}'::JSONB)
+               = '{}'::JSONB
+           AND r.id::TEXT = COALESCE(
+               requested_state #>> ARRAY[
+                   '_stateless_claim_retirement', 'unpublished_creation',
+                   'reservation_id'
+               ],
+               requested_state #>> ARRAY[
+                   '_stateless_workspace_retirement_settled',
+                   'unpublished_creation', 'reservation_id'
+               ]
+           )
+           AND r.operation_kind = 'create'
+           AND r.settled_at IS NOT NULL
+           AND r.phase = 'aborted'
+           AND r.result_kind = 'aborted'
+           AND r.pod_uid IS NULL
+           AND r.runtime_incarnation IS NULL
+           AND r.cancel_target_disposition = 'deleted'
+           AND r.cancel_cleanup_completed_at IS NOT NULL
+           AND r.external_effects #>> '{pod,observed_uid}' IS NULL
+           AND (
+               NOT require_reclaimed
+               OR r.cancel_resource_policy = 'terminal_reclaim'
+           )
+          FROM public.managed_repository_workspace_creation_reservations AS r
+         WHERE r.owner_kind = 'thread'
+           AND r.owner_id = requested_thread
+           AND r.scope = 'workspace_container'
+         ORDER BY r.reservation_generation DESC
+         LIMIT 1
+    ), FALSE);
+$$;
 
 
 --
@@ -23617,7 +23870,9 @@ BEGIN
         'vm_absent',true,'vmi_absent',true,'launcher_absent',true,
         'same_generation_replacement',false,'controller_authenticated',true,
         'pvc_disposition',CASE WHEN a.purge_disk THEN 'purged' ELSE 'retained' END);
-    IF s.stop_evidence IS DISTINCT FROM expected
+    IF (s.stop_evidence IS DISTINCT FROM expected
+           AND NOT (public.vm_thread_cleanup_disk_purged_by_upgrade_abort(a)
+               AND s.stop_evidence=expected||'{"pvc_disposition":"purged_by_upgrade_abort"}'::jsonb))
        OR (NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r
            WHERE r.id=a.reservation_id AND (r.state='teardown' OR (allow_released AND r.state='released')))
            AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries source WHERE source.request_id=a.request_id
@@ -23828,7 +24083,9 @@ BEGIN
         '{"compute_cleanup_admission_id":"%s","owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","retirement_token":"%s","runtime_generation":"%s","source":"pinned_thread_retained_disk_purge","vm_uid":"%s"}',
         a.cleanup_admission_id,a.thread_id,a.provision_generation,a.pvc_uid,d.retirement_token,d.runtime_generation,a.vm_uid),'UTF8')),'hex');
     IF a.cleanup_admission_id IS NULL OR a.purge_disk IS DISTINCT FROM false
-       OR s.cleanup_admission_id IS NULL OR s.stop_evidence IS DISTINCT FROM expected_stop
+       OR s.cleanup_admission_id IS NULL OR (s.stop_evidence IS DISTINCT FROM expected_stop
+           AND NOT (public.vm_thread_cleanup_disk_purged_by_upgrade_abort(a)
+               AND s.stop_evidence=expected_stop||'{"pvc_disposition":"purged_by_upgrade_abort"}'::jsonb))
        OR old_cleanup.id IS NULL OR old_cleanup.owner_kind IS DISTINCT FROM 'thread'
        OR old_cleanup.owner_id IS DISTINCT FROM a.thread_id OR old_cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
        OR old_cleanup.parent_admission_id IS NOT NULL
@@ -26069,6 +26326,25 @@ $$;
 
 
 --
+-- Name: vm_thread_cleanup_disk_purged_by_upgrade_abort(public.vm_resource_thread_cleanup_authorities); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_thread_cleanup_disk_purged_by_upgrade_abort(a public.vm_resource_thread_cleanup_authorities) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT NOT a.purge_disk AND EXISTS (
+        SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+        WHERE c.owner_kind='thread' AND c.owner_id=a.thread_id AND c.pvc_uid=a.pvc_uid
+          AND c.source='abort_thread_vm_upgrade' AND c.parent_admission_id IS NULL
+          AND c.completed_at IS NOT NULL AND c.outcome='completed'
+          -- cleanup_intent_digest's compact JSON, keys sorted, as in 0295.
+          AND c.intent_digest='sha256:' || encode(sha256(convert_to(format(
+              '{"owner_id":"%s","owner_kind":"thread","provision_generation":"%s","purge_disk":true,"pvc_uid":"%s","resource":"vm_workspace","source":"abort_thread_vm_upgrade","vm_uid":"%s"}',
+              a.thread_id,a.provision_generation,a.pvc_uid,a.vm_uid),'UTF8')),'hex'))
+$$;
+
+
+--
 -- Name: vm_thread_creation_compute_delete_evidence(public.threads); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -26858,6 +27134,7 @@ CREATE TABLE public.agents (
     intents jsonb DEFAULT '{}'::jsonb NOT NULL,
     pod_uid text,
     aux_degraded boolean DEFAULT false NOT NULL,
+    image text,
     CONSTRAINT valid_agent_status CHECK (((status)::text = ANY ((ARRAY['booting'::character varying, 'ready'::character varying, 'working'::character varying, 'session'::character varying, 'draining'::character varying, 'completed'::character varying, 'failed'::character varying, 'offline'::character varying])::text[])))
 );
 
@@ -29028,6 +29305,7 @@ CREATE TABLE public.jobs (
     completion_outcome_kind text,
     workspace_idle_revision bigint DEFAULT 0 NOT NULL,
     workspace_idle_episode jsonb,
+    harness_image text,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),
@@ -29890,6 +30168,7 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     pull_budget_seconds double precision,
     ssh_budget_seconds double precision,
     startup_attention_at timestamp with time zone,
+    startup_exit_code integer,
     CONSTRAINT managed_repository_workspace_creation_cancel_shape_check CHECK ((((cancel_requested_at IS NULL) AND (cancel_claim_projection_transaction_id IS NULL) AND (cancel_target_disposition IS NULL) AND (cancel_resource_policy IS NULL) AND (cancel_suspended_at IS NULL) AND (cancel_snapshot_restore_required IS NULL)) OR ((cancel_requested_at IS NOT NULL) AND (cancel_claim_projection_transaction_id IS NOT NULL) AND (cancel_target_disposition IS NOT NULL) AND (cancel_resource_policy = ANY (ARRAY['preserve'::text, 'terminal_reclaim'::text])) AND (cancel_snapshot_restore_required IS NOT NULL) AND ((cancel_target_disposition = 'suspended'::text) OR (cancel_suspended_at IS NULL))))),
     CONSTRAINT managed_repository_workspace_creation_cleanup_shape_check CHECK ((((cancel_cleanup_completed_at IS NULL) AND (cancel_projection_transaction_id IS NULL)) OR ((cancel_cleanup_completed_at IS NOT NULL) AND (cancel_projection_transaction_id IS NOT NULL) AND (cancel_requested_at IS NOT NULL) AND (settled_at IS NOT NULL) AND (result_kind = 'aborted'::text) AND (phase = 'aborted'::text)))),
     CONSTRAINT managed_repository_workspace_creation_effects_check CHECK ((jsonb_typeof(external_effects) = 'object'::text)),
@@ -29903,7 +30182,7 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     CONSTRAINT managed_repository_workspace_creation_scope_check CHECK ((scope = ANY (ARRAY['workspace_container'::text, 'ide'::text]))),
     CONSTRAINT managed_repository_workspace_creation_thread_generation_shape CHECK ((((owner_kind = 'job'::text) AND (thread_runtime_generation IS NULL)) OR ((owner_kind = 'thread'::text) AND (thread_runtime_generation IS NOT NULL)))),
     CONSTRAINT managed_repository_workspace_restore_work_shape_check CHECK (((restore_work_claim_token >= 0) AND (((restore_work_claimed_by IS NULL) AND (restore_work_claim_expires_at IS NULL)) OR ((restore_work_claimed_by IS NOT NULL) AND (restore_work_claim_expires_at IS NOT NULL) AND (restore_work_claim_token > 0))) AND (((restore_work_result_kind IS NULL) AND (restore_work_projection_transaction_id IS NULL)) OR ((operation_kind = 'restore'::text) AND (result_kind = 'settled'::text) AND (restore_work_completed_at IS NOT NULL) AND (restore_work_projection_transaction_id IS NOT NULL) AND (((scope = 'ide'::text) AND (restore_work_result_kind = ANY (ARRAY['active'::text, 'failed'::text]))) OR ((scope = 'workspace_container'::text) AND (restore_work_result_kind = ANY (ARRAY['ready'::text, 'failed'::text])))))) AND ((restore_work_completed_at IS NULL) OR (restore_work_result_kind IS NOT NULL)))),
-    CONSTRAINT managed_workspace_startup_stage_shape_check CHECK (COALESCE((((startup_protocol_version IS NULL) AND (startup_stage IS NULL) AND (startup_state IS NULL) AND (startup_reason_code IS NULL) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_protocol_version = 1) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (scope = 'workspace_container'::text) AND (operation_kind = 'create'::text) AND (runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation) AND (((startup_stage = 'scheduling'::text) AND (startup_state = ANY (ARRAY['observing'::text, 'waiting_capacity'::text])) AND (((startup_state = 'observing'::text) AND (startup_reason_code = ANY (ARRAY['observation_pending'::text, 'scheduling_other'::text]))) OR ((startup_state = 'waiting_capacity'::text) AND (startup_reason_code = ANY (ARRAY['scheduler_unschedulable'::text, 'insufficient_capacity'::text])))) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_stage = 'readiness'::text) AND (((startup_state = 'starting'::text) AND (startup_reason_code = 'scheduled'::text) AND (startup_attention_at IS NULL)) OR ((startup_state = 'attention'::text) AND (startup_reason_code = ANY (ARRAY['invalid_image'::text, 'invalid_configuration'::text, 'pull_deadline'::text, 'readiness_deadline'::text, 'ssh_deadline'::text])) AND (startup_attention_at IS NOT NULL))) AND (scheduled_at IS NOT NULL) AND (ready_budget_seconds >= (0.000001)::double precision) AND (ready_budget_seconds < (31536000)::double precision) AND ((pull_budget_seconds IS NULL) OR ((pull_budget_seconds >= (0.000001)::double precision) AND (pull_budget_seconds < (31536000)::double precision))) AND (ssh_budget_seconds >= (0.000001)::double precision) AND (ssh_budget_seconds < (31536000)::double precision) AND ((startup_first_ready_at IS NULL) OR ((startup_first_ready_at >= scheduled_at) AND (startup_first_ready_at <= (scheduled_at + make_interval(secs => GREATEST(ready_budget_seconds, COALESCE(pull_budget_seconds, (0)::double precision))))))))))), false))
+    CONSTRAINT managed_workspace_startup_stage_shape_check_v2 CHECK (COALESCE(((((startup_protocol_version IS NULL) AND (startup_stage IS NULL) AND (startup_state IS NULL) AND (startup_reason_code IS NULL) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_protocol_version = 1) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (scope = 'workspace_container'::text) AND (operation_kind = 'create'::text) AND (runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation) AND (((startup_stage = 'scheduling'::text) AND (startup_state = ANY (ARRAY['observing'::text, 'waiting_capacity'::text])) AND (((startup_state = 'observing'::text) AND (startup_reason_code = ANY (ARRAY['observation_pending'::text, 'scheduling_other'::text]))) OR ((startup_state = 'waiting_capacity'::text) AND (startup_reason_code = ANY (ARRAY['scheduler_unschedulable'::text, 'insufficient_capacity'::text])))) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_stage = 'readiness'::text) AND (((startup_state = 'starting'::text) AND (startup_reason_code = 'scheduled'::text) AND (startup_attention_at IS NULL)) OR ((startup_state = 'attention'::text) AND (startup_reason_code = ANY (ARRAY['invalid_image'::text, 'invalid_configuration'::text, 'pull_deadline'::text, 'readiness_deadline'::text, 'ssh_deadline'::text, 'container_exited'::text])) AND (startup_attention_at IS NOT NULL))) AND (scheduled_at IS NOT NULL) AND (ready_budget_seconds >= (0.000001)::double precision) AND (ready_budget_seconds < (31536000)::double precision) AND ((pull_budget_seconds IS NULL) OR ((pull_budget_seconds >= (0.000001)::double precision) AND (pull_budget_seconds < (31536000)::double precision))) AND (ssh_budget_seconds >= (0.000001)::double precision) AND (ssh_budget_seconds < (31536000)::double precision) AND ((startup_first_ready_at IS NULL) OR ((startup_first_ready_at >= scheduled_at) AND (startup_first_ready_at <= (scheduled_at + make_interval(secs => GREATEST(ready_budget_seconds, COALESCE(pull_budget_seconds, (0)::double precision))))))))))) AND ((startup_exit_code IS NULL) OR (NOT (startup_reason_code IS DISTINCT FROM 'container_exited'::text))) AND ((startup_reason_code IS DISTINCT FROM 'container_exited'::text) OR ((startup_first_ready_at IS NULL) AND (startup_exit_code IS NOT NULL)))), false))
 );
 
 
@@ -30061,10 +30340,18 @@ CREATE TABLE public.models (
     source text DEFAULT 'ui'::text NOT NULL,
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    served_model_id text,
     CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text, 'live_voice'::text]))),
     CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
     CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );
+
+
+--
+-- Name: COLUMN models.served_model_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.models.served_model_id IS 'The model name sent to the provider when it differs from model_id. NULL sends model_id (minus a routing prefix such as openrouter/). When set, model_id is this name plus a -suffix of the same family, e.g. claude-opus-5-5-api serving claude-opus-5-5.';
 
 
 --
@@ -40408,6 +40695,13 @@ CREATE UNIQUE INDEX uq_managed_repository_creation_live_scope ON public.managed_
 
 
 --
+-- Name: uq_models_model_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_models_model_id ON public.models USING btree (model_id);
+
+
+--
 -- Name: uq_notification_delivery_claim; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -42057,6 +42351,13 @@ CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs 
 --
 
 CREATE CONSTRAINT TRIGGER trg_container_startup_current_binding AFTER INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_container_startup_current_binding();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations trg_container_startup_exit_code_frozen; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_container_startup_exit_code_frozen BEFORE UPDATE ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.freeze_container_startup_exit_code();
 
 
 --

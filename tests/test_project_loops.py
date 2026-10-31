@@ -217,54 +217,27 @@ class TestJobLoopId:
         assert job_loop_id({"context": {"loop_id": ""}}) is None
 
 
-class TestFanOutMemoryAssembler:
-    """Fan-out stage members disable the TTL-curation assembler so concurrent
-    analysis roles don't race the shared project RecallStore's curation slot
-    (knowledge-base/knowledge/features/loop_parallel_stages.md). The lever is the existing
-    ``auxiliary.tasks.assemble_memories.enabled`` gate — a scalar deep-merge,
-    NOT a rewrite of ``memory.pipeline.writers``."""
+class TestLoopJobConfigOverride:
+    """A loop job's override carries the bare lifecycle invariants and the
+    loop's model, and nothing for the auxiliary tasks (every stage, fan-out
+    included, runs the expert's own aux settings)."""
 
     @pytest.mark.asyncio
-    async def test_disabled_when_flag_set(self) -> None:
-        db = _db()
-        await create_loop_job(
-            db, _loop(), role="scholar", iteration=2, disable_memory_assembler=True
-        )
-        co = _config_override(db)
-        assert co["auxiliary"]["tasks"]["assemble_memories"]["enabled"] is False
-
-    @pytest.mark.asyncio
-    async def test_no_auxiliary_override_by_default(self) -> None:
-        # Single-role stages (the default) leave the resolved config untouched —
-        # the assembler keeps compounding the KB across sequential iterations.
+    async def test_no_auxiliary_override(self) -> None:
         db = _db()
         await create_loop_job(db, _loop(), role="scholar", iteration=1)
         assert "auxiliary" not in _config_override(db)
 
     @pytest.mark.asyncio
-    async def test_override_is_scalar_not_writers_list(self) -> None:
-        # The disable must NOT clobber the memory.pipeline.writers list (that
-        # would drop the append-only extractors too, and drift from defaults).
-        db = _db()
-        await create_loop_job(
-            db, _loop(), role="product-qa", iteration=2, disable_memory_assembler=True
-        )
-        co = _config_override(db)
-        assert "memory" in co and "pipeline" not in co["memory"]
-
-    @pytest.mark.asyncio
-    async def test_coexists_with_bare_invariants(self) -> None:
+    async def test_bare_invariants_and_the_model_override(self) -> None:
         db = _db()
         await create_loop_job(
             db,
             _loop(model="openrouter/minimax/minimax-m3"),
             role="scholar",
             iteration=2,
-            disable_memory_assembler=True,
         )
         co = _config_override(db)
-        # The bare lifecycle invariants and the model override survive alongside.
-        assert co["auxiliary"]["tasks"]["assemble_memories"]["enabled"] is False
         assert co["memory"] == {"required": True}
         assert co["curator"] == {"enabled": True}
         assert co["llm"] == {"model": "openrouter/minimax/minimax-m3"}
@@ -669,10 +642,10 @@ class TestHistoryNamesTheDelivery:
         }
 
     _PR_CHANGE = {
-        "datasource": "Knaeckebrothero/KurortEngine",
+        "datasource": "Acme/WidgetShop",
         "kind": "pull_request",
         "action": "open",
-        "ref": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+        "ref": "https://github.com/Acme/WidgetShop/pull/1",
         "summary": "github PR #1: design/hotel-rheinland-theme → main",
         "verified": True,
     }

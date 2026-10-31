@@ -64,6 +64,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.services.config_drift import acknowledged_grant_keys
 from orchestrator.services.config_overrides import deep_merge_dicts, looks_like_uuid
 from orchestrator.services.config_resolver import (
@@ -495,7 +496,9 @@ async def resolve_session_config(
             # columns. Check exactly the values the final attach will deliver,
             # including an acknowledged control newer than this config revision.
             interactive = {
-                "permission_mode": str(thread.get("permission_mode") or "supervised")
+                "permission_mode": normalize_permission_mode(
+                    str(thread.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+                )
             }
             if thread.get("narration_mode") is not None:
                 interactive["narration_mode"] = str(thread["narration_mode"])
@@ -694,8 +697,8 @@ async def resolve_session_config(
         # those exact values before capturing the first canonical generation.
         materialized = {}
         if "permission_mode" in thread:
-            materialized["permission_mode"] = str(
-                thread.get("permission_mode") or "supervised"
+            materialized["permission_mode"] = normalize_permission_mode(
+                str(thread.get("permission_mode") or DEFAULT_PERMISSION_MODE)
             )
         if thread.get("narration_mode") is not None:
             materialized["narration_mode"] = str(thread["narration_mode"])

@@ -133,7 +133,7 @@ describe('SettingsComponent — persistent agent workspace field', () => {
     service.preferences.set({
       persistent_agent: {
         model: 'claude-sonnet-4-6',
-        permission_mode: 'supervised',
+        permission_mode: 'read_only',
         idle_timeout_minutes: 30,
       },
     } as never);
@@ -147,6 +147,26 @@ describe('SettingsComponent — persistent agent workspace field', () => {
       persistent_agent: Record<string, unknown>;
     };
     expect(sent.persistent_agent).not.toHaveProperty('workspace_backend');
+  });
+
+  it('loads a preference saved as `supervised` as read_only and saves it back canonical', () => {
+    const service = makeSettingsService();
+    service.preferences.set({
+      persistent_agent: { permission_mode: 'supervised' },
+    } as never);
+    service.resolvedDefaults.set({
+      persistent_agent: { permission_mode: 'supervised' },
+    } as never);
+    const component = setup(service).componentInstance;
+
+    expect(component.paPermissionMode()).toBe('read_only');
+    expect(component.resolvedPaPermissionMode()).toBe('read_only');
+
+    component.savePersistentAgent();
+    const sent = service.updatePreferences.mock.calls.at(-1)![0] as {
+      persistent_agent: Record<string, unknown>;
+    };
+    expect(sent.persistent_agent['permission_mode']).toBe('read_only');
   });
 
   it('replaces the field with a link to the personal project when one exists', () => {

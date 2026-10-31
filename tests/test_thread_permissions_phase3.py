@@ -80,7 +80,7 @@ def _make_postgres_conn(
     return postgres_conn
 
 
-def _install_session(postgres_conn=None, permission_mode="supervised"):
+def _install_session(postgres_conn=None, permission_mode="read_only"):
     """Install a minimal _session into the persistent_app module globals.
 
     Note: call AFTER create_persistent_app() if you also need _thread_id
@@ -266,9 +266,13 @@ class TestResolvePendingPermission:
         assert result is not None
         assert result["status"] == "approved"
         # UPDATE issued via fetchrow with the explicit id.
-        sql = postgres._fake_conn.fetchrow.await_args.args[0]
+        call = postgres._fake_conn.fetchrow.await_args
+        sql = call.args[0]
         assert "UPDATE thread_permission_requests" in sql
         assert "WHERE id = $1" in sql
+        # N29: the explicit id is scoped to this session's thread.
+        assert "AND thread_id = $4" in sql
+        assert call.args[4] == "thread-test"
 
     @pytest.mark.asyncio
     async def test_resolves_most_recent_when_no_id(self):
@@ -453,7 +457,7 @@ class TestLoopPermissionCheckDBPath:
     async def test_denies_when_insert_fails(self):
         import agent.api.persistent_app as mod
 
-        session = _install_session(postgres_conn=None, permission_mode="supervised")
+        session = _install_session(postgres_conn=None, permission_mode="read_only")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
         assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
@@ -466,7 +470,7 @@ class TestLoopPermissionCheckDBPath:
             insert_returns="rid-approve",
             select_status_sequence=["approved"],  # SELECT-first picks it up
         )
-        session = _install_session(postgres_conn=postgres, permission_mode="supervised")
+        session = _install_session(postgres_conn=postgres, permission_mode="read_only")
         result = await mod._loop_permission_check("run_command", {"cmd": "ls"}, "tc1")
         assert result is PermissionOutcome.APPROVED
         assert session.tool_decisions["tc1"] == "approved"
@@ -479,7 +483,7 @@ class TestLoopPermissionCheckDBPath:
             insert_returns="rid-deny",
             select_status_sequence=["denied"],
         )
-        session = _install_session(postgres_conn=postgres, permission_mode="supervised")
+        session = _install_session(postgres_conn=postgres, permission_mode="read_only")
         result = await mod._loop_permission_check(
             "run_command", {"cmd": "rm -rf /"}, "tc1"
         )
@@ -497,7 +501,7 @@ class TestLoopPermissionCheckDBPath:
             insert_returns="rid-broadcast",
             select_status_sequence=["approved"],
         )
-        _install_session(postgres_conn=postgres, permission_mode="supervised")
+        _install_session(postgres_conn=postgres, permission_mode="read_only")
         q = mod._subscribe("client-X")
         await mod._loop_permission_check("run_command", {"cmd": "ls"}, "tc1")
         # First broadcast on the queue should be permission.request.

@@ -1,19 +1,18 @@
 """Unit tests for citation-verification feedback injection (Phase 2b / D4).
 
-Pure-function coverage (no DB/LLM): the formatter, the synthetic tool-call pair,
-and the exclusion checkers. The DB-driven retrieval + end-to-end write-back are
-covered by the gated Postgres round-trip (tests/citation_engine/).
+Pure-function coverage (no DB/LLM): the formatter, and the exclusion checker
+still recognising the legacy synthetic pair that restored histories carry. The
+DB-driven retrieval + end-to-end write-back are covered by the gated Postgres
+round-trip (tests/citation_engine/).
 """
 
 from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage
 
-from agent.core.citation_feedback_injection import (
-    CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
+from agent.core.citation_feedback_injection import format_failed_citations
+from tests._legacy_injection_rows import (
     create_citation_feedback_injection_messages,
-    format_failed_citations,
-    is_citation_feedback_injection_message,
 )
 from shared.runtime.core.workspace_injection import is_workspace_injection_message
 
@@ -30,9 +29,16 @@ class TestFormatFailedCitations:
             [_cit(3, "Records retained for 10 years", notes="not in source")]
         )
         assert "edit_citation" in block
-        assert "[3]" in block
+        assert "withdraw_citation" in block
+        assert "[^c3]" in block
         assert "Records retained for 10 years" in block
         assert "not in source" in block
+
+    def test_names_the_reason_code_in_words(self):
+        cit = _cit(4, "claim", notes="checked against page 2")
+        cit.verification_reason = "quote_not_found"
+        block = format_failed_citations([cit])
+        assert "the quoted words are not in the source: checked against page 2" in block
 
     def test_truncates_long_claim_and_reason(self):
         block = format_failed_citations([_cit(1, "C" * 300, notes="R" * 400)])
@@ -46,33 +52,17 @@ class TestFormatFailedCitations:
         block = format_failed_citations(cits, limit=5)
         assert "and 3 more" in block
         # Only the first 5 are listed explicitly.
-        assert "[5]" not in block
+        assert "[^c5]" not in block
 
     def test_missing_score_omits_similarity(self):
         block = format_failed_citations([_cit(2, "claim", score=None)])
         assert "similarity" not in block
 
 
-class TestInjectionPair:
-    def test_pair_has_tool_call_and_prefix(self):
-        ai, tool = create_citation_feedback_injection_messages("failed: [1]")
-        assert (
-            ai.tool_calls and ai.tool_calls[0]["name"] == "check_citation_verification"
-        )
-        tid = ai.tool_calls[0]["id"]
-        assert tid.startswith(CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX)
-        assert tool.tool_call_id == tid
-        assert tool.content == "failed: [1]"
-
-    def test_is_citation_feedback_recognizes_pair(self):
-        ai, tool = create_citation_feedback_injection_messages("x")
-        assert is_citation_feedback_injection_message(ai)
-        assert is_citation_feedback_injection_message(tool)
-        assert not is_citation_feedback_injection_message(HumanMessage(content="hi"))
-
+class TestLegacyPair:
     def test_unified_checker_excludes_feedback_pair(self):
-        # is_workspace_injection_message must exclude citation feedback so it's
-        # dropped from summarization/extraction like other transient injections.
+        # is_workspace_injection_message must still exclude a legacy citation
+        # feedback pair (restored histories) from summarization/extraction.
         ai, tool = create_citation_feedback_injection_messages("x")
         assert is_workspace_injection_message(ai)
         assert is_workspace_injection_message(tool)

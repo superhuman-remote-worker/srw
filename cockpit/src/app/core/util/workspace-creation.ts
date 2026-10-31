@@ -27,8 +27,16 @@ export function workspaceCreationMessageKey(view: WorkspaceCreationView): string
         case 'pull_deadline': return 'workspaceCreation.pullDeadline';
         case 'readiness_deadline': return 'workspaceCreation.readinessDeadline';
         case 'ssh_deadline': return 'workspaceCreation.sshDeadline';
+        // The copy names the code, so without an integer code it falls back.
+        case 'container_exited':
+          return Number.isInteger(view.exit_code) ? 'workspaceCreation.containerExited' : 'workspaceCreation.unknown';
       }
     }
   }
   return 'workspaceCreation.unknown';
+}
+
+/** Interpolation values for the key above: only the integer exit code ever crosses. */
+export function workspaceCreationMessageParams(view: WorkspaceCreationView): {exitCode?: number} {
+  return Number.isInteger(view.exit_code) ? {exitCode: view.exit_code as number} : {};
 }

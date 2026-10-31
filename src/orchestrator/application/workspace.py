@@ -38,6 +38,7 @@ from orchestrator.routers import (
     workspace_access as workspace_access_routes,
 )
 from orchestrator.schemas.thread_admission import ThreadCreateRequest, TrustedThreadSeed
+from orchestrator.security import access
 from orchestrator.services import (
     agent_cloud_mounts,
     agent_provisioner as agent_provisioner_module,
@@ -308,7 +309,8 @@ async def _prepare_session_cloud(
 ) -> dict[str, Any]:
     """What a session's cloud folders need before its Pod is planned (main
     cloud slices 3, 4 and 6.1): the one-time conversion of a session created
-    before cloud connectors, then its outbox folder ensured and its share
+    before cloud connectors, and the folders an upgraded Virtual session's
+    creation left out; then its outbox folder ensured and its share
     retried, and its owner's root probed. The thread as it now is. Never
     raises."""
     store = resources.postgres_db
@@ -327,6 +329,21 @@ async def _prepare_session_cloud(
         )
         converted = None
     thread = converted or thread
+    # Upgraded from Virtual: the folders its creation left out, before the
+    # outbox step below makes a re-added outbox's folder.
+    try:
+        restored = await session_cloud_preparation.restore_virtual_exclusions(
+            thread, mount_rows=mount_rows, store=store
+        )
+    except Exception:
+        logger.warning(
+            "Session %s: the cloud folders Virtual left out were not restored; "
+            "the next Pod retries it",
+            thread.get("id"),
+            exc_info=True,
+        )
+        restored = None
+    thread = restored or thread
     await session_cloud_preparation.prepare_session_outbox(
         thread, store=store, cloud_router=resources.main_cloud_router
     )
@@ -346,6 +363,54 @@ async def _prepare_session_cloud(
         dependencies=agent_cloud_mount_dependencies(resources),
     )
     return thread
+
+
+def cloud_remote_planner(
+    resources: ApplicationResources,
+) -> Callable[..., Awaitable[Any]]:
+    """The workspace delivery's planner of a Virtual Session's cloud folders
+    (features/cloud_folders_on_virtual_sessions.md § Orchestrator): the
+    session's cloud prepared first, as a Pod's planner does (the one-time
+    conversion, the outbox folder and its share retry, the owner's root,
+    the per-folder grants), then every attached connector bound for the
+    ``virtual`` tier and handed over as a remote descriptor. Runs on every
+    delivery, since the stateless lane re-attaches on any executor."""
+    from orchestrator.services import cloud_remote_plan
+
+    async def plan(
+        thread: dict[str, Any], *, mount_rows: list[dict[str, Any]] | None
+    ) -> cloud_remote_plan.CloudRemotePlan | None:
+        store = resources.postgres_db
+        rows = (
+            mount_rows
+            if mount_rows is not None
+            else await store.list_thread_mounts(str(thread["id"]))
+        )
+        thread = await _prepare_session_cloud(resources, thread, rows)
+        return await cloud_remote_plan.resolve_cloud_remote_plan(
+            thread,
+            mount_rows=rows,
+            dependencies=agent_cloud_mount_dependencies(resources),
+        )
+
+    return plan
+
+
+def cloud_remote_token_dependencies(resources: ApplicationResources) -> Any:
+    """The token route of a Virtual Session's cloud folders
+    (features/cloud_folders_on_virtual_sessions.md § Provider neutrality):
+    the folder is bound again with the planner's own dependencies, on this
+    application's store and cloud router, under the router's internal
+    guard."""
+    from orchestrator.services import cloud_remote_token
+
+    return cloud_remote_token.CloudRemoteTokenDependencies(
+        db=resources.postgres_db,
+        require_internal=access.require_internal,
+        cloud_mount_dependencies=functools.partial(
+            agent_cloud_mount_dependencies, resources
+        ),
+    )
 
 
 def cloud_mount_planner(

@@ -1,0 +1,36 @@
+# =============================================================================
+# srw-voice-piper — Piper TTS behind an OpenAI-compatible /v1/audio/speech
+# =============================================================================
+# The cascade-cpu test profile's TTS (local_voice_gateway.md §6.2). Piper
+# 2023.11.14-2 (MIT; bundles onnxruntime and espeak-ng) from the rhasspy/piper
+# GitHub release, sha256 pinned, the same build as the WP0 bench image; the
+# voice is mounted at /models (docker/voice-models/models.py fetches it).
+# Local only, never pushed:
+#
+#   docker build -f docker/voice-models/Dockerfile.piper \
+#       -t srw-voice-piper:2023.11.14-2 docker/voice-models
+# =============================================================================
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+
+ARG PIPER_VERSION=2023.11.14-2
+ARG PIPER_SHA256=a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl python3; \
+    curl -fsSLo /tmp/piper.tar.gz \
+        "https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/piper_linux_x86_64.tar.gz"; \
+    echo "${PIPER_SHA256}  /tmp/piper.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/piper.tar.gz -C /opt; \
+    rm /tmp/piper.tar.gz; \
+    apt-get purge -y curl; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/*; \
+    /opt/piper/piper --version
+
+COPY piper_server.py /usr/local/lib/piper_server.py
+USER 65532:65532
+# A tmpfs: piper_server.py keeps each utterance there only while reading it.
+ENV PIPER_WORK=/dev/shm/piper PORT=8000
+EXPOSE 8000
+ENTRYPOINT ["python3", "/usr/local/lib/piper_server.py"]

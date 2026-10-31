@@ -292,7 +292,10 @@ def access_token_dependencies(
     return access_token_routes.AccessTokenDependencies(
         store=resources.postgres_db,
         tokens=access_token_operations.AccessTokenDependencies(
-            store=resources.postgres_db
+            store=resources.postgres_db,
+            schedule_default_project_knowledge=functools.partial(
+                projects_composition.schedule_default_project_knowledge, resources
+            ),
         ),
         require_approved_user=auth.require_approved_user,
         require_internal=access.require_internal,

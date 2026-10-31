@@ -224,7 +224,7 @@ PLANS: dict[str, list[str]] = {
         "[read] occ status (maintenance on and settled, no cron.php running; "
         "unless --hot)",
         "[read] md5 of nextcloud.db(-wal, -shm) and config.php in the pod",
-        "[read] tar over kubectl exec stdout -> <backup-dir>/backup.tar (hot: <backup-dir>/hot/)",
+        "[read] tar | gzip over kubectl exec stdout -> <backup-dir>/backup.tar.gz (hot: <backup-dir>/hot/)",
         "[read] md5 in the pod again; local md5 of the extracted files",
         "[read] PRAGMA integrity_check in the pod (read-only PDO) and locally (sqlite3)",
         "[read] inventory, config digests, sample files read by fileid",
@@ -1993,9 +1993,14 @@ class Migration:
             raise MigrationError(f"{db} is not in {datadir}")
         names = sorted(sizes, key=lambda n: (n != db, n))
         before = self.pod_md5(datadir, names)
-        tar_path = out / "backup.tar"
+        # Compressed in the pod: a SQLite file is mostly free pages after a
+        # cleanup, and a long exec stream can stall or end early (dev,
+        # 2026-10-17: a 306 MB plain stream died at 120 MB over WebSockets and
+        # ended short without an error over SPDY). The md5 checks below catch a
+        # damaged copy either way; gzip makes an intact one likely.
+        tar_path = out / "backup.tar.gz"
         argv = self.kube.exec_argv(
-            f"tar -cf - -C {shlex.quote(datadir)} "
+            f"tar -czf - -C {shlex.quote(datadir)} "
             + " ".join(shlex.quote(n) for n in names)
             + f" -C {NC_ROOT}/config config.php"
         )
@@ -2012,16 +2017,22 @@ class Migration:
             shutil.rmtree(files)
         files.mkdir(mode=0o700)
         expected = set(names) | {"config.php"}
-        with tarfile.open(tar_path) as archive:
-            for member in archive.getmembers():
-                if member.name not in expected or not member.isfile():
-                    raise MigrationError(f"unexpected tar member {member.name!r}")
-                source = archive.extractfile(member)
-                assert source is not None
-                target = files / member.name
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "wb") as handle:
-                    shutil.copyfileobj(source, handle)
+        try:
+            with tarfile.open(tar_path) as archive:
+                for member in archive.getmembers():
+                    if member.name not in expected or not member.isfile():
+                        raise MigrationError(f"unexpected tar member {member.name!r}")
+                    source = archive.extractfile(member)
+                    assert source is not None
+                    target = files / member.name
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "wb") as handle:
+                        shutil.copyfileobj(source, handle)
+        except (tarfile.TarError, EOFError, OSError) as exc:
+            raise MigrationError(
+                f"{tar_path.name} is incomplete or damaged ({exc}): the transfer "
+                "ended early; run backup again"
+            ) from exc
         local = {name: md5_file(files / name) for name in sorted(expected)}
         verified = True
         for name in sorted(expected):

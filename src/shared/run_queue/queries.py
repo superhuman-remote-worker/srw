@@ -837,6 +837,57 @@ WHERE unit_id = $1::uuid AND state = 'parked'
 RETURNING state
 """
 
+# Owner disposition of a parked unit whose interrupted turn was answered by the
+# owner's decision (session_unknown_tool_result_needs_admin.md): the watermark
+# moves past that turn's input, the park lifts, and the unit is runnable only
+# when work is still waiting — the same queued/done rule as _COMPLETE_SQL.
+# $2 NULL keeps the watermark.
+_SETTLE_PARKED_SQL = """
+WITH settled AS (
+    SELECT unit_id,
+           CASE WHEN $2::bigint IS NULL THEN consumed_seq
+                ELSE GREATEST(COALESCE(consumed_seq, $2::bigint), $2::bigint)
+           END AS consumed
+      FROM run_queue
+     WHERE unit_id = $1::uuid AND state = 'parked'
+)
+UPDATE run_queue SET
+    consumed_seq = settled.consumed,
+    attempts_since_completion = 0,
+    attach_failures = 0,
+    park_reason = NULL,
+    parked_at = NULL,
+    last_error = NULL,
+    last_error_signature = NULL,
+    queued_at = now(),
+    run_after = now(),
+    state = CASE WHEN (input_seq IS NOT NULL
+                       AND (settled.consumed IS NULL
+                            OR input_seq > settled.consumed))
+                      OR control_input_seq > control_consumed_seq
+                      OR EXISTS (
+                          SELECT 1
+                          FROM thread_input_deliveries AS delivery
+                          JOIN thread_messages AS message
+                            ON message.id = delivery.message_id
+                          WHERE delivery.thread_id = run_queue.unit_id
+                            AND delivery.execution_lane = 'stateless'
+                            AND delivery.state IN (
+                                'persisted', 'owned', 'queued', 'deferred'
+                            )
+                            AND message.rewound_at IS NULL
+                      )
+                 THEN 'queued' ELSE 'done' END
+FROM settled
+WHERE run_queue.unit_id = settled.unit_id
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
+RETURNING run_queue.state
+"""
+
 # Attach-failed release (stateless_turn_resilience.md step 2). The claim
 # already counted this attempt in attempts_since_completion, so this does not
 # increment it again (same convention as _RELEASE_SQL); it records the failure,
@@ -1536,6 +1587,21 @@ async def unpark_unit(conn: Executor, *, unit_id: UUID | str) -> bool:
     """
     state = await conn.fetchval(_UNPARK_SQL, _uuid(unit_id))
     return state is not None
+
+
+async def settle_parked_unit(
+    conn: Executor, *, unit_id: UUID | str, consumed_seq: int | None
+) -> str | None:
+    """Owner verb: parked → ``queued``/``done`` with the watermark advanced.
+
+    The interrupted turn whose unanswered tool calls parked the unit has been
+    answered by the owner's decision, so its input counts as consumed: it is
+    not replayed after its own partial work. Later input (and pending
+    controls or event deliveries) still runs, exactly as after
+    :func:`complete_unit`. Returns the new state, or ``None`` when the unit
+    is not parked (or a VM workspace recovery still owns it).
+    """
+    return await conn.fetchval(_SETTLE_PARKED_SQL, _uuid(unit_id), consumed_seq)
 
 
 # =============================================================================

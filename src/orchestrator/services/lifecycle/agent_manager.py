@@ -20,8 +20,17 @@ import os
 from typing import Any
 
 from orchestrator.services.lifecycle.types import Instance
+from orchestrator.services.manifest_experts import (
+    approved_srw_images,
+    harness_image_class,
+    trusted_srw_image,
+)
 
 logger = logging.getLogger(__name__)
+
+# Version reported for a pod whose image is neither the installed SRW image
+# nor approved: never an expected SHA, so the drift drain removes it.
+INELIGIBLE_IMAGE_VERSION = "ineligible-image"
 
 
 def expected_agent_shas() -> set[str]:
@@ -81,6 +90,9 @@ class AgentInstanceManager:
             row["hostname"]: row for row in agent_rows if row.get("hostname")
         }
 
+        approved = approved_srw_images(self._db)
+        installed = trusted_srw_image(self._db)
+
         instances: list[Instance] = []
         for pod in pods:
             name = pod.metadata.name
@@ -99,7 +111,16 @@ class AgentInstanceManager:
                         meta = json.loads(meta)
                     except (json.JSONDecodeError, ValueError):
                         meta = {}
-                version = meta.get("build_sha") or None
+                image_class, _ = harness_image_class(
+                    row.get("image"), approved=approved, installed=installed
+                )
+                if image_class == "custom":
+                    # Single-use pod of an approved image: it ends on its own.
+                    version = None
+                elif image_class == "ineligible":
+                    version = INELIGIBLE_IMAGE_VERSION
+                else:
+                    version = meta.get("build_sha") or None
                 metadata["agent_id"] = str(row["id"])
                 metadata["status"] = row.get("status")
                 metadata["current_job_id"] = (
@@ -275,7 +296,7 @@ class AgentInstanceManager:
                 rows = await conn.fetch(
                     """
                     SELECT id, hostname, status, current_job_id, thread_id,
-                           metadata, agent_mode, last_heartbeat
+                           metadata, agent_mode, last_heartbeat, image
                     FROM agents
                     WHERE hostname IS NOT NULL
                     """

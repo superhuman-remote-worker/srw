@@ -7,6 +7,7 @@ import {TranslocoService} from '@jsverse/transloco';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {CanvasState} from '../../core/models/canvas.model';
 import {CanvasService} from '../../core/services/canvas.service';
+import {WorkspaceFileDownloadService} from '../../core/services/workspace-file-download.service';
 import {CanvasContentController} from './canvas-content.controller';
 import {CanvasBrowserController} from './canvas-browser.controller';
 import {CanvasEditController} from './canvas-edit.controller';
@@ -375,6 +376,7 @@ describe('Canvas pane trusted chrome', () => {
         {provide: CanvasViewerController, useValue: viewer},
         {provide: CanvasOfficeController, useValue: office},
         {provide: CanvasBrowserController, useValue: browser},
+        {provide: WorkspaceFileDownloadService, useValue: {download: vi.fn()}},
         {provide: TranslocoService, useValue: {translate: (key: string) => key}},
         {provide: Router, useValue: {}},
       ],
@@ -446,8 +448,13 @@ describe('Canvas pane trusted chrome', () => {
 });
 
 describe('Canvas pane durable presentation', () => {
-  function paneWith(overrides: Partial<CanvasState>) {
-    const state = signal<CanvasState | null>(canvasState(4, 'markdown', overrides));
+  const downloads = {download: vi.fn().mockResolvedValue(true)};
+
+  function paneWith(
+    overrides: Partial<CanvasState>,
+    renderer: CanvasState['renderer'] = 'markdown',
+  ) {
+    const state = signal<CanvasState | null>(canvasState(4, renderer, overrides));
     const canvas = {
       threadId: signal<string | null>('thread-1'),
       state,
@@ -510,6 +517,7 @@ describe('Canvas pane durable presentation', () => {
           connectionStatus: signal<'idle'>('idle'),
           errorCode: signal<string | null>(null),
         }},
+        {provide: WorkspaceFileDownloadService, useValue: downloads},
         {provide: TranslocoService, useValue: {translate: (key: string) => key}},
         {provide: Router, useValue: {}},
       ],
@@ -517,7 +525,36 @@ describe('Canvas pane durable presentation', () => {
     return TestBed.runInInjectionContext(() => new CanvasPaneComponent());
   }
 
-  afterEach(() => TestBed.resetTestingModule());
+  afterEach(() => {
+    downloads.download.mockClear();
+    TestBed.resetTestingModule();
+  });
+
+  it('downloads the presented workspace file', async () => {
+    const pane = paneWith({});
+    TestBed.flushEffects();
+
+    expect(pane.downloadPath()).toBe('output/report.md');
+    await pane.downloadFile();
+
+    expect(downloads.download).toHaveBeenCalledWith('thread-1', 'output/report.md');
+    expect(pane.downloading()).toBe(false);
+  });
+
+  it('offers no download for a source that is not a workspace file', async () => {
+    const pane = paneWith({source: {type: 'browser'}, source_version: null});
+    TestBed.flushEffects();
+
+    expect(pane.downloadPath()).toBeNull();
+    await pane.downloadFile();
+    expect(downloads.download).not.toHaveBeenCalled();
+  });
+
+  it('says a static HTML preview hides scripts and styles', () => {
+    expect(paneWith({}, 'html').staticHtmlPreview()).toBe(true);
+    TestBed.resetTestingModule();
+    expect(paneWith({}, 'html-interactive').staticHtmlPreview()).toBe(false);
+  });
 
   it('labels a snapshot-backed file by its real renderer, never "unsupported"', () => {
     const pane = paneWith({

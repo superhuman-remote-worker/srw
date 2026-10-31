@@ -11,8 +11,10 @@ Covers:
      pgvector write fails the tool instead of claiming "Created".
   4. Charter fetch (KnowledgeStore.get_charter_note) — project_id-keyed,
      path-agnostic, active-only.
-  5. Charter injection: dedicated pair, first in the injection zone,
-     excluded from summarization; gate strict on officer.enabled/conference.
+  5. Charter injection: a ``charter`` context entry, first of the entries a
+     request appends, persisted as a context row, excluded from
+     summarization and appended again once a compaction evicted it; gate
+     strict on officer.enabled/conference.
   6. Config plumbing: officer.conference parses in the loader and is admitted
      by the session override sanitizer.
 """
@@ -23,21 +25,31 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from agent.core.knowledge_injection import (
-    CHARTER_TOOL_CALL_ID_PREFIX,
-    create_charter_injection_messages,
+from agent.core.context_injection import ContextSources, plan_context_entries
+from shared.runtime.core.context_entries import (
+    FOLDED_KEY,
+    entry_body,
+    entry_kind,
+    is_context_entry,
 )
 from shared.runtime.core.loader import OfficerConfig, _parse_officer_config
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT, PERSIST_ROLE_KEY
 from shared.runtime.core.workspace_injection import is_workspace_injection_message
 from agent.persistent_graph import (
+    PersistentLoopCallbacks,
     _charter_injection_enabled,
-    _inject_context_pairs,
+    _execute_turn,
 )
+from shared.runtime.services.recall_store import MemoryRecord
 from shared.runtime.services.knowledge_graph import NOTE_TYPES
 from agent.services.knowledge.bindings import KnowledgeBinding
-from shared.runtime.services.knowledge_store import KB_TTL_BY_NOTE_TYPE, KnowledgeStore
+from shared.runtime.services.knowledge_store import (
+    KB_TTL_BY_NOTE_TYPE,
+    KnowledgeRecord,
+    KnowledgeStore,
+)
 from shared.runtime_actor import (
     SENSITIVE_KNOWLEDGE_HUMAN_ROLE_POLICY,
     RuntimeActorContext,
@@ -499,44 +511,153 @@ class TestGetCharterNote:
 
 
 class TestCharterInjection:
-    def test_pair_shape_and_summarization_exclusion(self):
-        ai, tool = create_charter_injection_messages("standing orders")
-        assert isinstance(ai, AIMessage) and isinstance(tool, ToolMessage)
-        assert ai.tool_calls[0]["id"].startswith(CHARTER_TOOL_CALL_ID_PREFIX)
-        assert tool.tool_call_id == ai.tool_calls[0]["id"]
-        assert tool.content == "standing orders"
-        # Excluded from summarization — re-injected fresh each turn, so
+    _PROJECT_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+    async def _wake(self, charter):
+        """One officer wake through the session loop with every source live.
+
+        Returns the durable history, the persisted messages and the request
+        the provider received.
+        """
+        config = MagicMock()
+        config.extra = {}
+        config.llm.model = None
+        config.memory.query = None
+        config.context_management.max_summary_length = 10_000
+        config.officer = OfficerConfig(enabled=True)
+
+        recall = MagicMock()
+        recall.retrieve = AsyncMock(return_value=[MemoryRecord(content="memories")])
+        ks = MagicMock()
+        ks.get_charter_note = AsyncMock(return_value=charter)
+        ks.hybrid_search = AsyncMock(
+            return_value=[
+                KnowledgeRecord(
+                    note_id="n1",
+                    project_id=uuid.UUID(self._PROJECT_ID),
+                    title="Notes",
+                    note_type="learning",
+                    content="notes",
+                )
+            ]
+        )
+        context_manager = AsyncMock()
+        context_manager.should_summarize = MagicMock(return_value=False)
+        context_manager.record_main_request = MagicMock()
+        context_manager.ensure_within_limits = AsyncMock(
+            side_effect=lambda messages, *_args, **_kwargs: messages
+        )
+        captured: list = []
+
+        async def _astream(provider_input, **_kwargs):
+            captured.append(list(provider_input))
+            yield AIMessage(content="sleeping")
+
+        llm = MagicMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        persisted: list = []
+
+        async def _persist(msg):
+            persisted.append(msg)
+            return True
+
+        callbacks = PersistentLoopCallbacks(
+            get_user_input=AsyncMock(),
+            on_token=AsyncMock(),
+            on_thinking=AsyncMock(),
+            on_tool_start=AsyncMock(),
+            on_tool_result=AsyncMock(),
+            permission_check=AsyncMock(return_value=True),
+            on_turn_start=AsyncMock(),
+            on_turn_complete=AsyncMock(),
+            on_error=AsyncMock(),
+            check_interrupt=MagicMock(return_value=False),
+            persist_message=_persist,
+        )
+        messages = [SystemMessage(content="sys"), HumanMessage(content="wake")]
+        result = await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=context_manager,
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=config,
+            recall_store=recall,
+            knowledge_store=ks,
+            project_id=self._PROJECT_ID,
+        )
+        assert result.error is None
+        assert len(captured) == 1
+        return messages, persisted, captured[0]
+
+    def test_entry_shape_and_summarization_exclusion(self):
+        history = [HumanMessage(content="wake")]
+        (entry,) = plan_context_entries(
+            history,
+            ContextSources(charter="standing orders"),
+            model=None,
+            max_memories=5,
+        ).entries
+        assert entry_kind(entry) == "charter"
+        assert entry_body(entry) == "standing orders"
+        assert entry.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_CONTEXT
+        # Excluded from summarization — harness context, not conversation.
+        assert is_workspace_injection_message(entry)
+        # Present in the history: not appended again on the next call.
+        sources = ContextSources(charter="standing orders")
+        assert (
+            plan_context_entries(
+                [*history, entry], sources, model=None, max_memories=5
+            ).entries
+            == []
+        )
+        # A compaction that evicted it makes it absent: it goes in again, so
         # compaction can never strip the standing orders.
-        assert is_workspace_injection_message(ai)
-        assert is_workspace_injection_message(tool)
+        (again,) = plan_context_entries(
+            [HumanMessage(content="[summary]"), HumanMessage(content="next")],
+            sources,
+            model=None,
+            max_memories=5,
+        ).entries
+        assert entry_kind(again) == "charter"
+        assert again.content == entry.content
 
-    def test_charter_lands_first_in_injection_zone(self):
-        prepared = [HumanMessage(content="wake")]
-        n = _inject_context_pairs(
-            prepared,
-            manager_injection=[],
-            memory_block="memories",
-            knowledge_block="notes",
-            citation_feedback_block="",
-            charter_block="orders",
+    @pytest.mark.asyncio
+    async def test_charter_lands_first_in_injection_zone(self):
+        messages, persisted, request = await self._wake(
+            {"title": "Standing orders", "content": "orders"}
         )
-        assert n == 6
-        # Zone starts after the trailing human message.
-        first_ai = prepared[1]
-        assert isinstance(first_ai, AIMessage)
-        assert first_ai.tool_calls[0]["id"].startswith(CHARTER_TOOL_CALL_ID_PREFIX)
-        assert prepared[2].content == "orders"
 
-    def test_no_charter_block_no_pair(self):
-        prepared = [HumanMessage(content="wake")]
-        n = _inject_context_pairs(
-            prepared,
-            manager_injection=[],
-            memory_block="",
-            knowledge_block="",
-            citation_feedback_block="",
+        entries = [m for m in messages if is_context_entry(m)]
+        assert [entry_kind(m) for m in entries] == ["charter", "memory", "knowledge"]
+        assert "# Standing orders\n\norders" in entry_body(entries[0])
+        # Persisted as context rows before the provider call.
+        assert persisted[:3] == entries
+        assert all(
+            m.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_CONTEXT
+            for m in entries
         )
-        assert n == 0
+        # The request: the wake message carries the charter first.
+        assert [type(m) for m in request] == [SystemMessage, HumanMessage]
+        carrier = request[-1]
+        assert carrier.additional_kwargs[FOLDED_KEY] == [
+            "charter",
+            "memory",
+            "knowledge",
+        ]
+        assert carrier.content.startswith(f"wake\n\n{entries[0].content}")
+
+    @pytest.mark.asyncio
+    async def test_no_charter_no_entry(self):
+        messages, _persisted, request = await self._wake(None)
+
+        kinds = [entry_kind(m) for m in messages if is_context_entry(m)]
+        assert kinds == ["memory", "knowledge"]
+        assert request[-1].additional_kwargs[FOLDED_KEY] == ["memory", "knowledge"]
+        assert "standing orders" not in request[-1].content.lower()
 
     def test_gate_officer_enabled(self):
         cfg = MagicMock()

@@ -591,6 +591,33 @@ def test_a_missing_application_session_expert_is_a_503():
     store.create_thread.assert_not_awaited()
 
 
+def test_an_application_session_expert_on_a_custom_image_is_jobs_only():
+    custom = "example.invalid/h@sha256:" + "b" * 64
+    store = _store(
+        manifest_runtime_image="installed:1",
+        manifest_approved_images=({"name": "cc", "image": custom},),
+        get_application_expert_default=AsyncMock(
+            return_value={
+                "id": CHILD_ID,
+                "harness_adapter": "srw/v1",
+                "config": {},
+                "manifest": {
+                    "spec": {"runtime": {"adapter": "srw/v1", "image": custom}}
+                },
+            }
+        ),
+    )
+    resolve = MagicMock(side_effect=AssertionError("resolved a jobs-only expert"))
+    deps = _deps(
+        store=store, is_experts_db_enabled=lambda: True, resolve_config=resolve
+    )
+    resp = _client(deps).post("/api/agents/threads", json={})
+    assert resp.status_code == 422
+    assert "jobs only" in resp.json()["detail"]
+    resolve.assert_not_called()
+    store.create_thread.assert_not_awaited()
+
+
 def test_agent_thread_creation_is_owner_less_and_datasource_empty():
     store = _store()
     deps = _deps(

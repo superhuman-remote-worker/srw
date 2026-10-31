@@ -647,6 +647,8 @@ class _AgentPool:
         self.is_available = True
         self.max_agents = 5
         self.active_count = AsyncMock(return_value=0)
+        self.active_count_for_image = AsyncMock(return_value=0)
+        self.busy_agent_count_for_image = AsyncMock(return_value=0)
         self.provision_agent = AsyncMock(return_value="srw-agent-j-1")
 
 
@@ -942,6 +944,399 @@ class TestClaimedJobsAreNotPending:
         pool.provision_agent.assert_awaited_once_with(purpose="job")
 
 
+CUSTOM = "example.invalid/h@sha256:" + "b" * 64
+CUSTOM2 = "example.invalid/other@sha256:" + "c" * 64
+APPROVED = ({"name": "cc", "image": CUSTOM}, {"name": "other", "image": CUSTOM2})
+INSTALLED = "ghcr.io/superhuman-remote-worker/srw-agent:latest"
+
+
+def _approved_store(**kwargs: Any) -> FakeStore:
+    store = FakeStore(**kwargs)
+    store.manifest_approved_images = APPROVED
+    return store
+
+
+class TestHarnessImagePairing:
+    """A job runs only on a pod of its harness image: NULL ``harness_image``
+    is the installed default; a custom image is one on the approved list,
+    cold-started for its job (swappable harness image, Task 8)."""
+
+    @pytest.mark.asyncio
+    async def test_a_custom_job_never_takes_a_default_pod(self, no_dispatcher_error):
+        job = _job("j1", harness_image=CUSTOM)
+        store = _approved_store(
+            pinned=[job], agents=[{"id": "a1", "metadata": {}, "image": None}]
+        )
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+        pool.provision_agent.assert_awaited_once_with(purpose="job", image=CUSTOM)
+
+    @pytest.mark.asyncio
+    async def test_a_default_job_never_takes_a_custom_pod(self, no_dispatcher_error):
+        job = _job("j1")
+        store = _approved_store(
+            pinned=[job], agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+
+    @pytest.mark.asyncio
+    async def test_an_agent_without_an_image_column_serves_default_jobs(
+        self, no_dispatcher_error
+    ):
+        job, agent = _job("j1"), {"id": "a1", "metadata": {}}
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_each_job_lands_on_a_pod_of_its_image(self, no_dispatcher_error):
+        j1, j2 = _job("j1"), _job("j2", harness_image=CUSTOM)
+        a2 = {"id": "a2", "metadata": {}, "image": CUSTOM}
+        a1 = {"id": "a1", "metadata": {}, "image": None}
+        store = _approved_store(pinned=[j1, j2], agents=[a2, a1])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        assert [c.args for c in delivery.dispatch.await_args_list] == [
+            (j1, a1),
+            (j2, a2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_custom_pod_skips_the_stale_sha_check(
+        self, monkeypatch, no_dispatcher_error
+    ):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-new")
+        job = _job("j1", harness_image=CUSTOM)
+        agent = {"id": "a2", "metadata": {"build_sha": "whatever"}, "image": CUSTOM}
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_an_old_default_pod_is_still_skipped_as_stale(
+        self, monkeypatch, no_dispatcher_error
+    ):
+        """After an upgrade the previous release's pods report their old tag.
+        Not on the approved list, they stay default-class: skipped as stale,
+        never mistaken for a custom image."""
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-new")
+        j1, j2 = _job("j1"), _job("j2", harness_image=CUSTOM)
+        old = {
+            "id": "a0",
+            "metadata": {"build_sha": "old"},
+            "image": "srw-agent:sha-old",
+        }
+        store = _approved_store(pinned=[j1, j2], agents=[old])
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job"},
+            {"purpose": "job", "image": CUSTOM},
+        ]
+        assert any(
+            "Skipping stale worker agent a0" in r.getMessage()
+            for r in no_dispatcher_error.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_starting_custom_pod_is_not_provisioned_twice(
+        self, no_dispatcher_error
+    ):
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM)])
+        pool = _AgentPool()
+        pool.active_count_for_image = AsyncMock(return_value=1)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.active_count_for_image.assert_awaited_once_with(CUSTOM)
+        pool.provision_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("live", "started"), [(0, 2), (1, 1), (2, 0), (3, 0)])
+    async def test_a_custom_image_gets_one_pod_per_pending_job_less_its_live_pods(
+        self, live, started, no_dispatcher_error
+    ):
+        jobs = [_job(f"j{i}", harness_image=CUSTOM) for i in (1, 2)]
+        store = _approved_store(pinned=jobs)
+        pool = _AgentPool()
+        pool.active_count_for_image = AsyncMock(return_value=live)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.active_count_for_image.assert_awaited_once_with(CUSTOM)
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM}
+        ] * started
+
+    @pytest.mark.asyncio
+    async def test_a_custom_pod_respects_the_agent_ceiling(self, no_dispatcher_error):
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM)])
+        pool = _AgentPool()
+        pool.active_count = AsyncMock(return_value=pool.max_agents)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_image_off_the_approved_list_provisions_nothing(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1", harness_image=CUSTOM)
+        store = FakeStore(
+            pinned=[job], agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        pool.provision_agent.assert_not_awaited()
+        assert store.called("update_job_status") == []
+        assert any(
+            r.levelno == logging.WARNING
+            and "j1" in r.getMessage()
+            and CUSTOM in r.getMessage()
+            for r in no_dispatcher_error.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bound", [None, ()], ids=["unbound", "empty"])
+    async def test_a_pod_of_an_unknown_image_never_gets_a_default_job(
+        self, bound, no_dispatcher_error
+    ):
+        """No ``:sha-`` tag configured, so the stale-build check fails open:
+        a pod whose image is neither installed nor approved must still serve
+        nothing."""
+        job = _job("j1")
+        store = FakeStore(
+            pinned=[job], agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        if bound is not None:
+            store.manifest_approved_images = bound
+        delivery, pool = FakeDelivery(), _AgentPool()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, delivery=delivery, agent_provisioner=pool)
+        )
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+
+    @pytest.mark.asyncio
+    async def test_without_an_approved_list_a_custom_pod_serves_nothing(
+        self, no_dispatcher_error
+    ):
+        """An invalid MANIFEST_APPROVED_IMAGES binds ``()`` at startup."""
+        jobs = [_job("j1", harness_image=CUSTOM), _job("j2")]
+        store = FakeStore(
+            pinned=jobs, agents=[{"id": "a2", "metadata": {}, "image": CUSTOM}]
+        )
+        store.manifest_approved_images = ()
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+
+    @pytest.mark.asyncio
+    async def test_a_previous_release_pod_still_serves_default_jobs(
+        self, no_dispatcher_error
+    ):
+        """Another tag of the installed repository is a default pod: with no
+        SHA-tagged image configured it keeps serving, as before the upgrade."""
+        job = _job("j1")
+        agent = {
+            "id": "a0",
+            "metadata": {},
+            "image": "ghcr.io/superhuman-remote-worker/srw-agent:sha-old",
+        }
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "image",
+        [INSTALLED, "ghcr.io/superhuman-remote-worker/srw-agent:sha-other"],
+        ids=["installed", "installed-repository"],
+    )
+    async def test_a_job_naming_the_installed_image_is_a_default_job(
+        self, image, no_dispatcher_error
+    ):
+        job, agent = _job("j1", harness_image=image), {"id": "a1", "metadata": {}}
+        store = _approved_store(pinned=[job], agents=[agent])
+        delivery = FakeDelivery()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
+
+        delivery.dispatch.assert_awaited_once_with(job, agent)
+
+    @pytest.mark.asyncio
+    async def test_a_job_naming_the_installed_image_gets_a_default_pod(
+        self, no_dispatcher_error
+    ):
+        store = _approved_store(pinned=[_job("j1", harness_image=INSTALLED)])
+        pool = _AgentPool()
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_awaited_once_with(purpose="job")
+        pool.active_count_for_image.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_custom_pod_does_not_starve_a_default_job(
+        self, no_dispatcher_error
+    ):
+        # Preflights reach matching in batches of two: one batch here.
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM), _job("j2")])
+        pool = _AgentPool()
+
+        async def provision(*, purpose, image=None):
+            return None if image else "srw-agent-j-1"
+
+        pool.provision_agent = AsyncMock(side_effect=provision)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM},
+            {"purpose": "job"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_custom_pod_is_not_retried_in_the_same_pass(
+        self, no_dispatcher_error
+    ):
+        jobs = [_job("j1", harness_image=CUSTOM), _job("j2", harness_image=CUSTOM)]
+        store = _approved_store(pinned=jobs)
+        pool = _AgentPool()
+        pool.provision_agent = AsyncMock(return_value=None)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.provision_agent.assert_awaited_once_with(purpose="job", image=CUSTOM)
+
+    @pytest.mark.asyncio
+    async def test_each_custom_image_has_its_own_budget(self, no_dispatcher_error):
+        jobs = [_job("j1", harness_image=CUSTOM), _job("j2", harness_image=CUSTOM2)]
+        store = _approved_store(pinned=jobs)
+        pool = _AgentPool()
+        live = {CUSTOM: 1, CUSTOM2: 0}
+        pool.active_count_for_image = AsyncMock(side_effect=lambda image: live[image])
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        assert [c.args for c in pool.active_count_for_image.await_args_list] == [
+            (CUSTOM,),
+            (CUSTOM2,),
+        ]
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM2}
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("live", "busy", "started"),
+        [(1, 1, 1), (2, 1, 0), (1, 0, 0), (1, 3, 1)],
+    )
+    async def test_a_busy_custom_pod_does_not_hold_back_the_next_job(
+        self, live, busy, started, no_dispatcher_error
+    ):
+        """A live pod still running its job cannot take another; only idle or
+        starting pods of the image count against the pending jobs."""
+        store = _approved_store(pinned=[_job("j1", harness_image=CUSTOM)])
+        pool = _AgentPool()
+        pool.active_count_for_image = AsyncMock(return_value=live)
+        pool.busy_agent_count_for_image = AsyncMock(return_value=busy)
+
+        await dispatch_pending_jobs(dependencies=_deps(store, agent_provisioner=pool))
+
+        pool.busy_agent_count_for_image.assert_awaited_once_with(CUSTOM)
+        assert [c.kwargs for c in pool.provision_agent.await_args_list] == [
+            {"purpose": "job", "image": CUSTOM}
+        ] * started
+
+    @pytest.mark.asyncio
+    async def test_a_default_job_never_preempts_a_custom_running_job(
+        self, no_dispatcher_error
+    ):
+        """Pausing a custom-image job frees a pod a default job cannot use;
+        the next default candidate is preempted instead."""
+        on_custom = {"id": "custom-run", "priority": 1, "assigned_agent_id": "a8"}
+        on_default = {"id": "default-run", "priority": 2, "assigned_agent_id": "a9"}
+        store = _approved_store(
+            pinned=[_job("pending", priority=9)],
+            candidates=[on_custom, on_default],
+            jobs={
+                "custom-run": {"id": "custom-run", "harness_image": CUSTOM},
+                "default-run": {"id": "default-run", "harness_image": None},
+            },
+        )
+        state, delivery = JobDispatchState(), FakeDelivery()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, state=state, delivery=delivery)
+        )
+        await _drain_tasks()
+
+        delivery.initiate_pause.assert_awaited_once_with(on_default)
+        assert state.pause_pending_job_ids == {"default-run"}
+
+    @pytest.mark.asyncio
+    async def test_a_custom_job_preempts_nothing(self, no_dispatcher_error):
+        """Pausing a running job frees a default pod, which cannot serve a
+        custom job."""
+        candidate = {"id": "running", "priority": 1, "assigned_agent_id": "a9"}
+        store = _approved_store(
+            pinned=[_job("pending", priority=9, harness_image=CUSTOM)],
+            candidates=[candidate],
+        )
+        state, delivery = JobDispatchState(), FakeDelivery()
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, state=state, delivery=delivery)
+        )
+        await _drain_tasks()
+
+        delivery.initiate_pause.assert_not_awaited()
+        assert state.pause_pending_job_ids == set()
+
+
 # =============================================================================
 # Stateless admission
 # =============================================================================
@@ -1177,6 +1572,105 @@ class TestTriggerDispatch:
         else:
             assert store.calls == []
 
+    @staticmethod
+    def _follower(monkeypatch) -> None:
+        from orchestrator.services import leader_election
+
+        monkeypatch.setattr(leader_election, "is_leader", asyncio.Event())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("auto_assign", "stateless"), [(True, False), (False, True), (True, True)]
+    )
+    async def test_a_follower_asks_the_leader_and_runs_no_pass(
+        self, monkeypatch, auto_assign, stateless
+    ):
+        """The live-call job of 2026-10-20 was created on the replica that
+        was not the leader: the trigger did nothing and the job waited 28 s
+        for the leader's catch-all pass while warm agents sat ready."""
+        self._follower(monkeypatch)
+        asked = AsyncMock()
+        store = FakeStore(pinned=[_job("j1")])
+        deps = dataclasses.replace(
+            _deps(
+                store,
+                auto_assign_enabled=auto_assign,
+                stateless_worker_enabled=stateless,
+            ),
+            request_leader_dispatch=asked,
+        )
+
+        trigger_dispatch(dependencies=deps)
+        (task,) = deps.state.tasks
+        await asyncio.wait_for(task, 1.0)
+
+        asked.assert_awaited_once_with()
+        assert store.calls == []
+        assert deps.state.runner is None
+        assert deps.state.leader_bound is False
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_or_closing_follower_asks_nothing(self, monkeypatch):
+        self._follower(monkeypatch)
+        asked = AsyncMock()
+        disabled = dataclasses.replace(
+            _deps(
+                FakeStore(), auto_assign_enabled=False, stateless_worker_enabled=False
+            ),
+            request_leader_dispatch=asked,
+        )
+        closing = dataclasses.replace(_deps(FakeStore()), request_leader_dispatch=asked)
+        closing.state.closing = True
+
+        trigger_dispatch(dependencies=disabled)
+        trigger_dispatch(dependencies=closing)
+
+        assert disabled.state.tasks == set() and closing.state.tasks == set()
+        asked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_request_is_logged_not_raised(self, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=LOGGER_NAME)
+        self._follower(monkeypatch)
+        deps = dataclasses.replace(
+            _deps(FakeStore()),
+            request_leader_dispatch=AsyncMock(side_effect=OSError("pool closed")),
+        )
+
+        trigger_dispatch(dependencies=deps)
+        (task,) = deps.state.tasks
+        await asyncio.wait_for(task, 1.0)
+
+        assert task.exception() is None
+        assert any(
+            r.getMessage().startswith("Dispatch: could not ask the leader")
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_request_notifies_the_channel_the_leader_listens_on(self):
+        store = SimpleNamespace(notify_channel=AsyncMock())
+
+        await job_dispatcher.request_leader_dispatch(store)
+
+        store.notify_channel.assert_awaited_once_with(job_dispatcher.DISPATCH_CHANNEL)
+
+    @pytest.mark.asyncio
+    async def test_the_leader_listens_on_that_channel(self, monkeypatch):
+        from orchestrator.services import connector_service_hosting
+
+        heard: list[tuple] = []
+
+        async def fake_listen(store, wake, shutdown, *, channel):
+            heard.append((store, wake, shutdown, channel))
+
+        monkeypatch.setattr(connector_service_hosting, "_listen", fake_listen)
+        store, wake, shutdown = object(), asyncio.Event(), asyncio.Event()
+
+        await job_dispatcher.listen_for_dispatch_requests(store, wake, shutdown)
+
+        assert heard == [(store, wake, shutdown, job_dispatcher.DISPATCH_CHANNEL)]
+
 
 # =============================================================================
 # auto_assign_dispatcher
@@ -1249,6 +1743,93 @@ class TestAutoAssignDispatcher:
             and r.getMessage() == "Error in auto-assign dispatcher: store down"
             for r in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_a_peer_request_schedules_a_pass_and_the_catch_all_keeps_time(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(job_dispatcher, "DISPATCH_INTERVAL_SECONDS", 0.3)
+        shutdown = asyncio.Event()
+        events: list[str] = []
+
+        async def tick(*, dependencies):
+            events.append("catch-all")
+            if events.count("catch-all") == 2:
+                shutdown.set()
+
+        def request(dependencies, *, discover):
+            assert dependencies is deps and discover is True
+            events.append("requested")
+
+        async def listen(wake, stop):
+            assert stop is shutdown
+            await asyncio.sleep(0.05)
+            wake.set()  # one peer replica's NOTIFY
+            await stop.wait()
+
+        monkeypatch.setattr(job_dispatcher, "dispatch_pending_jobs", tick)
+        monkeypatch.setattr(job_dispatcher, "_request_dispatch", request)
+        deps = dataclasses.replace(
+            _deps(FakeStore()), listen_for_dispatch_requests=listen
+        )
+        started = asyncio.get_running_loop().time()
+
+        await asyncio.wait_for(auto_assign_dispatcher(shutdown, dependencies=deps), 2.0)
+
+        # Heard at once, then the catch-all pass on its own schedule.
+        assert events == ["catch-all", "requested", "catch-all"]
+        assert asyncio.get_running_loop().time() - started >= 0.3
+
+    @pytest.mark.asyncio
+    async def test_the_listener_ends_with_the_loop(self, monkeypatch):
+        shutdown = asyncio.Event()
+        listening, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def tick(*, dependencies):
+            await listening.wait()
+            shutdown.set()
+
+        async def listen(wake, stop):
+            listening.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(job_dispatcher, "dispatch_pending_jobs", tick)
+        deps = dataclasses.replace(
+            _deps(FakeStore()), listen_for_dispatch_requests=listen
+        )
+
+        await asyncio.wait_for(auto_assign_dispatcher(shutdown, dependencies=deps), 1.0)
+
+        assert cancelled.is_set()
+
+    def test_the_application_wires_both_halves_to_its_store(self):
+        from orchestrator.application import jobs as jobs_composition
+
+        store = object()
+        deps = jobs_composition.job_dispatch_dependencies(
+            SimpleNamespace(
+                job_dispatch_state=JobDispatchState(),
+                postgres_db=store,
+                completion_control_boundary=object(),
+                settings=SimpleNamespace(
+                    auto_assign_enabled=True, stateless_worker_enabled=False
+                ),
+            )
+        )
+
+        for bound_half, owner in (
+            (deps.request_leader_dispatch, job_dispatcher.request_leader_dispatch),
+            (
+                deps.listen_for_dispatch_requests,
+                job_dispatcher.listen_for_dispatch_requests,
+            ),
+        ):
+            assert isinstance(bound_half, functools.partial)
+            assert bound_half.func is owner and bound_half.args == (store,)
 
 
 # --------------------------------------------------------------------------- #

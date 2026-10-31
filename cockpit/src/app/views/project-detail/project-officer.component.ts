@@ -10,7 +10,7 @@ import { ApiService } from '../../core/services/api.service';
 import { NotificationService } from '../../core/services/notification.service';
 import { buildConferenceThreadCreateBody } from '../../core/officer/conference';
 import type { Notification } from '../../core/models/notification.model';
-import { ModelService } from '../../core/services/model.service';
+import { chatModelLabels, ModelService } from '../../core/services/model.service';
 import type {
   OfficerBrainSpec,
   OfficerDecommissionResult,
@@ -694,7 +694,7 @@ export function nextWakeLabel(
                   >
                     <option value="">{{ 'officerCard.defaults.session' | transloco }}</option>
                     @for (m of modelOptions(); track m) {
-                      <option [value]="m">{{ m }}</option>
+                      <option [value]="m">{{ modelLabels()[m] }}</option>
                     }
                   </app-select>
                 </app-form-field>
@@ -774,7 +774,7 @@ export function nextWakeLabel(
                     >
                       <option value="">{{ 'officerCard.defaults.worker' | transloco }}</option>
                       @for (m of modelOptions(); track m) {
-                        <option [value]="m">{{ m }}</option>
+                        <option [value]="m">{{ modelLabels()[m] }}</option>
                       }
                     </app-select>
                   </app-form-field>
@@ -1537,6 +1537,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly immediacy = (field: OfficerEditField): string => immediacyLabel(field, this.tr);
 
   readonly modelOptions = computed(() => this.modelService.models().flatMap((g) => g.models));
+  /** Option text per model id: the catalog label; the value stays the id. */
+  readonly modelLabels = computed(() => chatModelLabels(this.modelService.models()));
   readonly postState = computed<OfficerPostState>(() => postStateOf(this.post()));
   readonly canManage = computed(() => this.post()?.can_manage === true);
   readonly autoPullEnableAvailable = computed(

@@ -95,6 +95,41 @@ class TestRetryCloudSyncStart:
         )
 
     @pytest.mark.asyncio
+    async def test_remote_cloud_folders_mean_no_mirror_and_stop_retrying(self):
+        """A Virtual Session served its folders as remote descriptors has its
+        outbox at cloud/outbox already: the flat field beside them is not a
+        mirror to build, and that verdict is final."""
+        session = _session_stub()
+        build = MagicMock()
+
+        with (
+            patch.object(papp, "_session", session),
+            patch.object(papp._session_identity, "_thread_id", "t1"),
+            patch.object(
+                papp,
+                "_orchestrator_client",
+                _client_stub(
+                    {
+                        "nc_session_folder": "sessions/t1",
+                        "cloud_remote": {
+                            "mounts": [{"name": "outbox", "path": "cloud/outbox"}],
+                            "plan": {"fingerprint": "f" * 64, "incarnation": "c" * 32},
+                        },
+                    }
+                ),
+            ),
+            patch.object(papp, "_cloud_sync_retry_pending", True),
+            patch.object(papp, "_build_sync_coordinator", build),
+            patch.object(papp, "_broadcast", lambda k, p: None),
+        ):
+            await papp._retry_cloud_sync_start(1)
+
+            assert session.workspace_sync is None
+            assert papp._cloud_sync_retry_pending is False
+
+        build.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_keeps_retrying_while_no_target_resolves(self):
         """Provisioning may still be in flight (or the cloud down). Stay
         pending and stay quiet — the degraded toast already fired at attach,

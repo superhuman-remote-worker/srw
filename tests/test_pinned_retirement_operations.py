@@ -28,6 +28,13 @@ ROOTDISK_UID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 CLAIM_ID = "66666666-6666-4666-8666-666666666666"
 CLAIM_ATTEMPT = "77777777-7777-4777-8777-777777777777"
 CLAIM_GENERATION = "88888888-8888-4888-8888-888888888888"
+# The object-store binding a virtual Session keeps after its upgrade to a VM.
+UPGRADE_LEFT_VIRTUAL_BINDING = {
+    "kind": "virtual",
+    "backing_id": "rclone:" + "3e" * 32,
+    "generation": "e1db3f79-2826-409c-8507-8efe0f4d7d3a",
+    "ssh_host_key_fingerprint": None,
+}
 
 
 def _operations(
@@ -234,7 +241,7 @@ async def test_permanent_retirement_deletes_original_before_pvc_fence() -> None:
     )
 
 
-def _vm_retirement() -> dict[str, object]:
+def _vm_retirement(binding: dict[str, object] | None = None) -> dict[str, object]:
     pod_name = "srw-agent-pinned"
     pod_uid = "55555555-5555-4555-8555-555555555555"
     return {
@@ -261,7 +268,7 @@ def _vm_retirement() -> dict[str, object]:
                 "repo_name": "srw",
                 "git_remote_url": "https://example.invalid/srw.git",
             },
-            "workspace_binding": {},
+            "workspace_binding": dict(binding or {}),
             "workspace_provision_intent": {},
             "vm": {
                 "provision_generation": VM_GENERATION,
@@ -278,7 +285,7 @@ def _vm_retirement() -> dict[str, object]:
     }
 
 
-def _current_vm_thread() -> dict[str, object]:
+def _current_vm_thread(binding: dict[str, object] | None = None) -> dict[str, object]:
     return {
         "id": THREAD_ID,
         "status": "active",
@@ -286,7 +293,7 @@ def _current_vm_thread() -> dict[str, object]:
         "runtime_retirement_token": RETIREMENT_TOKEN,
         "runtime_retirement_permanent": True,
         "runtime_retirement_authorized_at": "authorized",
-        "runtime_retirement_context": _vm_retirement()["context"],
+        "runtime_retirement_context": _vm_retirement(binding)["context"],
         "runtime_retirement_local_quiescence": None,
         "metadata": {},
     }
@@ -302,13 +309,18 @@ def _non_retained_vm_purge(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "binding",
+    [{}, UPGRADE_LEFT_VIRTUAL_BINDING],
+    ids=["no-binding", "binding-left-by-a-virtual-upgrade"],
+)
 async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
-    monkeypatch,
+    monkeypatch, binding
 ) -> None:
     retained_selector = _non_retained_vm_purge(monkeypatch)
     events: list[str] = []
     store = MagicMock()
-    store.get_thread = AsyncMock(return_value=_current_vm_thread())
+    store.get_thread = AsyncMock(return_value=_current_vm_thread(binding))
 
     @asynccontextmanager
     async def lifecycle_lock(_thread_id: str):
@@ -357,7 +369,7 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
         vm_provisioner=vm_provisioner,
     )
 
-    assert await operations.recover_captured_process_zero(_vm_retirement())
+    assert await operations.recover_captured_process_zero(_vm_retirement(binding))
 
     assert events == [
         "delete_pod",
@@ -399,7 +411,7 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
     # A duplicate recovery sees the exact durable receipt and the already
     # absent Pod, so it must not issue another VM release.
     completed = {
-        **_current_vm_thread(),
+        **_current_vm_thread(binding),
         "runtime_retirement_local_quiescence": {
             "version": 1,
             "runtime_generation": RUNTIME_GENERATION,
@@ -418,7 +430,7 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
         "exact_absent",
         "exact_absent",
     ]
-    assert await operations.recover_captured_process_zero(_vm_retirement())
+    assert await operations.recover_captured_process_zero(_vm_retirement(binding))
     vm_provisioner.release_vm_captured.assert_awaited_once()
     store.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
     retained_selector.assert_awaited_once_with(
@@ -653,6 +665,59 @@ async def test_vm_recovery_refuses_explicit_competing_physical_authority_before_
     assert not await operations.recover_captured_process_zero(retirement)
     pod.delete_agent_pod_exact.assert_not_awaited()
     vm.release_vm_captured.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("backend", "binding"),
+    [
+        ("remote", UPGRADE_LEFT_VIRTUAL_BINDING),
+        ("vm", {**UPGRADE_LEFT_VIRTUAL_BINDING, "kind": "remote"}),
+        (
+            "vm",
+            {
+                **UPGRADE_LEFT_VIRTUAL_BINDING,
+                "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
+            },
+        ),
+        ("vm", {**UPGRADE_LEFT_VIRTUAL_BINDING, "backing_id": "k8s-pvc:workspace"}),
+        ("vm", {**UPGRADE_LEFT_VIRTUAL_BINDING, "backing_id": "rclone:3E3E"}),
+        (
+            "vm",
+            {
+                **UPGRADE_LEFT_VIRTUAL_BINDING,
+                "generation": UPGRADE_LEFT_VIRTUAL_BINDING["generation"].upper(),
+            },
+        ),
+        ("vm", {**UPGRADE_LEFT_VIRTUAL_BINDING, "pod_name": "workspace"}),
+        (
+            "vm",
+            {
+                key: value
+                for key, value in UPGRADE_LEFT_VIRTUAL_BINDING.items()
+                if key != "generation"
+            },
+        ),
+    ],
+    ids=[
+        "remote-backend",
+        "remote-kind",
+        "host-key",
+        "pod-backing",
+        "short-backing",
+        "noncanonical-generation",
+        "extra-field",
+        "missing-generation",
+    ],
+)
+def test_vm_recovery_takes_no_other_binding_for_the_one_an_upgrade_left(
+    backend: str, binding: dict[str, object]
+) -> None:
+    context = _vm_retirement(binding)["context"]
+    context["workspace_backend"] = backend
+
+    assert (
+        _operations()._captured_vm_recovery_identity(context, permanent=False) is None
+    )
 
 
 @pytest.mark.asyncio

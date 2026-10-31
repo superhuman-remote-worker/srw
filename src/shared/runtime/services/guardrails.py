@@ -56,9 +56,6 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     # src/managers/todo.py
     "todo_list_footer": set(),
     # src/services/recall_store.py
-    "memory_block_header_pinned": set(),
-    "memory_block_header_retrieved": set(),
-    "memory_block_footer": {"count", "tokens"},
     "memory_entry_header": set(),
     "memory_summary_header": {"count"},
     "memory_summary_hint": set(),
@@ -69,10 +66,17 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     # context_injection.py (append-only cleared renderings)
     "citation_feedback_resolved": set(),
     "active_subagents_none": set(),
+    # src/agent/core/context_injection.py (the session's permission mode)
+    "permission_mode_read_only": set(),
+    "permission_mode_auto_accept": set(),
+    "permission_mode_autonomous": set(),
     # src/persistent_graph.py
     "empty_response_recovery": set(),
     # src/tools/context.py, src/tools/registry.py, src/tools/workspace/files.py
     "read_file_required_error": {"file_path", "tool_name"},
+    # src/agent/tools/context.py — an enforced instruction delivered in the refusal
+    "read_file_delivered_with_refusal": {"file_path", "tool_name", "content"},
+    "read_file_delivered_in_batch": {"file_path", "tool_name"},
 }
 
 

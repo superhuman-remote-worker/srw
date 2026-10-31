@@ -8,7 +8,8 @@ Characterized against the pre-extraction ``main.py`` handlers and ported onto
   either route;
 * the **live file wins over the archive**, and the response says which it was;
 * ``raw=true`` returns the *unfiltered, untailed* text, which for an archived
-  pod log is deliberately the whole pod log;
+  pod log is only this job's (or session's) id-tagged lines, never the whole
+  pooled pod log, and nothing when no line is tagged (N32);
 * the shell-state proxy dials only a **freshly attested** recipient, and an
   agent-side mismatch stays a 409 rather than becoming a 502.
 
@@ -153,9 +154,26 @@ def test_archived_log_is_scoped_to_this_job(tmp_path):
     assert OTHER_ID not in body["lines"][0]
 
 
-def test_raw_returns_the_whole_unfiltered_text(tmp_path):
-    """For an archived pod log this is deliberately the *whole* pod log."""
-    text = f'{{"job_id": "{JOB_ID}"}}\n{{"job_id": "{OTHER_ID}"}}'
+def test_raw_live_log_returns_the_whole_unfiltered_text(tmp_path):
+    text = "2026-07-15 10:00:01 - src.graph - INFO - fine\nsecond"
+    _write_job_log(tmp_path, text)
+    wire = _wire(tmp_path=tmp_path)
+
+    resp = wire.client.get(
+        f"/api/jobs/{JOB_ID}/logs", params={"raw": "true", "level": "ERROR"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.text == text  # the per-job file: untailed, unfiltered
+
+
+def test_raw_archived_log_is_scoped_to_this_job(tmp_path):
+    """N32: raw on a pooled pod log is this job's lines, not the whole log."""
+    mine = f'{{"level": "INFO", "job_id": "{JOB_ID}", "message": "mine"}}'
+    text = "\n".join(
+        [mine, f'{{"level": "ERROR", "job_id": "{OTHER_ID}", "message": "other"}}']
+    )
     wire = _wire(
         tmp_path=tmp_path,
         job={"id": JOB_ID, "context": {"log_archive_keys": ["k"]}},
@@ -168,7 +186,24 @@ def test_raw_returns_the_whole_unfiltered_text(tmp_path):
 
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/plain")
-    assert resp.text == text  # untailed, unfiltered, unscoped
+    assert resp.text == mine  # scoped, but neither level-filtered nor tailed
+
+
+def test_an_archived_log_with_no_line_for_this_job_serves_nothing(tmp_path):
+    text = f'{{"job_id": "{OTHER_ID}", "message": "other"}}\nuntagged line'
+    wire = _wire(
+        tmp_path=tmp_path,
+        job={"id": JOB_ID, "context": {"log_archive_keys": ["k"]}},
+        blobs={"k": text.encode()},
+    )
+
+    raw = wire.client.get(f"/api/jobs/{JOB_ID}/logs", params={"raw": "true"})
+    body = wire.client.get(f"/api/jobs/{JOB_ID}/logs").json()
+
+    assert raw.status_code == 200
+    assert raw.text == ""
+    assert body["lines"] == []
+    assert body["total_lines"] == 0
 
 
 def test_level_and_grep_filters_are_reported(tmp_path):
@@ -248,14 +283,29 @@ def test_a_session_with_no_archive_is_404():
 
 
 def test_thread_logs_are_always_reported_as_archived():
+    lines = [f"{THREAD_ID} a", f"{THREAD_ID} b"]
     wire = _wire(
         thread={"id": THREAD_ID, "metadata": {"log_archive_keys": ["k"]}},
-        blobs={"k": b"a\nb"},
+        blobs={"k": "\n".join(lines).encode()},
     )
     body = wire.client.get(f"/api/persistent/threads/{THREAD_ID}/logs").json()
     assert body["archived"] is True
     assert body["thread_id"] == THREAD_ID
-    assert body["lines"] == ["a", "b"]
+    assert body["lines"] == lines
+
+
+def test_raw_thread_log_is_scoped_to_this_session():
+    mine = f'{{"thread_id": "{THREAD_ID}", "message": "mine"}}'
+    text = "\n".join([mine, f'{{"thread_id": "{OTHER_ID}"}}', "untagged"])
+    wire = _wire(
+        thread={"id": THREAD_ID, "metadata": {"log_archive_keys": ["k"]}},
+        blobs={"k": text.encode()},
+    )
+    resp = wire.client.get(
+        f"/api/persistent/threads/{THREAD_ID}/logs", params={"raw": "true"}
+    )
+    assert resp.status_code == 200
+    assert resp.text == mine
 
 
 def test_thread_logs_use_the_same_scoping_and_filter_as_job_logs():
@@ -286,10 +336,10 @@ def test_thread_metadata_may_be_a_json_string():
             "id": THREAD_ID,
             "metadata": '{"log_archive_keys": ["k"]}',
         },
-        blobs={"k": b"stitched"},
+        blobs={"k": f"{THREAD_ID} stitched".encode()},
     )
     body = wire.client.get(f"/api/persistent/threads/{THREAD_ID}/logs").json()
-    assert body["lines"] == ["stitched"]
+    assert body["lines"] == [f"{THREAD_ID} stitched"]
 
 
 def test_thread_logs_refuse_a_non_owner():

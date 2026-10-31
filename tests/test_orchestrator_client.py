@@ -1214,15 +1214,13 @@ class TestCreateThread:
 
         with patch.object(client, "_client", AsyncMock()) as mock_http:
             mock_http.post = AsyncMock(return_value=mock_response)
-            await client.create_thread(
-                "persistent_defaults", "supervised", "My Session"
-            )
+            await client.create_thread("persistent_defaults", "read_only", "My Session")
 
             mock_http.post.assert_called_once_with(
                 "http://localhost:8085/api/agents/threads",
                 json={
                     "config_name": "persistent_defaults",
-                    "permission_mode": "supervised",
+                    "permission_mode": "read_only",
                     "title": "My Session",
                 },
             )
@@ -1292,7 +1290,7 @@ class TestCreateThread:
 
             call_payload = mock_http.post.call_args[1]["json"]
             assert call_payload["config_name"] == "session_base"
-            assert call_payload["permission_mode"] == "supervised"
+            assert call_payload["permission_mode"] == "read_only"
             assert call_payload["title"] == "Local Session"
 
 
@@ -1779,6 +1777,61 @@ class TestGetThreadWorkspace:
                 "X-Session-Runtime-Attach-Token": RUNTIME_ATTACH_TOKEN,
             },
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            {"code": "workspace_runtime_identity_changed"},
+            "Workspace authority changed during attach",
+            "VM workspace authority changed during attach",
+        ],
+    )
+    async def test_a_changed_workspace_snapshot_raises_only_when_asked(
+        self, client, detail
+    ):
+        """The readiness poll reads again after these 409s; every other caller
+        keeps getting None, as before."""
+        from agent.api.orchestrator_client import WorkspaceSnapshotChanged
+
+        mock_response = MagicMock(status_code=409)
+        mock_response.json.return_value = {"detail": detail}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=mock_response)
+            assert await client.get_thread_workspace("tid-1") is None
+            with pytest.raises(WorkspaceSnapshotChanged) as raised:
+                await client.get_thread_workspace(
+                    "tid-1", raise_on_snapshot_change=True
+                )
+        assert raised.value.code == (
+            detail["code"] if isinstance(detail, dict) else detail
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_409s_stay_none_and_log_only_their_code(self, client, caplog):
+        from agent.api.orchestrator_client import WorkspaceSnapshotChanged
+
+        mock_response = MagicMock(status_code=409)
+        mock_response.json.return_value = {
+            "detail": {
+                "code": "pinned_runtime_identity_mismatch",
+                "message": "PRIVATE-DETAIL-MUST-NOT-LOG",
+            }
+        }
+
+        with patch.object(client, "_client", AsyncMock()) as mock_http:
+            mock_http.get = AsyncMock(return_value=mock_response)
+            with caplog.at_level("INFO", logger="agent.api.orchestrator_client"):
+                try:
+                    result = await client.get_thread_workspace(
+                        "tid-1", raise_on_snapshot_change=True
+                    )
+                except WorkspaceSnapshotChanged:  # pragma: no cover - the defect
+                    pytest.fail("an unrelated 409 must not be read as a change")
+        assert result is None
+        assert "409 pinned_runtime_identity_mismatch" in caplog.text
+        assert "PRIVATE-DETAIL-MUST-NOT-LOG" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_reports_sidecar_cloud_mount_state(self, client):

@@ -89,7 +89,7 @@ async def transcribe_thread_audio(
     if creds is None:
         logger.info("No STT (whisper) model configured for user %s", user_id)
         return None
-    model = creds.model
+    model = creds.wire_model
     base_url = creds.base_url
     api_key = creds.api_key
 
@@ -152,7 +152,9 @@ async def transcribe_thread_audio(
                         ts=datetime.now(timezone.utc),
                         user_id=user_id,
                         project_id=project_id,
-                        ref_kind="thread",
+                        # No thread on the landing draft: an unreferenced
+                        # event, like the TTS voice preview's.
+                        ref_kind="thread" if ref_id else None,
                         ref_id=ref_id,
                         details={"bytes": len(audio_bytes)},
                     )

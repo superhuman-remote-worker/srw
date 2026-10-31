@@ -1611,6 +1611,18 @@ class VMProvisioner:
             return None
         if type(candidate.get("purge_disk")) is not bool:
             return None
+        from orchestrator.services.vm_upgrade_abort_cleanup import (
+            DISK_PURGED_BY_UPGRADE_ABORT,
+            cleanup_stop_pvc_disposition,
+        )
+
+        # A soft End may find the disk its Session's own upgrade abort purged
+        # (E4b); only a thread's retained-disk candidate can say so.
+        pvc_disposition = cleanup_stop_pvc_disposition(candidate)
+        if DISK_PURGED_BY_UPGRADE_ABORT in candidate and (
+            owner_kind != "thread" or pvc_disposition != "purged_by_upgrade_abort"
+        ):
+            return None
         retention_preflight = candidate.get("retention_preflight")
         if "retention_preflight" in candidate:
             from shared.vm_cancel_retention import (
@@ -1735,7 +1747,7 @@ class VMProvisioner:
             or not probe.vmi_absent
             or not probe.launcher_absent
             or probe.identity.rootdisk_pvc_uid
-            != (None if candidate["purge_disk"] else fields["pvc_uid"])
+            != (fields["pvc_uid"] if pvc_disposition == "retained" else None)
         ):
             return None
         retained = {}
@@ -1767,7 +1779,7 @@ class VMProvisioner:
             "vmi_absent": True,
             "launcher_absent": True,
             "same_generation_replacement": False,
-            "pvc_disposition": ("purged" if candidate["purge_disk"] else "retained"),
+            "pvc_disposition": pvc_disposition,
             "controller_authenticated": True,
         }
 
@@ -2803,6 +2815,16 @@ class VMProvisioner:
                 )
             if contained:
                 await self._record_retained_detach(job_id, binding)
+                # Found already released (by an upgrade's abort, E4b): the
+                # runtime is proven absent, so record it as a delete does. A
+                # later permanent delete requires that record.
+                if (
+                    entity_type == "thread"
+                    and not await self._set_context_if_generation(
+                        entity_type, job_id, generation, {"status": "deleted"}
+                    )
+                ):
+                    return VMTeardownResult("identity_unknown", False)
             return VMTeardownResult(
                 "completed" if contained else "process_zero_unproven",
                 contained,

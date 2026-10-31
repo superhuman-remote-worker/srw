@@ -10,6 +10,7 @@ See knowledge-base/knowledge/features/vm_backend.md for the full design.
 
 import base64
 import errno
+import functools
 import fnmatch
 import hashlib
 import hmac
@@ -42,11 +43,15 @@ from shared.runtime.core.shell_protocol import (
     INTERACTIVE_PROMPT_TEMPLATE,
     NO_CHANGE_TIMEOUT_SECONDS,
     NONINTERACTIVE_ENV_EXPORT,
+    SESSION_ENDED_MESSAGE,
     STILL_RUNNING_HARDCAP_TEMPLATE,
     STILL_RUNNING_TEMPLATE,
     SUDO_FREEZE_SENTINEL,
+    TAB_SHELL_ENDED_TEMPLATE,
     build_sentinel_command,
+    command_shell_ended_message,
     compute_no_change_state,
+    confine_shell_exit,
     new_start_marker,
     start_marker_command,
 )
@@ -56,8 +61,10 @@ from shared.runtime.core.workspace_backend import (
     RemoteCommandTimeoutError,
     WorkspaceAuthenticationError,
     WorkspaceBackend,
+    WorkspaceDiskFullError,
     WorkspaceUnavailableError,
 )
+from shared.workspace_disk import WorkspaceDiskUsage
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +107,10 @@ _TERMINAL_PROOF_SETTLE_SECONDS = 5.0
 _CHANNEL_OPEN_RETRIES = 3
 _CHANNEL_OPEN_BACKOFF_SECONDS = 0.25
 
+# shell_run: how many transport losses one wait for a running command rides
+# out by reconnecting (each reconnect is bounded by connect()'s own budget).
+_SHELL_WAIT_RESUMES = 3
+
 # shell_cancel: seconds to wait after a Ctrl+C before re-checking whether the
 # tab returned to a prompt. Two attempts, then fall back to a tab reset.
 _CANCEL_SETTLE_SECONDS = 0.5
@@ -113,6 +124,18 @@ _TCP_KEEPALIVE_IDLE_SECONDS = 10
 _TCP_KEEPALIVE_COUNT = 3
 _TCP_KEEPALIVE_INTERVAL_SECONDS = 5
 _TCP_USER_TIMEOUT_MILLIS = 10_000
+
+# Client-side rekey limits. paramiko starts a rekey itself after 512 MiB; a
+# CHANNEL_CLOSE the server sent before our KEXINIT then reaches the transport
+# thread, whose reply waits on the key exchange only that thread can finish,
+# and the whole transport dies 30 s later ("Key-exchange timed out waiting for
+# key negotiation"). Shell polling closes a channel every 0.3 s, so a long
+# turn hits it. Server-initiated rekeys cannot (the server sends only kex after
+# its KEXINIT), so stay above OpenSSH's own default (64 GiB for AES) within
+# RFC 4344's bounds and let the server rekey first.
+# knowledge-base/knowledge/issues/session_unknown_tool_result_needs_admin.md
+_CLIENT_REKEY_BYTES = 2**36
+_CLIENT_REKEY_PACKETS = 2**31
 
 # Explicit deadlines for heavy/recursive remote ops. Now that _exec's
 # deadline actually binds (drain-loop fix), these need generous budgets or
@@ -178,6 +201,19 @@ def _validate_private_key(key_path: Optional[str]) -> str:
         ) from exc
 
     return _sha256_public_key_fingerprint(private_key)
+
+
+def _defer_rekey_to_server(transport: Any) -> None:
+    """Raise this transport's own rekey limits (see ``_CLIENT_REKEY_BYTES``).
+
+    paramiko reads the limits through ``self`` on its packetizer, so instance
+    attributes override the class defaults for this one connection.
+    """
+    packetizer = getattr(transport, "packetizer", None)
+    if packetizer is None:
+        return
+    packetizer.REKEY_BYTES = _CLIENT_REKEY_BYTES
+    packetizer.REKEY_PACKETS = _CLIENT_REKEY_PACKETS
 
 
 def _sha256_public_key_fingerprint(key: Any) -> str:
@@ -295,6 +331,20 @@ _TMUX_PROMPT_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _TMUX_STATE_VERSION = "1"
 _TMUX_LEGACY_INCARNATION_STATE_VERSION = "2"
 _TMUX_INCARNATION_STATE_VERSION = "3"
+# The ownership-record write failed, even after spending the disk reserve.
+# Never 78: that is the fencing refusal for a malformed or foreign record, and
+# a full volume is neither. Like every other nonzero exit it authorizes
+# nothing. The script prints the volume's usage after the marker.
+_TMUX_STATE_WRITE_FAILED_EXIT = 82
+_STATE_WRITE_FAILED_MARKER = "srw-state-write-failed"
+# A record write succeeded only by spending the reserve: the volume is full.
+_DISK_RESERVE_RELEASED_MARKER = "srw-disk-reserve-released"
+# Room for one ownership-record write on a full volume, so the shell still
+# starts and the agent can free space itself. A spent reserve is recreated
+# only once the volume has room for it many times over.
+_DISK_RESERVE_FILENAME = "disk.reserve"
+_DISK_RESERVE_BYTES = 8 * 1024 * 1024
+_DISK_RESERVE_RECREATE_FREE_KIB = 256 * 1024
 _WORKSPACE_PROCESS_TAG_ENV = "SRW_WORKSPACE_PROCESS_TAG"
 _SHELL_PROCESS_TAG_ENV = "SRW_SHELL_PROCESS_TAG"
 
@@ -308,6 +358,47 @@ DEFAULT_BLOCKED_COMMANDS = frozenset(
         "init",
     ]
 )
+
+
+class ShellEndedError(KeyError):
+    """A tab's shell exited, so the tab, or the whole session, is gone.
+
+    A ``KeyError`` because every shell tool already reports a missing tab as
+    a tool error the model can act on; the job carries on. The message is
+    written for the model, so ``str()`` is the text, not KeyError's repr.
+    """
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if self.args else ""
+
+
+class ShellSessionLostError(WorkspaceUnavailableError):
+    """The tmux session is gone while the workspace itself still answers.
+
+    The shell of its last pane exited (``exit`` typed into it, ``kill $$``) or
+    the tmux server died. Still a ``WorkspaceUnavailableError`` wherever the
+    shell cannot be rebuilt; the shell calls rebuild it and raise
+    ``ShellEndedError`` instead of pausing the job.
+    """
+
+
+def _rebuilds_ended_session(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Rebuild a shell session found ended at the start of a shell call.
+
+    The call's first capture found the session gone before it did anything,
+    so after a fresh session the model is told to repeat it. A rebuild that
+    fails raises ``WorkspaceUnavailableError``, as any shell call did before.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "RemoteBackend", *args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(self, *args, **kwargs)
+        except ShellSessionLostError as lost:
+            self._ensure_shell()
+            raise ShellEndedError(SESSION_ENDED_MESSAGE) from lost
+
+    return wrapper
 
 
 class _RemoteTab:
@@ -598,6 +689,12 @@ class RemoteBackend(WorkspaceBackend):
         # A pane pruned while reattaching must be reported to the agent once,
         # before the usual ensure-tab path is allowed to recreate it.
         self._lost_tab_notices: set[str] = set()
+        # Sessions this backend created rather than adopted. A change across a
+        # reconnect proves that the pane a command was waiting on is gone.
+        self._shell_creations = 0
+        # A claim that could start its shell only by spending the disk
+        # reserve leaves this for the next shell tool result, once.
+        self._disk_full_notice: Optional[str] = None
         # Synchronous commands must serialize per pane, not per backend.  A
         # shared-tree child can wait on its own tmux tab while the parent uses
         # another tab (notably ``git`` during turn finalization).  A backend-
@@ -1386,10 +1483,13 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     retain_tail=True,
                 )
             if exit_code != 0:
-                raise WorkspaceUnavailableError(
-                    f"Terminal-fenced {operation} failed with exit code {exit_code}"
+                raise self._tmux_exit_error(
+                    f"Terminal-fenced {operation} failed with exit code {exit_code}",
+                    exit_code,
+                    output,
+                    command_in_flight=True,
                 )
-            return output
+            return self._take_disk_reserve_notice(output)
 
     def verify_terminal_claim_resources_retired(
         self,
@@ -1878,6 +1978,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         transport = self._ssh.get_transport()
         if transport is not None:
             transport.set_keepalive(_TRANSPORT_KEEPALIVE_SECONDS)
+            _defer_rekey_to_server(transport)
             try:
                 sock = transport.get_socket()
             except Exception:
@@ -2862,16 +2963,10 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 '  printf "%s" "$_srw_generation" | '
                 "grep -Eq '^[0-9a-f]{32}$' || exit 78\n"
                 "}\n"
-                "_srw_write_state() {\n"
-                '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || exit 78\n'
-                "  trap 'rm -f \"$_srw_tmp\"' EXIT HUP INT TERM\n"
-                f"  printf '{_TMUX_INCARNATION_STATE_VERSION}|{owner}|"
-                f"{workspace_generation}|{runtime_incarnation}|%s|%s|%s\\n' "
-                '"$1" "$2" "$3" > "$_srw_tmp" || exit 78\n'
-                '  chmod 600 "$_srw_tmp" || exit 78\n'
-                '  mv -f "$_srw_tmp" "$_srw_state" || exit 78\n'
-                "  trap - EXIT HUP INT TERM\n"
-                "}\n"
+                + self._tmux_state_write_shell(
+                    f"'{_TMUX_INCARNATION_STATE_VERSION}|{owner}|"
+                    f"{workspace_generation}|{runtime_incarnation}|%s|%s|%s\\n'"
+                )
             )
         return (
             '_srw_state_dir="$HOME/.srw/tmux"\n'
@@ -2890,14 +2985,71 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             '  printf "%s" "$_srw_generation" | '
             "grep -Eq '^[0-9a-f]{32}$' || exit 78\n"
             "}\n"
-            "_srw_write_state() {\n"
-            '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || exit 78\n'
+            + self._tmux_state_write_shell(
+                f"'{_TMUX_STATE_VERSION}|{owner}|%s|%s|%s\\n'"
+            )
+        )
+
+    @staticmethod
+    def _tmux_state_write_shell(record_format: str) -> str:
+        """Write the ownership record; spend the disk reserve once on a full volume.
+
+        ``record_format`` is the quoted ``printf`` format of one record line.
+        A write that fails even after spending the reserve exits 82 with the
+        volume's usage. A write that succeeds only by spending it reports the
+        same usage and returns, so the shell starts on a full volume and the
+        agent can free space itself. The reserve is recreated after a later
+        write once the volume has room again.
+        """
+        usage = (
+            '  _srw_blocks=$(df -Pk "$_srw_state_dir" 2>/dev/null '
+            "| awk 'NR == 2 { print $2, $3, $4 }')\n"
+            '  _srw_inodes=$(df -Pi "$_srw_state_dir" 2>/dev/null '
+            "| awk 'NR == 2 { print $2, $3, $4 }')\n"
+            '  printf \'%s %s %s\\n\' "$1" "$_srw_blocks" "$_srw_inodes"\n'
+        )
+        return (
+            f'_srw_reserve="$HOME/.srw/{_DISK_RESERVE_FILENAME}"\n'
+            "_srw_disk_usage() {\n" + usage + "}\n"
+            "_srw_try_write_state() {\n"
+            '  _srw_tmp=$(mktemp "$_srw_state_dir/.state.XXXXXX") || return 1\n'
             "  trap 'rm -f \"$_srw_tmp\"' EXIT HUP INT TERM\n"
-            f"  printf '{_TMUX_STATE_VERSION}|{owner}|%s|%s|%s\\n' "
-            '"$1" "$2" "$3" > "$_srw_tmp" || exit 78\n'
-            '  chmod 600 "$_srw_tmp" || exit 78\n'
-            '  mv -f "$_srw_tmp" "$_srw_state" || exit 78\n'
+            f'  if printf {record_format} "$1" "$2" "$3" > "$_srw_tmp" \\\n'
+            '    && chmod 600 "$_srw_tmp" && mv -f "$_srw_tmp" "$_srw_state"; then\n'
+            "    trap - EXIT HUP INT TERM\n"
+            "    return 0\n"
+            "  fi\n"
+            '  rm -f "$_srw_tmp"\n'
             "  trap - EXIT HUP INT TERM\n"
+            "  return 1\n"
+            "}\n"
+            "_srw_keep_reserve() {\n"
+            '  [ ! -e "$_srw_reserve" ] || return 0\n'
+            '  _srw_free=$(df -Pk "$_srw_state_dir" 2>/dev/null '
+            "| awk 'NR == 2 { print $4 }')\n"
+            '  case "$_srw_free" in ""|*[!0-9]*) return 0 ;; esac\n'
+            f'  [ "$_srw_free" -ge {_DISK_RESERVE_RECREATE_FREE_KIB} ] || return 0\n'
+            '  _srw_reserve_tmp="$_srw_reserve.$$"\n'
+            f'  if fallocate -l {_DISK_RESERVE_BYTES} "$_srw_reserve_tmp" '
+            "2>/dev/null \\\n"
+            f"    || head -c {_DISK_RESERVE_BYTES} /dev/zero "
+            '> "$_srw_reserve_tmp" 2>/dev/null; then\n'
+            '    mv -f "$_srw_reserve_tmp" "$_srw_reserve" 2>/dev/null && return 0\n'
+            "  fi\n"
+            '  rm -f "$_srw_reserve_tmp"\n'
+            "}\n"
+            "_srw_write_state() {\n"
+            '  if _srw_try_write_state "$1" "$2" "$3"; then\n'
+            "    _srw_keep_reserve\n"
+            "    return 0\n"
+            "  fi\n"
+            '  if [ -f "$_srw_reserve" ] && rm -f "$_srw_reserve" \\\n'
+            '    && _srw_try_write_state "$1" "$2" "$3"; then\n'
+            f"    _srw_disk_usage {_DISK_RESERVE_RELEASED_MARKER}\n"
+            "    return 0\n"
+            "  fi\n"
+            f"  _srw_disk_usage {_STATE_WRITE_FAILED_MARKER}\n"
+            f"  exit {_TMUX_STATE_WRITE_FAILED_EXIT}\n"
             "}\n"
         )
 
@@ -3113,6 +3265,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         allow_shell_retired: bool = False,
         close_sftp: bool = False,
         pane_context: Optional[tuple[str, str]] = None,
+        command_in_flight: bool = True,
     ) -> str:
         """Run a generated tmux command and prove its remote exit status.
 
@@ -3123,7 +3276,9 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         directly, without adding temp-file I/O to the 300 ms capture loop.
         Pane-scoped callers may supply their exact tab and pane identity;
         only a follow-up liveness proof can then downgrade the failure to an
-        ordinary missing-tab error.
+        ordinary missing-tab error. ``command_in_flight`` is False only for a
+        shell that is starting and has accepted no command yet; a full volume
+        reported from there may be resumed without the explicit-Resume hold.
         """
         with self._shell_io_lock:
             if self._shell_retired and not allow_shell_retired:
@@ -3143,6 +3298,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     tab_name, pane_id = pane_context
                     try:
                         pane_gone = self._tmux_pane_gone(tab_name, pane_id)
+                        session_gone = not pane_gone and self._tmux_session_gone()
                     except Exception as probe_error:
                         self._shell_initialized = False
                         self._tabs.clear()
@@ -3151,19 +3307,106 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         ) from probe_error
                     if pane_gone:
                         self._prune_lost_tmux_tab(tab_name)
-                        raise KeyError(self._lost_tab_message(tab_name))
+                        raise ShellEndedError(self._lost_tab_message(tab_name))
+                    if session_gone:
+                        self._shell_initialized = False
+                        self._tabs.clear()
+                        raise ShellSessionLostError(
+                            f"Remote tmux {operation} failed with exit code "
+                            f"{exit_code}: the shell session has ended"
+                        )
                 self._shell_initialized = False
                 self._tabs.clear()
-                raise WorkspaceUnavailableError(
-                    f"Remote tmux {operation} failed with exit code {exit_code}"
+                raise self._tmux_exit_error(
+                    f"Remote tmux {operation} failed with exit code {exit_code}",
+                    exit_code,
+                    output,
+                    command_in_flight=command_in_flight,
                 )
-            return output
+            return self._take_disk_reserve_notice(output)
+
+    @staticmethod
+    def _take_marker_line(
+        output: str, marker: str
+    ) -> tuple[str, bool, Optional[WorkspaceDiskUsage]]:
+        """Remove a state-script marker line; return the rest and its usage."""
+        kept: list[str] = []
+        found = False
+        usage = None
+        for line in output.split("\n"):
+            fields = line.split()
+            if fields and fields[0] == marker:
+                found = True
+                usage = WorkspaceDiskUsage.from_df(fields[1:])
+                continue
+            kept.append(line)
+        return "\n".join(kept), found, usage
+
+    def _tmux_exit_error(
+        self,
+        message: str,
+        exit_code: int,
+        output: str,
+        *,
+        command_in_flight: bool,
+    ) -> WorkspaceUnavailableError:
+        """Name a full volume behind a failed ownership-record write (exit 82)."""
+        if exit_code != _TMUX_STATE_WRITE_FAILED_EXIT:
+            return WorkspaceUnavailableError(message)
+        _, _, usage = self._take_marker_line(output, _STATE_WRITE_FAILED_MARKER)
+        if usage is None or not usage.full:
+            # df does not show a full volume (an unwritable state directory,
+            # a read-only filesystem): the workspace is unavailable, as before.
+            return WorkspaceUnavailableError(
+                f"{message}: could not write the shell ownership record"
+            )
+        logger.warning(
+            "workspace disk full: session=%s %s", self._session_name, usage.describe()
+        )
+        return WorkspaceDiskFullError(
+            f"{message}: workspace disk is full ({usage.describe()})",
+            usage=usage,
+            command_in_flight=command_in_flight,
+        )
+
+    def _take_disk_reserve_notice(self, output: str) -> str:
+        """Keep a spent-reserve report for the agent; return the script output."""
+        output, released, usage = self._take_marker_line(
+            output, _DISK_RESERVE_RELEASED_MARKER
+        )
+        if released and (usage is None or usage.full):
+            measured = f" ({usage.describe()})" if usage is not None else ""
+            logger.warning(
+                "workspace disk full, reserve spent: session=%s%s",
+                self._session_name,
+                measured,
+            )
+            self._disk_full_notice = (
+                f"⚠ Workspace disk is full{measured}. SRW spent a small emergency "
+                "reserve so this shell could start; if the disk stays full, the "
+                "job pauses at its next step. Free space now, for example "
+                "`pip cache purge`, `uv cache clean`, `npm cache clean --force`, "
+                "or remove build output and unused virtualenvs "
+                "(`du -xsh ~/* ~/.[!.]* 2>/dev/null | sort -h` shows what is large)."
+            )
+        return output
+
+    def take_disk_full_notice(self) -> Optional[str]:
+        """Return, once, the notice that this claim found the disk full."""
+        notice, self._disk_full_notice = self._disk_full_notice, None
+        return notice
 
     def _lost_tab_message(self, tab_name: str) -> str:
-        return (
-            f"Tab '{tab_name}' no longer exists. "
-            f"Available: {', '.join(self._tabs.keys())}"
+        return TAB_SHELL_ENDED_TEMPLATE.format(
+            tab=tab_name, tabs=", ".join(self._tabs.keys()) or "none"
         )
+
+    def _tmux_session_gone(self) -> bool:
+        """True when this backend's exact tmux session no longer answers."""
+        _output, session_exit = self._exec_with_status(
+            f"tmux has-session -t {self._tmux_target()} >/dev/null 2>&1"
+        )
+        return session_exit != 0
 
     def _tmux_pane_gone(self, tab_name: str, pane_id: str) -> bool:
         """Prove that one pane vanished while its exact session stayed live.
@@ -3610,6 +3853,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         output = self._tmux_exec_checked(
             self._tmux_lock_command(inner),
             operation="create or observe stateless session",
+            command_in_flight=False,
         ).strip()
         if output not in {"created", "existing"}:
             raise WorkspaceUnavailableError(
@@ -3768,6 +4012,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         output = self._tmux_exec_checked(
             self._tmux_lock_command(inner),
             operation="create or observe incarnation-fenced stateless session",
+            command_in_flight=False,
         ).strip()
         if output not in {"created", "existing"}:
             raise WorkspaceUnavailableError(
@@ -4266,6 +4511,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     _TMUX_SETUP_OPTION,
                     _TMUX_SETUP_COMPLETE,
                 )
+                self._shell_creations += 1
                 logger.info("Remote shell created: session=%s", self._session_name)
 
             if not self._shell_protocol_current:
@@ -4302,6 +4548,52 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         """Ensure shell is initialized before shell operations."""
         if not self._shell_initialized:
             self._init_shell()
+
+    def _resume_wait_after_transport_loss(
+        self, tab_name: str, sentinel: str, pane_id: Optional[str]
+    ) -> Optional[_RemoteTab]:
+        """Re-adopt the tab a running command owns after the shell was lost.
+
+        Reading the pane is idempotent and the command keeps running in tmux,
+        so a dropped transport is no reason to fail the wait. Reconnect,
+        re-adopt the tmux session (which re-attests ownership and restores the
+        durable pending guards) and return the tab when this exact command
+        still owns it. When re-adoption succeeds but the command's pane did
+        not survive (a new session, or the tab gone or on another pane) the
+        workspace answers and only that shell ended: raise
+        ``ShellEndedError`` for the model. ``None`` when the failure was not a
+        loss or the tab changed owner on the same pane: the caller fails as
+        before.
+        """
+        if self._retired or (self.is_connected() and self._shell_initialized):
+            return None
+        logger.warning(
+            "Shell session or SSH transport to %s lost while waiting on tab %r; "
+            "reconnecting to keep waiting on the running command",
+            self._host,
+            tab_name,
+        )
+        creations = self._shell_creations
+        self._ensure_connected()
+        self._ensure_shell()
+        tab = self._tabs.get(tab_name)
+        if tab is not None and tab.pending_sentinel == sentinel:
+            logger.info("Resumed waiting on tab %r after reconnect", tab_name)
+            return tab
+        session_reset = self._shell_creations != creations
+        if tab is None or tab.pane_id != pane_id or session_reset:
+            logger.warning(
+                "shell_ended_mid_command: session=%s tab=%s session_reset=%s",
+                self._session_name,
+                tab_name,
+                session_reset,
+            )
+            # This error tells the model; a reattach notice would repeat it.
+            self._lost_tab_notices.discard(tab_name)
+            raise ShellEndedError(
+                command_shell_ended_message(tab_name, session_reset=session_reset)
+            )
+        return None
 
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
@@ -4437,8 +4729,16 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         working_dir: Optional[str],
         start_marker: Optional[str] = None,
     ) -> str:
-        """Build one command whose sentinel follows any requested cwd restore."""
-        command = self._with_credential_environment(self._spill_long_command(command))
+        """Build one command whose sentinel follows any requested cwd restore.
+
+        A command that would end the tab's shell (``...; exit "$rc"``) runs in
+        a subshell first, so its ``exit`` sets the exit code as under
+        ``bash -c``; a spilled command is sourced into the tab's shell, so the
+        subshell goes on before the spill.
+        """
+        command = self._with_credential_environment(
+            self._spill_long_command(confine_shell_exit(command))
+        )
         if not working_dir:
             return build_sentinel_command(command, sentinel, start_marker)
 
@@ -4464,6 +4764,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             f'printf \'\\n{sentinel} %s %s\\n\' "$_srw_rc" "$_srw_cwd"'
         )
 
+    @_rebuilds_ended_session
     def shell_run(
         self,
         command: str,
@@ -4572,13 +4873,35 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             resolved_cwd = None
             last_content_hash = None
             stall_start = None
+            resumes = 0
+            pane_id = tab.pane_id
 
             while time.monotonic() - start_time < timeout:
                 time.sleep(0.3)  # Slightly longer poll interval for SSH latency
                 try:
                     all_lines = self._tmux_capture(tab_name)
-                except WorkspaceUnavailableError:
-                    raise
+                except ShellEndedError as ended:
+                    # The pane exited under the command; the session lives on.
+                    raise ShellEndedError(
+                        command_shell_ended_message(tab_name, session_reset=False)
+                    ) from ended
+                except WorkspaceUnavailableError as lost:
+                    resumed_tab = (
+                        self._resume_wait_after_transport_loss(
+                            tab_name, sentinel, pane_id
+                        )
+                        if resumes < _SHELL_WAIT_RESUMES
+                        else None
+                    )
+                    if resumed_tab is None:
+                        if isinstance(lost, ShellSessionLostError):
+                            # The command did run: never let the session
+                            # rebuild report it as a call that did nothing.
+                            raise WorkspaceUnavailableError(str(lost)) from lost
+                        raise
+                    resumes += 1
+                    tab = resumed_tab
+                    continue
 
                 # Find sentinel output line
                 sentinel_line_idx = None
@@ -4755,6 +5078,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             logger.debug(f"Failed to capture terminal state: {e}")
             return "(failed to capture terminal state)"
 
+    @_rebuilds_ended_session
     def shell_send(
         self,
         tab_name: str,
@@ -4831,6 +5155,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             tab.last_activity = datetime.now(timezone.utc)
         return f"Sent to '{tab_name}'"
 
+    @_rebuilds_ended_session
     def shell_cancel(self, tab_name: str = "default") -> str:
         """Send Ctrl+C to a shell tab to abort a stuck/hung command.
 
@@ -4886,6 +5211,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             f"reset (shell-local state and background jobs were cleared)."
         )
 
+    @_rebuilds_ended_session
     def shell_read(
         self,
         tab_name: str,
@@ -4928,6 +5254,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
 
         return text, metadata
 
+    @_rebuilds_ended_session
     def shell_read_with_offset(
         self,
         tab_name: str,
@@ -4981,7 +5308,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 return
             if name in self._lost_tab_notices:
                 self._lost_tab_notices.remove(name)
-                raise KeyError(self._lost_tab_message(name))
+                raise ShellEndedError(self._lost_tab_message(name))
             self.shell_open_tab(name)
 
     def shell_open_tab(

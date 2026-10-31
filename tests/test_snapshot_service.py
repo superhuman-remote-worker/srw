@@ -24,6 +24,7 @@ See knowledge-base/knowledge/features/workspace_durability_tiering.md §C2/§C3.
 
 import hashlib
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -951,3 +952,87 @@ class TestGetStorageStatsHistoryExclusion:
         # though they're excluded from the snapshot count.
         canonical_bytes = len(fake_s3.store[f"{prefix}/env.tar.zst"])
         assert stats["total_size_bytes"] >= canonical_bytes * 2
+
+
+class TestStoreReprobe:
+    """A fresh ``helm install --wait`` probes before the Garage bootstrap
+    hook grants the key: the first HeadBucket is a 403. The service keeps its
+    configuration and comes up on a later probe without another connect().
+    See the vault issue snapshot_service_startup_probe_never_retried.
+    """
+
+    @staticmethod
+    def _forbidden() -> ClientError:
+        return ClientError(
+            {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadBucket"
+        )
+
+    @pytest.fixture
+    def store(self, monkeypatch):
+        from orchestrator.services import snapshot_service as module
+
+        client = MagicMock()
+        built = []
+
+        def build(*args, **kwargs):
+            built.append(kwargs["endpoint_url"])
+            return client
+
+        monkeypatch.setattr(module, "BOTO3_AVAILABLE", True)
+        monkeypatch.setattr(module, "boto3", MagicMock(client=build))
+        monkeypatch.setattr(module, "BotoConfig", MagicMock())
+        monkeypatch.setenv("S3_ENDPOINT", "http://garage:3900")
+        monkeypatch.setenv("S3_BUCKET", "srw-snapshots")
+        return client, built
+
+    @pytest.mark.asyncio
+    async def test_a_403_then_200_flips_availability_without_another_connect(
+        self, store
+    ):
+        client, built = store
+        client.head_bucket.side_effect = [self._forbidden(), None]
+        svc = SnapshotService()
+
+        await svc.connect(db=None)
+
+        assert svc.is_available is False
+        assert svc.needs_reprobe is True
+        assert svc._s3 is None
+
+        assert await svc.reprobe() is True
+        assert svc.is_available is True
+        assert svc.needs_reprobe is False
+        assert svc._s3 is client
+        assert built == ["http://garage:3900", "http://garage:3900"]
+
+    @pytest.mark.asyncio
+    async def test_a_permanent_403_keeps_failing_with_a_rate_limited_warning(
+        self, store, caplog
+    ):
+        client, _ = store
+        client.head_bucket.side_effect = self._forbidden()
+        svc = SnapshotService()
+        await svc.connect(db=None)
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="orchestrator.services.snapshot_service")
+
+        results = [await svc.reprobe() for _ in range(12)]
+
+        assert results == [False] * 12
+        assert svc.is_available is False
+        assert svc._s3 is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [r.getMessage().split(" failed")[0] for r in warnings] == [
+            "Snapshot service: S3 re-probe 1",
+            "Snapshot service: S3 re-probe 11",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_store_is_never_reprobed(self, monkeypatch):
+        monkeypatch.delenv("S3_ENDPOINT", raising=False)
+        svc = SnapshotService()
+
+        await svc.connect(db=None)
+
+        assert svc.needs_reprobe is False
+        assert await svc.reprobe() is False

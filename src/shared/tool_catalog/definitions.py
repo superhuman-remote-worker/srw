@@ -27,6 +27,7 @@ CANVAS_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "presentation metadata, not source bytes or credentials."
         ),
         "category": "canvas",
+        "effect": "read",
         "short_description": "Inspect the current shared Canvas presentation.",
         "phases": ["strategic", "tactical"],
     },
@@ -43,6 +44,7 @@ CANVAS_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "after updating a presented source."
         ),
         "category": "canvas",
+        "effect": "bookkeeping",
         "short_description": "Present or refresh a workspace source on Canvas.",
         "phases": ["strategic", "tactical"],
     },
@@ -54,6 +56,7 @@ CANVAS_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "not delete its source file or stop any workspace process."
         ),
         "category": "canvas",
+        "effect": "bookkeeping",
         "short_description": "Clear the shared Canvas without deleting its source.",
         "phases": ["strategic", "tactical"],
     },
@@ -67,6 +70,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cite_document",
         "description": "Create a verified citation for document content",
         "category": "citation",
+        "effect": "write",
         "defer_to_workspace": True,
         "short_description": "Create verified citation for document content.",
         "phases": ["strategic", "tactical"],
@@ -76,6 +80,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cite_web",
         "description": "Create a verified citation for web content",
         "category": "citation",
+        "effect": "write",
         "defer_to_workspace": True,
         "short_description": "Create verified citation for web content.",
         "phases": ["strategic", "tactical"],
@@ -85,6 +90,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_sources",
         "description": "List all registered citation sources",
         "category": "citation",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "List all registered citation sources.",
         "phases": ["strategic", "tactical"],
@@ -94,6 +100,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_citation",
         "description": "Get details about a specific citation",
         "category": "citation",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Get details about a specific citation by ID.",
         "phases": ["strategic", "tactical"],
@@ -103,6 +110,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_citations",
         "description": "List all citations created in this session",
         "category": "citation",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "List all citations with status and source info.",
         "phases": ["strategic", "tactical"],
@@ -112,8 +120,19 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "edit_citation",
         "description": "Edit fields of an existing citation",
         "category": "citation",
+        "effect": "write",
         "defer_to_workspace": True,
         "short_description": "Edit citation fields (claim, quote, confidence, etc.).",
+        "phases": ["strategic", "tactical"],
+    },
+    "withdraw_citation": {
+        "module": "citation.sources",
+        "function": "withdraw_citation",
+        "description": "Withdraw a citation you no longer use, keeping its record",
+        "category": "citation",
+        "effect": "write",
+        "defer_to_workspace": True,
+        "short_description": "Withdraw an unused or unfixable citation; the record stays.",
         "phases": ["strategic", "tactical"],
     },
     "annotate_source": {
@@ -121,6 +140,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "annotate_source",
         "description": "Add a note, highlight, summary, question, or critique to a source",
         "category": "citation",
+        "effect": "write",
         "defer_to_workspace": True,
         "short_description": "Add annotation to a citation source.",
         "phases": ["strategic", "tactical"],
@@ -130,6 +150,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_annotations",
         "description": "Get annotations for a source",
         "category": "citation",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Get annotations for a citation source.",
         "phases": ["strategic", "tactical"],
@@ -139,6 +160,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "tag_source",
         "description": "Add or remove tags on a citation source",
         "category": "citation",
+        "effect": "write",
         "defer_to_workspace": True,
         "short_description": "Add or remove tags on a citation source.",
         "phases": ["strategic", "tactical"],
@@ -148,6 +170,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "search_library",
         "description": "Search the source library using keyword, semantic, or hybrid search",
         "category": "citation",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Search source library with hybrid retrieval and evidence labels.",
         "phases": ["strategic", "tactical"],
@@ -157,6 +180,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "generate_bibliography",
         "description": "Generate a formatted bibliography/references file from citations",
         "category": "citation",
+        "effect": "write",
         "defer_to_workspace": True,
         "short_description": "Generate formatted bibliography file from citations.",
         "phases": ["strategic", "tactical"],
@@ -175,6 +199,7 @@ COMMUNICATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Use sparingly — the recipient receives this as an email."
         ),
         "category": "communication",
+        "effect": "external",
         "short_description": "Email the job owner. Supports async and blocking modes.",
         "phases": ["strategic", "tactical"],
     },
@@ -188,6 +213,7 @@ JOB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "mark_complete",
         "description": "Signal task/phase completion with structured report",
         "category": "core",
+        "effect": "bookkeeping",
         "phases": ["strategic", "tactical"],  # Both modes
     },
     "job_complete": {
@@ -195,6 +221,7 @@ JOB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "job_complete",
         "description": "Signal FINAL job completion - call when all phases are done",
         "category": "core",
+        "effect": "bookkeeping",
         "phases": ["strategic"],  # Strategic-only: prevents premature termination
     },
 }
@@ -211,6 +238,7 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "durable and survives restarts. Officer sessions only."
         ),
         "category": "core",
+        "effect": "bookkeeping",
         "short_description": "End the wake; sleep until the timer or an event.",
         "phases": ["strategic", "tactical"],  # phase-free in sessions
         # No config lists this; persistent_session.py:1554-1557 appends it.
@@ -228,6 +256,7 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "your session. Officer sessions only."
         ),
         "category": "core",
+        "effect": "external",
         "short_description": "Message the user: log, digest, or page.",
         "phases": ["strategic", "tactical"],
         # No config lists this; persistent_session.py:1554-1557 appends it.
@@ -244,6 +273,7 @@ SESSION_TASK_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "task_add",
         "description": "Add a task to the session task list",
         "category": "session_task",
+        "effect": "bookkeeping",
         "phases": ["strategic", "tactical"],
     },
     "task_complete": {
@@ -251,6 +281,7 @@ SESSION_TASK_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "task_complete",
         "description": "Mark a session task as completed",
         "category": "session_task",
+        "effect": "bookkeeping",
         "phases": ["strategic", "tactical"],
     },
     "task_list": {
@@ -258,6 +289,7 @@ SESSION_TASK_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "task_list",
         "description": "List all session tasks with status",
         "category": "session_task",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -270,6 +302,7 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "next_phase_todos",
         "description": "Stage todos for the next tactical phase",
         "category": "core",
+        "effect": "bookkeeping",
         "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
     },
     "todo_complete": {
@@ -277,6 +310,7 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "todo_complete",
         "description": "Mark a single task as complete (one at a time)",
         "category": "core",
+        "effect": "bookkeeping",
         "phases": ["strategic", "tactical"],  # Both: used in all phases
     },
     "todo_list": {
@@ -284,6 +318,7 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "todo_list",
         "description": "List all todos with IDs and status",
         "category": "core",
+        "effect": "read",
         "phases": ["strategic", "tactical"],  # Both: helps see current state
     },
     "request_replan": {
@@ -291,6 +326,7 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "request_replan",
         "description": "End this phase early and return to planning, keeping all work and todo state",
         "category": "core",
+        "effect": "bookkeeping",
         "phases": ["tactical"],  # Tactical-only: the in-flight adaptation path
     },
 }
@@ -302,12 +338,14 @@ WORKSPACE_UPGRADE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.upgrade",
         "function": "request_workspace_upgrade",
         "description": (
-            "Ask to upgrade from the lite workspace to one with a shell (a "
-            "Session gets a VM, a Job a container). A human decides before "
-            "anything is provisioned; you only request, and you may not be "
-            "resumed afterwards."
+            "Ask the user to upgrade from the lite workspace to a workspace "
+            "with a shell (a Session gets a container, or a VM where only that "
+            "is offered, when SRW would accept the upgrade; a Job a "
+            "container). A human decides before anything is provisioned; you "
+            "only request, and you may not be resumed afterwards."
         ),
         "category": "core",
+        "effect": "bookkeeping",
         "short_description": "Ask to upgrade to a workspace with a shell.",
         "phases": ["strategic", "tactical"],  # Available in both modes
         # No config lists this; persistent_session.py:1547 and agent.py:3078
@@ -340,6 +378,7 @@ def _metadata(
 
 CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
     "wait_agent": {
+        "effect": "read",
         **_metadata(
             "Wait for one background subagent, or for any background "
             "subagent when handle is omitted. Use this only when its next "
@@ -354,6 +393,7 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "wait_agent",
     },
     "message_agent": {
+        "effect": "external",
         **_metadata(
             "Send a concise steering message to an addressable background "
             "subagent by handle. A queued or running child accepts steering. "
@@ -369,6 +409,7 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "message_agent",
     },
     "stop_agent": {
+        "effect": "bookkeeping",
         **_metadata(
             "Ask a background subagent to stop by handle. It gets a bounded "
             "grace window for a tool-less partial synthesis before a hard "
@@ -379,6 +420,7 @@ CONTROL_PLANE_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "stop_agent",
     },
     "list_agents": {
+        "effect": "read",
         **_metadata(
             "List this parent's addressable background subagents as a "
             "bounded status view. It never returns transcripts or full "
@@ -406,6 +448,7 @@ DELEGATE_AGENT_METADATA: Dict[str, Dict[str, Any]] = {
             "cannot delegate further."
         ),
         "category": "delegation",
+        "effect": "external",
         "short_description": (
             "Delegate a bounded brief in the foreground or durable background."
         ),
@@ -426,6 +469,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_list_folders",
         "category": "email",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         "description": "List accessible mailbox folders with message/unseen counts",
     },
@@ -433,6 +477,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_list",
         "category": "email",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         "description": "List message envelopes in a folder (UIDs, newest first)",
     },
@@ -440,6 +485,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_search",
         "category": "email",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         "description": (
             "Search messages by text/sender/subject/date across allowed folders"
@@ -449,6 +495,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_read",
         "category": "email",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         "description": (
             "Read one message: headers + bounded snippet; body saved to workspace"
@@ -458,6 +505,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_move",
         "category": "email",
+        "effect": "external",
         "phases": ["tactical"],
         "description": "Move messages to another folder (archive/trash are moves)",
     },
@@ -465,6 +513,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_flag",
         "category": "email",
+        "effect": "external",
         "phases": ["tactical"],
         "description": "Mark messages read/unread, or star/unstar them",
     },
@@ -472,6 +521,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_draft",
         "category": "email",
+        "effect": "external",
         "phases": ["tactical"],
         "description": (
             "Compose a plain-text draft into the Drafts folder "
@@ -482,6 +532,7 @@ EMAIL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "email.tools",
         "function": "email_send",
         "category": "email",
+        "effect": "external",
         "phases": ["tactical"],
         "description": (
             "Send mail as the user via SMTP (gated unless unattended send is enabled)"
@@ -497,6 +548,7 @@ EVALUATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "approve_job_verdict",
         "description": "Approve a target job that is pending review",
         "category": "evaluation",
+        "effect": "write",
         "short_description": "Approve a pending_review job (transitions to completed).",
         "phases": ["strategic"],
     },
@@ -505,6 +557,7 @@ EVALUATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "return_job_with_feedback",
         "description": "Resume a target job with feedback for the original agent to address",
         "category": "evaluation",
+        "effect": "write",
         "short_description": "Return a job to the original agent with issues to fix.",
         "phases": ["strategic"],
     },
@@ -518,6 +571,7 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "git_log",
         "description": "View commit history with filtering",
         "category": "git",
+        "effect": "read",
         "short_description": "View commit history (default: last 10 commits). Pass repo='<name>' for an attached repository.",
         "phases": ["strategic", "tactical"],
     },
@@ -526,6 +580,7 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "git_show",
         "description": "Inspect a specific commit's changes",
         "category": "git",
+        "effect": "read",
         "short_description": "Show commit details and diff (use stat_only=true for summary). Pass repo='<name>' for an attached repository.",
         "phases": ["strategic", "tactical"],
     },
@@ -534,6 +589,7 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "git_diff",
         "description": "Compare current state to previous commits",
         "category": "git",
+        "effect": "read",
         "short_description": "Show differences (uncommitted changes or between refs). Pass repo='<name>' for an attached repository.",
         "phases": ["strategic", "tactical"],
     },
@@ -542,6 +598,7 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "git_status",
         "description": "See uncommitted changes and workspace state",
         "category": "git",
+        "effect": "read",
         "short_description": "Show current branch and uncommitted changes. Pass repo='<name>' for an attached repository.",
         "phases": ["strategic", "tactical"],
     },
@@ -550,6 +607,7 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "git_tags",
         "description": "List phase milestone tags",
         "category": "git",
+        "effect": "read",
         "short_description": "List git tags for this job (use all_jobs=True for all). Pass repo='<name>' for an attached repository.",
         "phases": ["strategic", "tactical"],
     },
@@ -563,6 +621,7 @@ GRAPH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cypher_query",
         "description": "Execute a read-only Cypher query against Neo4j",
         "category": "graph",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Execute read-only Cypher query against Neo4j.",
         "phases": ["tactical"],
@@ -572,6 +631,7 @@ GRAPH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cypher_execute",
         "description": "Execute a write Cypher statement (CREATE, MERGE, DELETE, SET) against Neo4j",
         "category": "graph",
+        "effect": "external",
         "defer_to_workspace": True,
         "short_description": "Execute write Cypher (CREATE/MERGE/DELETE/SET) against Neo4j.",
         "phases": ["tactical"],
@@ -581,6 +641,7 @@ GRAPH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_database_schema",
         "description": "Get Neo4j database schema (labels, relationships, properties)",
         "category": "graph",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Get Neo4j schema (labels, relationships, properties).",
         "phases": ["tactical"],
@@ -596,6 +657,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_write",
         "description": "Create a new knowledge note (Neo4j + pgvector write-through)",
         "category": "knowledge",
+        "effect": "write",
         "short_description": "Create a knowledge note in the project knowledge base.",
         "phases": ["strategic", "tactical"],
     },
@@ -604,6 +666,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_update",
         "description": "Update an existing knowledge note",
         "category": "knowledge",
+        "effect": "write",
         "short_description": "Update a knowledge note (append, status, tags, links).",
         "phases": ["strategic", "tactical"],
     },
@@ -615,6 +678,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "hidden from search, purged later by the grace-period lane)"
         ),
         "category": "knowledge",
+        "effect": "write",
         "short_description": "Retire a knowledge note with a reason (archive, reversible).",
         "phases": ["strategic", "tactical"],
     },
@@ -624,6 +688,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_read",
         "description": "Read a full knowledge note with metadata and relationships",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "Read a knowledge note by slug ID.",
         "phases": ["strategic", "tactical"],
     },
@@ -632,6 +697,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_list",
         "description": "List knowledge notes with optional filters",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "List knowledge notes (filter by type, tag, status).",
         "phases": ["strategic", "tactical"],
     },
@@ -640,6 +706,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_search",
         "description": "Hybrid search over knowledge base (semantic + keyword + recency)",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "Search knowledge base with hybrid ranking.",
         "phases": ["strategic", "tactical"],
     },
@@ -648,6 +715,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_grep",
         "description": "Enumerate every matching line in the knowledge base (substring or regex, with context)",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "Grep the knowledge base for a literal or regex.",
         "phases": ["strategic", "tactical"],
     },
@@ -657,6 +725,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_related",
         "description": "Find notes related to a given note (graph traversal)",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "Find related notes within N hops.",
         "phases": ["strategic", "tactical"],
     },
@@ -665,6 +734,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_contradictions",
         "description": "Find contradicting notes in the knowledge base",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "List notes connected by CONTRADICTS edges.",
         "phases": ["strategic", "tactical"],
     },
@@ -673,6 +743,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_provenance",
         "description": "Trace a note's derivation chain (DERIVED_FROM)",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "Trace DERIVED_FROM chain for a note.",
         "phases": ["strategic", "tactical"],
     },
@@ -681,6 +752,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_unanswered",
         "description": "List open questions with no answers",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "List question notes without ANSWERS edges.",
         "phases": ["strategic", "tactical"],
     },
@@ -690,6 +762,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_export",
         "description": "Export knowledge base as OKF/markdown files",
         "category": "knowledge",
+        "effect": "write",
         "short_description": "Export knowledge base to OKF .md files.",
         "phases": ["strategic", "tactical"],
     },
@@ -699,6 +772,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_lint",
         "description": "Lint an OKF knowledge base for structural/link/id issues",
         "category": "knowledge",
+        "effect": "read",
         "short_description": "Lint the knowledge base (frontmatter, links, ids).",
         "phases": ["strategic", "tactical"],
     },
@@ -707,6 +781,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "kb_index",
         "description": "Regenerate the OKF index.md for a knowledge base",
         "category": "knowledge",
+        "effect": "write",
         "short_description": "Regenerate index.md (grouped links by type).",
         "phases": ["strategic", "tactical"],
     },
@@ -726,6 +801,7 @@ MEMORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "something the conversation does not already hold"
         ),
         "category": "memory",
+        "effect": "read",
         "short_description": "Search project memory for earlier facts and decisions.",
         "phases": ["strategic", "tactical"],
     },
@@ -748,6 +824,7 @@ LOOP_PLAN_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "completes; re-filing replaces the previous plan."
         ),
         "category": "loop",
+        "effect": "external",
         "short_description": "File the next campaign plan (checkpoint critic only).",
         "phases": ["strategic", "tactical"],
     },
@@ -761,6 +838,7 @@ MONGODB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "mongo_query",
         "description": "Query documents from a MongoDB collection with optional filters",
         "category": "mongodb",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Query documents from a MongoDB collection.",
         "phases": ["tactical"],
@@ -770,6 +848,7 @@ MONGODB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "mongo_aggregate",
         "description": "Run an aggregation pipeline on a MongoDB collection",
         "category": "mongodb",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Run aggregation pipeline on a MongoDB collection.",
         "phases": ["tactical"],
@@ -779,6 +858,7 @@ MONGODB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "mongo_schema",
         "description": "Inspect MongoDB database schema (collections, sample fields, indexes)",
         "category": "mongodb",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Inspect MongoDB schema (collections, fields, indexes).",
         "phases": ["tactical"],
@@ -788,6 +868,7 @@ MONGODB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "mongo_insert",
         "description": "Insert one or more documents into a MongoDB collection",
         "category": "mongodb",
+        "effect": "external",
         "defer_to_workspace": True,
         "short_description": "Insert documents into a MongoDB collection.",
         "phases": ["tactical"],
@@ -797,6 +878,7 @@ MONGODB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "mongo_update",
         "description": "Update documents in a MongoDB collection",
         "category": "mongodb",
+        "effect": "external",
         "defer_to_workspace": True,
         "short_description": "Update documents in a MongoDB collection.",
         "phases": ["tactical"],
@@ -814,6 +896,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "catalog inspection."
         ),
         "category": "agent_catalog",
+        "effect": "read",
         "short_description": "List visible experts.",
         "phases": ["strategic", "tactical"],
     },
@@ -825,6 +908,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "instructions preview, enabled tool categories, and effective models."
         ),
         "category": "agent_catalog",
+        "effect": "read",
         "short_description": "Inspect an expert.",
         "phases": ["strategic", "tactical"],
     },
@@ -833,6 +917,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_skills",
         "description": "List bundled and visible user/global skills.",
         "category": "agent_catalog",
+        "effect": "read",
         "short_description": "List visible skills.",
         "phases": ["strategic", "tactical"],
     },
@@ -844,6 +929,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "source, and tags."
         ),
         "category": "agent_catalog",
+        "effect": "read",
         "short_description": "Search visible skills.",
         "phases": ["strategic", "tactical"],
     },
@@ -855,6 +941,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "and SKILL.md preview. Does not dump the full file tree by default."
         ),
         "category": "agent_catalog",
+        "effect": "read",
         "short_description": "Inspect a skill.",
         "phases": ["strategic", "tactical"],
     },
@@ -866,6 +953,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Authoring support; not injected by default."
         ),
         "category": "catalog_authoring",
+        "effect": "read",
         "short_description": "Get editable expert JSON.",
         "phases": ["strategic", "tactical"],
     },
@@ -878,6 +966,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "support; not injected by default."
         ),
         "category": "catalog_authoring",
+        "effect": "write",
         "short_description": "Create or update an expert from JSON.",
         "phases": ["strategic", "tactical"],
     },
@@ -889,6 +978,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "editing or forking. Authoring support; not injected by default."
         ),
         "category": "catalog_authoring",
+        "effect": "read",
         "short_description": "Get editable skill JSON.",
         "phases": ["strategic", "tactical"],
     },
@@ -901,6 +991,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "support; not injected by default."
         ),
         "category": "catalog_authoring",
+        "effect": "write",
         "short_description": "Create or update a skill from JSON.",
         "phases": ["strategic", "tactical"],
     },
@@ -919,6 +1010,7 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "models this deployment routes, and the caller's effective grants."
         ),
         "category": "orchestrator",
+        "effect": "read",
         "short_description": "Show current session/project/workspace context.",
         "phases": ["strategic", "tactical"],
     },
@@ -936,6 +1028,7 @@ PROJECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "session. Uses the session's project scope from the thread context."
         ),
         "category": "orchestrator",
+        "effect": "read",
         "short_description": "Get the current session project.",
         "phases": ["strategic", "tactical"],
     },
@@ -947,6 +1040,7 @@ PROJECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "the caller has access. Returns full job IDs and useful summaries."
         ),
         "category": "orchestrator",
+        "effect": "read",
         "short_description": "List jobs for the current or selected project.",
         "phases": ["strategic", "tactical"],
     },
@@ -963,6 +1057,7 @@ REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Returned URLs are safe/redacted display URLs."
         ),
         "category": "orchestrator",
+        "effect": "read",
         "short_description": "List project repositories.",
         "phases": ["strategic", "tactical"],
     },
@@ -974,6 +1069,7 @@ REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Project cloud files and job history are not repository roles."
         ),
         "category": "orchestrator",
+        "effect": "read",
         "short_description": "Show the default project repository.",
         "phases": ["strategic", "tactical"],
     },
@@ -985,6 +1081,7 @@ REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Requires a shell-capable sandbox or VM workspace."
         ),
         "category": "orchestrator",
+        "effect": "write",
         "short_description": "Clone a project repository into the session workspace.",
         "phases": ["strategic", "tactical"],
         # No config lists this; persistent_session.py:1540 appends it. It is
@@ -1004,6 +1101,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_automations",
         "description": "List visible cron automations for the user or a project.",
         "category": "workflows",
+        "effect": "read",
         "short_description": "List automations.",
         "phases": ["strategic", "tactical"],
     },
@@ -1012,6 +1110,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_automation",
         "description": "Inspect one visible automation.",
         "category": "workflows",
+        "effect": "read",
         "short_description": "Inspect an automation.",
         "phases": ["strategic", "tactical"],
     },
@@ -1020,6 +1119,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_automation_runs",
         "description": "List jobs spawned by an automation.",
         "category": "workflows",
+        "effect": "read",
         "short_description": "List automation runs.",
         "phases": ["strategic", "tactical"],
     },
@@ -1031,6 +1131,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "set_automation_bundle with dry_run=false only after user approval."
         ),
         "category": "workflows",
+        "effect": "read",
         "short_description": "Draft a disabled automation.",
         "phases": ["strategic", "tactical"],
     },
@@ -1042,6 +1143,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "support; not injected by default."
         ),
         "category": "catalog_authoring",
+        "effect": "read",
         "short_description": "Get editable automation JSON.",
         "phases": ["strategic", "tactical"],
     },
@@ -1054,6 +1156,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Authoring support; not injected by default."
         ),
         "category": "catalog_authoring",
+        "effect": "external",
         "short_description": "Create or update an automation from JSON.",
         "phases": ["strategic", "tactical"],
     },
@@ -1062,6 +1165,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_project_loop",
         "description": "Inspect the current or most recent project loop.",
         "category": "workflows",
+        "effect": "read",
         "short_description": "Inspect the project loop.",
         "phases": ["strategic", "tactical"],
     },
@@ -1070,6 +1174,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_project_loop_jobs",
         "description": "List jobs spawned by the active project loop.",
         "category": "workflows",
+        "effect": "read",
         "short_description": "List project loop jobs.",
         "phases": ["strategic", "tactical"],
     },
@@ -1081,6 +1186,7 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "last error, and likely next actions."
         ),
         "category": "workflows",
+        "effect": "read",
         "short_description": "Explain project loop state.",
         "phases": ["strategic", "tactical"],
     },
@@ -1100,6 +1206,7 @@ PRODUCT_CAPABILITY_TOOLS_METADATA: dict[str, dict[str, Any]] = {
             "advisory; an operation must still enforce current policy."
         ),
         "category": "product_help",
+        "effect": "read",
         "short_description": "Check current SRW capability and session state.",
         "phases": ["strategic", "tactical"],
         # Persistent-session floor appended at persistent_session.py:1442-1448
@@ -1125,6 +1232,7 @@ PRODUCT_HELP_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "composing adjacent features."
         ),
         "category": "product_help",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         # Persistent-session floor appended at persistent_session.py:1427-1432
         # and removed again by the operator break-glass. `product_help` has no
@@ -1139,6 +1247,7 @@ PRODUCT_HELP_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 REPO_TOOLS_METADATA = {
     "repo_checkout": {
         "category": "repo",
+        "effect": "write",
         "description": (
             "Switch an attached repository to a branch, optionally creating it."
         ),
@@ -1146,21 +1255,25 @@ REPO_TOOLS_METADATA = {
     },
     "repo_commit": {
         "category": "repo",
+        "effect": "write",
         "description": "Stage all changes and commit them in an attached repository.",
         "short_description": "Stage and commit changes in an attached repository.",
     },
     "repo_push": {
         "category": "repo",
+        "effect": "external",
         "description": "Push a branch of an attached repository to its remote.",
         "short_description": "Push the current branch of an attached repository.",
     },
     "repo_pull": {
         "category": "repo",
+        "effect": "write",
         "description": "Fast-forward pull in an attached repository.",
         "short_description": "Fast-forward pull in an attached repository.",
     },
     "repo_open_pr": {
         "category": "repo",
+        "effect": "external",
         "description": (
             "Open a pull request (merge request on GitLab) for an attached repository."
         ),
@@ -1168,6 +1281,7 @@ REPO_TOOLS_METADATA = {
     },
     "repo_pr_status": {
         "category": "repo",
+        "effect": "read",
         "description": (
             "Read the live open, merged, or closed state of a pull request "
             "(merge request on GitLab) in an attached repository."
@@ -1187,6 +1301,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "to inspect, interact with, or visually verify a specific page."
         ),
         "category": "browser_direct",
+        "effect": "read",
         "short_description": "Navigate to URL and return page DOM + screenshot.",
         "phases": ["tactical"],
     },
@@ -1198,6 +1313,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "screenshot. Use after actions to see what changed."
         ),
         "category": "browser_direct",
+        "effect": "read",
         "short_description": "Return current page DOM snapshot + screenshot.",
         "phases": ["tactical"],
     },
@@ -1206,6 +1322,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "browser_click",
         "description": "Click an element on the page by its reference number from the DOM snapshot.",
         "category": "browser_direct",
+        "effect": "write",
         "short_description": "Click element by DOM reference number.",
         "phases": ["tactical"],
     },
@@ -1214,6 +1331,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "browser_type",
         "description": "Type literal text or a workspace credential environment variable (env_var) into an input field identified by its reference number. Supply exactly one of text or env_var.",
         "category": "browser_direct",
+        "effect": "write",
         "short_description": "Type text into input field by reference number.",
         "phases": ["tactical"],
     },
@@ -1222,6 +1340,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "browser_select",
         "description": "Select an option from a dropdown by its reference number.",
         "category": "browser_direct",
+        "effect": "write",
         "short_description": "Select dropdown option by reference number.",
         "phases": ["tactical"],
     },
@@ -1232,6 +1351,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Scroll the page or a specific element. Direction: up, down, left, right."
         ),
         "category": "browser_direct",
+        "effect": "read",
         "short_description": "Scroll page or element in a direction.",
         "phases": ["tactical"],
     },
@@ -1240,6 +1360,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "browser_screenshot",
         "description": "Take a screenshot of the current page. Always returns an image regardless of multimodal setting.",
         "category": "browser_direct",
+        "effect": "read",
         "short_description": "Take full screenshot of current page.",
         "phases": ["tactical"],
     },
@@ -1248,6 +1369,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "browser_back",
         "description": "Navigate back to the previous page in browser history.",
         "category": "browser_direct",
+        "effect": "read",
         "short_description": "Go back one page in browser history.",
         "phases": ["tactical"],
     },
@@ -1256,6 +1378,7 @@ BROWSER_DIRECT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "browser_close",
         "description": "Close the browser and free resources. The browser will restart on next use.",
         "category": "browser_direct",
+        "effect": "bookkeeping",
         "short_description": "Close the browser session.",
         "phases": ["tactical"],
     },
@@ -1269,6 +1392,7 @@ PAPER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "search_papers",
         "description": "Search academic databases for papers",
         "category": "research",
+        "effect": "read",
         "short_description": "Search arXiv or Semantic Scholar for academic papers.",
         "phases": ["tactical"],
     },
@@ -1277,6 +1401,7 @@ PAPER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "download_paper",
         "description": "Download paper PDF to workspace",
         "category": "research",
+        "effect": "read",
         "short_description": "Download paper PDF using arXiv/Unpaywall/browser fallback chain.",
         "phases": ["tactical"],
     },
@@ -1285,6 +1410,7 @@ PAPER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_paper_info",
         "description": "Get metadata and citation info for a paper",
         "category": "research",
+        "effect": "read",
         "short_description": "Get paper metadata, abstract, and citations via Semantic Scholar.",
         "phases": ["tactical"],
     },
@@ -1302,6 +1428,7 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "workspace for later reading/citation."
         ),
         "category": "research",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": (
             "Search the web; archive full text and return compact snippets."
@@ -1316,6 +1443,7 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "possible and inline output is bounded per call."
         ),
         "category": "research",
+        "effect": "read",
         "short_description": (
             "Extract and archive page content from URLs with bounded inline output."
         ),
@@ -1329,6 +1457,7 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "and returned as snippets with saved-file pointers."
         ),
         "category": "research",
+        "effect": "read",
         "short_description": "Crawl and archive website pages with compact snippets.",
         "phases": ["tactical"],
     },
@@ -1337,6 +1466,7 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "map_website",
         "description": "Map website structure to discover URLs",
         "category": "research",
+        "effect": "read",
         "short_description": "Discover URLs in a website's structure.",
         "phases": ["tactical"],
     },
@@ -1350,6 +1480,7 @@ RESEARCH_WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "research_topic",
         "description": "Comprehensive literature search across multiple databases",
         "category": "research",
+        "effect": "read",
         "short_description": "Search arXiv + Semantic Scholar, deduplicate, download OA papers.",
         "phases": ["tactical"],
     },
@@ -1367,6 +1498,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "run_command",
         "description": "Execute a shell command and return its output",
         "category": "shell",
+        "effect": "shell",
         "short_description": "Run a shell command and get output.",
         "phases": ["strategic", "tactical"],
     },
@@ -1375,6 +1507,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cancel_command",
         "description": "Abort a stuck/hung command by sending Ctrl+C to the shell tab",
         "category": "shell",
+        "effect": "write",
         "short_description": "Cancel a stuck shell command (Ctrl+C).",
         "phases": ["strategic", "tactical"],
     },
@@ -1383,6 +1516,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "shell_execute",
         "description": "Execute a command or send keystrokes in an independent persistent terminal tab",
         "category": "shell",
+        "effect": "shell",
         "short_description": "Run commands in a persistent terminal tab.",
         "phases": ["strategic", "tactical"],
     },
@@ -1391,6 +1525,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "shell_read",
         "description": "Read scrollback output from a persistent terminal tab",
         "category": "shell",
+        "effect": "read",
         "short_description": "Read output from a terminal tab.",
         "phases": ["strategic", "tactical"],
     },
@@ -1399,6 +1534,7 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "srw_cloud_status",
         "description": "Show rclone cloud mount status, cache usage, and rclone RC stats",
         "category": "shell",
+        "effect": "read",
         "short_description": "Show cloud mount/cache status.",
         "phases": ["strategic", "tactical"],
         # No config lists this; persistent_session.py:1526 appends it. Keeping
@@ -1418,6 +1554,7 @@ SQL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "sql_query",
         "description": "Execute a read-only SQL query against the PostgreSQL connector",
         "category": "sql",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Execute a read-only SQL query against PostgreSQL.",
         "phases": ["tactical"],
@@ -1427,6 +1564,7 @@ SQL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "sql_schema",
         "description": "Inspect the PostgreSQL connector schema (tables, columns, types)",
         "category": "sql",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Inspect the PostgreSQL schema (tables, columns, types).",
         "phases": ["tactical"],
@@ -1436,6 +1574,7 @@ SQL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "sql_execute",
         "description": "Execute a write SQL statement (INSERT, UPDATE, DELETE, DDL) against the PostgreSQL connector",
         "category": "sql",
+        "effect": "external",
         "defer_to_workspace": True,
         "short_description": "Execute write SQL (INSERT/UPDATE/DELETE/DDL) against PostgreSQL.",
         "phases": ["tactical"],
@@ -1449,6 +1588,7 @@ WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "webdav.tools",
         "function": "webdav_list",
         "category": "webdav",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         "description": "List files and folders in WebDAV",
     },
@@ -1456,6 +1596,7 @@ WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "webdav.tools",
         "function": "webdav_read",
         "category": "webdav",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
         "description": "Download a file from WebDAV into the workspace",
     },
@@ -1463,6 +1604,7 @@ WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "webdav.tools",
         "function": "webdav_info",
         "category": "webdav",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
         "description": "Get metadata about a file or folder in WebDAV",
     },
@@ -1470,6 +1612,7 @@ WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "webdav.tools",
         "function": "webdav_write",
         "category": "webdav",
+        "effect": "external",
         "phases": ["tactical"],
         "description": "Upload a file from the workspace to WebDAV",
     },
@@ -1477,6 +1620,7 @@ WEBDAV_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "webdav.tools",
         "function": "webdav_delete",
         "category": "webdav",
+        "effect": "external",
         "phases": ["tactical"],
         "description": "Delete a file or folder from WebDAV",
     },
@@ -1490,6 +1634,7 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "read_file",
         "description": "Read content from a file in the workspace",
         "category": "workspace",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
     },
     "write_file": {
@@ -1497,6 +1642,7 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "write_file",
         "description": "Write content to a file (requires read_file first for existing files)",
         "category": "workspace",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
     },
     "edit_file": {
@@ -1504,6 +1650,7 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "edit_file",
         "description": "Edit a file: replace text, or use position='end'/'start' to append/prepend (requires read_file first)",
         "category": "workspace",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -1516,6 +1663,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "list_files",
         "description": "List files and directories in the workspace",
         "category": "workspace",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
     },
     "delete_file": {
@@ -1523,6 +1671,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "delete_file",
         "description": "Delete a file or empty directory",
         "category": "workspace",
+        "effect": "external",
         "phases": ["strategic", "tactical"],
     },
     "search_files": {
@@ -1530,6 +1679,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "search_files",
         "description": "Search workspace files for literal text (not a regex)",
         "category": "workspace",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
     },
     "file_exists": {
@@ -1537,6 +1687,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "file_exists",
         "description": "Check if a file or directory exists",
         "category": "workspace",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
     },
     "move_file": {
@@ -1544,6 +1695,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "move_file",
         "description": "Move or rename a file/directory in the workspace",
         "category": "workspace",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
     },
     "rename_file": {
@@ -1551,6 +1703,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "rename_file",
         "description": "Rename a file or directory (keeps it in the same location)",
         "category": "workspace",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
     },
     "copy_file": {
@@ -1558,6 +1711,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "copy_file",
         "description": "Copy a file within the workspace",
         "category": "workspace",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
     },
     "get_document_info": {
@@ -1565,6 +1719,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "get_document_info",
         "description": "Get document metadata (page count, size) for planning access",
         "category": "workspace",
+        "effect": "read",
         "defer_to_workspace": True,
         "short_description": "Get PDF/document metadata (pages, size) for planning access.",
         "phases": ["strategic", "tactical"],
@@ -1574,6 +1729,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "create_directory",
         "description": "Create a directory (and parents) in the workspace",
         "category": "workspace",
+        "effect": "write",
         "phases": ["strategic", "tactical"],
     },
     "delete_directory": {
@@ -1581,18 +1737,23 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "delete_directory",
         "description": "Delete a directory and all its contents",
         "category": "workspace",
+        "effect": "external",
         "phases": ["strategic", "tactical"],
     },
 }
 
 
-# workspace/skills
+# workspace/skills. Its own category so that an expert writing its own
+# ``tools.workspace`` list (lists replace wholesale) cannot drop it by accident;
+# ``tools.skills: []`` is the deliberate off switch.
+# knowledge-base/knowledge/features/skills_tool_category.md
 SKILL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "use_skill": {
         "module": "workspace.skills",
         "function": "use_skill",
         "description": "Load a skill's SKILL.md guidance into context for the current task",
-        "category": "workspace",
+        "category": "skills",
+        "effect": "read",
         "phases": ["strategic", "tactical"],
     },
 }

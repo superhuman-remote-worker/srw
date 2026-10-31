@@ -1,3 +1,8 @@
+---
+title: Architecture
+description: How SRW's control plane, agent runtimes and workspaces fit together, where state lives, and how jobs and sessions run.
+---
+
 # Architecture
 
 Superhuman Remote Worker is a Kubernetes-native control plane for interactive

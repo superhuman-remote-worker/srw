@@ -299,6 +299,7 @@ async def test_detail_reads_exact_startup_view_after_owner_gate(reads_wire):
         "state": "attention",
         "reason_code": "invalid_image",
         "readiness_deadline_at": STAMP,
+        "exit_code": None,
     }
     reads_wire.state.job["status"] = "processing"
     reads_wire.db.container_workspace_creation_views.return_value = {UUID(JOB): view}
@@ -315,6 +316,25 @@ async def test_detail_reads_exact_startup_view_after_owner_gate(reads_wire):
     denied = await get(reads_wire, DETAIL, authenticated=False)
     assert denied.status_code == 401
     reads_wire.db.container_workspace_creation_views.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_detail_passes_the_exit_code_of_an_exited_job_container(reads_wire):
+    view = {
+        "stage": "readiness",
+        "state": "attention",
+        "reason_code": "container_exited",
+        "readiness_deadline_at": STAMP,
+        "exit_code": 3,
+    }
+    reads_wire.state.job["status"] = "created"
+    reads_wire.db.container_workspace_creation_views.return_value = {UUID(JOB): view}
+    response = await get(reads_wire, DETAIL)
+    assert response.status_code == 200
+    assert response.json()["workspace_creation"] == {
+        **view,
+        "readiness_deadline_at": "2026-09-07T08:00:00Z",
+    }
 
 
 @pytest.mark.asyncio

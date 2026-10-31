@@ -448,7 +448,25 @@ async def import_candidates(
             )
             continue
         if row is None:
-            outcome.skipped.append(candidate.model_id)
+            holder = await db.find_model_by_model_id(candidate.model_id)
+            if holder is not None and (
+                holder.get("provider_kind") != "endpoint"
+                or str(holder.get("provider_ref")) != endpoint_id
+            ):
+                # A model id names one catalog row: another provider holds
+                # this one, and every reference to it routes there.
+                outcome.rejected.append(
+                    {
+                        "id": candidate.model_id,
+                        "reason": (
+                            "already in the catalog under "
+                            f"{holder.get('provider_kind')} "
+                            f"{holder.get('provider_ref')}"
+                        ),
+                    }
+                )
+            else:
+                outcome.skipped.append(candidate.model_id)
         else:
             outcome.created.append(candidate.model_id)
 

@@ -217,6 +217,7 @@ def sessions_dependencies(
                 )
             )
         ),
+        vm_provisioner=vm_provisioner_module.vm_provisioner,
     )
 
 
@@ -351,7 +352,7 @@ def agent_registration_dependencies(
         logger=logger,
         require_internal=access.require_internal,
         require_admin=functools.partial(access_composition.require_admin, resources),
-        is_internal_call=access.is_internal_call,
+        is_internal_service_call=access.is_internal_service_call,
         log_security_event=access.log_security_event,
         completion_commands_enabled=lambda: resources.settings.completion_commands_enabled,
         require_pinned_status_identity=deployment_gates.require_pinned_status_identity,

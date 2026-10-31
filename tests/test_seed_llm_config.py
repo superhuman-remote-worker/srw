@@ -94,12 +94,17 @@ def _fake_db(
         key = (kwargs["provider_ref"], kwargs["model_id"])
         if key in catalog_keys:
             return None
+        # ON CONFLICT DO NOTHING also covers uq_models_model_id: a model id
+        # names one row across every provider.
+        if any(r["model_id"] == kwargs["model_id"] for r in rows):
+            return None
         catalog_keys.add(key)
         row = {
             "id": f"catalog-{kwargs['model_id']}",
             "provider_kind": kwargs.get("provider_kind"),
             "provider_ref": kwargs["provider_ref"],
             "model_id": kwargs["model_id"],
+            "served_model_id": kwargs.get("served_model_id"),
             "capabilities": list(kwargs.get("capabilities") or []),
             "enabled": kwargs.get("enabled", True),
             "source": kwargs.get("source"),
@@ -107,6 +112,18 @@ def _fake_db(
         }
         rows.append(row)
         return row
+
+    async def _find_model_by_model_id(model_id):
+        # A fixture row given without its provider stands for this
+        # provider's own row, never a holder elsewhere.
+        for row in rows:
+            if (
+                row["model_id"] == model_id
+                and row.get("provider_kind")
+                and row.get("provider_ref")
+            ):
+                return dict(row)
+        return None
 
     async def _list_models(
         *, capabilities=None, provider_kind=None, provider_ref=None, enabled_only=False
@@ -189,6 +206,7 @@ def _fake_db(
 
     db.create_system_llm_endpoint = AsyncMock(side_effect=_create_endpoint)
     db.create_model = AsyncMock(side_effect=_create_model)
+    db.find_model_by_model_id = AsyncMock(side_effect=_find_model_by_model_id)
     db.list_models = AsyncMock(side_effect=_list_models)
     db.update_model = AsyncMock(side_effect=_update_model)
     db.get_default_llm_model = AsyncMock(side_effect=_get_default)
@@ -1604,3 +1622,112 @@ class TestReconcileManifest:
             manifest[s] == []
             for s in ("systemApiKeys", "systemEndpoints", "models", "defaults")
         )
+
+
+class TestOneRowPerModelId:
+    """A model id names one catalog row across every provider: the seed skips
+    an entry another provider holds, and ``servedModelId`` gives a second
+    provider's row its own id while sending the same name upstream."""
+
+    _proxy_row = {
+        "id": "catalog-proxy-opus",
+        "provider_kind": "endpoint",
+        "provider_ref": "endpoint-Proxy",
+        "model_id": "claude-opus-5-5",
+        "capabilities": ["chat", "auxiliary"],
+        "enabled": True,
+        "source": "ui",
+    }
+
+    @pytest.mark.asyncio
+    async def test_an_id_held_by_another_provider_is_skipped_and_logged(self, caplog):
+        db = _fake_db(
+            existing_api_keys=[{"provider": "anthropic"}],
+            catalog_rows=[dict(self._proxy_row)],
+        )
+        entry = {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5",
+            "capabilities": ["chat"],
+            "reconcile": True,
+        }
+        with caplog.at_level("ERROR", logger="orchestrator.seed.llm_config"):
+            report = await seed(db, {"systemModels": [entry]})
+        assert report.models_seeded == []
+        assert report.models_skipped == [("anthropic", "claude-opus-5-5")]
+        # Reconcile must not rewrite the proxy's row either.
+        db.update_model.assert_not_awaited()
+        assert "already in the catalog under endpoint endpoint-Proxy" in caplog.text
+        assert "claude-opus-5-5-anthropic" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_served_model_id_seeds_a_second_row_for_the_same_model(self):
+        db = _fake_db(
+            existing_api_keys=[{"provider": "anthropic"}],
+            catalog_rows=[dict(self._proxy_row)],
+        )
+        entry = {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5-api",
+            "servedModelId": "claude-opus-5-5",
+            "capabilities": ["chat"],
+        }
+        report = await seed(db, {"systemModels": [entry]})
+        assert report.models_seeded == [("anthropic", "claude-opus-5-5-api")]
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["served_model_id"] == "claude-opus-5-5"
+        assert kwargs["family"] == "claude-opus-5-5"
+
+    @pytest.mark.asyncio
+    async def test_a_served_id_breaking_the_naming_rule_is_skipped(self):
+        db = _fake_db(existing_api_keys=[{"provider": "anthropic"}])
+        entry = {
+            "provider": "anthropic",
+            "id": "opus-api",
+            "servedModelId": "claude-opus-5-5",
+            "capabilities": ["chat"],
+        }
+        report = await seed(db, {"systemModels": [entry]})
+        db.create_model.assert_not_awaited()
+        assert report.models_skipped == [("anthropic", "opus-api")]
+
+    def test_an_undeclared_served_id_leaves_the_value_hash_unchanged(self):
+        # Rows seeded before the key existed must not all read as changed.
+        from orchestrator.seed.llm_config import _declared_model_fields
+        from shared.runtime.core.model_registry import family_of
+
+        fields = _declared_model_fields(
+            {"id": "gpt-5-mini"},
+            model_id="gpt-5-mini",
+            capabilities=["chat"],
+            family_of=family_of,
+            context="t",
+        )
+        assert "served_model_id" not in fields
+
+    @pytest.mark.asyncio
+    async def test_reconcile_clears_a_served_id_the_values_dropped(self):
+        row = {
+            "id": "catalog-1",
+            "provider_kind": "system",
+            "provider_ref": "anthropic",
+            "model_id": "claude-opus-5-5-api",
+            "served_model_id": "claude-opus-5-5",
+            "capabilities": ["chat"],
+            "enabled": True,
+            "source": "helm",
+            "helm_value_hash": "stale",
+        }
+        db = _fake_db(
+            existing_api_keys=[{"provider": "anthropic"}],
+            existing_catalog_keys={("anthropic", "claude-opus-5-5-api")},
+            catalog_rows=[row],
+        )
+        entry = {
+            "provider": "anthropic",
+            "id": "claude-opus-5-5-api",
+            "capabilities": ["chat"],
+            "reconcile": True,
+        }
+        await seed(db, {"systemModels": [entry]})
+        assert db.update_model.await_args.kwargs["served_model_id"] is None

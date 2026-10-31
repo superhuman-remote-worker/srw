@@ -62,6 +62,7 @@
     "tag_source",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "bughunter": [
@@ -110,6 +111,7 @@
     "stop_agent",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"
@@ -232,6 +234,7 @@
     "stop_agent",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "write_file"
   ],
@@ -276,6 +279,7 @@
     "send_message",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "write_file"
   ],
   "designer": [
@@ -322,6 +326,7 @@
     "shell_read",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "web_search",
     "write_file"
   ],
@@ -365,6 +370,7 @@
     "search_files",
     "set_canvas",
     "shell_read",
+    "use_skill",
     "web_search",
     "write_file"
   ],
@@ -414,6 +420,7 @@
     "shell_read",
     "stop_agent",
     "todo_complete",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"
@@ -536,6 +543,7 @@
     "tag_source",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "general-worker": [
@@ -605,6 +613,7 @@
     "todo_list",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "interactive": [
@@ -675,6 +684,7 @@
     "stop_agent",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "web_search",
     "write_file"
@@ -763,8 +773,10 @@
     "tag_source",
     "todo_complete",
     "todo_list",
+    "use_skill",
     "wait_agent",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "session_base": [
@@ -830,6 +842,7 @@
     "tag_source",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "subagent_base": [
@@ -917,6 +930,7 @@
     "list_sources",
     "move_file",
     "read_file",
+    "run_command",
     "run_command",
     "search_files",
     "search_library",
@@ -1046,6 +1060,7 @@
     "read_file",
     "read_job_evidence",
     "run_command",
+    "run_command",
     "search_audit",
     "search_files",
     "search_library",
@@ -1074,6 +1089,7 @@
     "list_files",
     "list_sources",
     "read_file",
+    "run_command",
     "run_command",
     "search_files",
     "search_library",
@@ -1130,6 +1146,7 @@
     "list_todo_archives",
     "read_file",
     "read_job_evidence",
+    "run_command",
     "run_command",
     "search_audit",
     "search_files",
@@ -1206,6 +1223,7 @@
     "todo_list",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ],
   "writer": [
@@ -1275,6 +1293,7 @@
     "todo_list",
     "use_skill",
     "web_search",
+    "withdraw_citation",
     "write_file"
   ]
 }

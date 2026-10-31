@@ -183,3 +183,15 @@ def test_list_document_excludes_private_join_fields(document):
         "latest_diagnostic",
         "captured_identity",
     }.isdisjoint(recovery["properties"])
+
+
+def test_workspace_creation_view_documents_the_exit_code():
+    schema = PublicJobListPage.model_json_schema()["$defs"]["WorkspaceCreationView"]
+    assert set(schema["properties"]) == {
+        "stage",
+        "state",
+        "reason_code",
+        "readiness_deadline_at",
+        "exit_code",
+    }
+    assert "exit_code" in schema["required"]

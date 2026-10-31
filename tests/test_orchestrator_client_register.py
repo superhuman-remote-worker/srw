@@ -281,3 +281,28 @@ async def test_register_non_409_failure_returns_false():
     )
 
     assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_register_payload_includes_image_from_env(monkeypatch):
+    monkeypatch.setenv("AGENT_IMAGE", "srw-agent:dev")
+
+    client = OrchestratorClient(
+        orchestrator_url="http://test-orch:8085",
+        pod_ip="10.0.0.5",
+        pod_port=8001,
+        hostname="srw-agent-test",
+        config_name="defaults",
+        pid=1234,
+    )
+    fake_http = AsyncMock()
+    fake_http.post = AsyncMock(
+        return_value=MagicMock(
+            status_code=200,
+            json=lambda: {"agent_id": "a-1", "heartbeat_interval_seconds": 60},
+        )
+    )
+    client._client = fake_http
+
+    assert await client.register(agent_mode="worker") is True
+    assert fake_http.post.call_args.kwargs["json"]["image"] == "srw-agent:dev"

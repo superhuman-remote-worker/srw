@@ -180,8 +180,8 @@ ARTIFACT_TOOLS = [
                         "description": (
                             "Controls when the agent pauses for human review. "
                             "full=never pauses, review=pauses at completion, "
-                            "partial=pauses at phase boundaries + completion, "
-                            "guided=pauses after every tactical phase, "
+                            "partial=pauses after the first strategic phase + completion, "
+                            "guided=pauses after every strategic phase + completion, "
                             "dependent=pauses after every phase"
                         ),
                     },

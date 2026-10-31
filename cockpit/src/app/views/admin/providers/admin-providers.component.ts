@@ -2,7 +2,7 @@ import {ChangeDetectionStrategy, Component, computed, inject, OnInit, output, si
 import {RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
-import {AdminModelsService} from '../../../core/services/admin-models.service';
+import {AdminModelsService, catalogErrorDetail} from '../../../core/services/admin-models.service';
 import {AdminModelsCoordinatorService} from '../models/admin-models-coordinator.service';
 import {
   ApiKeyProvider,
@@ -302,6 +302,13 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
 
               @if (discoveryError()) {
                 <p class="form-error">{{ discoveryError() }}</p>
+              }
+              @if (discoveryFailures().length > 0) {
+                <ul class="form-error discovery-failures" data-testid="discovery-failures">
+                  @for (f of discoveryFailures(); track f.modelId) {
+                    <li><span class="mono">{{ f.modelId }}</span>: {{ f.detail }}</li>
+                  }
+                </ul>
               }
             </div>
           }
@@ -701,6 +708,9 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       font-size: 12px;
       margin: 4px 0 8px 0;
     }
+    .discovery-failures {
+      padding-left: 18px;
+    }
     .mono { font-family: ui-monospace, monospace; font-size: 12px; }
     .muted { color: var(--text-muted); }
     .discovery-pane {
@@ -883,6 +893,8 @@ export class AdminProvidersComponent implements OnInit {
   >({});
   readonly discoveryAdding = signal(false);
   readonly discoveryError = signal<string>('');
+  /** Per-model refusals from the last "Add selected", in the server's words. */
+  readonly discoveryFailures = signal<{modelId: string; detail: string}[]>([]);
 
   // Endpoint form
   readonly newEndpointLabel = signal('');
@@ -952,6 +964,7 @@ export class AdminProvidersComponent implements OnInit {
     if (!this.confirmHelmOverride(this.admin.systemApiKeys().find((k) => k.provider === provider))) return;
     this.savingKey.set(true);
     this.discoveryError.set('');
+    this.discoveryFailures.set([]);
     this.keyFormError.set('');
     this.admin
       .setSystemApiKey(provider, {
@@ -1018,6 +1031,7 @@ export class AdminProvidersComponent implements OnInit {
     if (!provider) return;
     this.discoveryPolling.set(true);
     this.discoveryError.set('');
+    this.discoveryFailures.set([]);
     this.admin.rediscoverProvider(provider).subscribe({
       next: (res: DiscoveryResponse) => {
         this.discoveryPolling.set(false);
@@ -1054,6 +1068,7 @@ export class AdminProvidersComponent implements OnInit {
     this.discoveryPayload.set(null);
     this.discoverySelections.set({});
     this.discoveryError.set('');
+    this.discoveryFailures.set([]);
   }
 
   toggleCandidate(modelId: string, checked: boolean): void {
@@ -1128,9 +1143,10 @@ export class AdminProvidersComponent implements OnInit {
 
     this.discoveryAdding.set(true);
     this.discoveryError.set('');
+    this.discoveryFailures.set([]);
 
     let remaining = chosen.length;
-    let failures = 0;
+    const failures: {modelId: string; detail: string}[] = [];
     for (const c of chosen) {
       const selectedCaps = selections[c.model_id]?.capabilities ?? [];
       const capabilities =
@@ -1150,21 +1166,23 @@ export class AdminProvidersComponent implements OnInit {
             remaining -= 1;
             if (remaining === 0) this.finishAdding(failures);
           },
-          error: () => {
+          error: (err) => {
             remaining -= 1;
-            failures += 1;
+            failures.push({
+              modelId: c.model_id,
+              detail: catalogErrorDetail(err, 'Failed to add model.'),
+            });
             if (remaining === 0) this.finishAdding(failures);
           },
         });
     }
   }
 
-  private finishAdding(failures: number): void {
+  private finishAdding(failures: {modelId: string; detail: string}[]): void {
     this.discoveryAdding.set(false);
-    if (failures > 0) {
-      this.discoveryError.set(
-        `Added with ${failures} failure(s) — likely duplicates that already exist in the catalog.`,
-      );
+    if (failures.length > 0) {
+      this.discoveryError.set(`Added with ${failures.length} failure(s):`);
+      this.discoveryFailures.set(failures);
     } else {
       this.closeDiscovery();
     }

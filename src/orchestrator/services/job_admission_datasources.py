@@ -150,7 +150,7 @@ async def prepare_job_admission_datasources(
     # own thread had been created without a selection, which then persisted
     # as ``datasource_ids: []`` (origin ``omitted_compat``). Every job he
     # commissioned faithfully inherited the empty list, so his workers got
-    # no KurortEngine checkout, could not clone/commit/push, and he
+    # no WidgetShop checkout, could not clone/commit/push, and he
     # correctly refused to dispatch further against a candidate that could
     # never be produced — a full night idle on one absent field.
     wants_dispatch_defaults = bool(

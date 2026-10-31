@@ -2738,6 +2738,161 @@ async def test_0195_cancelled_pre_pod_creation_settles_without_shared_reclaim(db
 
 
 @pytest.mark.asyncio
+async def test_a_refused_job_creation_settles_and_keeps_its_error(db):
+    """A Pod refused at admission leaves the Job only its error to show.
+
+    Its terminal transition cancels the creation; the sweep then settles it
+    with no Pod, and the Job can be deleted. The error is all the Job has, so
+    the settle leaves it in place rather than projecting a runtime status.
+    """
+    job_id = uuid4()
+    pvc_uid = uuid4()
+    error = {
+        "error": 'Workspace pod was rejected by the cluster: pods "w" is forbidden'
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'refused at admission', 'processing')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-r",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-r",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert reservation is not None
+    assert await db.record_managed_repository_workspace_creation_resource(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-r",
+        claim_token=int(reservation["claim_token"]),
+        resource_kind="pvc",
+        resource_uid=str(pvc_uid),
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_build_object("
+            "'workspace_container', $2::jsonb) WHERE id = $1",
+            job_id,
+            json.dumps(error),
+        )
+        # The terminal transition cancels the creation and expires its claim.
+        await conn.execute("UPDATE jobs SET status = 'failed' WHERE id = $1", job_id)
+    claimed = await db.claim_managed_repository_workspace_creation_reconciliation(
+        str(reservation["id"]), claimant="sweep-r"
+    )
+    assert claimed is not None
+    assert claimed["cancel_requested_at"] is not None
+    assert claimed["cancel_resource_policy"] == "terminal_reclaim"
+
+    assert await db.settle_cancelled_partial_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(claimed["reservation_generation"]),
+        claimant="sweep-r",
+        claim_token=int(claimed["claim_token"]),
+    )
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT context->'workspace_container' AS workspace, phase, result_kind "
+            "FROM jobs CROSS JOIN managed_repository_workspace_creation_reservations "
+            "WHERE jobs.id = $1 AND owner_id = $1",
+            job_id,
+        )
+        workspace = row["workspace"]
+        if isinstance(workspace, str):
+            workspace = json.loads(workspace)
+        assert workspace == error
+        assert (row["phase"], row["result_kind"]) == ("aborted", "aborted")
+        assert (
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id) == "DELETE 1"
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_error_only_job_that_kept_its_storage_cannot_be_deleted(db):
+    """The error-only record is metadata, but a kept PVC still holds the row."""
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'refused, then paused', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="creator-k",
+        desired_manifest_digest="0" * 64,
+    )
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-k",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert await db.record_managed_repository_workspace_creation_resource(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="creator-k",
+        claim_token=int(reservation["claim_token"]),
+        resource_kind="pvc",
+        resource_uid=str(uuid4()),
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_build_object("
+            "'workspace_container', jsonb_build_object('error', 'refused')) "
+            "WHERE id = $1",
+            job_id,
+        )
+    cancelled = await db.request_managed_repository_workspace_creation_cancellation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        target_disposition="suspended",
+        reclaim_shared_resources=False,
+        claimant="cleanup-k",
+    )
+    assert cancelled["cancel_resource_policy"] == "preserve"
+    assert await db.settle_cancelled_partial_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(cancelled["reservation_generation"]),
+        claimant="cleanup-k",
+        claim_token=int(cancelled["claim_token"]),
+    )
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+            await conn.execute("DELETE FROM jobs WHERE id = $1", job_id)
+    assert exc_info.value.constraint_name == (
+        "managed_repository_legacy_workspace_cleanup_required_before_owner_delete"
+    )
+
+
+@pytest.mark.asyncio
 async def test_0195_active_creation_blocks_raw_owner_delete_until_abort(db):
     job_id = uuid4()
     async with db.acquire() as conn:

@@ -17,7 +17,7 @@ from uuid import UUID
 import pytest
 
 from orchestrator.services.agent_pod_entrypoint import InvalidConfigNameError
-from orchestrator.services.agent_provisioner import AgentProvisioner
+from orchestrator.services.agent_provisioner import AgentProvisioner, image_key
 from shared.runtime.core.loader import canonical_config_name
 from orchestrator.services.pinned_k8s_effect import (
     K8S_MUTATION_REQUEST_TIMEOUT,
@@ -900,6 +900,43 @@ class TestScaleDownIdle:
 
         assert result == 0
         p._core_api.delete_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_custom_idle_agent_is_not_deleted_but_ineligible_is(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-current")
+        p, conn = _make_provisioner(min_agents=1)
+        p._db.manifest_approved_images = ({"image": "reg/custom:1"},)
+        pods_result = MagicMock()
+        pods_result.items = [_make_pod(f"pod-{i}") for i in range(3)]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        conn.fetch.return_value = [
+            {"id": "c", "hostname": "pod-0", "pod_uid": "u0", "image": "reg/custom:1"},
+            {"id": "i", "hostname": "pod-1", "pod_uid": "u1", "image": "reg/other:1"},
+        ]
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.scale_down_idle(max_terminate=2)
+        assert result == 1
+        (call,) = p._core_api.delete_namespaced_pod.call_args_list
+        assert "pod-1" in (*call.args, *call.kwargs.values())
+        assert "pod-0" not in (*call.args, *call.kwargs.values())
+
+    @pytest.mark.asyncio
+    async def test_count_idle_agents_ignores_custom(self, monkeypatch):
+        monkeypatch.setenv("AGENT_IMAGE", "srw-agent:sha-current")
+        p, conn = _make_provisioner()
+        p._db.manifest_approved_images = ({"image": "reg/custom:1"},)
+        conn.fetch.return_value = [
+            {"image": None},
+            {"image": "srw-agent:sha-old"},
+            {"image": "reg/custom:1"},
+            {"image": "reg/other:1"},
+        ]
+        assert await p._count_idle_agents() == 3
 
     @pytest.mark.asyncio
     async def test_noop_when_no_idle_agents(self):
@@ -2509,3 +2546,117 @@ class TestConfigNameBoundary:
         assert shlex.split(command[2]) == _expected_agent_argv(
             "scholar", hostile_thread
         )
+
+
+CUSTOM = "example.invalid/h@sha256:" + "b" * 64
+
+_MANIFEST_ARGS = dict(
+    pod_name="x",
+    purpose="job",
+    thread_id=None,
+    config_name="worker_base",
+    cpu_request="1",
+    memory_request="1Mi",
+    cpu_limit="1",
+    memory_limit="1Mi",
+)
+
+
+def test_pod_manifest_runs_a_custom_image_on_its_own_entrypoint():
+    p = _bare_provisioner_for_manifest()
+    m = p._build_pod_manifest(**_MANIFEST_ARGS, image=CUSTOM)
+    c = m["spec"]["containers"][0]
+    assert c["image"] == CUSTOM
+    assert "command" not in c
+    assert {"name": "AGENT_IMAGE", "value": CUSTOM} in c["env"]
+    assert "srw/build-sha" not in m["metadata"]["labels"]
+    assert m["metadata"]["labels"]["srw/image-key"] == image_key(CUSTOM)
+
+
+def test_pod_manifest_default_image_keeps_its_command_and_names_itself():
+    p = _bare_provisioner_for_manifest()
+    m = p._build_pod_manifest(**_MANIFEST_ARGS)
+    c = m["spec"]["containers"][0]
+    assert c["image"] == "srw-agent:latest"
+    assert c["command"][2].startswith("exec python agent.py ")
+    assert {"name": "AGENT_IMAGE", "value": "srw-agent:latest"} in c["env"]
+    assert m["metadata"]["labels"]["srw/image-key"] == image_key("srw-agent:latest")
+
+
+def test_image_key_is_label_safe():
+    key = image_key(CUSTOM)
+    assert len(key) == 32 and all(ch in "0123456789abcdef" for ch in key)
+
+
+class TestProvisionImage:
+    @pytest.mark.asyncio
+    async def test_provision_agent_passes_the_image_through(self):
+        p, _ = _make_provisioner()
+        pods_list = MagicMock()
+        pods_list.items = []
+        p._core_api.list_namespaced_pod.return_value = pods_list
+        p._core_api.create_namespaced_pod.return_value = MagicMock()
+        real = p._build_pod_manifest
+        p._build_pod_manifest = MagicMock(side_effect=real)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            await p.provision_agent(purpose="job", image=CUSTOM)
+
+        assert p._build_pod_manifest.call_args.kwargs["image"] == CUSTOM
+
+    @pytest.mark.asyncio
+    async def test_active_count_for_image_counts_live_pods_with_the_label(self):
+        p, _ = _make_provisioner()
+        key = image_key(CUSTOM)
+
+        def labelled(name, k, phase="Running", **kw):
+            pod = _make_pod(name, phase=phase, **kw)
+            pod.metadata.labels["srw/image-key"] = k
+            return pod
+
+        pods = [
+            labelled("a", key),
+            labelled("b", key),
+            labelled("c", key, phase="Succeeded"),
+            labelled("d", key, agent_terminated_at=5),
+            labelled("e", image_key("other")),
+        ]
+
+        def fake_list(namespace, label_selector):
+            want = label_selector.split("srw/image-key=")[-1]
+            return SimpleNamespace(
+                items=[x for x in pods if x.metadata.labels["srw/image-key"] == want]
+            )
+
+        p._core_api.list_namespaced_pod.side_effect = fake_list
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await p.active_count_for_image(CUSTOM) == 2
+
+    @pytest.mark.asyncio
+    async def test_busy_agent_count_for_image_asks_the_database(self):
+        p, _ = _make_provisioner()
+        conn = p._db.acquire.return_value.__aenter__.return_value
+        conn.fetchval = AsyncMock(return_value=3)
+
+        assert await p.busy_agent_count_for_image(CUSTOM) == 3
+
+        sql, image = conn.fetchval.await_args.args
+        assert image == CUSTOM
+        assert "status = 'processing'" in sql
+
+    @pytest.mark.asyncio
+    async def test_busy_agent_count_for_image_is_zero_without_or_on_a_failing_db(
+        self,
+    ):
+        p, _ = _make_provisioner()
+        conn = p._db.acquire.return_value.__aenter__.return_value
+        conn.fetchval = AsyncMock(side_effect=RuntimeError("db down"))
+        assert await p.busy_agent_count_for_image(CUSTOM) == 0
+        p._db = None
+        assert await p.busy_agent_count_for_image(CUSTOM) == 0

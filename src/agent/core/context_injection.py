@@ -5,8 +5,8 @@ Design: knowledge-base/knowledge/features/append_only_context_injection.md
 (knowledge-base/knowledge/plans/append_only_context_injection_wp2_spec.md
 §C, §G).
 
-In ``append_only`` mode harness context (memory, knowledge, guidance, ...)
-is not rebuilt at the request tail on every call. It is appended to the
+Harness context (memory, knowledge, guidance, ...) is not rebuilt at the
+request tail on every call. It is appended to the
 history once, as typed entries (``shared.runtime.core.context_entries``),
 and appended again only when it changes. :func:`plan_context_entries` decides
 what to append: it reads what the history already holds
@@ -35,7 +35,7 @@ compaction evicted is absent and becomes eligible again (D4, D21).
 Pure: no I/O, no clock, no counters. The same history and sources always
 give byte-identical entries, and an entry's text carries no per-turn data
 (D11). The worker execute node (``graph.py``) and the session loop
-(``persistent_graph.py``) call it in ``append_only`` mode.
+(``persistent_graph.py``) call it.
 """
 
 from __future__ import annotations
@@ -62,7 +62,6 @@ from shared.runtime.core.context_entries import (
     MEMORY_SUMMARY_KIND,
     digest,
     entry_meta,
-    is_append_only,
     is_context_entry,
     knowledge_item_key,
     make_context_entry,
@@ -259,6 +258,8 @@ class ContextSources:
       the ids already delivered (spec §C, D21).
     - ``subagents``: the rendered active-subagents block; None when there is
       no subagent runtime, "" when none is running.
+    - ``permission_mode``: the session's permission mode (D13 of
+      tool_permission_tiers.md); None on workers and subagents.
     - ``turn_boundary``: the rendered App Guide turn boundary ("" when off);
       ``turn`` the session turn id (None on workers).
     """
@@ -273,6 +274,7 @@ class ContextSources:
     guidance: Sequence[Mapping[str, Any]] = ()
     delivered_guidance_ids: Collection[str] = ()
     subagents: Optional[str] = None
+    permission_mode: Optional[str] = None
     turn_boundary: str = ""
     turn: Optional[int] = None
 
@@ -419,9 +421,7 @@ def _plan_guidance(
         new.append(item)
     if not new:
         return None
-    body = format_supervisor_guidance(
-        [dict(item.record) for item in new], repeat_notice=False
-    ).strip()
+    body = format_supervisor_guidance([dict(item.record) for item in new]).strip()
     if not body:
         return None
     entry = make_context_entry(
@@ -535,6 +535,33 @@ def _plan_subagents(
     )
 
 
+def format_permission_mode(mode: Optional[str], model: Optional[str] = None) -> str:
+    """What the model is told about a permission mode; "" for an unknown one."""
+    from shared.permission_modes import PERMISSION_MODES, normalize_permission_mode
+    from shared.runtime.services.guardrails import format_nudge
+
+    mode = normalize_permission_mode(mode)
+    if mode not in PERMISSION_MODES:
+        return ""
+    return format_nudge(f"permission_mode_{mode}", model=model)
+
+
+def _plan_permission_mode(
+    sources: ContextSources,
+    presence: Presence,
+    *,
+    model: Optional[str],
+) -> Optional[HumanMessage]:
+    """State mode: told at session start, after a compaction removed it, and
+    whenever the user changes the mode."""
+    if sources.permission_mode is None:
+        return None
+    body = format_permission_mode(sources.permission_mode, model)
+    return _plan_state(
+        "permission_mode", body, presence, has_state=bool(body), turn=sources.turn
+    )
+
+
 def _plan_turn_boundary(
     sources: ContextSources, presence: Presence
 ) -> Optional[HumanMessage]:
@@ -606,6 +633,9 @@ def plan_context_entries(
         "citation": lambda: _plan_citation(sources, presence, model=model),
         "guidance": lambda: _plan_guidance(sources, presence, planned),
         "subagents": lambda: _plan_subagents(sources, presence, model=model),
+        "permission_mode": lambda: _plan_permission_mode(
+            sources, presence, model=model
+        ),
         "turn_boundary": lambda: _plan_turn_boundary(sources, presence),
     }
     for kind in INJECTION_KINDS:
@@ -630,9 +660,9 @@ __all__ = [
     "Planned",
     "Presence",
     "format_active_subagents_none",
+    "format_permission_mode",
     "guidance_item",
     "guidance_text",
-    "is_append_only",
     "knowledge_item",
     "max_memories_per_entry",
     "memory_item",

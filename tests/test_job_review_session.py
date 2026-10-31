@@ -43,9 +43,9 @@ def _job(job: dict) -> dict:
             {
                 "pull_request": {
                     "forge": "github",
-                    "repo": "Knaeckebrothero/KurortEngine",
+                    "repo": "Acme/WidgetShop",
                     "number": 1,
-                    "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+                    "url": "https://github.com/Acme/WidgetShop/pull/1",
                     "head": "design/hotel-rheinland-theme",
                     "base": "main",
                 },
@@ -62,9 +62,9 @@ def _job(job: dict) -> dict:
 def _repository() -> dict:
     return {
         "id": REPO_ID,
-        "name": "KurortEngine",
+        "name": "WidgetShop",
         "type": "repository",
-        "connection_url": "https://github.com/Knaeckebrothero/KurortEngine.git",
+        "connection_url": "https://github.com/Acme/WidgetShop.git",
         "config": {"forge": "github"},
         "credentials": {"token": "server-only-token"},
         "default_branch": "main",
@@ -130,11 +130,11 @@ class TestReviewSessionEndpoint:
         assert body.title.startswith("Review job 29c28492")
         # Worker and session profiles are structurally different. Model and
         # temperature are copied onto the safe session base, while a review
-        # always starts supervised even if the worker ran with auto-accept.
+        # always starts read-only even if the worker ran with auto-accept.
         assert body.config_name == "session_base"
         assert body.model == "gpt-5.6-sol"
         assert body.temperature == 0.2
-        assert body.permission_mode == "supervised"
+        assert body.permission_mode == "read_only"
         assert body.project_ids == [str(job_a["project_id"])]
         assert body.datasource_ids == [DB_ID, REPO_ID]
         # The source checkout needs a real workspace, but this value is fixed
@@ -150,19 +150,19 @@ class TestReviewSessionEndpoint:
                 "datasource_id": REPO_ID,
                 "forge": "github",
                 "repository_host": "github.com",
-                "repo": "Knaeckebrothero/KurortEngine",
+                "repo": "Acme/WidgetShop",
                 "branch": "design/hotel-rheinland-theme",
                 "base": "main",
                 "pull_request": {
                     "number": 1,
-                    "url": "https://github.com/Knaeckebrothero/KurortEngine/pull/1",
+                    "url": "https://github.com/Acme/WidgetShop/pull/1",
                 },
             }
         }
         assert f"Job: {JOB_ID}" in seed.opening_event
         assert "design/hotel-rheinland-theme" in seed.opening_event
         assert "design_spec/hotel-rheinland-theme.md" in seed.opening_event
-        assert "Permission mode: supervised" in seed.opening_event
+        assert "Permission mode: read-only" in seed.opening_event
         assert "workspace, tools" in seed.opening_event
         assert "server-only" not in seed.opening_event
         assert result == {
@@ -387,7 +387,7 @@ class TestReviewSessionEndpoint:
 
         lookalike = _repository()
         lookalike["connection_url"] = (
-            "https://github.enterprise.test/Knaeckebrothero/KurortEngine.git"
+            "https://github.enterprise.test/Acme/WidgetShop.git"
         )
         fake_db.get_job = AsyncMock(return_value=_job(job_a))
         fake_db.resolve_datasources_for_job = AsyncMock(return_value=[lookalike])
@@ -477,7 +477,7 @@ class TestReviewDeliveryAttach:
                 "datasource_id": REPO_ID,
                 "forge": "github",
                 "repository_host": "github.com",
-                "repo": "Knaeckebrothero/KurortEngine",
+                "repo": "Acme/WidgetShop",
                 "branch": "design/hotel-rheinland-theme",
             }
         }
@@ -509,7 +509,7 @@ class TestReviewDeliveryAttach:
                 "datasource_id": REPO_ID,
                 "forge": "github",
                 "repository_host": "github.com",
-                "repo": "Knaeckebrothero/KurortEngine",
+                "repo": "Acme/WidgetShop",
                 "branch": "design/hotel-rheinland-theme",
             }
         }
@@ -531,14 +531,12 @@ class TestReviewDeliveryAttach:
                 "datasource_id": REPO_ID,
                 "forge": "github",
                 "repository_host": "github.com",
-                "repo": "Knaeckebrothero/KurortEngine",
+                "repo": "Acme/WidgetShop",
                 "branch": "design/hotel-rheinland-theme",
             }
         }
         changed = _repository()
-        changed["connection_url"] = (
-            "https://github.enterprise.test/Knaeckebrothero/KurortEngine.git"
-        )
+        changed["connection_url"] = "https://github.enterprise.test/Acme/WidgetShop.git"
 
         with pytest.raises(ReviewDeliveryError, match="no longer matches"):
             apply_review_delivery_branch(metadata, [changed])

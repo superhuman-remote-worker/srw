@@ -93,21 +93,26 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # auxiliary.summarization_reasoning_level (both roles; same value as the
     # dataclass default, so the effective compare needs no exclusion).
     # Append-only context injection WP2: the shared root states
-    # context_management.injection_mode and memory.max_memories_per_entry
-    # (both roles; same values as the dataclass defaults, so the effective
-    # compare needs no exclusion).
+    # memory.max_memories_per_entry (both roles; same value as the dataclass
+    # default, so the effective compare needs no exclusion). Its rollback
+    # flag, context_management.injection_mode, was added then and removed in
+    # WP6, so it is in neither the baseline nor the overlays.
     # Append-only context injection WP5a: the shared root binds memory_search
     # (a new category, tools.memory) and its memory.pipeline.extensions entry,
     # both roles (D34). Both differ from the dataclass defaults ([]), so the
     # effective compare strips them on both sides.
+    # Append-only context injection P4: the shared root states
+    # memory.retrieval (both roles). Since D38 (2026-10-29) its value,
+    # same_conversation: skip_in_context, differs from the dataclass default
+    # (allow, kept for configs frozen before the key).
     "worker": (
         "delegation.max_concurrent",
         "delegation.run_in_background_default",
         "auxiliary.summarization_reasoning_level",
-        "context_management.injection_mode",
         "memory.max_memories_per_entry",
         "tools.memory",
         "memory.pipeline.extensions",
+        "memory.retrieval",
     ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
@@ -116,10 +121,10 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     "session": (
         "limits.llm_inproc_retries",
         "auxiliary.summarization_reasoning_level",
-        "context_management.injection_mode",
         "memory.max_memories_per_entry",
         "tools.memory",
         "memory.pipeline.extensions",
+        "memory.retrieval",
     ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was
@@ -138,16 +143,28 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # dispatch and the loader default is None, so the key left both overlays.
     # Per-turn tool-result clearing was retired (it broke the prompt cache
     # every turn), so its window key left the shared root.
+    # Append-only context injection WP6 (D37): the memory assembler was
+    # removed, so its interval and its auxiliary task left the shared root
+    # (and the worker overlay's enable). WP6 (D36): the TTL-pinned tier was
+    # retired, so default_ttl and the reranker's keep_pinned_first left too.
     "worker": (
         "limits.tool_category_timeouts.delegation",
         "workspace.backend",
         "memory.reranker.model",
         "context_management.keep_recent_tool_results",
+        "memory.assembler_interval",
+        "auxiliary.tasks.assemble_memories",
+        "memory.default_ttl",
+        "memory.reranker.keep_pinned_first",
     ),
     "session": (
         "workspace.backend",
         "memory.reranker.model",
         "context_management.keep_recent_tool_results",
+        "memory.assembler_interval",
+        "auxiliary.tasks.assemble_memories",
+        "memory.default_ttl",
+        "memory.reranker.keep_pinned_first",
     ),
 }
 #: Keys whose overlay VALUE changed after the baseline was frozen (role ->
@@ -158,8 +175,14 @@ _POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
     # Website demo findings F10 (2026-10-11): a session's browser runs in its
     # own workspace container, so the session overlay opens localhost as the
     # worker overlay does (only cloud metadata stays blocked).
-    "worker": (),
-    "session": ("browser.security.blocked_domains",),
+    # Append-only context injection WP6 (D37): the worker's writer list lost
+    # memory_assembler. WP6 (D36): the retriever recall_two_tier became
+    # recall_hybrid (both roles).
+    "worker": ("memory.pipeline.writers", "memory.pipeline.retrievers"),
+    "session": (
+        "browser.security.blocked_domains",
+        "memory.pipeline.retrievers",
+    ),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).
@@ -174,8 +197,16 @@ _POST_SPLIT_TOOL_ADDITIONS: dict[str, dict[str, tuple[str, ...]]] = {
     # root's knowledge category, so every expert that inherits it gained it.
     # kb_retrieval_hardening T7: kb_grep (literal/regex enumeration) joined
     # the shared root's knowledge category alongside kb_search.
-    "worker": {"knowledge": ("kb_delete", "kb_grep")},
-    "session": {"knowledge": ("kb_delete", "kb_grep")},
+    # Citation engine overhaul (D7): withdraw_citation joined the shared root's
+    # citation category next to edit_citation (flag, never delete).
+    "worker": {
+        "knowledge": ("kb_delete", "kb_grep"),
+        "citation": ("withdraw_citation",),
+    },
+    "session": {
+        "knowledge": ("kb_delete", "kb_grep"),
+        "citation": ("withdraw_citation",),
+    },
 }
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->
 #: skill names). The list replaces wholesale on merge, so a dotted path cannot
@@ -527,7 +558,7 @@ def test_every_bundled_expert_resolves_in_the_subagent_role(name, subagent_ignor
         assert not _dotted_present(data, dotted), f"{name}: {dotted} survived"
     assert data["tools"] and data["llm"]["model"]
     # The subagent overlay's own values sit under the expert
-    assert data["interactive"]["permission_mode"] in {"autonomous", "supervised"}
+    assert data["interactive"]["permission_mode"] in {"autonomous", "read_only"}
     # and the whole thing parses — with the matrix applied — like any config.
     cfg = load_agent_config(str(leaf), deployment_dir, role="subagent")
     assert cfg.agent_id == data["agent_id"]

@@ -13,6 +13,23 @@ import {ModelService} from './model.service';
 import {ReadinessService} from './readiness.service';
 
 /**
+ * The server's reason for a refused catalog write: a plain-string `detail`
+ * (a 409 naming the provider that already holds the model ID, a 422 naming the
+ * served-model-id rule), FastAPI's validation list, or `fallback`.
+ */
+export function catalogErrorDetail(err: unknown, fallback: string): string {
+  const detail = (err as {error?: {detail?: unknown}} | null)?.error?.detail;
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => (typeof item === 'string' ? item : (item as {msg?: unknown})?.msg))
+      .filter((message): message is string => typeof message === 'string' && !!message);
+    if (messages.length) return messages.join('; ');
+  }
+  return fallback;
+}
+
+/**
  * REST client for the `/api/admin/providers/models` surface and the
  * sibling `/api/admin/families` family-list endpoint. Every call is gated
  * by the `srw-admin` role server-side; the client does not re-check.

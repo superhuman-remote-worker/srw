@@ -25,19 +25,38 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 
 from orchestrator.security.access import require_thread_owner
+from orchestrator.services.canvas_files import (
+    CanvasFileError,
+    CanvasResponseLease,
+    ThreadWorkspaceFileGateway,
+    acquire_canvas_response_lease,
+)
 from orchestrator.services.gitea import GiteaPathError, validate_gitea_name
 from orchestrator.services.ide_proxy import contain_ide_status_for
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.stateless_workspace_upgrade import (
+    WORKSPACE_UPGRADE_UPLOAD_REFUSED,
+)
 from orchestrator.services.thread_files import (
     _prepare_pinned_k8s_thread_upload,
     _prepare_pinned_vm_thread_operation,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from shared.session_retirement import stateless_stop_markers
+from shared.workspace_upgrade import workspace_upgrade_seed_from
 
 logger = logging.getLogger(__name__)
 
@@ -620,6 +639,12 @@ async def upload_files_to_thread(
                             status_code=409,
                             detail="Stateless session is not accepting uploads",
                         )
+                    if workspace_upgrade_seed_from(fresh.get("metadata")) is not None:
+                        # Until the claimant has copied the old prefix in, a
+                        # write to either side could be lost (spec "Uploads").
+                        raise HTTPException(
+                            status_code=409, detail=WORKSPACE_UPGRADE_UPLOAD_REFUSED
+                        )
                     backend = dependencies.require_stateless_workspace(fresh)
                     destination = resolve_thread_upload_destination(fresh)
                     payloads = await _materialize_payloads()
@@ -821,6 +846,12 @@ async def delete_thread_upload(
                             status_code=409,
                             detail="Stateless session is not accepting upload deletes",
                         )
+                    if workspace_upgrade_seed_from(fresh.get("metadata")) is not None:
+                        # Until the claimant has copied the old prefix in, a
+                        # write to either side could be lost (spec "Uploads").
+                        raise HTTPException(
+                            status_code=409, detail=WORKSPACE_UPGRADE_UPLOAD_REFUSED
+                        )
                     backend = dependencies.require_stateless_workspace(fresh)
                     destination = resolve_thread_upload_destination(fresh)
                     if backend == "virtual":
@@ -872,3 +903,69 @@ async def delete_thread_upload(
         raise HTTPException(status_code=404, detail="Upload not found")
 
     return {"thread_id": thread_id, "path": f"uploads/{removed}", "deleted": True}
+
+
+class _LeasedDownload(Response):
+    """Keep the response buffer lease until the body is sent or cancelled."""
+
+    def __init__(self, *args: Any, lease: CanvasResponseLease, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._lease = lease
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._lease.release()
+
+
+@router.get("/api/persistent/threads/{thread_id}/files/{path:path}")
+async def download_thread_file(
+    thread_id: str,
+    path: str,
+    request: Request,
+    *,
+    dependencies: ThreadFilesDependencies = Depends(get_thread_files_dependencies),
+) -> Response:
+    """Send one file of the Session's workspace to its owner as an attachment.
+
+    Any workspace backend the Canvas can read (virtual, or a live container or
+    VM). The bytes are never rendered: octet-stream, nosniff and a sandbox
+    CSP keep an agent-written page inert on this origin.
+    """
+    _, thread = await dependencies.require_thread_owner(
+        request, dependencies.store, thread_id
+    )
+    lease: CanvasResponseLease | None = None
+    try:
+        # Reserve buffer capacity before the bytes enter memory.
+        lease = await acquire_canvas_response_lease()
+        gateway = ThreadWorkspaceFileGateway(
+            thread_loader=getattr(dependencies.store, "get_thread", None)
+        )
+        file_path, file = await gateway.read_download(thread, path)
+        # Ownership may change while the workspace is read.
+        await dependencies.require_thread_owner(request, dependencies.store, thread_id)
+        filename = quote(file_path.rsplit("/", 1)[-1], safe="")
+        response = _LeasedDownload(
+            content=file.data,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+            },
+            lease=lease,
+        )
+        lease = None
+        return response
+    except CanvasFileError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    finally:
+        if lease is not None:
+            lease.release()

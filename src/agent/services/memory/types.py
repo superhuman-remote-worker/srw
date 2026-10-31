@@ -34,9 +34,9 @@ class MemoryPipelineError(RuntimeError):
     knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
 
     ``stage`` and ``plugin`` name the failing stage (e.g. ``"scorer"``,
-    ``"reranker"``). In ``append_only`` mode retrieval runs off the request
-    path (WP3) and the manager reports this error instead of raising it
-    (D13); the two names make up its signature there.
+    ``"reranker"``). Retrieval runs off the request path (WP3) and the
+    manager reports this error instead of raising it (D13); the two names
+    make up its signature there.
     """
 
     def __init__(
@@ -113,8 +113,7 @@ class CaptureEvent:
     turn_start: Optional[int] = None
     turn_end: Optional[int] = None
     #: Call-site extras that don't warrant a field yet (compaction passes
-    #: {"summary": ...}, todo_complete {"queued_memories": [...]},
-    #: turn_end {"current_injection_text": ...} for the assembler).
+    #: {"summary": ...}, todo_complete {"queued_memories": [...]}).
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -174,19 +173,11 @@ class AssembleRequest:
     task_frame: Optional[TaskFrame] = None
     budget_tokens: int = 10000
     buckets: List[BucketRef] = field(default_factory=list)
-    #: Main-LLM model name; the legacy block assemblers take it for token
-    #: counting (RecallStore.assemble_memory_block(model=...)).
-    model: Optional[str] = None
     #: False: plugins make one attempt per call and never back off (the
     #: reranker's transient-fault retries are off). The session's idle-time
     #: prefetch runs under a hard budget of a few seconds (D33); a transient
     #: fault then degrades that retrieval instead of retrying past it.
     retries: bool = True
-    #: False: the retrieval is read-only and does not advance the TTL tier
-    #: (``recall_two_tier``'s decrement). The idle-time prefetch is an extra
-    #: retrieval per session turn; the turn's own retrieval keeps the one
-    #: tick per turn.
-    ttl_tick: bool = True
 
 
 @dataclass
@@ -218,23 +209,15 @@ class Scored:
 
 @dataclass
 class InjectionBlock:
-    """One ready-to-inject unit of the assembled payload.
-
-    ``messages`` holds the synthetic tool-call pair exactly as today
-    (memory_inject_/knowledge_inject_ prefixes, excluded from
-    summarization) — the mechanics move inside the manager unchanged.
-    """
+    """One kind's share of the assembled payload."""
 
     kind: str  # "memory" | "knowledge"
-    content: str = ""  # rendered block text (assemble_*_block output)
-    messages: List[BaseMessage] = field(default_factory=list)
     token_count: int = 0
     #: Provenance of what got injected (ids/sources/scores) — feeds stats,
     #: the cockpit memory panel, and eventually the learned-scorer flywheel.
     items: List[Dict[str, Any]] = field(default_factory=list)
     #: The store records behind the block (MemoryRecord/KnowledgeRecord), in
-    #: rank order. The append-only planner renders its own entries from
-    #: them; ``content``/``messages`` stay the legacy rendering.
+    #: rank order. The append-only planner renders its entries from them.
     records: List[Any] = field(default_factory=list)
 
 
@@ -280,17 +263,10 @@ class MemoryPayload:
     blocks: List[InjectionBlock] = field(default_factory=list)
     stats: AssembleStats = field(default_factory=AssembleStats)
 
-    def messages(self) -> List[BaseMessage]:
-        """All injection messages in block order — what the graphs splice in."""
-        out: List[BaseMessage] = []
-        for block in self.blocks:
-            out.extend(block.messages)
-        return out
-
 
 @dataclass
 class RetrievalResult:
-    """One finished asynchronous retrieval (``append_only`` mode, WP3).
+    """One finished asynchronous retrieval (WP3).
 
     Retrieval runs off the request path (D6): a request starts it, and a
     later request build takes the finished result in (D8) and plans from its
@@ -386,15 +362,14 @@ class MemoryRuntime:
     auxiliary_llm: Any = None
     memory_config: Any = None  # src.core.loader.MemoryConfig
     #: src.core.loader.AuxiliaryConfig — the legacy worker call sites gate
-    #: extraction/assembly on auxiliary.enabled + tasks[...].enabled.
+    #: extraction on auxiliary.enabled + tasks[...].enabled.
     auxiliary_config: Any = None
     #: Read at event time, not bind time — persistent sessions re-resolve
     #: the extraction prompt on config.update (B1 fix) by mutating this.
     extraction_prompt: Optional[str] = None
-    assembler_prompt: Optional[str] = None
     job_id: Optional[str] = None
     #: The expert's agent id; the manager's own audit rows carry it (the
-    #: append_only retrieval reports a degraded pipeline itself, D13).
+    #: asynchronous retrieval reports a degraded pipeline itself, D13).
     agent_type: Optional[str] = None
     project_id: Optional[str] = None
     project_ids: List[str] = field(default_factory=list)

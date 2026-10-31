@@ -6,7 +6,7 @@ import type {
     SessionToolCategory,
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
-import {readConfigPath, SettingsMode, TierReachability, WORKSPACE_BACKENDS} from './agent-settings.types';
+import {liveUpgradeState, readConfigPath, SettingsMode, TierReachability, WORKSPACE_BACKENDS} from './agent-settings.types';
 import {deepMergeConfig} from './config-merge';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
@@ -245,7 +245,7 @@ import type {BadgeTone} from '../../ui/badge';
                 {{ 'agentSettings.locked.templateAndResources' | transloco }}
                 <span class="locked-reason"><app-icon size="xs">lock</app-icon>{{ 'agentSettings.locked.atCreation' | transloco }}</span>
               </span>
-              <span class="locked-value">{{ 'agentSettings.locked.templateAndResourcesHint' | transloco }}</span>
+              <span class="locked-value">{{ (liveUpgrade() === 'available' ? 'agentSettings.locked.templateAndResourcesHint' : 'agentSettings.locked.resourcesFixedHint') | transloco }}</span>
             </div>
           } @else {
             <ng-content select="[workspacePicker]" />
@@ -274,6 +274,8 @@ import type {BadgeTone} from '../../ui/badge';
             [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
             [isLiteBackend]="mode() === 'live' ? liteBackend() : workspacePicker() ? isLite(pickerBackend()) : false"
+            [liteBackendName]="mode() === 'live' ? (liveTier() ?? null) : workspacePicker() ? pickerBackend() : null"
+            [cloudFoldersTakeContainer]="workspacePicker() && cloudFoldersTakeContainer()"
             [initialSelectedIds]="mode() === 'live' || mode() === 'session' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
             [accessMode]="datasourceAccessMode()"
@@ -504,6 +506,9 @@ export class AgentSettingsComponent {
   workspacePicker = input(false);
   /** The backend the picker's choice runs on, for the lite-tier greying. */
   pickerBackend = input<string | null>(null);
+  /** A cloud folder would take the picker's default Virtual tier to a
+   *  Container: cloud folders stay selectable on it. */
+  cloudFoldersTakeContainer = input(false);
   /** Expert detail loading state. */
   loadingExpert = input(false);
   /** Display name of the Expert template the form started from (create), or
@@ -655,10 +660,15 @@ export class AgentSettingsComponent {
     return this.pickerQuery()?.summary() ?? '';
   });
 
+  /** Live mode: whether this session can move tier at all. The upgrade copy
+   *  (chip, template line) shows only when it can. */
+  protected readonly liveUpgrade = computed(() => liveUpgradeState(this.liveTier(), this.tierReachability()));
+
   readonly workspaceChip = computed<{label: string; tone: BadgeTone}>(() => {
     this.activeLang();
     if (this.mode() === 'live') {
-      return {label: this.transloco.translate('agentSettings.sections.chip.upgradeOnly'), tone: 'neutral'};
+      const key = this.liveUpgrade() === 'available' ? 'upgradeOnly' : 'fixed';
+      return {label: this.transloco.translate(`agentSettings.sections.chip.${key}`), tone: 'neutral'};
     }
     const kind = this.pickerQuery()?.choice().kind ?? 'default';
     const key = kind === 'default' ? 'default' : kind === 'inline' ? 'custom' : kind === 'none' ? 'none' : 'template';
@@ -798,6 +808,11 @@ export class AgentSettingsComponent {
   /** Return selected datasource IDs (not part of config_override). */
   getSelectedDatasourceIds(): string[] {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
+  }
+
+  /** Whether the user changed which connectors are selected. */
+  hasDatasourceSelection(): boolean {
+    return this.datasourcesGroup?.hasUserSelection() ?? false;
   }
 
   /** How a connector with access levels shows its level: a new session

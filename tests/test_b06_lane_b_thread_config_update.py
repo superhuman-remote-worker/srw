@@ -7,6 +7,7 @@ that it happens BEFORE the effect it guards.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +24,7 @@ from orchestrator.schemas.thread_config import (
     ThreadConfigPatchRequest,
     ThreadWorkspaceUpgradeRequest,
 )
+from orchestrator.services import stateless_workspace_upgrade as swu
 from orchestrator.services import thread_config_update as tcu
 
 THREAD = "11111111-1111-4111-8111-111111111111"
@@ -59,7 +61,7 @@ def _transaction(conn: Any):
 
 def _lock():
     @contextlib.asynccontextmanager
-    async def _scope(_thread_id: str):
+    async def _scope(_thread_id: str, **_options: Any):
         yield None
 
     return _scope
@@ -364,7 +366,11 @@ class TestUpgradeToVm:
     async def test_the_chain_template_is_recorded_before_provisioning(self):
         deps = _deps()
         await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
-        record = {"upgrade_config": {}, "upgrade_sources": CHAIN_SOURCES}
+        record = {
+            "upgrade_config": {},
+            "upgrade_sources": CHAIN_SOURCES,
+            "upgrade_seed": None,
+        }
         deps.store.get_user.assert_awaited_once_with(OWNER)
         deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
         call = deps.vm_provisioner.create_thread_vm.await_args
@@ -391,7 +397,7 @@ class TestUpgradeToVm:
             MagicMock(), THREAD, dependencies=deps
         )
         assert result["status"] == "provisioning"
-        record = {"upgrade_config": {}, "upgrade_sources": None}
+        record = {"upgrade_config": {}, "upgrade_sources": None, "upgrade_seed": None}
         deps.store.get_user.assert_not_awaited()
         deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
         call = deps.vm_provisioner.create_thread_vm.await_args
@@ -462,6 +468,24 @@ class TestUpgradeToVm:
         }
 
 
+VM_GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def _installed_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
+    """A Session with an installed VM (``metadata.vm`` names its generation)."""
+    store = {
+        "get_thread": AsyncMock(
+            return_value=_pinned_thread(
+                metadata={"vm": {"provision_generation": VM_GENERATION}}
+            )
+        ),
+        "undo_thread_vm_upgrade": AsyncMock(return_value=False),
+        "merge_thread_vm_context_if_provision_generation": AsyncMock(return_value=True),
+        **over.pop("store", {}),
+    }
+    return _deps(store=store, **over)
+
+
 class TestAbortVmUpgrade:
     @pytest.mark.asyncio
     async def test_workspace_recovery_blocks_abort_vm_external_delete(self):
@@ -472,7 +496,7 @@ class TestAbortVmUpgrade:
                 reason="workspace_recovery_unresolved",
             )
         )
-        deps = _deps(recovery_store=recovery_store)
+        deps = _installed_deps(recovery_store=recovery_store)
         deps.vm_provisioner.capture_vm_teardown_identity = AsyncMock(
             return_value=SimpleNamespace(
                 provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -493,7 +517,7 @@ class TestAbortVmUpgrade:
 
     @pytest.mark.asyncio
     async def test_unproven_teardown_is_503_and_never_stamps_aborted(self):
-        deps = _deps()
+        deps = _installed_deps()
         deps.vm_provisioner.release_vm_captured = AsyncMock(
             return_value=SimpleNamespace(disposition="process_zero_unproven")
         )
@@ -506,11 +530,12 @@ class TestAbortVmUpgrade:
             "code": "vm_process_zero_unproven",
             "retryable": True,
         }
-        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.store.undo_thread_vm_upgrade.assert_not_awaited()
+        deps.store.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_raising_delete_is_also_unproven(self):
-        deps = _deps()
+        deps = _installed_deps()
         deps.vm_provisioner.release_vm_captured = AsyncMock(
             side_effect=RuntimeError("x")
         )
@@ -522,7 +547,7 @@ class TestAbortVmUpgrade:
 
     @pytest.mark.asyncio
     async def test_proven_teardown_stamps_aborted(self):
-        deps = _deps()
+        deps = _installed_deps()
         result = await tcu.agent_abort_thread_vm_upgrade(
             MagicMock(), THREAD, dependencies=deps
         )
@@ -531,8 +556,11 @@ class TestAbortVmUpgrade:
             "thread_id": THREAD,
             "vm_deleted": True,
         }
-        deps.store.merge_thread_vm_context.assert_awaited_once_with(
-            THREAD, {"status": "aborted"}
+        deps.store.undo_thread_vm_upgrade.assert_awaited_once_with(
+            THREAD, provision_generation=VM_GENERATION
+        )
+        deps.store.merge_thread_vm_context_if_provision_generation.assert_awaited_once_with(
+            THREAD, VM_GENERATION, {"status": "aborted"}, require_not_retiring=True
         )
 
 
@@ -797,7 +825,11 @@ class TestUpgradeToWorkspace:
         ]
         assert render.await_args.args[1] == {"id": OWNER}
         assert render.await_args.kwargs["current_backend"] == "virtual"
-        record = {"upgrade_config": vm, "upgrade_sources": sources}
+        record = {
+            "upgrade_config": vm,
+            "upgrade_sources": sources,
+            "upgrade_seed": None,
+        }
         deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
         call = deps.vm_provisioner.create_thread_vm.await_args
         assert (call.kwargs["vm_image"], call.kwargs["cpu_cores"]) == (
@@ -933,27 +965,45 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {"vm": {"available": True, "reason": None}}
+        assert result["vm"] == {"available": True, "reason": None}
+        # The pinned lane never offers a container, so it gives no reason.
+        assert result["container"] == {"available": False, "reason": None}
         deps.require_internal.assert_awaited_once()
         deps.store.merge_thread_vm_context.assert_not_awaited()
         deps.vm_provisioner.create_thread_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stateless_lane_is_unavailable_before_the_grant_gate(self):
+    @pytest.mark.parametrize("vms_on", [False, True])
+    async def test_stateless_lane_vm_follows_c2s_checks(self, monkeypatch, vms_on):
+        monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.upgrade_record",
+            AsyncMock(
+                return_value=("vm", {"upgrade_config": {}, "upgrade_sources": None})
+            ),
+        )
         deps = _deps()
+        deps.vm_provisioner.is_available = vms_on
         deps.store.get_thread = AsyncMock(
-            return_value=_pinned_thread(execution_lane="stateless")
+            return_value=_pinned_thread(
+                execution_lane="stateless",
+                kind="session",
+                metadata={"config_override": {"workspace": {"backend": "virtual"}}},
+            )
         )
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {
-                "available": False,
-                "reason": "Workspace upgrades are not yet supported on the stateless lane",
-            }
+        assert result["vm"] == (
+            {"available": True, "reason": None}
+            if vms_on
+            else {"available": False, "reason": tcu.VM_PROVISIONING_UNAVAILABLE}
+        )
+        assert result["container"] == {
+            "available": False,
+            "reason": swu.STARTUP_TRACKING_REQUIRED,
         }
-        deps.enforce_workspace_upgrade_grants.assert_not_awaited()
+        deps.store.merge_thread_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_protected_session_is_unavailable_with_its_refusal_text(self):
@@ -979,8 +1029,9 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {"available": False, "reason": "vm_workspace grant denied"}
+        assert result["vm"] == {
+            "available": False,
+            "reason": "vm_workspace grant denied",
         }
 
     @pytest.mark.asyncio
@@ -990,11 +1041,9 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {
-                "available": False,
-                "reason": "VM workspaces aren't available on this installation.",
-            }
+        assert result["vm"] == {
+            "available": False,
+            "reason": "VM workspaces aren't available on this installation.",
         }
 
     @pytest.mark.asyncio
@@ -1006,9 +1055,40 @@ class TestUpgradeAvailability:
         result = await tcu.agent_thread_upgrade_availability(
             MagicMock(), THREAD, dependencies=deps
         )
-        assert result == {
-            "vm": {"available": False, "reason": "A VM upgrade is already in progress."}
+        assert result["vm"] == {
+            "available": False,
+            "reason": "A VM upgrade is already in progress.",
         }
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_virtual_session_can_upgrade_to_a_container(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.upgrade_record",
+            AsyncMock(
+                return_value=(
+                    "container",
+                    {"upgrade_config": {}, "upgrade_sources": None},
+                )
+            ),
+        )
+        deps = _deps()
+        deps.container_provisioner.is_available = True
+        deps.container_provisioner.in_cluster = True
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                execution_lane="stateless",
+                metadata={"config_override": {"workspace": {"backend": "virtual"}}},
+            )
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result["container"] == {"available": True, "reason": None}
+        assert result["vm"]["available"] is False
+        deps.store.merge_thread_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_vm_session_is_unavailable_by_the_tier_rule(self):
@@ -1023,3 +1103,411 @@ class TestUpgradeAvailability:
         )
         assert result["vm"]["available"] is False
         assert result["vm"]["reason"]  # the tier rule's own refusal text
+
+
+class TestVmUpgradeSeedMarker:
+    """C2 (D4 (a)): the lane switch's request id makes the VM request record a
+    durable seed marker in the same pre-CAS merge as the template record."""
+
+    REQUEST = "55555555-5555-4555-8555-555555555555"
+    BINDING = {"kind": "virtual", "backing_id": "rclone:" + "a" * 64}
+
+    def _deps(self, row, *, backend="virtual"):
+        deps = _deps(store={"fetchrow": AsyncMock(return_value=row)})
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={
+                    "config_override": {"workspace": {"backend": backend}},
+                    "_workspace_binding": self.BINDING,
+                }
+            )
+        )
+        return deps
+
+    @pytest.mark.asyncio
+    async def test_a_lane_switch_request_records_a_pending_marker(self):
+        deps = self._deps({"verb": "upgrade-to-workspace", "outcome": None})
+        await tcu.agent_upgrade_thread_to_vm(
+            MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+        )
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"] == {
+            "control_request_id": self.REQUEST,
+            "state": "pending",
+            "source": {
+                "backend": "virtual",
+                "prefix": f"threads/{THREAD}/",
+                "binding": self.BINDING,
+            },
+        }
+        call = deps.vm_provisioner.create_thread_vm.await_args
+        assert (
+            call.kwargs["expected_vm_context"]["upgrade_seed"] == record["upgrade_seed"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_none_session_has_nothing_to_copy(self):
+        deps = self._deps(
+            {"verb": "upgrade-to-workspace", "outcome": None}, backend="none"
+        )
+        await tcu.agent_upgrade_thread_to_vm(
+            MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+        )
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"]["source"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_vm_request_records_a_null_marker(self):
+        deps = self._deps(None)
+        await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"] is None
+        deps.store.fetchrow.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "row",
+        [
+            None,
+            {"verb": "compact", "outcome": None},
+            {"verb": "upgrade-to-workspace", "outcome": "applied"},
+        ],
+    )
+    async def test_an_unknown_or_finished_request_is_refused_before_any_write(
+        self, row
+    ):
+        deps = self._deps(row)
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail == {"code": "workspace_upgrade_request_unknown"}
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upgrade_to_workspace_forwards_the_request_id(self):
+        deps = self._deps({"verb": "upgrade-to-workspace", "outcome": None})
+        result = await tcu.agent_upgrade_thread_to_workspace(
+            MagicMock(),
+            THREAD,
+            ThreadWorkspaceUpgradeRequest(
+                target_tier="vm", control_request_id=self.REQUEST
+            ),
+            dependencies=deps,
+        )
+        assert result["target_tier"] == "vm"
+        record = deps.store.merge_thread_vm_context.await_args.args[1]
+        assert record["upgrade_seed"]["control_request_id"] == self.REQUEST
+
+    @pytest.mark.asyncio
+    async def test_a_request_id_is_only_for_a_vm_upgrade(self):
+        deps = self._deps({"verb": "upgrade-to-workspace", "outcome": None})
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(
+                    target_tier="sandbox", control_request_id=self.REQUEST
+                ),
+                dependencies=deps,
+            )
+        assert refused.value.status_code == 400
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+
+
+class TestVmUpgradeFailureBeforeItIsRecorded:
+    """C2 prod gate: an untyped failure of the lane switch's VM request before
+    its provision CAS committed answers the typed 503 the agent reads as a
+    refusal; otherwise the request stays pending and fails again at every
+    drain. Anything recorded, and every other call, keeps its error."""
+
+    REQUEST = TestVmUpgradeSeedMarker.REQUEST
+    PROVISION = "66666666-6666-4666-8666-666666666666"
+    NOT_RECORDED = "SRW couldn't start the VM upgrade. Try again."
+
+    def _session(self, vm=None):
+        metadata: dict[str, Any] = {
+            "config_override": {"workspace": {"backend": "virtual"}}
+        }
+        if vm is not None:
+            metadata["vm"] = vm
+        return _pinned_thread(metadata=metadata)
+
+    def _marker(self, **vm):
+        seed = {"control_request_id": self.REQUEST, "state": "pending", "source": None}
+        return {"upgrade_seed": seed, **vm}
+
+    def _deps(self, *rereads):
+        """The route reads the Session twice; the guard's re-read gets ``rereads``."""
+        deps = _deps(
+            store={
+                "fetchrow": AsyncMock(
+                    return_value={"verb": "upgrade-to-workspace", "outcome": None}
+                )
+            }
+        )
+        session = self._session()
+        deps.store.get_thread = AsyncMock(
+            side_effect=[session, session, *(rereads or (session,))]
+        )
+        return deps
+
+    def _assert_logged(self, caplog, error):
+        [record] = [r for r in caplog.records if r.name == tcu.__name__]
+        assert record.exc_info[1] is error
+
+    def _lock_held_at_each_read(self, deps):
+        held: list[bool] = []
+        locked = False
+
+        @contextlib.asynccontextmanager
+        async def lock(_thread_id, **_options):
+            nonlocal locked
+            locked = True
+            try:
+                yield None
+            finally:
+                locked = False
+
+        read = deps.store.get_thread
+
+        async def get_thread(thread_id):
+            held.append(locked)
+            return await read(thread_id)
+
+        deps.store.thread_advisory_lock = lock
+        deps.store.get_thread = get_thread
+        return held
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("step", ["grants", "options"])
+    async def test_an_untyped_failure_before_anything_is_written_is_a_typed_refusal(
+        self, step, monkeypatch, caplog
+    ):
+        boom = RuntimeError("bad row")
+        deps = self._deps()
+        if step == "grants":
+            # A read before the lifecycle lock.
+            deps.enforce_workspace_upgrade_grants.side_effect = boom
+        else:
+            monkeypatch.setattr(
+                tcu, "vm_provisioning_options", AsyncMock(side_effect=boom)
+            )
+        held = self._lock_held_at_each_read(deps)
+        with caplog.at_level("ERROR", logger=tcu.__name__):
+            with pytest.raises(HTTPException) as refused:
+                await tcu.agent_upgrade_thread_to_vm(
+                    MagicMock(),
+                    THREAD,
+                    dependencies=deps,
+                    control_request_id=self.REQUEST,
+                )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+        assert refused.value.__cause__ is boom
+        self._assert_logged(caplog, boom)
+        # The route's own reads, then the re-read under the lifecycle lock.
+        assert held == ([False, True] if step == "grants" else [False, True, True])
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_marker_whose_provision_cas_never_committed_is_not_recorded(
+        self, caplog
+    ):
+        boom = RuntimeError("provisioner bug")
+        # The pre-CAS merge wrote the marker; the CAS never ran.
+        deps = self._deps(self._session(self._marker()))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with caplog.at_level("ERROR", logger=tcu.__name__):
+            with pytest.raises(HTTPException) as refused:
+                await tcu.agent_upgrade_thread_to_vm(
+                    MagicMock(),
+                    THREAD,
+                    dependencies=deps,
+                    control_request_id=self.REQUEST,
+                )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+        self._assert_logged(caplog, boom)
+
+    @pytest.mark.asyncio
+    async def test_a_template_lookup_failure_is_a_typed_refusal(self, monkeypatch):
+        from orchestrator.services import workspace_defaults_resolution
+
+        boom = RuntimeError("bad template row")
+        monkeypatch.setattr(
+            workspace_defaults_resolution,
+            "find_readable_template",
+            AsyncMock(side_effect=boom),
+        )
+        deps = self._deps()
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(
+                    target_tier="vm", template="vm-big", control_request_id=self.REQUEST
+                ),
+                dependencies=deps,
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+        assert refused.value.__cause__ is boom
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failure_after_the_provision_cas_keeps_its_error(self):
+        boom = RuntimeError("NATS publish failed")
+        recorded = self._session(
+            self._marker(status="provisioning", provision_generation=self.PROVISION)
+        )
+        deps = self._deps(recorded)
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(RuntimeError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert raised.value is boom
+        assert deps.store.get_thread.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_failed_re_read_keeps_the_original_error(self):
+        boom = RuntimeError("provisioner bug")
+        deps = self._deps(OSError("database gone"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(RuntimeError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert raised.value is boom
+
+    def _preparing(self, status, *, generation=GENERATION, cancelled=False):
+        """What the re-read finds once the VM template's preparation stage
+        committed before the provision CAS (``_prepare_thread_workspace``)."""
+        session = self._session(self._marker())
+        stage = {
+            "status": status,
+            "provision_generation": self.PROVISION,
+            "preparation_only": True,
+            "preparation_request": {
+                "allocationId": THREAD,
+                "ownerKind": "session",
+                "runtimeGeneration": generation,
+                "revision": "r1",
+            },
+        }
+        if cancelled:
+            # The End sweep cancelled its allocation and left the status.
+            stage["preparation_cancelled_revision"] = "r1"
+        session["metadata"]["workspace_preparation"] = stage
+        return session
+
+    @pytest.mark.asyncio
+    async def test_a_live_preparation_stage_keeps_the_original_error(self):
+        """The readiness poller provisions the VM once the stage completes:
+        a refusal would leave that VM booting for nobody."""
+        boom = ValueError("Preparation response authentication failed.")
+        deps = self._deps(self._preparing("waiting_preparation"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(ValueError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert raised.value is boom
+
+    @pytest.mark.asyncio
+    async def test_a_failed_preparation_stage_is_a_typed_refusal(self):
+        """The poller skips a failed stage and a retry of it is refused, so no
+        VM can come of it."""
+        boom = ValueError("Invalid preparation progress response")
+        deps = self._deps(self._preparing("failed"))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stale",
+        [
+            {"cancelled": True},
+            {"generation": "77777777-7777-4777-8777-777777777777"},
+        ],
+        ids=["cancelled-at-end", "an-earlier-life"],
+    )
+    async def test_a_stale_preparation_stage_is_a_typed_refusal(self, stale):
+        """Only the provision CAS removes a stage, so one left by an End still
+        reads ``waiting_preparation``; nothing drives it for this life."""
+        boom = ValueError("bad template row")
+        deps = self._deps(self._preparing("waiting_preparation", **stale))
+        deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            503,
+            self.NOT_RECORDED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_re_read_waits_briefly_and_a_timeout_keeps_the_error(self):
+        errors: list[TimeoutError] = []
+        waits: list[Any] = []
+
+        @contextlib.asynccontextmanager
+        async def lock(_thread_id, **options):
+            waits.append(options.get("wait_timeout_s"))
+            errors.append(TimeoutError("advisory lock wait timed out"))
+            raise errors[-1]
+            yield  # pragma: no cover
+
+        deps = self._deps()
+        deps.store.thread_advisory_lock = lock
+        with pytest.raises(TimeoutError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        # The body's own lock timed out; the re-read's short wait did too.
+        assert raised.value is errors[0]
+        assert waits[0] is None
+        assert waits[1] is not None and 0 < waits[1] <= 10
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_propagates_without_a_re_read(self):
+        deps = self._deps()
+        deps.vm_provisioner.create_thread_vm.side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await tcu.agent_upgrade_thread_to_vm(
+                MagicMock(), THREAD, dependencies=deps, control_request_id=self.REQUEST
+            )
+        assert deps.store.get_thread.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("step", ["grants", "provision"])
+    async def test_a_call_without_a_request_id_keeps_its_error(self, step):
+        boom = RuntimeError("bad row")
+        deps = self._deps()
+        if step == "grants":
+            deps.enforce_workspace_upgrade_grants.side_effect = boom
+        else:
+            deps.vm_provisioner.create_thread_vm.side_effect = boom
+        with pytest.raises(RuntimeError) as raised:
+            await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        assert raised.value is boom
+        # No re-read: the route's own reads only.
+        assert deps.store.get_thread.await_count == (1 if step == "grants" else 2)

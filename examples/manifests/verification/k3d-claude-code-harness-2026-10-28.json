@@ -1,0 +1,87 @@
+{
+  "date": "2026-10-28",
+  "plan": "Custom harness (Claude Code) live check, knowledge-base superpowers/plans/2026-10-27-custom-harness-claude-code-plan.md Task 14",
+  "code": "develop ceef83982 (runtime launch fields removed from the schema; harness image starts python3 -I -u -m from site-packages), 34a50e37e (apiBaseUrl), 6c81a6b24 (uid 10001 account + USER/LOGNAME), 47c911263 (workspace connect retry); Tilt images built from the same tree",
+  "stack": {
+    "context": "k3d-srw",
+    "namespaces": {
+      "control": "srw",
+      "hosting": "srw-native"
+    },
+    "helmRevision": 19477,
+    "orchestratorImage": "srw-registry:5000/srw-orchestrator:tilt-4ae836b31e33b773",
+    "harnessImage": "srw-registry:5000/srw-harness-claude-code@sha256:0766f7b4f9b3370387b8661c83ae6fb441da56257d85cba53947a7f3ba60dd40",
+    "harnessImageBuilt": "podman build of docker/Dockerfile.harness-claude-code at ceef83982; pushed to the k3d registry; digest read back from the registry manifest",
+    "values": "git-ignored deployment/values-local.yaml (sha256 66d43af5... before) plus a marked temporary manifestHosting block: allowApprovedImagesWithoutVerifiedIsolation true, approvedImages [claude-code], harnessEgress [kube-dns 53, public 0.0.0.0/0:443 minus private ranges, garage pods in srw on 3900]",
+    "clusterRuntimeFixes": "CoreDNS forward repointed from /etc/resolv.conf (dead node resolver) to 1.1.1.1 9.9.9.9; cluster state only, not in the repo",
+    "caller": "python in the orchestrator Pod (X-Internal-Key + X-MCP-User-Id); test user dev-user-1 9ce801db-... (non-admin, granted custom_harness_images by admin@localhost); gate-user 11111111-... (non-admin, no grant)",
+    "objectStore": "bundled Garage, bucket srw-snapshots, prefix harness-tests/2026-10-28/, presigned PUT/GET (SigV4, path style) minted inside the orchestrator Pod",
+    "harnessImages": {
+      "run0/run0b": "sha256:0766f7b4f9b3370387b8661c83ae6fb441da56257d85cba53947a7f3ba60dd40 (ceef83982)",
+      "run1c": "sha256:9a4e5a78119394a832afabcafd4c5328616fdc2d9d1197a17c305011eb456b48 (+apiBaseUrl)",
+      "run1d": "sha256:f85608d29ffb038ff037d7d52d198fe13899309368bf6266c099efcc85391c8e (+local user)",
+      "run1e/run2": "sha256:b776401509bfaa354607a2c497a66356ea6a8a52f2fe1c86d0bde46428e9ca99 (+connect retry)"
+    },
+    "modelEndpoint": "Meta Muse Spark API https://api.meta.ai (Anthropic Messages protocol; probed from inside the orchestrator Pod: 200 for muse-spark-1.3-contributor and muse-spark-1.3); key taken from the owner's Admin \u2192 Providers entry inside the cluster and stored as dev-user-1's personal secret claude-code/token; the key never left the cluster or entered the transcript"
+  },
+  "offlineGate": "36 affected test files, 1389 passed; image smoke under podman: -I imports from site-packages, start command exits 2 without a config file, PYTHONPATH sitecustomize injection blocked (control without -I prints the marker)",
+  "negativeChecks": {
+    "noGrant": {
+      "user": "gate-user",
+      "result": "PASS",
+      "observed": "POST /api/manifests/apply -> 403 \"Running approved harness images requires the 'custom_harness_images' capability grant\""
+    },
+    "commandField": {
+      "user": "dev-user-1",
+      "result": "PASS",
+      "observed": "422 {code: UnknownField, path: /spec/execution/expert/inline/runtime}: the deployed schema has no command/args/probes fields; refused before admission"
+    },
+    "unapprovedImage": {
+      "user": "dev-user-1",
+      "result": "PASS",
+      "observed": "422 \"Generic hosting runs only images on the installation's approved list\" (first try with a credential secretRef hit the missing-secret check first: 422 \"A declared credential reference or key does not exist.\")"
+    }
+  },
+  "run0NoCredential": {
+    "purpose": "the whole pipeline up to the model call, with no credential delivered",
+    "job": "4bcc2ca8-9b65-43b2-ae3a-97eb55f2e284",
+    "execution": "23012f1e-33aa-4518-88fb-c78daf45cd4f",
+    "result": "PASS with one upload failure explained below",
+    "observed": "workspace Pod srw-ws-7fd7058a... (sandbox, srw-workspace:tilt-0b60f5ad8143d260) ready on sshd 30022 in ~35s; harness Pod srw-run-23012f1e...-a1 pulled the approved digest and ran the new entrypoint; log: reading the delivered files -> writing result.json -> uploading the bundle (10240 bytes) -> upload failed (ConnectError: No address associated with hostname) -> exit 2 no model credential; attempt row phase Failed exit_code 2 image_id = approved digest; resource status phase failed, attempt cleaned, workspace Released; jobs.status failed",
+    "uploadFailureCause": "presigned URL host was the bare service name srw-garage, which resolves only inside namespace srw; from the hosting namespace getent hosts srw-garage has no address while srw-garage.srw.svc.cluster.local resolves. Not a NetworkPolicy issue. README now says to use the fully qualified name."
+  },
+  "run0bNoCredentialFqdnUpload": {
+    "job": "871f703c-db1c-4d72-8717-de2cf8427959",
+    "execution": "18fac0ee-75c2-442c-9ce5-150c3a1c71e3",
+    "result": "PASS",
+    "observed": "harness log: bundle uploaded (HTTP 200) then exit 2; bundle.tar (10240 bytes) in Garage holds transcript.jsonl (0 bytes) and result.json {exitCode 2, exitReason 'no model credential: ...', versions {harness 0.1.0, sdk 0.2.174, cli 2.1.310}, configHash b9635797..., inputs [], archive null}"
+  },
+  "run1cMetaFirstAttempt": {
+    "job": "5161d6de-efdf-4d4b-bea0-5b75093f7f61",
+    "execution": "c907be8d-cb41-4ae3-9178-e14c18a14c21",
+    "result": "FAIL, fixed in 6c81a6b24",
+    "observed": "exit 1 before the session: 'Unknown local username: set one of LOGNAME, USER, LNAME, or USERNAME'. asyncssh calls getpass.getuser() while preparing every connection; the image ran uid 10001 with no passwd entry and no USER variable. Bundle uploaded (result.json exitCode 1).",
+    "fix": "image creates the harness account for uid/gid 10001 and sets USER/LOGNAME; CI smoke test checks getpass.getuser() with the variables cleared"
+  },
+  "run1dMetaSecondAttempt": {
+    "job": "46675a1a-9200-47a3-8464-c32091915ee3",
+    "execution": "8224d658-b129-41ec-83fd-8e41533dd1f8",
+    "result": "FAIL, fixed in 47c911263",
+    "observed": "harness Pod created 10:53:16Z, container started :19, connect refused at :20 ('[Errno 111] Connect call failed (10.42.0.247, 30022)'), exit 1; workspace Pod created :07, readiness passed before the launch, killed only at 10:54:16 during cleanup. Both NetworkPolicies existed with matching selectors (workspace ingress from attempt.labels in the hosting namespace on 30022; harness egress to the workspace labels). The node's policy controller (k3s kube-router v2.6.3) ends each KUBE-POD-FW chain with REJECT --reject-with icmp-port-unreachable, so a not-yet-admitted connection is refused, not dropped; the harness made one attempt one second after start.",
+    "fix": "Workspace.connect retries refused/unreachable/timed-out/dropped connections (10 s per attempt, 0.5-5 s backoff) for up to 90 s; SSH-level errors still fail at once"
+  },
+  "run1eMetaFullSession": {
+    "job": "60e956fe-b193-4ee3-9b4c-dea98940139e",
+    "execution": "24dd5a61-a9b7-478c-acea-19f94fbc3e2b",
+    "result": "PASS",
+    "observed": "harness log: reading the delivered files -> connecting to the workspace -> writing the workspace environment file -> staging 1 input file(s) -> starting Claude Code (model muse-spark-1.3-contributor; the CLI logs unrecognized_model and proceeds) -> session ended: success -> result.json -> workspace archived (177 bytes) -> bundle uploaded (HTTP 200, 20480 bytes) -> exit 0. result.json: exitCode 0, durationSeconds 10.9, inputs [data/customers.csv 61 bytes sha256 987ceeeb...], archive.excludedInputs [./data/customers.csv], result {subtype success, numTurns 3, totalCostUsd 0.0327, stopReason end_turn, finalMessage 'Created hello.txt ... wc -l data/customers.csv reports 4 lines'} (the CSV has a header and 3 rows: correct). transcript.jsonl 13 lines; workspace.tar.gz holds ./hello.txt = 'hello from the harness'. Attempt phase Succeeded exit 0, imageId = the approved retry digest; workspace Terminating during cleanup."
+  },
+  "run2Cancel": {
+    "job": "a056ad06-11f8-460d-97ff-06dc220b342c",
+    "execution": "9e12f4ed-7a04-4ff3-996f-d9eaafd66fd5",
+    "result": "PASS",
+    "observed": "task 'sleep 600' via Bash; harness Running 11:42:18Z; PUT /api/jobs/{id}/cancel as dev-user-1 at 11:43:03Z -> 200 {status: cancelled}; Pod Failed exit 4 at 11:43:07Z (+3-4 s); bundle uploaded during the stop: result.json {exitCode 4, exitReason 'interrupted: stop requested', interrupted true, archive null (skipped on stop as designed), result {subtype error_during_execution, numTurns 3, stopReason tool_use}}, transcript.jsonl 10 lines ending with '[Request interrupted by user for tool use]'; attempt row Cancelled exit_code 4; jobs.status cancelled; workspace and harness Pods torn down afterwards by the reconciler"
+  },
+  "cleanup": "Pods and policies of every attempt were removed by the reconciler (the successful run's job settled to completed after its workspace detached). Left in place on purpose for further runs: the marked manifestHosting block in deployment/values-local.yaml (approved digest b7764015...), dev-user-1's custom_harness_images grant and personal secret claude-code/token (the Meta key copy), the CoreDNS forward change; Tilt is not running (tilt ci exits).",
+  "notReproducedLocally": "the thesis graph-load step (Neo4j is disabled in the k3d values); the dev run (Task 14 step 8) awaits the owner's go"
+}

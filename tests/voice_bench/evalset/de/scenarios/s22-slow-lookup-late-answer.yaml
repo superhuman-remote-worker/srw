@@ -1,0 +1,38 @@
+id: s22-slow-lookup-late-answer
+title: A slow lookup with the back office's line, its notice, and an answer while the caller speaks
+why: >-
+  Owner's call 2026-10-23 (§9.15): the back office's line came 3 s after the
+  filler, then two hold sentences and SRW's 25 s notice, five holding
+  sentences in 27 s; the answer came in while the caller spoke, and the
+  voice said it twice (a guess in the reply to the caller, then the answer).
+  The line must take a hold sentence's place, and the answer be said once.
+categories: [back_office]
+voice: m-middle
+condition: g711a
+# Asked again, the voice may hand it on again.
+default_answer: Am Freitag ist kein Doppelzimmer frei, nur ein Einzelzimmer.
+turns:
+  - say: Ich wollte fragen, ist nächste Woche Freitag bei Ihnen noch ein Doppelzimmer frei?
+    expect:
+      outcome: delegate
+      values:
+        - {keyword: doppelzimmer, in: request}
+    back_office:
+      status: Einen Moment, ich prüfe gerade das Buchungssystem.
+      status_after: 5
+      follow_up: >-
+        Tell the person that looking this up takes a little longer and that
+        you will tell them as soon as you have it. Meanwhile they can ask
+        something else or leave a message.
+      follow_up_after: 20
+      answer: >-
+        Am Freitag nächste Woche ist kein Doppelzimmer mehr frei, nur noch
+        ein Einzelzimmer. Die Stimme kann gerne eine Nachricht aufnehmen.
+      after: 36
+  - say: Nein, ich wollte eigentlich nur wissen, ob am Freitag noch ein Doppelzimmer frei ist, wegen der Buchung.
+    when: after_caller
+    offset: 33
+    expect:
+      outcome: any
+      values:
+        - {keyword: einzelzimmer, in: reply}

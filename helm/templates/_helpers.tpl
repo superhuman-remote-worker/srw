@@ -1006,6 +1006,33 @@ Internal cluster URL for Gitea — used by orchestrator/agents for back-end API 
 {{- end }}
 {{- end }}
 
+{{/*
+KB_GIT_ALLOWED_HOSTS: the exact Git endpoints the orchestrator trusts for
+external OKF KB datasources beyond its built-in public providers. While
+gitea.enabled that is the chart's Gitea, public host and in-cluster endpoint,
+then orchestrator.kbGitAllowedHosts. The orchestrator rejects the whole list
+when one entry is localhost or an IP literal, so derived hosts of that kind
+(local k3d's git.localhost) are left out. Empty renders no variable.
+*/}}
+{{- define "srw.kbGitAllowedHosts" -}}
+{{- $hosts := list -}}
+{{- if .Values.gitea.enabled -}}
+{{- range $url := list (include "srw.gitUrl" .) (include "srw.giteaInternalUrl" .) -}}
+{{- $endpoint := $url | trimPrefix "https://" | trimPrefix "http://" | splitList "/" | first | lower -}}
+{{- $host := regexReplaceAll ":[0-9]+$" $endpoint "" -}}
+{{- if and $host (ne $host "localhost") (not (hasSuffix ".localhost" $host)) (not (regexMatch "^[0-9.]+$" $host)) (not (hasPrefix "[" $host)) -}}
+{{- $hosts = append $hosts $endpoint -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $entry := splitList "," (.Values.orchestrator.kbGitAllowedHosts | default "") -}}
+{{- if trim $entry -}}
+{{- $hosts = append $hosts (trim $entry) -}}
+{{- end -}}
+{{- end -}}
+{{- $hosts | uniq | join "," -}}
+{{- end }}
+
 {{- define "srw.cloudUrl" -}}
 {{- if include "srw.singleOrigin" . -}}
 {{- printf "%s/cloud" (include "srw.publicOrigin" .) -}}

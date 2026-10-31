@@ -470,3 +470,51 @@ def test_develop_rebuilds_the_in_pod_plane_when_either_image_is_missing():
     assert 'image_missing cloud-mount "$FUSE_OPENER_SHA"' in text
     outputs = jobs["changes"]["outputs"]
     assert "fuse-opener" in outputs and "fuse-opener-sha" in outputs
+
+
+@pytest.mark.parametrize(
+    ("name", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_the_voice_images_are_built_tested_and_pinned_by_digest(name, publication):
+    """The local voice path: the gateway image waits for its pipeline tests
+    (which need its own locked environment), the Asterisk image is built from
+    its Dockerfile, and the chart pins both digests; publication waits."""
+    _, jobs = workflow(name)
+    gateway = jobs["build-voice-gateway"]
+    assert "test-voice-gateway" in gateway["needs"]
+    assert "needs.test-voice-gateway.result == 'success'" in gateway["if"]
+    tests = "\n".join(
+        step.get("run", "") for step in jobs["test-voice-gateway"]["steps"]
+    )
+    assert "--require-hashes --no-deps --only-binary :all:" in tests
+    assert "pytest --noconftest" in tests and "test_voice_gateway_cascade.py" in tests
+    for job, dockerfile in (
+        ("build-voice-gateway", "./docker/Dockerfile.voice-gateway"),
+        ("build-asterisk", "./docker/Dockerfile.asterisk"),
+    ):
+        (build,) = [
+            step["with"]
+            for step in jobs[job]["steps"]
+            if step.get("uses", "").startswith("docker/build-push-action@")
+        ]
+        assert build["file"] == dockerfile
+        assert job in jobs[publication]["needs"]
+    scripts = "\n".join(step.get("run", "") for step in jobs[publication]["steps"])
+    for stamp in (
+        ".voiceGateway.image.digest = strenv(VOICE_GATEWAY_DIGEST)",
+        ".asterisk.image.digest = strenv(ASTERISK_DIGEST)",
+    ):
+        assert stamp in scripts
+    assert {"voice-gateway", "asterisk"} <= set(gate.COMPONENTS)
+
+
+def test_develop_rebuilds_the_voice_images_when_their_inputs_change():
+    text, jobs = workflow("develop")
+    assert "VOICE_GATEWAY_PATHS=(src/voice_gateway/ requirements/" in text
+    assert "ASTERISK_PATHS=(docker/Dockerfile.asterisk docker/asterisk/" in text
+    assert 'image_missing voice-gateway "$VOICE_GATEWAY_SHA"' in text
+    assert 'image_missing asterisk "$ASTERISK_SHA"' in text
+    outputs = jobs["changes"]["outputs"]
+    for key in ("voice-gateway", "voice-gateway-sha", "asterisk", "asterisk-sha"):
+        assert key in outputs

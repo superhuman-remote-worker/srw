@@ -56,10 +56,10 @@ async def test_428_raises_a_drift_error_naming_the_items() -> None:
                             "id": "connector:abc",
                             "kind": "connector",
                             "reason": "deleted",
-                            "label": "KurortEngine",
+                            "label": "WidgetShop",
                         }
                     ],
-                    "summary": ["KurortEngine"],
+                    "summary": ["WidgetShop"],
                 }
             },
         )
@@ -71,13 +71,13 @@ async def test_428_raises_a_drift_error_naming_the_items() -> None:
     finally:
         await client.close()
 
-    assert "KurortEngine" in str(excinfo.value)
+    assert "WidgetShop" in str(excinfo.value)
     assert excinfo.value.drift == [
         {
             "id": "connector:abc",
             "kind": "connector",
             "reason": "deleted",
-            "label": "KurortEngine",
+            "label": "WidgetShop",
         }
     ]
 
@@ -101,7 +101,7 @@ async def test_error_message_carries_ids_and_a_literal_acknowledge_list() -> Non
                             "id": "connector:abc",
                             "kind": "connector",
                             "reason": "deleted",
-                            "label": "KurortEngine",
+                            "label": "WidgetShop",
                         }
                     ],
                 }

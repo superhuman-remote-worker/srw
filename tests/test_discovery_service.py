@@ -257,3 +257,21 @@ def test_build_cache_payload_shape() -> None:
     # ISO-8601 with timezone — must round-trip through fromisoformat.
     parsed = datetime.fromisoformat(payload["fetched_at"])
     assert parsed.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_a_listing_that_declares_live_voice_needs_no_name_hint() -> None:
+    payload = {
+        "data": [
+            {"id": "cascade-cpu", "capabilities": ["live_voice"]},
+            {"id": "gpt-realtime"},
+            {"id": "gpt-4o", "capabilities": ["vision"]},
+        ]
+    }
+    factory = _mock_async_client(payload)
+    with patch("orchestrator.services.discovery.httpx.AsyncClient", factory):
+        candidates = await discovery.discover_models("openai", "sk-test")
+    suggested = {c["model_id"]: c["suggested_capabilities"] for c in candidates}
+    assert suggested["cascade-cpu"] == ["live_voice"]
+    assert suggested["gpt-realtime"] == ["live_voice"]
+    assert suggested["gpt-4o"] == ["chat", "auxiliary", "vision"]

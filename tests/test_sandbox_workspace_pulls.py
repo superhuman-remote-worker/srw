@@ -1,6 +1,7 @@
 """A custom image that cannot be pulled fails with its reason, never hangs."""
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType, SimpleNamespace
@@ -15,10 +16,13 @@ from orchestrator.services.container_provisioner import (
     WorkspaceContainerExitedError,
     WorkspaceImagePullError,
     WorkspaceRuntimeAuthorityError,
+    _image_exit_code_before_first_ready,
+    _workspace_container_exit_before_first_ready,
 )
 from orchestrator.services.sandbox_workspace_settings import (
     SandboxSettings,
     classify_image_pull,
+    definite_admission_refusal_status,
     pod_admission_rejection,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
@@ -151,6 +155,35 @@ def test_quota_rejection_reads_the_kubernetes_client_bytes_body():
     assert pod_admission_rejection(exc) == (
         "Workspace pod was rejected by the cluster: exceeded quota: workspace-quota"
     )
+
+
+def _status_body(code, **extra):
+    return json.dumps(
+        {"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": code}
+        | extra
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (403, _status_body(403), 403),
+        (422, _status_body(422), 422),
+        (403, _status_body(403).decode(), 403),
+        (403, None, None),
+        (403, b'{"message": "forbidden"}', None),
+        (403, _status_body(403, status="Success"), None),
+        (403, _status_body(422), None),
+        (409, _status_body(409), None),
+        (429, _status_body(429), None),
+        (500, _status_body(500), None),
+    ],
+)
+def test_only_a_status_refusal_counts_as_storing_nothing(status, body, expected):
+    exc = ApiException(status=status, reason="x")
+    exc.body = body
+    assert definite_admission_refusal_status(exc) == expected
+    assert definite_admission_refusal_status(TimeoutError()) is None
 
 
 def provisioner_reading(p):
@@ -1389,3 +1422,90 @@ async def test_a_cluster_stopped_container_gets_no_image_advice(
     assert str(raised.value) == (
         f"Workspace container exited with code 137 ({shown}) before it became ready."
     )
+
+
+# --- one classifier for the flag-off error and the flag-on observer ---------
+
+
+@pytest.mark.parametrize(
+    ("phase", "exit_code", "reason"),
+    [
+        ("Succeeded", 0, "Completed"),
+        ("Failed", 17, "Error"),
+        ("Failed", 3, None),
+        ("Failed", 3, ""),
+    ],
+    ids=["succeeded-exit-0", "failed-exit-17", "no-reason", "empty-reason"],
+)
+def test_the_shared_classifier_returns_the_exit_of_an_image(phase, exit_code, reason):
+    observed = exited_pod(phase=phase, exit_code=exit_code, reason=reason)
+
+    exited = _workspace_container_exit_before_first_ready(observed)
+
+    assert exited is not None
+    assert (exited.exit_code, exited.reason) == (exit_code, reason or "")
+    assert not exited.stopped_by_cluster
+    # Exit code 0 is a real code, not "missing".
+    assert _image_exit_code_before_first_ready(observed) == exit_code
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "still-running-phase",
+        "restart-policy-always",
+        "unscheduled",
+        "ready-condition",
+        "restarted",
+        "no-container-id",
+        "sidecar-running",
+    ],
+)
+def test_the_shared_classifier_needs_exact_exit_evidence(change):
+    observed = _unproven(change)
+
+    assert _workspace_container_exit_before_first_ready(observed) is None
+    assert _image_exit_code_before_first_ready(observed) is None
+
+
+@pytest.mark.parametrize(
+    ("container_reason", "pod_reason", "shown"),
+    [
+        ("OOMKilled", None, "OOMKilled"),
+        ("ContainerStatusUnknown", None, "ContainerStatusUnknown"),
+        ("Error", "Evicted", "Evicted"),
+    ],
+    ids=["oom-killed", "status-unknown", "evicted"],
+)
+def test_a_cluster_stop_is_exit_evidence_but_not_an_image_exit(
+    container_reason, pod_reason, shown
+):
+    observed = exited_pod(phase="Failed", exit_code=137, reason=container_reason)
+    observed.status.reason = pod_reason
+
+    exited = _workspace_container_exit_before_first_ready(observed)
+
+    assert exited is not None
+    assert (exited.reason, exited.stopped_by_cluster) == (shown, True)
+    # The flag-on observer leaves a cluster stop to the deadline path.
+    assert _image_exit_code_before_first_ready(observed) is None
+
+
+def test_a_bool_exit_code_is_not_an_exit_code():
+    observed = exited_pod()
+    observed.status.container_statuses[0].state.terminated.exit_code = True
+
+    assert _workspace_container_exit_before_first_ready(observed) is None
+
+
+def test_the_flag_off_error_renders_from_the_shared_classifier():
+    error = provisioner_module._workspace_container_exited_error(
+        exited_pod(phase="Failed", exit_code=17, reason="Error")
+    )
+
+    assert isinstance(error, WorkspaceContainerExitedError)
+    assert (
+        str(error) == f"Workspace container exited with code 17 (Error) {EXITED_ADVICE}"
+    )
+    with pytest.raises(ValueError):
+        provisioner_module._workspace_container_exited_error(_unproven("restarted"))

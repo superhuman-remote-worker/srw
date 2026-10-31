@@ -220,6 +220,18 @@ describe('ApiService.transcribeVoice', () => {
     expect(await pending).toEqual({text: 'hello world'});
   });
 
+  it('transcribes on the landing draft through the account route', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'voice.webm', {type: 'audio/webm'});
+    const pending = firstValueFrom(api.transcribeVoice(null, file));
+
+    const req = httpMock.expectOne((r) => r.url.endsWith('/voice/transcribe'));
+    expect(req.request.method).toBe('POST');
+    expect((req.request.body as FormData).get('audio')).toBeInstanceOf(File);
+
+    req.flush({text: 'draft words'});
+    expect(await pending).toEqual({text: 'draft words'});
+  });
+
   it('maps a 204 response to "unavailable"', async () => {
     const blob = new Blob([new Uint8Array([1])], {type: 'audio/webm'});
     const pending = firstValueFrom(api.transcribeVoice('t', blob));
@@ -1406,13 +1418,13 @@ describe('ApiService — protected cloud diff outcomes', () => {
   it('separates a permission failure from "no changes"', async () => {
     const pending = firstValueFrom(api.getThreadCloudDiffOutcome('t1'));
     await expect(
-      failWith(pending, (u) => u.endsWith('/threads/t1/cloud-diff'), 403, {detail: 'nope'}),
+      failWith(pending, (u) => u.endsWith('/persistent/threads/t1/cloud-diff'), 403, {detail: 'nope'}),
     ).resolves.toEqual({kind: 'forbidden'});
   });
 
   it('reports an offline browser as a network error, not a bare HTTP string', async () => {
     const pending = firstValueFrom(api.getThreadCloudDiffOutcome('t1'));
-    const request = httpMock.expectOne((item) => item.url.endsWith('/threads/t1/cloud-diff'));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/persistent/threads/t1/cloud-diff'));
     request.error(new ProgressEvent('error'), {status: 0, statusText: 'Unknown Error'});
     await expect(pending).resolves.toEqual({
       kind: 'error',
@@ -1476,6 +1488,78 @@ describe('ApiService — protected cloud diff outcomes', () => {
     expect(request.request.body).toEqual({epoch: 5});
     request.flush({thread_id: 't1', rejected: true, epoch: 6, overlay_reset: true});
     await expect(pending).resolves.toMatchObject({kind: 'ok'});
+  });
+});
+
+describe('ApiService — browser calls stay out of the agent-internal prefix', () => {
+  // /api/agents is agent ↔ orchestrator traffic and an edge may 403 all of it
+  // (the dev tunnel does), so the protected-cloud review and the admin fleet
+  // view are called on their moved paths.
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {danger: vi.fn()}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, k: string) => k}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  function pathOf(url: string): string {
+    return new URL(url, 'http://cockpit.test').pathname;
+  }
+
+  it.each([
+    ['GET', '/api/persistent/threads/t1/cloud-diff', () => api.getThreadCloudDiffOutcome('t1')],
+    [
+      'GET',
+      '/api/persistent/threads/t1/cloud-diff/dir/a%20b.txt',
+      () => api.getThreadCloudDiffFileOutcome('t1', 'dir/a b.txt'),
+    ],
+    ['POST', '/api/persistent/threads/t1/cloud-diff/apply', () => api.applyThreadCloudDiff('t1', 3)],
+    ['POST', '/api/persistent/threads/t1/cloud-diff/reject', () => api.rejectThreadCloudDiff('t1', 3)],
+    ['POST', '/api/persistent/threads/t1/cloud-diff/restage', () => api.restageThreadCloudDiff('t1')],
+    ['GET', '/api/admin/agents', () => api.getAgents()],
+    ['GET', '/api/admin/agents/a1', () => api.getAgent('a1')],
+    ['DELETE', '/api/admin/agents/a1', () => api.deleteAgent('a1')],
+  ] as const)('%s %s', async (method, path, call) => {
+    const pending = firstValueFrom(call() as never);
+    const request = httpMock.expectOne(() => true);
+    expect(request.request.method).toBe(method);
+    expect(pathOf(request.request.url)).toBe(path);
+    expect(pathOf(request.request.url)).not.toMatch(/^\/api\/agents(\/|$)/);
+    request.flush({});
+    await pending;
+  });
+
+  it('keeps the agent list query params and returns the list', async () => {
+    const pending = firstValueFrom(api.getAgents('ready', 5));
+    const request = httpMock.expectOne((item) => pathOf(item.url) === '/api/admin/agents');
+    expect(request.request.params.get('status')).toBe('ready');
+    expect(request.request.params.get('limit')).toBe('5');
+    request.flush([{id: 'a1'}]);
+    await expect(pending).resolves.toEqual([{id: 'a1'}]);
+  });
+
+  it('reports a failed agent list as null, not as an empty fleet', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pending = firstValueFrom(api.getAgents());
+    httpMock
+      .expectOne((item) => pathOf(item.url) === '/api/admin/agents')
+      .flush({detail: 'nope'}, {status: 504, statusText: 'Gateway Timeout'});
+    await expect(pending).resolves.toBeNull();
+    log.mockRestore();
   });
 });
 

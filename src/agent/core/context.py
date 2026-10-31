@@ -419,11 +419,13 @@ def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
     """List ``content`` minus blocks a provider must not see again.
 
     Drops ``tool_use`` blocks whose id is not in ``keep_tool_use_ids`` (their
-    call was stripped, so Anthropic would see a call without a result) and
-    ``thinking`` blocks without a signature (an interrupted stream's partial
-    block, which fails signature validation on replay). Returns ``""`` when
-    neither text nor a kept ``tool_use`` remains: a thinking block alone is no
-    turn to replay. A string is returned unchanged.
+    call was stripped, so Anthropic would see a call without a result), the
+    Responses API's ``function_call`` items whose ``call_id`` is not (the
+    same, as an item without its output), and ``thinking`` blocks without a
+    signature (an interrupted stream's partial block, which fails signature
+    validation on replay). Returns ``""`` when neither text nor a kept call
+    remains: a thinking block or reasoning item alone is no turn to replay. A
+    string is returned unchanged.
     """
     if not isinstance(content, list):
         return content
@@ -433,6 +435,11 @@ def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
             kind = block.get("type")
             if kind == "tool_use" and block.get("id") not in keep_tool_use_ids:
                 continue
+            if (
+                kind == "function_call"
+                and block.get("call_id") not in keep_tool_use_ids
+            ):
+                continue
             if kind == "thinking" and not block.get("signature"):
                 continue
         kept.append(block)
@@ -441,7 +448,7 @@ def strip_unreplayable_blocks(content: Any, keep_tool_use_ids: Set[str]) -> Any:
         or (
             isinstance(b, dict)
             and (
-                b.get("type") == "tool_use"
+                b.get("type") in ("tool_use", "function_call")
                 or (b.get("type") == "text" and str(b.get("text", "")).strip())
             )
         )
@@ -498,7 +505,8 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
                 # fixed pairing while silently discarding everything else on
                 # the turn; model_copy changes only the poisoned field.
                 # Anthropic content carries the calls again as tool_use
-                # blocks, which a provider would still receive.
+                # blocks and Responses content as function_call items, which
+                # a provider would still receive.
                 m = m.model_copy(
                     update={
                         "tool_calls": kept,
@@ -676,11 +684,12 @@ def sanitize_history_for_provider_boundary(
 
             content = m.content
             if isinstance(content, list):
-                # A Claude turn replayed to the Claude family that produced it
-                # keeps its thinking blocks: they are the model's own reasoning
-                # and the native route replays them unchanged.
+                # A turn replayed to the family that produced it keeps its
+                # reasoning (Claude's signed thinking, a Responses reasoning
+                # item, Gemini's thought parts): it is the model's own, and
+                # its route replays it unchanged. ``default`` is no family.
                 produced_by = (m.response_metadata or {}).get("model_name") or ""
-                own_thinking = target_family.startswith("claude") and (
+                own_reasoning = target_family != "default" and (
                     family_of(produced_by) == target_family
                 )
                 kept = [
@@ -689,10 +698,7 @@ def sanitize_history_for_provider_boundary(
                     if not (
                         isinstance(b, dict)
                         and b.get("type") in _REASONING_BLOCK_TYPES
-                        and not (
-                            own_thinking
-                            and b.get("type") in ("thinking", "redacted_thinking")
-                        )
+                        and not own_reasoning
                     )
                 ]
                 if len(kept) != len(content):
@@ -1308,6 +1314,14 @@ class ContextManager:
         # instead of whole post-boundary turns. None when the last call did not
         # actually compact. See knowledge-base/knowledge/issues/persistent_session_midturn_message_loss.md.
         self._last_compaction_boundary_id: Optional[str] = None
+        # The last conversation turn the newest summary covers, in the
+        # persistent-session transport's turn numbering: the compaction
+        # checkpoint's `boundary_turn`, set where the transport writes the
+        # checkpoint and when it restores from one. None until one is
+        # recorded. The memory take-in reads it to tell whether a memory's
+        # source turns are still in context (memory.retrieval.same_conversation,
+        # P4). Workers derive theirs from the history instead.
+        self.compaction_boundary_turn: Optional[int] = None
         # Monotonic count of *successful* summarizations. Transports snapshot
         # it around a compaction call to know whether a summary was actually
         # produced this call — the authoritative signal, replacing length-delta

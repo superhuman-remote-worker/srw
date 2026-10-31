@@ -64,6 +64,14 @@ python3.11 -m venv /tmp/srw-orchestrator-env
 ```
 
 Use Python 3.12 and `locks/vm-controller-py312.txt` for the controller.
+
+The voice gateway (`voice-gateway`, Python 3.12, `docker/Dockerfile.voice-gateway`)
+is a third role with one difference: `docopt`, which `num2words` declares for
+its command-line script only, ships no wheel, so the generator resolves it from
+source and leaves it out of the lock (`EXCLUDED` in the script). The role
+installs its lock with `--no-deps` and checks consistency with
+`python scripts/lock_dependencies.py pip-check voice-gateway`, which tolerates
+exactly that missing requirement. Its CI job is `test-voice-gateway`.
 Do not install these two platform-specific locks together or apply the 3.11
 lock to the combined 3.12 unit environment. That environment still resolves the
 root, orchestrator, MCP and development declarations, including the shared

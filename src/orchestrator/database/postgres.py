@@ -12,6 +12,7 @@ This is the canonical database layer for the orchestrator.
 
 import asyncio
 import base64
+import copy
 import functools
 import hashlib
 import inspect
@@ -134,6 +135,7 @@ from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedJobRecipient, PinnedSessionBinding
 from shared.pinned_workspace_evidence import (
+    canonical_virtual_binding,
     has_pinned_physical_workspace_evidence,
     never_published_workspace_create,
     soft_fenced_workspace,
@@ -168,6 +170,7 @@ from shared.workspace_contract import (
     workspace_contract_authority_identity,
     workspace_contract_projection,
 )
+from shared.workspace_upgrade import VM_UPGRADE_SOURCE_KEY
 from shared.pinned_job_delivery import (
     pinned_resume_consumed_keys,
     pinned_resume_input_digests,
@@ -191,6 +194,7 @@ from orchestrator.services.cloud_staging.source_identity import (
 from shared.container_recovery import (
     ContainerRecoveryCleanup,
     container_recovery_resume_allowed_sql,
+    container_retained_projection_sql,
 )
 from shared.worker_execution_hold import (
     WORKER_EXECUTION_HOLD_KEY,
@@ -205,6 +209,11 @@ from shared.operator_pause_hold import (
     operator_pause_hold_matches_sql,
     operator_pause_hold_merged_feedback_sql,
     operator_pause_hold_present_sql,
+)
+from shared.workspace_disk import (
+    WorkspaceDiskFullReport,
+    WorkspaceVolumeGrowth,
+    workspace_disk_full_action,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
@@ -275,6 +284,17 @@ _DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS = _DOCKER_WORKSPACE_PRESERVED_FIEL
 # Terminal checkpoint prune batch size. An unbounded single-statement DELETE is
 # what got cancelled under bloat on 2026-07-27 (Defect 6); batching makes the
 # prune insensitive to row count. The max-batches value is a runaway guard.
+# C2 (spec D3): a stateless -> VM lane switch leaves its upgrade request for
+# the first pinned owner. While no agent has taken it (no adoption, no receipt)
+# it has no consumer to strand, so ending that life passes it: Begin, and the
+# zero-admission receipt the retirement then needs. It stays pending; Resume
+# (0185) re-stamps it and the next owner rejects it as ``upgrade_cancelled``.
+# ``r`` is the thread_control_requests row; callers bind the verb.
+_UNTAKEN_REQUEST_SQL = (
+    "(r.outcome IS NULL AND r.accepted_agent_id IS NULL AND NOT EXISTS ("
+    "SELECT 1 FROM thread_events receipt WHERE receipt.thread_id=r.thread_id "
+    "AND receipt.control_request_id=r.id))"
+)
 _CHECKPOINT_DELETE_BATCH = 1000
 _CHECKPOINT_DELETE_MAX_BATCHES = 1000
 _CHECKPOINT_RETENTION_SOURCE_PREFIX = "checkpoint_retention_prune:v1:"
@@ -2818,7 +2838,11 @@ def _pinned_retirement_external_cleanup_expected(
             "sandbox_actuator_zero_v1" if sandbox_evidence else "external_none_v1"
         )
     elif backend in {"vm", "remote"}:
-        if sandbox_evidence:
+        # A Session upgraded from the virtual tier before the VM install dropped
+        # its binding (E3) captured the binding of its old object-store files;
+        # nothing runs behind it. 0556 accepts the same in SQL.
+        upgrade_left_binding = backend == "vm" and canonical_virtual_binding(binding)
+        if workspace_physical_evidence or (binding and not upgrade_left_binding):
             return False, None
         workspace_protocol = (
             "workspace_actuator_zero_v1" if vm_evidence else "external_none_v1"
@@ -4252,7 +4276,12 @@ class PostgresDB:
                 )
                 SELECT j.id, j.description, j.status,
                        j.completion_outcome_kind, j.origin,
-                       j.config_name, j.assigned_agent_id, j.user_id,
+                       j.config_name,
+                       -- A DB expert's job stores config_name='worker_base'
+                       -- (the framework root) and names the expert only by
+                       -- id, so the list carries the display name to label it.
+                       j.expert_id, ex.display_name AS expert_display_name,
+                       j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.exported_folder_handle,
@@ -4303,6 +4332,7 @@ class PostgresDB:
                   OR (j.parent_job_id = page.id
                       AND j.id IN (SELECT id FROM matched))
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN experts ex ON ex.id = j.expert_id
                 LEFT JOIN subtree_counts sc ON sc.root_id = j.id
                 LEFT JOIN LATERAL (
                     SELECT s.id FROM sudo_approval_requests s
@@ -4441,6 +4471,7 @@ class PostgresDB:
                        j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
                        j.freeze_data,
                        j.workspace_idle_episode, j.workspace_idle_revision,
+                       j.harness_image,
                        j.cloud_diff_baseline_commit, j.diff_status,
                        j.exported_folder_handle, j.exported_at,
                        j.creation_order, j.worktree_path, j.delegation_context,
@@ -4544,6 +4575,7 @@ class PostgresDB:
         workspace_selection: Mapping[str, Any] | None = None,
         expert_row: Mapping[str, Any] | None = None,
         conn: Any = None,
+        harness_image: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -4816,7 +4848,7 @@ class PostgresDB:
             )
             written = await active_conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, origin, execution_lane, id)
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete, origin, execution_lane, id, harness_image)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
                         COALESCE(
                             $22::text,
@@ -4826,7 +4858,7 @@ class PostgresDB:
                               FOR SHARE),
                             'pinned'
                         ),
-                        $23)
+                        $23, NULLIF($24, ''))
                 RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete, origin, execution_lane
                 """,
                 description,
@@ -4852,6 +4884,7 @@ class PostgresDB:
                 origin,
                 execution_lane,
                 job_uuid,
+                harness_image,
             )
             if datasource_uuids:
                 await active_conn.executemany(
@@ -4914,6 +4947,9 @@ class PostgresDB:
                     str(key): value for key, value in policy_snapshot.items()
                 },
                 runner_kind=runner_kind,
+                # The snapshot re-derives the Expert's image and refuses a
+                # custom-image Expert that job admission did not select.
+                harness_image=harness_image,
             )
             return written
 
@@ -6241,6 +6277,62 @@ class PostgresDB:
             "safe": unannotated == 0 and ambiguous == 0,
         }
 
+    async def managed_repository_workspace_runtime_is_unannotated(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+    ) -> bool:
+        """Whether one owner's managed K8s runtime lacks its exact creation record.
+
+        The per-owner form of the activation inventory's unannotated count,
+        with the same classification. A runtime projected before migration 0195
+        has no settled creation reservation, so automatic cleanup cannot tell
+        its predecessor from a successor. An absent owner, or a projection that
+        is not a managed K8s runtime, is not unannotated: orphan admission keeps
+        its own process-zero receipt requirement. Malformed input fails closed.
+        """
+
+        if (owner_kind, scope) == ("job", "workspace_container"):
+            table, state = "jobs", "context -> 'workspace_container'"
+        elif (owner_kind, scope) == ("job", "ide"):
+            table, state = "jobs", "context -> 'ide_session'"
+        elif (owner_kind, scope) == ("thread", "workspace_container"):
+            table, state = "threads", "metadata -> 'workspace_container'"
+        else:
+            return True
+        try:
+            owner_uuid = UUID(str(owner_id))
+        except (TypeError, ValueError):
+            return True
+        managed = (
+            "runtime ->> 'restore_type' = 'k8s_container'"
+            if scope == "ide"
+            else "runtime ->> 'provisioner' = 'k8s'"
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COALESCE(jsonb_typeof(runtime) = 'object' "
+                f"AND {managed}, false) AS managed, "
+                "EXISTS (SELECT 1 FROM "
+                "managed_repository_workspace_creation_reservations r "
+                "WHERE r.owner_kind = $2 AND r.owner_id = $1 AND r.scope = $3 "
+                "AND r.id::text = runtime ->> '_creation_reservation_id' "
+                "AND r.runtime_incarnation::text = "
+                "    runtime ->> '_runtime_incarnation' "
+                "AND r.claim_token::text = runtime ->> '_creation_claim_token' "
+                "AND r.result_kind = 'settled' AND r.settled_at IS NOT NULL"
+                ") AS exact_reservation "
+                f"FROM (SELECT {state} AS runtime FROM {table} WHERE id = $1) owner",
+                owner_uuid,
+                owner_kind,
+                scope,
+            )
+        if row is None or not row["managed"]:
+            return False
+        return not row["exact_reservation"]
+
     async def stateless_cancel_cleanup_pending(self, job_id: str) -> bool | None:
         """Return marker state for a cleanup-lock owner.
 
@@ -7516,6 +7608,41 @@ class PostgresDB:
             interrupted_command=True,
         )
 
+    async def hold_full_workspace_disk(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        error_detail: str,
+        disk_full: WorkspaceDiskFullReport,
+        growth: WorkspaceVolumeGrowth | None = None,
+        resume: bool = False,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Hold a job whose workspace disk is full, or resume it on a grown volume.
+
+        The same fences as the unknown-outcome hold, with a reason that names
+        the full disk. ``resume`` (only after the volume grew and while no
+        command was running) parks the job in the runnable paused shape
+        instead, so admission picks it up again on the same, larger volume.
+        Neither counts as a recovery attempt: the transport works.
+        """
+        return await self._hold_workspace_recovery_attention(
+            job_id,
+            expected_workspace=expected_workspace,
+            expected_agent_id=expected_agent_id,
+            recovery_cap=0,
+            error_detail=error_detail,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            interrupted_command=True,
+            disk_full=disk_full,
+            disk_growth=growth,
+            requeue=resume,
+        )
+
     async def _hold_workspace_recovery_attention(
         self,
         job_id: str,
@@ -7528,6 +7655,9 @@ class PostgresDB:
         completion_finalizing_by: str | None = None,
         worker_queue_exhausted: bool = False,
         interrupted_command: bool = False,
+        disk_full: WorkspaceDiskFullReport | None = None,
+        disk_growth: WorkspaceVolumeGrowth | None = None,
+        requeue: bool = False,
     ) -> Dict[str, Any] | None:
         """Retain uncertain container work behind the existing explicit-resume fence.
 
@@ -7535,9 +7665,19 @@ class PostgresDB:
         proof. This write grants no cleanup authority and never changes runtime
         coordinates. Queue-first serialization also covers stateless reports;
         their exact accepted queue term must already be terminalized.
+
+        ``requeue`` is the one exception to the hold: a full disk whose volume
+        grew while no command was running resumes without an explicit Resume.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
+        if requeue and (
+            disk_full is None
+            or disk_full.command_in_flight
+            or disk_growth is None
+            or disk_growth.outcome != "resized"
+        ):
+            raise ValueError("only a grown full volume with no command resumes")
         try:
             job_uuid = UUID(job_id)
             runtime_uid = str(UUID(str(expected_workspace.get("_runtime_incarnation"))))
@@ -7681,6 +7821,7 @@ class PostgresDB:
                 attempts = int(workspace.get("recovery_attempts") or 0) + (
                     0
                     if worker_queue_exhausted
+                    or disk_full is not None
                     or (
                         command_uuid is not None
                         and workspace.get("recovery_attempt_command_id")
@@ -7698,9 +7839,13 @@ class PostgresDB:
                     "job_id": job_id,
                     "new_status": "paused",
                     "paused": True,
-                    "held_for_resume": True,
+                    "held_for_resume": not requeue,
                     "actions": [
-                        (
+                        workspace_disk_full_action(
+                            disk_full, disk_growth, resumed=requeue
+                        )
+                        if disk_full is not None
+                        else (
                             "workspace transport lost; interrupted command outcome is unknown; "
                             if interrupted_command
                             else "worker reported exhausted workspace retries; "
@@ -7712,6 +7857,9 @@ class PostgresDB:
                     **({"cleanup_pending": False} if interrupted_command else {}),
                 }
                 updates = {"recovery_attempts": attempts}
+                if disk_growth is not None and disk_growth.grown:
+                    # The volume grows once per job; a later full disk holds.
+                    updates["disk_growth"] = disk_growth.as_dict()
                 if command_uuid is not None:
                     updates.update(
                         recovery_attempt_command_id=str(command_uuid),
@@ -7727,7 +7875,20 @@ class PostgresDB:
                     "detail": str(error_detail)[:1000],
                     **(
                         {"reason": "interrupted_command_outcome_unknown"}
-                        if interrupted_command
+                        if interrupted_command and disk_full is None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "reason": disk_full.error_fields()["reason"],
+                            "disk": disk_full.error_fields()["disk"],
+                            **(
+                                {"growth": disk_growth.as_dict()}
+                                if disk_growth is not None
+                                else {}
+                            ),
+                        }
+                        if disk_full is not None
                         else {}
                     ),
                 }
@@ -7741,15 +7902,20 @@ class PostgresDB:
                 # reply/Resume stashes that column and must not overwrite the
                 # original checkpoint freeze with an infrastructure diagnosis.
                 hold = f"({hold} || jsonb_build_object('attention',$3::jsonb))"
+                # A requeue ($10) is the runnable paused shape admission picks
+                # up: no hold, and the job's error message stays as it was.
                 changed = await conn.fetchval(
                     f"""UPDATE jobs SET status='paused', assigned_agent_id=NULL,
                         context=jsonb_set(
                             COALESCE(context,'{{}}'::jsonb)
                             || CASE WHEN freeze_data IS NULL THEN '{{}}'::jsonb
                                ELSE jsonb_build_object('last_freeze_data',freeze_data) END
-                            || jsonb_build_object('{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}',{hold}),
+                            || CASE WHEN $10::boolean THEN '{{}}'::jsonb
+                               ELSE jsonb_build_object('{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}',{hold}) END,
                             '{{workspace_container}}',context->'workspace_container'||$2::jsonb),
-                        freeze_data=NULL,error_message=$4,updated_at=clock_timestamp()
+                        freeze_data=NULL,
+                        error_message=CASE WHEN $10::boolean THEN error_message ELSE $4::text END,
+                        updated_at=clock_timestamp()
                         WHERE id=$1 AND ($8::uuid IS NULL OR EXISTS (
                             SELECT 1 FROM job_completion_commands command
                             WHERE command.id=$8 AND command.job_id=jobs.id
@@ -7762,12 +7928,15 @@ class PostgresDB:
                     json.dumps(freeze),
                     outcome["actions"][0],
                     str(uuid4()),
-                    "workspace_recovery_unavailable"
+                    "workspace_disk_full"
+                    if disk_full is not None
+                    else "workspace_recovery_unavailable"
                     if interrupted_command
                     else "workspace_recovery_exhausted",
                     None,
                     command_uuid,
                     completion_finalizing_by,
+                    requeue,
                 )
                 return outcome if changed is not None else None
 
@@ -13579,7 +13748,8 @@ class PostgresDB:
         query = (
             "UPDATE jobs "
             "SET context = CASE "
-            "        WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context "
+            "        WHEN $2::text='workspace_container' AND (context->'workspace_container' ? 'recovery_cleanup' "
+            f"            OR {container_retained_projection_sql('context')}) THEN context "
             "        WHEN COALESCE(context, '{}'::jsonb) ? $2::text "
             "        THEN (COALESCE(context, '{}'::jsonb) - $2::text) "
             "             || jsonb_build_object('last_' || $2::text, context -> $2::text) "
@@ -18786,6 +18956,7 @@ class PostgresDB:
             "r.cancel_requested_at,r.startup_protocol_version,r.startup_stage,"
             "r.startup_state,r.startup_reason_code,r.scheduled_at,"
             "r.ready_budget_seconds,r.pull_budget_seconds,r.ssh_budget_seconds,"
+            "r.startup_exit_code,"
             f"j.{owner_json} #>> '{{workspace_container,status}}' AS workspace_status "
             f"FROM {owner_table} j JOIN "
             "managed_repository_workspace_creation_reservations r "
@@ -19950,6 +20121,64 @@ class PostgresDB:
                 )
                 return dict(row) if row is not None else None
 
+    async def record_refused_workspace_creation_pod_effect(
+        self,
+        owner_id: str,
+        *,
+        owner_kind: str,
+        scope: str,
+        reservation_generation: int,
+        claimant: str,
+        claim_token: int,
+        refused_status: int,
+    ) -> bool:
+        """End the wait for a late Pod create after a definite refusal.
+
+        The API server answered this claim's Pod create with a 403/422 Status,
+        so that request persisted nothing and no later answer can land for it.
+        Cleanup still reads the Pod by name before it settles anything; only
+        the ambiguity window for an unobserved create closes now. The effect
+        gains no diagnostic keys (container startup stage design).
+        """
+
+        if (
+            owner_kind not in {"job", "thread"}
+            or scope != "workspace_container"
+            or refused_status not in {403, 422}
+            or isinstance(reservation_generation, bool)
+            or not isinstance(reservation_generation, int)
+            or isinstance(claim_token, bool)
+            or not isinstance(claim_token, int)
+            or not isinstance(claimant, str)
+            or not claimant
+        ):
+            return False
+        try:
+            owner_uuid = UUID(str(owner_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            updated = await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET external_effects = jsonb_set(external_effects, "
+                "'{pod,ambiguity_until}', to_jsonb(LEAST(now(), "
+                "(external_effects #>> '{pod,ambiguity_until}')::timestamptz))) "
+                "WHERE owner_kind = $1 AND owner_id = $2 AND scope = $3 "
+                "AND reservation_generation = $4 AND claimed_by = $5 "
+                "AND claim_token = $6 AND settled_at IS NULL "
+                "AND phase = 'mutating' AND runtime_incarnation IS NULL "
+                "AND pod_uid IS NULL AND external_effects ? 'pod' "
+                "AND external_effects #>> '{pod,observed_uid}' IS NULL "
+                "AND (external_effects #>> '{pod,claim_token}')::bigint = $6",
+                owner_kind,
+                owner_uuid,
+                scope,
+                reservation_generation,
+                claimant,
+                claim_token,
+            )
+        return updated == "UPDATE 1"
+
     async def managed_repository_workspace_creation_effects_are_quiescent(
         self,
         owner_id: str,
@@ -21091,6 +21320,19 @@ class PostgresDB:
                 raw_runtime = state.get(state_key)
                 if raw_runtime is not None and not isinstance(raw_runtime, dict):
                     return False
+                # A Job whose Pod was refused before any runtime was recorded
+                # holds only its creation error (`_record_creation_diagnostic`).
+                # No provisioner ever claimed it, so there is no runtime status
+                # to project: close the reservation and leave the error to show.
+                # The guards read that error-only record as metadata, so the
+                # Job can then be deleted (migration 0560).
+                error_only = (
+                    owner_kind == "job"
+                    and scope == "workspace_container"
+                    and isinstance(raw_runtime, dict)
+                    and "error" in raw_runtime
+                    and set(raw_runtime) <= {"error", "status"}
+                )
                 next_runtime = dict(raw_runtime or {})
                 raw_uid = next_runtime.get(_STATELESS_RUNTIME_INCARNATION_KEY)
                 if raw_uid is not None:
@@ -21151,6 +21393,8 @@ class PostgresDB:
                 )
                 if closed != "UPDATE 1":
                     return False
+                if error_only:
+                    return True
                 updated = await conn.execute(
                     f"UPDATE {table} SET {json_column} = $2::jsonb, "
                     f"{timestamp_column} = CURRENT_TIMESTAMP WHERE id = $1",
@@ -24117,9 +24361,21 @@ class PostgresDB:
                     "pull_deadline",
                     "readiness_deadline",
                     "ssh_deadline",
+                    "container_exited",
                 }
                 or budgets is not None
             ):
+                return False
+            if observation.reason_code == "container_exited":
+                # Positive exit evidence for Jobs only (owner decision,
+                # 2026-10-06). The code must fit the integer column.
+                if (
+                    owner_kind != "job"
+                    or type(observation.exit_code) is not int
+                    or not -(2**31) <= observation.exit_code < 2**31
+                ):
+                    return False
+            elif observation.exit_code is not None:
                 return False
         else:
             return False
@@ -24247,6 +24503,7 @@ class PostgresDB:
                 pull_seconds = receipt["pull_budget_seconds"]
                 ssh_seconds = receipt["ssh_budget_seconds"]
                 attention_at = None
+                exit_code = None
 
                 if isinstance(observation, Unscheduled):
                     if scheduled_at is not None:
@@ -24339,15 +24596,26 @@ class PostgresDB:
                             hard_bound + timedelta(seconds=ssh_seconds),
                         ):
                             return False
+                    elif reason == "container_exited":
+                        # Like invalid_image, no elapsed clock is needed; an
+                        # exit after the first Ready is not a startup exit.
+                        if first_ready_at is not None:
+                            return False
+                        exit_code = observation.exit_code
                     stage, state, attention_at = "readiness", "attention", now
 
+                exit_code_args = () if exit_code is None else (exit_code,)
                 result = await conn.execute(
                     "UPDATE managed_repository_workspace_creation_reservations "
                     "SET startup_protocol_version=1, startup_stage=$2, "
                     "startup_state=$3, startup_reason_code=$4, scheduled_at=$5, "
                     "startup_first_ready_at=$6, ready_budget_seconds=$7, "
                     "pull_budget_seconds=$8, ssh_budget_seconds=$9, "
-                    "startup_attention_at=$10 WHERE id=$1 "
+                    "startup_attention_at=$10"
+                    # Named only when present, so the writer still works on a
+                    # schema that predates the column.
+                    + (", startup_exit_code=$12" if exit_code_args else "")
+                    + " WHERE id=$1 "
                     "AND claim_token=$11 AND phase='runtime_bound' "
                     "AND settled_at IS NULL AND cancel_requested_at IS NULL "
                     "AND expires_at > clock_timestamp()",
@@ -24362,6 +24630,7 @@ class PostgresDB:
                     ssh_seconds,
                     attention_at,
                     claim_token,
+                    *exit_code_args,
                 )
                 return result == "UPDATE 1"
 
@@ -26715,7 +26984,27 @@ class PostgresDB:
                     "vm",
                 }:
                     return False
+                upgrade_source = None
                 if contract.assigned_backend != "vm":
+                    if contract.assigned_backend == "virtual":
+                        # E4: what this UPDATE replaces, for a completed abort
+                        # to restore (undo_thread_vm_upgrade). Copied before
+                        # any of it changes below.
+                        binding = metadata.get("_workspace_binding")
+                        upgrade_source = {
+                            "backend": "virtual",
+                            "workspace": copy.deepcopy(
+                                (metadata.get("config_override") or {}).get("workspace")
+                            ),
+                            "workspace_contract": copy.deepcopy(
+                                metadata.get(WORKSPACE_CONTRACT_CONTEXT_KEY)
+                            ),
+                            "binding": (
+                                copy.deepcopy(binding)
+                                if canonical_virtual_binding(binding)
+                                else None
+                            ),
+                        }
                     metadata[WORKSPACE_CONTRACT_CONTEXT_KEY] = {
                         "version": 1,
                         "requested_backend": "vm",
@@ -26734,8 +27023,17 @@ class PostgresDB:
                     workspace.pop("remote", None)
                     config_override["workspace"] = workspace
                     metadata["config_override"] = config_override
+                    # The virtual tier's binding names only the old object-store
+                    # files, and neither End nor an attach takes it next to a VM
+                    # (E3). The seed doesn't need it: the bound agent copies with
+                    # the mounts it holds, and a new agent of a C2 lane switch
+                    # reads the copy in metadata.vm.upgrade_seed.
+                    if canonical_virtual_binding(metadata.get("_workspace_binding")):
+                        metadata.pop("_workspace_binding")
 
                 next_vm = {**(current_vm or {}), **proposed}
+                if upgrade_source is not None:
+                    next_vm[VM_UPGRADE_SOURCE_KEY] = upgrade_source
                 metadata["vm"] = next_vm
                 result = await conn.execute(
                     "UPDATE threads SET metadata=$2::jsonb,"
@@ -26897,8 +27195,13 @@ class PostgresDB:
         vm_updates: Dict[str, Any],
         *,
         require_status_not_ready: bool = False,
+        require_not_retiring: bool = False,
     ) -> bool:
-        """Atomically merge only into the current thread VM provision."""
+        """Atomically merge only into the current thread VM provision.
+
+        ``require_not_retiring`` also refuses once End began or the Session
+        ended: End owns the VM record then.
+        """
         import json as json_module
 
         try:
@@ -26917,6 +27220,9 @@ class PostgresDB:
             "WHERE id = $2 "
             "  AND metadata->'vm'->>'provision_generation' = $3 "
             "  AND ($4::boolean = FALSE "
+            "       OR (runtime_retirement_token IS NULL "
+            "           AND status IS DISTINCT FROM 'ended')) "
+            "  AND ($5::boolean = FALSE "
             "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready') "
             "  AND NOT EXISTS ("
             "      SELECT 1 FROM vm_workspace_recoveries recovery "
@@ -26931,10 +27237,117 @@ class PostgresDB:
                 json_module.dumps(vm_updates),
                 uuid_val,
                 expected_generation,
+                require_not_retiring,
                 require_status_not_ready,
             )
 
         return result == "UPDATE 1"
+
+    async def undo_thread_vm_upgrade(
+        self, thread_id: str, *, provision_generation: str
+    ) -> bool:
+        """Make a Session whose VM upgrade was aborted a virtual Session again.
+
+        E4: the caller has released that VM generation. When its install
+        recorded what it replaced (an upgrade from the virtual tier), restore
+        the workspace config, contract and binding and drop ``metadata.vm`` in
+        one owner-locked UPDATE, so End and a new attach see the Session the
+        live agent still serves. False, changing nothing, unless the row is
+        open (not retiring), its VM record is exactly that install's, and that
+        VM holds no open resource charge (only End's VM cleanup releases it).
+        """
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            generation = _canonical_uuid_text(
+                provision_generation, label="thread VM provision generation"
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                from orchestrator.services.vm_thread_retained_resume import (
+                    lock_owner_on_conn,
+                )
+
+                await lock_owner_on_conn(conn, parsed_thread)
+                row = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id=$1::uuid "
+                    "AND runtime_retirement_token IS NULL FOR UPDATE",
+                    parsed_thread,
+                )
+                if row is None:
+                    return False
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(metadata, dict):
+                    return False
+                vm = metadata.get("vm")
+                if not isinstance(vm, dict) or (
+                    vm.get("provision_generation") != generation
+                ):
+                    return False
+                source = vm.get(VM_UPGRADE_SOURCE_KEY)
+                if not isinstance(source, dict) or source.get("backend") != "virtual":
+                    return False
+                binding = source.get("binding")
+                if binding is not None and (
+                    not canonical_virtual_binding(binding)
+                    or metadata.get("_workspace_binding") is not None
+                ):
+                    return False
+                # A Session VM's resource charge is released only by End's own
+                # VM cleanup. Without the VM record End would be virtual and the
+                # charge would stay open for good, so keep the record until the
+                # charge (or a wait for one) is gone.
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vm_creation_retries c "
+                    "WHERE c.owner_kind='thread' AND c.thread_id=$1 "
+                    "AND c.provision_generation=$2::uuid AND ("
+                    "EXISTS (SELECT 1 FROM vm_resource_waiters w "
+                    "WHERE w.request_id=c.request_id "
+                    "AND w.state IN ('waiting','nonfit')) "
+                    "OR (SELECT r.state FROM vm_resource_reservations r "
+                    "WHERE r.request_id=c.request_id "
+                    "ORDER BY r.revision DESC LIMIT 1) <> 'released'))",
+                    parsed_thread,
+                    generation,
+                ):
+                    return False
+
+                config_override = dict(metadata.get("config_override") or {})
+                if source.get("workspace") is None:
+                    config_override.pop("workspace", None)
+                else:
+                    config_override["workspace"] = source["workspace"]
+                metadata["config_override"] = config_override
+                if source.get("workspace_contract") is None:
+                    metadata.pop(WORKSPACE_CONTRACT_CONTEXT_KEY, None)
+                else:
+                    metadata[WORKSPACE_CONTRACT_CONTEXT_KEY] = source[
+                        "workspace_contract"
+                    ]
+                if binding is not None:
+                    metadata["_workspace_binding"] = binding
+                metadata.pop("vm")
+                result = await conn.execute(
+                    "UPDATE threads SET metadata=$2::jsonb,"
+                    "last_activity=CURRENT_TIMESTAMP "
+                    "WHERE id=$1::uuid AND runtime_retirement_token IS NULL "
+                    "AND NOT EXISTS ("
+                    "    SELECT 1 FROM vm_workspace_recoveries recovery "
+                    "    WHERE recovery.owner_kind='thread' "
+                    "      AND recovery.owner_id=threads.id "
+                    "      AND recovery.resolved_at IS NULL)",
+                    parsed_thread,
+                    json.dumps(metadata),
+                )
+                return result == "UPDATE 1"
 
     async def list_thread_vm_readiness_candidates(self, *, ready: bool = False) -> list:
         status_clause = (
@@ -27753,6 +28166,7 @@ class PostgresDB:
         expected_agent_id: str | None = None,
         insert_only: bool = False,
         completion_commands_enabled: bool = False,
+        image: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -27859,7 +28273,8 @@ class PostgresDB:
                         agent_mode    = $6,
                         thread_id     = $7,
                         metadata = COALESCE(metadata, '{}') || $8::jsonb,
-                        pod_uid       = COALESCE(NULLIF($9, ''), pod_uid)
+                        pod_uid       = COALESCE(NULLIF($9, ''), pod_uid),
+                        image         = COALESCE(NULLIF($10, ''), image)
                     WHERE id = $5
                     """,
                     pod_ip,
@@ -27871,6 +28286,7 @@ class PostgresDB:
                     thread_id,
                     registration_metadata,
                     pod_uid,
+                    image,
                 )
                 if expected_agent_id is not None and update_result != "UPDATE 1":
                     raise RuntimeError(
@@ -27885,8 +28301,8 @@ class PostgresDB:
             # Create new agent
             row = await conn.fetchrow(
                 """
-                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata, pod_uid)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NULLIF($9, ''))
+                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata, pod_uid, image)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NULLIF($9, ''), NULLIF($10, ''))
                 RETURNING id
                 """,
                 config_name,
@@ -27898,6 +28314,7 @@ class PostgresDB:
                 thread_id,
                 registration_metadata,
                 pod_uid,
+                image,
             )
 
             return {
@@ -36318,7 +36735,8 @@ class PostgresDB:
                         f"""
                         UPDATE jobs
                            SET context = CASE
-                                WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context
+                                WHEN $2::text='workspace_container' AND (context->'workspace_container' ? 'recovery_cleanup'
+                                    OR {container_retained_projection_sql("context")}) THEN context
                                 WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
                                 THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
                                      || jsonb_build_object(
@@ -36412,7 +36830,8 @@ class PostgresDB:
                         f"""
                         UPDATE jobs
                         SET context = CASE
-                                WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context
+                                WHEN $2::text='workspace_container' AND (context->'workspace_container' ? 'recovery_cleanup'
+                                    OR {container_retained_projection_sql("context")}) THEN context
                             WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
                             THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
                                  || jsonb_build_object(
@@ -37171,7 +37590,7 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, registered_at, last_heartbeat,
-                       last_completed_at, metadata, pod_uid
+                       last_completed_at, metadata, pod_uid, image
                 FROM agents
                 WHERE status = 'ready'
                   AND COALESCE(agent_mode, 'worker') IN ('worker', 'dual')
@@ -37194,7 +37613,7 @@ class PostgresDB:
         user_id: str | None = None,
         project_id: str | None = None,
         config_name: str = "session_base",
-        permission_mode: str = "supervised",
+        permission_mode: str = "read_only",
         narration_mode: str = "auto",
         title: str = "Untitled Session",
         datasource_ids: list[str] | None = None,
@@ -43139,12 +43558,30 @@ class PostgresDB:
                 # strand an already-admitted request under a token that its
                 # old consumer is then forbidden to use.  The locked thread
                 # row serializes this proof with public control admission.
+                # One exception (C2, spec D3): a stateless -> VM lane switch
+                # leaves its upgrade request pending for the first pinned
+                # owner.  With no owner bound, or a bound one that never took
+                # it (its attach can fail first), there is no consumer to
+                # strand, so End settles past it (_UNTAKEN_REQUEST_SQL);
+                # Resume (0185) re-stamps it and the next owner rejects its
+                # older payload generation as ``upgrade_cancelled``.  An agent
+                # can't take it after this token: its fence and adoption both
+                # require no retirement token.  Suspend still waits: skipping
+                # there would cancel the upgrade on Resume.
+                from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
+
                 if await conn.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                    "WHERE thread_id=$1::uuid AND outcome IS NULL "
-                    "AND runtime_generation=$2::uuid)",
+                    "SELECT EXISTS (SELECT 1 FROM thread_control_requests r "
+                    "WHERE r.thread_id=$1::uuid AND r.outcome IS NULL "
+                    "AND r.runtime_generation=$2::uuid "
+                    "AND NOT ($3::boolean AND r.verb=$4 AND ($5::boolean OR "
+                    + _UNTAKEN_REQUEST_SQL
+                    + ")))",
                     parsed_thread_id,
                     UUID(generation),
+                    settle_status == "ended",
+                    WORKSPACE_UPGRADE_VERB,
+                    thread.get("agent_id") is None,
                 ):
                     return {
                         "state": "conflict",
@@ -44374,6 +44811,30 @@ class PostgresDB:
             )
         )
 
+    @staticmethod
+    async def _admitted_control_on_conn(
+        conn: Any, thread_id: UUID, generation: UUID, *, settles_ended: bool
+    ) -> bool:
+        """Whether this life admitted control work its zero receipt must wait for.
+
+        Every request of the generation counts, applied or not, except, when
+        the life is ending, the upgrade request Begin passed because no agent
+        took it (_UNTAKEN_REQUEST_SQL).
+        """
+        from shared.workspace_upgrade import WORKSPACE_UPGRADE_VERB
+
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM thread_control_requests r "
+                "WHERE r.thread_id=$1::uuid AND r.runtime_generation=$2::uuid "
+                "AND NOT ($3::boolean AND r.verb=$4 AND " + _UNTAKEN_REQUEST_SQL + "))",
+                thread_id,
+                generation,
+                settles_ended,
+                WORKSPACE_UPGRADE_VERB,
+            )
+        )
+
     async def acknowledge_pinned_thread_local_quiescence(
         self,
         thread_id: str,
@@ -44479,11 +44940,11 @@ class PostgresDB:
                         expected_agent_pod_uid,
                         str(row["status"] or "") == "active",
                     )
-                    admitted_control = await conn.fetchval(
-                        "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                        "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                    admitted_control = await self._admitted_control_on_conn(
+                        conn,
                         parsed_thread,
                         parsed_generation,
+                        settles_ended=expected_settle_status == "ended",
                     )
                     if used_input or admitted_control:
                         return None
@@ -44599,11 +45060,14 @@ class PostgresDB:
                             expected_agent_pod_uid,
                             str(row["status"] or "") == "active",
                         )
-                        admitted_control = await conn.fetchval(
-                            "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
-                            "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid)",
+                        # Strict: a bound-VM no-source proof refuses every
+                        # control of the life anyway (0529's obligations check),
+                        # and a C2 switch adopts its request before any VM.
+                        admitted_control = await self._admitted_control_on_conn(
+                            conn,
                             parsed_thread,
                             parsed_generation,
+                            settles_ended=False,
                         )
                         if used_input or admitted_control:
                             return None
@@ -46343,10 +46807,12 @@ class PostgresDB:
     ) -> bool:
         """Validate initial End provenance under owner -> queue -> ledger locks."""
         from shared.session_retirement import (
+            active_claim_authority,
             initial_creation_retirement_authority,
             stateless_retirement_authority,
             stateless_settled_retirement_authority,
         )
+        from shared.workspace_upgrade import workspace_upgrade_seed_from
 
         try:
             initial = initial_creation_retirement_authority(initial)
@@ -46370,12 +46836,29 @@ class PostgresDB:
             "SELECT * FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE", thread["id"]
         )
         if admission:
-            if thread["status"] != "created" or (
+            # A container upgrade's create (C1) keeps its lite Session's queue
+            # and presence: a served lite turn and every pre-Ready claim
+            # (released on its 425) took a token, and a served turn left its
+            # claim record and an active/awaiting_user status. Every claim runs
+            # under the queue lease, so on an unleased queue none of them can
+            # still run: the seed marker admits that history there. Any other
+            # create still needs a never-claimed queue.
+            upgrade_history = bool(
+                workspace_upgrade_seed_from(metadata) is not None
+                and queue is not None
+                and queue["state"] != "leased"
+                and queue["leased_by"] is None
+            )
+            if thread["status"] not in (
+                ("created", "active", "awaiting_user")
+                if upgrade_history
+                else ("created",)
+            ) or (
                 queue is not None
                 and (
                     queue["unit_kind"] != "session_turn"
                     or queue["state"] == "leased"
-                    or queue["lease_token"] != 0
+                    or (queue["lease_token"] != 0 and not upgrade_history)
                 )
             ):
                 return False
@@ -46384,12 +46867,25 @@ class PostgresDB:
                 for key in (
                     "_stateless_claim_retirement",
                     "_stateless_workspace_retirement_settled",
-                    "_stateless_active_claim",
                     "_stateless_claim_losses",
                     "_stateless_claim_loss_hold",
                 )
             ):
                 return False
+            if "_stateless_active_claim" in metadata:
+                # The record outlives its claim's completion: at the queue's
+                # token it names the last finished claim. No claim stamps one
+                # above the token it holds.
+                try:
+                    active = active_claim_authority(metadata)
+                except RuntimeError:
+                    return False
+                if (
+                    not upgrade_history
+                    or active is None
+                    or active[0] > queue["lease_token"]
+                ):
+                    return False
         else:
             try:
                 marker = stateless_retirement_authority(
@@ -46700,6 +47196,347 @@ class PostgresDB:
                     return None
                 return initial
 
+    async def _unpublished_creation_retirement_is_current_on_conn(
+        self,
+        conn: Any,
+        thread: Any,
+        unpublished: dict[str, Any],
+        *,
+        admission: bool = False,
+        require_settled: bool = False,
+    ) -> dict[str, Any] | None:
+        """Validate a refused creation's End under owner -> queue -> ledger locks.
+
+        The cluster refused the one Pod create, so the creation never recorded
+        a runtime or Pod UID and its Pod effect was never observed. Admission
+        also needs every effect past its ambiguity window, so no late create
+        can still land. Returns the locked reservation row, else None.
+        """
+        from shared.session_retirement import (
+            active_claim_authority,
+            stateless_retirement_authority,
+            stateless_settled_retirement_authority,
+            unpublished_creation_retirement_authority,
+        )
+        from shared.workspace_upgrade import workspace_upgrade_seed_from
+
+        try:
+            unpublished = unpublished_creation_retirement_authority(unpublished)
+            metadata = _strict_json_object(thread["metadata"], label="thread metadata")
+        except RuntimeError:
+            return None
+        workspace = metadata.get("workspace_container")
+        if (
+            thread["execution_lane"] != "stateless"
+            or str(thread["runtime_generation"]) != unpublished["generation"]
+            or not isinstance(workspace, dict)
+            or workspace.get("provisioner") != "k8s"
+            or workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY) is not None
+            or workspace.get("_creation_reservation_id")
+            not in {None, unpublished["reservation_id"]}
+            or metadata.get("_workspace_binding")
+            or workspace.get("_canvas_workspace_generation") is not None
+            or workspace.get("_snapshot_restore_required", False) is not False
+        ):
+            return None
+        queue = await conn.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE", thread["id"]
+        )
+        if admission:
+            # The same queue and claim history the initial End admits,
+            # including a container upgrade's (C1) served lite turns.
+            upgrade_history = bool(
+                workspace_upgrade_seed_from(metadata) is not None
+                and queue is not None
+                and queue["state"] != "leased"
+                and queue["leased_by"] is None
+            )
+            if thread["status"] not in (
+                ("created", "active", "awaiting_user")
+                if upgrade_history
+                else ("created",)
+            ) or (
+                queue is not None
+                and (
+                    queue["unit_kind"] != "session_turn"
+                    or queue["state"] == "leased"
+                    or (queue["lease_token"] != 0 and not upgrade_history)
+                )
+            ):
+                return None
+            if any(
+                key in metadata
+                for key in (
+                    "_stateless_claim_retirement",
+                    "_stateless_workspace_retirement_settled",
+                    "_stateless_claim_losses",
+                    "_stateless_claim_loss_hold",
+                )
+            ):
+                return None
+            if "_stateless_active_claim" in metadata:
+                try:
+                    active = active_claim_authority(metadata)
+                except RuntimeError:
+                    return None
+                if (
+                    not upgrade_history
+                    or active is None
+                    or active[0] > queue["lease_token"]
+                ):
+                    return None
+        else:
+            try:
+                marker = stateless_retirement_authority(
+                    metadata
+                ) or stateless_settled_retirement_authority(metadata)
+            except RuntimeError:
+                return None
+            if (
+                thread["status"] != "ended"
+                or not isinstance(marker, dict)
+                or marker.get("unpublished_creation") != unpublished
+                or queue is None
+                or queue["unit_kind"] != "session_turn"
+                or queue["state"] != "done"
+                or queue["lease_token"] != marker.get("terminal_token")
+                or queue["leased_by"] is not None
+            ):
+                return None
+        creation = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            unpublished["reservation_id"],
+            thread["id"],
+        )
+        if creation is None or any(
+            (
+                str(creation["thread_runtime_generation"]) != unpublished["generation"],
+                creation["reservation_generation"]
+                != unpublished["reservation_generation"],
+                creation["operation_kind"] != "create",
+                creation["runtime_incarnation"] is not None,
+                creation["pod_uid"] is not None,
+            )
+        ):
+            return None
+        try:
+            effects = _strict_json_object(
+                creation["external_effects"], label="creation effects"
+            )
+        except RuntimeError:
+            return None
+        pod_effect = effects.get("pod")
+        if (
+            not isinstance(pod_effect, dict)
+            or pod_effect.get("issued_at") is None
+            or pod_effect.get("observed_uid") is not None
+        ):
+            return None
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$2::uuid) "
+            "OR EXISTS(SELECT 1 FROM thread_turn_commits WHERE thread_id=$1::uuid) "
+            "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid)",
+            thread["id"],
+            unpublished["reservation_id"],
+        ):
+            return None
+        if admission:
+            try:
+                creation_marker = _stateless_runtime_creation_marker(workspace)
+            except RuntimeError:
+                return None
+            # The lease may have lapsed; quiescence alone says no late create
+            # can still land.
+            if not (
+                creation_marker
+                == {
+                    "generation": unpublished["generation"],
+                    "mode": "create",
+                    "attempted": True,
+                    "replaces_uid": None,
+                    "legacy": False,
+                }
+                and workspace.get("status") != "ready"
+                and creation["phase"] == "mutating"
+                and creation["settled_at"] is None
+                and creation["cancel_requested_at"] is None
+                and await conn.fetchval(
+                    "SELECT NOT EXISTS (SELECT 1 FROM "
+                    "jsonb_each($1::jsonb) AS effect "
+                    "WHERE effect.value ->> 'observed_uid' IS NULL "
+                    "AND (effect.value ->> 'ambiguity_until')::timestamptz > now())",
+                    json.dumps(effects),
+                )
+            ):
+                return None
+            return dict(creation)
+        if (
+            creation["cancel_requested_at"] is None
+            or creation["cancel_target_disposition"] != "deleted"
+        ):
+            return None
+        if require_settled and not (
+            creation["result_kind"] == "aborted"
+            and creation["settled_at"] is not None
+            and creation["cancel_cleanup_completed_at"] is not None
+        ):
+            return None
+        return dict(creation)
+
+    async def get_stateless_unpublished_creation_candidate(
+        self, thread_id: str, *, namespace: str
+    ) -> dict[str, Any] | None:
+        """Name the current refused creation End may retire, else None."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return None
+                creation = await conn.fetchrow(
+                    "SELECT id, reservation_generation, thread_runtime_generation "
+                    "FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND scope='workspace_container' AND settled_at IS NULL",
+                    thread["id"],
+                )
+                if creation is None or creation["thread_runtime_generation"] is None:
+                    return None
+                unpublished = {
+                    "generation": str(creation["thread_runtime_generation"]),
+                    "reservation_id": str(creation["id"]),
+                    "reservation_generation": int(creation["reservation_generation"]),
+                    "namespace": namespace,
+                }
+                if not await self._unpublished_creation_retirement_is_current_on_conn(
+                    conn, thread, unpublished, admission=True
+                ):
+                    return None
+                return unpublished
+
+    async def get_stateless_unpublished_creation_retirement(
+        self,
+        thread_id: str,
+        *,
+        require_settled: bool = False,
+    ) -> dict[str, Any] | None:
+        """Read the exact refused-creation End ledger, after a restart too."""
+        storage = await self.get_stateless_unpublished_creation_storage(
+            thread_id, require_settled=require_settled
+        )
+        return storage["unpublished_creation"] if storage is not None else None
+
+    async def get_stateless_unpublished_creation_storage(
+        self,
+        thread_id: str,
+        *,
+        require_settled: bool = True,
+    ) -> dict[str, Any] | None:
+        """The ended refused creation and the storage its reservation recorded."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return None
+                metadata = _strict_json_object(
+                    thread["metadata"], label="thread metadata"
+                )
+                marker = metadata.get("_stateless_claim_retirement") or metadata.get(
+                    "_stateless_workspace_retirement_settled"
+                )
+                unpublished = (
+                    marker.get("unpublished_creation")
+                    if isinstance(marker, dict)
+                    else None
+                )
+                if not isinstance(unpublished, dict):
+                    return None
+                creation = (
+                    await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn,
+                        thread,
+                        unpublished,
+                        require_settled=require_settled,
+                    )
+                )
+                if creation is None:
+                    return None
+                return {
+                    "unpublished_creation": unpublished,
+                    "resource_policy": creation["cancel_resource_policy"],
+                    **{
+                        field: (
+                            str(creation[field])
+                            if creation[field] is not None
+                            else None
+                        )
+                        for field in ("pvc_uid", "service_uid", "seed_configmap_uid")
+                    },
+                }
+
+    async def record_unpublished_creation_storage_reclaimed(
+        self, thread_id: str, *, unpublished: dict[str, Any]
+    ) -> bool:
+        """Mark a soft-Ended refused creation's kept storage as reclaimed.
+
+        Soft End kept the PVC under a preserve cancellation. Permanent End
+        removed it, and its exact queue authority now records that on the same
+        aborted reservation, which the owner-delete guard reads (0561).
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return False
+                try:
+                    state = _strict_json_object(
+                        thread["metadata"], label="thread metadata"
+                    )
+                except RuntimeError:
+                    return False
+                if (
+                    await self._lock_terminal_workspace_reclaim_authority(
+                        conn,
+                        owner_kind="thread",
+                        owner_id=thread["id"],
+                        owner_status=str(thread["status"] or ""),
+                        owner_state=state,
+                    )
+                    is None
+                ):
+                    return False
+                creation = (
+                    await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn, thread, unpublished, require_settled=True
+                    )
+                )
+                if creation is None:
+                    return False
+                updated = await conn.execute(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET cancel_resource_policy = 'terminal_reclaim' "
+                    "WHERE id = $1 AND settled_at IS NOT NULL "
+                    "AND result_kind = 'aborted' AND runtime_incarnation IS NULL "
+                    "AND pod_uid IS NULL AND cancel_cleanup_completed_at IS NOT NULL",
+                    creation["id"],
+                )
+                return updated == "UPDATE 1"
+
     async def begin_stateless_thread_workspace_retirement(
         self,
         thread_id: str,
@@ -46709,6 +47546,7 @@ class PostgresDB:
         workspace_absence_proven: bool = False,
         initial_creation: dict[str, Any] | None = None,
         retained_startup_attention: dict[str, Any] | None = None,
+        unpublished_creation: dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Atomically close a stateless session queue before external teardown.
 
@@ -46726,6 +47564,10 @@ class PostgresDB:
         """
         if retained_startup_attention is not None and permanent:
             raise RuntimeError("retained startup attention supports soft End only")
+        if unpublished_creation is not None and (
+            initial_creation is not None or retained_startup_attention is not None
+        ):
+            raise RuntimeError("one stateless End names one creation authority")
         from orchestrator.services.container_provisioner import (
             WORKSPACE_RUNTIME_INCARNATION_KEY,
         )
@@ -46875,6 +47717,11 @@ class PostgresDB:
                                 ]
                             }
                             if "retained_startup_attention" in settled
+                            else {}
+                        ),
+                        **(
+                            {"unpublished_creation": settled["unpublished_creation"]}
+                            if "unpublished_creation" in settled
                             else {}
                         ),
                         "terminal_token": token,
@@ -47094,7 +47941,26 @@ class PostgresDB:
                     raise RuntimeError(
                         "stateless workspace absence proof contradicts runtime authority"
                     )
-                if physical_without_runtime and not workspace_absence_proven:
+                if (
+                    unpublished_creation is not None
+                    and not await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn,
+                        thread,
+                        unpublished_creation,
+                        admission=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "unpublished creation retirement authority changed"
+                    )
+                # A refused creation never had a Pod: the locked ledger above
+                # is the runtime preflight, and End then settles that
+                # creation through its own Pod read.
+                if (
+                    physical_without_runtime
+                    and not workspace_absence_proven
+                    and unpublished_creation is None
+                ):
                     # Kubernetes probing must happen before queue/thread
                     # mutation. The DB cannot distinguish a deterministic 404
                     # from a live or ambiguous Pod when no UID was persisted.
@@ -47266,8 +48132,12 @@ class PostgresDB:
                             "stateless session queue close lost its fence"
                         )
 
+                # A refused creation never had a Pod, so it has no shell and no
+                # residents; its End settles the creation instead.
                 shell_retirement_required = bool(
-                    terminal_token > 0 and workspace_has_physical_authority
+                    terminal_token > 0
+                    and workspace_has_physical_authority
+                    and unpublished_creation is None
                 )
                 # Every exact-live physical workspace can contain writers with
                 # buffered durable effects (IDE, browser, rclone VFS). Drain
@@ -47304,6 +48174,8 @@ class PostgresDB:
                     marker["retained_startup_attention"] = dict(
                         retained_startup_attention
                     )
+                if unpublished_creation is not None:
+                    marker["unpublished_creation"] = dict(unpublished_creation)
                 if not permanent:
                     await self._terminalize_live_session_subagents_for_retirement(
                         conn,
@@ -48100,6 +48972,25 @@ class PostgresDB:
                     return False
                 initial = marker.get("initial_creation")
                 retained = marker.get("retained_startup_attention")
+                unpublished = marker.get("unpublished_creation")
+                if unpublished is not None:
+                    # The refused creation settled with no Pod; its one-shot
+                    # create marker has nothing left to protect.
+                    if not await self._unpublished_creation_retirement_is_current_on_conn(
+                        conn, thread, unpublished, require_settled=True
+                    ):
+                        return False
+                    creation = workspace.get(_STATELESS_RUNTIME_CREATION_KEY)
+                    if creation != {
+                        "generation": unpublished["generation"],
+                        "mode": "create",
+                        "attempted": True,
+                        "replaces_uid": None,
+                    }:
+                        return False
+                    workspace = dict(workspace)
+                    workspace.pop(_STATELESS_RUNTIME_CREATION_KEY)
+                    metadata["workspace_container"] = workspace
                 if initial is not None:
                     if not await self._initial_creation_retirement_is_current_on_conn(
                         conn,
@@ -48188,6 +49079,8 @@ class PostgresDB:
                     settled["initial_creation"] = initial
                 if retained is not None:
                     settled["retained_startup_attention"] = retained
+                if unpublished is not None:
+                    settled["unpublished_creation"] = unpublished
                 await self._terminalize_live_session_subagents_for_retirement(
                     conn,
                     parent_thread_id=thread_id,
@@ -56375,8 +57268,8 @@ class PostgresDB:
     # =========================================================================
 
     _MODEL_FIELDS = (
-        "id, provider_kind, provider_ref, model_id, display_label, "
-        "capabilities, family, context_window, reasoning_level, "
+        "id, provider_kind, provider_ref, model_id, served_model_id, "
+        "display_label, capabilities, family, context_window, reasoning_level, "
         "params_json, enabled, seeded_from, notes, "
         "source, helm_value_hash, source_updated_at, created_at, updated_at"
     )
@@ -56491,6 +57384,19 @@ class PostgresDB:
             )
         return self._row_to_model(row) if row else None
 
+    async def find_model_by_model_id(self, model_id: str) -> Dict[str, Any] | None:
+        """The catalog row that holds ``model_id``, enabled or not.
+
+        A model id names one row across every provider (``uq_models_model_id``),
+        so this is the holder a create or rename must not collide with.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {self._MODEL_FIELDS} FROM models WHERE model_id = $1",
+                model_id,
+            )
+        return self._row_to_model(row) if row else None
+
     async def create_model(
         self,
         *,
@@ -56510,8 +57416,12 @@ class PostgresDB:
         on_conflict_do_nothing: bool = False,
         source: str | None = None,
         helm_value_hash: str | None = None,
+        served_model_id: str | None = None,
     ) -> Dict[str, Any] | None:
         """Insert a catalog row.
+
+        ``served_model_id`` is the name sent to the provider when it differs
+        from ``model_id``; ``None`` sends ``model_id``.
 
         ``source`` (``shared.helm_provenance``) defaults to a derivation from
         ``seeded_from``; ``helm_value_hash`` is set by the seed Job only.
@@ -56524,19 +57434,17 @@ class PostgresDB:
         is translated into the canonical ``capabilities[]`` array internally
         — the table only stores the array form.
 
-        When ``on_conflict_do_nothing`` is True and a row already exists for
-        ``(provider_kind, provider_ref, model_id)``, returns None so the seed
-        pipeline can count "newly inserted" cleanly.
+        When ``on_conflict_do_nothing`` is True and ``model_id`` is already in
+        the catalog, returns None so the seed pipeline can count "newly
+        inserted" cleanly. That covers a row under another provider too
+        (``uq_models_model_id``); :meth:`find_model_by_model_id` tells the two
+        apart.
         """
         canonical = self._canonicalize_capabilities(
             capability=capability, capabilities=capabilities
         )
         source = source or provenance_from_breadcrumb(seeded_from)
-        on_conflict = (
-            "ON CONFLICT (provider_kind, provider_ref, model_id) DO NOTHING"
-            if on_conflict_do_nothing
-            else ""
-        )
+        on_conflict = "ON CONFLICT DO NOTHING" if on_conflict_do_nothing else ""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 f"""
@@ -56544,9 +57452,9 @@ class PostgresDB:
                     (provider_kind, provider_ref, model_id, display_label,
                      capabilities, family, context_window,
                      reasoning_level, params_json, enabled, seeded_from, notes,
-                     source, helm_value_hash, source_updated_at)
+                     source, helm_value_hash, served_model_id, source_updated_at)
                 VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, CURRENT_TIMESTAMP)
+                        $13, $14, $15, CURRENT_TIMESTAMP)
                 {on_conflict}
                 RETURNING {self._MODEL_FIELDS}
                 """,
@@ -56564,6 +57472,7 @@ class PostgresDB:
                 notes,
                 source,
                 helm_value_hash,
+                served_model_id,
             )
         return self._row_to_model(row) if row else None
 
@@ -56583,6 +57492,7 @@ class PostgresDB:
             "provider_kind",
             "provider_ref",
             "model_id",
+            "served_model_id",
             "display_label",
             "capabilities",
             "family",
@@ -56653,8 +57563,9 @@ class PostgresDB:
           ``api_key`` (decrypted inline); ``base_url`` is left None so the
           dispatcher falls through to the provider's hardcoded base URL.
 
-        When multiple rows match (same ``model_id`` under both a system
-        provider and an endpoint), the system row wins — direct beats gateway.
+        A model id names one row across every provider (``uq_models_model_id``),
+        so there is nothing to choose between. ``served_model_id`` is the name
+        the row sends upstream when it differs from ``model_id``.
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -56664,6 +57575,7 @@ class PostgresDB:
                     m.provider_kind,
                     m.provider_ref,
                     m.model_id,
+                    m.served_model_id,
                     m.display_label,
                     m.capabilities,
                     m.family,
@@ -56687,8 +57599,6 @@ class PostgresDB:
                 WHERE m.model_id = $1
                   AND $2 = ANY(m.capabilities)
                   AND m.enabled = TRUE
-                ORDER BY (m.provider_kind = 'system') DESC, m.created_at ASC
-                LIMIT 1
                 """,
                 model_id,
                 capability,
@@ -63877,6 +64787,38 @@ class PostgresDB:
         except Exception:
             logger.exception(
                 "unattended_operations grant read failed; denying unattended work"
+            )
+            return False
+
+    async def user_can_run_custom_harness_images(
+        self, user: dict, project_id: str | None
+    ) -> bool:
+        """Effective custom_harness_images grant (generic Job admission).
+
+        Admins short-circuit to True. Mirrors
+        user_can_run_unattended_operations: user, project and global scopes are
+        resolved together so a global denial cannot be widened by a user grant.
+        Fail mode is CLOSED: running an arbitrary approved image is the thing
+        being gated, and a failed read is not a capability the caller has.
+        """
+        if user.get("is_admin"):
+            return True
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]),
+                project_ids=[str(project_id)] if project_id else [],
+            )
+            from shared.runtime.core.capability_grants import resolve_grants
+
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            return bool(g.get("custom_harness_images"))
+        except Exception:
+            logger.exception(
+                "custom_harness_images grant read failed; denying custom harness"
             )
             return False
 

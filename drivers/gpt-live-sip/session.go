@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,9 @@ type handoff struct {
 		Voice        string `json:"voice"`
 	} `json:"accept"`
 	Greeting string `json:"greeting_instruction"`
-	Texts    struct {
+	// What the quiet-line watch sends (empty: no nudge).
+	Idle  string `json:"idle_instruction"`
+	Texts struct {
 		Fallback string `json:"fallback"`
 	} `json:"texts"`
 	Limits struct {
@@ -100,12 +103,31 @@ type session struct {
 	replay          []bufferedEvent
 	closed          event
 	subscribers     map[chan event]bool
+	// The greeter's inputs: whether the engine's timeline runs (session.started
+	// or any transcript seen), how many assistant transcript deltas arrived,
+	// and a wake-up for a new sideband or the start.
+	started         bool
+	assistantSpeech int
+	greetWake       chan struct{}
+	// The quiet-line watch's inputs: when the line last had speech, a
+	// delegation or an append; the delegations the back office has answered;
+	// nudges since the caller last spoke, and nudges in the call (their ids).
+	lastActivity time.Time
+	answered     map[string]bool
+	nudges       int
+	nudgeSeq     int
 }
 
 func newSession(d *driver, h handoff) *session {
 	ctx, cancel := context.WithCancel(d.ctx)
 	leaseCtx, leaseCancel := context.WithCancel(d.ctx)
-	return &session{d: d, h: h, ctx: ctx, cancel: cancel, leaseCtx: leaseCtx, leaseCancel: leaseCancel, initialized: make(chan struct{}), done: make(chan struct{}), view: statusView{SessionID: h.SessionID, ProviderID: h.ProviderID, JobID: h.JobID, Status: "initializing"}, sent: map[string]bool{}, delegations: map[string]time.Time{}, pending: map[string]pendingAppend{}, subscribers: map[chan event]bool{}}
+	return &session{d: d, h: h, ctx: ctx, cancel: cancel, leaseCtx: leaseCtx, leaseCancel: leaseCancel, initialized: make(chan struct{}), done: make(chan struct{}), view: statusView{SessionID: h.SessionID, ProviderID: h.ProviderID, JobID: h.JobID, Status: "initializing"}, sent: map[string]bool{}, delegations: map[string]time.Time{}, pending: map[string]pendingAppend{}, subscribers: map[chan event]bool{}, greetWake: make(chan struct{}, 1), answered: map[string]bool{}}
+}
+func (s *session) wakeGreeter() {
+	select {
+	case s.greetWake <- struct{}{}:
+	default:
+	}
 }
 func (s *session) snapshot() statusView { s.mu.Lock(); defer s.mu.Unlock(); return s.view }
 func (s *session) active() bool {
@@ -118,6 +140,7 @@ func (s *session) setWS(w *websocket) bool {
 		return false
 	}
 	s.ws = w
+	s.wakeGreeter()
 	return true
 }
 func (s *session) clearWS(w *websocket) {
@@ -175,7 +198,7 @@ func (s *session) run() {
 	renewDone := make(chan struct{})
 	go func() { defer close(renewDone); s.renew() }()
 	var wg sync.WaitGroup
-	for _, fn := range []func(){s.readLoop, s.monitor} {
+	for _, fn := range []func(){s.readLoop, s.monitor, s.greet} {
 		wg.Add(1)
 		go func(fn func()) { defer wg.Done(); fn() }(fn)
 	}
@@ -253,19 +276,18 @@ func (s *session) readLoop() {
 					}
 				}
 			}()
-			if s.sendRecorder(w, "instructions", s.h.Greeting, "", "srw_greeting_"+s.h.SessionID) == nil {
-				for s.ctx.Err() == nil {
-					b, readErr := w.readText()
-					if readErr != nil {
-						err = readErr
-						break
-					}
-					var raw map[string]any
-					if json.Unmarshal(b, &raw) != nil || raw == nil {
-						continue
-					}
-					s.handleEvent(raw)
+			// The greeting is the greeter's: it waits for the engine's start.
+			for s.ctx.Err() == nil {
+				b, readErr := w.readText()
+				if readErr != nil {
+					err = readErr
+					break
 				}
+				var raw map[string]any
+				if json.Unmarshal(b, &raw) != nil || raw == nil {
+					continue
+				}
+				s.handleEvent(raw)
 			}
 			stop()
 			hbCancel()
@@ -292,6 +314,96 @@ func (s *session) readLoop() {
 			return
 		}
 		delay = nextBackoff(delay)
+	}
+}
+func (s *session) markStarted() {
+	if !s.started {
+		s.started = true
+		s.wakeGreeter()
+	}
+}
+
+// greet sends the greeting append once the engine's audio timeline runs:
+// after session.started (live or replayed; a transcript also counts) and the
+// settle delay after accept, or after the start wait if session.started was
+// missed. GPT-Live takes an earlier append as context only and stays silent
+// until the caller speaks. If no assistant speech follows within the retry
+// window, one re-prompt goes out on the same sideband. A greeting sent before
+// (by this process, or listed in sent_event_ids at adoption) is never sent
+// again, and a sideband change during the window cancels the re-prompt,
+// because speech in the gap may have gone unseen (duplicate greeting, I6).
+func (s *session) greet() {
+	greetID, retryID := "srw_greeting_"+s.h.SessionID, "srw_greeting_retry_"+s.h.SessionID
+	cfg := s.d.cfg
+	var greetedOn, failedOn *websocket
+	var greetedAt time.Time
+	spoken := 0
+	for {
+		s.mu.Lock()
+		if !s.active() || s.view.AcceptedAt == nil || strings.TrimSpace(s.h.Greeting) == "" {
+			s.mu.Unlock()
+			return
+		}
+		if greetedOn == nil && s.sent[greetID] {
+			// Only adoption restores a sent greeting (sent_event_ids).
+			s.mu.Unlock()
+			s.d.log("greeting_skipped", map[string]any{"session_id": s.h.SessionID, "reason": "already_sent"})
+			return
+		}
+		now, w, started, mark := s.d.clock.Now(), s.ws, s.started, s.assistantSpeech
+		accepted := *s.view.AcceptedAt
+		id, due := greetID, accepted.Add(cfg.greetingDelay)
+		if greetedOn == nil && !started {
+			if limit := accepted.Add(cfg.greetingStartWait); limit.After(due) {
+				due = limit
+			}
+		}
+		if greetedOn != nil {
+			id, due = retryID, greetedAt.Add(cfg.greetingRetry)
+			skip := ""
+			if mark != spoken {
+				skip = "assistant_spoke"
+			} else if w != greetedOn {
+				skip = "sideband_changed"
+			}
+			if skip != "" {
+				s.mu.Unlock()
+				s.d.log("greeting_retry_skipped", map[string]any{"session_id": s.h.SessionID, "reason": skip})
+				return
+			}
+		}
+		s.mu.Unlock()
+		if now.Before(due) || w == nil || w == failedOn {
+			var timer <-chan time.Time
+			if now.Before(due) {
+				timer = s.d.clock.After(due.Sub(now))
+			}
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.greetWake:
+			case <-timer:
+			}
+			continue
+		}
+		if err := s.sendRecorder(w, "instructions", s.h.Greeting, "", id); err != nil {
+			if err != errUnavailable {
+				failedOn = w
+				w.close()
+			}
+			continue
+		}
+		fields := map[string]any{"session_id": s.h.SessionID, "after_accept_ms": now.Sub(accepted).Milliseconds()}
+		if id == retryID {
+			s.d.log("greeting_retry_sent", fields)
+			return
+		}
+		fields["started"] = started
+		s.d.log("greeting_sent", fields)
+		if cfg.greetingRetry <= 0 {
+			return
+		}
+		greetedOn, greetedAt, spoken = w, now, mark
 	}
 }
 func (s *session) sendRecorder(w *websocket, kind, content, delegation, id string) error {
@@ -321,6 +433,10 @@ func (s *session) sendRecorder(w *websocket, kind, content, delegation, id strin
 		return errUnavailable
 	}
 	s.sent[id] = true
+	s.lastActivity = s.d.clock.Now()
+	if delegation != "" && kind != "instructions" {
+		s.answered[delegation] = true
+	}
 	rowKind := "instruction"
 	if kind == "commentary" {
 		rowKind = "fallback"
@@ -355,6 +471,24 @@ func (s *session) handleEvent(raw map[string]any) {
 		if _, ok := s.delegations[id]; !ok {
 			s.delegations[id] = s.d.clock.Now()
 			s.delegationOrder = append(s.delegationOrder, id)
+		}
+		s.lastActivity = s.d.clock.Now()
+	case "transcript":
+		// Speech of either side means the audio timeline runs. GPT-Live
+		// streams both sides' transcripts with the audio, so the last delta
+		// is when the line last had speech.
+		s.markStarted()
+		s.lastActivity = s.d.clock.Now()
+		if strings.TrimSpace(str(e["text"])) != "" {
+			if e["speaker"] == "assistant" {
+				s.assistantSpeech++
+			} else {
+				s.nudges = 0
+			}
+		}
+	case "other":
+		if e["wire_type"] == "session.started" {
+			s.markStarted()
 		}
 	case "usage":
 		n, _ := e["seconds"].(float64)
@@ -463,6 +597,10 @@ func (s *session) monitor() {
 		maxID := "srw_max_duration_" + s.h.SessionID
 		hangup := !now.Before(deadline) && !s.sent[maxID]
 		w := s.ws
+		nudgeID := ""
+		if w != nil && s.nudgeDue(now) {
+			nudgeID = "srw_idle_" + s.h.SessionID + "_" + strconv.Itoa(s.nudgeSeq+1)
+		}
 		pending := []string{}
 		if s.view.AttachedAt == nil && w != nil {
 			for _, id := range s.delegationOrder {
@@ -495,7 +633,43 @@ func (s *session) monitor() {
 				break
 			}
 		}
+		if nudgeID != "" {
+			s.nudge(w, nudgeID)
+		}
 	}
+}
+
+// nudgeDue reports, under s.mu, whether the line has been quiet long enough
+// for the idle instruction: the voice has spoken (the greeting is out), no
+// delegation waits for its answer, nothing happened on the line for
+// idle_nudge_ms, and fewer than idle_nudge_max nudges went out since the
+// caller last spoke. The voice may have said it is checking without
+// delegating, or the caller went quiet (receptionist_expert T9).
+func (s *session) nudgeDue(now time.Time) bool {
+	cfg := s.d.cfg
+	if cfg.idleNudge <= 0 || s.nudges >= cfg.idleNudgeMax || strings.TrimSpace(s.h.Idle) == "" || s.assistantSpeech == 0 || s.lastActivity.IsZero() {
+		return false
+	}
+	for _, id := range s.delegationOrder {
+		if !s.answered[id] {
+			return false
+		}
+	}
+	return now.Sub(s.lastActivity) >= cfg.idleNudge
+}
+func (s *session) nudge(w *websocket, id string) {
+	if err := s.sendRecorder(w, "instructions", s.h.Idle, "", id); err != nil {
+		if err != errUnavailable {
+			w.close()
+		}
+		return
+	}
+	s.mu.Lock()
+	s.nudges++
+	s.nudgeSeq++
+	n := s.nudges
+	s.mu.Unlock()
+	s.d.log("idle_nudge_sent", map[string]any{"session_id": s.h.SessionID, "nudge": n})
 }
 func (s *session) renew() {
 	for {
@@ -572,6 +746,12 @@ func (s *session) append(ctx context.Context, kind, content string, delegation *
 	select {
 	case e := <-p.result:
 		if e["type"] == "append_ack" {
+			s.mu.Lock()
+			s.lastActivity = s.d.clock.Now()
+			if delegation != nil && kind != "instructions" {
+				s.answered[*delegation] = true
+			}
+			s.mu.Unlock()
 			return 200, map[string]any{"ok": true}
 		}
 		if e["code"] == "not_active" {

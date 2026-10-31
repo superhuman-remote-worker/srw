@@ -140,15 +140,20 @@ async def next_job(db, workspace, previous, payload):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("allocation_lost", [False, True])
+@pytest.mark.parametrize("profile_enabled", [False, True])
 async def test_prepared_inheritance_keeps_exact_completed_target_and_original_receipt(
-    db, workspace, allocation_lost
+    db, workspace, allocation_lost, monkeypatch, profile_enabled
 ):
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_ENABLED", "true" if profile_enabled else "false"
+    )
     ctrl, api, _, _, service = workspace
     store, original, request, fresh, source = await inheritance(
         db, workspace, allocation_lost=allocation_lost
     )
     disk = deepcopy(api.read("DataVolume", storage_name(request["workspace_storage"])))
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
+    assert "network_profile" not in row["canonical_request"]
     result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created", result
     current = await store.inspect(request_id=str(row["request_id"]))

@@ -88,6 +88,35 @@ def _managed_spec(ds: dict[str, Any]) -> bool:
     return spec is not None and managed_mcp_driver(spec)
 
 
+def mcp_tool_effect(annotations: Any, managed_block: Any = None, name: str = "") -> str:
+    """The permission effect of one MCP tool (tool_permission_tiers.md, D11).
+
+    A managed server's driver spec classes its tools, and only that decides:
+    the tools it names as reads are ``read``, the rest act on the upstream
+    service. Any other server's annotation hints are mapped as Codex maps
+    them; a missing hint takes the MCP default (destructive, open world).
+    """
+    from shared.permission_modes import EXTERNAL, READ, WRITE
+
+    if managed_block is not None:
+        return READ if managed_block.tool_class(name) == READ else EXTERNAL
+    hints = annotations if isinstance(annotations, dict) else {}
+    if hints.get("readOnlyHint") is True:
+        return READ
+    if hints.get("destructiveHint") is False and hints.get("openWorldHint") is False:
+        return WRITE
+    return EXTERNAL
+
+
+def _managed_block(ds: dict[str, Any]) -> Any:
+    """The parsed ``mcp`` block of a managed server's driver spec, else None."""
+    from shared.connectors.builtin import spec_for_type
+    from shared.connectors.mcp import managed_mcp
+
+    spec = spec_for_type(ds.get("type"))
+    return managed_mcp(spec) if spec is not None else None
+
+
 def _parse_managed(ds: dict[str, Any], name: str) -> MCPServerConfig:
     """A managed server: its endpoint and the lease token as the bearer."""
     from shared.connectors.leases import LEASE_TOKEN_PREFIX, token_shape_valid
@@ -438,6 +467,7 @@ class MCPManager:
         taken = {
             tool.name for other_handle in self._handles for tool in other_handle.tools
         }
+        managed_block = _managed_block(handle.ds) if handle.managed else None
         wrapped = []
         for tool in raw_tools:
             namespaced_name = namespace_mcp_tool(handle.slug, tool.name, taken)
@@ -452,6 +482,9 @@ class MCPManager:
                         "mcp_server": handle.name,
                         "mcp_server_slug": handle.slug,
                         "mcp_tool_name": tool.name,
+                        "effect": mcp_tool_effect(
+                            getattr(tool, "metadata", None), managed_block, tool.name
+                        ),
                     },
                 )
             )

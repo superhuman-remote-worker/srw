@@ -902,7 +902,7 @@ class TestReviewSessionOpeningEvent:
         assert "Source repository: org/app" in event
         assert "Delivered branch: srw/job" in event
         assert "Pull request: #7 (https://forge/org/app/pulls/7)" in event
-        assert "Permission mode: supervised for review" in event
+        assert "Permission mode: read-only for review" in event
 
     def test_a_profile_change_is_explained(self):
         event = job_review_session._review_session_opening_event(
@@ -1049,7 +1049,7 @@ class TestCreateJobReviewSession:
         assert exc.value.detail == "Could not resolve this job's connectors"
 
     @pytest.mark.asyncio
-    async def test_the_created_thread_is_supervised_sandbox_and_server_seeded(self):
+    async def test_the_created_thread_is_read_only_sandbox_and_server_seeded(self):
         created = AsyncMock(return_value={"thread_id": "t-1", "status": "created"})
         deps = _review_deps(create_thread=created)
         request = _request()
@@ -1077,7 +1077,7 @@ class TestCreateJobReviewSession:
 
         body, passed_request = created.await_args.args
         assert passed_request is request
-        assert body.kwargs["permission_mode"] == "supervised"
+        assert body.kwargs["permission_mode"] == "read_only"
         assert body.kwargs["config_override"] == {"workspace": {"backend": "sandbox"}}
         assert body.kwargs["config_name"] == "session_base"
         assert body.kwargs["project_ids"] == [PROJECT_ID]

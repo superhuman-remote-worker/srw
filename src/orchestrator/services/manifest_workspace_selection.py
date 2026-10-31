@@ -183,8 +183,12 @@ async def select_execution_workspace(
     config_override: dict | None = None,
     account_defaults: dict | None = None,
     request: Any = None,
+    upgrade: Any = None,
 ) -> tuple[dict, dict | None]:
     """Explicit selection > the workspace defaults chain (Slice A2b).
+
+    ``upgrade`` (a ``shared.workspace_defaults.Upgrade``) asks the defaults
+    chain for a higher tier than it would pick, with that tier's template.
 
     The returned receipt carries frozen workspace and Project revisions into
     the insertion transaction. A recommendation never enters this function.
@@ -216,7 +220,7 @@ async def select_execution_workspace(
         from shared.workspace_defaults import backend_mode
 
         resolution = await resolve_workspace_defaults(
-            db, role=role, project_id=project_id
+            db, role=role, project_id=project_id, upgrade=upgrade
         )
         workspace = resolution.binding()
         sources = resolution.sources()

@@ -50,11 +50,14 @@ def tables_api(monkeypatch, user_admin):
         record_security_event=AsyncMock(),
     )
     identity = AsyncMock(return_value=user_admin)
-    monkeypatch.setattr(
-        main.app.state, "tables_dependencies", TablesDependencies(db=db)
-    )
+    # Not monkeypatch: Starlette's State keeps attributes outside its
+    # ``__dict__``, so pytest >= 9.2 records them as unset and its undo deletes
+    # the application's real dependency.
+    original = main.app.state.tables_dependencies
+    main.app.state.tables_dependencies = TablesDependencies(db=db)
     monkeypatch.setattr(auth, "get_current_user", identity)
-    return SimpleNamespace(app=main.app, db=db, identity=identity)
+    yield SimpleNamespace(app=main.app, db=db, identity=identity)
+    main.app.state.tables_dependencies = original
 
 
 async def _get(api, path, **kwargs):
@@ -272,6 +275,41 @@ async def test_database_errors_keep_endpoint_specific_http_handling(
     assert response.json() == {"detail": detail}
     getattr(tables_api.db, method).assert_awaited_once()
     tables_api.db.record_security_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", _DENIED_PATHS)
+async def test_an_admins_project_scoped_mcp_token_is_refused(
+    tables_api, user_admin, project_a, path
+):
+    # N35: the admin gate passes for an admin's project-scoped token, but the
+    # raw tables span every project and cannot apply the scope.
+    tables_api.identity.return_value = {
+        **user_admin,
+        "scopes": [f"project:{project_a['id']}"],
+    }
+
+    response = await _get(tables_api, path)
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Access denied by MCP token scope"}
+    _assert_no_reads(tables_api.db)
+    tables_api.db.record_security_event.assert_awaited_once()
+    event = tables_api.db.record_security_event.await_args.kwargs
+    assert event["resource_type"] == "admin_tables"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["all", "user"])
+async def test_an_admins_unscoped_mcp_token_still_reads_tables(
+    tables_api, user_admin, scope
+):
+    tables_api.identity.return_value = {**user_admin, "scopes": [scope]}
+
+    response = await _get(tables_api, "/api/tables")
+
+    assert response.status_code == 200
+    tables_api.db.get_tables.assert_awaited_once_with()
 
 
 def test_table_openapi_preserves_operations_parameters_and_response_shapes(tables_api):

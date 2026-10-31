@@ -442,6 +442,44 @@ async def ensure_project_cloud_resources(
     return project
 
 
+async def _unfinished_knowledge_repository_id(
+    repo_name: str,
+    project_id: str,
+    *,
+    dependencies: ProjectProvisioningDependencies,
+) -> str | None:
+    """The repository id an earlier, unfinished vault creation reserved.
+
+    A creation that failed (Gitea unavailable) or was interrupted leaves its
+    durable intent ``pending`` (``created`` when only the repository row was
+    lost). That is retryable by design, but the intent is keyed on the
+    authority id the attempt generated: a retry under a fresh id is refused as
+    another scope's, so one Gitea hiccup would keep the project vault-less for
+    good. Reusing the id resumes the same intent and marker; a repository the
+    earlier attempt did create is re-adopted by that marker. Best-effort: a
+    failed read only gives up the resume.
+    """
+    try:
+        intent = await dependencies.store.get_managed_repository_creation_intent(
+            repo_name, repository_owner=str(dependencies.forge.repository_owner)
+        )
+    except Exception as exc:
+        dependencies.logger.debug(
+            "No resumable creation intent read for '%s': %s", repo_name, exc
+        )
+        return None
+    if not isinstance(intent, dict):
+        return None
+    if (
+        intent.get("authority_kind") != "project_repository"
+        or str(intent.get("project_id")) != project_id
+        or intent.get("access_mode") != "none"
+        or not intent.get("authority_id")
+    ):
+        return None
+    return str(intent["authority_id"])
+
+
 async def provision_project_knowledge_repo(
     project: dict[str, Any],
     owner_id: str | None,
@@ -469,6 +507,9 @@ async def provision_project_knowledge_repo(
     a second copy of "where the vault lives" is exactly the divergence §10
     warns about. ``project_repositories`` remains the one authoritative answer.
 
+    A retry after an unfinished creation resumes that creation's intent rather
+    than colliding with it (:func:`_unfinished_knowledge_repository_id`).
+
     Returns the created datasource row, or None when Gitea refused the repo.
     """
     from orchestrator.services.kb_datasources import NATIVE_PROJECT_CONFIG_KEY
@@ -479,7 +520,9 @@ async def provision_project_knowledge_repo(
     project_id = str(project["id"])
     id8 = project_id[:8]
     repo_name = f"project-{id8}-knowledge"
-    repository_id = str(uuid4())
+    repository_id = await _unfinished_knowledge_repository_id(
+        repo_name, project_id, dependencies=dependencies
+    ) or str(uuid4())
 
     try:
         repo_url, _creation_intent = await create_managed_repository(

@@ -545,7 +545,7 @@ async def test_snapshot_lists_parked_units_newest_first_with_owner():
                 "thread_id": unit,
                 "title": "Comparing Take-Home Pay",
                 "user_id": _uuid.uuid4(),
-                "owner": "knaeckebrothero",
+                "owner": "acme",
             }
         ]
     )
@@ -558,7 +558,7 @@ async def test_snapshot_lists_parked_units_newest_first_with_owner():
             "unit_kind": "session_turn",
             "thread_id": str(unit),
             "title": "Comparing Take-Home Pay",
-            "owner": "knaeckebrothero",
+            "owner": "acme",
             "park_reason": "attach_failed",
             "parked_at": NOW.isoformat(),
             "attempts": 5,

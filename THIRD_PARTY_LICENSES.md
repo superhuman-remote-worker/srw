@@ -21,6 +21,8 @@ Software. This file discharges that obligation for every bundled dependency.
 - **Frontend:** npm **production** dependencies bundled into the cockpit browser/SSR
   build (`cockpit/package.json` → `dependencies`; `devDependencies` are build-time
   only and are not shipped).
+- **Voice path images** (`srw-asterisk`, `srw-voice-gateway`): their own
+  hand-maintained section, [Voice path images](#voice-path-images-local-phone-lines).
 
 **NOT covered, by design** — server software we deploy but do **not** redistribute:
 
@@ -76,6 +78,131 @@ before the on-prem launch:
 | `certifi` | MPL-2.0 | CA bundle. File-level copyleft over a data file we never modify. |
 | `tqdm` | MPL-2.0 AND MIT | Progress bars, transitive via `sentence-transformers`/`huggingface-hub`. Unmodified. |
 | `orjson` | MPL-2.0 AND (Apache-2.0 OR MIT) | JSON codec, transitive via the LangChain stack. Unmodified. |
+
+---
+
+## Voice path images (local phone lines)
+
+SRW's local voice path ships two images of its own, separate from the
+orchestrator inventory below: `srw-asterisk` and `srw-voice-gateway`
+(`docker/Dockerfile.asterisk`, `docker/Dockerfile.voice-gateway`; Helm
+`asterisk` and `voiceGateway`, both off by default). Hand-maintained: update it
+with either Dockerfile or `requirements/locks/voice-gateway-py312.txt`.
+
+### `srw-asterisk`
+
+Asterisk runs as its own process in its own image; SRW talks to it only over
+its network interfaces (SIP, ARI, WebSocket), so the GPL does not reach SRW's
+code. The image carries the licences and the exact source tarballs it was
+built from under `/usr/share/doc/srw-asterisk/` (`COPYING.asterisk`,
+`LICENSE.asterisk`, `COPYING.pjproject`, `source/`); the build configuration
+is `docker/Dockerfile.asterisk`.
+
+| Component | Version | License | Notes |
+|---|---|---|---|
+| [Asterisk](https://www.asterisk.org) | 22.11.0 | GPL-2.0-only | Official release tarball, sha256 and the Asterisk Development Team's signature checked; only the voice path's modules. |
+| [pjproject](https://www.pjsip.org) | 2.17 (bundled) | GPL-2.0-or-later | From Asterisk's third-party mirror, sha256 checked. |
+| Debian 13 (trixie-slim) runtime libraries | see image | various | libedit (BSD-3-Clause), jansson (MIT), SQLite (public domain), libuuid (BSD-3-Clause), libxml2 (MIT), OpenSSL 3 (Apache-2.0), zlib (Zlib), ca-certificates (MPL-2.0); each package's terms in `/usr/share/doc/<package>/copyright`. |
+
+### `srw-voice-gateway`
+
+SRW's voice gateway (this repository's `src/voice_gateway`, under SRW's own
+licence) on the official `python:3.12-slim` image (Python: PSF-2.0; Debian 13
+packages with their terms in `/usr/share/doc`). Model files in the image:
+
+| Model | Version | License | Source |
+|---|---|---|---|
+| Silero VAD | v6.2.3 | MIT | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) at its v6.2.3 commit, sha256 checked (`/opt/srw-voice/models/`) |
+| Silero VAD | v6.0 | MIT | Bundled in the Pipecat wheel |
+| Smart Turn | v3.2 | BSD-2-Clause | [pipecat-ai/smart-turn](https://github.com/pipecat-ai/smart-turn), bundled in the Pipecat wheel |
+
+Weak copyleft in this image, used unmodified as libraries: `soxr` (LGPL-2.1-or-later,
+the libsoxr resampler), `soundfile` bundling libsndfile (LGPL-2.1-or-later),
+`num2words` (LGPL-2.1). `docopt` (MIT), which `num2words` declares for its
+command-line script only, is not installed (`scripts/lock_dependencies.py`).
+
+The Python packages, as pinned by the lock:
+
+| Package | Version | License |
+|---|---|---|
+| aiofiles | 25.1.0 | Apache Software License |
+| aiohappyeyeballs | 2.7.1 | Python Software Foundation License |
+| aiohttp | 3.14.5 | Apache-2.0 AND MIT |
+| aiosignal | 1.4.0 | Apache Software License |
+| annotated-types | 0.8.0 | MIT |
+| anyio | 4.15.1 | MIT |
+| attrs | 26.1.0 | MIT |
+| cffi | 2.1.1 | MIT-0 |
+| docstring-parser | 0.18.0 | MIT License |
+| flatbuffers | 25.12.19 | Apache Software License |
+| frozenlist | 1.8.0 | Apache-2.0 |
+| h11 | 0.16.0 | MIT License |
+| httpcore2 | 2.16.0 | BSD-3-Clause |
+| httpx2 | 2.16.0 | BSD-3-Clause |
+| idna | 3.20 | BSD-3-Clause |
+| jiter | 0.17.0 | MIT |
+| llvmlite | 0.50.0 | BSD-2-Clause AND Apache-2.0 WITH LLVM-exception |
+| loguru | 0.7.3 | MIT License |
+| loudness | 0.2.0 | MIT |
+| markdown | 3.11.2 | BSD-3-Clause |
+| mpmath | 1.3.0 | BSD License |
+| multidict | 7.1.0 | Apache-2.0 |
+| num2words | 0.5.14 | GNU Library or Lesser General Public License (LGPL) |
+| numba | 0.68.0 | BSD License |
+| numpy | 2.5.4 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 |
+| onnxruntime | 1.24.4 | MIT License |
+| openai | 3.36.0 | Apache-2.0 |
+| packaging | 26.3 | Apache-2.0 OR BSD-2-Clause |
+| pillow | 12.3.0 | MIT-CMU |
+| pipecat-ai | 1.12.0 | BSD-2-Clause |
+| propcache | 0.5.4 | Apache-2.0 |
+| protobuf | 6.33.6 | 3-Clause BSD License |
+| pycparser | 3.11 | BSD-3-Clause |
+| pydantic | 2.14.1 | MIT |
+| pydantic-core | 2.50.1 | MIT |
+| python-dotenv | 1.2.4 | BSD-3-Clause |
+| pyyaml | 6.0.3 | MIT License |
+| resampy | 0.4.3 | ISC License (ISCL) |
+| sentencex | 1.0.31 | MIT |
+| sniffio | 1.3.1 | Apache Software License; MIT License |
+| soundfile | 0.13.1 | BSD License |
+| soxr | 1.0.0 | LGPL-2.1-or-later |
+| sympy | 1.14.0 | BSD License |
+| truststore | 0.10.5 | MIT |
+| typing-extensions | 4.16.0 | PSF-2.0 |
+| typing-inspection | 0.4.4 | MIT |
+| websockets | 17.3 | BSD-3-Clause |
+| yarl | 1.25.1 | Apache-2.0 |
+
+The image keeps each package's licence files in its `*.dist-info` directory.
+Four of them ship NOTICE files, carried in the image: `aiofiles`, `propcache`
+and `yarl` (`*.dist-info/licenses/NOTICE`) and `onnxruntime`
+(`onnxruntime/ThirdPartyNotices.txt`).
+
+### Local model servers (`docker/voice-models/`)
+
+The STT, voice LLM and TTS servers a cascade profile points at are not SRW
+images and not part of the chart: `docker/voice-models/compose.yaml` builds or
+pulls them for development and on-premises setups, and `models.py` fetches
+their pinned, sha256-checked weights. Every component (code and weights)
+allows commercial use; the full table with versions is in
+[`docker/voice-models/README.md`](docker/voice-models/README.md#licences-code-and-weights-all-allow-commercial-use).
+
+| Component | License |
+|---|---|
+| llama.cpp, whisper.cpp, Piper, Speaches, faster-qwen3-tts | MIT |
+| Gemma 4 12B, Qwen3-TTS 0.6B/1.7B Base, Qwen3-ASR 0.6B (bench judge only), Qwen3-TTS 1.7B VoiceDesign (test-set caller voices only) | Apache-2.0 |
+| whisper-large-v3-turbo, faster-whisper small, Piper `de_DE-mls-medium` | MIT |
+| PyTorch (ROCm wheel, bundling the ROCm libraries), Transformers, Accelerate, qwen-tts-hf | BSD-3-Clause / Apache-2.0 |
+| soxr (LGPL-2.1-or-later), certifi and tqdm (MPL-2.0) in the ROCm TTS runtime | weak copyleft, used unmodified |
+
+The bundled voice sample `docker/voice-models/voices/de-1.wav` was generated
+by Qwen3-TTS (Apache-2.0) without a reference recording; it is no real
+person's voice.
+The voice test set (`tests/voice_bench/evalset/`) commits no audio: its
+caller voices are designed from text descriptions by Qwen3-TTS VoiceDesign,
+its background noise is generated, and both are rendered into a gitignored
+cache; its licences are listed in that folder's README.
 
 ---
 
@@ -251,8 +378,8 @@ that tolerates `1` must still fail on `2`.
 | [langchain-text-splitters](https://docs.langchain.com/) | 1.1.2 | MIT License | ALLOW |
 | langdetect | 1.0.9 | Apache Software License | ALLOW |
 | [langgraph](https://docs.langchain.com/oss/python/langgraph/overview) | 1.2.10 | MIT | ALLOW |
-| [langgraph-checkpoint](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint) | 4.1.1 | MIT | ALLOW |
-| [langgraph-checkpoint-postgres](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres) | 3.1.1 | MIT | ALLOW |
+| [langgraph-checkpoint](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint) | 4.3.0 | MIT | ALLOW |
+| [langgraph-checkpoint-postgres](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres) | 3.1.3 | MIT | ALLOW |
 | [langgraph-checkpoint-sqlite](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-sqlite) | 3.1.1 | MIT | ALLOW |
 | [langgraph-prebuilt](https://github.com/langchain-ai/langgraph/tree/main/libs/prebuilt) | 1.1.0 | MIT | ALLOW |
 | [langgraph-sdk](https://github.com/langchain-ai/langgraph/tree/main/libs/sdk-py) | 0.4.4 | MIT | ALLOW |

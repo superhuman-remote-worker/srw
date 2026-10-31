@@ -22,9 +22,10 @@ import en from '../../../assets/i18n/en.json';
 
 @Pipe({name: 'transloco', standalone: true})
 class WorkspaceCreationTranslocoPipe implements PipeTransform {
-  transform(key: string): string {
+  transform(key: string, params: Record<string, unknown> = {}): string {
     if (key.startsWith('workspaceCreation.')) {
-      return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+      const copy = (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+      return copy.replace(/{{\s*(\w+)\s*}}/g, (_match, name: string) => String(params[name] ?? ''));
     }
     return key;
   }
@@ -111,7 +112,7 @@ describe('typed workspace creation on job rows', () => {
     const {fixture, component} = mountLogic({rendered: true, api: {
       getJobsPage: vi.fn().mockReturnValue(of(page([job('startup', {
         status: 'created', workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
-          reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+          reason_code: 'scheduler_unschedulable', readiness_deadline_at: null, exit_code: null},
       })]))),
     }});
     fixture.detectChanges();
@@ -131,7 +132,7 @@ describe('typed workspace creation on job rows', () => {
       getJobsPage: vi.fn().mockReturnValue(of(page([job('failed-startup', {
         status: 'failed', error_message: '0/3 nodes had a private taint',
         workspace_creation: {stage: 'readiness', state: 'attention',
-          reason_code: 'invalid_configuration', readiness_deadline_at: null},
+          reason_code: 'invalid_configuration', readiness_deadline_at: null, exit_code: null},
       })]))),
     }});
     fixture.detectChanges();
@@ -140,6 +141,34 @@ describe('typed workspace creation on job rows', () => {
     const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
     expect(text).toContain('Workspace needs attention');
     expect(text).not.toContain('0/3 nodes');
+  });
+  it('names the exit code when a Job container exited before it was ready', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('exited', {
+        status: 'created', workspace_creation: {stage: 'readiness', state: 'attention',
+          reason_code: 'container_exited', readiness_deadline_at: null, exit_code: 3},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('its container exited with code 3 before it was ready');
+    expect(text).not.toContain('{{exitCode}}');
+  });
+
+  it('shows the reworded readiness deadline copy on a Job', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('deadline', {
+        status: 'created', workspace_creation: {stage: 'readiness', state: 'attention',
+          reason_code: 'readiness_deadline', readiness_deadline_at: null, exit_code: null},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.');
   });
 });
 
@@ -210,13 +239,48 @@ describe('phone sessions in lazy job detail', () => {
     component.toggleExpand('job-1');
     await vi.advanceTimersByTimeAsync(30_000);
     expect(getSessions).toHaveBeenCalledTimes(2);
-    expect(component.jobDetails()['job-1'].loading).toBe(true);
+    expect(component.jobDetails()['job-1'].loading).toBe(false);
+    expect(component.jobDetails()['job-1'].refreshing).toBe(true);
     expect(component.jobDetails()['job-1'].sessions).toEqual([liveSessionFixture()]);
     const ended = liveSessionFixture({status: 'ended'});
     pending.next({sessions: [ended]});
     pending.complete();
     expect(component.jobDetails()['job-1'].sessions).toEqual([ended]);
-    expect(component.jobDetails()['job-1'].loading).toBe(false);
+    expect(component.jobDetails()['job-1'].refreshing).toBe(false);
+  });
+
+  it('keeps the figures on screen while the 30s poll refreshes an open panel', async () => {
+    // Resetting to the first-load state swapped the figures for a spinner on
+    // every poll, which made the open panel blink and shift the rows below.
+    const detail = {id: 'job-1'} as never;
+    const usage = {job_count: 1, state: 'measured'} as never;
+    const pendingUsage = new Subject<never>();
+    const getJobUsage = vi.fn().mockReturnValueOnce(of(usage)).mockReturnValue(pendingUsage);
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('job-1', {status: 'processing'})]))),
+        getJob: vi.fn().mockReturnValue(of(detail)),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    component.toggleExpand('job-1');
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getJobUsage).toHaveBeenCalledTimes(2);
+    let state = component.jobDetails()['job-1'];
+    expect(state.loading).toBe(false);
+    expect(state.detail).toBe(detail);
+    expect(state.usage).toBe(usage);
+
+    // A source that fails on refresh keeps its last answer rather than
+    // dropping the figure to "unknown" until the next poll.
+    pendingUsage.next(null as never);
+    pendingUsage.complete();
+    state = component.jobDetails()['job-1'];
+    expect(state.usage).toBe(usage);
+    expect(state.refreshing).toBe(false);
+    expect(state.error).toBe(false);
   });
 
   it('refreshes sessions on completed jobs for post-call follow-ups and retains them on failed reads', async () => {
@@ -668,6 +732,38 @@ describe('JobListComponent — server-resolved tree', () => {
     // own + subtree again, not own alone.
     expect(getJobUsage).toHaveBeenCalledTimes(4);
     expect(getJobUsage).toHaveBeenLastCalledWith('root-1', true);
+  });
+
+  it('keeps the subtree figure on screen while a refresh re-asks for it', () => {
+    const subtree = {job_count: 3, state: 'measured'} as never;
+    const pendingSubtree = new Subject<never>();
+    const getJobUsage = vi
+      .fn()
+      .mockImplementation((_id: string, includeSubtree?: boolean) =>
+        includeSubtree ? pendingSubtree : of(null),
+      )
+      .mockReturnValueOnce(of(null))
+      .mockReturnValueOnce(of(subtree));
+    const {fixture, component} = mountLogic({
+      api: {
+        getJobsPage: vi.fn().mockReturnValue(of(page([job('root-1')]))),
+        getJobUsage,
+      } as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.toggleExpand('root-1');
+    component.loadSubtreeUsage('root-1');
+    component.refresh();
+    let state = component.jobDetails()['root-1'];
+    expect(state.loadingSubtree).toBe(false);
+    expect(state.usageSubtree).toBe(subtree);
+
+    pendingSubtree.next(null as never);
+    pendingSubtree.complete();
+    state = component.jobDetails()['root-1'];
+    expect(state.usageSubtree).toBe(subtree);
+    expect(state.subtreeAttempted).toBe(true);
   });
 
   it('refreshes nothing when no panel is open', () => {

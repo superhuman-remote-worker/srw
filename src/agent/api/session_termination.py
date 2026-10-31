@@ -18,6 +18,8 @@ from agent.api.session_identity import canonical_runtime_generation
 _DEREGISTER_ON_EXIT_TIMEOUT_S = 5.0
 
 _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
+#: E4: how long a pinned End waits for a failed VM upgrade's abort to finish.
+_VM_UPGRADE_ABORT_END_WAIT_S = 60.0
 
 _DEDICATED_SELF_END_REASONS = frozenset(
     {"archive", "idle_timeout", "loop_complete", "loop_crash"}
@@ -75,6 +77,8 @@ class SessionTerminationPorts:
     tool_inflight: Callable[..., Any]
     turn_event_open: Callable[..., Any]
     update_thread_status: Callable[..., Any]
+    #: The running abort of a failed VM upgrade (an ``asyncio.Task``), if any.
+    vm_upgrade_abort: Callable[..., Any]
 
 
 class SessionTerminationCoordinator:
@@ -1573,6 +1577,29 @@ class SessionTerminationCoordinator:
                     return True
             attempt += 1
 
+    async def await_vm_upgrade_abort(self, thread_id: Optional[str]) -> None:
+        """Let a failed VM upgrade's abort finish before End begins (E4).
+
+        A finished abort of an upgrade from the virtual tier makes the row
+        virtual again, so a Begin of this agent captures the tier it serves,
+        and the abort's cleanup permit isn't left open. Bounded: past the wait
+        End goes on, and its side-task quiesce cancels the abort.
+        """
+        task = self._ports.vm_upgrade_abort()
+        if not isinstance(task, asyncio.Task) or task.done():
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_VM_UPGRADE_ABORT_END_WAIT_S
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "VM upgrade abort still pending; End goes on (thread=%s)", thread_id
+            )
+        except Exception:
+            # The abort logs its own failure where it runs.
+            pass
+
     async def _terminate_inner(
         self,
         reason: str,
@@ -1611,6 +1638,7 @@ class SessionTerminationCoordinator:
             )
         )
         if mark_thread and not self._ports.stateless_mode():
+            await self.await_vm_upgrade_abort(thread_id)
             # Linearize retirement before *any* local teardown effect. Besides
             # explicit/idle archive, this common path owns loop crash/complete,
             # shutdown, watchdog and REST detach. Cancelling the loop, stopping
@@ -1823,8 +1851,11 @@ class SessionTerminationCoordinator:
                 git_mgr = getattr(
                     self._ports.session().workspace_manager, "git_manager", None
                 )
-                if git_mgr and git_mgr.is_active:
-                    try:
+                try:
+                    # Asking whether the repository exists reaches the
+                    # workspace too: a workspace that is gone has nothing to
+                    # commit, and must not fail the detach of a settled turn.
+                    if git_mgr and git_mgr.is_active:
                         if git_mgr.has_uncommitted_changes():
                             git_mgr.commit(f"Session detach: thread {thread_id}")
                         if git_mgr.push() is False:
@@ -1832,8 +1863,8 @@ class SessionTerminationCoordinator:
                                 "Final git push was unsuccessful (non-fatal): %s",
                                 getattr(git_mgr, "last_push_error", None),
                             )
-                    except Exception as e:
-                        self._logger.warning(f"Final git push failed (non-fatal): {e}")
+                except Exception as e:
+                    self._logger.warning(f"Final git push failed (non-fatal): {e}")
 
         # The journal owns a captured pool + thread identity. Drain it while both
         # the session and live subscribers still exist: terminal Canvas failures

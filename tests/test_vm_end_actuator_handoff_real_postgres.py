@@ -72,6 +72,7 @@ async def scenario(
     pod_provisioner="persistent",
     actor_status="session",
     thread_status="active",
+    binding=None,
 ):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
@@ -105,6 +106,8 @@ async def scenario(
     metadata["config_override"]["workspace"]["backend"] = "vm"
     metadata["config_override"]["officer"]["enabled"] = False
     metadata["vm"] = vm
+    if binding is not None:
+        metadata["_workspace_binding"] = binding
     await db.execute(
         "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
         ids["thread"],
@@ -281,6 +284,317 @@ async def test_live_actor_handoff_nominates_and_stops_exact_runtime(
     )
     assert outcome["status"] == "settled_or_superseded"
     assert events == ["pod-stop", "vm-stop"]
+
+
+def _virtual_binding(**changes):
+    """The object-store binding a virtual Session keeps after its VM upgrade."""
+    return {
+        "kind": "virtual",
+        "backing_id": "rclone:" + "3e" * 32,
+        "generation": str(uuid4()),
+        "ssh_host_key_fingerprint": None,
+        **changes,
+    }
+
+
+_CANONICAL_GENERATION = "e1db3f79-2826-409c-8507-8efe0f4d7d3a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "canonical"),
+    [
+        (_virtual_binding(generation=_CANONICAL_GENERATION), True),
+        (_virtual_binding(generation=_CANONICAL_GENERATION.upper()), False),
+        (_virtual_binding(generation="{" + _CANONICAL_GENERATION + "}"), False),
+        (_virtual_binding(generation="urn:uuid:" + _CANONICAL_GENERATION), False),
+        (_virtual_binding(generation=_CANONICAL_GENERATION.replace("-", "")), False),
+        (_virtual_binding(generation=None), False),
+        (_virtual_binding(generation=7), False),
+        (_virtual_binding(backing_id=None), False),
+        (_virtual_binding(backing_id=7), False),
+        (_virtual_binding(backing_id="rclone:" + "3E" * 32), False),
+        (_virtual_binding(kind=None), False),
+        (_virtual_binding(kind="remote"), False),
+        (_virtual_binding(ssh_host_key_fingerprint="SHA256:" + "A" * 43), False),
+        (_virtual_binding(ssh_host_key_fingerprint=""), False),
+        (_virtual_binding(pod_name="workspace"), False),
+        (
+            {
+                key: value
+                for key, value in _virtual_binding().items()
+                if key != "ssh_host_key_fingerprint"
+            },
+            False,
+        ),
+        ({}, False),
+        ([_virtual_binding()], False),
+        ("virtual", False),
+        (None, False),
+    ],
+)
+async def test_python_and_sql_agree_on_the_virtual_binding_an_upgrade_left(
+    db, value, canonical
+):
+    from shared.pinned_workspace_evidence import canonical_virtual_binding
+
+    assert canonical_virtual_binding(value) is canonical
+    assert (
+        await db.fetchval(
+            "SELECT public.pinned_canonical_virtual_binding($1::jsonb)",
+            json.dumps(value),
+        )
+        is canonical
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend", "protocol"),
+    [("vm", "workspace_actuator_zero_v1"), ("remote", None)],
+)
+async def test_only_a_vm_end_takes_the_virtual_binding_an_upgrade_left(
+    db, backend, protocol
+):
+    from orchestrator.database.postgres import (
+        _pinned_retirement_external_cleanup_expected,
+    )
+
+    generation, token = str(uuid4()), str(uuid4())
+    context = {
+        "thread_id": str(uuid4()),
+        "workspace_backend": backend,
+        "workspace_binding": _virtual_binding(),
+        "vm": {"status": "ready", "provision_generation": str(uuid4())},
+    }
+
+    valid, receipt = _pinned_retirement_external_cleanup_expected(
+        context, runtime_generation=generation, retirement_token=token
+    )
+    assert (receipt or {}).get("workspace_cleanup_protocol") == protocol
+    assert valid is (protocol is not None)
+    assert (
+        await db.fetchval(
+            "SELECT public.pinned_retirement_external_cleanup_expected("
+            "$1::jsonb,$2::uuid,$3::uuid)->>'workspace_cleanup_protocol'",
+            json.dumps(context),
+            generation,
+            token,
+        )
+        == protocol
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_upgraded_vm_ends_past_the_virtual_binding_it_kept(
+    db, monkeypatch, permanent
+):
+    ids, retirement, request, events, _, _ = await scenario(
+        db, monkeypatch, permanent=permanent, binding=_virtual_binding()
+    )
+    accepted = await db.request_pinned_thread_retirement_actuator(
+        ids["thread"], **request
+    )
+    assert accepted is not None and accepted["status"] == "actuator_requested"
+    stopped = asyncio.Event()
+    gc = db.gc_offline_agents
+
+    async def finish_pass(**kwargs):
+        result = await gc(**kwargs)
+        stopped.set()
+        return result
+
+    monkeypatch.setattr(db, "gc_offline_agents", finish_pass)
+    await asyncio.wait_for(
+        detector.stale_agent_detector(
+            stopped,
+            dependencies=composition.stale_agent_detector_dependencies(
+                main.app.state.resources
+            ),
+        ),
+        timeout=15,
+    )
+    assert events == ["pod-stop", "vm-stop"]
+    current = await db.get_thread(ids["thread"])
+    assert current is None if permanent else current["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_upgraded_vm_crash_recovery_ends_past_the_virtual_binding_it_kept(
+    db, monkeypatch
+):
+    """The dev shape: the agent died before it asked for the VM teardown."""
+    ids, _, _, events, _, vm_provider = await scenario(
+        db, monkeypatch, binding=_virtual_binding()
+    )
+
+    async def release_vm(thread_id, identity, **_kwargs):
+        events.append("vm-stop")
+        assert await db.record_managed_repository_workspace_process_zero(
+            thread_id,
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=identity.provision_generation,
+        )
+        assert await db.merge_thread_vm_context_if_provision_generation(
+            thread_id,
+            identity.provision_generation,
+            {"status": "retiring_process_zero"},
+        )
+        return VMTeardownResult("completed", True)
+
+    vm_provider.release_vm_captured = release_vm
+    await db.execute(
+        "UPDATE agents SET status='offline' WHERE id=$1::uuid", ids["agent"]
+    )
+    candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
+    assert len(candidates) == 1 and not candidates[0]["nominated_before_grace"]
+
+    assert await detector.retry_pending_pinned_retirement(
+        candidates[0],
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+    assert events == ["pod-stop", "vm-stop"]
+    assert (await db.get_thread(ids["thread"]))["status"] == "ended"
+
+
+async def _crash_recovery_behind_an_open_admission(
+    db, monkeypatch, source, *, release_fails=False
+):
+    """The dev shape of 06f21b14: End captured the VM, the agent is gone, and
+    an admission of ``source`` for that VM was left open. Returns the sources
+    the VM was released under, the admission and whether recovery settled."""
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from orchestrator.services.vm_workspace_recovery_store import (
+        VMWorkspaceRecoveryStore,
+        acquire_vm_cleanup_permit,
+    )
+
+    ids, retirement, _, events, _, vm_provider = await scenario(
+        db, monkeypatch, binding=_virtual_binding()
+    )
+    vm = retirement["context"]["vm"]
+    open_admission = await acquire_vm_cleanup_permit(
+        VMWorkspaceRecoveryStore(db),
+        owner_kind="thread",
+        owner_id=ids["thread"],
+        identity=VMTeardownIdentity(
+            provision_generation=vm["provision_generation"],
+            vm_uid=vm["vm_uid"],
+            rootdisk_pvc_uid=vm["rootdisk_pvc_uid"],
+        ),
+        source=source,
+        purge_disk=True,
+    )
+    assert open_admission.allowed
+    released = []
+
+    async def release_vm(thread_id, identity, **kwargs):
+        released.append(kwargs["parent_cleanup"]["intent"]["source"])
+        if release_fails:
+            raise RuntimeError("captured rootdisk cleanup is still reconciling")
+        await db.record_managed_repository_workspace_process_zero(
+            thread_id,
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=identity.provision_generation,
+        )
+        await db.merge_thread_vm_context_if_provision_generation(
+            thread_id,
+            identity.provision_generation,
+            {"status": "retiring_process_zero"},
+        )
+        return VMTeardownResult("completed", True)
+
+    vm_provider.release_vm_captured = release_vm
+    await db.execute(
+        "UPDATE agents SET status='offline' WHERE id=$1::uuid", ids["agent"]
+    )
+    candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
+    assert len(candidates) == 1
+    settled = await detector.retry_pending_pinned_retirement(
+        candidates[0],
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+    admission = await db.fetchrow(
+        "SELECT completed_at, outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        open_admission.admission_id,
+    )
+    thread = await db.get_thread(ids["thread"])
+    return released, admission, settled and thread["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_finishes_the_abort_a_failed_upgrade_left_open(
+    db, monkeypatch
+):
+    """E4 part 3: the abort's open permit no longer blocks crash recovery."""
+    released, admission, ended = await _crash_recovery_behind_an_open_admission(
+        db, monkeypatch, "abort_thread_vm_upgrade"
+    )
+
+    assert released == ["abort_thread_vm_upgrade", "pinned_thread_retirement"]
+    assert admission["completed_at"] is not None
+    assert admission["outcome"] == "completed"
+    assert ended
+
+
+@pytest.mark.asyncio
+async def test_an_abort_recovery_cannot_finish_yet_keeps_it_open_and_says_why(
+    db, monkeypatch, caplog
+):
+    with caplog.at_level("WARNING"):
+        released, admission, ended = await _crash_recovery_behind_an_open_admission(
+            db, monkeypatch, "abort_thread_vm_upgrade", release_fails=True
+        )
+
+    assert released == ["abort_thread_vm_upgrade"]
+    assert admission["completed_at"] is None
+    assert not ended
+    assert "still reconciling" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_says_why_another_open_admission_blocks_it(
+    db, monkeypatch, caplog
+):
+    """Only the abort's own admission is finished; any other blocks, logged."""
+    with caplog.at_level("WARNING"):
+        released, admission, ended = await _crash_recovery_behind_an_open_admission(
+            db, monkeypatch, "controller_vm_create"
+        )
+
+    assert released == []
+    assert admission["completed_at"] is None
+    assert not ended
+    assert "workspace_cleanup_already_admitted" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "binding",
+    [
+        _virtual_binding(ssh_host_key_fingerprint="SHA256:" + "A" * 43),
+        _virtual_binding(backing_id="rclone:3e3e"),
+        _virtual_binding(pod_name="workspace"),
+    ],
+    ids=["host-key", "short-backing", "extra-field"],
+)
+async def test_vm_end_request_takes_no_other_virtual_binding(db, monkeypatch, binding):
+    ids, _, request, events, _, _ = await scenario(db, monkeypatch, binding=binding)
+
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+        is None
+    )
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -729,10 +1043,12 @@ def test_accelerated_owner_clock_excludes_real_loop_time(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def _soft_end_settled(db, monkeypatch):
+async def _soft_end_settled(db, monkeypatch, binding=None):
     """A legacy (non-v3) VM thread whose soft End retained its root disk."""
 
-    ids, retirement, request, events, k8s, provider = await scenario(db, monkeypatch)
+    ids, retirement, request, events, k8s, provider = await scenario(
+        db, monkeypatch, binding=binding
+    )
     assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
     candidate = (await db.list_retryable_pinned_retirements())[0]
     assert await detector.retry_pending_pinned_retirement(
@@ -825,6 +1141,25 @@ async def test_soft_end_then_permanent_delete_reclaims_the_retained_disk(
     assert purge["request_id"] != keep[0]["request_id"]
     assert purge["intent_digest"] != keep[0]["intent_digest"]
     assert (purge["outcome"], purge["completed_at"] is not None) == ("completed", True)
+
+
+@pytest.mark.asyncio
+async def test_upgraded_vm_soft_end_then_permanent_delete_past_its_virtual_binding(
+    db, monkeypatch
+):
+    ids, _, provider = await _soft_end_settled(
+        db, monkeypatch, binding=_virtual_binding()
+    )
+    purges = []
+    _purging_provider(provider, ids, purges)
+
+    results = await _owner_delete_until_settled(db, ids["thread"])
+
+    assert await db.get_thread(ids["thread"]) is None, results
+    vm = ids["vm"]
+    assert purges == [
+        (vm["provision_generation"], vm["vm_uid"], vm["rootdisk_pvc_uid"])
+    ]
 
 
 @pytest.mark.asyncio

@@ -9,10 +9,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import HTTPException
+from orchestrator.schemas.job_runtime import JobStartRequest
 from orchestrator.security.access import (
     externalize_gitea_url,
     vm_workspaces_on_pod_network,
@@ -100,6 +102,52 @@ async def _pinned_vm_delivery_intent(
         "pinned_projection_digest": digest,
         "pinned_delivery_proof": proof,
     }, intent
+
+
+def _job_llm_section(job_start: JobStartRequest) -> Mapping[str, Any]:
+    """The ``llm`` section delivered with the job, as the harness reads it.
+
+    The resolved blob carries it under ``agent``; a start without one (a
+    historical job) carries it in the override instead.
+    """
+
+    if job_start.resolved_config is not None:
+        agent = job_start.resolved_config.get("agent")
+        llm = agent.get("llm") if isinstance(agent, Mapping) else None
+    else:
+        llm = (job_start.config_override or {}).get("llm")
+    return llm if isinstance(llm, Mapping) else {}
+
+
+def job_model_protocol(job_start: JobStartRequest) -> str | None:
+    """The API shape the job's model is called with, ``None`` when unknown."""
+
+    protocol = _job_llm_section(job_start).get("client_protocol")
+    return protocol if isinstance(protocol, str) and protocol else None
+
+
+def _harness_refusal(
+    capabilities: Mapping[str, Any], job_start: JobStartRequest
+) -> str | None:
+    """Why the probed harness cannot take this job, or ``None`` when it can.
+
+    Only an explicit declaration refuses. A ``/ready`` without ``jobs`` or
+    without ``model_protocols`` is SRW's own agent or a pod of the previous
+    release, and a job whose protocol is unknown is never refused for it.
+    """
+
+    if capabilities.get("jobs") is False:
+        return "This harness does not run jobs (capabilities.jobs is false)."
+    protocols = capabilities.get("model_protocols")
+    if isinstance(protocols, list):
+        protocol = job_model_protocol(job_start)
+        if protocol is not None and protocol not in protocols:
+            model = _job_llm_section(job_start).get("model") or "unknown"
+            return (
+                f"This harness speaks {', '.join(map(str, protocols))}; "
+                f"the job's model {model} is {protocol}."
+            )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +341,32 @@ async def dispatch_job_to_agent(
             require_idle=True,
         )
         if target is None:
+            return False
+        harness_refusal = _harness_refusal(target.capabilities, job_start)
+        if harness_refusal is not None:
+            dependencies.logger.warning(
+                "Dispatch: agent %s cannot take job %s: %s",
+                agent_id,
+                job_id,
+                harness_refusal,
+            )
+            # Every pod of the job's image would refuse it alike, so the job
+            # fails with the reason instead of returning to the queue.
+            if dependencies.completion_commands_enabled():
+                await dependencies.refuse_job_start(
+                    job_id,
+                    reason="harness_unsupported",
+                    message=harness_refusal,
+                    resume=False,
+                    agent_id=agent_id,
+                )
+            else:
+                await dependencies.store.update_job_status(
+                    job_id=job_id,
+                    status="failed",
+                    error_message=harness_refusal,
+                    expected_status="processing",
+                )
             return False
         job_start = job_start.model_copy(update={"recipient": target.recipient})
         delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(

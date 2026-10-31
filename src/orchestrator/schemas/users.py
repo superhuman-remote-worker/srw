@@ -12,11 +12,16 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """Request body for updating a user."""
+    """Request body for updating a user's profile.
+
+    E-mail is intentionally NOT settable here. It comes from the Keycloak
+    claims, and the first OIDC login links an unlinked ``users`` row by
+    e-mail (``upsert_user_from_oidc``), so a writable e-mail would be an
+    account-linking lever. An ``email`` key in the body is ignored.
+    """
 
     display_name: str | None = None
     avatar_color: str | None = None
-    email: str | None = None
 
 
 class AdminUserUpdate(BaseModel):

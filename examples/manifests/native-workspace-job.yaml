@@ -12,10 +12,10 @@ spec:
     expert:
       inline:
         runtime:
-          image: alpine/git:latest
-          command: ["/bin/sh", "-c"]
-          args:
-            - /run/srw-workspace/ssh 'cd /home/agent-host/workspace && test -f initialized && printf "Completed a job\n" >> history.txt'
+          # Generic Jobs run the image's own entrypoint; command, args and probes are refused at admission.
+          # Placeholder: substitute an image you approved in manifestHosting.approvedImages (digest-pinned).
+          image: registry.example.invalid/your-approved-image@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          config: {version: 1, model: claude-sonnet-5-5}
     workspace:
       template:
         inline:

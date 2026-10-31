@@ -1676,8 +1676,10 @@ class SubagentRuntime:
             return None
         question = pending[0]
         question["surfaced"] = True
+        # The caller may hand over one request in pieces: the other open
+        # questions' words, so the answer can take all of them in.
         still_open = [
-            q["delegation_id"]
+            {"delegation_id": q["delegation_id"], "request": q.get("request")}
             for q in run.questions
             if q.get("status") == "open" and q is not question
         ]
@@ -1701,7 +1703,8 @@ class SubagentRuntime:
                 "message_agent(handle, message=<the answer in plain words for "
                 "the caller>, reply_to=<delegation_id>) before answer_by; "
                 "after that the caller is told it is noted and it becomes a "
-                "follow-up."
+                "follow-up. Answering a question also settles the open ones "
+                "asked before it."
             ),
         }
 

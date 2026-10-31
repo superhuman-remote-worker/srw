@@ -159,6 +159,10 @@ export function duplicateResultTranslationArgs(
                         <app-menu-item (activated)="edit(e)">
                           {{ 'experts.edit' | transloco }}
                         </app-menu-item>
+                      } @else {
+                        <app-menu-item (activated)="view(e)">
+                          {{ 'experts.view' | transloco }}
+                        </app-menu-item>
                       }
                       <app-menu-item (activated)="duplicate(e)">
                         {{ 'experts.duplicate' | transloco }}
@@ -182,6 +186,16 @@ export function duplicateResultTranslationArgs(
                         (clicked)="edit(e)"
                       >
                         <app-icon size="sm">edit</app-icon>
+                      </app-icon-button>
+                    } @else {
+                      <app-icon-button
+                        size="sm"
+                        variant="ghost"
+                        [ariaLabel]="'experts.view' | transloco"
+                        [tooltip]="'experts.view' | transloco"
+                        (clicked)="view(e)"
+                      >
+                        <app-icon size="sm">visibility</app-icon>
                       </app-icon-button>
                     }
                     <app-icon-button
@@ -394,6 +408,10 @@ export class ExpertsListComponent implements OnInit {
     this.router.navigate(['/experts', e.id, 'edit']);
   }
 
+  view(e: Expert): void {
+    this.router.navigate(['/experts', e.id, 'view']);
+  }
+
   duplicate(e: Expert): void {
     this.api.duplicateExpert(e.id).subscribe({
       next: (result) => {
@@ -406,14 +424,19 @@ export class ExpertsListComponent implements OnInit {
   }
 
   exportExpert(e: Expert): void {
-    this.api.exportExpert(e.id).subscribe((bundle) => {
-      const blob = new Blob([JSON.stringify(bundle, null, 2)], {type: 'application/json'});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${e.display_name || e.id}.expert.json`;
-      a.click();
-      URL.revokeObjectURL(url);
+    this.api.exportExpert(e.id).subscribe({
+      next: (bundle) => {
+        const blob = new Blob([JSON.stringify(bundle, null, 2)], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${e.display_name || e.id}.expert.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+      // An asset-backed expert (every bundled one and its copies) is refused
+      // with a 409 that says why; without this the button did nothing.
+      error: (err) => this.errorMessage.set(this.detail(err) ?? 'Export failed'),
     });
   }
 

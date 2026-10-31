@@ -156,6 +156,11 @@ class ServiceGate:
             workspace=self.workspace,
             native_hosting_enabled=True,
             harness_egress=os.environ.get("MANIFEST_HARNESS_EGRESS", "[]"),
+            approved_images=[
+                {"name": k, "image": v}
+                for k, v in self.images.items()
+                if "@sha256:" in v
+            ],
         )
         self.resources = ManifestResourceService(
             self.db, admit_job=self.execution.admit
@@ -803,6 +808,9 @@ printf 'successful\\n' > proof-done
 
 
 async def run(args):
+    # Generic admission runs only approved images, compared by exact string:
+    # the gate's job images must be digest references (publish_images pins
+    # them) to be on the approved list ServiceGate derives from them.
     api, nodes = await asyncio.to_thread(
         verify_disposable_profile, args.kube_context, args.kubeconfig
     )

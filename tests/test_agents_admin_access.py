@@ -5,11 +5,15 @@ pod IPs and hostnames — to any approved user. G4 admin-gates them and
 adds a stripped-projection endpoint so non-admins can still see what's
 running for them, without infrastructure metadata.
 
-* `GET /api/agents`              → admin only
-* `GET /api/agents/{id}`         → admin only
-* `GET /api/agents/{id}/system-info` → admin only
-* `DELETE /api/agents/{id}`      → admin, or X-Internal-Key (agent
-  self-deregistration on graceful exit)
+* `GET /api/admin/agents`              → admin only
+* `GET /api/admin/agents/{id}`         → admin only
+* `GET /api/admin/agents/{id}/system-info` → admin only
+* `DELETE /api/admin/agents/{id}`      → admin, or X-Internal-Key (agent
+  self-deregistration on graceful exit, which uses `/api/agents/{id}`)
+
+Each fleet route also answers on its old `/api/agents` path, a deprecated
+alias kept for one release; the handlers are called directly here, so the
+path does not matter (wire tests: tests/test_b06_lane_c_agent_registration.py).
 * `GET /api/me/active-jobs`      → any approved user; returns caller's
   visible jobs filtered to active statuses (created / processing /
   paused / pending_review). Uses the G1 visibility helpers, so MCP
@@ -211,6 +215,8 @@ class TestAgentsAdminOnly:
         )
 
         fake_db.delete_agent = AsyncMock(return_value=True)
+        # A bare internal-key call: no delegated X-MCP-User-Id rides along.
+        fake_request.headers = {}
         with ExitStack() as stack:
             stack.enter_context(
                 patch(

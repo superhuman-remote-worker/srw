@@ -1,0 +1,27 @@
+/* SRW accent colours (the violet of the Cockpit icon) on Starlight's default theme. */
+
+/* Dark theme */
+:root {
+	--sl-color-accent-low: #262036;
+	--sl-color-accent: #8a74c8;
+	--sl-color-accent-high: #d8cff2;
+}
+
+/* Light theme */
+:root[data-theme='light'] {
+	--sl-color-accent-low: #e4ddf3;
+	--sl-color-accent: #5f499c;
+	--sl-color-accent-high: #35285f;
+}
+
+/* Generated Helm values reference: key paths as compact monospace headings. */
+.srw-helm-reference :is(h2, h3) {
+	font-family: var(--__sl-font-mono);
+	overflow-wrap: anywhere;
+}
+.srw-helm-reference h2 {
+	font-size: var(--sl-text-2xl);
+}
+.srw-helm-reference h3 {
+	font-size: var(--sl-text-lg);
+}

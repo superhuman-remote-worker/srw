@@ -672,10 +672,32 @@ def test_embedding_profile_is_explicit_and_does_not_touch_process_env() -> None:
 
     assert service_cls.call_args.kwargs == {
         "model": "tenant/model",
+        "served_model": None,
         "base_url": "https://tenant.invalid/v1",
         "api_key": "tenant-secret",
         "provider": "openrouter",
         "expected_dimensions": 4096,
         "profile_identity": "tenant:endpoint",
     }
+    assert os.environ == before
+
+
+def test_embedding_profile_carries_the_rows_served_model() -> None:
+    before = dict(os.environ)
+    config = SimpleNamespace(
+        extra={
+            "env_keys": {
+                "EMBEDDING_PROVIDER": "local",
+                "EMBEDDING_MODEL": "qwen/qwen3-embedding-8b-local",
+                "EMBEDDING_SERVED_MODEL": "qwen/qwen3-embedding-8b",
+                "EMBEDDING_BASE_URL": "https://tenant.invalid/v1",
+                "EMBEDDING_API_KEY": "tenant-secret",
+            }
+        }
+    )
+
+    service = _build_embedding_service(config)
+
+    assert service.catalog_model == "qwen/qwen3-embedding-8b-local"
+    assert service.model == "qwen/qwen3-embedding-8b"
     assert os.environ == before

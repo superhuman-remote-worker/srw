@@ -22,6 +22,11 @@ from shared.runtime.core.workspace_backend import SEARCH_RESULT_HARD_CAP
 logger = logging.getLogger(__name__)
 
 
+class _Hits(list):
+    """Search hits that may carry a bounded inner search's ``truncated``,
+    ``scanned`` and ``limit``; a plain list otherwise."""
+
+
 class VirtualPathError(ValueError):
     """An operation is not permitted on a virtual path.
 
@@ -286,9 +291,8 @@ class VirtualOverlayBackend:
                 hits = [hit for hit in hits if hit["path"] == target]
             return hits[:SEARCH_RESULT_HARD_CAP]
 
-        results = list(
-            self._inner.search_files(query, path, case_sensitive, exclude_dirs)
-        )
+        inner_hits = self._inner.search_files(query, path, case_sensitive, exclude_dirs)
+        results = list(inner_hits)
         if not self._normalize(path):
             for provider in self._providers.values():
                 # exclude_dirs are directory-name globs (the tool contract, and
@@ -304,7 +308,14 @@ class VirtualOverlayBackend:
                 ):
                     continue
                 results.extend(self._search_provider(provider, query, case_sensitive))
-        return results[:SEARCH_RESULT_HARD_CAP]
+        capped = _Hits(results[:SEARCH_RESULT_HARD_CAP])
+        # A bounded inner search (a cloud folder on the virtual tier) says it
+        # stopped early; the tool prints that, so the attributes survive the
+        # passage through here.
+        for attr in ("truncated", "scanned", "limit"):
+            if hasattr(inner_hits, attr):
+                setattr(capped, attr, getattr(inner_hits, attr))
+        return capped
 
     # --- mutation path (write operations) ---------------------------------
 

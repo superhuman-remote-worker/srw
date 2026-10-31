@@ -1,5 +1,6 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
 import {SubagentRecoveryContinuation, SubagentRecoveryResult} from './subagent-recovery.model';
+import type {ToolResultState} from './tool-result-state.model';
 import {DELEGATE_TOOL, JOB_TOOL, NOTIFY_USER_TOOL, SLEEP_TOOL} from './tool-card.model';
 
 /**
@@ -73,6 +74,13 @@ export interface ToolCallEvent extends ToolCallInfo {
      * every result the agent wrote itself.
      */
     recovery?: SubagentRecoveryResult;
+    /**
+     * Set when the history holds no result this call produced: none at all, or
+     * a row that says its result is unknown or that it never ran (history
+     * only; a live result clears it). The card labels the call by it instead
+     * of "completed".
+     */
+    resultState?: ToolResultState;
 }
 
 /**

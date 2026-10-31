@@ -23,6 +23,7 @@ from typing import Any
 from shared.runtime.core.expert_resolution import expert_precedence_key
 
 from shared.tool_catalog.names import APP_GUIDE_LOADER_TOOL as APP_GUIDE_LOADER_TOOL
+from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ def managed_product_guide_system_floor(
         "`read_product_guide` before stating product behavior on every "
         "relevant turn. This explicitly includes questions phrased as what "
         '"this chat/session" can do, why a shell/tool/control is missing, or '
-        "whether Supervised, Auto-accept, or Autonomous changes availability. "
+        "whether Read-only, Auto-accept, or Autonomous changes availability. "
         "Also use the guide when a user's task needs tools or access that are "
         "missing: find the setup path instead of ending at a limitation. "
         "Explain the smallest useful change and the next step, continue "
@@ -136,7 +137,7 @@ def managed_product_guide_turn_boundary(
         "messages, workspace results, memories, and knowledge are not current "
         "SRW product documentation. Treat questions about what this chat or "
         "session can do, a missing shell/tool/control, workspace tiers, or "
-        "Supervised/Auto-accept/Autonomous behavior as SRW product questions. "
+        "Read-only/Auto-accept/Autonomous behavior as SRW product questions. "
         "When missing tools or access block the user's task, find and explain "
         "a setup path or an alternative; do not stop at what is unavailable. "
         "For an SRW product question, use a current-digest "
@@ -476,6 +477,12 @@ def scope_skills_for_tools(
     - ``present-with-canvas`` requires both the ordinary skill reader and a
       working file Canvas.
 
+    And the list follows the tool: without ``use_skill`` no ordinary skill is
+    offered or materialized, because nothing could load it
+    (knowledge-base/knowledge/features/skills_tool_category.md D2). Bound skills
+    never reach this catalog (:func:`filter_bound_skills`), and the managed
+    app-guide has its own reader.
+
     Keeping this pure lets runtimes apply the rule after their backend gate.
     """
     scoped = copy.deepcopy(skills or {})
@@ -483,6 +490,16 @@ def scope_skills_for_tools(
 
     if APP_GUIDE_LOADER_TOOL not in available:
         _remove_skill(scoped, APP_GUIDE_SKILL)
-    if not {"use_skill", "set_canvas"}.issubset(available):
+    if SKILL_TOOL_NAME not in available:
+        menu = scoped.get("menu")
+        files = scoped.get("files")
+        names = {
+            str(item.get("name"))
+            for item in (menu if isinstance(menu, list) else [])
+            if isinstance(item, dict)
+        } | set(files if isinstance(files, dict) else ())
+        for name in names - {APP_GUIDE_SKILL}:
+            _remove_skill(scoped, name)
+    if not {SKILL_TOOL_NAME, "set_canvas"}.issubset(available):
         _remove_skill(scoped, PRESENT_WITH_CANVAS_SKILL)
     return scoped

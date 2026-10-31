@@ -41,7 +41,6 @@ spec:
         tools:
           workspace:
             - read_file
-            - use_skill
             - list_files
             - search_files
             - file_exists
@@ -52,6 +51,8 @@ spec:
             - move_file
             - copy_file
             - delete_file
+          skills:
+            - use_skill
           research:
             - web_search
             - extract_webpage
@@ -76,8 +77,12 @@ spec:
             - kb_unanswered
           git: []
           shell:
+            # Both executor names: a child gets only what its parent loaded, and
+            # the parent's shell.mode keeps one of them (stateless -> run_command,
+            # persistent -> shell_execute, every capable family's default).
             - run_command
             - cancel_command
+            - shell_execute
             - shell_read
 
         isolation: shared

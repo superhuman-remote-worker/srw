@@ -90,9 +90,9 @@ Helm will run a one-shot seed Job (`{{ include "srw.fullname" . }}-llm-seed`)
 post-install and post-upgrade. It inserts provider keys, endpoints and
 catalog rows, and pins default models (llm.seed.defaults), only where they
 are absent — existing rows and pins, whether previously seeded or set via
-Admin → Models, are never overwritten. Entries declared with
-`reconcile: true` are the exception: those are re-applied on every upgrade
-and shown with a "Helm" badge in Admin → Models.
+Settings → Administration → Models, are never overwritten. Entries declared
+with `reconcile: true` are the exception: those are re-applied on every
+upgrade and shown with a "Helm" badge in Settings → Administration → Models.
 
 Inspect the run:
 
@@ -142,5 +142,38 @@ The lifecycle Secret is `{{ include "srw.vmLifecycleAuthSecretName" . }}`.
 {{- end }}
 The SSH key Secret is `{{ include "srw.vmSshKeySecretName" . }}`. See
 helm/README.md#vm-workspaces-on-your-cluster for prerequisites and checks.
+{{- end }}
+{{- if .Values.voiceGateway.enabled }}
+
+Local phone lines (voice gateway)
+=================================
+The gateway serves {{ len .Values.voiceGateway.lines }} line(s) with the profiles {{ keys .Values.voiceGateway.profiles | sortAlpha | join ", " }}.
+Its live_voice endpoint is {{ include "srw.voiceGatewayBaseUrl" . }}
+{{- if include "srw.voiceCatalogSeeded" . }} (seeded by the
+llm-seed Job with the key from Secret {{ include "srw.voiceSecretName" . }}).
+{{- else }}; add it in Settings -> Administration -> Models
+with the `api-key` of Secret {{ include "srw.voiceSecretName" . }} and import the profiles.
+{{- end }}
+Each line's phone-line connector names one profile as its model and holds
+the line's webhook secret.
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "srw.voiceGatewayName" . }}
+{{- if .Values.asterisk.enabled }}
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "srw.asteriskName" . }} -c asterisk -- asterisk -rx "pjsip show registrations"
+{{- if eq .Values.asterisk.network.mode "hostNetwork" }}
+
+Asterisk runs on the node's network ({{ toJson .Values.asterisk.nodeSelector }}): the phone
+system reaches SIP {{ .Values.asterisk.sip.port }} and RTP {{ .Values.asterisk.rtp.start }}-{{ .Values.asterisk.rtp.end }}/udp at that node's
+address, and ARI ({{ .Values.asterisk.ari.port }}) listens there too: keep it off the LAN with the node's firewall.
+{{- else }}
+
+The phone system reaches SIP and RTP at {{ .Values.asterisk.network.externalAddress }}
+(Service {{ include "srw.asteriskName" . }}-sip).
+{{- end }}
+{{- end }}
+
+Every call is a live job that needs a back-office agent at once: keep a warm
+agent per line that may ring at the same time (agent.pool.buffer and
+minAgents{{ if lt (int .Values.agent.pool.buffer) (len .Values.voiceGateway.lines) }}; buffer {{ .Values.agent.pool.buffer }} is below the {{ len .Values.voiceGateway.lines }} line(s){{ end }}).
 {{- end }}
 {{ include "srw.backupNotes" . }}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Play one live session against a running SRW through the fake GPT-Live server.
+"""Play one live session against SRW through a fake engine or a running voice gateway.
 
 The end-to-end gate for live-session jobs (design
 knowledge-base/knowledge/features/live_session_jobs.md §5.7, §12). It runs
@@ -21,6 +21,14 @@ Scenarios: ``cancel`` (an appointment cancellation, A3), ``human`` (ask for a
 person: transfer, A6), ``no-automation`` (no enabled live automation on the
 connector: the pod rejects with SIP 480) and ``missed`` (the caller hangs up
 before the job attaches: the job still turns strategic and finishes).
+
+With ``--gateway http://host:18440 --line demo --api-key-file /path/to/key``,
+the gateway creates the call and sends the webhook using its configured line.
+``--test-control-url`` overrides the test API URL. Test control must be enabled
+in the gateway config. The engine already speaks appends; the script does not
+inject a second greeting. All four scenarios and database checks are shared.
+``--insecure`` applies to the fake webhook; gateway TLS verification is set by
+its ``webhook_verify_ssl`` config.
 
 Prerequisites: a live_voice catalog model whose endpoint is
 ``http://<--advertise-host>:<--port>/v1`` with the API key ``--api-key``; a
@@ -50,6 +58,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 sys.path.insert(0, REPO)
 
 from tests._fake_gpt_live import FakeGptLive  # noqa: E402
+from voice_gateway.test_client import GatewayClient  # noqa: E402
 
 PSQL = "kubectl --context k3d-srw -n srw exec srw-postgres-0 -- psql -U srw -d srw -tAc"
 AUDIT_PSQL = (
@@ -99,15 +108,26 @@ async def play(args: argparse.Namespace) -> int:
     if args.webhook_secret_file:
         with open(os.path.expanduser(args.webhook_secret_file)) as handle:
             secret = handle.read().strip()
-    if not secret:
+    if not args.gateway and not secret:
         _step("FAIL: a webhook secret is required (--webhook-secret-file)")
         return 2
-    fake = FakeGptLive(api_key=args.api_key, host="0.0.0.0", port=args.port)
-    await fake.start()
-    _step(
-        f"fake GPT-Live on :{fake.port}; the line's pod uses "
-        f"http://{args.advertise_host}:{fake.port}/v1"
+    api_key = args.api_key
+    if args.api_key_file:
+        with open(os.path.expanduser(args.api_key_file)) as handle:
+            api_key = handle.read().strip()
+    fake = (
+        GatewayClient(args.test_control_url or args.gateway, args.line, api_key)
+        if args.gateway
+        else FakeGptLive(api_key=api_key, host="0.0.0.0", port=args.port)
     )
+    await fake.start()
+    if args.gateway:
+        _step(f"voice gateway {args.gateway}; line {args.line}")
+    else:
+        _step(
+            f"fake GPT-Live on :{fake.port}; the line's pod uses "
+            f"http://{args.advertise_host}:{fake.port}/v1"
+        )
     failures = 0
     try:
         webhook_url = (
@@ -161,19 +181,21 @@ async def play(args: argparse.Namespace) -> int:
             f"pod attached; greeting after {time.monotonic() - started:.1f}s: "
             f"{greeting['content'][:100]!r}"
         )
-        await fake.say(
-            provider_id,
-            "assistant",
-            "Hello, you are speaking with an AI assistant. How can I help?",
-        )
+        if not args.gateway:
+            await fake.say(
+                provider_id,
+                "assistant",
+                "Hello, you are speaking with an AI assistant. How can I help?",
+            )
 
         if args.scenario == "missed":
             await fake.say(provider_id, "caller", "Never mind, I will call back.")
             await asyncio.sleep(0.5)
             # The engine bills the seconds the session ran.
-            fake.session(provider_id).usage_seconds = round(
-                time.monotonic() - accepted, 1
-            )
+            if not args.gateway:
+                fake.session(provider_id).usage_seconds = round(
+                    time.monotonic() - accepted, 1
+                )
             await fake.remote_hangup(provider_id)
             _step("caller hung up before the job attached")
         else:
@@ -225,10 +247,13 @@ async def play(args: argparse.Namespace) -> int:
                     failures += 1
             await fake.say(provider_id, "caller", "Thank you, goodbye.")
             await asyncio.sleep(1.0)
+            if args.gateway:
+                await fake.refresh(provider_id)
             if fake.session(provider_id).status != "closed":
-                fake.session(provider_id).usage_seconds = round(
-                    time.monotonic() - accepted, 1
-                )
+                if not args.gateway:
+                    fake.session(provider_id).usage_seconds = round(
+                        time.monotonic() - accepted, 1
+                    )
                 await fake.remote_hangup(provider_id)
             _step("caller hung up")
 
@@ -271,6 +296,8 @@ async def play(args: argparse.Namespace) -> int:
             _step(f"usage row: {billed or 'none'}")
             if not billed:
                 failures += 1
+        if args.gateway:
+            await fake.refresh(provider_id)
         sent = [c["type"] for c in fake.session(provider_id).commands]
         _step(f"commands received: {sent}")
         return 1 if failures else 0
@@ -284,7 +311,13 @@ def main() -> int:
     )
     parser.add_argument("--orchestrator", required=True)
     parser.add_argument("--connector-id", required=True)
-    parser.add_argument("--advertise-host", required=True)
+    parser.add_argument("--advertise-host")
+    parser.add_argument("--gateway", help="Running gateway URL (without /v1)")
+    parser.add_argument("--line", help="Gateway line name")
+    parser.add_argument(
+        "--test-control-url", help="Test API URL; defaults to --gateway"
+    )
+    parser.add_argument("--api-key-file", help="File containing the gateway API key")
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument(
         "--scenario",
@@ -304,7 +337,12 @@ def main() -> int:
         "--audit-psql", default=AUDIT_PSQL, help="Command prefix for the audit DB"
     )
     parser.add_argument("--insecure", action="store_true")
-    return asyncio.run(play(parser.parse_args()))
+    args = parser.parse_args()
+    if args.gateway and not (args.line and args.api_key_file):
+        parser.error("--gateway requires --line and --api-key-file")
+    if not args.gateway and not args.advertise_host:
+        parser.error("fake mode requires --advertise-host")
+    return asyncio.run(play(args))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,81 @@
+name: Install or upgrade problem
+description: The chart does not install, upgrade or come up healthy.
+title: "[install] "
+labels: ["install"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [Troubleshooting](https://docs.superhuman-remote-worker.com/troubleshooting/) first: it covers the problems a new installation hits most often.
+
+        **Remove API keys, passwords, tokens and private hostnames from everything you paste.** Values files and logs can contain them. Report a suspected vulnerability privately, as [SECURITY.md](https://github.com/superhuman-remote-worker/srw/blob/main/SECURITY.md) describes, not here.
+  - type: input
+    id: chart-version
+    attributes:
+      label: Chart version
+      description: The version you installed or upgraded to, and from which version for an upgrade. `helm list -n <namespace>` shows it.
+      placeholder: 0.1.2 (upgrade from 0.1.1)
+    validations:
+      required: true
+  - type: dropdown
+    id: install-path
+    attributes:
+      label: Install path
+      options:
+        - /configure generator (install.sh)
+        - Local k3d (docs/local-kubernetes.md)
+        - Other (helm install with my own values)
+    validations:
+      required: true
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes distribution and version
+      placeholder: k3s v1.33.4+k3s1, single node
+    validations:
+      required: true
+  - type: input
+    id: storage-class
+    attributes:
+      label: Storage class
+      description: The storage class (or classes) your volumes use, and whether it supports ReadWriteMany.
+      placeholder: local-path (ReadWriteOnce only)
+    validations:
+      required: true
+  - type: textarea
+    id: models
+    attributes:
+      label: Models and providers
+      description: Which providers and models you configured for chat, auxiliary, embedding and rerank. Model IDs only, no keys.
+      placeholder: One OpenRouter key, Claude Sonnet 5.5 for chat and auxiliary, Qwen3 Embedding 8B, Qwen3 Reranker 8B
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you saw instead (the error message, or the step that hangs).
+    validations:
+      required: true
+  - type: textarea
+    id: pods
+    attributes:
+      label: "`kubectl get pods` output"
+      description: "`kubectl -n <namespace> get pods`"
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        For a pod that is not ready: `kubectl -n <namespace> describe pod <pod>` and `kubectl -n <namespace> logs <pod>`. For the orchestrator: `kubectl -n <namespace> logs deploy/<release>-orchestrator --tail=200`. Include the `helm` or `install.sh` error if there is one.
+      render: shell
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed API keys, passwords and tokens from everything above.
+          required: true

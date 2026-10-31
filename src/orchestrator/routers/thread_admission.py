@@ -52,9 +52,14 @@ async def preview_thread_creation(
     plan = await thread_admission.resolve_thread_creation_plan(
         request_body, user, dependencies=dependencies
     )
+    # Where the tier came from, so the draft's picker can say why (a Container
+    # its cloud folders need, sources.tier == "cloud_connectors").
+    selection = plan.create_kwargs.get("workspace_selection") or {}
     return {
         "project_ids": plan.effective_project_ids,
         "workspace_backend": plan.thread_backend,
+        "workspace_sources": selection.get("sources"),
+        "workspace_template_name": selection.get("template_name"),
         "datasource_ids": plan.selected_datasource_ids,
     }
 

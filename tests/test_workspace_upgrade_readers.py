@@ -1,5 +1,6 @@
 """The provisioning readers fall back to an upgrade's template (Slice A2b)."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -106,7 +107,43 @@ async def test_a_session_never_reads_a_job_upgrade(monkeypatch):
         "orchestrator.services.sandbox_workspace_settings.read_execution",
         AsyncMock(return_value=None),
     )
-    store = SimpleNamespace(get_job=AsyncMock())
+    store = SimpleNamespace(
+        get_job=AsyncMock(), get_thread=AsyncMock(return_value=None)
+    )
     settings = await resolve_sandbox_settings(store, "session", JOB_ID)
     assert settings.is_empty()
+    store.get_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_session_container_upgrade_uses_its_template_settings(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.sandbox_workspace_settings.read_execution",
+        AsyncMock(return_value=None),
+    )
+    store = SimpleNamespace(
+        get_job=AsyncMock(),
+        get_thread=AsyncMock(
+            return_value={
+                "id": JOB_ID,
+                "metadata": json.dumps(
+                    {
+                        "workspace_container": {
+                            "upgrade_config": {
+                                "image": "r.example/site:1",
+                                "cpu": 2,
+                                "memory": "4Gi",
+                            }
+                        }
+                    }
+                ),
+            }
+        ),
+    )
+    settings = await resolve_sandbox_settings(store, "session", JOB_ID)
+    assert (settings.image, settings.cpu, settings.memory) == (
+        "r.example/site:1",
+        2,
+        "4Gi",
+    )
     store.get_job.assert_not_awaited()

@@ -12,6 +12,11 @@
       "denied": "abgelehnt",
       "expired": "nicht ausgeführt"
     },
+    "outcome": {
+      "noResult": "kein Ergebnis",
+      "resultUnknown": "Ergebnis unbekannt",
+      "notRun": "nicht ausgeführt"
+    },
     "diff": {
       "replace": "Diff",
       "append": "angehängt",
@@ -127,6 +132,8 @@
     "untrusted": "Vom Agenten bereitgestellter Inhalt",
     "lastSynced": "Zuletzt synchronisiert",
     "refresh": "Canvas-Status aktualisieren",
+    "download": "Datei herunterladen",
+    "staticHtmlNotice": "Diese Vorschau blendet die Skripte und Styles der Seite aus Sicherheitsgründen aus. Lade die Datei herunter, um sie in deinem Browser zu öffnen.",
     "popOut": "Canvas in einem neuen Fenster öffnen",
     "close": "Canvas schließen",
     "open": "Canvas öffnen",
@@ -134,7 +141,10 @@
     "skipToCanvas": "Zum Canvas springen",
     "newContent": "Neuer Canvas-Inhalt verfügbar",
     "workspaceFile": {
-      "notPresented": "{{path}} ist eine Datei im Workspace dieser Session. Bitte den Agenten, sie im Canvas zu präsentieren."
+      "notFound": "{{path}} liegt nicht im Workspace dieser Session.",
+      "tooLarge": "{{path}} ist zu groß zum Herunterladen (Limit: 50 MB).",
+      "unavailable": "{{path}} kann nicht heruntergeladen werden, solange der Workspace schläft. Schick eine Nachricht, um die Session zu wecken, und versuch es dann noch einmal.",
+      "downloadFailed": "{{path}} konnte nicht heruntergeladen werden."
     },
     "returnToChat": "Zurück zum Chat",
     "resize": "Chat und Canvas in der Größe ändern",
@@ -418,6 +428,17 @@
       "today": "Heute",
       "yesterday": "Gestern",
       "earlier": "Früher"
+    },
+    "sessionMenu": {
+      "options": "Sitzungsoptionen",
+      "openInNewTab": "In neuem Tab öffnen",
+      "copyLink": "Link kopieren",
+      "linkCopied": "Link kopiert",
+      "sessionFiles": "Sitzungsdateien",
+      "end": "Sitzung beenden",
+      "resume": "Sitzung fortsetzen",
+      "endRetryable": "Das Beenden hat begonnen, die Bereinigung ist aber noch nicht abgeschlossen. Wähle gleich noch einmal „Sitzung beenden“, um es erneut zu versuchen.",
+      "deleteRetryable": "Diese Sitzung wird noch heruntergefahren und konnte noch nicht gelöscht werden. Versuche es gleich unter „Alle Sitzungen anzeigen“ erneut."
     }
   },
   "grants": {
@@ -628,7 +649,7 @@
       "projectArchivedWarning": "Ein archiviertes Projekt ist weiterhin ausgewählt — eine Sitzung darauf wird abgelehnt. Wählen Sie es ab oder heben Sie die Archivierung auf.",
       "projectsHint": "Wählen Sie das Projekt, in dem diese Sitzung arbeitet.",
       "permissionLabel": "Berechtigungsmodus",
-      "permissionSupervised": "Beaufsichtigt",
+      "permissionReadOnly": "Nur lesen",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "creating": "Wird erstellt...",
@@ -674,8 +695,9 @@
     "invalidImage": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image ist ungültig.",
     "invalidConfiguration": "Arbeitsbereich benötigt Aufmerksamkeit: Die Konfiguration ist ungültig.",
     "pullDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image wurde nicht rechtzeitig fertig geladen. Prüfen Sie die Image-Referenz und ob der Cluster aus der zugehörigen Registry laden kann.",
-    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Er wurde nicht rechtzeitig bereit. Wenn er Ihr eigenes Image verwendet, prüfen Sie, ob das Image weiterläuft: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER.",
+    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Er wurde nicht rechtzeitig bereit. Wenn er Ihr eigenes Image verwendet, prüfen Sie, ob das Image den SSH-Server von SRW weiter ausführt: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER. Möglicherweise hat ihn auch der Cluster gestoppt, etwa weil ihm der Arbeitsspeicher ausging: Versuchen Sie eine Vorlage mit mehr Arbeitsspeicher.",
     "sshDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Frist für die SSH-Authentifizierung ist abgelaufen.",
+    "containerExited": "Arbeitsbereich benötigt Aufmerksamkeit: Sein Container wurde mit Code {{exitCode}} beendet, bevor er bereit war. Ein Arbeitsbereich-Image muss den SSH-Server von SRW weiter ausführen: Bauen Sie es auf einem SRW-Basis-Image auf (FROM) und überschreiben Sie weder ENTRYPOINT noch USER.",
     "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
   },
   "jobs": {
@@ -1480,7 +1502,7 @@
       "defaultPrefix": "Standard:",
       "permissionMode": "Berechtigungsmodus",
       "idleTimeout": "Leerlauf-Timeout (Minuten)",
-      "permissionSupervised": "Beaufsichtigt",
+      "permissionReadOnly": "Nur lesen",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "workspaceMoved": "Den Arbeitsbereich für neue Sitzungen legen die Einstellungen deines persönlichen Projekts fest.",
@@ -2013,10 +2035,32 @@
       "driftChanged": "Quelle seit Zitat geändert",
       "driftUnreachable": "Live-Quelle nicht erreichbar",
       "driftUnknown": "Änderung unbekannt",
-      "statusVerified": "Verifiziert",
-      "statusPending": "Wird verifiziert…",
-      "statusFailed": "Nicht verifiziert",
-      "statusUnknown": "Unbekannt"
+      "state": {
+        "pending": "Wird geprüft",
+        "verified": "Verifiziert",
+        "failed": "Nicht verifiziert",
+        "unchecked": "Nicht geprüft",
+        "withdrawn": "Zurückgezogen"
+      },
+      "reason": {
+        "quote_not_found": "Die zitierten Worte stehen nicht in der Quelle",
+        "not_supported": "Die Passage stützt die Aussage nicht",
+        "source_unavailable": "Die Quelle war zum Prüfen nicht auffindbar",
+        "not_checked": "Es lief keine Prüfung"
+      },
+      "popover": {
+        "label": "Quelle {{n}}",
+        "unknownSource": "Unbenannte Quelle",
+        "pendingNote": "Die Quelle wird noch geprüft.",
+        "withdrawn": "Der Agent hat diese Quelle zurückgezogen: {{reason}}",
+        "noReason": "ohne Begründung",
+        "claim": "Aussage",
+        "passage": "Passage",
+        "openSource": "Quelle öffnen",
+        "showInList": "In der Quellenliste zeigen"
+      },
+      "chipLabel": "Quelle {{n}}: {{source}}, {{state}}",
+      "notFound": "Die Quelle {{handle}} gehört nicht zu dieser Sitzung"
     },
     "status": {
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
@@ -2037,7 +2081,7 @@
       },
       "state": {
         "mounted": "eingebunden",
-        "pending": "wird verbunden…"
+        "pending": "wird beim Start des Agenten bestätigt"
       },
       "review": "Zur Prüfung",
       "notAttachedKind": {
@@ -2074,7 +2118,9 @@
         "cloud_not_connected": "noch kein Cloud-Konto: verbinde deine Cloud unter Einstellungen → Konnektoren",
         "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren",
         "delivery_unsupported": "diese Installation synchronisiert Dateien, statt sie einzubinden; Cloud-Ordner werden hier nicht bereitgestellt",
-        "mount_unsupported": "dieser Arbeitsbereich kann keine Cloud-Ordner einbinden; sie werden hier nicht bereitgestellt"
+        "mount_unsupported": "dieser Arbeitsbereich kann keine Cloud-Ordner einbinden; sie werden hier nicht bereitgestellt",
+        "virtual_workspace": "ein virtueller Arbeitsbereich kann ihn auf der gewünschten Zugriffsstufe nicht bereitstellen; ein Container bekommt ihn: Upgrade dieser Session oder eine neue Session mit Container",
+        "bearer_token": "deine Cloud meldet sich mit einem Token an, das ein virtueller Arbeitsbereich noch nicht halten kann; ein Container bekommt ihn: Upgrade dieser Session oder eine neue Session mit Container"
       }
     },
     "cloudReview": {
@@ -2119,8 +2165,18 @@
         "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
         "retryExhausted": "Diese Nachricht ist wiederholt auf dieselbe Weise fehlgeschlagen und wurde zurückgestellt.",
         "modelUnavailable": "Das Modell dieser Sitzung ist nicht mehr verfügbar. Wählen Sie in den Einstellungen dieser Sitzung ein anderes Modell und versuchen Sie es dann erneut.",
+        "toolResultUnknown": "Ein Befehl wurde unterbrochen, bevor sein Ergebnis gespeichert wurde, und der Verlauf darum lässt sich nicht sicher lesen — ein Administrator muss ihn reparieren, bevor diese Nachricht ausgeführt werden kann.",
         "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
       }
+    },
+    "unknownResult": {
+      "label": "Ergebnis unbekannt",
+      "singleTitle": "Ein Werkzeugaufruf wurde unterbrochen, bevor sein Ergebnis gespeichert wurde",
+      "batchTitle": "{{count}} Werkzeugaufrufe wurden unterbrochen, bevor ihre Ergebnisse gespeichert wurden",
+      "hint": "Ein unterbrochener Aufruf ist vielleicht fertig gelaufen, vielleicht nicht. „Fortsetzen“ teilt dem Agenten mit, dass das Ergebnis unbekannt ist, und lässt ihn dort weitermachen; „Hier anhalten“ beendet diese Anfrage. Was Sie danach gesendet haben, wird in beiden Fällen ausgeführt.",
+      "continue": "Fortsetzen",
+      "stop": "Hier anhalten",
+      "failed": "Die Entscheidung wurde abgelehnt ({{code}})"
     },
     "queued": {
       "notSent": "Nicht gesendet",
@@ -2197,6 +2253,7 @@
           "title": "Auf VM upgraden?",
           "body": "Stellt eine dedizierte virtuelle Maschine mit root und sudo bereit und kopiert deine Dateien darauf. Ein Kaltstart dauert 6–25 Minuten."
         },
+        "vmReconnect": "Die Sitzung verbindet sich zuerst mit einem eigenen Agenten neu.",
         "irreversible": "Das lässt sich nicht rückgängig machen — die Sitzung kann nicht auf eine niedrigere Stufe zurück.",
         "confirm": "Upgraden"
       }
@@ -2208,7 +2265,7 @@
       "toolCalls": "Werkzeugaufrufe",
       "model": "Modell",
       "temperature": "Temperatur: {{value}}",
-      "modeSupervised": "Beaufsichtigt",
+      "modeReadOnly": "Nur lesen",
       "modeAutoAccept": "Auto-akzeptieren",
       "modeAutonomous": "Autonom",
       "narrationAuto": "Automatisch",
@@ -2336,6 +2393,8 @@
       "batchTitle": "Der Agent möchte {{count}} Werkzeugaufruf(e) ausführen",
       "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
+      "autoAcceptHint": "Genehmigt diese Aufrufe und wechselt zu Auto-akzeptieren. Änderungen an Workspace-Dateien laufen danach ohne Rückfrage; Befehle sowie unumkehrbare oder nach außen gerichtete Aktionen fragen weiterhin nach.",
+      "childRunsUnattended": "Der Subagent führt danach seine eigenen Werkzeuge ohne Rückfrage aus, auch Befehle und Aktionen nach außen.",
       "stop": "Stoppen"
     },
     "control": {
@@ -2355,7 +2414,41 @@
       "undoUnsupported": "Rückgängig machen ist für den Workspace dieser Sitzung nicht verfügbar.",
       "undoRejected": "Der Agent konnte die letzten Dateiänderungen nicht rückgängig machen.",
       "containerUpgradeUnavailable": "Container-Upgrades sind in dieser Sitzung nicht verfügbar. Verwende /upgrade-workspace vm oder starte eine neue Sitzung mit einem Container-Workspace.",
-      "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar."
+      "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar.",
+      "upgradeDeferred": "Das Workspace-Upgrade startet nach der aktuellen Antwort.",
+      "vmUpgradeUnavailable": "VM-Workspaces sind auf dieser Installation nicht verfügbar.",
+      "vmUpgradeRetry": "Das VM-Upgrade konnte auf dem Agenten dieser Sitzung nicht starten. Sende /upgrade-workspace vm, um es erneut zu versuchen.",
+      "upgradeBusy": "Die Sitzung erledigt noch Hintergrundarbeit (zum Beispiel eine Cloud-Synchronisierung), daher hat das Workspace-Upgrade nicht begonnen. Versuche es in einer Minute erneut."
+    },
+    "workspaceUpgrade": {
+      "failedStartupRetry": "Workspace-Upgrade fehlgeschlagen. {{reason}} Um es erneut zu versuchen, beende diese Sitzung und setze sie dann fort; deine Dateien bleiben erhalten.",
+      "failedStartup": "Workspace-Upgrade fehlgeschlagen. {{reason}} Beende diese Sitzung und starte eine neue; deine Dateien bleiben erhalten.",
+      "notPossible": "Der Workspace dieser Sitzung lässt sich nicht direkt aufrüsten. Starte stattdessen eine neue Sitzung mit einem Container-Workspace.",
+      "movingToVm": "Diese Sitzung wird auf einen VM-Workspace verschoben (die Sitzung verbindet sich zuerst neu)…",
+      "card": {
+        "title": "Workspace-Upgrade",
+        "titleContainer": "Upgrade auf einen Container",
+        "titleVm": "Upgrade auf eine VM",
+        "titleTemplate": "Upgrade auf {{template}}"
+      },
+      "steps": {
+        "requested": "Upgrade angefordert",
+        "startingContainer": "Container wird gestartet",
+        "startingVm": "VM wird gestartet (das kann einige Minuten dauern)",
+        "startingWorkspace": "Workspace wird gestartet",
+        "copying": "Deine Dateien werden kopiert"
+      },
+      "skippedFiles": "Diese Dateien waren größer als das Kopierlimit von 100 MB und wurden nicht kopiert; sie liegen weiter im alten Speicher: {{files}}",
+      "ready": "Workspace bereit – Shell, Git und Datei-Tools sind jetzt verfügbar.",
+      "readySudo": "Läuft auf einer VM – sudo ist jetzt verfügbar.",
+      "readySeeded": "{{count}} Datei(en) übernommen.",
+      "failed": {
+        "upgradeCancelled": "Das VM-Upgrade wurde abgebrochen, als diese Sitzung beendet wurde.",
+        "upgradeRefused": "Das VM-Upgrade konnte nicht starten: SRW hat es beim erneuten Verbinden der Sitzung abgelehnt. Die Sitzung behält ihren aktuellen Workspace; du kannst /upgrade-workspace vm erneut versuchen.",
+        "upgradeFailed": "Das VM-Upgrade ist fehlgeschlagen. Diese Sitzung funktioniert vorerst weiter, kann aber nicht neu starten: Beende sie und starte eine neue, wenn du fertig bist. Deine Dateien bleiben erhalten.",
+        "upgradeInterrupted": "Das VM-Upgrade wurde unterbrochen, bevor deine Dateien kopiert wurden. Beende diese Sitzung und starte eine neue; deine Dateien bleiben im alten Speicher erhalten.",
+        "upgradeAlreadyRunning": "Ein Workspace-Upgrade läuft bereits."
+      }
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",
@@ -2365,7 +2458,6 @@
       "deny": "Ablehnen",
       "denyStarter": "Kein Workspace-Upgrade — ",
       "continueMessage": "Der Workspace ist bereit — Shell-, Git- und Datei-Tools sind jetzt verfügbar. Bitte mach dort weiter, wo du aufgehört hast.",
-      "provisioning": "{{tier}} wird bereitgestellt…",
       "willContinue": "Wird automatisch fortgesetzt, sobald bereit."
     },
     "approval": {
@@ -2386,6 +2478,7 @@
       "queued": "Warten auf einen verfügbaren Agenten…",
       "parked": "Diese Nachricht muss erneut gesendet werden",
       "parkedBlocked": "Blockiert, bis ein Administrator sie freigibt",
+      "parkedDecide": "Wählen Sie oben „Fortsetzen“ oder „Hier anhalten“, um weiterzumachen",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
@@ -2481,9 +2574,9 @@
       "done": "Sitzung beenden — Erinnerungen extrahieren und archivieren",
       "undo": "Dateiänderungen des letzten Zugs rückgängig machen",
       "rewind": "Zu einer früheren Nachricht zurückspulen",
-      "auto": "Zu Auto-Akzeptieren wechseln (alles außer Shell genehmigen)",
-      "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
-      "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
+      "auto": "Zu Auto-akzeptieren wechseln — ändert Workspace-Dateien frei, fragt vor unumkehrbaren oder nach außen gerichteten Aktionen und Befehlen",
+      "readonly": "Zu Nur lesen wechseln — liest, sucht und browst frei, fragt vor Änderungen, Aktionen außerhalb des Workspace und Befehlen",
+      "autonomous": "Zu Autonom wechseln — führt jedes Tool ohne Rückfrage aus",
       "silent": "Reasoning ausblenden und Werkzeug-Details minimieren",
       "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen",
       "upgradeWorkspace": "Arbeitsbereich aufwerten: ohne Angabe die nächste Stufe, \"vm\" oder ein Vorlagenname"
@@ -2559,6 +2652,7 @@
     },
     "toolCategories": {
       "workspace": "Arbeit mit Dateien",
+      "skills": "Skills verwenden",
       "git": "Versionskontrolle",
       "shell": "Befehle ausführen",
       "research": "Recherche & Browsen",
@@ -2600,6 +2694,7 @@
       "research": "Suchen",
       "session_task": "Aufgaben",
       "shell": "Befehle",
+      "skills": "Skills",
       "sql": "Abfragen",
       "thought": "Gedanken",
       "workspace": "Dateien"
@@ -2621,6 +2716,7 @@
       "research": "Suche",
       "session_task": "Aufgabe",
       "shell": "Befehl",
+      "skills": "Skill",
       "sql": "Abfrage",
       "thought": "Gedanke",
       "workspace": "Datei"
@@ -2659,6 +2755,12 @@
     "inUse": "Experte wird von {{count}} Aufträgen verwendet",
     "saveFailed": "Speichern fehlgeschlagen",
     "invalidJson": "Ungültige JSON-Datei",
+    "view": "Ansehen",
+    "back": "Zurück",
+    "readonlyNotice": "Sie können diesen Experten nicht bearbeiten. Duplizieren Sie ihn, um eine bearbeitbare Kopie zu erhalten.",
+    "duplicateToEdit": "Zum Bearbeiten duplizieren",
+    "duplicateFailed": "Duplizieren fehlgeschlagen",
+    "loadFailed": "Experte konnte nicht geladen werden: {{detail}}",
     "model": {
       "title": "Modell",
       "model": "Modell",
@@ -3605,7 +3707,7 @@
       "noBaseline": "Der Projektordner wurde für diesen Job nicht kopiert, es gibt also keine Änderungen zu prüfen.",
       "headUnreadable": "Die Änderungen des Jobs an seiner Kopie des Projektordners konnten nicht gelesen werden, es gibt also nichts zu prüfen."
     },
-    "reviewSessionHint": "Startet eine beaufsichtigte Sitzung in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
+    "reviewSessionHint": "Startet eine Sitzung im Modus „Nur lesen“ in einem frischen Sandbox-Checkout des bereitgestellten Branches mit Modell, Projekt und Konnektoren dieses Jobs. Job-spezifische Arbeitsbereichs- und Tool-Einstellungen werden nicht kopiert.",
     "vmUpgrade": {
       "title": "Sudo erforderlich",
       "reason": "Der Agent hat einen privilegierten Befehl in einem gehärteten Container versucht:",
@@ -3903,6 +4005,7 @@
           "changes": "{{n}} geändert",
           "template": "Vorlage",
           "upgradeOnly": "Nur Upgrade",
+          "fixed": "Festgelegt",
           "default": "Standard",
           "custom": "Angepasst",
           "none": "Keiner",
@@ -3916,6 +4019,7 @@
         "project": "Projekt",
         "templateAndResources": "Vorlage und Ressourcen",
         "templateAndResourcesHint": "Die Stufe oben lässt sich upgraden. Image und Ressourcen bleiben wie erstellt.",
+        "resourcesFixedHint": "Image und Ressourcen bleiben wie erstellt.",
         "moreLive": "Diese wurden beim Start der Session festgelegt.",
         "moreUnavailable": "Die Werte, mit denen diese Session gestartet wurde, konnten nicht geladen werden."
       },
@@ -3946,6 +4050,7 @@
       "loadFailed": "Konnektoren konnten für diesen Projektkontext nicht geladen werden. Die Erstellung ist deaktiviert.",
       "retry": "Erneut versuchen",
       "unavailableName": "Nicht verfügbarer Konnektor",
+      "requiresShellWorkspace": "Braucht einen Container- oder VM-Workspace",
       "unavailableLive": "Dieser angehängte Konnektor ist nicht mehr autorisiert oder im Geltungsbereich. Entfernen Sie ihn, bevor Sie fortfahren.",
       "unavailableBadge": "Nicht verfügbar",
       "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
@@ -3980,7 +4085,7 @@
       "label": "Workspace",
       "default": "Standard: {{what}} ({{layer}})",
       "defaultUnknown": "Standard (Projekt oder Installation)",
-      "layer": {"project": "Projektstandard", "installation": "Installationsstandard"},
+      "layer": {"project": "Projektstandard", "installation": "Installationsstandard", "cloud_connectors": "für Cloud-Ordner nötig"},
       "mode": {"none": "Kein Workspace", "virtual": "Virtuell", "container": "Container", "vm": "VM"},
       "group": {"shared": "Geteilt", "project": "Dieses Projekt", "mine": "Meine"},
       "none": "Kein Workspace",
@@ -4009,6 +4114,12 @@
       "tierCurrent": "aktuell",
       "tierNext": "die nächste Stufe",
       "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
+      "tierFixed": {
+        "needsApproval": "Für ein Upgrade dieser Sitzung brauchst du die Freigabe eines Admins.",
+        "sessionUnsupported": "Diese Sitzung kann ihren Workspace nicht wechseln. Starte eine neue Sitzung, um auf einer anderen Stufe zu arbeiten.",
+        "highest": "Diese Sitzung läuft bereits auf der höchsten Stufe.",
+        "unsupported": "Diese Stufe lässt sich nicht upgraden."
+      },
       "tierUpgrading": "{{tier}} wird bereitgestellt…",
       "tierUnreachable": {
         "downgrade": "Herunterstufen nicht möglich",
@@ -4028,11 +4139,11 @@
       },
       "partial": {
         "label": "Partiell",
-        "description": "Stoppt an Phasengrenzen und beim Job-Abschluss"
+        "description": "Stoppt nach der ersten strategischen Phase und beim Job-Abschluss"
       },
       "guided": {
         "label": "Geführt",
-        "description": "Stoppt nach jeder taktischen Phase"
+        "description": "Stoppt nach jeder strategischen Phase und beim Job-Abschluss"
       },
       "dependent": {
         "label": "Abhängig",
@@ -4040,17 +4151,17 @@
       }
     },
     "permissionModes": {
-      "supervised": {
-        "label": "Beaufsichtigt",
-        "description": "Agent fragt vor jedem Befehl um Freigabe"
+      "read_only": {
+        "label": "Nur lesen",
+        "description": "Liest, sucht und browst frei. Fragt vor Änderungen, Aktionen außerhalb des Workspace und Befehlen."
       },
       "auto_accept": {
         "label": "Automatisch",
-        "description": "Die meisten Aktionen werden automatisch freigegeben, riskante markiert"
+        "description": "Ändert Workspace-Dateien frei. Fragt vor unumkehrbaren oder nach außen gerichteten Aktionen und Befehlen."
       },
       "autonomous": {
         "label": "Autonom",
-        "description": "Agent führt Aktionen ohne Rückfrage aus"
+        "description": "Führt jedes Tool ohne Rückfrage aus."
       }
     },
     "imageQuality": {
@@ -4115,6 +4226,10 @@
       "canvas": {
         "label": "Canvas",
         "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
+      },
+      "skills": {
+        "label": "Skills",
+        "description": "Kann Skills aus Ihrem Skill-Katalog laden. Aus heißt: Der Agent sieht keine Skill-Liste"
       },
       "citation": {
         "label": "Zitation",
@@ -4257,6 +4372,8 @@
     "loadingAgents": "Agenten werden geladen…",
     "empty": "Keine Agenten registriert",
     "emptyHint": "Agenten erscheinen hier, sobald sie sich mit dem Orchestrator verbinden",
+    "loadFailed": "Agenten konnten nicht geladen werden",
+    "loadFailedHint": "Der Orchestrator hat die Agentenliste nicht geliefert. Zum erneuten Versuch aktualisieren.",
     "table": {
       "status": "Status",
       "config": "Konfiguration",

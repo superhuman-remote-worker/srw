@@ -23,6 +23,7 @@ from orchestrator.services import (
     officer_post_lifecycle as officer_post_lifecycle_service,
 )
 from orchestrator.services.cloud import SessionFolderHandle
+from orchestrator.services.cloud.errors import FeatureNotAvailable
 from orchestrator.services.cloud_stage_authority import (
     _capture_cloud_stage_authority,
     _retirement_stage_event_from_receipt as retirement_stage_event_from_receipt,
@@ -80,6 +81,8 @@ class ThreadRetirementDependencies:
     decommission_officer_post: Callable[..., Awaitable[Any]]
     conclude_conference_if_any: Callable[..., Awaitable[None]]
     logger: logging.Logger
+    #: The vector store, for the deleted session's citation layer.
+    vector_db: Any = None
 
 
 async def thread_turn_in_flight(
@@ -381,6 +384,7 @@ async def reconcile_stateless_thread_retirement(
     workspace_absence_proven = False
     initial_creation = None
     retained_startup_attention = None
+    unpublished_creation = None
     preflight_thread = await postgres_db.get_thread(thread_id)
     if preflight_thread is None:
         return {"state": "missing"}
@@ -440,6 +444,11 @@ async def reconcile_stateless_thread_retirement(
             and "retained_startup_attention" in pending_authority
         ):
             retained_startup_attention = pending_authority["retained_startup_attention"]
+        elif (
+            isinstance(pending_authority, dict)
+            and "unpublished_creation" in pending_authority
+        ):
+            unpublished_creation = pending_authority["unpublished_creation"]
         elif creation_pending and not restore_pending:
             retained_source = (
                 await postgres_db.get_current_retained_startup_attention_source(
@@ -470,8 +479,25 @@ async def reconcile_stateless_thread_retirement(
                 initial_creation = await capture_initial(
                     container_provisioner, WorkspaceOwner.session(thread_id)
                 )
+            # The cluster refused the one Pod create (a LimitRange, a quota, a
+            # policy): no Pod or UID exists, so none can ever reach Ready.
+            capture_unpublished = getattr(
+                type(container_provisioner),
+                "capture_unpublished_stateless_creation_retirement",
+                None,
+            )
+            if (
+                retained_source is None
+                and initial_creation is None
+                and callable(capture_unpublished)
+            ):
+                unpublished_creation = await capture_unpublished(
+                    container_provisioner, WorkspaceOwner.session(thread_id)
+                )
         if (creation_pending or restore_pending) and (
-            initial_creation is None and retained_startup_attention is None
+            initial_creation is None
+            and retained_startup_attention is None
+            and unpublished_creation is None
         ):
             # Cancellation after the one-shot Pod call may leave a published
             # UID but no Ready binding/fingerprint. Terminal retirement cannot
@@ -553,6 +579,11 @@ async def reconcile_stateless_thread_retirement(
                     if retained_startup_attention is not None
                     else {}
                 ),
+                **(
+                    {"unpublished_creation": unpublished_creation}
+                    if unpublished_creation is not None
+                    else {}
+                ),
             )
         except RuntimeError as exc:
             raise HTTPException(
@@ -587,7 +618,25 @@ async def reconcile_stateless_thread_retirement(
         if permanent:
             backing_id = closure.get("backing_id")
             runtime_incarnation = closure.get("runtime_incarnation")
-            if (
+            if "unpublished_creation" in closure:
+                # Soft End kept the refused creation's PVC. No Pod ever ran, so
+                # its exact storage goes without a stop proof. A PVC just
+                # deleted can stay Terminating for a moment.
+                for attempt in range(3):
+                    if attempt:
+                        await asyncio.sleep(2)
+                    reclaimed = await container_provisioner.reclaim_unpublished_creation_storage(
+                        WorkspaceOwner.session(thread_id),
+                        closure["unpublished_creation"],
+                    )
+                    if reclaimed:
+                        break
+                if not reclaimed:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Refused workspace creation storage cleanup is incomplete",
+                    )
+            elif (
                 isinstance(backing_id, str)
                 and backing_id.startswith("k8s-")
                 or "initial_creation" in closure
@@ -718,6 +767,47 @@ async def reconcile_stateless_thread_retirement(
             "thread": await postgres_db.get_thread(thread_id),
             "closure": closure,
             "retained_startup_attention": retained,
+        }
+    if unpublished_creation is not None:
+        # The cluster refused the only Pod create, so there is no shell,
+        # resident or process to stop. Settle the creation the way a refused
+        # Job's settles: its reconciliation reads the Pod by name, then removes
+        # the seed and, for permanent End, the PVC. A PVC it just deleted can
+        # stay Terminating for a moment, so try a few times.
+        unpublished = await postgres_db.get_stateless_unpublished_creation_retirement(
+            thread_id
+        )
+        if unpublished != unpublished_creation or not closure.get("claimant_quiesced"):
+            raise HTTPException(503, "Refused workspace creation authority changed")
+        for attempt in range(3):
+            if await postgres_db.get_stateless_unpublished_creation_retirement(
+                thread_id, require_settled=True
+            ):
+                break
+            if attempt:
+                await asyncio.sleep(2)
+            await container_provisioner.request_workspace_creation_cancellation(
+                WorkspaceOwner.session(thread_id),
+                target_disposition="deleted",
+                reclaim_shared_resources=permanent,
+            )
+        if not await postgres_db.get_stateless_unpublished_creation_retirement(
+            thread_id, require_settled=True
+        ):
+            raise HTTPException(503, "Refused workspace creation is still settling")
+        if (
+            not permanent
+            and not await postgres_db.finish_stateless_thread_workspace_retirement(
+                thread_id
+            )
+        ):
+            raise HTTPException(
+                503, "Refused workspace retirement settlement remains incomplete"
+            )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
         }
     if initial_creation is not None:
         # No Ready binding ever existed. The captured initial creation may skip
@@ -1391,6 +1481,50 @@ async def reconcile_stateless_thread_retirement(
 SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S = 30.0
 
 
+async def delete_main_cloud_session_folder(
+    thread: dict[str, Any], *, main_cloud_router: Any, logger: logging.Logger
+) -> None:
+    """Delete a permanently ended session's main-cloud folder, best effort.
+
+    The folder lives on the installation that created it. When this replica
+    cannot resolve that installation (the cloud was not answering at startup
+    and its authority is not established yet), the delete answers a typed
+    503 before the thread row goes, so End stays retryable instead of a 500
+    that leaves the folder behind. A failed remote delete only logs.
+    """
+    session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if not session_handle_str:
+        return
+    try:
+        backend = main_cloud_router.for_thread(thread)
+    except FeatureNotAvailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "main_cloud_unavailable",
+                "message": (
+                    "This session's cloud folder is on a cloud installation "
+                    "that is not reachable yet; retry the delete."
+                ),
+            },
+        ) from exc
+    if not backend.is_initialized:
+        return
+    try:
+        session_handle = SessionFolderHandle.from_db(
+            session_handle_str, backend=backend.backend_id
+        )
+        await backend.delete_session_folder(session_handle)
+    except Exception as exc:
+        logger.warning(
+            "Failed to delete main-cloud session folder for thread %s: %s",
+            thread.get("id"),
+            exc,
+        )
+
+
 @asynccontextmanager
 async def _end_workspace_ownership(store, thread_id: str, *, lane: str, held: bool):
     if held:
@@ -1747,23 +1881,27 @@ async def _end_thread_flow_owned(
             ):
                 raise RuntimeError("Repository credential revocation is retryable")
 
-        session_handle_str = authoritative_thread.get(
-            "main_cloud_session_handle"
-        ) or authoritative_thread.get("nc_session_folder")
-        if session_handle_str:
-            backend = main_cloud_router.for_thread(authoritative_thread)
-            if backend.is_initialized:
-                try:
-                    session_handle = SessionFolderHandle.from_db(
-                        session_handle_str, backend=backend.backend_id
+        await delete_main_cloud_session_folder(
+            authoritative_thread, main_cloud_router=main_cloud_router, logger=logger
+        )
+
+        # The session's citations, annotations, tags and source links, and any
+        # source nothing else uses (citation engine overhaul WP5). Its
+        # memories stay: they belong to the project. Best-effort like the log
+        # archives: rows of a deleted thread are unreachable through the API.
+        vector_db = dependencies.vector_db
+        if vector_db is not None:
+            try:
+                async with vector_db.acquire() as conn:
+                    await conn.execute(
+                        "SELECT retire_session_citations($1::uuid)", thread_id
                     )
-                    await backend.delete_session_folder(session_handle)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to delete main-cloud session folder for thread %s: %s",
-                        thread_id,
-                        exc,
-                    )
+            except Exception as exc:
+                logger.warning(
+                    "Citation cleanup failed for deleted thread %s: %s",
+                    thread_id,
+                    exc,
+                )
 
     if not stateless:
         if (
@@ -2448,6 +2586,27 @@ async def _end_thread_flow_owned(
                 if agent_workspace_exit_handoff:
                     return _ending_response(retiring_agent_exit_authorized=True)
                 if permanent:
+                    from orchestrator.services.thread_uploads import (
+                        purge_virtual_workspace_leftover,
+                        recorded_virtual_upgrade_bindings,
+                    )
+
+                    # A VM upgrade from a virtual Session kept its old files as
+                    # the upgrade's fallback. The retirement captured the VM
+                    # record; the row's own copy may already be cleared.
+                    retired_vm = (
+                        context.get("vm") if isinstance(context, Mapping) else None
+                    )
+                    if not await purge_virtual_workspace_leftover(
+                        authoritative_thread,
+                        recorded_bindings=recorded_virtual_upgrade_bindings(
+                            thread_metadata_object(authoritative_thread),
+                            vm=retired_vm if isinstance(retired_vm, dict) else None,
+                        ),
+                    ):
+                        raise RuntimeError(
+                            "The old virtual workspace's cleanup remains retryable"
+                        )
                     await _delete_auxiliary_state(authoritative_thread)
                     await postgres_db.delete_thread(
                         thread_id,
@@ -2710,6 +2869,27 @@ async def _end_thread_flow_owned(
                         raise HTTPException(
                             status_code=503,
                             detail=("Terminal virtual workspace cleanup is incomplete"),
+                        )
+                else:
+                    from orchestrator.services.thread_uploads import (
+                        purge_virtual_workspace_leftover,
+                        recorded_virtual_upgrade_bindings,
+                    )
+
+                    # An upgraded Session's old virtual files stayed behind as
+                    # the upgrade's fallback; nothing reads them once the row
+                    # goes.
+                    if not await purge_virtual_workspace_leftover(
+                        terminal_thread,
+                        recorded_bindings=recorded_virtual_upgrade_bindings(
+                            terminal_metadata
+                        ),
+                    ):
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "The old virtual workspace's cleanup is incomplete"
+                            ),
                         )
                 from orchestrator.services.stateless_workspace_history_cleanup import (
                     reclaim_stateless_workspace_history,
@@ -3132,6 +3312,37 @@ async def archive_and_cleanup_workspace(
                     permit=purge,
                 )
                 actions.append("retained vm rootdisk permanently deleted")
+
+        if (
+            ws_ctx
+            and set(ws_ctx) <= {"error", "status"}
+            and isinstance(ws_ctx.get("error"), str)
+        ):
+            # The cluster refused the Pod, so the Job holds only that error and
+            # its creation (with any PVC) waits for the sweep. Settle it here;
+            # the reconciliation proves the Pod absent first. A PVC it just
+            # deleted can stay Terminating for a moment, so try a few times.
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2)
+                cancelled = (
+                    await container_provisioner.request_workspace_creation_cancellation(
+                        WorkspaceOwner.job(entity_id),
+                        target_disposition="deleted",
+                        reclaim_shared_resources=True,
+                    )
+                )
+                if (
+                    cancelled is None
+                    or cancelled.get("reconciliation_outcome") == "aborted"
+                ):
+                    break
+            if cancelled is not None:
+                if cancelled.get("reconciliation_outcome") != "aborted":
+                    raise RuntimeError(
+                        "Refused Kubernetes workspace creation is still settling"
+                    )
+                actions.append("refused k8s workspace creation settled")
 
         # Workspace container cleanup (snapshot + delete)
         if ws_ctx and ws_ctx.get("status") not in (

@@ -112,7 +112,7 @@ NODE_REGISTRY = "srw-registry:5000"
 REGISTRY_CONTAINER = "srw-registry"
 REGISTRY_REPOSITORIES = "/var/lib/registry/docker/registry/v2/repositories"
 UPSTREAM_RCLONE = (
-    "rclone/rclone:1.74.3"
+    "rclone/rclone:1.75.2"
     "@sha256:623378ad0ff3ebd5cebf77720843c0e02edfe46e2d5b5ac6bed54c6371780dfb"
 )
 WORKSPACE_IMAGE = "docker.io/library/busybox:1.36"

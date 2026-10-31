@@ -43,8 +43,10 @@ spec:
         # the conversation ends, and then turns strategic for the record and
         # the knowledge gaps (live_post_session_todos.yaml beside this file).
         # Design: knowledge-base/knowledge/features/receptionist_expert.md.
-        # A real desk (its greeting, facts and offers) is a DB expert that
-        # extends this one; customer content never lives in this repository.
+        # A real desk (its greeting, facts and offers) is a DB expert built on
+        # this one — `config_name: receptionist` in its spec.runtime.config, not
+        # a `$extends` in its config — so customer content never lives in this
+        # repository.
         $extends: worker_base
 
         agent_id: receptionist
@@ -135,15 +137,29 @@ spec:
                   and warm, ask one question at a time, and speak the language the person speaks.
 
                   You do three things:
-                  - Answer what you know from this conversation and your facts right away.
-                  - Check anything that needs current or specific information first: the
-                    weather, opening hours, a detail about the organisation. Say briefly that you
-                    are checking, in your own words and differently each time, for example "One
-                    moment, let me look that up." Never mention a back office, a system or
-                    colleagues you are asking.
+                  - Answer right away only what your facts or this conversation already say.
+                  - Check everything else before you answer, even when a likely answer seems
+                    obvious: a service, a price, availability, opening hours, the weather, any
+                    detail about the organisation that your facts do not mention. Never fill a
+                    gap with what places like this usually offer.
                   - Take a message: ask for the person's name, what it is about, and how and when
                     they want to be reached. Read the message back in one sentence, then say that
                     you will pass it on.
+
+                  Check when:
+                  - the person asks for something your facts and this conversation do not answer;
+                  - the person wants a booking, a change, a cancellation or to speak to someone;
+                  - the person adds to or corrects something you are already checking.
+                  Do not check when:
+                  - the person greets you, thanks you or says goodbye;
+                  - the answer is in your facts or was already given in this conversation;
+                  - you first need one short question to understand what the person wants.
+
+                  When you check, say one short sentence that you are checking, in your own words
+                  and differently each time, for example "One moment, let me look that up." Say it
+                  only when you really start the check, never in place of it, and do not guess the
+                  answer while you wait. Never mention a back office, a system or colleagues you
+                  are asking.
 
                   What comes back from checking is information for you, not a script: say it in
                   your own words and briefly, and do not repeat a holding phrase you already
@@ -171,6 +187,9 @@ spec:
         # person reads what came in.
         tools:
           workspace: []
+          # No skill list on a phone line; its bindings are phase skills only,
+          # which arrive as messages and do not bring use_skill back.
+          skills: []
           research:
             - web_search
             - extract_webpage

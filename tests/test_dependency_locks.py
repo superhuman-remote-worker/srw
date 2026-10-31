@@ -22,6 +22,12 @@ SPEC.loader.exec_module(locks)
 
 #: The packages the orchestrator image copies in beside its locked environment.
 ORCHESTRATOR_IMAGE_PACKAGES = {"orchestrator", "shared"}
+#: Roles whose image Tilt builds for the local inner loop. The voice gateway
+#: is opt-in (voiceGateway.enabled) and its image comes from CI or a local
+#: build, so Tilt does not rebuild it on every start.
+TILT_ROLES = {"orchestrator", "vm-controller"}
+#: Roles that talk to the Kubernetes API and so carry the shared SDK policy.
+SDK_ROLES = {"orchestrator", "vm-controller"}
 
 
 def third_party_imports(package: Path) -> dict[str, set[str]]:
@@ -133,6 +139,19 @@ def test_wrong_python_target_fails(monkeypatch):
 
 @pytest.mark.parametrize("role", locks.ROLES)
 def test_lock_inputs_invalidate_tilt_and_develop_image_identity(role):
+    workflow = (ROOT / ".github/workflows/develop.yml").read_text()
+    variable = role.upper().replace("-", "_")
+    match = re.search(
+        rf"^\s*{variable}_PATHS=\((.*?)\)", workflow, re.MULTILINE | re.DOTALL
+    )
+    identity_inputs = shlex.split(match.group(1))
+    if role not in TILT_ROLES:
+        for name in (*locks.COMMON_INPUTS, *locks.paths(role)):
+            assert any(
+                name == path or (path.endswith("/") and name.startswith(path))
+                for path in identity_inputs
+            ), (name, identity_inputs)
+        return
     build = next(
         node
         for node in ast.walk(ast.parse((ROOT / "Tiltfile").read_text()))
@@ -146,12 +165,6 @@ def test_lock_inputs_invalidate_tilt_and_develop_image_identity(role):
     watched = ast.literal_eval(
         next(item.value for item in build.keywords if item.arg == "only")
     )
-    workflow = (ROOT / ".github/workflows/develop.yml").read_text()
-    variable = role.upper().replace("-", "_")
-    match = re.search(
-        rf"^\s*{variable}_PATHS=\((.*?)\)", workflow, re.MULTILINE | re.DOTALL
-    )
-    identity_inputs = shlex.split(match.group(1))
     groups = [watched, identity_inputs]
     if role == "orchestrator":
         fallback = next(
@@ -193,7 +206,13 @@ def test_ci_role_checks_gate_existing_build_and_publication_path(workflow):
 def test_shared_sdk_policy_matches_both_resolutions(role):
     pins = locks.pinned_versions(ROOT / locks.paths(role)[1])
     policy = locks.pinned_versions(ROOT / "requirements/constraints.txt")
-    assert {name: pins[name] for name in policy} == policy
+    if role in SDK_ROLES:
+        assert set(policy) <= set(pins), role
+    # A constraint binds every role that resolves the package at all.
+    shared = set(policy) & set(pins)
+    assert {name: pins[name] for name in shared} == {
+        name: policy[name] for name in shared
+    }
     manifest = json.loads((ROOT / locks.paths(role)[2]).read_text())
     assert manifest["platform"] == "linux/amd64"
 
@@ -219,3 +238,55 @@ def test_lazy_import_missing_from_the_lock_is_reported(tmp_path):
     )
     imports = third_party_imports(tmp_path)
     assert unlocked_imports(imports, {"httpx": "0.28.1"}) == [("neo4j", ["probe.py"])]
+
+
+def test_excluded_distributions_leave_the_lock_and_only_them(tmp_path):
+    """A role's sdist-only distribution its image never imports (docopt for
+    the voice gateway) is resolved, then left out of the lock with its
+    format option; nothing else is touched."""
+    lock = tmp_path / "lock.txt"
+    lock.write_text(
+        "#\n# header\n#\n--no-binary docopt\n--only-binary :all:\n\n"
+        "docopt==0.6.2 \\\n    --hash=sha256:aa\n    # via num2words\n"
+        "num2words==0.5.14 \\\n    --hash=sha256:bb\n    # via pipecat-ai\n"
+    )
+    locks.strip_excluded("voice-gateway", lock)
+    text = lock.read_text()
+    assert "docopt==" not in text and "--no-binary" not in text
+    assert "num2words==0.5.14" in text and "--only-binary :all:" in text
+    assert locks.pinned_versions(lock) == {"num2words": "0.5.14"}
+    before = lock.read_text()
+    locks.strip_excluded("orchestrator", lock)
+    assert lock.read_text() == before
+
+
+def test_the_voice_gateway_lock_leaves_out_what_its_image_never_imports():
+    pins = locks.pinned_versions(ROOT / locks.paths("voice-gateway")[1])
+    assert "pipecat-ai" in pins and "onnxruntime" in pins
+    assert set(locks.EXCLUDED["voice-gateway"]) & set(pins) == set()
+
+
+def test_pip_check_tolerates_only_the_roles_exclusions(monkeypatch):
+    class Result:
+        returncode = 1
+        stdout = (
+            "num2words 0.5.14 requires docopt, which is not installed.\n"
+            "pipecat-ai 1.12.0 has requirement numpy<3, but you have numpy 3.0.\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(locks.subprocess, "run", lambda *a, **k: Result())
+    assert locks.pip_check("voice-gateway") == [
+        "pipecat-ai 1.12.0 has requirement numpy<3, but you have numpy 3.0."
+    ]
+    assert len(locks.pip_check("orchestrator")) == 2
+    Result.returncode, Result.stdout = 0, "No broken requirements found.\n"
+    assert locks.pip_check("orchestrator") == []
+
+
+def test_the_voice_gateway_image_installs_its_lock_like_ci_does():
+    dockerfile = (ROOT / "docker/Dockerfile.voice-gateway").read_text()
+    assert "--require-hashes --no-deps --only-binary :all:" in dockerfile
+    assert "-r requirements/locks/voice-gateway-py312.txt" in dockerfile
+    assert "check voice-gateway --installed" in dockerfile
+    assert "pip-check voice-gateway" in dockerfile

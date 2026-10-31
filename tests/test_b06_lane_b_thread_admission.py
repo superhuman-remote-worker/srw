@@ -271,7 +271,7 @@ class TestConfigOverrideRebuild:
         )
         assert override["interactive"]["permission_mode"] == "autonomous"
 
-    @pytest.mark.parametrize("mode", ["supervised", "auto_accept", "autonomous", None])
+    @pytest.mark.parametrize("mode", ["read_only", "auto_accept", "autonomous", None])
     def test_valid_permission_modes_and_none_are_accepted(self, mode):
         assert ThreadCreateRequest(permission_mode=mode).permission_mode == mode
 
@@ -279,10 +279,10 @@ class TestConfigOverrideRebuild:
         with pytest.raises(ValidationError) as exc:
             ThreadCreateRequest(permission_mode="default")
         text = str(exc.value)
-        for allowed in ("supervised", "auto_accept", "autonomous"):
+        for allowed in ("read_only", "auto_accept", "autonomous"):
             assert allowed in text
 
-    @pytest.mark.parametrize("mode", ["supervised", "auto_accept", "autonomous"])
+    @pytest.mark.parametrize("mode", ["read_only", "auto_accept", "autonomous"])
     def test_child_thread_schema_accepts_valid_permission_modes(self, mode):
         assert AgentThreadCreateRequest(permission_mode=mode).permission_mode == mode
 
@@ -290,7 +290,7 @@ class TestConfigOverrideRebuild:
         with pytest.raises(ValidationError) as exc:
             AgentThreadCreateRequest(permission_mode="default")
         text = str(exc.value)
-        for allowed in ("supervised", "auto_accept", "autonomous"):
+        for allowed in ("read_only", "auto_accept", "autonomous"):
             assert allowed in text
 
     def test_the_workspace_tier_is_honored_at_create(self):
@@ -648,7 +648,7 @@ class TestCreationPlan:
         assert plan.execution_lane == "pinned"
         assert plan.lite_session is False and plan.vm_session is False
         assert plan.create_kwargs["config_name"] == "session_base"
-        assert plan.create_kwargs["permission_mode"] == "supervised"
+        assert plan.create_kwargs["permission_mode"] == "read_only"
 
     @pytest.mark.asyncio
     async def test_a_new_session_follows_the_connector_rule_from_birth(self):
@@ -1008,6 +1008,26 @@ class TestExpertSelection:
         deps.store.create_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_an_inline_expert_on_an_approved_image_is_told_to_save_it(
+        self, monkeypatch
+    ):
+        approved = "example.invalid/h@sha256:" + "b" * 64
+        deps, _resolver = _experts_on(
+            monkeypatch,
+            store={"manifest_approved_images": ({"name": "cc", "image": approved},)},
+        )
+        expert = _inline()
+        expert["inline"]["runtime"]["image"] = approved
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=expert), deps)
+        assert exc.value.status_code == 422
+        assert exc.value.detail == (
+            "Inline Experts run the installed harness; save the Expert as a "
+            "manifest resource to run an approved harness image."
+        )
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_uuid_expert_selects_the_db_expert(self, monkeypatch):
         deps, resolver = _experts_on(monkeypatch)
         plan = await _plan(
@@ -1061,6 +1081,40 @@ class TestExpertSelection:
             ThreadCreateRequest(expert="session_base", expert_id=DB_EXPERT), deps
         )
         assert resolver.await_args.kwargs["explicit_expert_id"] == DB_EXPERT
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("approved", [True, False])
+    async def test_a_saved_expert_on_a_custom_image_is_jobs_only(
+        self, monkeypatch, approved
+    ):
+        custom = "example.invalid/h@sha256:" + "b" * 64
+        deps, _ = _experts_on(
+            monkeypatch,
+            store={
+                "manifest_approved_images": (
+                    ({"name": "cc", "image": custom},) if approved else ()
+                )
+            },
+        )
+        ta.resolve_root_expert.return_value = ExpertSelection(
+            expert={
+                "id": DB_EXPERT,
+                "harness_adapter": "srw/v1",
+                "config": {},
+                "manifest": {
+                    "spec": {"runtime": {"adapter": "srw/v1", "image": custom}}
+                },
+            },
+            source="explicit",
+        )
+        resolve = MagicMock(side_effect=AssertionError("resolved a jobs-only expert"))
+        monkeypatch.setattr(ta, "resolve_config", resolve)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=DB_EXPERT), deps)
+        assert exc.value.status_code == 422
+        assert "jobs only" in exc.value.detail
+        resolve.assert_not_called()
+        deps.store.create_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_commit_hands_the_inline_definition_to_the_insert(self):

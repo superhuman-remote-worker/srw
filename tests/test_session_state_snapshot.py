@@ -118,7 +118,7 @@ class _SnapshotDB:
 def _thread(**overrides):
     row = {
         "id": "thread-1",
-        "permission_mode": "supervised",
+        "permission_mode": "read_only",
         "metadata": {},
         "status": "active",
         "execution_lane": "pinned",
@@ -233,7 +233,7 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
         "thread_id": "thread-1",
         "conversation_revision": 6,
         # The first-class thread column is the durable permission authority.
-        "permission_mode": "supervised",
+        "permission_mode": "read_only",
         "narration_mode": "verbose",
         "turn_count": 7,
         "turn_in_flight": True,
@@ -362,7 +362,7 @@ async def test_valid_pending_prior_epoch_receipt_overlays_old_thread_scalar():
     )
     conn = _SnapshotConn(
         thread=_thread(
-            permission_mode="supervised",
+            permission_mode="read_only",
             narration_mode="auto",
             events_epoch=3,
         ),
@@ -393,7 +393,7 @@ async def test_finalized_historical_receipt_does_not_overlay_newer_thread_scalar
     )
     conn = _SnapshotConn(
         thread=_thread(
-            permission_mode="supervised",
+            permission_mode="read_only",
             narration_mode="verbose",
         ),
         control_receipts=[historical],
@@ -402,7 +402,7 @@ async def test_finalized_historical_receipt_does_not_overlay_newer_thread_scalar
     result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
 
     assert result is not None
-    assert result["permission_mode"] == "supervised"
+    assert result["permission_mode"] == "read_only"
     assert result["narration_mode"] == "verbose"
     control_sql = next(
         sql for sql, _args in conn.calls if "FROM thread_control_requests" in sql
@@ -419,7 +419,7 @@ async def test_finalized_historical_receipt_does_not_overlay_newer_thread_scalar
             id="mismatched-kind",
         ),
         pytest.param(
-            {"event_mode": "supervised"},
+            {"event_mode": "read_only"},
             id="mismatched-mode",
         ),
         pytest.param(
@@ -437,14 +437,14 @@ async def test_mismatched_pending_control_receipt_is_ignored(receipt_override):
         **receipt_override,
     )
     conn = _SnapshotConn(
-        thread=_thread(permission_mode="supervised", narration_mode="auto"),
+        thread=_thread(permission_mode="read_only", narration_mode="auto"),
         control_receipts=[receipt],
     )
 
     result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
 
     assert result is not None
-    assert result["permission_mode"] == "supervised"
+    assert result["permission_mode"] == "read_only"
     assert result["narration_mode"] == "auto"
 
 
@@ -463,7 +463,7 @@ async def test_pending_permission_and_narration_receipts_overlay_independently()
         mode="auto_accept",
     )
     conn = _SnapshotConn(
-        thread=_thread(permission_mode="supervised", narration_mode="verbose"),
+        thread=_thread(permission_mode="read_only", narration_mode="verbose"),
         control_receipts=[narration, permission],
     )
 

@@ -97,7 +97,10 @@ def resolve_config(
     resolved entries, not ``{$ref: critic}``). ``db_refs`` is the caller's
     prefetched ``{expert_uuid: row}`` map for UUID ``$ref``s; an entry that
     cannot be resolved is dropped and recorded in ``agent._roster_warnings``
-    — dispatch never fails a job over its roster.
+    — dispatch never fails a job over its roster. The exception is a merged
+    entry that breaks the live voice contract (a ``live`` block without
+    ``driver: live``): ``LiveEntryError`` (a ``ValueError``) is raised, since
+    the save checks each authored layer alone and only the merge can see it.
 
     ``base_defaults`` sits just above the bundled base and *below* the expert:
     use it for the system/user **default model** selection (model names only), so

@@ -50,6 +50,7 @@ async def build_kb_embedding_service(
     set EMBEDDING_*. Returns ``None`` when no usable key resolves — the caller
     must skip reindexing (a keyless run could only write vectorless rows).
     """
+    from shared.runtime.core.transport_resolution import served_model_from_env
     from shared.runtime.services.embedding_service import EmbeddingService
 
     env: dict[str, Any] = {}
@@ -57,6 +58,7 @@ async def build_kb_embedding_service(
     if env.get("KB_EMBEDDING_API_KEY"):
         return EmbeddingService(
             model=env.get("KB_EMBEDDING_MODEL"),
+            served_model=served_model_from_env("KB_EMBEDDING", env),
             base_url=env.get("KB_EMBEDDING_BASE_URL"),
             api_key=env.get("KB_EMBEDDING_API_KEY"),
             provider=env.get("KB_EMBEDDING_PROVIDER"),

@@ -184,7 +184,7 @@ def format_cloud_scan_guard_message(command: str, risk: CloudScanRisk) -> str:
         "broad operation over rclone-mounted cloud storage.\n"
         f"Reason: {risk.reason}.\n"
         f"Command: {command}\n\n"
-        "Use a narrower file or directory under /workspace/cloud, run a metadata-only "
+        "Use a narrower file or directory under the cloud/ folder, run a metadata-only "
         "query first, or ask the operator before scanning a large cloud tree."
     )
 

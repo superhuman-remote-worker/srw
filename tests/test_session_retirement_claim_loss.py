@@ -330,6 +330,98 @@ def test_pending_workspace_absence_proof_is_unsupported():
         stateless_retirement_authority(metadata)
 
 
+UNPUBLISHED = {
+    "generation": "11111111-1111-4111-8111-111111111111",
+    "reservation_id": "33333333-3333-4333-8333-333333333333",
+    "reservation_generation": 4,
+    "namespace": "agent-workspaces",
+}
+
+
+def _unpublished_metadata(**marker_changes) -> dict:
+    """A refused creation's End: no Pod ever existed, so nothing to retire."""
+    marker = {
+        "terminal_token": 1,
+        "claimant_quiesced": True,
+        "shell_retirement_required": False,
+        "resident_cleanup_required": False,
+        "residents_retired": True,
+        "remote_retired": True,
+        "permanent": False,
+        "workspace_generation": None,
+        "endpoint_generation": None,
+        "runtime_incarnation": None,
+        "host_key_fingerprint": None,
+        "unpublished_creation": dict(UNPUBLISHED),
+    }
+    marker.update(marker_changes)
+    return {
+        "_stateless_workspace_retirement_pending": True,
+        "_stateless_claim_retirement": marker,
+        "workspace_container": {"status": "pending", "provisioner": "k8s"},
+    }
+
+
+def test_an_unpublished_creation_end_needs_no_shell_or_resident_proof():
+    marker = stateless_retirement_release_authorized(_unpublished_metadata())
+    assert marker["unpublished_creation"] == UNPUBLISHED
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"runtime_incarnation": "22222222-2222-4222-8222-222222222222"},
+        {"shell_retirement_required": True, "remote_retired": False},
+        {"resident_cleanup_required": True, "residents_retired": False},
+        {"terminal_token": 0},
+        {"unpublished_creation": {**UNPUBLISHED, "pod_uid": None}},
+        {"unpublished_creation": {**UNPUBLISHED, "reservation_generation": 0}},
+        {"initial_creation": {}},
+    ],
+    ids=[
+        "runtime",
+        "shell",
+        "resident",
+        "no-token",
+        "extra-field",
+        "no-generation",
+        "two-variants",
+    ],
+)
+def test_an_unpublished_creation_marker_refuses_any_other_shape(change):
+    with pytest.raises(RuntimeError):
+        stateless_retirement_authority(_unpublished_metadata(**change))
+
+
+@pytest.mark.parametrize(
+    "change,accepted",
+    [
+        ({}, True),
+        ({"backing_id": "k8s-pvc:agent-workspaces:pvc-uid"}, False),
+        ({"runtime_incarnation": "22222222-2222-4222-8222-222222222222"}, False),
+        ({"snapshot_restore_required": True}, False),
+    ],
+)
+def test_a_settled_unpublished_creation_names_no_runtime_or_backing(change, accepted):
+    settled = {
+        "terminal_token": 1,
+        "cleanup_complete": True,
+        "permanent": False,
+        "backing_id": None,
+        "runtime_incarnation": None,
+        "snapshot_restore_required": False,
+        "unpublished_creation": dict(UNPUBLISHED),
+        **change,
+    }
+    metadata = {"_stateless_workspace_retirement_settled": settled}
+    if accepted:
+        parsed = stateless_settled_retirement_authority(metadata)
+        assert parsed["unpublished_creation"] == UNPUBLISHED
+    else:
+        with pytest.raises(RuntimeError):
+            stateless_settled_retirement_authority(metadata)
+
+
 def test_settled_workspace_absence_proof_is_unsupported():
     with pytest.raises(RuntimeError, match="absence proof is unsupported"):
         stateless_settled_retirement_authority(

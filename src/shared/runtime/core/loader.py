@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import yaml
 from langchain_core.language_models import BaseChatModel
 
+from shared.permission_modes import (
+    DEFAULT_PERMISSION_MODE,
+    normalize_permission_mode,
+)
 from shared.runtime.core.delegation_settings import (
     FAMILY_SESSION_MAX_CONCURRENT_KEY,
     MATRIX_SESSION_MAX_CONCURRENT_KEY,
@@ -40,6 +44,7 @@ from shared.runtime.core.tool_policy import (
     normalize_tool_policy,
 )
 from shared.runtime.llm.reasoning_chat import ReasoningChatOpenAI
+from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +502,41 @@ def normalize_delegation_block(fragment: Any, *, source: str) -> Any:
     return out
 
 
+_PERMISSION_MODE_LOG_SEEN: set = set()
+
+
+def normalize_interactive_permission_mode(fragment: Any, *, source: str) -> Any:
+    """Map a legacy ``interactive.permission_mode`` spelling of ONE config layer.
+
+    ``supervised`` was renamed ``read_only`` (tool_permission_tiers.md, D2).
+    Never mutates the input; a layer without the legacy value is returned by
+    identity. Logs one deprecation warning per source.
+    """
+    if not isinstance(fragment, dict):
+        return fragment
+    interactive = fragment.get("interactive")
+    if not isinstance(interactive, dict):
+        return fragment
+    mode = interactive.get("permission_mode")
+    canonical = normalize_permission_mode(mode)
+    if canonical == mode:
+        return fragment
+    out = dict(fragment)
+    out["interactive"] = {**interactive, "permission_mode": canonical}
+    if source not in _PERMISSION_MODE_LOG_SEEN:
+        if len(_PERMISSION_MODE_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
+            _PERMISSION_MODE_LOG_SEEN.clear()
+        _PERMISSION_MODE_LOG_SEEN.add(source)
+        logger.warning(
+            "config: interactive.permission_mode %r in %s read as %r (renamed; "
+            "see tool_permission_tiers.md)",
+            mode,
+            source,
+            canonical,
+        )
+    return out
+
+
 # =============================================================================
 # Subagent roster: the ``inherit`` model sentinel (U1 — universal experts)
 # =============================================================================
@@ -522,6 +562,7 @@ LLM_INHERITED_KEYS = (
     "base_url",
     "api_key",
     "model_max_context_tokens",
+    "served_model",
 )
 
 
@@ -753,6 +794,10 @@ def load_and_merge_config(
     config_data = normalize_llm_tiers(config_data, source=str(config_path))
     # And for the pre-U3 delegation keys (dropped, never merged).
     config_data = normalize_delegation_block(config_data, source=str(config_path))
+    # And for the renamed permission mode (supervised -> read_only).
+    config_data = normalize_interactive_permission_mode(
+        config_data, source=str(config_path)
+    )
 
     # Handle $extends inheritance
     if "$extends" in config_data:
@@ -2021,6 +2066,8 @@ class PhaseLLMOverride:
     extra_body: Optional[Dict[str, Any]] = None
     # Transport headers for this phase's route (see LLMConfig.extra_headers).
     extra_headers: Optional[Dict[str, str]] = None
+    # The string this phase's catalog row sends upstream (LLMConfig.served_model).
+    served_model: Optional[str] = None
 
 
 @dataclass
@@ -2080,6 +2127,13 @@ class LLMConfig:
     # back as empty thinking blocks (shared.subscription_routing). Honoured by
     # the OpenAI-compatible factories; other providers ignore it.
     extra_headers: Optional[Dict[str, str]] = None
+    # The model string sent upstream when the catalog row names one
+    # (``models.served_model_id``), injected at DISPATCH from that row — never
+    # set from YAML. ``model`` stays the catalog id: family, settings matrix,
+    # reasoning checks and usage all read it; only the request carries this.
+    # None = send ``model`` (minus a routing prefix), and a dispatch writes
+    # None to clear it on a session model switch. See ``wire_model_name``.
+    served_model: Optional[str] = None
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
@@ -2138,6 +2192,15 @@ class LLMConfig:
         else:
             api_key = self.api_key
 
+        # The served string belongs to its model: an overlay that names a
+        # different model brings its own (or none), never the parent's.
+        if override.model is not None and override.model != self.model:
+            served_model = override.served_model
+        elif override.served_model is not None:
+            served_model = override.served_model
+        else:
+            served_model = self.served_model
+
         # Create new config with overrides applied (don't copy phase fields)
         return LLMConfig(
             model=override.model if override.model is not None else self.model,
@@ -2181,6 +2244,7 @@ class LLMConfig:
             extra_headers=override.extra_headers
             if override.extra_headers is not None
             else self.extra_headers,
+            served_model=served_model,
             compaction=self.compaction,
             # Phase overrides not inherited to resolved config
             summarization=None,
@@ -2243,6 +2307,11 @@ class ToolsConfig:
     """
 
     workspace: List[str] = field(default_factory=list)
+    # use_skill. Its own category so a rewritten ``workspace`` list cannot drop
+    # it; a ``before_tool`` skill binding puts it back even when this is ``[]``
+    # (ensure_skill_tool_for_bindings).
+    # knowledge-base/knowledge/features/skills_tool_category.md
+    skills: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
     research: List[str] = field(default_factory=list)
     browser_direct: List[str] = field(default_factory=list)
@@ -2306,7 +2375,7 @@ class ToolsConfig:
         # answering one question is how job c4849fa1 (2026-08-16) ended up
         # reading `fatal: bad object` from git_show — then the job's own repo
         # only — as proof that its attached repository was unusable, while the
-        # files it wanted sat in repos/KurortEngine/.
+        # files it wanted sat in repos/WidgetShop/.
         #
         # Shell wins: it is strictly more capable. Suppressing here rather
         # than in src/tools/registry keeps
@@ -2439,12 +2508,6 @@ class ContextManagementConfig:
     summarization_template: str = "summarization_prompt.txt"
     reasoning_level: str = "high"
     max_summary_length: int = 10000
-    # Append-only context injection rollback flag (WP2 spec §I): "legacy"
-    # rebuilds the per-request transient tail; "append_only" appends typed
-    # context entries to the history only when their content changes. The
-    # carrier fold, the injection predicate, persistence and restore work the
-    # same in both modes.
-    injection_mode: str = "legacy"
 
 
 @dataclass
@@ -2515,10 +2578,6 @@ class RerankerConfig:
     # knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
     retries: int = 2
     retry_backoff: float = 1.0
-    # Keep TTL-pinned items (the recency working set) ahead of the
-    # reranked tail — Phase 3's bounded-core policy revisits pinning
-    # itself; the scorer doesn't change tier semantics.
-    keep_pinned_first: bool = True
 
 
 @dataclass
@@ -2554,8 +2613,7 @@ class GateConfig:
     magnitude per query while evidence/distractor separation stays
     strong, so absolute cutoffs delete weakly-phrased evidence). Items
     the channel never scored (scorer outage, candidates past the
-    reranker's top_k, a pinned head under keep_pinned_first) pass
-    through ungated, so a failed scorer degrades to the legacy full dump
+    reranker's top_k) pass through ungated, so a failed scorer degrades to the legacy full dump
     rather than an empty injection. ``threshold`` must be set for the
     policy to bind.
     """
@@ -2624,6 +2682,37 @@ class QueryConfig:
     digest_max_chars_per_message: int = 500
 
 
+#: ``memory.retrieval.same_conversation`` values (append-only context
+#: injection P4, decided by the test in the vault,
+#: knowledge-base/knowledge/tests/aoci_same_conversation_memory_reinjection_test.md).
+#: ``skip_in_context`` skips a memory whose source is the current job or
+#: session while its source turns are still in context (arm B, the shipped
+#: default since 2026-10-29); ``allow`` keeps it eligible (arm A, before).
+SAME_CONVERSATION_ALLOW = "allow"
+SAME_CONVERSATION_SKIP_IN_CONTEXT = "skip_in_context"
+SAME_CONVERSATION_MODES = (SAME_CONVERSATION_ALLOW, SAME_CONVERSATION_SKIP_IN_CONTEXT)
+
+
+@dataclass
+class MemoryRetrievalConfig:
+    """memory.retrieval — what a finished retrieval may inject (P4).
+
+    ``same_conversation`` decides the memories the observer extracted from
+    the conversation that is retrieving them. ``skip_in_context`` drops one
+    while its source turns are still in context and lets it in again once a
+    compaction has removed them (``agent.services.memory.same_conversation``);
+    ``allow`` keeps them eligible. The model's own ``memory_search`` is never
+    filtered.
+
+    The shipped default is ``skip_in_context``, stated in
+    ``config/expert_base.yaml`` (D38). This dataclass default stays ``allow``
+    for a config without the key: a resolved config frozen before the key
+    existed keeps the behaviour its job was created with.
+    """
+
+    same_conversation: str = SAME_CONVERSATION_ALLOW
+
+
 @dataclass
 class MemoryConfig:
     """Memory Light (RecallStore) configuration.
@@ -2653,8 +2742,6 @@ class MemoryConfig:
     # the prefetch off.
     prefetch_budget_s: float = 3.0
     observer_interval: int = 5
-    assembler_interval: int = 7
-    default_ttl: int = 10
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
@@ -2668,6 +2755,7 @@ class MemoryConfig:
     bounded: BoundedConfig = field(default_factory=BoundedConfig)
     gate: GateConfig = field(default_factory=GateConfig)
     query: QueryConfig = field(default_factory=QueryConfig)
+    retrieval: MemoryRetrievalConfig = field(default_factory=MemoryRetrievalConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
 
@@ -2716,6 +2804,9 @@ class AuxiliaryConfig:
     # list, and rebuilding the LLMConfig without it silently drops the route's
     # header.
     extra_headers: Optional[Dict[str, str]] = None
+    # The aux row's upstream model string (LLMConfig.served_model), injected
+    # at dispatch; threaded for the same reason as ``extra_headers``.
+    served_model: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -2736,7 +2827,6 @@ class AuxiliaryConfig:
         default_factory=lambda: {
             "extract_memories": AuxiliaryTaskConfig(enabled=True),
             "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
-            "assemble_memories": AuxiliaryTaskConfig(enabled=True),
             "verify_citations": AuxiliaryTaskConfig(enabled=True),
         }
     )
@@ -2750,7 +2840,9 @@ class InteractiveConfig:
     Controls permission defaults and idle behavior.
     """
 
-    permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
+    permission_mode: str = (
+        DEFAULT_PERMISSION_MODE  # read_only | auto_accept | autonomous
+    )
     narration_mode: str = "auto"  # silent | verbose | auto
     idle_timeout_minutes: int = 30  # 0 = disabled
 
@@ -2964,6 +3056,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         model_max_context_tokens=data.get("model_max_context_tokens"),
         extra_body=data.get("extra_body"),
         extra_headers=data.get("extra_headers"),
+        served_model=data.get("served_model"),
     )
 
 
@@ -3003,6 +3096,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         extra_body=llm_data.get("extra_body"),
         extra_headers=llm_data.get("extra_headers"),
+        served_model=llm_data.get("served_model"),
         compaction=llm_data.get("compaction"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
@@ -3157,6 +3251,28 @@ def _parse_prefetch_budget(value: Any) -> float:
     return parsed
 
 
+def _parse_memory_retrieval(value: Any) -> MemoryRetrievalConfig:
+    """``memory.retrieval``: ``same_conversation`` is allow | skip_in_context (P4).
+
+    Absent or null means ``allow``: a stored config written before the key
+    existed keeps the behaviour it was created with. Every current config
+    states the key through ``config/expert_base.yaml`` (``skip_in_context``).
+    """
+    if value is None:
+        return MemoryRetrievalConfig()
+    if not isinstance(value, dict):
+        raise ValueError(f"memory.retrieval must be a mapping, got {value!r}")
+    mode = value.get("same_conversation")
+    if mode is None:
+        return MemoryRetrievalConfig()
+    if mode not in SAME_CONVERSATION_MODES:
+        raise ValueError(
+            "memory.retrieval.same_conversation must be one of "
+            f"{', '.join(SAME_CONVERSATION_MODES)}, got {mode!r}"
+        )
+    return MemoryRetrievalConfig(same_conversation=mode)
+
+
 def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     """Parse memory configuration from dict.
 
@@ -3185,7 +3301,6 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         api_key=reranker_data.get("api_key"),
         top_k=int(reranker_data.get("top_k", 64)),
         timeout=float(reranker_data.get("timeout", 10.0)),
-        keep_pinned_first=bool(reranker_data.get("keep_pinned_first", True)),
     )
     bounded_data = data.get("bounded", {}) or {}
     bounded = BoundedConfig(
@@ -3242,8 +3357,6 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         ),
         prefetch_budget_s=_parse_prefetch_budget(data.get("prefetch_budget_s", 3.0)),
         observer_interval=data.get("observer_interval", 5),
-        assembler_interval=data.get("assembler_interval", 7),
-        default_ttl=data.get("default_ttl", 10),
         importance_threshold=data.get("importance_threshold", 0.3),
         dedup_threshold=data.get("dedup_threshold", 0.85),
         retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),
@@ -3262,6 +3375,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         bounded=bounded,
         gate=gate,
         query=query,
+        retrieval=_parse_memory_retrieval(data.get("retrieval")),
         ingestion=ingestion,
         extraction=extraction,
     )
@@ -3293,7 +3407,6 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
     for default_task in (
         "extract_memories",
         "curate_knowledge",
-        "assemble_memories",
         "verify_citations",
     ):
         if default_task not in tasks:
@@ -3306,6 +3419,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         api_key=data.get("api_key"),
         provider=data.get("provider"),
         extra_headers=data.get("extra_headers"),
+        served_model=data.get("served_model"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -3315,23 +3429,6 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         ),
         tasks=tasks,
     )
-
-
-def _parse_injection_mode(value: Any) -> str:
-    """``context_management.injection_mode``: ``legacy`` (default) or ``append_only``."""
-    from shared.runtime.core.context_entries import (
-        INJECTION_MODE_LEGACY,
-        INJECTION_MODES,
-    )
-
-    if value is None:
-        return INJECTION_MODE_LEGACY
-    if value not in INJECTION_MODES:
-        raise ValueError(
-            f"context_management.injection_mode must be one of "
-            f"{', '.join(INJECTION_MODES)}; got {value!r}"
-        )
-    return value
 
 
 def _parse_reasoning_level_value(value: Any) -> Optional[str]:
@@ -3474,6 +3571,7 @@ def load_agent_config(
     assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
+        skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
         browser_direct=tools_data.get("browser_direct", []),
@@ -3559,7 +3657,6 @@ def load_agent_config(
         ),
         reasoning_level=context_data.get("reasoning_level", "high"),
         max_summary_length=context_data.get("max_summary_length", 10000),
-        injection_mode=_parse_injection_mode(context_data.get("injection_mode")),
     )
 
     phase_data = data.get("phase_settings", {})
@@ -3639,7 +3736,9 @@ def load_agent_config(
     # Parse interactive config
     interactive_data = data.get("interactive", {})
     interactive_config = InteractiveConfig(
-        permission_mode=interactive_data.get("permission_mode", "supervised"),
+        permission_mode=normalize_permission_mode(
+            interactive_data.get("permission_mode", DEFAULT_PERMISSION_MODE)
+        ),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
     )
 
@@ -3652,6 +3751,8 @@ def load_agent_config(
 
     # Parse officer config (centurion — shared helper, both loader paths)
     officer_config = _parse_officer_config(data)
+
+    ensure_skill_tool_for_bindings(tools_config, instruction_files)
 
     return AgentConfig(
         agent_id=data["agent_id"],
@@ -3746,6 +3847,7 @@ def load_agent_config_from_dict(
     assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
+        skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
         browser_direct=tools_data.get("browser_direct", []),
@@ -3831,7 +3933,6 @@ def load_agent_config_from_dict(
         ),
         reasoning_level=context_data.get("reasoning_level", "high"),
         max_summary_length=context_data.get("max_summary_length", 10000),
-        injection_mode=_parse_injection_mode(context_data.get("injection_mode")),
     )
 
     phase_data = data.get("phase_settings", {})
@@ -3930,7 +4031,9 @@ def load_agent_config_from_dict(
     # Parse interactive config
     interactive_data = data.get("interactive", {})
     interactive_config = InteractiveConfig(
-        permission_mode=interactive_data.get("permission_mode", "supervised"),
+        permission_mode=normalize_permission_mode(
+            interactive_data.get("permission_mode", DEFAULT_PERMISSION_MODE)
+        ),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
     )
 
@@ -3943,6 +4046,8 @@ def load_agent_config_from_dict(
 
     # Parse officer config (centurion — shared helper, both loader paths)
     officer_config = _parse_officer_config(data)
+
+    ensure_skill_tool_for_bindings(tools_config, instruction_files)
 
     return AgentConfig(
         agent_id=data["agent_id"],
@@ -4295,6 +4400,38 @@ def supports_parallel_tool_calls(provider: Optional[str], model: Optional[str]) 
     return True
 
 
+def served_model_of(config: Any) -> Optional[str]:
+    """``config.served_model`` when it is a non-empty string, else ``None``."""
+    served = getattr(config, "served_model", None)
+    return served if isinstance(served, str) and served else None
+
+
+def wire_model_name(config: LLMConfig) -> str:
+    """The model string a factory sends upstream for ``config``.
+
+    The catalog row's served id when it names one, else the catalog id
+    itself. A factory still strips its routing prefix (``openrouter/`` …)
+    from whichever string this returns.
+    """
+    return served_model_of(config) or config.model
+
+
+def recorded_model_name(
+    config: Optional[LLMConfig], echoed: Optional[str]
+) -> Optional[str]:
+    """The model name usage records for a call made with ``config``.
+
+    ``echoed`` is the name the provider returned, i.e. the string it was
+    sent. When the catalog row names a served string, that string can belong
+    to another row too (the same model behind another transport), so usage
+    and price would land on the wrong row: the catalog id is recorded then.
+    """
+    model = getattr(config, "model", None)
+    if served_model_of(config) and isinstance(model, str) and model:
+        return model
+    return echoed
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -4340,19 +4477,24 @@ def create_llm(
         provider = "openai"
 
     if provider == "anthropic" or _claude_native_via_proxy(config, provider):
-        return _create_anthropic_llm(config, limits)
+        llm = _create_anthropic_llm(config, limits)
     elif provider == "google":
-        return _create_google_llm(config, limits)
+        llm = _create_google_llm(config, limits)
     elif provider == "groq":
-        return _create_groq_llm(config, limits)
+        llm = _create_groq_llm(config, limits)
     elif provider == "openrouter":
-        return _create_openrouter_llm(config, limits)
+        llm = _create_openrouter_llm(config, limits)
     elif provider == "mistral":
-        return _create_mistral_llm(config, limits)
+        llm = _create_mistral_llm(config, limits)
     elif provider == "codex":
-        return _create_codex_llm(config, limits)
+        llm = _create_codex_llm(config, limits)
     else:
-        return _create_openai_llm(config, limits)
+        llm = _create_openai_llm(config, limits)
+    if served_model_of(config):
+        from shared.runtime.core.transport_resolution import stamp_catalog_model
+
+        stamp_catalog_model(llm, config.model)
+    return llm
 
 
 def build_auxiliary_llm_config(
@@ -4371,6 +4513,7 @@ def build_auxiliary_llm_config(
         api_key=aux.api_key,
         provider=aux.provider,
         extra_headers=aux.extra_headers,
+        served_model=aux.served_model,
         temperature=aux.temperature,
         top_p=model_settings.get("top_p"),
         top_k=model_settings.get("top_k"),
@@ -4654,24 +4797,48 @@ def _create_openai_llm(
     # receive it in the request body; skip it for native api.openai.com
     # since the SDK rejects unknown kwargs.
     extra_body: dict = {}
+    wire_model = wire_model_name(config)
+    # Which wire API this client speaks. Chat Completions everywhere except:
+    #  - Sol 6.1, on any endpoint: it needs Responses for tool calls, including
+    #    when no effort is injected and the provider's default reasoning applies.
+    #  - OpenAI's own reasoning models (o-series, gpt-5*, gpt-6*) on OpenAI's
+    #    own endpoint, ALWAYS — not only when an effort is sent. OpenAI rejects
+    #    function tools with any reasoning effort on /v1/chat/completions for
+    #    gpt-6-sol/-luna, gpt-6.1-sol, gpt-5.6-*, and (with an explicit effort)
+    #    gpt-5.5 and gpt-5.4-mini/-nano. Leaving the effort out does not help:
+    #    the provider default is not `none` for gpt-6* and gpt-5.6, so they 400
+    #    with no `reasoning_effort` sent too (measured 2026-10-20). Keeping the
+    #    route per model also keeps one wire format for a whole conversation
+    #    when the reasoning level changes between turns.
+    # Other endpoints keep Chat Completions: an OpenAI-compatible server may
+    # not serve /v1/responses, and a subscription-proxy row reaches this
+    # factory precisely because it chose `openai-chat`.
+    # langchain#34660 (streamed tool calls) no longer blocks this on the
+    # langchain-openai we pin; the codex lane runs these models on Responses
+    # with tools daily (model_config_matrix.yaml, `gpt-5` block).
+    from shared.runtime.core.transport_resolution import is_openai_default_endpoint
+
     sol_6_1 = family_of(config.model) == "gpt-6.1-sol"
-    if config.top_k is not None and base_url and not sol_6_1:
+    responses_api = sol_6_1 or (
+        is_openai_default_endpoint(base_url)
+        and _should_use_reasoning_summary(wire_model)
+    )
+    if config.top_k is not None and base_url and not responses_api:
         extra_body["top_k"] = config.top_k
 
-    # Build kwargs for ChatOpenAI.
-    # Force Chat Completions API — LangChain auto-detects Responses API for
-    # gpt-5.*/o3/o4 models, but its streaming is broken for tool calls
-    # (https://github.com/langchain-ai/langchain/issues/34660, still open).
+    # Build kwargs for ChatOpenAI. `use_responses_api` is always explicit:
+    # LangChain would otherwise pick the API itself per request.
     llm_kwargs = {
-        "model": config.model,
-        "temperature": None if sol_6_1 else config.temperature,
+        "model": wire_model,
+        # The Responses reasoning models reject custom sampling values. The
+        # matrix value for these families is 1.0, the provider default, so
+        # omitting it changes nothing for a family default.
+        "temperature": None if responses_api else config.temperature,
         "api_key": api_key,
         "max_retries": config.max_retries,
-        # Sol 6.1 requires Responses for tool calls, including when no effort
-        # is injected and the provider's default reasoning applies.
-        "use_responses_api": sol_6_1,
+        "use_responses_api": responses_api,
     }
-    if config.top_p is not None and not sol_6_1:
+    if config.top_p is not None and not responses_api:
         llm_kwargs["top_p"] = config.top_p
 
     # Reasoning delivery is driven by the family's `reasoning` capability
@@ -4689,7 +4856,7 @@ def _create_openai_llm(
         level = _clamp_reasoning_level(
             _rplan["value"], _supported_efforts(_rplan["cap"])
         )
-        if sol_6_1:
+        if responses_api:
             llm_kwargs["reasoning"] = {"effort": level, "summary": "auto"}
             reasoning_mode = f"responses_api(effort={level})"
         else:
@@ -4813,7 +4980,9 @@ def _create_openai_llm(
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
-        f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
+        f"Created OpenAI LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={llm_kwargs['temperature']}, "
+        f"api={'responses' if responses_api else 'chat_completions'}, "
         f"base_url={base_url or 'default'}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
@@ -4904,7 +5073,7 @@ def _create_anthropic_llm(
         )
 
     llm_kwargs: Dict[str, Any] = {
-        "model": config.model,
+        "model": wire_model_name(config),
         "api_key": keys[0],
         "max_retries": config.max_retries,
         # Anthropic requires max_tokens. Route through the shared resolver so
@@ -4940,12 +5109,14 @@ def _create_anthropic_llm(
             reasoning_mode = f"adaptive(effort={level})"
         else:
             reasoning_mode = "adaptive"
-    else:
+    elif family_of(config.model).startswith("claude"):
         llm_kwargs["temperature"] = config.temperature
         if config.top_p is not None:
             llm_kwargs["top_p"] = config.top_p
         if config.top_k is not None:
             llm_kwargs["top_k"] = config.top_k
+    # else: a non-Claude model on this shape (Meta's Anthropic-compatible API
+    # answers 400 "temperature is removed") gets no sampling parameters.
 
     # Always a beta request: the beta client's stream events type the
     # `context_management` the API adds to `message_delta`, while the stable
@@ -4970,6 +5141,7 @@ def _create_anthropic_llm(
 
     logger.info(
         f"Created Anthropic LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, "
         f"base_url={llm_kwargs.get('base_url', 'default')}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={llm_kwargs['max_tokens']}, reasoning={reasoning_mode}, "
@@ -5033,7 +5205,7 @@ def _create_google_llm(
         )
 
     llm_kwargs = {
-        "model": config.model,
+        "model": wire_model_name(config),
         "temperature": config.temperature,
         "google_api_key": api_key,
     }
@@ -5090,6 +5262,7 @@ def _create_google_llm(
 
     logger.info(
         f"Created Google LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, "
         f"temp={llm_kwargs.get('temperature')}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_output_tokens={max_tokens}, "
         f"thinking={thinking_mode}"
@@ -5120,7 +5293,7 @@ def _create_groq_llm(
         )
 
     # Strip groq/ prefix — Groq API expects bare model names
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("groq/"):
         model = model[len("groq/") :]
 
@@ -5152,7 +5325,8 @@ def _create_groq_llm(
     llm = ChatGroq(**llm_kwargs)
 
     logger.info(
-        f"Created Groq LLM: model={model}, temp={config.temperature}, "
+        f"Created Groq LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={max_tokens}"
     )
@@ -5209,7 +5383,7 @@ def _create_openrouter_llm(
     api_key = keys[0]
 
     # Strip openrouter/ prefix — OpenRouter expects provider/model format
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("openrouter/"):
         model = model[len("openrouter/") :]
 
@@ -5323,7 +5497,8 @@ def _create_openrouter_llm(
         else "none"
     )
     logger.info(
-        f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
+        f"Created OpenRouter LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
@@ -5358,7 +5533,7 @@ def _create_mistral_llm(
         )
 
     # Strip a defensive mistral/ prefix — the native API expects bare ids.
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("mistral/"):
         model = model[len("mistral/") :]
 
@@ -5404,7 +5579,8 @@ def _create_mistral_llm(
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
-        f"Created Mistral LLM: model={model}, temp={config.temperature}, "
+        f"Created Mistral LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, "
         f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
@@ -5455,7 +5631,7 @@ def _create_codex_llm(
     api_key = keys[0]
 
     # Strip codex/ prefix — the proxy expects bare model names
-    model = config.model
+    model = wire_model_name(config)
     if model.lower().startswith("codex/"):
         model = model[len("codex/") :]
 
@@ -5547,7 +5723,8 @@ def _create_codex_llm(
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
-        f"Created Codex LLM: model={model}, temp={config.temperature}, "
+        f"Created Codex LLM: model={config.model}, "
+        f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
@@ -5743,12 +5920,17 @@ def append_expert_workflow_addendum(body: str, addendum: str) -> str:
     return f"{body.rstrip()}\n\n{addendum}\n"
 
 
-def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
+def cloud_mount_system_floor(
+    unavailable: Any, mounted: Any = None, *, status_tool: bool = True
+) -> str:
     """Return what the agent must know about this session's cloud folders,
-    or "" when it has none.
+    or "" when it has none. ``status_tool=False`` leaves ``srw_cloud_status``
+    unmentioned (a Virtual Session serves its folders without the shell
+    category that tool lives in).
 
     Every folder in the workspace is named (main cloud slice 3): where it
-    is, whose it is and its access, so the agent never mistakes the
+    is (``cloud/<name>``, the path the file tools take from the workspace
+    root; ``cloud`` for a session's only folder), whose it is and its access, so the agent never mistakes the
     session's outbox for the project's folder. ``mounted`` rows carry
     ``path`` (or ``name``) and plain ``text``. A mount that does not come up
     never blocks the workspace (connector drivers D7, decision 23): the
@@ -5778,11 +5960,16 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
             [
                 "<cloud_folders>",
                 f"Protected cloud unavailable: {text}.",
-                "This protected session has no cloud folder at all: workspace/"
-                "cloud does not exist and nothing you write reaches the cloud. "
+                "This protected session has no cloud folder at all: there is no "
+                "cloud/ folder in the workspace and nothing you write reaches the "
+                "cloud. "
                 "Tell the user plainly if their request needs the cloud; "
-                "srw_cloud_status shows the current state, and the user can "
-                "start a new session once it is fixed.",
+                + (
+                    "srw_cloud_status shows the current state, and the user can "
+                    if status_tool
+                    else "the user can "
+                )
+                + "start a new session once it is fixed.",
                 "</cloud_folders>",
             ]
         )
@@ -5791,11 +5978,9 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
         lines.append("Cloud folders in this session's workspace:")
         for row in present:
             name = str(row.get("name") or "")
-            path = str(row.get("path") or "") or (
-                f"workspace/cloud/{name}" if name else ""
-            )
+            path = str(row.get("path") or "") or (f"cloud/{name}" if name else "")
             pending = " (still coming up)" if row.get("state") == "pending" else ""
-            lines.append(f"- {path or 'workspace/cloud'}: {row['text']}{pending}.")
+            lines.append(f"- {path or 'cloud'}: {row['text']}{pending}.")
     if rows:
         lines.append(
             "Some cloud folders of this session are not available:"
@@ -5804,9 +5989,7 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
         )
         for row in rows:
             name = str(row.get("name") or "")
-            path = str(row.get("path") or "") or (
-                f"workspace/cloud/{name}" if name else ""
-            )
+            path = str(row.get("path") or "") or (f"cloud/{name}" if name else "")
             title = str(row.get("title") or "")
             if path:
                 lines.append(f"- {path}: {row['text']}.")
@@ -5818,8 +6001,13 @@ def cloud_mount_system_floor(unavailable: Any, mounted: Any = None) -> str:
         "Save work for the user only into a folder listed here as in the "
         "workspace, and say which one; never say a file is saved to the cloud "
         "in a folder that is not available. Tell the user plainly what is "
-        "missing if their request needs it; srw_cloud_status shows the current "
-        "state, and the user can start a new session once a folder is fixed."
+        "missing if their request needs it; "
+        + (
+            "srw_cloud_status shows the current state, and the user can "
+            if status_tool
+            else "the user can "
+        )
+        + "start a new session once a folder is fixed."
     )
     lines.append("</cloud_folders>")
     return "\n".join(lines)
@@ -6093,6 +6281,7 @@ def get_phase_system_prompt(
             expert_identity=expert_identity,
             available_skills=available_skills,
         )
+        rendered = _with_unplaced_skills_menu(rendered, template, available_skills)
         # The managed product guide is runtime-owned policy, not an ordinary
         # user skill. Model-specific interactive templates may intentionally
         # omit {available_skills}; inject its trusted reader rule separately so
@@ -6134,6 +6323,7 @@ def get_phase_system_prompt(
         cloud_floor = cloud_mount_system_floor(
             config.extra.get("_cloud_mounts_unavailable"),
             config.extra.get("_cloud_mounts_mounted"),
+            status_tool=config.extra.get("_cloud_status_tool", True) is not False,
         )
         if cloud_floor:
             rendered = f"{rendered}\n\n{cloud_floor}"
@@ -6268,6 +6458,7 @@ def _render_worker_prompt(
         available_skills=available_skills,
         prompt_content=rendered_component,
     )
+    rendered = _with_unplaced_skills_menu(rendered, base_template, available_skills)
 
     # Prepend reasoning directive only for OSS models that need it as prompt text
     method = detect_reasoning_method(
@@ -6378,6 +6569,7 @@ def get_subagent_system_prompt(
         subagent_environment=environment,
         available_skills=available_skills,
     )
+    rendered = _with_unplaced_skills_menu(rendered, template, available_skills)
 
     method = detect_reasoning_method(
         model or config.llm.model, config.llm.reasoning_method
@@ -6576,6 +6768,50 @@ def memory_tool_names_bindable(config: Any) -> frozenset[str]:
     if not isinstance(extensions, (list, tuple)):
         return frozenset()
     return frozenset(name for name in extensions if isinstance(name, str))
+
+
+def _with_unplaced_skills_menu(rendered: str, template: str, menu: str) -> str:
+    """Append the fenced skills menu when ``template`` has no slot for it.
+
+    The menu used to reach the model only through an ``{available_skills}``
+    placeholder, and 17 model-family templates (and Design Studio's) have
+    none, so their agents never saw a skill. The assembler owns the menu now,
+    like the product-guide floor: a template that places it keeps its spot,
+    any other gets it after the template body. ``menu`` is empty whenever
+    ``use_skill`` is not bound (``scope_skills_for_tools``).
+    knowledge-base/knowledge/features/skills_tool_category.md D3.
+    """
+    if not menu or "{available_skills}" in template:
+        return rendered
+    return f"{rendered}\n\n{menu}"
+
+
+def ensure_skill_tool_for_bindings(
+    tools: "ToolsConfig", instruction_files: List["InstructionFileEntry"]
+) -> None:
+    """Put ``use_skill`` into ``tools.skills`` when a bound skill needs it.
+
+    A ``before_tool`` skill binding is a read gate the agent has to open, and
+    ``use_skill`` is the skill route to it, so an expert that binds one gets
+    the tool even with ``tools.skills: []`` (owner decision, 2026-10-15).
+    ``phase_start`` bindings do not count: their text arrives as a message.
+    Runs at load, so the frozen resolved config shows the tool. A name already
+    listed under any category (a frozen blob from before the ``skills``
+    category lists it under ``workspace``) is left alone.
+
+    This is one of the implicit grants listed in
+    knowledge-base/knowledge/issues/expert_config_is_not_the_whole_toolset.md.
+    """
+    if not any(
+        entry.skill and entry.trigger_type == "before_tool"
+        for entry in instruction_files
+    ):
+        return
+    for category in _tools_config_field_names():
+        names = getattr(tools, category, None)
+        if isinstance(names, list) and SKILL_TOOL_NAME in names:
+            return
+    tools.skills = [*tools.skills, SKILL_TOOL_NAME]
 
 
 def get_all_tool_names(config: AgentConfig) -> List[str]:

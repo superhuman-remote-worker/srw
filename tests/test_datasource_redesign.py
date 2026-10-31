@@ -498,7 +498,7 @@ class TestRenderInstructionContentProtectedCloud:
         "- Your workspace is your persistent working area.\n"
         "{% if protected_cloud %}\n"
         "Protected cloud mode:\n"
-        "- The cloud folder (workspace/cloud) is in PROTECTED mode: everything "
+        "- The cloud folder (cloud/ in the workspace) is in PROTECTED mode: everything "
         "you write there is STAGED for the user's review — nothing is saved to "
         "the cloud or visible to anyone else until the user applies it in the "
         "review panel.\n"

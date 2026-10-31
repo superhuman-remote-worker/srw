@@ -999,7 +999,6 @@ async def create_loop_job(
     iteration: int,
     seq_index: int | None = None,
     remaining_iterations: int | None = None,
-    disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
     backlog_block: str | None = None,
     history_block: str | None = None,
@@ -1027,17 +1026,6 @@ async def create_loop_job(
     truth the torn-advance sweeper reads back directly to reconstruct the loop's
     counters — robust to variable-width parallel stages, where the old
     ``(iteration-1) % len(roles)`` modulo no longer maps job-count to stage.
-
-    ``disable_memory_assembler`` turns off the RecallStore TTL-curation
-    assembler for this job (set by the caller for members of a *fan-out* stage).
-    The assembler is the one memory writer that does a read-modify-write over the
-    project-scoped shared store (it retires/re-TTLs existing memories); running N
-    of them concurrently over one project would race that curation slot. It is
-    disabled via the existing ``auxiliary.tasks.assemble_memories.enabled`` flag
-    (the same lever ``session_base.yaml`` uses) rather than by editing the
-    ``memory.pipeline.writers`` list — a scalar deep-merge that leaves the
-    append-only extractors, the KB curator, and the writers list untouched. See
-    knowledge-base/knowledge/features/loop_parallel_stages.md and [[project_kb_convergence_f13]].
 
     ``backlog_block`` is threaded straight through to ``build_loop_kickoff`` —
     this function does no fetching itself, it just carries the caller's
@@ -1098,15 +1086,6 @@ async def create_loop_job(
     workspace_backend = loop.get("workspace_backend")
     if workspace_backend:
         config_override["workspace"] = {"backend": workspace_backend}
-
-    # Fan-out members: silence the TTL-curation assembler so N concurrent
-    # analysis roles don't race the shared project RecallStore's read-modify-
-    # write curation slot (see docstring). Scalar override on the existing aux
-    # gate — no list surgery, extractors/curator keep running.
-    if disable_memory_assembler:
-        config_override["auxiliary"] = {
-            "tasks": {"assemble_memories": {"enabled": False}}
-        }
 
     # Split the synthesized prompt the way the manual create-job form does:
     # a concise `description` (the cockpit row title + task_brief "## Description")

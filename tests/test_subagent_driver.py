@@ -14,6 +14,7 @@ staying unarmed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import subprocess
 import time
 from typing import Any, Dict, List
@@ -305,25 +306,48 @@ class TestScenarioABF:
         ]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("mode", ["legacy", "append_only"])
-    async def test_the_child_reads_the_injection_mode_from_its_config(
-        self, parent, mode
-    ):
-        """A child runs the session loop, so it reads
-        ``context_management.injection_mode`` from its own config: in
-        append_only mode the archive receives the unfolded request
-        (``history_messages``) for the chat delta; legacy calls are unchanged.
-        A child has no charter, memory, knowledge or subagent runtime, so it
-        appends no entries and both requests carry the same messages."""
+    async def test_a_served_model_row_is_metered_under_its_catalog_id(self, parent):
+        # The provider echoes the served string ("fake-model"); the catalog
+        # row it was dispatched for is what usage and llm_requests name.
         parent_ctx, _ = parent
-        driver, fake, build = await make_driver(
+        driver, _, build = await make_driver(parent_ctx, [text_turn(SECRET)])
+        build.config.llm = dataclasses.replace(
+            build.config.llm, model="fake-model-proxy", served_model="fake-model"
+        )
+        loop_metrics: List[Dict[str, Any]] = []
+        archive = driver.archive_llm_call
+
+        def spy(prepared, response, metrics, *args, **kwargs):
+            loop_metrics.append(dict(metrics or {}))
+            return archive(prepared, response, metrics, *args, **kwargs)
+
+        driver.archive_llm_call = spy  # type: ignore[method-assign]
+        try:
+            await driver.run("say it")
+            for _ in range(20):
+                if driver.archived:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await driver.close()
+        assert [row["model"] for row in driver.archived] == ["fake-model-proxy"]
+        # The loop's own usage metrics already name the row (persistent_graph).
+        assert [m.get("model") for m in loop_metrics] == ["fake-model-proxy"]
+
+    @pytest.mark.asyncio
+    async def test_the_archive_receives_the_unfolded_request(self, parent):
+        """A child runs the session loop, so the archive receives the
+        unfolded request (``history_messages``) for the chat delta. A child
+        has no charter, memory, knowledge or subagent runtime, so it appends
+        no entries and both requests carry the same messages."""
+        parent_ctx, _ = parent
+        driver, _, _ = await make_driver(
             parent_ctx,
             [
                 tool_turn("read_file", {"path": "notes/hello.md"}, "c1"),
                 text_turn(SECRET),
             ],
         )
-        build.config.context_management.injection_mode = mode
         try:
             await driver.run("read it")
             for _ in range(20):
@@ -334,12 +358,9 @@ class TestScenarioABF:
             await driver.close()
         assert len(driver.archived) == 2
         for row in driver.archived:
-            if mode == "legacy":
-                assert "history_messages" not in row
-            else:
-                assert [m.content for m in row["history_messages"]] == [
-                    m.content for m in row["messages"]
-                ]
+            assert [m.content for m in row["history_messages"]] == [
+                m.content for m in row["messages"]
+            ]
         assert not any(
             (getattr(m, "additional_kwargs", None) or {}).get(PERSIST_ROLE_KEY)
             == "context"
@@ -535,7 +556,9 @@ class TestScenarioC:
 
         parent_ctx, _ = parent
         ledger = RefusingLedger()
-        seed = seed_fork_history([SystemMessage(content="[Summary] durable")])
+        seed = seed_fork_history(
+            [SystemMessage(content="[Summary of prior work] durable")]
+        )
         driver, fake, _ = await make_driver(
             parent_ctx,
             [text_turn("must never run")],

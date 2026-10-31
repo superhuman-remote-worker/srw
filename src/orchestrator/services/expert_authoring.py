@@ -7,7 +7,9 @@ grant checks and writes retain their sequencing without importing HTTP Request.
 
 from __future__ import annotations
 
+import io
 import logging
+import zipfile
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -45,6 +47,107 @@ from orchestrator.services.expert_catalog_contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Caps on an uploaded skill zip (N61). ``unpack_skill_zip`` reads every entry
+#: whole into memory, so the archive is bounded before it is handed over.
+SKILL_IMPORT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+SKILL_IMPORT_MAX_ENTRIES = 500
+SKILL_IMPORT_MAX_ENTRY_BYTES = 10 * 1024 * 1024
+SKILL_IMPORT_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+_SKILL_IMPORT_READ_CHUNK = 64 * 1024
+_SKILL_IMPORT_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+
+
+def _too_large(detail: str) -> HTTPException:
+    return HTTPException(status_code=413, detail=f"Skill archive {detail}")
+
+
+def bounded_skill_archive(archive: bytes) -> bytes:
+    """Return ``archive`` re-packed with only honest, bounded entries.
+
+    A zip's declared sizes are the uploader's word, and one ``read()`` of a
+    deflate member decompresses its whole stream before cutting it to the
+    declared size. So each member is read here in small chunks (which caps the
+    output at its declared size), every cap is enforced on what was read, and
+    the content is re-packed stored: the unpacker then decompresses nothing.
+    A malformed archive is passed through for ``unpack_skill_zip`` to report.
+    """
+    if len(archive) > SKILL_IMPORT_MAX_UPLOAD_BYTES:
+        raise _too_large(f"exceeds {SKILL_IMPORT_MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+    try:
+        source = zipfile.ZipFile(io.BytesIO(archive))
+    except zipfile.BadZipFile:
+        return archive
+    with source:
+        entries = source.infolist()
+        if len(entries) > SKILL_IMPORT_MAX_ENTRIES:
+            raise _too_large(f"has more than {SKILL_IMPORT_MAX_ENTRIES} entries")
+        contents: dict[str, bytes] = {}
+        total = 0
+        for info in entries:
+            if info.is_dir():
+                continue
+            if info.flag_bits & 0x1:
+                raise HTTPException(
+                    status_code=422, detail=f"{info.filename}: encrypted entry"
+                )
+            if info.compress_type not in _SKILL_IMPORT_COMPRESSION:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{info.filename}: only stored or deflated entries",
+                )
+            if info.file_size > SKILL_IMPORT_MAX_ENTRY_BYTES:
+                raise _too_large(
+                    f"entry {info.filename} exceeds "
+                    f"{SKILL_IMPORT_MAX_ENTRY_BYTES // (1024 * 1024)} MB"
+                )
+            chunks: list[bytes] = []
+            size = 0
+            try:
+                with source.open(info) as member:
+                    while chunk := member.read(_SKILL_IMPORT_READ_CHUNK):
+                        size += len(chunk)
+                        total += len(chunk)
+                        if size > SKILL_IMPORT_MAX_ENTRY_BYTES:
+                            raise _too_large(
+                                f"entry {info.filename} exceeds "
+                                f"{SKILL_IMPORT_MAX_ENTRY_BYTES // (1024 * 1024)} MB"
+                            )
+                        if total > SKILL_IMPORT_MAX_TOTAL_BYTES:
+                            raise _too_large(
+                                "exceeds "
+                                f"{SKILL_IMPORT_MAX_TOTAL_BYTES // (1024 * 1024)} MB "
+                                "uncompressed"
+                            )
+                        chunks.append(chunk)
+            except zipfile.BadZipFile as e:
+                raise HTTPException(
+                    status_code=422, detail=f"not a valid zip archive: {e}"
+                ) from e
+            # A repeated name reads as its last entry, as ``ZipFile.read`` does.
+            contents[info.filename] = b"".join(chunks)
+    repacked = io.BytesIO()
+    with zipfile.ZipFile(repacked, "w", zipfile.ZIP_STORED) as target:
+        for name, data in contents.items():
+            target.writestr(name, data)
+    return repacked.getvalue()
+
+
+def _refuse_contradicting_extends(
+    config: Any, source: dict[str, Any], *, expert_type: str | None
+) -> None:
+    """422 when the fragment's ``$extends`` names a base other than the one the
+    saved Expert resolves on: ``source``'s ``harness_config_name`` (a copy
+    keeps its source's base; a new row has none) or the role's root. Copies
+    also carry ``source``'s private layers."""
+    from orchestrator.services.manifest_experts import refuse_contradicting_extends
+
+    refuse_contradicting_extends(
+        config,
+        config_name=source.get("harness_config_name"),
+        expert_type=expert_type,
+        layers=source.get("harness_config_layers") or [],
+    )
 
 
 def default_expert_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -182,6 +285,7 @@ class ExpertAuthoringService:
 
         if body.config:
             body.config = self.catalog.validate_expert_fragment(body.config)
+            _refuse_contradicting_extends(body.config, {}, expert_type=body.expert_type)
             await self.catalog.require_visible_roster_refs(body.config, user=user)
         await write_policy.enforce_save(body.config or {}, user=user)
         try:
@@ -229,6 +333,13 @@ class ExpertAuthoringService:
             )
         if body.config is not None:
             body.config = self.catalog.validate_expert_fragment(body.config)
+            # Only the authored fragment is checked: the row keeps its base and
+            # private layers, and a metadata-only edit never reaches here.
+            _refuse_contradicting_extends(
+                body.config,
+                {"harness_config_name": existing.get("harness_config_name")},
+                expert_type=existing.get("expert_type"),
+            )
             await self.catalog.require_visible_roster_refs(body.config, user=user)
         await write_policy.enforce_save(body.config or {}, user=user)
         fields = body.model_dump(exclude_unset=True)
@@ -281,11 +392,12 @@ class ExpertAuthoringService:
         await self.store.delete_expert(expert_id)
         return {"deleted": True}
 
-    async def duplicate_expert(
-        self, expert_id: str, *, user: dict[str, Any], write_policy: ExpertWritePolicy
+    async def _visible_expert_source(
+        self, expert_id: str, *, user: dict[str, Any]
     ) -> dict[str, Any]:
-        """Fork any visible expert (bundled or DB) into an owned copy — 'start from
-        scholar' (decision 4: copy, not live link)."""
+        """The bundle source of any expert visible to ``user`` — a DB row by UUID,
+        else a bundled expert by name — with its ``harness_*`` keys. 404 for a
+        missing or invisible one."""
         if self.catalog.deps.looks_like_uuid(expert_id):
             visible = await self.catalog.deps.visible_project_ids(user, self.store)
             row = await self.store.get_expert_visible_by_id(
@@ -296,11 +408,18 @@ class ExpertAuthoringService:
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Expert not found")
-            src = db_expert_to_bundle_src(row)
-        else:
-            src = await self.catalog.bundled_expert_source(expert_id)
-            if not src:
-                raise HTTPException(status_code=404, detail="Expert not found")
+            return db_expert_to_bundle_src(row)
+        src = await self.catalog.bundled_expert_source(expert_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Expert not found")
+        return src
+
+    async def duplicate_expert(
+        self, expert_id: str, *, user: dict[str, Any], write_policy: ExpertWritePolicy
+    ) -> dict[str, Any]:
+        """Fork any visible expert (bundled or DB) into an owned copy — 'start from
+        scholar' (decision 4: copy, not live link)."""
+        src = await self._visible_expert_source(expert_id, user=user)
         # A fork is a new write by a new principal, and the source row may be
         # someone else's (visibility, not ownership, is the test above). Validating
         # here is what stops a legacy smuggled fragment being copied forward — the
@@ -308,6 +427,9 @@ class ExpertAuthoringService:
         # `_bundled_expert_bundle` and `_db_expert_to_bundle_src` build a fresh
         # dict, so assigning into `src` cannot corrupt a cache or the source row.
         src["config"] = self.catalog.validate_expert_fragment(src.get("config") or {})
+        _refuse_contradicting_extends(
+            src["config"], src, expert_type=src.get("expert_type")
+        )
         # Fifth of five expert-write routes. The other four call
         # _enforce_expert_save right after validating theirs — the kill-switch
         # half of that is NOT optional here just because the row already existed:
@@ -334,31 +456,28 @@ class ExpertAuthoringService:
         their raw fragment; bundled experts export their on-disk config."""
         from shared.runtime.core.expert_resolution import to_export_bundle
 
-        if self.catalog.deps.looks_like_uuid(expert_id):
-            visible = await self.catalog.deps.visible_project_ids(user, self.store)
-            row = await self.store.get_expert_visible_by_id(
-                expert_id,
-                user_id=str(user["id"]),
-                project_ids=[] if visible == "all" else [str(p) for p in visible],
-                is_admin=bool(user.get("is_admin")),
-            )
-            if not row:
-                raise HTTPException(status_code=404, detail="Expert not found")
-            if row.get("harness_config_layers") or row.get("harness_asset_name"):
-                raise HTTPException(
-                    409,
-                    "Export this Expert through its manifest to retain private layers and installed asset selections.",
-                )
-            return to_export_bundle(db_expert_to_bundle_src(row))
-        bundle = await self.catalog.bundled_expert_source(expert_id)
-        if not bundle:
-            raise HTTPException(status_code=404, detail="Expert not found")
-        if bundle.get("harness_config_layers") or bundle.get("harness_asset_name"):
+        src = await self._visible_expert_source(expert_id, user=user)
+        if src.get("harness_config_layers") or src.get("harness_asset_name"):
             raise HTTPException(
                 409,
                 "Export this Expert through its manifest to retain private layers and installed asset selections.",
             )
-        return to_export_bundle(bundle)
+        return to_export_bundle(src)
+
+    async def expert_source(
+        self, expert_id: str, *, user: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The authored fields of a visible expert, in the export bundle's shape —
+        what the cockpit editor and its read-only view show.
+
+        Export refuses an expert with private layers or an installed asset (every
+        bundled expert and every copy of one), because a downloaded file would
+        drop them. A read for display drops nothing: the row keeps both, and a
+        save through ``update_expert`` writes only the authored fragment.
+        """
+        from shared.runtime.core.expert_resolution import to_export_bundle
+
+        return to_export_bundle(await self._visible_expert_source(expert_id, user=user))
 
     async def import_expert(
         self,
@@ -373,6 +492,7 @@ class ExpertAuthoringService:
 
         if body.config:
             body.config = self.catalog.validate_expert_fragment(body.config)
+            _refuse_contradicting_extends(body.config, {}, expert_type=body.expert_type)
             await self.catalog.require_visible_roster_refs(body.config, user=user)
         await write_policy.enforce_save(body.config or {}, user=user)
         name = body.name
@@ -532,6 +652,9 @@ class ExpertAuthoringService:
 
         source["config"] = self.catalog.validate_expert_fragment(
             source.get("config") or {}
+        )
+        _refuse_contradicting_extends(
+            source["config"], source, expert_type=source.get("expert_type")
         )
         source["prompts"] = (
             validate_expert_prompt_source_or_422(source.get("prompts") or {}) or {}
@@ -739,6 +862,19 @@ class ExpertAuthoringService:
             raise HTTPException(
                 status_code=403, detail="Only an admin may publish a skill globally"
             )
+        if (
+            existing.get("is_global")
+            and fields.get("is_global") is not False
+            and (body.files is not None or fields)
+            and not user.get("is_admin")
+        ):
+            # What an admin published is what every user's menu serves, so
+            # while the skill stays global its files and metadata are the
+            # admin's to change. Un-publishing (and editing with it) is open.
+            raise HTTPException(
+                status_code=403,
+                detail="Only an admin may edit a global skill; un-publish it first",
+            )
         files = body.files
         if files is not None:
             name, description, files = parse_skill_bundle(files)
@@ -814,7 +950,7 @@ class ExpertAuthoringService:
         from shared.runtime.core.skill_format import SkillFormatError, unpack_skill_zip
 
         try:
-            files = unpack_skill_zip(archive)
+            files = unpack_skill_zip(bounded_skill_archive(archive))
         except SkillFormatError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         name, description, files = parse_skill_bundle(files)

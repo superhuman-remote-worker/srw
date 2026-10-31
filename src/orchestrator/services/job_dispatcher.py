@@ -6,10 +6,12 @@ application lock; neither waits for a workspace create or mutation guard.
 Completed preparation is only a candidate for current-row checks and the
 existing database claim/admission and delivery authority.
 
-Triggers coalesce into one runner. The leader loop drains its preflights when
-it stops; application shutdown drains every owned task before closing stores.
-No in-memory scheduler state grants continuation of a pending creation after
-restart. Existing durable reservation and runtime fences remain authoritative.
+Triggers coalesce into one runner; a trigger on a replica that is not the
+leader NOTIFYs the leader's loop instead. The leader loop drains its
+preflights when it stops; application shutdown drains every owned task before
+closing stores. No in-memory scheduler state grants continuation of a pending
+creation after restart. Existing durable reservation and runtime fences remain
+authoritative.
 """
 
 from __future__ import annotations
@@ -58,6 +60,12 @@ from orchestrator.services.job_workspace_runtime import stateless_worker_workspa
 from orchestrator.services.job_workspace_runtime import (
     scholar_provision_parent_id as _scholar_provision_parent_id,
 )
+from orchestrator.services.manifest_experts import (
+    HarnessImageClass,
+    approved_srw_images,
+    harness_image_class,
+    trusted_srw_image,
+)
 from orchestrator.services.model_availability import WHERE_JOB
 from orchestrator.services.session_runtime_identity import (
     agent_sha_is_current as _agent_sha_is_current,
@@ -84,6 +92,13 @@ READY_PREFLIGHT_LIMIT = 2
 PENDING_PREFLIGHT_LIMIT = 100
 DISCOVERY_HEAD_LIMIT = 10
 DISCOVERY_PROGRESS_LIMIT = 40
+#: Seconds between the leader loop's catch-all passes.
+DISPATCH_INTERVAL_SECONDS = 30.0
+#: A replica that is not the leader asks the leader's loop for a pass on this
+#: channel. :func:`trigger_dispatch` alone is in-process and leader-gated, so
+#: a job created behind the load balancer on another replica would wait for
+#: the next catch-all pass.
+DISPATCH_CHANNEL = "srw_job_dispatch"
 
 
 class _MutationRequired(Exception):
@@ -120,7 +135,8 @@ class _PreparedCandidate:
 class JobDispatchState:
     """Serialization state one application's dispatcher owns.
 
-    ``tasks`` owns coalesced passes, workspace preflights and preemption pauses.
+    ``tasks`` owns coalesced passes, workspace preflights, preemption pauses
+    and a non-leader's requests for a leader pass.
     ``preflight_tasks`` is the subset drained on leadership loss. Pending work
     is bounded data, not a task per waiting Job. The application drains all
     tasks on shutdown before its pools close.
@@ -249,6 +265,37 @@ class JobDispatchDependencies:
     #: handling S4, ``job_start_bundle.unavailable_models_before_claim``):
     #: ``None``, or the ``ModelUnavailable`` its start bundle would refuse.
     unavailable_job_models: Callable[[Any], Awaitable[Any]] = _no_unavailable_models
+    #: Asks the leader's loop for a pass from a replica that is not the
+    #: leader (:func:`request_leader_dispatch` bound to the store). ``None``
+    #: leaves that trigger to the leader's next catch-all pass.
+    request_leader_dispatch: Callable[[], Awaitable[None]] | None = None
+    #: Holds the leader loop's LISTEN for those requests until shutdown,
+    #: setting the event it is given for each one
+    #: (:func:`listen_for_dispatch_requests` bound to the store). ``None``:
+    #: the loop hears no peer replica.
+    listen_for_dispatch_requests: (
+        Callable[[asyncio.Event, asyncio.Event], Awaitable[None]] | None
+    ) = None
+
+
+async def request_leader_dispatch(store: Any) -> None:
+    """NOTIFY :data:`DISPATCH_CHANNEL` so the leader's loop runs a pass now."""
+
+    await store.notify_channel(DISPATCH_CHANNEL)
+
+
+async def listen_for_dispatch_requests(
+    store: Any, wake: asyncio.Event, shutdown_event: asyncio.Event
+) -> None:
+    """Set ``wake`` for each NOTIFY on :data:`DISPATCH_CHANNEL` until shutdown.
+
+    One pooled connection holds the LISTEN and is reopened after a lost
+    backend (the connector reconcilers' listener). The catch-all pass stays
+    the floor for a request sent while no LISTEN was open.
+    """
+    from orchestrator.services.connector_service_hosting import _listen
+
+    await _listen(store, wake, shutdown_event, channel=DISPATCH_CHANNEL)
 
 
 def _needs_mutation(job: dict[str, Any], dependencies: JobDispatchDependencies) -> bool:
@@ -1301,6 +1348,124 @@ async def _preflight_job(
     return job
 
 
+@dataclass(frozen=True)
+class _HarnessImages:
+    """The installation's harness images for one matching pass."""
+
+    installed: str
+    approved: tuple[dict[str, Any], ...]
+
+    def classify(self, image: str | None) -> tuple[HarnessImageClass, str | None]:
+        return harness_image_class(
+            image, approved=self.approved, installed=self.installed
+        )
+
+    def of_job(self, job: dict[str, Any]) -> tuple[HarnessImageClass, str | None]:
+        """A job's class: ``harness_image`` NULL, the installed image or its
+        repository is a default job (key ``None``)."""
+        return self.classify(job.get("harness_image"))
+
+
+async def _available_agents_by_image(
+    dependencies: JobDispatchDependencies, images: _HarnessImages
+) -> dict[str | None, list[dict[str, Any]]]:
+    """Ready agents (cooldown passed) grouped by harness image, each group in
+    heartbeat order; ``None`` groups the default pods.
+
+    A default pod of a stale build is skipped; the lifecycle reconciler drains
+    it. A custom-image pod is identified by its approved image, never by the
+    SRW build SHA its image happens to bake in. A pod whose image is neither
+    installed nor approved serves nothing.
+    """
+    groups: dict[str | None, list[dict[str, Any]]] = {}
+    for ag in await dependencies.store.get_available_agents(limit=50):
+        kind, image = images.classify(ag.get("image"))
+        if kind == "ineligible":
+            logger.debug(
+                "Skipping agent %s: its image is neither installed nor approved",
+                ag["id"],
+            )
+            continue
+        if kind == "default":
+            meta = ag.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, ValueError):
+                    meta = {}
+            if not _agent_sha_is_current(meta):
+                logger.debug(
+                    "Skipping stale worker agent %s (build_sha=%s)",
+                    ag["id"],
+                    meta.get("build_sha", ""),
+                )
+                continue
+        groups.setdefault(image, []).append(ag)
+    return groups
+
+
+async def _provision_job_pods(
+    remaining: list[dict[str, Any]],
+    images: _HarnessImages,
+    *,
+    dependencies: JobDispatchDependencies,
+) -> None:
+    """Phase 1.5: start a pod of its harness image for each unclaimed job.
+
+    A default job gets today's pod. A custom image has no warm pool: it gets at
+    most one pod per pending job of that image in this batch, less the pods of
+    that image that are live but not running a job (starting, or idle), so an
+    image that never registers cannot eat the agent capacity. A custom pod
+    that fails to start ends that image's attempts for the batch without
+    holding back other jobs. A job whose image is neither installed nor
+    approved starts nothing and stays pending.
+    """
+    provisioner = dependencies.agent_provisioner
+    # Pods each custom image may still start in this batch.
+    budgets: dict[str, int] = {}
+    for job in remaining:
+        job_id = str(job["id"])
+        kind, image = images.of_job(job)
+        if kind == "ineligible":
+            logger.warning(
+                "Dispatcher: job %s runs harness image %s, which is neither "
+                "installed nor on the approved list; no pod is started for it",
+                job_id,
+                image,
+            )
+            continue
+        if image is not None:
+            if image not in budgets:
+                pending = sum(1 for j in remaining if images.of_job(j)[1] == image)
+                live = await provisioner.active_count_for_image(image)
+                busy = await provisioner.busy_agent_count_for_image(image)
+                budgets[image] = pending - max(0, live - busy)
+            if budgets[image] <= 0:
+                continue
+        if await provisioner.active_count() >= provisioner.max_agents:
+            break
+        if image is None:
+            pod_name = await provisioner.provision_agent(purpose="job")
+        else:
+            pod_name = await provisioner.provision_agent(purpose="job", image=image)
+        if not pod_name:
+            if image is None:
+                break  # At capacity or error
+            budgets[image] = 0
+            continue
+        if image is not None:
+            budgets[image] -= 1
+        logger.info(
+            "Provisioned agent %s for pending job %s (harness image: %s)",
+            pod_name,
+            job_id,
+            image or "installed",
+        )
+        # Don't assign yet — pod needs to register first.
+        # Agent heartbeats "ready" → _trigger_dispatch() → next
+        # cycle matches it.
+
+
 async def _match_jobs(
     prepared: list[_PreparedCandidate], *, dependencies: JobDispatchDependencies
 ) -> None:
@@ -1309,26 +1474,12 @@ async def _match_jobs(
     if not dispatchable_jobs:
         return
 
-    # Get available agents (ready, cooldown passed), skip stale images
-    all_agents = await dependencies.store.get_available_agents(limit=50)
-    available_agents = []
-    for ag in all_agents:
-        meta = ag.get("metadata") or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except (json.JSONDecodeError, ValueError):
-                meta = {}
-        if _agent_sha_is_current(meta):
-            available_agents.append(ag)
-        else:
-            # Stale-SHA agents are skipped here; the lifecycle
-            # reconciler is responsible for draining them.
-            logger.debug(
-                "Skipping stale worker agent %s (build_sha=%s)",
-                ag["id"],
-                meta.get("build_sha", ""),
-            )
+    # A job runs only on a pod of its harness image (None: the installed one).
+    images = _HarnessImages(
+        installed=trusted_srw_image(dependencies.store),
+        approved=approved_srw_images(dependencies.store),
+    )
+    agents_by_image = await _available_agents_by_image(dependencies, images)
 
     # Phase 1: Direct assignment
     matched_agent_ids = set()
@@ -1343,11 +1494,12 @@ async def _match_jobs(
     # regression and none was found (connector drivers decision 34 review).
     claimed_job_ids = set()
 
-    agents_iter = iter(available_agents)
     for job in dispatchable_jobs:
-        agent = next(agents_iter, None)
-        if agent is None:
-            break  # No more free agents
+        kind, image = images.of_job(job)
+        free_agents = agents_by_image.get(image) if kind != "ineligible" else None
+        if not free_agents:
+            continue  # No free agent of this job's image
+        agent = free_agents.pop(0)
 
         job_id = str(job["id"])
         if not await _current_candidate(candidates_by_id[job_id], dependencies):
@@ -1391,32 +1543,19 @@ async def _match_jobs(
     # Phase 1.5: Provision agent pods for unclaimed jobs (K8s only)
     remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
     if remaining and dependencies.agent_provisioner.is_available:
-        for job in remaining:
-            if (
-                await dependencies.agent_provisioner.active_count()
-                >= dependencies.agent_provisioner.max_agents
-            ):
-                break
-            pod_name = await dependencies.agent_provisioner.provision_agent(
-                purpose="job"
-            )
-            if pod_name:
-                logger.info(
-                    "Provisioned agent %s for pending job %s",
-                    pod_name,
-                    str(job["id"]),
-                )
-            else:
-                break  # At capacity or error
-            # Don't assign yet — pod needs to register first.
-            # Agent heartbeats "ready" → _trigger_dispatch() → next
-            # cycle matches it.
+        await _provision_job_pods(remaining, images, dependencies=dependencies)
 
     # Phase 2: Preemption (non-blocking). D1 placeability guard: only
     # workspace-ready jobs (dispatchable_jobs, not the full pending set)
     # may drive preemption — pausing a running job to free an agent is
-    # pointless for a job that has no workspace to run in.
-    remaining = [j for j in dispatchable_jobs if str(j["id"]) not in claimed_job_ids]
+    # pointless for a job that has no workspace to run in. Default-image
+    # jobs only, and only over jobs running on default pods: a pod of
+    # another image cannot serve the job that preempted it.
+    remaining = [
+        j
+        for j in dispatchable_jobs
+        if str(j["id"]) not in claimed_job_ids and images.of_job(j)[0] == "default"
+    ]
     if not remaining:
         return
 
@@ -1424,6 +1563,9 @@ async def _match_jobs(
     if not candidates:
         return
 
+    # Candidate id -> whether its job runs on a default pod. The candidate
+    # rows carry no harness image; one lookup each, only on this rare path.
+    on_default_pod: dict[str, bool] = {}
     for pending_job in remaining:
         pending_priority = pending_job.get("priority", 5)
         pending_job_id = str(pending_job["id"])
@@ -1463,6 +1605,12 @@ async def _match_jobs(
             if str(candidate.get("assigned_agent_id", "")) in matched_agent_ids:
                 continue
 
+            if candidate_id not in on_default_pod:
+                running = await dependencies.store.get_job(candidate_id) or {}
+                on_default_pod[candidate_id] = images.of_job(running)[0] == "default"
+            if not on_default_pod[candidate_id]:
+                continue
+
             # Initiate preemption (fire-and-forget)
             dependencies.state.pause_pending_job_ids.add(candidate_id)
             dependencies.state.spawn(
@@ -1483,7 +1631,9 @@ async def auto_assign_dispatcher(
     """Background task that periodically dispatches pending jobs to available agents.
 
     Runs every 30 seconds as a catch-all. Event-driven triggers (job creation,
-    agent heartbeat) also call dispatch_pending_jobs() for faster response.
+    agent heartbeat) schedule a pass at once: on this replica through
+    :func:`trigger_dispatch`, from any other through a NOTIFY this loop
+    LISTENs for while it leads.
     """
     logger.info(
         "Auto-assign dispatcher started (pinned=%s, stateless_workers=%s)",
@@ -1494,6 +1644,14 @@ async def auto_assign_dispatcher(
         return
     dependencies.state.leader_bound = True
     dependencies.state.scheduling_paused = False
+    wake = asyncio.Event()
+    listener = (
+        asyncio.create_task(
+            dependencies.listen_for_dispatch_requests(wake, shutdown_event)
+        )
+        if dependencies.listen_for_dispatch_requests is not None
+        else None
+    )
     try:
         while not shutdown_event.is_set():
             try:
@@ -1501,29 +1659,79 @@ async def auto_assign_dispatcher(
             except Exception as e:
                 logger.error(f"Error in auto-assign dispatcher: {e}")
 
-            # Wait 30 seconds or until shutdown
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
+            if await _until_next_pass(shutdown_event, wake, dependencies):
                 break
-            except asyncio.TimeoutError:
-                pass
     finally:
+        if listener is not None:
+            listener.cancel()
+            await asyncio.gather(listener, return_exceptions=True)
         await dependencies.state.pause_preflights()
 
     logger.info("Auto-assign dispatcher stopped")
 
 
+async def _until_next_pass(
+    shutdown_event: asyncio.Event,
+    wake: asyncio.Event,
+    dependencies: JobDispatchDependencies,
+) -> bool:
+    """Wait out the catch-all interval; ``True`` once shutdown is set.
+
+    A peer replica's request (``wake``) schedules a pass through the same
+    coalescing runner the leader's own trigger uses, and the catch-all pass
+    keeps its time.
+    """
+
+    deadline = time.monotonic() + DISPATCH_INTERVAL_SECONDS
+    while not shutdown_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        waiters = [
+            asyncio.ensure_future(event.wait()) for event in (shutdown_event, wake)
+        ]
+        try:
+            await asyncio.wait(
+                waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        if wake.is_set() and not shutdown_event.is_set():
+            wake.clear()
+            _request_dispatch(dependencies, discover=True)
+    return True
+
+
+async def _ask_leader(request: Callable[[], Awaitable[None]]) -> None:
+    try:
+        await request()
+    except Exception:
+        logger.warning(
+            "Dispatch: could not ask the leader for a pass; its catch-all pass "
+            "picks the work up",
+            exc_info=True,
+        )
+
+
 def trigger_dispatch(*, dependencies: JobDispatchDependencies) -> None:
     """Fire-and-forget trigger for the dispatcher. Safe to call from any endpoint.
 
-    Gated on leadership (M1): only the elected leader dispatches, so a job
-    created via a REST handler on a non-leader replica is picked up by the
-    leader's periodic dispatcher loop rather than dispatched here.
+    Gated on leadership (M1): only the elected leader dispatches. A replica
+    that is not the leader (a REST handler behind the load balancer created
+    a job, an agent turned ready) asks the leader's loop for a pass instead,
+    so the work does not wait up to :data:`DISPATCH_INTERVAL_SECONDS` for
+    its catch-all pass.
     """
     from orchestrator.services.leader_election import is_leader
 
-    if (
-        dependencies.auto_assign_enabled or dependencies.stateless_worker_enabled
-    ) and is_leader.is_set():
+    if not (dependencies.auto_assign_enabled or dependencies.stateless_worker_enabled):
+        return
+    if is_leader.is_set():
         dependencies.state.leader_bound = True
         _request_dispatch(dependencies, discover=True)
+    elif (
+        dependencies.request_leader_dispatch is not None
+        and not dependencies.state.closing
+    ):
+        dependencies.state.spawn(_ask_leader(dependencies.request_leader_dispatch))

@@ -147,7 +147,7 @@ def _deps(db: PostgresDB, lanes: str) -> AgentRegistrationDependencies:
         logger=MagicMock(),
         require_internal=AsyncMock(),
         require_admin=AsyncMock(),
-        is_internal_call=MagicMock(return_value=True),
+        is_internal_service_call=MagicMock(return_value=True),
         log_security_event=AsyncMock(),
         completion_commands_enabled=lambda: False,
         require_pinned_status_identity=lambda: True,

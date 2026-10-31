@@ -38,6 +38,7 @@ from orchestrator.services.session_tool_policy import (
     legacy_session_tool_policy,
     merged_session_tool_policy,
 )
+from orchestrator.services.workspace_tier_policy import backend_from_override
 from shared.runtime.core.loader import canonical_config_name
 from shared.runtime.core.tool_policy import enumerate_only_members
 from shared.runtime.core.tool_report import (
@@ -65,6 +66,12 @@ class SessionToolViewDependencies:
     #: The installed SRW harness image an inline expert's explicit image must
     #: equal (the one creation's execution snapshot records).
     srw_image: Callable[[], str]
+    #: Admission's ``cloud_folders_need_a_container``: whether a default
+    #: Session in a project gets a Container for its cloud connectors.
+    cloud_folders_need_a_container: Callable[..., Awaitable[bool]]
+    #: Admission's ``cloud_folders_can_take_a_container``: whether a cloud
+    #: folder would take such a Session to a Container at all.
+    cloud_folders_can_take_a_container: Callable[..., Awaitable[bool]]
 
 
 async def session_tool_grants(
@@ -298,9 +305,13 @@ async def preview_tool_groups(
                 ),
             )
         from orchestrator.services.inline_expert import admit_inline_expert
+        from orchestrator.services.manifest_experts import approved_srw_images
 
         expert_row = admit_inline_expert(
-            inline, role=body.expert_type, trusted_image=dependencies.srw_image()
+            inline,
+            role=body.expert_type,
+            trusted_image=dependencies.srw_image(),
+            approved_images=approved_srw_images(store),
         )
     legacy = (
         not is_experts_db_enabled() or not await dependencies.user_experts_enabled()
@@ -342,6 +353,59 @@ async def preview_tool_groups(
         account_defaults=account,
         request=request,
     )
+    # Admission's rule (resolve_thread_creation_plan): a Session whose tier
+    # came from the defaults and whose cloud connectors Virtual cannot serve
+    # (a protected folder, a provider without the Virtual delivery) gets a
+    # Container. The form then lists and submits those connectors, and keeps
+    # its cloud folders selectable while it predicts Virtual: ticking one
+    # takes the Session to a Container rather than being refused.
+    cloud_folders_take_container = False
+    if (
+        not is_worker
+        and workspace_selection is not None
+        and "workspace" not in body.model_fields_set
+        and backend_from_override(
+            bind_execution_workspace(body.config_override or {}, workspace_config)
+        )
+        == "virtual"
+    ):
+        try:
+            needs_container = await dependencies.cloud_folders_need_a_container(
+                user,
+                project_id=body.project_id,
+                datasource_ids=body.datasource_ids,
+                datasource_access=getattr(body, "datasource_access", None),
+            )
+            cloud_folders_take_container = (
+                needs_container
+                or await dependencies.cloud_folders_can_take_a_container(
+                    user, project_id=body.project_id
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Tool-group preview could not read the cloud connectors' tier"
+            )
+            needs_container = False
+        if needs_container:
+            from shared.workspace_defaults import Upgrade
+
+            workspace_config, workspace_selection = await select_execution_workspace(
+                store,
+                user,
+                project_id=body.project_id,
+                role=body.expert_type,
+                workspace=None,
+                supplied=False,
+                config_override=body.config_override,
+                account_defaults=account,
+                request=request,
+                upgrade=Upgrade(current="virtual", requested="container"),
+            )
+            workspace_selection["sources"] = {
+                **workspace_selection["sources"],
+                "tier": "cloud_connectors",
+            }
     sources = (workspace_selection or {}).get("sources") or {}
     template_name = (workspace_selection or {}).get("template_name")
     workspace_source = (
@@ -357,6 +421,7 @@ async def preview_tool_groups(
     if workspace_source == "default" and body.workspace_preference is not None:
         workspace_config = {"backend": body.workspace_preference}
         workspace_source = "recommendation"
+        cloud_folders_take_container = False
         # The client submits this binding as its explicit choice, so it names
         # the recommended tier, never the default template it replaces.
         workspace_selection = None
@@ -377,6 +442,7 @@ async def preview_tool_groups(
         ),
         "sources": sources,
         "template_name": template_name,
+        "cloud_folders_take_container": cloud_folders_take_container,
     }
 
     # The legacy branch models ONE agent's behaviour: persistent_session's

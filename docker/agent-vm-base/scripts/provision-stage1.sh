@@ -295,8 +295,8 @@ _section "Installing rclone (pinned)"
 
 # SRW_ prefix matters: rclone parses RCLONE_* env vars as flags, so a stray
 # exported RCLONE_VERSION would crash every rclone invocation.
-SRW_RCLONE_VERSION=1.74.3
-SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
+SRW_RCLONE_VERSION=1.75.2
+SRW_RCLONE_SHA256=efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c
 curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SRW_RCLONE_VERSION}-linux-amd64.deb" \
     -o /tmp/rclone.deb
 echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c -
@@ -400,7 +400,9 @@ sudo PLAYWRIGHT_BROWSERS_PATH=/opt/playwright eatmydata playwright install --wit
 CHROMIUM_BIN=$(sudo find /opt/playwright -maxdepth 4 -type f \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) ! -path '*headless_shell*' | head -1)
 test -n "$CHROMIUM_BIN" || { echo "ERROR: chromium binary not found under /opt/playwright"; sudo find /opt/playwright -maxdepth 4 -type d; exit 1; }
 sudo ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium
-echo "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright" | sudo tee -a /etc/environment
+# No PLAYWRIGHT_BROWSERS_PATH: it would send every Playwright version, including
+# a project's own, to this read-only folder. The agent's Playwright finds these
+# browsers through links in ~/.cache/ms-playwright, made in stage2.
 echo "Chromium installed at $CHROMIUM_BIN (symlinked /usr/local/bin/agent-chromium)"
 
 # Assert stage1's half of the browser contract here rather than deferring it all

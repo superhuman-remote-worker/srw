@@ -318,6 +318,11 @@ class ShellManager:
         """
         return self._backend.shell_format_tab_header()
 
+    def take_disk_full_notice(self) -> Optional[str]:
+        """The backend's one-time notice that the workspace disk is full."""
+        take = getattr(self._backend, "take_disk_full_notice", None)
+        return take() if callable(take) else None
+
     def list_tabs(self) -> List[Dict[str, Any]]:
         """Return metadata for all tabs.
 

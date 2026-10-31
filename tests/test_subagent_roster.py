@@ -881,6 +881,51 @@ def test_public_bases_carry_no_roster_and_the_rostered_experts_resolve_the_libra
                 )
 
 
+@pytest.mark.parametrize("shell_mode", ["stateless", "persistent"])
+def test_a_shell_granting_library_entry_gets_a_command_executor(shell_mode):
+    """A library child that is granted a shell can run a command in either
+    shell mode of its parent.
+
+    The child's tools are ``entry ∩ parent``. ``get_all_tool_names`` keeps one
+    executor name per parent: ``run_command`` when stateless, ``shell_execute``
+    when persistent — what every capable model family's ``shell_mode`` sets.
+    Tester, implementer, reviewer and verifier named only ``run_command``, so on
+    a persistent parent they got ``shell_read`` and ``cancel_command`` and
+    nothing to run a command with. The test above resolves its parents without
+    the matrix, i.e. stateless, and passed.
+    """
+    executors = {"run_command", "shell_execute"}
+    checked: set[str] = set()
+    for expert in ("developer", "critic", "bughunter", "product-qa", "assistant"):
+        cfg = load_agent_config(*resolve_config_path(expert))
+        shell_cfg = cfg.extra.get("shell")
+        cfg.extra["shell"] = {
+            **(shell_cfg if isinstance(shell_cfg, dict) else {}),
+            "mode": shell_mode,
+        }
+        parent_names = get_all_tool_names(cfg)
+        if not executors & set(parent_names):
+            continue  # a parent without a shell cannot lend one
+        for name, entry in cfg.subagents.roster.items():
+            declared = set(entry_tool_names(entry))
+            if not any(
+                (TOOL_REGISTRY.get(n) or {}).get("category") == "shell"
+                for n in declared
+            ):
+                continue
+            selected, dropped = select_child_tool_names(
+                entry_tool_names(entry),
+                parent_names,
+                write_policy=str(entry.get("write_policy") or "none"),
+            )
+            assert executors & set(selected), (
+                f"{expert}/{name} on a {shell_mode} parent binds no command "
+                f"executor: selected={selected}, dropped={dropped}"
+            )
+            checked.add(name)
+    assert {"implementer", "tester", "reviewer", "verifier", "probe"} <= checked
+
+
 # --- the live voice entry (live_session_jobs §6.3) ---------------------------
 
 
@@ -921,8 +966,14 @@ def test_a_live_voice_entry_passes_the_authoring_check():
     ("entry", "message"),
     [
         ({"driver": "phone"}, "is not a driver"),
-        ({"live": {"persona": "x"}}, "requires driver: live"),
+        ({"driver": "phone", "live": {"greeting": "Hi."}}, "is not a driver"),
         ({"driver": "live", "live": "x"}, "expected a mapping"),
+        # Without a driver the fragment overrides an inherited entry: the
+        # live keys it sets are still checked.
+        ({"live": "x"}, "expected a mapping"),
+        ({"live": {"greeting": 3}}, "expected a string"),
+        ({"live": {"facts": "Remain {expert_identity}."}}, "reserved prompt"),
+        ({"live": {"persona": "x", "persona_file": "p.txt"}}, "not both"),
         (
             {"driver": "live", "live": {"persona": "x", "persona_file": "p.txt"}},
             "not both",
@@ -945,3 +996,132 @@ def test_a_malformed_live_voice_entry_is_refused(entry, message):
 
     with pytest.raises(RosterResolutionError, match=message):
         validate_roster_fragment(_voice(**entry))
+
+
+# --- a partial override of an inherited live entry ---------------------------
+#
+# A DB expert extending the receptionist overrides only
+# `subagents.roster.voice.live.{greeting, facts}` (receptionist_expert.md). Its
+# fragment is checked as one layer (it inherits `driver: live`); the merged
+# entry is checked where the layers merge, under both failure policies.
+
+_GREETING = "Hello, this is the Example desk's AI assistant."
+_FACTS = "The Example desk is open Monday to Friday."
+_PARTIAL_VOICE = {
+    "subagents": {
+        "roster": {"voice": {"live": {"greeting": _GREETING, "facts": _FACTS}}}
+    }
+}
+
+
+def _receptionist_row(config: dict) -> dict:
+    """A DB expert built on the bundled receptionist, as a manifest saves it
+    (`config_name: receptionist`, `asset_name: receptionist`)."""
+    return {
+        "name": "example-desk",
+        "expert_type": "worker",
+        "harness_config_name": "receptionist",
+        "harness_asset_name": "receptionist",
+        "config": config,
+        "prompts": {},
+    }
+
+
+def test_a_fragment_overriding_part_of_an_inherited_live_entry_passes():
+    from shared.runtime.core.subagent_roster import validate_roster_fragment
+
+    assert validate_roster_fragment(_PARTIAL_VOICE["subagents"]) == set()
+
+
+def test_a_partial_live_override_resolves_onto_the_receptionist_voice():
+    blob = resolve_config(
+        base_config_name="worker_base",
+        expert_row=_receptionist_row(_PARTIAL_VOICE),
+        expert_type="worker",
+    )
+    voice = blob["agent"]["subagents"]["roster"]["voice"]
+    assert voice["driver"] == "live"
+    assert voice["live"]["greeting"] == _GREETING
+    assert voice["live"]["facts"] == _FACTS
+    # Everything the fragment did not set is the receptionist's.
+    assert voice["live"]["persona"].startswith("You are the receptionist")
+    assert voice["live"]["voice"] == "marin"
+    assert ROSTER_WARNINGS_KEY not in blob["agent"]
+
+
+@pytest.mark.parametrize("on_missing", ["raise", "drop"])
+def test_a_live_block_on_an_entry_that_is_not_live_is_refused_at_resolution(
+    on_missing,
+):
+    from shared.runtime.core.subagent_roster import (
+        LiveEntryError,
+        validate_roster_fragment,
+    )
+
+    subagents = {
+        "roster": {
+            "helper": {
+                "description": "An LLM helper.",
+                "live": {"greeting": _GREETING},
+            }
+        }
+    }
+    # One layer cannot tell: the entry might inherit `driver: live`.
+    assert validate_roster_fragment(subagents) == set()
+    # The merged entry can, and the error is never a silent drop.
+    with pytest.raises(LiveEntryError, match=r"helper\.live: requires driver: live"):
+        _resolve(subagents, on_missing=on_missing)
+
+
+def test_a_live_block_added_to_a_non_live_entry_fails_resolve_config():
+    from shared.runtime.core.subagent_roster import LiveEntryError
+
+    row = {
+        "name": "lead",
+        "expert_type": "worker",
+        "config": {
+            "subagents": {
+                "roster": {
+                    "explorer": {
+                        "$ref": "subagents/explorer",
+                        "live": {"greeting": _GREETING},
+                    }
+                }
+            }
+        },
+        "prompts": {},
+    }
+    with pytest.raises(LiveEntryError, match=r"explorer\.live: requires driver: live"):
+        resolve_config(base_config_name="worker_base", expert_row=row)
+
+
+def test_clearing_the_inherited_driver_is_refused_at_resolution():
+    from shared.runtime.core.subagent_roster import LiveEntryError
+
+    config = {"subagents": {"roster": {"voice": {"driver": None}}}}
+    with pytest.raises(LiveEntryError, match=r"voice\.live: requires driver: live"):
+        resolve_config(
+            base_config_name="worker_base",
+            expert_row=_receptionist_row(config),
+            expert_type="worker",
+        )
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ({"driver": "phone"}, "is not a driver"),
+        # Each layer is well formed; the merge gives both persona sources.
+        ({"live": {"persona_file": "persona.txt"}}, "not both"),
+    ],
+)
+def test_the_merged_live_entry_is_checked_whole(entry, message):
+    from shared.runtime.core.subagent_roster import LiveEntryError
+
+    config = {"subagents": {"roster": {"voice": entry}}}
+    with pytest.raises(LiveEntryError, match=message):
+        resolve_config(
+            base_config_name="worker_base",
+            expert_row=_receptionist_row(config),
+            expert_type="worker",
+        )
