@@ -1851,8 +1851,11 @@ class SessionTerminationCoordinator:
                 git_mgr = getattr(
                     self._ports.session().workspace_manager, "git_manager", None
                 )
-                if git_mgr and git_mgr.is_active:
-                    try:
+                try:
+                    # Asking whether the repository exists reaches the
+                    # workspace too: a workspace that is gone has nothing to
+                    # commit, and must not fail the detach of a settled turn.
+                    if git_mgr and git_mgr.is_active:
                         if git_mgr.has_uncommitted_changes():
                             git_mgr.commit(f"Session detach: thread {thread_id}")
                         if git_mgr.push() is False:
@@ -1860,8 +1863,8 @@ class SessionTerminationCoordinator:
                                 "Final git push was unsuccessful (non-fatal): %s",
                                 getattr(git_mgr, "last_push_error", None),
                             )
-                    except Exception as e:
-                        self._logger.warning(f"Final git push failed (non-fatal): {e}")
+                except Exception as e:
+                    self._logger.warning(f"Final git push failed (non-fatal): {e}")
 
         # The journal owns a captured pool + thread identity. Drain it while both
         # the session and live subscribers still exist: terminal Canvas failures

@@ -16,7 +16,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call as mock_call, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call as mock_call, patch
 from uuid import uuid4
 
 import pytest
@@ -54,6 +54,7 @@ from agent.api.session_attach import session_backend_is_lite, session_backend_is
 from agent.api.session_workspace import poll_workspace_ready
 from agent.core.context import summary_text
 from shared.runtime.core.message_markers import is_compaction_summary
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 
 
 async def _handle_api_interrupt(request):
@@ -6000,6 +6001,39 @@ class TestTerminateSession:
             preserve_shell=False,
             preserve_workspace_daemons=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_a_lost_workspace_does_not_fail_the_detach(self):
+        """Asking a gone workspace whether a repository exists must not fail
+        the detach of a settled turn: the executor would park the Session as
+        a crash after a tool effect, with nothing the owner can do
+        (session_unknown_tool_result_needs_admin.md, k3d 2026-10-31)."""
+        import agent.api.persistent_app as mod
+
+        mod._loop_task = None
+        mod._session_identity._thread_id = "t-lost"
+        mod._event_writer = None
+        mod._session_termination.terminating = False
+        mod._session_termination.max_sessions_per_process = 0
+        fake_session = _retirement_session_mock()
+        fake_session.workspace_sync = None
+        git_mgr = MagicMock()
+        type(git_mgr).is_active = PropertyMock(
+            side_effect=WorkspaceUnavailableError("workspace gone")
+        )
+        fake_session.workspace_manager = MagicMock(git_manager=git_mgr)
+        fake_session.cleanup = AsyncMock()
+        mod._session = fake_session
+
+        with (
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
+        ):
+            await mod._session_termination.terminate("test")
+
+        git_mgr.commit.assert_not_called()
+        fake_session.cleanup.assert_awaited_once()
+        assert mod._session is None
 
     @pytest.mark.asyncio
     async def test_mark_thread_false_preserves_shell_for_ownership_handoff(self):

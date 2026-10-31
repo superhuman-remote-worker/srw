@@ -11,7 +11,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 from typing import List
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 from langchain_core.messages import (
@@ -1208,6 +1208,62 @@ class TestAutoCommitGit:
 
         git_mgr.commit.assert_called_once()
         assert "turn 1" in git_mgr.commit.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_a_lost_workspace_skips_the_auto_commit(self):
+        """The turn already reported the lost workspace; asking it whether a
+        repository exists must not crash the loop after the turn settled
+        (session_unknown_tool_result_needs_admin.md, k3d 2026-10-31)."""
+        response_with_tool = AIMessage(
+            content="",
+            tool_calls=[{"name": "test_tool", "args": {}, "id": "tc1"}],
+        )
+        final_response = _make_llm_response("Done!")
+        call_count = 0
+
+        async def _astream(messages, **kw):
+            nonlocal call_count
+            call_count += 1
+            yield response_with_tool if call_count == 1 else final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        git_mgr = MagicMock()
+        type(git_mgr).is_active = PropertyMock(
+            side_effect=WorkspaceUnavailableError("workspace gone")
+        )
+        ws_mgr = MagicMock()
+        ws_mgr.git_manager = git_mgr
+        ws_mgr.read_file.return_value = ""
+        tool_ctx = MagicMock()
+        tool_ctx.workspace_manager = ws_mgr
+        tool_ctx.consume_freeze_request.return_value = None
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "do something"
+            raise asyncio.CancelledError
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[_make_tool("test_tool", "result")],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=[],
+            tool_context=tool_ctx,
+        )
+
+        assert turns == 2
+        git_mgr.commit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_commit_when_no_tool_calls(self):

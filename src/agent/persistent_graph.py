@@ -1907,7 +1907,18 @@ async def run_persistent_loop(
             if tool_context and not input_delivery_removed_from_context:
                 ws_mgr = getattr(tool_context, "workspace_manager", None)
                 git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
-                if git_mgr and git_mgr.is_active:
+                try:
+                    # This reaches the workspace: one that is gone (the turn
+                    # already reported it) has nothing to commit.
+                    git_active = bool(git_mgr and git_mgr.is_active)
+                except Exception:
+                    logger.warning(
+                        f"Turn {turn_id}: workspace git state unavailable; "
+                        "skipping the auto-commit",
+                        exc_info=True,
+                    )
+                    git_active = False
+                if git_active:
                     map_head = False
                     if tool_calls_this_turn > 0:
                         try:
