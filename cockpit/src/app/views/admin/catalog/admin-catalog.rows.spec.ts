@@ -138,10 +138,10 @@ describe('catalog rows', () => {
   it('resets the box without a PATCH when the Helm override is cancelled', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     const component = setup().componentInstance;
-    const before = component.rowResync();
+    const before = component.resyncKey(row());
     component.toggleEnabled(row({managed_by_helm: true}), false);
     expect(models.updateModel).not.toHaveBeenCalled();
-    expect(component.rowResync()).toBe(before + 1);
+    expect(component.resyncKey(row())).not.toBe(before);
   });
 
   it('reloads, resets the box and says why when the PATCH fails', () => {
@@ -149,22 +149,32 @@ describe('catalog rows', () => {
       throwError(() => ({error: {detail: 'last chat model'}})) as never,
     );
     const component = setup().componentInstance;
-    const before = component.rowResync();
+    const before = component.resyncKey(row());
     component.toggleEnabled(row(), false);
     expect(models.loadModels).toHaveBeenCalled();
-    expect(component.rowResync()).toBe(before + 1);
+    expect(component.resyncKey(row())).not.toBe(before);
     expect(component.rowError()).toBe('gpt-6-sol: last chat model');
   });
 
-  it('re-creates the checkbox on a resync so it shows the stored value', () => {
-    models.models.set([row()]);
+  it("re-creates only that row's checkbox on a resync", () => {
+    // A cancelled toggle rebuilds the clicked box so it shows the stored value
+    // again; the other rows keep theirs (rebuilding every row's controls also
+    // flooded the dev console with NG0956).
+    vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const other = row({id: 'row-2', model_id: 'claude', display_label: 'claude'});
+    models.models.set([row({managed_by_helm: true}), other]);
     const fixture = setup();
     fixture.detectChanges();
-    const first = fixture.nativeElement.querySelector('.model-row .col-enabled app-checkbox');
-    fixture.componentInstance.rowResync.update((n) => n + 1);
+    const boxes = () =>
+      Array.from(
+        (fixture.nativeElement as HTMLElement).querySelectorAll('.model-row .col-enabled app-checkbox'),
+      );
+    const [firstBefore, otherBefore] = boxes();
+    fixture.componentInstance.toggleEnabled(row({managed_by_helm: true}), false);
     fixture.detectChanges();
-    const second = fixture.nativeElement.querySelector('.model-row .col-enabled app-checkbox');
-    expect(second).not.toBeNull();
-    expect(second).not.toBe(first);
+    const [firstAfter, otherAfter] = boxes();
+    expect(firstAfter).not.toBeUndefined();
+    expect(firstAfter).not.toBe(firstBefore);
+    expect(otherAfter).toBe(otherBefore);
   });
 });

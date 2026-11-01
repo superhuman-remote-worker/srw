@@ -374,8 +374,10 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                       } @else {
                         <!-- app-select keeps its own value after a pick; re-creating it
                              on a resync snaps it back to the row's shape: the stored
-                             one, else the one the agent really calls it with. -->
-                        @for (epoch of [rowResync()]; track epoch) {
+                             one, else the one the agent really calls it with. Keyed by
+                             row + resync count, so only this row's control is rebuilt; the
+                             key is read in the list (not in track) so a bump re-renders. -->
+                        @for (control of [{key: resyncKey(m)}]; track control.key) {
                           <app-select
                             [value]="m.client_protocol || m.effective_client_protocol || null"
                             [ariaLabel]="'API shape for ' + m.display_label"
@@ -391,7 +393,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                     <span class="col-enabled">
                       <!-- Re-created on a resync for the same reason as the select:
                            a cancelled or refused toggle must not stay ticked. -->
-                      @for (epoch of [rowResync()]; track epoch) {
+                      @for (control of [{key: resyncKey(m)}]; track control.key) {
                         <app-checkbox
                           size="sm"
                           [checked]="m.enabled"
@@ -1540,10 +1542,20 @@ export class AdminCatalogComponent implements OnInit {
   /** Last failed inline edit on a row (API shape, enabled); cleared by the next attempt. */
   readonly rowError = signal('');
   /**
-   * Bumped to re-create the row selects and checkboxes, which keep their own
-   * value after a click, so they show the stored value again.
+   * Per-row count, bumped to re-create that row's select and checkbox: both
+   * keep their own value after a click, so a cancelled or refused edit would
+   * otherwise stay on screen. Only the row that changed is rebuilt.
    */
-  readonly rowResync = signal(0);
+  private readonly resyncCounts = signal<ReadonlyMap<string, number>>(new Map());
+
+  /** The key a row's inline controls are tracked by; it changes on a resync. */
+  resyncKey(m: CatalogModel): string {
+    return `${m.id}:${this.resyncCounts().get(m.id) ?? 0}`;
+  }
+
+  private resyncRow(id: string): void {
+    this.resyncCounts.update((prev) => new Map(prev).set(id, (prev.get(id) ?? 0) + 1));
+  }
   // True when the operator picked "Custom…" (or the backend is unrecognized);
   // then formVoice is a free-text voice id rather than a catalog selection.
   readonly formVoiceCustom = signal(false);
@@ -2031,7 +2043,7 @@ export class AdminCatalogComponent implements OnInit {
   toggleEnabled(model: CatalogModel, checked: boolean): void {
     this.rowError.set('');
     if (!this.confirmHelmOverride(model)) {
-      this.rowResync.update((n) => n + 1);
+      this.resyncRow(model.id);
       return;
     }
     this.models.updateModel(model.id, {enabled: checked}).subscribe({
@@ -2039,7 +2051,7 @@ export class AdminCatalogComponent implements OnInit {
         const fallback = checked ? 'Failed to enable the model.' : 'Failed to disable the model.';
         this.rowError.set(`${model.display_label}: ${catalogErrorDetail(err, fallback)}`);
         this.models.loadModels();
-        this.rowResync.update((n) => n + 1);
+        this.resyncRow(model.id);
       },
     });
   }
@@ -2047,7 +2059,7 @@ export class AdminCatalogComponent implements OnInit {
   setProtocol(model: CatalogModel, protocol: string | null): void {
     this.rowError.set('');
     if (protocol === null || !this.confirmHelmOverride(model)) {
-      this.rowResync.update((n) => n + 1);
+      this.resyncRow(model.id);
       return;
     }
     this.models
@@ -2058,7 +2070,7 @@ export class AdminCatalogComponent implements OnInit {
             `${model.display_label}: ${catalogErrorDetail(err, 'Failed to change the API shape.')}`,
           );
           this.models.loadModels();
-          this.rowResync.update((n) => n + 1);
+          this.resyncRow(model.id);
         },
       });
   }

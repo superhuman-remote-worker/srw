@@ -246,20 +246,20 @@ describe('API shape', () => {
     );
     const fixture = setup(makeProviders([ENDPOINT]));
     const component = fixture.componentInstance;
-    const before = component.rowResync();
+    const before = component.resyncKey(row());
     component.setProtocol(row(), 'anthropic-messages');
     expect(models.loadModels).toHaveBeenCalled();
-    expect(component.rowResync()).toBe(before + 1);
+    expect(component.resyncKey(row())).not.toBe(before);
     expect(component.rowError()).toContain('client_protocol not allowed');
   });
 
   it('resyncs the select without a PATCH when the Helm override is cancelled', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     const component = setup(makeProviders([ENDPOINT])).componentInstance;
-    const before = component.rowResync();
+    const before = component.resyncKey(row());
     component.setProtocol(row({managed_by_helm: true}), 'anthropic-messages');
     expect(models.updateModel).not.toHaveBeenCalled();
-    expect(component.rowResync()).toBe(before + 1);
+    expect(component.resyncKey(row())).not.toBe(before);
   });
 
   it('shows the add-form API shape for a plain endpoint but not the subscription proxy', () => {
