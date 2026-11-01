@@ -1358,11 +1358,13 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       color: var(--text-muted);
       font-variant-numeric: tabular-nums;
     }
-    @container catalog (max-width: 1040px) {
-      /* Below this width the nine columns no longer fit, and the overflow ran
-         past the row backgrounds or hid Test / Delete behind the page's
-         overflow:auto. Collapse each row into a stacked card so every field
-         and control stays on-screen. Wider containers keep the table grid. */
+    @container catalog (max-width: 1100px) {
+      /* Below this width the nine columns no longer fit: the content-sized
+         ones get squeezed (the API-shape select truncates, Delete reaches the
+         row edge). The widest table, measured on k3d with a 160px mapped
+         pricing id plus the longest family name in the config matrix
+         (gemini-3.8-flash), needs ~1,089px. Collapse each row into a stacked
+         card so every field and control stays whole. */
       .catalog-grid,
       .provider-group {
         display: flex;
