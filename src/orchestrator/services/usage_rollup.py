@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import asyncpg
 
 from orchestrator.services.usage_ledger import (
+    NET_EVENT_COUNT_SQL,
     V1_USAGE_COMPAT_PREDICATE,
     UsageLedger,
     _uuid,
@@ -71,12 +72,12 @@ _WATERMARK = "usage_daily"
 # matches the ledger's own day bucketing (usage_ledger.query_timeseries) so the
 # rollup and the raw tail agree on day boundaries. ts is the partition key, so
 # the range predicate prunes to the touched monthly partitions.
-_AGG_SQL = """
+_AGG_SQL = f"""
 SELECT (ts AT TIME ZONE 'UTC')::date AS day,
        user_id, project_id, category, resource, unit,
        SUM(quantity)               AS quantity,
        COALESCE(SUM(cost_usd), 0)  AS cost_usd,
-       COUNT(*)                    AS events
+       {NET_EVENT_COUNT_SQL}       AS events
 FROM usage_events
 WHERE ts >= $1 AND ts < $2
 GROUP BY 1, user_id, project_id, category, resource, unit

@@ -348,3 +348,79 @@ class TestLedgerFloor:
         assert await ledger.earliest_event_ts() == datetime(2026, 3, 20, tzinfo=UTC)
         await _insert(db, ts=datetime(2026, 2, 20, tzinfo=UTC))
         assert await ledger.earliest_event_ts() == datetime(2026, 3, 20, tzinfo=UTC)
+
+
+def _load_backfill_script():
+    """The manually run pricing backfill, imported from ``scripts/`` (no package)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "scripts" / "backfill_llm_pricing.py"
+    spec = importlib.util.spec_from_file_location("backfill_llm_pricing", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestRepricedEventsCountOnce:
+    """The backfill appends a reversal + a priced replacement per unpriced row.
+
+    Quantity and cost net out under SUM; the event count must too, or a fully
+    repriced job keeps its "partially priced" caveat: dev job ``90f68127``
+    went from "priced 314 of 472" to "priced 472 of 788" after its backfill.
+    Runs the script's own correction SQL so a change to either side shows up.
+    """
+
+    RATE = Decimal("0.000004")
+
+    async def _reprice(self, pool: asyncpg.Pool, resource: str, unit: str) -> None:
+        script = _load_backfill_script()
+        async with pool.acquire() as conn:
+            # The script's ON CONFLICT names the production dedupe index.
+            await conn.execute(
+                "CREATE UNIQUE INDEX usage_events_dedupe "
+                "ON usage_events (source, source_id, unit, ts)"
+            )
+            await conn.execute(script._CORRECT_SQL, resource, unit, self.RATE)
+
+    @pytest.mark.asyncio
+    async def test_ref_query_counts_each_repriced_call_once(self, db, ledger):
+        for _ in range(3):
+            await _insert(db, resource="claude-opus-5-5", quantity=1000.0)
+        await _insert(db, resource="claude-opus-5-5", quantity=500.0, cost_usd=0.002)
+
+        await self._reprice(db, "claude-opus-5-5", "prompt-token")
+        (row,) = await ledger.query_ref_usage(
+            ref_kind="job", ref_ids=[str(JOB)], from_ts=WIDE[0], to_ts=WIDE[1]
+        )
+
+        assert row["events"] == 4
+        assert row["priced_events"] == 4
+        assert row["quantity"] == pytest.approx(3500.0)
+        assert row["cost_usd"] == pytest.approx(3000 * 0.000004 + 0.002)
+
+    @pytest.mark.asyncio
+    async def test_rerunning_the_backfill_changes_nothing(self, db, ledger):
+        await _insert(db, resource="claude-opus-5-5", quantity=1000.0)
+        await self._reprice(db, "claude-opus-5-5", "prompt-token")
+        script = _load_backfill_script()
+        async with db.acquire() as conn:
+            await conn.execute(
+                script._CORRECT_SQL, "claude-opus-5-5", "prompt-token", self.RATE
+            )
+        (row,) = await ledger.query_ref_usage(
+            ref_kind="job", ref_ids=[str(JOB)], from_ts=WIDE[0], to_ts=WIDE[1]
+        )
+        assert (row["events"], row["priced_events"]) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_shared_usage_reader_counts_them_once_too(self, db, ledger):
+        for _ in range(2):
+            await _insert(db, resource="claude-opus-5-5", quantity=1000.0)
+        await self._reprice(db, "claude-opus-5-5", "prompt-token")
+        shared = await ledger.query_usage(
+            from_ts=WIDE[0], to_ts=WIDE[1], ref_id=str(JOB)
+        )
+        (llm,) = shared["by_category"]
+        assert llm["events"] == 2
+        assert llm["cost_usd"] == pytest.approx(2000 * 0.000004)
