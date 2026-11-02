@@ -3106,12 +3106,18 @@ export interface JobProgress {
   sources?: JobLivenessSource[];
   /** Always null from the current producer; kept for shape compatibility. */
   progress_percent: number | null;
-  elapsed_seconds: number;
+  /**
+   * Seconds from creation to now while the system works the job; once it
+   * stops (finished, or waiting on a human) the clock ends at its last audited
+   * step. Null only when the row has no creation time.
+   */
+  elapsed_seconds: number | null;
   /** Always null from the current producer; kept for shape compatibility. */
   eta_seconds?: number | null;
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
+  failed_at?: string | null;
 }
 
 // =============================================================================

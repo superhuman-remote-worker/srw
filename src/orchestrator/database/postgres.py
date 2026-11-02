@@ -27769,13 +27769,15 @@ class PostgresDB:
         fabricated ``progress_percent=0`` — no percentage telemetry exists,
         so the field is now an honest ``None`` (kept for payload-shape
         compatibility) and the ``/progress`` route composes the real
-        liveness verdict from ``services.job_liveness``.
+        liveness verdict and ``elapsed_seconds`` from
+        ``services.job_liveness``: how long a stopped job ran needs the audit
+        store's last write, which this store cannot read.
 
         Args:
             job_id: Job UUID as string
 
         Returns:
-            Dict with status/timestamps/elapsed, or None if job not found
+            Dict with status/timestamps, or None if job not found
         """
         try:
             uuid_val = UUID(job_id)
@@ -27786,7 +27788,8 @@ class PostgresDB:
             job = await conn.fetchrow(
                 """
                 SELECT id, description, status, completion_outcome_kind,
-                       config_name, assigned_agent_id, created_at, updated_at, completed_at
+                       config_name, assigned_agent_id, created_at, updated_at,
+                       completed_at, failed_at
                 FROM jobs WHERE id = $1
                 """,
                 uuid_val,
@@ -27794,13 +27797,8 @@ class PostgresDB:
             if not job:
                 return None
 
-        # Calculate elapsed time
-        created_at = job["created_at"]
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        elapsed = now - created_at
-        elapsed_seconds = elapsed.total_seconds()
+        def iso(column: str) -> str | None:
+            return job[column].isoformat() if job[column] else None
 
         return {
             "job_id": str(job["id"]),
@@ -27808,13 +27806,11 @@ class PostgresDB:
             "completion_outcome_kind": job["completion_outcome_kind"],
             # Honest nulls: never manufacture 0% / a fake ETA (E1).
             "progress_percent": None,
-            "elapsed_seconds": elapsed_seconds,
             "eta_seconds": None,
-            "created_at": job["created_at"].isoformat() if job["created_at"] else None,
-            "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
-            "completed_at": job["completed_at"].isoformat()
-            if job["completed_at"]
-            else None,
+            "created_at": iso("created_at"),
+            "updated_at": iso("updated_at"),
+            "completed_at": iso("completed_at"),
+            "failed_at": iso("failed_at"),
         }
 
     async def get_processing_jobs(

@@ -1480,7 +1480,7 @@ def _liveness_lines(data: dict[str, Any]) -> list[str]:
     if elapsed is not None:
         mins = int(elapsed) // 60
         secs = int(elapsed) % 60
-        lines.append(f"Elapsed since creation: {mins}m {secs}s")
+        lines.append(f"Duration: {mins}m {secs}s")
     for source in data.get("sources") or []:
         if not isinstance(source, dict):
             continue
