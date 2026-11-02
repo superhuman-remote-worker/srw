@@ -23,5 +23,14 @@ describe('citationExtension', () => {
     it('leaves links and definitions alone', () => {
         expect(render('[1](https://x.example)')).toContain('<a ');
         expect(render('[^c3]: Source')).not.toContain('citation-ref');
+        expect(render('[1][ref]')).not.toContain('citation-ref');
+    });
+
+    it('marks every handle in a stacked run, not only the last', () => {
+        const html = render('Claim.[^c5733][^c5734][^c5747] Next');
+        expect(html).toContain('cid-5733 handle');
+        expect(html).toContain('cid-5734 handle');
+        expect(html).toContain('cid-5747 handle');
+        expect(html).not.toMatch(/[^>]\[\^c/);
     });
 });

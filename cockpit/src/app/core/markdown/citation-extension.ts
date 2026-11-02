@@ -22,8 +22,12 @@ import {MarkedExtension} from 'marked';
  * `[c21]` (the caret dropped, as models sometimes write it) counts as a
  * handle. A marker immediately followed by `(`, `[` or `:` is left alone, so
  * Markdown links and definitions (`[1](url)`, `[1][ref]`, `[^c1]: …`) still
- * parse as before.
+ * parse as before — except a `[` that opens another marker: stacked handles
+ * (`[^c1][^c2]`, the usual way to cite two sources for one claim) are all
+ * citations, not link text plus a label.
  */
+const MARKER_RE = /^\[(\^?c)?(\d+)\]/;
+
 export function citationExtension(): MarkedExtension {
     return {
         extensions: [
@@ -35,12 +39,13 @@ export function citationExtension(): MarkedExtension {
                     return i < 0 ? undefined : i;
                 },
                 tokenizer(src: string) {
-                    const match = src.match(/^\[(\^?c)?(\d+)\]/);
+                    const match = src.match(MARKER_RE);
                     if (!match) {
                         return undefined;
                     }
-                    const after = src.charAt(match[0].length);
-                    if (after === '(' || after === '[' || after === ':') {
+                    const rest = src.slice(match[0].length);
+                    const after = rest.charAt(0);
+                    if (after === '(' || after === ':' || (after === '[' && !MARKER_RE.test(rest))) {
                         // Real markdown link / reference definition — not a citation.
                         return undefined;
                     }
