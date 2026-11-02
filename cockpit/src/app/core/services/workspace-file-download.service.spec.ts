@@ -6,7 +6,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 
 import {AppToastService} from '../../ui/toast';
 import {ApiService} from './api.service';
-import {WorkspaceFileDownloadService} from './workspace-file-download.service';
+import {WorkspaceFileDownloadService, workspaceFileViewType} from './workspace-file-download.service';
 
 describe('WorkspaceFileDownloadService', () => {
   let api: {downloadThreadFile: ReturnType<typeof vi.fn>};
@@ -73,5 +73,85 @@ describe('WorkspaceFileDownloadService', () => {
     expect(saved).toBe(false);
     expect(clicked).toEqual([]);
     expect(toast.danger).toHaveBeenCalledWith(`${key}:output/report.md`);
+  });
+
+  describe('open', () => {
+    let tab: {location: {href: string}; opener: unknown; close: ReturnType<typeof vi.fn>};
+    let openSpy: ReturnType<typeof vi.spyOn>;
+    let blobTypes: string[];
+
+    beforeEach(() => {
+      tab = {location: {href: ''}, opener: window, close: vi.fn()};
+      openSpy = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+      blobTypes = [];
+      (URL.createObjectURL as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        (b: Blob) => {
+          blobTypes.push(b.type);
+          return 'blob:file';
+        },
+      );
+    });
+
+    it('opens a PDF in a tab at the cited page, the tab taken before the fetch', async () => {
+      api.downloadThreadFile.mockImplementation(() => {
+        // The tab must already exist: a click's popup allowance does not
+        // survive a slow workspace read.
+        expect(openSpy).toHaveBeenCalledWith('', '_blank');
+        return of(new Blob(['%PDF-1.7'], {type: 'application/octet-stream'}));
+      });
+
+      const opened = await TestBed.inject(WorkspaceFileDownloadService).open(
+        'thread-1',
+        'uploads/credit.pdf',
+        {page: 2},
+      );
+
+      expect(opened).toBe(true);
+      expect(blobTypes).toEqual(['application/pdf']);
+      expect(tab.location.href).toBe('blob:file#page=2');
+      expect(tab.opener).toBeNull();
+      expect(clicked).toEqual([]);
+    });
+
+    it('shows text as plain text', async () => {
+      api.downloadThreadFile.mockReturnValue(of(new Blob(['# notes'])));
+
+      await TestBed.inject(WorkspaceFileDownloadService).open('thread-1', 'notes/a.md', {page: 4});
+
+      expect(blobTypes).toEqual(['text/plain;charset=utf-8']);
+      expect(tab.location.href).toBe('blob:file');
+    });
+
+    it('downloads a type it may not render, without opening a tab', async () => {
+      api.downloadThreadFile.mockReturnValue(of(new Blob(['<svg/>'])));
+
+      await TestBed.inject(WorkspaceFileDownloadService).open('thread-1', 'out/chart.svg');
+
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(clicked).toEqual([{href: 'blob:file', download: 'chart.svg'}]);
+    });
+
+    it('closes the tab and says why when the file cannot be read', async () => {
+      api.downloadThreadFile.mockReturnValue(throwError(() => new HttpErrorResponse({status: 404})));
+
+      const opened = await TestBed.inject(WorkspaceFileDownloadService).open(
+        'thread-1',
+        'uploads/gone.pdf',
+      );
+
+      expect(opened).toBe(false);
+      expect(tab.close).toHaveBeenCalled();
+      expect(toast.danger).toHaveBeenCalledWith('canvas.workspaceFile.notFound:uploads/gone.pdf');
+    });
+  });
+
+  it('workspaceFileViewType allowlists by extension', () => {
+    expect(workspaceFileViewType('a/B.PDF')).toBe('application/pdf');
+    expect(workspaceFileViewType('scan.jpeg')).toBe('image/jpeg');
+    expect(workspaceFileViewType('data.csv')).toBe('text/plain;charset=utf-8');
+    expect(workspaceFileViewType('site/index.html')).toBeNull();
+    expect(workspaceFileViewType('report.docx')).toBeNull();
+    expect(workspaceFileViewType('.pdf')).toBeNull();
+    expect(workspaceFileViewType('Makefile')).toBeNull();
   });
 });

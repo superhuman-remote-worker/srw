@@ -14,15 +14,18 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {openCitationSnapshot, snapshotViewType} from '../../../core/markdown/citation-snapshot';
 import {
     CitationState,
+    citationPage,
     citationReasonLabel,
     citationState,
     citationStateLabel,
+    citationWorkspacePath,
 } from '../../../core/markdown/citation-status';
 import {
     CitationDrift,
     PersistentChatService,
     ThreadCitation,
 } from '../../../core/services/persistent-chat.service';
+import {WorkspaceFileDownloadService} from '../../../core/services/workspace-file-download.service';
 import {AppBadgeComponent, BadgeTone} from '../../../ui/badge';
 import {AppIconComponent} from '../../../ui/icon';
 
@@ -31,6 +34,12 @@ interface CitationRow extends ThreadCitation {
     index: number;
     /** Source is reachable by URL → render the name as a link. */
     isWebLink: boolean;
+    /**
+     * The cited document's path in the session workspace → "open source".
+     * Null for web sources and for a cloud document with a backed-up
+     * original, which gets "view original" instead.
+     */
+    workspacePath: string | null;
     state: CitationState;
     /** i18n key of the reason a citation is not verified, or null. */
     reasonKey: string | null;
@@ -49,7 +58,8 @@ type DriftState = CitationDrift | 'loading' | undefined;
  * ones stay listed, struck through (D7). For cloud-document citations a
  * "view original" link (streams the cite-time snapshot) and an on-demand drift
  * check. Both reuse the by-citation Phase-3 endpoints, which now authorize
- * session citations by thread ownership.
+ * session citations by thread ownership. Any other cited document gets
+ * "open source", read from the session workspace.
  */
 @Component({
     selector: 'app-citations-panel',
@@ -98,7 +108,7 @@ type DriftState = CitationDrift | 'loading' | undefined;
                 </div>
               }
 
-              @if (c.has_cloud_anchor || c.has_snapshot) {
+              @if (c.has_cloud_anchor || c.has_snapshot || c.workspacePath) {
                 <div class="cp-cloud">
                   @if (c.has_cloud_anchor) {
                     @if (driftOf(c.id); as d) {
@@ -120,6 +130,12 @@ type DriftState = CitationDrift | 'loading' | undefined;
                     <button class="cp-link" type="button" (click)="viewOriginal(c.id)">
                       <app-icon size="xs">description</app-icon>
                       {{ 'chat.citations.viewOriginal' | transloco }}
+                    </button>
+                  }
+                  @if (c.workspacePath) {
+                    <button class="cp-link" type="button" (click)="openSource(c)">
+                      <app-icon size="xs">open_in_new</app-icon>
+                      {{ 'chat.citations.popover.openSource' | transloco }}
                     </button>
                   }
                 </div>
@@ -197,6 +213,7 @@ type DriftState = CitationDrift | 'loading' | undefined;
 })
 export class CitationsPanelComponent {
     private readonly chat = inject(PersistentChatService);
+    private readonly files = inject(WorkspaceFileDownloadService);
     private readonly doc = inject(DOCUMENT);
 
     /** The citation a chip's "show in citations list" asked for. */
@@ -224,13 +241,17 @@ export class CitationsPanelComponent {
 
     readonly rows = computed<CitationRow[]>(() => {
         const list = [...this.chat.citationsByCid().values()].sort((a, b) => a.id - b.id);
-        return list.map((c, i) => ({
-            ...c,
-            index: i + 1,
-            isWebLink: !!c.source_identifier && /^https?:\/\//i.test(c.source_identifier),
-            state: citationState(c),
-            reasonKey: citationReasonLabel(c.verification_reason),
-        }));
+        return list.map((c, i) => {
+            const isWebLink = !!c.source_identifier && /^https?:\/\//i.test(c.source_identifier);
+            return {
+                ...c,
+                index: i + 1,
+                isWebLink,
+                workspacePath: isWebLink || c.has_snapshot ? null : citationWorkspacePath(c),
+                state: citationState(c),
+                reasonKey: citationReasonLabel(c.verification_reason),
+            };
+        });
     });
 
     driftOf(cid: number): DriftState {
@@ -251,6 +272,13 @@ export class CitationsPanelComponent {
 
     async viewOriginal(cid: number): Promise<void> {
         await openCitationSnapshot(this.chat, cid);
+    }
+
+    /** Open the cited document from the session workspace, at its cited page. */
+    openSource(row: CitationRow): void {
+        const threadId = this.chat.threadId();
+        if (!threadId || !row.workspacePath) return;
+        void this.files.open(threadId, row.workspacePath, {page: citationPage(row.locator)});
     }
 
     stateTone(state: CitationState): BadgeTone {
