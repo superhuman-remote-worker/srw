@@ -341,6 +341,48 @@ async def test_release_stops_when_a_successor_replaces_the_receipt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dedicated_exit_release_is_bounded(monkeypatch, caplog):
+    """An orchestrator that keeps answering without confirming (a VM it cannot
+    retire yet) must not hold a clean exit until the Pod is SIGKILLed."""
+    import agent.api.session_attach as session_attach
+
+    monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01))
+    monkeypatch.setattr(session_attach, "DEDICATED_EXIT_RELEASE_TIMEOUT_SECONDS", 0.05)
+    owner, _ = _identity()
+    client = SimpleNamespace(release_thread_agent=AsyncMock(return_value=False))
+    coordinator = SessionAttachCoordinator(
+        _ports(owner, orchestrator_client=lambda: client)
+    )
+    receipt = _receipt()
+    coordinator.retain_release_receipt(receipt)
+
+    await asyncio.wait_for(coordinator.release_before_dedicated_exit(THREAD), 2.0)
+
+    assert client.release_thread_agent.await_count >= 1
+    # Nothing was confirmed, so the exact obligation is kept, not forged.
+    assert coordinator.release_receipt == receipt
+    assert any("still unconfirmed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_exit_release_returns_once_confirmed(monkeypatch):
+    import agent.api.session_attach as session_attach
+
+    monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,))
+    owner, _ = _identity(client=_Client())
+    client = SimpleNamespace(release_thread_agent=AsyncMock(return_value=True))
+    coordinator = SessionAttachCoordinator(
+        _ports(owner, orchestrator_client=lambda: client)
+    )
+    coordinator.retain_release_receipt(_receipt())
+
+    await coordinator.release_before_dedicated_exit(THREAD)
+
+    assert client.release_thread_agent.await_count == 1
+    assert coordinator.release_receipt is None
+
+
+@pytest.mark.asyncio
 async def test_coordinator_reads_the_identity_owner_at_call_time():
     first, _ = _identity(client=_Client())
     second, _ = _identity(client=_Client())
