@@ -46,6 +46,9 @@ from orchestrator.services.stateless_workspace_gate import (
     thread_metadata_object,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.vm_thread_legacy_absence import (
+    settle_legacy_failed_vm_absence,
+)
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -1980,6 +1983,27 @@ async def _end_thread_flow_owned(
         # and a later End reusing a pending token inherits the first Begin's.
         if retirement_cause is not None:
             begin_identity["cause"] = retirement_cause
+        # A legacy create can leave a failed VM marker with no source that
+        # Begin could retire. Prove that generation empty and drop the marker
+        # first; until then End refuses rather than strand the agent Pod.
+        legacy_vm_thread = await postgres_db.get_thread(thread_id)
+        if (
+            isinstance(legacy_vm_thread, Mapping)
+            and await settle_legacy_failed_vm_absence(
+                legacy_vm_thread,
+                store=postgres_db,
+                vm_provisioner=vm_provisioner,
+                logger=logger,
+            )
+            == "pending"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pinned_retirement_conflict",
+                    "reason": "legacy_vm_absence_pending",
+                },
+            )
         retirement = await _begin_pinned_thread_retirement(
             thread_id,
             permanent=permanent,

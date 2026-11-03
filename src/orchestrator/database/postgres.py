@@ -27349,6 +27349,112 @@ class PostgresDB:
                 )
                 return result == "UPDATE 1"
 
+    async def drop_legacy_failed_thread_vm_marker(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        provision_generation: str,
+        proof: Dict[str, Any],
+    ) -> bool:
+        """Replace a proven-empty legacy VM marker with its absence proof.
+
+        The caller has just deleted the generation's VM by name, observed it,
+        its runtime and its rootdisk absent (``prove_legacy_thread_vm_absent``)
+        and recorded that generation's VM process-zero receipt. Without
+        ``metadata.vm`` End retires the Session as a bound VM life with no VM
+        (migration 0529). False, changing nothing, unless the row is the same
+        open pinned life, its marker is still that legacy shape for that
+        generation, the receipt exists, and no VM ledger names the thread: any
+        of those is VM authority this proof does not cover.
+        """
+
+        from shared.pinned_vm_creation_retirement import legacy_failed_vm_generation
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            runtime = _canonical_uuid_text(
+                runtime_generation, label="thread runtime generation"
+            )
+            generation = _canonical_uuid_text(
+                provision_generation, label="thread VM provision generation"
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                from orchestrator.services.vm_thread_retained_resume import (
+                    lock_owner_on_conn,
+                )
+
+                await lock_owner_on_conn(conn, parsed_thread)
+                row = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id=$1::uuid "
+                    "AND execution_lane='pinned' AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL "
+                    "AND status IN ('created','active','awaiting_user','suspended') "
+                    "FOR UPDATE",
+                    parsed_thread,
+                    UUID(runtime),
+                )
+                if row is None:
+                    return False
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(metadata, dict):
+                    return False
+                if legacy_failed_vm_generation(metadata.get("vm")) != generation:
+                    return False
+                if not await conn.fetchval(
+                    "SELECT public.managed_repository_process_zero_receipt_exists("
+                    "'thread',$1,'vm','vm',$2)",
+                    parsed_thread,
+                    generation,
+                ):
+                    return False
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vm_creation_retries r "
+                    "    WHERE r.owner_kind='thread' AND r.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_resource_waiters w "
+                    "    WHERE w.owner_kind='thread' AND w.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_thread_creation_owners o "
+                    "    WHERE o.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_thread_retained_resumes r "
+                    "    WHERE r.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_idle_operations i "
+                    "    WHERE i.owner_kind='thread' AND i.owner_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_idle_access_leases l "
+                    "    WHERE l.owner_kind='thread' AND l.owner_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_workspace_recoveries r "
+                    "    WHERE r.owner_kind='thread' AND r.owner_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_resource_thread_cleanup_authorities a "
+                    "    WHERE a.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_workspace_cleanup_admissions a "
+                    "    WHERE a.owner_kind='thread' AND a.owner_id=$1)",
+                    parsed_thread,
+                ):
+                    return False
+                metadata["vm_legacy_absence"] = {
+                    **proof,
+                    "version": 1,
+                    "provision_generation": generation,
+                    "marker": metadata.pop("vm"),
+                }
+                result = await conn.execute(
+                    "UPDATE threads SET metadata=$3::jsonb,"
+                    "last_activity=CURRENT_TIMESTAMP "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    parsed_thread,
+                    UUID(runtime),
+                    json.dumps(metadata),
+                )
+                return result == "UPDATE 1"
+
     async def list_thread_vm_readiness_candidates(self, *, ready: bool = False) -> list:
         status_clause = (
             'metadata @> \'{"vm":{"status":"ready"}}\'::jsonb'
@@ -44212,7 +44318,18 @@ class PostgresDB:
                             from shared.vm_creation_issuance import (
                                 canonical_configuration_digest,
                             )
+                            from shared.pinned_vm_creation_retirement import (
+                                legacy_failed_vm_generation,
+                            )
 
+                            if legacy_failed_vm_generation(vm_context) is not None:
+                                # A legacy create left no source to retire.
+                                # End first proves its VM absent and drops the
+                                # marker (vm_thread_legacy_absence).
+                                return {
+                                    "state": "malformed",
+                                    "reason": "legacy_vm_absence_unproven",
+                                }
                             request_id = _canonical_uuid_text(
                                 vm_context.get("creation_request_id"),
                                 label="thread VM creation request",
