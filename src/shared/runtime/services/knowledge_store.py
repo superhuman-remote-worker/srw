@@ -1349,6 +1349,7 @@ class KnowledgeStore:
         modified_at: Optional[datetime] = None,
         priority: Optional[int] = 1,
         ready_at: Optional[datetime] = None,
+        description: Optional[str] = None,
     ) -> uuid.UUID:
         """Upsert a note-level row keyed by ``(kb_id, path)``.
 
@@ -1430,6 +1431,13 @@ class KnowledgeStore:
         reindex is a replay, not a new authorization, and re-seeding would
         reset every note's TTL on every sweep.
 
+        ``description`` is written on both branches with NO sentinel, unlike
+        the fields above: the file's frontmatter is its only source, so a
+        file without a ``description:`` line means the note has none, and the
+        row must say so. It is what lets ``kb_update`` carry an explicit
+        description across the rewrite instead of re-deriving it from the
+        body (:meth:`get_note_by_slug` reads it back).
+
         Returns the row id (for the chunk FK).
         """
         content_hash = self._content_hash(content)
@@ -1466,14 +1474,14 @@ class KnowledgeStore:
                  status, confidence, tags, keywords, retrieval_messages,
                  blob_sha, embedding_version, superseded_by, invalidated_at,
                  job_id, phase, content_hash, created_at, modified_at, indexed_at,
-                 priority, ready_at, remaining_cycles)
+                 priority, ready_at, remaining_cycles, description)
             VALUES
                 ($1, $1, $2, $3, $4, $5, $6,
                  to_tsvector('english', $6),
                  $7, $8, $9, $10, COALESCE($11::text[], '{}'::text[]),
                  $12, $13, $14, $15,
                  $16, $17, $18, $19, $20, NOW(),
-                 COALESCE($21, 1), $22, $23)
+                 COALESCE($21, 1), $22, $23, $24)
             ON CONFLICT (kb_id, path) WHERE kb_id IS NOT NULL AND path IS NOT NULL
             DO UPDATE SET
                 note_id = $2, title = $4, note_type = $5, content = $6,
@@ -1488,7 +1496,8 @@ class KnowledgeStore:
                 indexed_at = NOW(),
                 search_doc = EXCLUDED.search_doc,
                 priority = COALESCE($21, knowledge_index.priority),
-                ready_at = COALESCE($22, knowledge_index.ready_at)
+                ready_at = COALESCE($22, knowledge_index.ready_at),
+                description = $24
             RETURNING id
             """,
             kb_id,
@@ -1514,6 +1523,7 @@ class KnowledgeStore:
             priority,
             ready_at,
             ttl_value,
+            description,
         )
 
     async def stamp_note_indexed(
@@ -2049,7 +2059,7 @@ class KnowledgeStore:
             """
             SELECT note_id, title, note_type, status, content, confidence,
                    tags, keywords, job_id, phase, created_at, modified_at,
-                   priority, ready_at, blob_sha
+                   priority, ready_at, blob_sha, description
             FROM knowledge_index
             WHERE kb_id = $1 AND note_id = $2 AND path IS NOT NULL
             LIMIT 1
@@ -2086,6 +2096,10 @@ class KnowledgeStore:
             # silently dropped ready_at would lose the ticket's authorization
             # on the next full vault rebuild.
             "ready_at": r.get("ready_at"),
+            # The file's frontmatter description, for the same reason again:
+            # kb_update re-renders the file from this dict, and without it an
+            # explicit description became the body's first sentence.
+            "description": r.get("description"),
         }
 
     async def note_is_indexed(self, kb_id: uuid.UUID, note_id: str) -> bool:
@@ -2252,7 +2266,7 @@ class KnowledgeStore:
             """
             SELECT note_id, path, title, note_type, status, confidence,
                    priority, tags, keywords, job_id, phase, content,
-                   superseded_by, created_at, modified_at
+                   superseded_by, created_at, modified_at, description
             FROM knowledge_index
             WHERE (kb_id = $1 OR (kb_id IS NULL AND project_id = $1))
             ORDER BY note_id
@@ -2280,6 +2294,7 @@ class KnowledgeStore:
                 "superseded_by": dict(r).get("superseded_by"),
                 "created": r["created_at"],
                 "modified": r["modified_at"],
+                "description": dict(r).get("description"),
             }
             for r in rows
         ]

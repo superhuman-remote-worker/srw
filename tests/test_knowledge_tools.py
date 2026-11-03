@@ -4150,3 +4150,369 @@ class TestKbUpdateWithoutNeo4j:
     def test_no_kg_preserves_type_from_existing(self):
         _, calls = self._update(_existing_note(type="retrospective"), {"content": "x"})
         assert _canonical_note_fields(calls)["note_type"] == "retrospective"
+
+
+# =============================================================================
+# A note's file round-trips through the index (2026-11-03 fixes)
+#
+# The reindexer stores the whole file body as the row's ``content`` — the
+# ``# Title`` line and the generated ``## Relationships`` block included — and
+# the agent re-renders the whole file from that row on every update. These
+# tests drive the real renderer, the real parser and the reindexer's own field
+# mapper, so they see what lands in the file and what the row then holds.
+# =============================================================================
+
+
+def _rendered_and_parsed(note):
+    """``(frontmatter, body)`` of a note as it lands in the repository."""
+    from agent.tools.knowledge.knowledge_tools import _render_note_md
+    from shared.runtime.knowledge.gardener import parse_note_md
+
+    return parse_note_md(_render_note_md(note))
+
+
+def _stored_row(note, **over):
+    """The row ``get_note_by_slug`` returns for ``note`` after it was indexed."""
+    from orchestrator.services.kb_reindex import note_fields
+
+    fm, body = _rendered_and_parsed(note)
+    fields = note_fields(f"knowledge/{note['id']}.md", fm, body)
+    return _existing_note(
+        note_id=note["id"],
+        title=fields["title"],
+        type=fields["note_type"],
+        content=body,
+        description=fields.get("description"),
+        **over,
+    )
+
+
+_AWKWARD_TEXT = [
+    r"The config lives in C:\Users\srw\config.yaml",
+    "ends with a backslash \\",
+    r"an escaped \"quote\" inside",
+    r"regex \d+ and a literal \n",
+    "a real\ttab",
+    "a bell\x07 character",
+    "Größe – naïve 🙂",
+]
+
+
+class TestFrontmatterEscaping:
+    """A backslash in a description or tag used to make the frontmatter
+    unparseable, and the orchestrator refused the whole note."""
+
+    @pytest.mark.parametrize("text", _AWKWARD_TEXT)
+    def test_description_tags_and_keywords_round_trip(self, text):
+        fm, _ = _rendered_and_parsed(
+            {
+                "id": "n1",
+                "type": "learning",
+                "title": "T",
+                "description": text,
+                "tags": [text],
+                "keywords": [text],
+                "content": "Body.",
+            }
+        )
+        assert fm["description"] == text
+        assert fm["tags"] == [text]
+        assert fm["keywords"] == [text]
+
+    def test_a_description_derived_from_the_body_round_trips(self):
+        # No description argument: it is the body's first sentence, so a body
+        # opening with a Windows path broke the note without the agent ever
+        # passing anything unusual.
+        body = r"The config lives in C:\Users\srw\config.yaml on the box. More."
+        fm, _ = _rendered_and_parsed(
+            {"id": "n1", "type": "learning", "title": "T", "content": body}
+        )
+        assert (
+            fm["description"]
+            == r"The config lives in C:\Users\srw\config.yaml on the box."
+        )
+
+    def test_newlines_still_collapse_to_one_line(self):
+        fm, _ = _rendered_and_parsed(
+            {
+                "id": "n1",
+                "type": "learning",
+                "description": "line one\nline two",
+                "content": "b",
+            }
+        )
+        assert fm["description"] == "line one line two"
+
+
+class TestSplitRelationships:
+    def test_takes_the_generated_block_with_its_types(self):
+        from agent.tools.knowledge.knowledge_tools import _split_relationships
+
+        _, stored = _rendered_and_parsed(
+            {
+                "id": "n1",
+                "type": "decision",
+                "title": "Auth",
+                "content": "We use JWT.",
+                "relationships": [
+                    {"type": "SUPPORTS", "target": "auth-design"},
+                    {"type": "REFERENCES", "target": "rfc-7519"},
+                    {"type": "SUPPORTS", "target": "token-plan"},
+                ],
+            }
+        )
+        body, links = _split_relationships(stored)
+        assert body == "# Auth\n\nWe use JWT."
+        assert links == [
+            {"type": "SUPPORTS", "target": "auth-design"},
+            {"type": "SUPPORTS", "target": "token-plan"},
+            {"type": "REFERENCES", "target": "rfc-7519"},
+        ]
+
+    def test_repairs_a_body_that_already_carries_two_blocks(self):
+        # The shape an update produced before the fix: the old block, the
+        # appended text, then a second block for the new link.
+        from agent.tools.knowledge.knowledge_tools import _split_relationships
+
+        corrupted = (
+            "# Auth\n\nWe use JWT.\n\n## Relationships\n"
+            "**REFERENCES:** [a](a.md)\n\n\nAlso rotate keys.\n\n"
+            "## Relationships\n**REFERENCES:** [b](b.md)\n"
+        )
+        body, links = _split_relationships(corrupted)
+        assert body == "# Auth\n\nWe use JWT.\n\nAlso rotate keys."
+        assert [link["target"] for link in links] == ["a", "b"]
+
+    def test_leaves_a_section_written_in_the_authors_own_words(self):
+        from agent.tools.knowledge.knowledge_tools import _split_relationships
+
+        authored = "Intro.\n\n## Relationships\nThis loosely follows [a](a.md).\n"
+        assert _split_relationships(authored) == (authored, [])
+
+    def test_a_body_without_a_block_comes_back_unchanged(self):
+        from agent.tools.knowledge.knowledge_tools import _split_relationships
+
+        text = "# T\n\nNo links here.\n"
+        assert _split_relationships(text) == (text, [])
+
+
+class TestKbUpdateRoundTripsWithoutNeo4j:
+    """Store-only tier: the row is the only copy kb_update can read."""
+
+    def _update(self, existing, args):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = existing
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(_get_tool(tools, "kb_update"), {"note": "n1", **args})
+        return result, calls
+
+    def test_an_explicit_description_survives_an_append(self):
+        existing = _stored_row(
+            {
+                "id": "n1",
+                "type": "decision",
+                "title": "Auth",
+                "description": "Why JWT beat OAuth for service auth.",
+                "content": "We use JWT. Details follow.",
+            }
+        )
+        result, calls = self._update(existing, {"append": "Rotate keys monthly."})
+        assert result.startswith("Updated **")
+        assert (
+            _canonical_note_fields(calls)["description"]
+            == "Why JWT beat OAuth for service auth."
+        )
+
+    def test_an_explicit_description_survives_a_content_replacement(self):
+        existing = _stored_row(
+            {
+                "id": "n1",
+                "type": "decision",
+                "title": "Auth",
+                "description": "Why JWT beat OAuth.",
+                "content": "Old body.",
+            }
+        )
+        _, calls = self._update(existing, {"content": "Entirely new body. More."})
+        assert _canonical_note_fields(calls)["description"] == "Why JWT beat OAuth."
+
+    def test_a_derived_description_follows_the_new_content(self):
+        # Never given one: it was the old first sentence, and keeping it would
+        # freeze that sentence after the body moved on.
+        existing = _stored_row(
+            {"id": "n1", "type": "decision", "title": "Auth", "content": "Old one."}
+        )
+        assert existing["description"] == "Old one."
+        _, calls = self._update(existing, {"content": "New first sentence. Rest."})
+        assert _canonical_note_fields(calls)["description"] == "New first sentence."
+
+    def test_append_lands_before_a_single_links_block(self):
+        existing = _stored_row(
+            {
+                "id": "n1",
+                "type": "decision",
+                "title": "Auth",
+                "content": "We use JWT.",
+                "relationships": [{"type": "REFERENCES", "target": "a"}],
+            }
+        )
+        _, calls = self._update(
+            existing,
+            {
+                "append": "Also rotate keys.",
+                "add_links": [{"type": "SUPPORTS", "target": "b"}],
+            },
+        )
+        _, body = _rendered_and_parsed_file(calls)
+        assert body.count("## Relationships") == 1
+        assert body.index("Also rotate keys.") < body.index("## Relationships")
+        assert body.rstrip().endswith(
+            "## Relationships\n**REFERENCES:** [a](a.md)\n**SUPPORTS:** [b](b.md)"
+        )
+
+    def test_replacing_the_content_keeps_the_notes_links(self):
+        # The graph tier keeps its edges across a replacement; with no graph
+        # the block is the only place the links live.
+        existing = _stored_row(
+            {
+                "id": "n1",
+                "type": "decision",
+                "title": "Auth",
+                "content": "We use JWT.",
+                "relationships": [{"type": "DEPENDS_ON", "target": "a"}],
+            }
+        )
+        _, calls = self._update(existing, {"content": "Rewritten."})
+        _, body = _rendered_and_parsed_file(calls)
+        assert "Rewritten." in body
+        assert "We use JWT." not in body
+        assert "**DEPENDS_ON:** [a](a.md)" in body
+
+    def test_a_metadata_only_update_does_not_grow_the_note(self):
+        note = {
+            "id": "n1",
+            "type": "decision",
+            "title": "Auth",
+            "content": "We use JWT.",
+            "relationships": [{"type": "REFERENCES", "target": "a"}],
+        }
+        existing = _stored_row(note)
+        _, calls = self._update(existing, {"status": "resolved"})
+        _, body = _rendered_and_parsed_file(calls)
+        assert body == existing["content"]
+
+    def test_a_note_already_carrying_two_blocks_is_repaired(self):
+        existing = _existing_note(
+            content=(
+                "# Auth\n\nWe use JWT.\n\n## Relationships\n"
+                "**REFERENCES:** [a](a.md)\n\n\nAlso rotate keys.\n\n"
+                "## Relationships\n**REFERENCES:** [b](b.md)\n"
+            ),
+            title="Auth",
+        )
+        _, calls = self._update(existing, {"status": "resolved"})
+        _, body = _rendered_and_parsed_file(calls)
+        assert body.count("## Relationships") == 1
+        assert "**REFERENCES:** [a](a.md), [b](b.md)" in body
+
+
+def _rendered_and_parsed_file(calls):
+    """``(frontmatter, body)`` of the last file the tool sent for commit."""
+    from shared.runtime.knowledge.gardener import parse_note_md
+
+    return parse_note_md(calls[-1]["content"])
+
+
+class TestKbUpdateKeepsTheDescriptionWithNeo4j:
+    def test_the_rows_description_survives_the_rewrite(self):
+        # The graph never held a description; the row holds the file's.
+        ctx = _make_context()
+        ctx.knowledge_graph.read_note.return_value = _graph_existing(
+            content="We use JWT. Details follow."
+        )
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_store.get_note_by_slug.return_value = _stored_row(
+            {
+                "id": "an-existing-note",
+                "type": "decision",
+                "title": "T",
+                "description": "Why JWT beat OAuth.",
+                "content": "We use JWT. Details follow.",
+            }
+        )
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "an-existing-note", "append": "Rotate keys."},
+            )
+        assert result.startswith("Updated **")
+        assert _canonical_note_fields(calls)["description"] == "Why JWT beat OAuth."
+
+
+class TestKbWriteRewriteIsNotATwinWithoutNeo4j:
+    """The identical-content short-circuit compared the agent's text with the
+    row's, which carries the rendered ``# Title`` line — so without Neo4j it
+    never matched, and rewriting a note forked ``<slug>-<hash>``."""
+
+    def _write(self, existing, args):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = existing
+        ctx.knowledge_store.note_is_indexed.return_value = True
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(_get_tool(tools, "kb_write"), args)
+        return result, calls
+
+    def test_rewriting_the_same_note_is_a_no_op(self):
+        existing = _stored_row(
+            {
+                "id": "auth",
+                "type": "decision",
+                "title": "Auth",
+                "content": "We use JWT for service auth.",
+                "relationships": [{"type": "REFERENCES", "target": "rfc-7519"}],
+            }
+        )
+        result, calls = self._write(
+            existing,
+            {
+                "title": "Auth",
+                "type": "decision",
+                "content": "We use JWT for service auth.",
+            },
+        )
+        assert "identical content" in result
+        assert calls == []
+
+    def test_a_body_with_its_own_h1_is_still_the_same_note(self):
+        existing = _stored_row(
+            {
+                "id": "auth",
+                "type": "decision",
+                "title": "Auth",
+                "content": "# Auth\n\nWe use JWT.",
+            }
+        )
+        result, calls = self._write(
+            existing,
+            {"title": "Auth", "type": "decision", "content": "# Auth\n\nWe use JWT."},
+        )
+        assert "identical content" in result
+        assert calls == []
+
+    def test_different_content_under_the_same_title_still_forks(self):
+        # Unchanged by design: a same-title write with NEW content is not
+        # treated as an edit of the existing note.
+        existing = _stored_row(
+            {"id": "auth", "type": "decision", "title": "Auth", "content": "Old."}
+        )
+        result, calls = self._write(
+            existing, {"title": "Auth", "type": "decision", "content": "New."}
+        )
+        assert result.startswith("Created knowledge note:")
+        assert calls[0]["slug"].startswith("auth-")

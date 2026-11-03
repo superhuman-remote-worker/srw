@@ -323,7 +323,7 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
             REPO_ROOT / "src" / "orchestrator" / "database" / "migrations" / "vector"
         ).glob("*.sql")
     )
-    assert migrations[-1].name == "0029_citation_source_links.sql"
+    assert migrations[-1].name == "0030_knowledge_index_description.sql"
     snapshot = (
         REPO_ROOT / "src/orchestrator/database/vector_schema_current.sql"
     ).read_text()
@@ -347,3 +347,6 @@ def test_vector_idempotency_ledgers_are_current_and_in_generated_snapshot():
     assert "withdrawn_reason text" in snapshot
     # 0029: per-link source names and the session citation cleanup.
     assert "retire_session_citations" in snapshot
+    # 0030: the note's frontmatter description, read back by kb_update.
+    knowledge_index = snapshot.split("CREATE TABLE public.knowledge_index (", 1)[1]
+    assert "description text," in knowledge_index.split(");", 1)[0]
