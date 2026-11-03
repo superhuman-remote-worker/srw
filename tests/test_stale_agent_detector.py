@@ -1597,6 +1597,145 @@ async def test_retire_orphaned_runtime_preserves_a_runtime_that_won_authority(
     assert _OFFLINE_THREAD_ID in lost[0].getMessage()
 
 
+@pytest.fixture(autouse=True)
+def _clear_offline_retirement_backoff():
+    detector._offline_retirement_backoff.clear()
+    yield
+    detector._offline_retirement_backoff.clear()
+
+
+def _refusing_thread_ops(reason, code="pinned_retirement_conflict"):
+    return _ThreadRetirementFake(
+        AsyncMock(
+            side_effect=HTTPException(
+                status_code=409, detail={"code": code, "reason": reason}
+            )
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_retire_orphaned_runtime_warns_and_backs_off_on_a_stuck_refusal(
+    caplog,
+):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": _OFFLINE_THREAD_ID})
+    thread_ops = _refusing_thread_ops("physical_runtime_identity_malformed")
+    dependencies = _detector_dependencies(
+        db, thread_retirement_operations=lambda: thread_ops
+    )
+    caplog.set_level(logging.INFO, logger=detector.__name__)
+
+    assert not await detector.retire_orphaned_pinned_runtime(
+        _offline_candidate(), dependencies=dependencies
+    )
+    refused = [r for r in caplog.records if "refused" in r.getMessage()]
+    assert len(refused) == 1
+    assert refused[0].levelno == logging.WARNING
+    message = refused[0].getMessage()
+    assert _OFFLINE_THREAD_ID in message
+    assert "pinned_retirement_conflict" in message
+    assert "physical_runtime_identity_malformed" in message
+    assert not [r for r in caplog.records if "lost authority" in r.getMessage()]
+
+    # The next sweep inside the backoff does not hit End again.
+    assert not await detector.retire_orphaned_pinned_runtime(
+        _offline_candidate(), dependencies=dependencies
+    )
+    assert thread_ops.end_thread_flow.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retire_orphaned_runtime_backoff_doubles_up_to_its_ceiling(
+    monkeypatch,
+):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": _OFFLINE_THREAD_ID})
+    thread_ops = _refusing_thread_ops("workspace_backend_malformed")
+    dependencies = _detector_dependencies(
+        db, thread_retirement_operations=lambda: thread_ops
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(detector.time, "monotonic", lambda: clock[0])
+    first, ceiling = detector.OFFLINE_RETIREMENT_REFUSAL_BACKOFF_SECONDS
+    delays = []
+    for _ in range(6):
+        await detector.retire_orphaned_pinned_runtime(
+            _offline_candidate(), dependencies=dependencies
+        )
+        retry_at, delay = detector._offline_retirement_backoff[
+            (_OFFLINE_THREAD_ID, _OFFLINE_GENERATION)
+        ]
+        delays.append(delay)
+        clock[0] = retry_at
+    assert delays[0] == first
+    assert delays[1] == first * 2
+    assert delays[-1] == ceiling
+    assert thread_ops.end_thread_flow.await_count == 6
+
+
+@pytest.mark.asyncio
+async def test_retire_orphaned_runtime_retries_a_pending_vm_absence_each_sweep(
+    caplog,
+):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": _OFFLINE_THREAD_ID})
+    thread_ops = _refusing_thread_ops("legacy_vm_absence_pending")
+    dependencies = _detector_dependencies(
+        db, thread_retirement_operations=lambda: thread_ops
+    )
+    caplog.set_level(logging.INFO, logger=detector.__name__)
+
+    for _ in range(2):
+        assert not await detector.retire_orphaned_pinned_runtime(
+            _offline_candidate(), dependencies=dependencies
+        )
+    assert thread_ops.end_thread_flow.await_count == 2
+    assert not detector._offline_retirement_backoff
+    waiting = [r for r in caplog.records if "waiting" in r.getMessage()]
+    assert waiting and all(r.levelno == logging.INFO for r in waiting)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", ["authority_changed", "agent_recovered", "generation_changed"]
+)
+async def test_retire_orphaned_runtime_names_the_lost_authority_reason(caplog, reason):
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": _OFFLINE_THREAD_ID})
+    thread_ops = _refusing_thread_ops(reason)
+    caplog.set_level(logging.INFO, logger=detector.__name__)
+
+    assert not await detector.retire_orphaned_pinned_runtime(
+        _offline_candidate(),
+        dependencies=_detector_dependencies(
+            db, thread_retirement_operations=lambda: thread_ops
+        ),
+    )
+    lost = [r for r in caplog.records if "lost authority" in r.getMessage()]
+    assert len(lost) == 1 and lost[0].levelno == logging.INFO
+    assert reason in lost[0].getMessage()
+    assert not detector._offline_retirement_backoff
+
+
+@pytest.mark.asyncio
+async def test_retire_orphaned_runtime_success_clears_an_earlier_backoff():
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value={"id": _OFFLINE_THREAD_ID})
+    key = (_OFFLINE_THREAD_ID, _OFFLINE_GENERATION)
+    detector._offline_retirement_backoff[key] = (0.0, 600.0)
+    thread_ops = _ThreadRetirementFake()
+
+    assert await detector.retire_orphaned_pinned_runtime(
+        _offline_candidate(),
+        dependencies=_detector_dependencies(
+            db, thread_retirement_operations=lambda: thread_ops
+        ),
+    )
+    assert key not in detector._offline_retirement_backoff
+
+
 @pytest.mark.asyncio
 async def test_retire_orphaned_runtime_propagates_a_non_authority_failure():
     db = AsyncMock()
