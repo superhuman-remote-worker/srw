@@ -332,6 +332,13 @@ async def test_offline_retirement_proves_the_vm_absent_then_releases_the_pod(
         api, namespace="agents-a", name=agent["hostname"], uid=agent["pod_uid"]
     )
     monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    # The route teardown would load a real kubeconfig: without one (CI) End
+    # stays retryable, with one it touches whatever cluster the host points at.
+    monkeypatch.setattr(
+        main.app.state.resources.session_router,
+        "teardown_route",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         agent_module,
         "agent_provisioner",
