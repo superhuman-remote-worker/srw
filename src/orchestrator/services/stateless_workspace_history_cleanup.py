@@ -101,6 +101,9 @@ async def reclaim_stateless_workspace_history(
                     or workspace.get("status") != "deleted"
                 ):
                     return False
+                location = provisioner.workspace_cleanup_location(
+                    WorkspaceOwner.session(thread_id)
+                )
                 current = await conn.fetchrow(
                     "SELECT * FROM managed_repository_workspace_cleanup_intents "
                     "WHERE owner_kind='thread' AND owner_id=$1 "
@@ -117,16 +120,19 @@ async def reclaim_stateless_workspace_history(
                     workspace.get("_runtime_incarnation"),
                     terminal_token,
                 )
-                if current is None:
-                    return False
-                location = provisioner.workspace_cleanup_location(
-                    WorkspaceOwner.session(thread_id)
-                )
-                current_location = current["resource_location"]
-                if isinstance(current_location, str):
-                    current_location = json.loads(current_location)
-                if current_location != location:
-                    return False
+                if current is not None:
+                    current_location = current["resource_location"]
+                    if isinstance(current_location, str):
+                        current_location = json.loads(current_location)
+                    if current_location != location:
+                        return False
+                    reclaimed_by = {"terminal_reclaim_intent_id": str(current["id"])}
+                else:
+                    reclaimed_by = await _refused_resume_reclaim(
+                        conn, owner_id, metadata, location
+                    )
+                    if reclaimed_by is None:
+                        return False
                 preserved = []
                 for runtime in runtimes:
                     source = await conn.fetchrow(
@@ -200,7 +206,7 @@ async def reclaim_stateless_workspace_history(
                                 "retired_thread_runtime_generation": str(
                                     source["thread_runtime_generation"]
                                 ),
-                                "terminal_reclaim_intent_id": str(current["id"]),
+                                **reclaimed_by,
                             }
                         ),
                         terminal_token,
@@ -218,3 +224,47 @@ async def reclaim_stateless_workspace_history(
                         intent_id,
                     )
                 return True
+
+
+async def _refused_resume_reclaim(conn, owner_id, metadata, location):
+    """The creation that reclaimed a Resumed Session's kept PVC, if any.
+
+    When the cluster refused a Resumed Session's Pod, no current runtime ever
+    existed: permanent End's cancellation of that creation (or the reclaim
+    after a soft End) removed the PVC the earlier runtime left behind.
+    """
+    from shared.session_retirement import unpublished_creation_retirement_authority
+
+    marker = metadata.get("_stateless_claim_retirement") or metadata.get(
+        "_stateless_workspace_retirement_settled"
+    )
+    if not isinstance(marker, dict) or "unpublished_creation" not in marker:
+        return None
+    try:
+        unpublished = unpublished_creation_retirement_authority(
+            marker["unpublished_creation"]
+        )
+    except RuntimeError:
+        return None
+    retained = unpublished.get("retained")
+    if retained is None or unpublished["namespace"] != location["namespace"]:
+        return None
+    reclaimed = await conn.fetchval(
+        "SELECT id FROM managed_repository_workspace_creation_reservations "
+        "WHERE owner_kind='thread' AND owner_id=$1 AND scope='workspace_container' "
+        "AND id=$2::uuid AND reservation_generation=("
+        "SELECT max(reservation_generation) FROM "
+        "managed_repository_workspace_creation_reservations "
+        "WHERE owner_kind='thread' AND owner_id=$1 AND scope='workspace_container') "
+        "AND operation_kind='create' AND result_kind='aborted' "
+        "AND settled_at IS NOT NULL AND pod_uid IS NULL "
+        "AND runtime_incarnation IS NULL AND pvc_uid=$3::uuid "
+        "AND cancel_resource_policy='terminal_reclaim' "
+        "AND cancel_cleanup_completed_at IS NOT NULL FOR UPDATE",
+        owner_id,
+        unpublished["reservation_id"],
+        retained["pvc_uid"],
+    )
+    if reclaimed is None:
+        return None
+    return {"terminal_reclaim_creation_id": str(reclaimed)}

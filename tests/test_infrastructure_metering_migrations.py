@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0561_refused_session_creation_ends_without_pod.sql"
+    / "src/orchestrator/database/migrations/app/0562_refused_resumed_session_deletes_with_its_binding.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

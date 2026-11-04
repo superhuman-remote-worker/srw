@@ -20900,18 +20900,18 @@ CREATE FUNCTION public.stateless_unpublished_creation_settled_without_pod(reques
            AND requested_state #>> '{workspace_container,provisioner}' = 'k8s'
            AND requested_state #>> '{workspace_container,_runtime_incarnation}'
                IS NULL
-           AND COALESCE(requested_state -> '_workspace_binding', '{}'::JSONB)
-               = '{}'::JSONB
-           AND r.id::TEXT = COALESCE(
-               requested_state #>> ARRAY[
-                   '_stateless_claim_retirement', 'unpublished_creation',
-                   'reservation_id'
-               ],
-               requested_state #>> ARRAY[
-                   '_stateless_workspace_retirement_settled',
-                   'unpublished_creation', 'reservation_id'
-               ]
+           AND (
+               COALESCE(requested_state -> '_workspace_binding', '{}'::JSONB)
+                   = '{}'::JSONB
+               OR (
+                   r.cancel_resource_policy = 'terminal_reclaim'
+                   AND m.marker #>> '{retained,pvc_uid}' = r.pvc_uid::TEXT
+                   AND requested_state #>> '{_workspace_binding,backing_id}'
+                       = 'k8s-pvc:' || (m.marker ->> 'namespace') || ':'
+                         || r.pvc_uid::TEXT
+               )
            )
+           AND r.id::TEXT = m.marker ->> 'reservation_id'
            AND r.operation_kind = 'create'
            AND r.settled_at IS NOT NULL
            AND r.phase = 'aborted'
@@ -20926,6 +20926,17 @@ CREATE FUNCTION public.stateless_unpublished_creation_settled_without_pod(reques
                OR r.cancel_resource_policy = 'terminal_reclaim'
            )
           FROM public.managed_repository_workspace_creation_reservations AS r
+         CROSS JOIN LATERAL (
+             SELECT COALESCE(
+                 requested_state #> ARRAY[
+                     '_stateless_claim_retirement', 'unpublished_creation'
+                 ],
+                 requested_state #> ARRAY[
+                     '_stateless_workspace_retirement_settled',
+                     'unpublished_creation'
+                 ]
+             ) AS marker
+         ) AS m
          WHERE r.owner_kind = 'thread'
            AND r.owner_id = requested_thread
            AND r.scope = 'workspace_container'

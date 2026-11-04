@@ -47324,6 +47324,11 @@ class PostgresDB:
         a runtime or Pod UID and its Pod effect was never observed. Admission
         also needs every effect past its ambiguity window, so no late create
         can still land. Returns the locked reservation row, else None.
+
+        A Resumed Session's refusal names its ``retained`` lineage: the
+        earlier creation whose Pod ran and settled, that runtime's preserve
+        cleanup, and the binding to the PVC both creations recorded. Those
+        replace the first-generation rule that nothing else ever existed.
         """
         from shared.session_retirement import (
             active_claim_authority,
@@ -47338,17 +47343,42 @@ class PostgresDB:
             metadata = _strict_json_object(thread["metadata"], label="thread metadata")
         except RuntimeError:
             return None
+        retained = unpublished.get("retained")
         workspace = metadata.get("workspace_container")
+        binding = metadata.get("_workspace_binding")
+        if retained is None:
+            lineage_matches = bool(
+                not binding
+                and isinstance(workspace, dict)
+                and workspace.get("_canvas_workspace_generation") is None
+                and workspace.get("_creation_reservation_id")
+                in {None, unpublished["reservation_id"]}
+            )
+        else:
+            lineage_matches = bool(
+                isinstance(binding, dict)
+                and isinstance(workspace, dict)
+                and binding.get("kind") == "remote"
+                and binding.get("backing_id")
+                == f"k8s-pvc:{unpublished['namespace']}:{retained['pvc_uid']}"
+                and binding.get("generation") == retained["binding_generation"]
+                and workspace.get("namespace") == unpublished["namespace"]
+                and workspace.get("_canvas_workspace_generation")
+                in {None, retained["binding_generation"]}
+                and workspace.get("_creation_reservation_id")
+                in {
+                    None,
+                    unpublished["reservation_id"],
+                    retained["predecessor_reservation_id"],
+                }
+            )
         if (
-            thread["execution_lane"] != "stateless"
+            not lineage_matches
+            or thread["execution_lane"] != "stateless"
             or str(thread["runtime_generation"]) != unpublished["generation"]
             or not isinstance(workspace, dict)
             or workspace.get("provisioner") != "k8s"
             or workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY) is not None
-            or workspace.get("_creation_reservation_id")
-            not in {None, unpublished["reservation_id"]}
-            or metadata.get("_workspace_binding")
-            or workspace.get("_canvas_workspace_generation") is not None
             or workspace.get("_snapshot_restore_required", False) is not False
         ):
             return None
@@ -47357,9 +47387,13 @@ class PostgresDB:
         )
         if admission:
             # The same queue and claim history the initial End admits,
-            # including a container upgrade's (C1) served lite turns.
+            # including a container upgrade's (C1) served lite turns. A
+            # Resumed Session has served turns by definition.
             upgrade_history = bool(
-                workspace_upgrade_seed_from(metadata) is not None
+                (
+                    retained is not None
+                    or workspace_upgrade_seed_from(metadata) is not None
+                )
                 and queue is not None
                 and queue["state"] != "leased"
                 and queue["leased_by"] is None
@@ -47431,6 +47465,8 @@ class PostgresDB:
                 creation["operation_kind"] != "create",
                 creation["runtime_incarnation"] is not None,
                 creation["pod_uid"] is not None,
+                retained is not None
+                and str(creation["pvc_uid"]) != retained["pvc_uid"],
             )
         ):
             return None
@@ -47447,14 +47483,19 @@ class PostgresDB:
             or pod_effect.get("observed_uid") is not None
         ):
             return None
-        if await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
-            "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$2::uuid) "
-            "OR EXISTS(SELECT 1 FROM thread_turn_commits WHERE thread_id=$1::uuid) "
-            "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
-            "WHERE owner_kind='thread' AND owner_id=$1::uuid)",
-            thread["id"],
-            unpublished["reservation_id"],
+        if retained is None:
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$2::uuid) "
+                "OR EXISTS(SELECT 1 FROM thread_turn_commits WHERE thread_id=$1::uuid) "
+                "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid)",
+                thread["id"],
+                unpublished["reservation_id"],
+            ):
+                return None
+        elif not await self._unpublished_creation_lineage_is_current_on_conn(
+            conn, thread["id"], creation, retained
         ):
             return None
         if admission:
@@ -47500,6 +47541,71 @@ class PostgresDB:
             return None
         return dict(creation)
 
+    @staticmethod
+    async def _unpublished_creation_lineage_is_current_on_conn(
+        conn: Any,
+        owner_id: Any,
+        creation: Any,
+        retained: dict[str, Any],
+    ) -> bool:
+        """The storage a Resumed Session's refused create was to reuse.
+
+        Its immediate predecessor ran a Pod and settled; soft End then retired
+        that runtime with a settled preserve cleanup that kept the same PVC,
+        and nothing has been created or cleaned up since. Such an End is
+        final (Resume refuses it), so no second refusal can follow.
+        """
+        predecessor = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["predecessor_reservation_id"],
+            owner_id,
+        )
+        cleanup = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["predecessor_cleanup_id"],
+            owner_id,
+        )
+        if predecessor is None or cleanup is None:
+            return False
+        return not (
+            predecessor["operation_kind"] != "create"
+            or predecessor["result_kind"] != "settled"
+            or predecessor["settled_at"] is None
+            or predecessor["cancel_requested_at"] is not None
+            or predecessor["runtime_incarnation"] is None
+            or str(predecessor["pvc_uid"]) != retained["pvc_uid"]
+            or predecessor["reservation_generation"]
+            >= creation["reservation_generation"]
+            or cleanup["thread_runtime_generation"]
+            != predecessor["thread_runtime_generation"]
+            or cleanup["runtime_incarnation"] != predecessor["runtime_incarnation"]
+            or str(cleanup["pvc_uid"]) != retained["pvc_uid"]
+            or cleanup["resource_policy"] != "preserve"
+            or cleanup["target_disposition"] != "deleted"
+            or cleanup["reclaim_shared_resources"] is not False
+            or cleanup["result_kind"] != "settled"
+            or cleanup["settled_at"] is None
+            or cleanup["cleanup_completed_at"] is None
+            or await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND scope='workspace_container' "
+                "AND id NOT IN ($2::uuid,$3::uuid) AND reservation_generation >= $4) "
+                "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$5::uuid "
+                "AND (settled_at IS NULL OR intent_generation > $6))",
+                owner_id,
+                predecessor["id"],
+                creation["id"],
+                predecessor["reservation_generation"],
+                cleanup["id"],
+                cleanup["intent_generation"],
+            )
+        )
+
     async def get_stateless_unpublished_creation_candidate(
         self, thread_id: str, *, namespace: str
     ) -> dict[str, Any] | None:
@@ -47528,6 +47634,50 @@ class PostgresDB:
                     "reservation_generation": int(creation["reservation_generation"]),
                     "namespace": namespace,
                 }
+                # A Resumed Session: the create was to reuse the storage its
+                # previous runtime left behind.
+                predecessor = await conn.fetchrow(
+                    "SELECT id, pvc_uid, runtime_incarnation "
+                    "FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND scope='workspace_container' AND id<>$2::uuid "
+                    "ORDER BY reservation_generation DESC LIMIT 1",
+                    thread["id"],
+                    creation["id"],
+                )
+                if predecessor is not None:
+                    cleanup = (
+                        await conn.fetchval(
+                            "SELECT id FROM managed_repository_workspace_cleanup_intents "
+                            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                            "AND scope='workspace_container' "
+                            "AND runtime_incarnation=$2::uuid "
+                            "ORDER BY intent_generation DESC LIMIT 1",
+                            thread["id"],
+                            predecessor["runtime_incarnation"],
+                        )
+                        if predecessor["runtime_incarnation"] is not None
+                        else None
+                    )
+                    try:
+                        binding = _strict_json_object(
+                            thread["metadata"], label="thread metadata"
+                        ).get("_workspace_binding")
+                    except RuntimeError:
+                        return None
+                    if (
+                        cleanup is None
+                        or predecessor["pvc_uid"] is None
+                        or not isinstance(binding, dict)
+                        or not isinstance(binding.get("generation"), str)
+                    ):
+                        return None
+                    unpublished["retained"] = {
+                        "predecessor_reservation_id": str(predecessor["id"]),
+                        "predecessor_cleanup_id": str(cleanup),
+                        "pvc_uid": str(predecessor["pvc_uid"]),
+                        "binding_generation": binding["generation"],
+                    }
                 if not await self._unpublished_creation_retirement_is_current_on_conn(
                     conn, thread, unpublished, admission=True
                 ):
