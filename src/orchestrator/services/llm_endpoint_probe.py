@@ -7,6 +7,10 @@ The test handler cares only about success/status; the discover handler
 additionally parses the ``data`` array and attaches a capability hint
 per model so the UI can prefill the per-row capability <select>.
 
+A server with no model list (TEI) answers that probe 404; both Tests then
+judge an embedding or rerank row by :func:`probe_endpoint_capability`, one
+minimal call of that capability.
+
 The capability hint is a name-based heuristic, not authoritative — users
 are expected to override it at import time when the provider's naming
 convention doesn't line up (e.g., ``text-embedding-3-*`` → embedding, but
@@ -22,6 +26,7 @@ from typing import Any
 import httpx
 
 from shared.runtime.core.model_registry import family_of
+from shared.runtime.core.transport_resolution import wire_model_id
 
 
 @dataclass
@@ -239,3 +244,93 @@ async def probe_endpoint_models(
         probe_url=probe_url,
         models=models,
     )
+
+
+# Capabilities served by model servers that may have no model list: Hugging
+# Face TEI answers ``POST /embeddings`` or ``POST /rerank`` but 404s
+# ``GET /models``. In probe order, for a row that declares both.
+_CAPABILITY_PROBE_ORDER = ("embedding", "rerank")
+
+
+def capability_to_probe(capabilities: Any) -> str | None:
+    """The capability a model row is tested by when its server has no model
+    list: embedding, else rerank. ``None`` for any other row, so a chat row
+    never spends a completion on a Test."""
+    declared = capabilities if isinstance(capabilities, (list, tuple)) else ()
+    for capability in _CAPABILITY_PROBE_ORDER:
+        if capability in declared:
+            return capability
+    return None
+
+
+def _capability_probe_request(
+    capability: str, model: str
+) -> tuple[str, dict[str, Any], str]:
+    """Path, body and required list field of a one-item capability call.
+
+    Bodies match SRW's own clients: the embedding service's
+    ``embeddings.create(input=, model=)`` and the memory reranker's
+    Cohere-shaped ``{model, query, documents}`` read back from ``results``.
+    """
+    if capability == "embedding":
+        return "/embeddings", {"model": model, "input": "ping"}, "data"
+    return (
+        "/rerank",
+        {"model": model, "query": "ping", "documents": ["pong"]},
+        "results",
+    )
+
+
+async def probe_endpoint_capability(
+    *,
+    base_url: str,
+    api_key: str | None,
+    capability: str,
+    model: str,
+    timeout: float = 10.0,
+) -> ProbeResult:
+    """Make one minimal ``capability`` call against ``{base_url}``.
+
+    ``model`` is the row's upstream name (its served id, else its catalog id);
+    a routing prefix the provider rejects is dropped as SRW's embedding and
+    rerank clients drop it. Same client settings as the model-list probe
+    (timeout, default TLS verification, Bearer key only when set) and the same
+    host. Does not raise.
+    """
+    path, body, result_field = _capability_probe_request(
+        capability, wire_model_id(model, base_url)
+    )
+    probe_url = base_url.rstrip("/") + path
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(probe_url, headers=headers, json=body)
+    except httpx.HTTPError as e:
+        return ProbeResult(False, None, f"{type(e).__name__}: {e}", probe_url)
+
+    status = resp.status_code
+    if _is_web_page(resp):
+        return ProbeResult(
+            False,
+            status,
+            f"HTTP {status}: {probe_url} answered with a web page, not a "
+            f"{capability} response.",
+            probe_url,
+        )
+    if not (200 <= status < 300):
+        return ProbeResult(False, status, resp.text[:500] or None, probe_url)
+    try:
+        payload = resp.json()
+    except ValueError as e:
+        return ProbeResult(False, status, f"Response body is not JSON: {e}", probe_url)
+    if not (isinstance(payload, dict) and payload.get(result_field)):
+        return ProbeResult(
+            False,
+            status,
+            f"HTTP {status}: {probe_url} answered without a {capability} result.",
+            probe_url,
+        )
+    return ProbeResult(True, status, None, probe_url)
