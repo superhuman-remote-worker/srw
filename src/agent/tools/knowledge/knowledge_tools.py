@@ -2190,10 +2190,19 @@ def create_kb_tools(
                     else (prior_row or {}).get("priority", DEFAULT_PRIORITY_RANK)
                 )
 
-            relationships = _merge_relationships(
-                existing.get("relationships"), stored_links, inline_links, add_links
-            )
             prior_fields = prior_row if isinstance(prior_row, dict) else {}
+            # The graph only holds edges whose target note exists (create_note
+            # MATCHes it), so a link written ahead of its target lives in the
+            # file alone. Merge the row's links block too, or this rewrite
+            # drops it.
+            _, file_links = _split_relationships(prior_fields.get("content") or "")
+            relationships = _merge_relationships(
+                existing.get("relationships"),
+                file_links,
+                stored_links,
+                inline_links,
+                add_links,
+            )
             desired = {
                 "id": note,
                 "type": new_type,

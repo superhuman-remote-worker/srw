@@ -4453,6 +4453,63 @@ class TestKbUpdateKeepsTheDescriptionWithNeo4j:
         assert _canonical_note_fields(calls)["description"] == "Why JWT beat OAuth."
 
 
+class TestKbUpdateKeepsTheFilesLinksWithNeo4j:
+    """The graph drops an edge whose target note does not exist yet (its
+    ``create_note`` MATCHes the target), so such a link lives in the file
+    alone. Found on dev 11-04: an append re-rendered the file from the graph's
+    edges and the forward reference was gone."""
+
+    def _ctx(self, graph_relationships):
+        ctx = _make_context()
+        ctx.knowledge_graph.read_note.return_value = _graph_existing(
+            content="We use JWT.", relationships=graph_relationships
+        )
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_store.get_note_by_slug.return_value = _stored_row(
+            {
+                "id": "an-existing-note",
+                "type": "decision",
+                "title": "T",
+                "content": "We use JWT.",
+                "relationships": [
+                    {"type": "REFERENCES", "target": "not-written-yet"},
+                    {"type": "SUPPORTS", "target": "in-the-graph"},
+                ],
+            }
+        )
+        return ctx
+
+    def _update(self, ctx, **kw):
+        tools, _ = _make_tools(ctx)
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_update"), {"note": "an-existing-note", **kw}
+            )
+        assert result.startswith("Updated **"), result
+        _, body = _rendered_and_parsed_file(calls)
+        return body
+
+    def test_a_link_to_a_missing_note_survives_an_append(self):
+        ctx = self._ctx([{"type": "SUPPORTS", "target": "in-the-graph"}])
+        body = self._update(
+            ctx,
+            append="Rotate keys.",
+            add_links=[{"target": "added-now", "type": "SUPPORTS"}],
+        )
+        assert body.count("## Relationships") == 1
+        assert "**REFERENCES:** [not-written-yet](not-written-yet.md)" in body
+        # One entry per edge although the graph and the file both hold it.
+        assert "**SUPPORTS:** [in-the-graph](in-the-graph.md), [added-now]" in body
+        assert body.index("Rotate keys.") < body.index("## Relationships")
+
+    def test_it_survives_a_content_replacement(self):
+        ctx = self._ctx([])
+        body = self._update(ctx, content="We use JWT with rotation.")
+        assert "[not-written-yet](not-written-yet.md)" in body
+        assert "[in-the-graph](in-the-graph.md)" in body
+
+
 class TestKbWriteRewriteIsNotATwinWithoutNeo4j:
     """The identical-content short-circuit compared the agent's text with the
     row's, which carries the rendered ``# Title`` line — so without Neo4j it
