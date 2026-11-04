@@ -67,6 +67,7 @@ from shared.runtime.core.model_registry import (
     effective_client_protocol,
 )
 from shared.runtime.core.transport_resolution import (
+    CITATION_PROVIDER_ENV_KEY,
     NO_KEY_SENTINEL,
     env_endpoint_names,
     provider_base_url,
@@ -447,6 +448,14 @@ async def inject_env_key_credentials(
         env_keys[f"{prefix}_SERVED_MODEL"] = meta.served_model_id
     else:
         env_keys.pop(f"{prefix}_SERVED_MODEL", None)
+    if prefix == "CITATION_LLM":
+        # The flat citation client speaks OpenAI chat unless told otherwise; a
+        # row on the Anthropic shape names its client the way a model section's
+        # ``provider`` does.
+        if meta is not None and meta.provider == "anthropic":
+            env_keys[CITATION_PROVIDER_ENV_KEY] = "anthropic"
+        else:
+            env_keys.pop(CITATION_PROVIDER_ENV_KEY, None)
 
     if (
         meta is not None

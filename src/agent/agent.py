@@ -733,6 +733,7 @@ class UniversalAgent:
         import os
 
         from shared.runtime.core.transport_resolution import (
+            CITATION_PROVIDER_ENV_KEY,
             CitationTransportError,
             resolve_citation_transport,
             served_model_from_env,
@@ -764,6 +765,7 @@ class UniversalAgent:
                 transport = resolve_citation_transport()
                 verify_cfg = LLMConfig(
                     model=citation_model,
+                    provider=os.getenv(CITATION_PROVIDER_ENV_KEY) or None,
                     served_model=served_model_from_env("CITATION_LLM"),
                     base_url=transport.base_url,
                     api_key=transport.api_key,
