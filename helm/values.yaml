@@ -2168,17 +2168,22 @@ databases:
     engine: "statefulset"
     # -- Override the profile's instance count for this database. null = derive.
     instances: null
-    # -- max_connections for this server. The bundled StatefulSet inherited the
-    #    image default of 100; CloudNativePG sets it explicitly. Budget
-    #    arithmetic — orchestrator replicas x pool max, plus per-agent
-    #    checkpointer connections — is documented above under `orchestrator`.
-    #    Leave headroom for the instance manager's own connections.
+    # -- max_connections for this server, on every engine: the bundled
+    #    StatefulSet passes it as `-c max_connections=<value>`, CloudNativePG
+    #    sets it in the Cluster's parameters. A command-line flag beats
+    #    ALTER SYSTEM, so this wins over a value set by hand. null renders no
+    #    flag (image default 100; CloudNativePG still sets 100). Changing it
+    #    restarts the database pod. Budget arithmetic — orchestrator replicas
+    #    x pool max, plus per-agent checkpointer connections — is documented
+    #    above under `orchestrator`. Leave headroom for the instance manager's
+    #    own connections.
     maxConnections: 100
     # -- pg_restore --jobs for the post-data (index) section during a
     #    `migrating` import. null = serial, which is right for a database whose
     #    restore is dominated by COPY rather than by index builds.
     importRestoreJobs: null
-    # -- Extra postgresql.conf settings, merged over max_connections above.
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections above. The StatefulSet engine ignores them.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
     parameters: {}
@@ -2293,11 +2298,15 @@ databases:
     engine: "statefulset"
     # -- Override the profile's instance count for this database. null = derive.
     instances: null
-    # -- max_connections for this server. The bundled StatefulSet inherited the
-    #    image default of 100; CloudNativePG sets it explicitly. Budget
-    #    arithmetic — orchestrator replicas x pool max, plus per-agent
-    #    checkpointer connections — is documented above under `orchestrator`.
-    #    Leave headroom for the instance manager's own connections.
+    # -- max_connections for this server, on every engine: the bundled
+    #    StatefulSet passes it as `-c max_connections=<value>`, CloudNativePG
+    #    sets it in the Cluster's parameters. A command-line flag beats
+    #    ALTER SYSTEM, so this wins over a value set by hand. null renders no
+    #    flag (image default 100; CloudNativePG still sets 100). Changing it
+    #    restarts the database pod. Budget arithmetic — orchestrator replicas
+    #    x pool max, plus per-agent checkpointer connections — is documented
+    #    above under `orchestrator`. Leave headroom for the instance manager's
+    #    own connections.
     maxConnections: 100
     # -- pg_restore --jobs for the post-data (index) section during a
     #    `migrating` import. This database's restore is dominated by rebuilding
@@ -2305,7 +2314,8 @@ databases:
     #    the post-data section contains -- so parallelism here is the lever.
     #    Keep it at or below max_parallel_maintenance_workers above.
     importRestoreJobs: 4
-    # -- Extra postgresql.conf settings, merged over max_connections above.
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections above. The StatefulSet engine ignores them.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
     #
@@ -2436,17 +2446,22 @@ databases:
     engine: "statefulset"
     # -- Override the profile's instance count for this database. null = derive.
     instances: null
-    # -- max_connections for this server. The bundled StatefulSet inherited the
-    #    image default of 100; CloudNativePG sets it explicitly. Budget
-    #    arithmetic — orchestrator replicas x pool max, plus per-agent
-    #    checkpointer connections — is documented above under `orchestrator`.
-    #    Leave headroom for the instance manager's own connections.
+    # -- max_connections for this server, on every engine: the bundled
+    #    StatefulSet passes it as `-c max_connections=<value>`, CloudNativePG
+    #    sets it in the Cluster's parameters. A command-line flag beats
+    #    ALTER SYSTEM, so this wins over a value set by hand. null renders no
+    #    flag (image default 100; CloudNativePG still sets 100). Changing it
+    #    restarts the database pod. Budget arithmetic — orchestrator replicas
+    #    x pool max, plus per-agent checkpointer connections — is documented
+    #    above under `orchestrator`. Leave headroom for the instance manager's
+    #    own connections.
     maxConnections: 100
     # -- pg_restore --jobs for the post-data (index) section during a
     #    `migrating` import. null = serial, which is right for a database whose
     #    restore is dominated by COPY rather than by index builds.
     importRestoreJobs: null
-    # -- Extra postgresql.conf settings, merged over max_connections above.
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections above. The StatefulSet engine ignores them.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
     parameters:
@@ -2540,17 +2555,22 @@ databases:
     engine: "statefulset"
     # -- Override the profile's instance count for this database. null = derive.
     instances: null
-    # -- max_connections for this server. The bundled StatefulSet inherited the
-    #    image default of 100; CloudNativePG sets it explicitly. Budget
-    #    arithmetic — orchestrator replicas x pool max, plus per-agent
-    #    checkpointer connections — is documented above under `orchestrator`.
-    #    Leave headroom for the instance manager's own connections.
+    # -- max_connections for this server, on every engine: the bundled
+    #    StatefulSet passes it as `-c max_connections=<value>`, CloudNativePG
+    #    sets it in the Cluster's parameters. A command-line flag beats
+    #    ALTER SYSTEM, so this wins over a value set by hand. null renders no
+    #    flag (image default 100; CloudNativePG still sets 100). Changing it
+    #    restarts the database pod. Budget arithmetic — orchestrator replicas
+    #    x pool max, plus per-agent checkpointer connections — is documented
+    #    above under `orchestrator`. Leave headroom for the instance manager's
+    #    own connections.
     maxConnections: 100
     # -- pg_restore --jobs for the post-data (index) section during a
     #    `migrating` import. null = serial, which is right for a database whose
     #    restore is dominated by COPY rather than by index builds.
     importRestoreJobs: null
-    # -- Extra postgresql.conf settings, merged over max_connections above.
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections above. The StatefulSet engine ignores them.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
     parameters: {}
@@ -2624,17 +2644,22 @@ databases:
     engine: "statefulset"
     # -- Override the profile's instance count for this database. null = derive.
     instances: null
-    # -- max_connections for this server. The bundled StatefulSet inherited the
-    #    image default of 100; CloudNativePG sets it explicitly. Budget
-    #    arithmetic — orchestrator replicas x pool max, plus per-agent
-    #    checkpointer connections — is documented above under `orchestrator`.
-    #    Leave headroom for the instance manager's own connections.
+    # -- max_connections for this server, on every engine: the bundled
+    #    StatefulSet passes it as `-c max_connections=<value>`, CloudNativePG
+    #    sets it in the Cluster's parameters. A command-line flag beats
+    #    ALTER SYSTEM, so this wins over a value set by hand. null renders no
+    #    flag (image default 100; CloudNativePG still sets 100). Changing it
+    #    restarts the database pod. Budget arithmetic — orchestrator replicas
+    #    x pool max, plus per-agent checkpointer connections — is documented
+    #    above under `orchestrator`. Leave headroom for the instance manager's
+    #    own connections.
     maxConnections: 100
     # -- pg_restore --jobs for the post-data (index) section during a
     #    `migrating` import. null = serial, which is right for a database whose
     #    restore is dominated by COPY rather than by index builds.
     importRestoreJobs: null
-    # -- Extra postgresql.conf settings, merged over max_connections above.
+    # -- Extra postgresql.conf settings for the CloudNativePG Cluster, merged
+    #    over max_connections above. The StatefulSet engine ignores them.
     #    Values MUST be strings: CNPG's parameters map is map[string]string, and
     #    an unquoted integer fails admission for the whole Cluster.
     parameters: {}
