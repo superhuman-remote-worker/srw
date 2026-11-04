@@ -55856,6 +55856,10 @@ class PostgresDB:
         if row is None:
             return None
         result = dict(row)
+        # Whether a key is stored at all, decrypted or not: dispatch tells an
+        # endpoint registered without a key from one whose key failed to
+        # decrypt by this, never by the decrypted value (None for both).
+        result["api_key_stored"] = result.get("api_key") is not None
         result["api_key"] = _decrypt_stored(
             result.get("api_key"), field=f"llm_endpoints[{result['id']}].api_key"
         )
