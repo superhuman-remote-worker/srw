@@ -278,20 +278,93 @@ def test_the_note_is_the_drivers_to_write():
 # =============================================================================
 
 
-def _fake_graph_module(*, connect, monkeypatch):
+def _fake_graph_module(*, connect, monkeypatch, constructed=None):
     import sys
     import types
 
+    def _construct():
+        if constructed is not None:
+            constructed.append(True)
+        return SimpleNamespace(connect=connect, marker="constructed")
+
     module = types.ModuleType("shared.runtime.services.knowledge_graph")
-    module.KnowledgeGraphDB = lambda: SimpleNamespace(
-        connect=connect, marker="constructed"
-    )
+    module.KnowledgeGraphDB = _construct
     monkeypatch.setitem(sys.modules, "shared.runtime.services.knowledge_graph", module)
+
+
+@pytest.mark.parametrize("unset_value", [None, "", "   "])
+def test_the_graph_handle_never_connects_when_neo4j_is_not_configured(
+    monkeypatch, unset_value
+):
+    # The chart leaves NEO4J_URL out of the orchestrator's env when
+    # databases.neo4j.enabled is false; the handle must not fall through to
+    # KnowledgeGraphDB's localhost:7687 default and log a connection ERROR.
+    if unset_value is None:
+        monkeypatch.delenv("NEO4J_URL", raising=False)
+    else:
+        monkeypatch.setenv("NEO4J_URL", unset_value)
+    constructed: list[bool] = []
+    _fake_graph_module(
+        connect=lambda: True, monkeypatch=monkeypatch, constructed=constructed
+    )
+    logger = MagicMock()
+    handle = subject.KnowledgeGraphHandle(logger=logger)
+
+    assert handle.get() is None
+    assert handle.get() is None
+    assert handle.get() is None
+
+    assert constructed == []
+    logger.warning.assert_not_called()
+    logger.error.assert_not_called()
+    logger.info.assert_called_once()
+    assert "NEO4J_URL is not set" in logger.info.call_args.args[0]
+
+
+def test_a_configured_neo4j_without_the_driver_warns_instead_of_reporting_off(
+    monkeypatch,
+):
+    # Configured but driverless is the old orchestrator-image heisenbug: it
+    # must stay a WARNING naming the missing package, never the "off" INFO.
+    from shared.runtime.database import neo4j_db
+
+    monkeypatch.setenv("NEO4J_URL", "bolt://neo4j:7687")
+    monkeypatch.setattr(neo4j_db, "GraphDatabase", None)
+    logger = MagicMock()
+    handle = subject.KnowledgeGraphHandle(logger=logger)
+
+    assert handle.get() is None
+    warning = logger.warning.call_args.args[0]
+    assert "KnowledgeGraphDB not available" in warning
+    assert "neo4j Python package is not installed" in warning
+    logger.info.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_strict_sync_with_neo4j_not_configured_is_a_clean_no_op(monkeypatch):
+    monkeypatch.delenv("NEO4J_URL", raising=False)
+    conn = SimpleNamespace(execute=AsyncMock())
+    logger = MagicMock()
+    deps = _deps(
+        conn=conn, graph=subject.KnowledgeGraphHandle(logger=logger), logger=logger
+    )
+
+    await subject.sync_datasource_knowledge(
+        PROJECT_ID,
+        {"id": DS_ID, "name": "Files", "type": "webdav"},
+        strict=True,
+        dependencies=deps,
+    )
+
+    assert "INSERT INTO knowledge_index" in conn.execute.await_args.args[0]
+    logger.warning.assert_not_called()
+    logger.error.assert_not_called()
 
 
 def test_the_graph_handle_degrades_to_none_when_neo4j_refuses_the_connection(
     monkeypatch,
 ):
+    monkeypatch.setenv("NEO4J_URL", "bolt://neo4j:7687")
     _fake_graph_module(connect=lambda: False, monkeypatch=monkeypatch)
     logger = MagicMock()
     handle = subject.KnowledgeGraphHandle(logger=logger)
@@ -307,6 +380,7 @@ def test_the_graph_handle_degrades_to_none_when_the_driver_is_unimportable(
 ):
     import sys
 
+    monkeypatch.setenv("NEO4J_URL", "bolt://neo4j:7687")
     monkeypatch.setitem(sys.modules, "shared.runtime.services.knowledge_graph", None)
     logger = MagicMock()
     handle = subject.KnowledgeGraphHandle(logger=logger)
@@ -316,6 +390,7 @@ def test_the_graph_handle_degrades_to_none_when_the_driver_is_unimportable(
 
 
 def test_the_graph_handle_constructs_the_driver_only_once(monkeypatch):
+    monkeypatch.setenv("NEO4J_URL", "bolt://neo4j:7687")
     _fake_graph_module(connect=lambda: True, monkeypatch=monkeypatch)
     logger = MagicMock()
     handle = subject.KnowledgeGraphHandle(logger=logger)
