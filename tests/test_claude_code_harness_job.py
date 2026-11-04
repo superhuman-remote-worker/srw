@@ -69,6 +69,21 @@ def test_parse_job_start_reads_the_resolved_blob_first():
     assert spec.limits == Limits(200, 20.0, 3600)
 
 
+def test_the_served_model_is_the_name_sent_upstream():
+    body = copy.deepcopy(START_BODY)
+    body["resolved_config"]["agent"]["llm"] = {
+        **LLM,
+        "model": "claude-opus-5-5-harness",
+        "served_model": "claude-opus-5-5",
+    }
+    route = parse_job_start(body).model
+    # The catalog id names the model in reports; the provider knows only the
+    # served name (dev, 2026-11-04: the proxy answered 400 to the catalog id).
+    assert route.model == "claude-opus-5-5-harness"
+    assert route.upstream_model == "claude-opus-5-5"
+    assert parse_job_start(START_BODY).model.upstream_model == "muse-spark-1.3"
+
+
 def test_parse_job_start_falls_back_to_config_override():
     body = copy.deepcopy(START_BODY)
     body["resolved_config"] = None

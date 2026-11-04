@@ -117,7 +117,7 @@ def job_options(
         permission_mode="default",
         setting_sources=[],
         system_prompt=prompt,
-        model=spec.model.model,
+        model=spec.model.upstream_model,
         max_turns=spec.limits.max_turns,
         max_budget_usd=spec.limits.max_budget_usd,
         effort=spec.effort,
