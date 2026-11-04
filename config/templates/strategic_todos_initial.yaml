@@ -9,12 +9,14 @@ todos:
     content: >-
       EXPLORE: Thoroughly understand the task before doing anything else.
 
+      The task brief and instructions.md are already in your opening message, in full.
+      Read them there, every line; do not read_file task_brief.md or instructions.md
+      again unless a compaction has removed that message.
+
       Steps:
-      (1) Use read_file to read task_brief.md — this is the task description and opening message.
-      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
-      (3) Use list_files on the tools/ directory to understand your available capabilities.
-      (4) Use list_files on documents/ to inventory all input materials.
-      (5) Use list_files on reference/ to check for domain-specific reference material.
+      (1) Use list_files on the tools/ directory to understand your available capabilities.
+      (2) Use list_files on documents/ to inventory all input materials.
+      (3) Use list_files on reference/ to check for domain-specific reference material.
 
       {% if has_tool("kb_write") -%}
       Then persist critical rules as knowledge notes using kb_write:
@@ -27,7 +29,7 @@ todos:
       in the same project. Search existing notes first (kb_search) to avoid duplicates.
 
       COMPLETION CRITERIA: Knowledge notes created for all four categories above
-      (verify with kb_list). instructions.md and task_brief.md have been read in full.
+      (verify with kb_list). The brief and instructions in the opening message have been read in full.
       {% else -%}
       Then persist critical rules to a notes/ file so they survive compaction:
       - Required output files (exact paths and formats) → notes/task_rules.md under "## Deliverables"
@@ -38,11 +40,11 @@ todos:
       The memory system also recalls key context automatically across compaction.
 
       COMPLETION CRITERIA: Critical rules recorded in notes/task_rules.md under the four
-      categories above. instructions.md and task_brief.md have been read in full.
+      categories above. The brief and instructions in the opening message have been read in full.
       {%- endif %}
 
       INSTEAD OF: Starting to write output files now — this phase is read-only exploration.
-      Instead of skimming instructions.md — read every line, since every task failure
+      Instead of skimming the instructions — read every line, since every task failure
       starts with skipping this step.
 
   - id: 2

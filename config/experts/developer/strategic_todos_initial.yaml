@@ -8,13 +8,15 @@ todos:
     content: >-
       EXPLORE: Read the task brief and instructions before doing anything else.
 
+      The task brief and instructions.md are already in your opening message, in full.
+      Read them there, every line; do not read_file task_brief.md or instructions.md
+      again unless a compaction has removed that message. Pay attention to: required
+      deliverables, the TDD discipline (spec → red → green → refactor), forbidden test
+      patterns, and the abort token rules (BLOCKED / ABORT).
+
       Steps:
-      (1) Use read_file to read task_brief.md — this is the task description and opening message.
-      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
-          Pay attention to: required deliverables, the TDD discipline (spec → red → green → refactor),
-          forbidden test patterns, and the abort token rules (BLOCKED / ABORT).
-      (3) Use list_files on the tools/ directory to understand your available capabilities.
-      (4) Use list_files on documents/ to inventory all input materials.
+      (1) Use list_files on the tools/ directory to understand your available capabilities.
+      (2) Use list_files on documents/ to inventory all input materials.
 
       Then persist critical rules as knowledge notes using kb_write:
       - Required deliverables (exact output paths and formats) → kb_write with type="goal", tag="deliverable"
@@ -25,8 +27,7 @@ todos:
       in the same project. Search existing notes first (kb_search) to avoid duplicates.
 
       COMPLETION CRITERIA: Knowledge notes created for deliverables, pinned rules, and
-      delivery expectations (verify with kb_list). instructions.md and task_brief.md
-      have been read in full.
+      delivery expectations (verify with kb_list). The brief and instructions in the opening message have been read in full.
 
       INSTEAD OF: Starting to write or modify code — this is the bootstrap strategic phase.
       Instead of skipping the abort-token and forbidden-pattern rules — these are the
