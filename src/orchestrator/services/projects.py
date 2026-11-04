@@ -72,6 +72,7 @@ from orchestrator.services.managed_repository_authority import (
 from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
+from orchestrator.services.workspace_access import grant_project_repo_access
 from shared.connectors.builtin import spec_for_row
 from shared.connectors.contract import AccessContext, strict_access
 from shared.connectors.platform import (
@@ -897,12 +898,12 @@ async def add_project_member(
         if dependencies.forge.is_initialized:
             try:
                 if user and user.get("email"):
-                    repos = await store.get_project_repositories(project_id)
-                    for repo in repos:
-                        if repo.get("is_managed"):
-                            await dependencies.forge.grant_user_repo_access(
-                                user["email"], repo["name"]
-                            )
+                    await grant_project_repo_access(
+                        store=store,
+                        forge=dependencies.forge,
+                        project_id=project_id,
+                        email=user["email"],
+                    )
             except Exception as e:
                 logger.warning(
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"

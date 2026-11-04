@@ -2472,6 +2472,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     this.loadExperts();
     this.loadProjectDatasources();
     this.loadKBSummary();
+    // Re-grant the project's Gitea repos (knowledge vault, jobs repo) to the
+    // viewer: the creation-time grant is otherwise never retried.
+    this.api.ensureProjectRepoAccess(this.projectId).subscribe();
   }
 
   loadJobs(): void {

@@ -458,6 +458,7 @@ GET    /api/projects/{project_id}/datasources                                   
 DELETE /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
 PATCH  /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
 POST   /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/ensure-repo-access                                    pat=admin           gated:require_project_member
 DELETE /api/projects/{project_id}/expert-defaults/{expert_type}                         pat=admin           gated:require_project_owner
 PUT    /api/projects/{project_id}/expert-defaults/{expert_type}                         pat=admin           gated:require_project_owner
 GET    /api/projects/{project_id}/experts                                               pat=jobs:read       gated:require_project_member

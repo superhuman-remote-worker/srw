@@ -2481,11 +2481,12 @@ class GiteaClient:
                 )
                 return username
             if resp.status_code == 422:
-                # Name or email collision — user exists under a slightly
-                # different identity; leave lookup to the caller.
-                logger.debug(
-                    f"Gitea rejected ensure_user for '{username}' (422 — "
-                    f"likely username/email collision)"
+                # A name/email collision, or a name Gitea reserves (``admin``):
+                # either way no account exists and every grant for it fails,
+                # so say what Gitea said.
+                logger.warning(
+                    f"Gitea refused to create user '{username}' "
+                    f"(status 422): {resp.text[:200]}"
                 )
                 return None
             logger.warning(
@@ -2534,8 +2535,9 @@ class GiteaClient:
         if not resolved and username:
             resolved = await self.ensure_user(email, username, full_name, sub=sub)
         if not resolved:
-            logger.debug(
-                f"No Gitea account for '{email}', skipping access grant on '{repo_name}'"
+            logger.warning(
+                f"Gitea access to '{repo_name}' not granted to '{email}': "
+                f"no Gitea account resolved for that email"
             )
             return False
 

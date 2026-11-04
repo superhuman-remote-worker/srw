@@ -110,6 +110,7 @@ function createComponent(
     getDatasources: vi.fn().mockReturnValue(of([])),
     linkProjectDatasource: vi.fn().mockReturnValue(of({status: 'linked'})),
     getProjectRepositories: vi.fn().mockReturnValue(of([])),
+    ensureProjectRepoAccess: vi.fn().mockReturnValue(of(null)),
     attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
     getProject: vi.fn().mockReturnValue(
@@ -428,6 +429,19 @@ describe('ProjectDetailPageComponent external knowledge base', () => {
 
     expect(component.kbAttachError()).toBe('Set its note root to knowledge first');
     expect(component.isAttachingKb()).toBe(false);
+  });
+});
+
+describe('ProjectDetailPageComponent repository access', () => {
+  it('re-grants the managed repositories to the viewer when the project opens', () => {
+    // A vault shared with its creator only once 404s for them in Gitea; the
+    // server re-grants on this call, as it does for a job's workspace.
+    const {api, component} = createComponent();
+
+    component.loadAll();
+
+    expect(api.ensureProjectRepoAccess).toHaveBeenCalledTimes(1);
+    expect(api.ensureProjectRepoAccess).toHaveBeenCalledWith('project-a');
   });
 });
 
