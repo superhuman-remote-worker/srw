@@ -9,9 +9,10 @@ todos:
     content: >-
       VERIFY THE RESULT — finish this before deciding whether to continue.
 
-      Read and apply `skills/verify-before-done/SKILL.md`. Verify the current
-      outputs against the original requirements in instructions.md and any
-      runtime-declared required deliverables. Do not update plan.md or plan
+      Apply `skills/verify-before-done/SKILL.md` (delivered at the start of the
+      tactical phase; read the file only if it is no longer in your context).
+      Verify the current outputs against the original requirements in
+      instructions.md and any runtime-declared required deliverables. Do not update plan.md or plan
       another phase yet.
 
       Complete this todo with `todo_complete`. Record the skill's concise
