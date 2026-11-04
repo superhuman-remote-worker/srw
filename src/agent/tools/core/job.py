@@ -265,9 +265,28 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                         # completion. Propagate. (Defect 8)
                         raise
                     except Exception:
-                        validation_warnings.append(
-                            f"Deliverable '{deliverable}' could not be read"
-                        )
+                        # A binary deliverable (a SQLite database, an image, a
+                        # PDF) is not text: read_file cannot decode it, which
+                        # used to refuse a correct seal as "could not be read"
+                        # and leave the model two bad exits — a sub-0.5
+                        # confidence or a blocking message to a human (bench
+                        # run srw-claude-eff-02, M3 output/shop.db, 2026-11-04).
+                        # Its byte size answers the same "exists and is not
+                        # trivial" question.
+                        try:
+                            size = workspace.get_size(resolved)
+                        except WorkspaceUnavailableError:
+                            raise
+                        except Exception:
+                            size = None
+                        if size is None:
+                            validation_warnings.append(
+                                f"Deliverable '{deliverable}' could not be read"
+                            )
+                        elif size < 50:
+                            validation_warnings.append(
+                                f"Deliverable '{deliverable}' appears empty or trivial ({size} bytes)"
+                            )
 
             # Reject high confidence with validation warnings
             if validation_warnings and confidence > 0.5:
