@@ -2544,6 +2544,9 @@ export interface Job {
   worktree_path?: string | null;
   repo_name?: string | null;
   branch_name?: string | null;
+  /** The repository's Gitea page under the installation's real owner; null
+   *  without a repository. Absent from older responses. */
+  gitea_url?: string | null;
   merge_status?: string | null;
   delivery_status?: string | null;
   delivery_ref?: string | null;

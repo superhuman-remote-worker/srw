@@ -125,6 +125,32 @@ def encode_repo_ref(ref: str) -> str:
     return quote(raw, safe="")
 
 
+def repository_owner_name() -> str:
+    """The Gitea account every managed repository is created under."""
+    return os.environ.get("GITEA_ADMIN_USER", "srw")
+
+
+def repo_web_url(repo_name: Optional[str]) -> Optional[str]:
+    """Browser URL of a managed repository: ``GITEA_URL/<owner>/<repo>``.
+
+    The owner is :func:`repository_owner_name`, so a link follows an install
+    whose Gitea admin is not ``srw`` (the chart cannot render it for Cockpit
+    when it comes from an existing Secret). ``GITEA_URL`` is the browser-facing
+    base, public subpath included. None without a repository or a public Gitea
+    URL, and for a name Gitea would refuse: job rows are caller-shaped.
+    """
+    base = os.environ.get("GITEA_URL", "").strip().rstrip("/")
+    name = (repo_name or "").strip()
+    if not base or not name:
+        return None
+    try:
+        owner = validate_gitea_name(repository_owner_name(), kind="owner")
+        repo = validate_gitea_name(name)
+    except GiteaPathError:
+        return None
+    return f"{base}/{owner}/{repo}"
+
+
 class GiteaClient:
     """Async HTTP client for Gitea API.
 
@@ -151,7 +177,7 @@ class GiteaClient:
         self._url = (
             os.environ.get("GITEA_INTERNAL_URL") or os.environ.get("GITEA_URL", "")
         ).rstrip("/")
-        self._user = os.environ.get("GITEA_ADMIN_USER", "srw")
+        self._user = repository_owner_name()
         self._password = os.environ.get("GITEA_ADMIN_PASSWORD", "")
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None

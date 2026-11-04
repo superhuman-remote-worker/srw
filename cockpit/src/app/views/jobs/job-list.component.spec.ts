@@ -335,6 +335,14 @@ describe('JobListComponent — server-resolved tree', () => {
     ).toMatch(/\/my-repo\/src\/branch\/feat$/);
   });
 
+  it("links the server's repository URL, which names the installation's owner", () => {
+    const {component} = mountLogic();
+    const giteaUrl = 'https://srw.example.org/git/srw-admin/job-647db6e7';
+    expect(
+      component.getWorkspaceUrl(job('j1', {repo_name: 'job-647db6e7', gitea_url: giteaUrl}) as JobSummary),
+    ).toBe(giteaUrl);
+  });
+
   it('opens a suspended VM IDE from the click and uses the admitted URL', () => {
     const startIdeSession = vi.fn().mockReturnValue(of({
       status: 'active', access_lease_id: 'lease-1',
