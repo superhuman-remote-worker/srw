@@ -36,9 +36,9 @@ todos:
       deliverables complete, then call job_complete with the deliverable paths
       and any verification limitations.
 
-      Take exactly one branch. After the chosen lifecycle tool succeeds,
-      complete this todo with a concise `completion_note`; do not complete it
-      before job_complete or next_phase_todos succeeds.
+      Take exactly one branch. When this is the last pending todo, the
+      lifecycle tool completes it for you; do not call todo_complete for it
+      before job_complete or next_phase_todos has succeeded.
 
       COMPLETION CRITERIA: Verified gaps produced a corrective tactical phase,
       or a verified complete result produced job completion.

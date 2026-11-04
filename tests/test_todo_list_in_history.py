@@ -214,19 +214,46 @@ class TestTodoToolResults:
             }
         )
 
-        rendering = mgr.format_for_injection()
+        # The planning todo was the last one pending: the call completes it,
+        # so the finished strategic list is not repeated and no todo_complete
+        # request is needed before the tactical phase.
         assert result == (
             "Staged 2 todos for the next tactical phase (Build).\n"
             "  - Implement the parser module\n"
             "  - Write the parser tests\n\n"
-            f"{rendering}\n\n"
-            "All strategic todos complete. Invoke the `todo_complete` tool to "
-            "transition to tactical phase."
+            "Completed: Stage the todos for the next phase\n"
+            "That was the last strategic todo, so this call completed it. The "
+            "tactical phase starts next with the staged todos."
         )
-        # The current (strategic) list; the staged phase name is not part of
-        # its header — it is not checkpointed, so a resume would lose it.
+        assert mgr.all_complete()
+        assert mgr.list_all()[1].notes == [
+            "Staged the next tactical phase with next_phase_todos."
+        ]
+        # The staged phase name is not part of the list header — it is not
+        # checkpointed, so a resume would lose it.
+        rendering = mgr.format_for_injection()
         assert rendering.startswith("Current Tasks — Phase 1 (Strategic)\n")
         assert "Build" not in rendering
+
+    def test_next_phase_todos_after_the_last_strategic_todo_was_completed(self):
+        mgr = TodoManager(_offline_workspace(), min_todos=2)
+        mgr.is_strategic_phase = True
+        mgr.phase_number = 1
+        mgr.add("Review the brief and write plan.md")
+        mgr.add("Stage the todos for the next phase")
+        tools = _tools(mgr)
+        tools["todo_complete"].invoke({"todo_id": "todo_1"})
+        tools["todo_complete"].invoke({"todo_id": "todo_2"})
+
+        result = tools["next_phase_todos"].invoke(
+            {"todos": ["Implement the parser module", "Write the parser tests"]}
+        )
+
+        assert mgr.format_for_injection() in result
+        assert result.endswith(
+            "All strategic todos complete. The tactical phase starts next with "
+            "the staged todos."
+        )
 
     def test_next_phase_todos_with_strategic_work_left(self):
         mgr = TodoManager(_offline_workspace(), min_todos=2)

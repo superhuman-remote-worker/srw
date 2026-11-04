@@ -34,9 +34,9 @@ todos:
       phases and deliverables complete, then invoke job_complete with the real
       deliverable paths and any verification limitations.
 
-      Choose exactly one branch. Only after job_complete or next_phase_todos
-      succeeds, invoke todo_complete for todo_2 with a concise
-      `completion_note` describing the chosen branch.
+      Choose exactly one branch. When todo_2 is the last pending todo,
+      job_complete or next_phase_todos completes it for you; never invoke
+      todo_complete for todo_2 before that tool has succeeded.
 
       COMPLETION CRITERIA: GAPS created a corrective tactical phase, or PASS
       completed the job. No verification loop and no invented extra work.
