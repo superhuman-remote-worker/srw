@@ -295,6 +295,11 @@ _UNTAKEN_REQUEST_SQL = (
     "SELECT 1 FROM thread_events receipt WHERE receipt.thread_id=r.thread_id "
     "AND receipt.control_request_id=r.id))"
 )
+# A job-transition wake repeated for the same <job8>:<status> key within this
+# window is one event reported by two completion paths, not a new transition
+# (officer double-wake, 2026-11-05). Kept short so a genuine re-entry into the
+# same status (resume → pending_review again) is never swallowed.
+OFFICER_JOB_TRANSITION_REPEAT_SECONDS = 60.0
 _CHECKPOINT_DELETE_BATCH = 1000
 _CHECKPOINT_DELETE_MAX_BATCHES = 1000
 _CHECKPOINT_RETENTION_SOURCE_PREFIX = "checkpoint_retention_prune:v1:"
@@ -31183,12 +31188,19 @@ class PostgresDB:
         payload: Optional[Dict[str, Any]] = None,
         project_id: Optional[str] = None,
         fire_at: Optional[datetime] = None,
+        suppress_if_delivered_within_seconds: Optional[float] = None,
     ) -> bool:
         """Enqueue (or, for timers, re-file) an officer wake event.
 
         Never raises on bad ids — wake enqueueing must not break the calling
         transition path. Returns True when a row was inserted or a pending
         timer re-filed; False on coalesce/no-op.
+
+        ``suppress_if_delivered_within_seconds`` widens the dedup beyond the
+        pending-only unique index: the insert is also skipped while an equal
+        row is in flight (``sending``) or was delivered within that window.
+        Callers that may describe an event another path already enqueued use
+        it — see :meth:`_enqueue_session_wake_event_on_conn`.
         """
         try:
             thread_uuid = UUID(thread_id)
@@ -31210,6 +31222,9 @@ class PostgresDB:
                 payload_json=payload_json,
                 project_uuid=project_uuid,
                 fire_at=fire_at,
+                suppress_if_delivered_within_seconds=(
+                    suppress_if_delivered_within_seconds
+                ),
             )
 
     async def _enqueue_session_wake_event_on_conn(
@@ -31222,8 +31237,53 @@ class PostgresDB:
         payload_json: str,
         project_uuid: Optional[UUID] = None,
         fire_at: Optional[datetime] = None,
+        suppress_if_delivered_within_seconds: Optional[float] = None,
     ) -> bool:
-        """Connection-owned wake INSERT for post-authoritative transactions."""
+        """Connection-owned wake INSERT for post-authoritative transactions.
+
+        The unique index only covers ``pending`` rows, so an equal event that
+        arrives while the first is claimed (``sending``) or just after it was
+        delivered becomes a second row and a second paid turn. That is exactly
+        what happened to every officer-dispatched job completion: the
+        completion hook and the jobs-outbox backstop enqueue the same
+        ``<job8>:<status>`` key milliseconds apart, the hook's row is already
+        claimed by then, and both were delivered (k3d, 2026-11-05). Callers
+        that can repeat an event pass ``suppress_if_delivered_within_seconds``
+        to also skip the insert while an equal row is in flight or was sent
+        within that window. Timers never take it: a re-filed sleep is new.
+        """
+
+        if suppress_if_delivered_within_seconds is not None and source != "timer":
+            row = await conn.fetchrow(
+                """
+                INSERT INTO session_wake_events
+                    (thread_id, project_id, source, dedup_key, payload, fire_at)
+                SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::jsonb,
+                       $6::timestamptz
+                 WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM session_wake_events prior
+                        WHERE prior.thread_id = $1::uuid
+                          AND prior.source = $3::text
+                          AND prior.dedup_key = $4::text
+                          AND (prior.state = 'sending'
+                               OR (prior.state = 'sent'
+                                   AND prior.sent_at > NOW() - make_interval(
+                                       secs => $7::double precision))))
+                ON CONFLICT (thread_id, source, dedup_key)
+                    WHERE state = 'pending'
+                DO NOTHING
+                RETURNING id
+                """,
+                thread_uuid,
+                project_uuid,
+                source,
+                dedup_key,
+                payload_json,
+                fire_at,
+                float(suppress_if_delivered_within_seconds),
+            )
+            return row is not None
 
         if source == "timer":
             row = await conn.fetchrow(
@@ -34791,6 +34851,13 @@ class PostgresDB:
                             conn,
                             current_thread_id,
                             source="job_transition",
+                            # maybe_wake_session is called from several
+                            # completion paths for one transition; a repeat
+                            # while the first wake is in flight is the same
+                            # event, not a new one.
+                            suppress_if_delivered_within_seconds=(
+                                OFFICER_JOB_TRANSITION_REPEAT_SECONDS
+                            ),
                             dedup_key=dedup_key,
                             payload_json=json.dumps(
                                 {

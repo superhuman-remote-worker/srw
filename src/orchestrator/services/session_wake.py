@@ -115,6 +115,13 @@ TICK_SECONDS = int(os.getenv("SESSION_WAKE_SWEEP_SECONDS", "20"))
 # seconds, not minutes, of latency.
 VISIBILITY_TIMEOUT_SECONDS = int(os.getenv("SESSION_WAKE_VISIBILITY_SECONDS", "120"))
 
+# The jobs-outbox → officer-event backstop skips an equal job_transition row
+# that is in flight or was delivered within this window: the completion hook
+# reported the same transition. The jobs outbox fires once per job and status,
+# so the window only has to cover the hook-to-backstop latency, including the
+# sweeper's by-status re-find.
+OFFICER_JOB_BACKSTOP_DEDUP_SECONDS = 900.0
+
 # Attempt budget before a wake is buried as 'dead'. Burying matters: without it
 # one permanently-unreachable session re-claims forever and starves live wakes
 # behind it in the claim's ORDER BY.
@@ -400,6 +407,14 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool | WakeDeliveryResult:
                     "description": _truncate(str(row.get("description") or ""), 200),
                 },
                 project_id=(str(row["project_id"]) if row.get("project_id") else None),
+                # The completion hook usually enqueued this exact event a few
+                # milliseconds earlier and the drain may already have claimed
+                # or delivered it, which the pending-only index cannot see.
+                # This backstop fires once per job and status, so anything the
+                # hook delivered recently is the same transition.
+                suppress_if_delivered_within_seconds=(
+                    OFFICER_JOB_BACKSTOP_DEDUP_SECONDS
+                ),
             )
         except Exception:
             logger.exception(

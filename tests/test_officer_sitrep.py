@@ -441,6 +441,13 @@ class TestDeliverOfficerConversion:
         assert kwargs["source"] == "job_transition"
         assert kwargs["dedup_key"] == f"{JOB_A[:8]}:completed"
         assert kwargs["project_id"] == PROJECT_ID
+        # The hook usually reported this transition milliseconds earlier and
+        # its row may already be claimed: the backstop must not add a second
+        # paid wake (k3d double SITREP, 2026-11-05).
+        assert (
+            kwargs["suppress_if_delivered_within_seconds"]
+            == session_wake.OFFICER_JOB_BACKSTOP_DEDUP_SECONDS
+        )
         await asyncio.sleep(0)
 
     @pytest.mark.asyncio
