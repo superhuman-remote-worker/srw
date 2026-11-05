@@ -1758,7 +1758,9 @@ mcp:
   # stay at one replica while this is on.
   persistence:
     enabled: true
-    size: 256Mi
+    # -- At least 300Mi: Longhorn refuses smaller XFS volumes and the claim
+    # then never binds, which leaves the MCP pod Pending (main dev 2026-11-05).
+    size: 512Mi
     # -- Empty = the cluster's default StorageClass.
     storageClass: ""
   resources:

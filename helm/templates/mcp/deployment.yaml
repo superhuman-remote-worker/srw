@@ -143,17 +143,20 @@ spec:
       volumes:
         - name: oauth-state
           persistentVolumeClaim:
-            claimName: {{ include "srw.fullname" . }}-mcp-oauth
+            claimName: {{ include "srw.fullname" . }}-mcp-oauth-state
       {{- end }}
 {{- if .Values.mcp.persistence.enabled }}
 ---
 # The MCP OAuth server's state (G5): dynamically registered clients and
 # in-flight authorizations. Kept across uninstall like the other credential
 # volumes; FastMCP encrypts it with a key derived from the OIDC client secret.
+# Named "-mcp-oauth-state": the first claim ("-mcp-oauth", 256Mi) never bound
+# on Longhorn/XFS (minimum 300Mi) and a Pending claim's size cannot be
+# changed, so a resized claim needs a new name. The old one holds no data.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "srw.fullname" . }}-mcp-oauth
+  name: {{ include "srw.fullname" . }}-mcp-oauth-state
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "mcp") | nindent 4 }}
   annotations:

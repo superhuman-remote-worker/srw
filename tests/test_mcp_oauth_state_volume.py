@@ -99,3 +99,13 @@ def test_more_than_one_replica_with_the_volume_is_refused_at_render():
         _render("mcp.replicas=2")
 
     assert "mcp.persistence.enabled needs mcp.replicas=1" in exc.value.stderr
+
+
+def test_default_claim_is_big_enough_for_longhorn_xfs():
+    """Longhorn refuses XFS volumes under 300Mi; the 256Mi claim never bound
+    and kept the MCP pod Pending on main dev (2026-11-05)."""
+    claim = _render()["PersistentVolumeClaim"]
+    size = claim["spec"]["resources"]["requests"]["storage"]
+    assert size.endswith("Mi") and int(size[:-2]) >= 300
+    # A Pending claim's size cannot be changed, so the resized claim is new.
+    assert claim["metadata"]["name"].endswith("-mcp-oauth-state")
