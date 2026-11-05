@@ -1662,11 +1662,12 @@ async def lifespan(app: FastAPI):
         _session and _session_termination.officer_exits_without_retirement()
     )
     if _session and attach_settled:
-        await _session_termination.terminate(
-            "shutdown",
-            mark_thread=not stateless and not officer_leaves_thread,
-            preserve_shell=True if officer_leaves_thread else None,
-        )
+        if officer_leaves_thread:
+            await _session_termination.terminate(
+                "shutdown", mark_thread=False, preserve_shell=True
+            )
+        else:
+            await _session_termination.terminate("shutdown", mark_thread=not stateless)
 
     await _session_termination.drain_loop_completion_tasks()
 
