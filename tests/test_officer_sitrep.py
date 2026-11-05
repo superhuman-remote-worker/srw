@@ -464,6 +464,39 @@ class TestDeliverOfficerConversion:
         assert ok is False  # released → retried, never dropped
 
 
+class TestConferenceBriefRender:
+    def _row(self, **payload):
+        return {
+            "id": 9,
+            "source": "conference",
+            "dedup_key": "conf-1",
+            "payload": {
+                "title": "Conference — Century",
+                "summary": "conference concluded — direction agreed there is now in force.",
+                **payload,
+            },
+        }
+
+    def test_brief_renders_whole(self):
+        long_order = "Ship the booking flow first. " * 20
+        lines = sitrep._conference_lines(
+            [
+                self._row(
+                    legate_messages=[long_order],
+                    final_reply="Recorded.",
+                    kb_notes=["project:decision-booking-first"],
+                )
+            ]
+        )
+        text = "\n".join(lines)
+        assert long_order.strip() in text  # never cut to the 160-char reason line
+        assert "Recorded." in text
+        assert "project:decision-booking-first" in text
+
+    def test_pre_brief_rows_render_nothing_extra(self):
+        assert sitrep._conference_lines([self._row()]) == []
+
+
 class TestLegateNotes:
     """A directive is delivered whole or not at all (officer_legate_channel.md)."""
 

@@ -22,12 +22,17 @@ session wearing his identity via ``officer.conference``, with
 * **Concluding is idempotent** (:func:`conclude_conference_if_any`): the brief
   wake dedups on the conference thread id, so the end hook and the watchdog's
   self-heal can both run. Never raises.
+* **The brief carries the meeting** (:func:`conference_brief_from_transcript`):
+  what the Legate said, the conference's last reply, and the knowledge notes it
+  wrote — read from the transcript, no model call. A bare "direction agreed is
+  in force" pointer left the background officer guessing which notes changed.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -52,6 +57,75 @@ class OfficerConferenceDependencies:
 
 
 CONFERENCE_BRAIN_KEYS = ("model", "reasoning_level")
+
+# Bounds on the conference brief carried in the wake payload. The Legate's own
+# words get the largest share: they are the direction.
+BRIEF_MAX_LEGATE_MESSAGES = 8
+BRIEF_MAX_LEGATE_CHARS = 6000
+BRIEF_MAX_REPLY_CHARS = 2000
+BRIEF_MAX_NOTES = 20
+
+# kb_write / kb_update results name the note in bold: "Created knowledge note:
+# **project:slug** (…)" and "Updated **project:slug**: …".
+_KB_NOTE_RESULT = re.compile(
+    r"^(?:Created knowledge note:|Updated)\s+\*\*([A-Za-z_]+:[^*\s]+)\*\*"
+)
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p).strip()
+    return ""
+
+
+def conference_brief_from_transcript(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the background officer must know about a concluded conference.
+
+    Returns ``legate_messages`` (the Legate's own words, newest kept within
+    the budget, oldest first), ``final_reply`` (the conference's last answer)
+    and ``kb_notes`` (ids of notes the conference created or updated, in
+    order). Deterministic and model-free, so it cannot fail on a provider.
+    """
+    legate: list[str] = []
+    final_reply = ""
+    notes: list[str] = []
+    for message in messages:
+        role = str(message.get("role") or "")
+        text = _message_text(message.get("content"))
+        if not text:
+            continue
+        if role in ("human", "user"):
+            legate.append(text)
+        elif role in ("ai", "assistant"):
+            final_reply = text
+        elif role == "tool":
+            match = _KB_NOTE_RESULT.match(text)
+            if match and match.group(1) not in notes:
+                notes.append(match.group(1))
+
+    kept: list[str] = []
+    budget = BRIEF_MAX_LEGATE_CHARS
+    for text in reversed(legate[-BRIEF_MAX_LEGATE_MESSAGES:]):
+        if len(text) > budget:
+            if kept:
+                break  # older words drop out whole; the newest always survive
+            text = text[:budget] + " [truncated]"
+        kept.insert(0, text)
+        budget -= len(text)
+    if len(final_reply) > BRIEF_MAX_REPLY_CHARS:
+        final_reply = final_reply[:BRIEF_MAX_REPLY_CHARS] + " [truncated]"
+    return {
+        "legate_messages": kept,
+        "final_reply": final_reply,
+        "kb_notes": notes[:BRIEF_MAX_NOTES],
+    }
 
 
 def inherit_conference_brain(
@@ -214,6 +288,17 @@ async def conclude_conference_if_any(
                 expected_thread_id=officer_tid,
                 hold=None,
             )
+        brief: dict[str, Any] = {}
+        try:
+            transcript = await dependencies.store.get_thread_messages_history(conf_tid)
+            brief = conference_brief_from_transcript(transcript or [])
+        except Exception:
+            # The pointer alone still releases him and tells him to re-read.
+            logger.warning(
+                "conference %s: transcript brief unavailable (non-fatal)",
+                conf_tid[:8],
+                exc_info=True,
+            )
         await dependencies.store.enqueue_session_wake_event(
             officer_tid,
             source="conference",
@@ -227,6 +312,7 @@ async def conclude_conference_if_any(
                     "notes updated during the meeting before your next "
                     "scheduling decision."
                 ),
+                **brief,
             },
             project_id=str(project_id),
         )
@@ -242,6 +328,7 @@ async def conclude_conference_if_any(
 
 __all__ = [
     "CONFERENCE_BRAIN_KEYS",
+    "conference_brief_from_transcript",
     "OfficerConferenceDependencies",
     "conclude_conference_if_any",
     "find_open_conference_thread",

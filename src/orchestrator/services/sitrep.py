@@ -216,6 +216,9 @@ async def build_wake_message(
             is_note = str(row.get("source") or "") == LEGATE_SOURCE
             (notes if is_note else reasons).append(row)
         lines += _legate_lines(notes)
+        lines += _conference_lines(
+            [r for r in reasons if str(r.get("source") or "") == "conference"]
+        )
         lines += _reason_lines(reasons)
 
         jobs_lines, fingerprints = await _jobs_section(
@@ -296,6 +299,47 @@ def _legate_lines(rows: list[dict[str, Any]]) -> list[str]:
             )
         lines.append(f"[note {index}]")
         lines.append(message)
+    return lines
+
+
+def _conference_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """Render each concluded conference's brief whole, after Legate notes.
+
+    The reason line keeps only a 160-char pointer; the brief is the Legate's
+    direction from a meeting the background officer did not attend, so it
+    gets the same treatment as a note. Older rows without a brief render
+    nothing here and keep their pointer.
+    """
+    lines: list[str] = []
+    for row in rows:
+        payload = _as_dict(row.get("payload"))
+        said = [
+            str(m).strip()
+            for m in (payload.get("legate_messages") or [])
+            if str(m).strip()
+        ]
+        reply = str(payload.get("final_reply") or "").strip()
+        notes = [str(n) for n in (payload.get("kb_notes") or []) if str(n).strip()]
+        if not (said or reply or notes):
+            continue
+        title = str(payload.get("title") or "conference")
+        lines.append(
+            f"Conference brief — {title}: the Legate met your conference "
+            "embodiment; what was agreed there is in force and outranks your "
+            "standing plan."
+        )
+        if said:
+            lines.append("The Legate said:")
+            for index, text in enumerate(said, start=1):
+                lines.append(f"[{index}] {sanitize_text(text)}")
+        if reply:
+            lines.append("Your conference embodiment's last reply:")
+            lines.append(sanitize_text(reply))
+        if notes:
+            lines.append(
+                "Knowledge notes written or updated in the meeting (read them "
+                "before your next scheduling decision): " + ", ".join(notes)
+            )
     return lines
 
 
