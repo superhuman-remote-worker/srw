@@ -27,6 +27,15 @@ from mcp_server.oauth_bridge import (
     allowed_redirect_uris_from_env,
 )
 
+# The pinned fastmcp (src/mcp_server/requirements.txt, 3.4.11 — what CI and
+# the image install). Older releases neither synthesize a client for the
+# upstream client id nor check registrations against the list, so these
+# behaviours do not exist there to test; a stale local venv skips them.
+requires_pinned_fastmcp = pytest.mark.skipif(
+    tuple(int(part) for part in fastmcp.__version__.split(".")[:2]) < (3, 4),
+    reason="needs fastmcp>=3.4 (pip install -r src/mcp_server/requirements.txt)",
+)
+
 UPSTREAM_CLIENT_ID = "mcp-server"
 CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
 ATTACKER_CALLBACK = "https://attacker.example/steal"
@@ -116,6 +125,7 @@ async def _register(proxy, client_id: str, redirect: str):
     return await proxy.get_client(client_id)
 
 
+@requires_pinned_fastmcp
 class TestProxyAllowlist:
     def test_proxy_is_never_built_without_a_list(self, proxy):
         assert proxy._allowed_client_redirect_uris == list(
@@ -185,6 +195,7 @@ class TestProxyAllowlist:
         assert await proxy.get_client("dcr-attacker") is None
 
 
+@requires_pinned_fastmcp
 class TestAuthorizeEndpoint:
     """End to end over HTTP: /register and /authorize refuse foreign redirects."""
 
