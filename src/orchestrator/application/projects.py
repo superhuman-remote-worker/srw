@@ -207,7 +207,8 @@ def knowledge_dependencies(
             knowledge_index=knowledge_index_dependencies(resources),
         ),
         require_project_member=access.require_project_member,
-        require_internal=access.require_internal,
+        # The KB write lane refuses a call the MCP server makes for a user (G2).
+        require_internal_service=access.require_internal_service,
     )
 
 
