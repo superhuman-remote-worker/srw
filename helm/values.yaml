@@ -1740,6 +1740,17 @@ mcp:
   oauth:
     enabled: true
     clientId: "mcp-server"
+    # -- Redirect URIs an MCP client may receive an authorization code at
+    # (FastMCP pattern syntax: a loopback host without a port matches any
+    # port and path). Empty = the built-in list of documented callbacks:
+    # claude.ai / claude.com, ChatGPT, vscode.dev, cursor.com and loopback
+    # (src/mcp_server/oauth_bridge.py DEFAULT_ALLOWED_REDIRECT_URIS). A
+    # non-empty list REPLACES that default. The server never runs without a
+    # list: none would let anyone redirect a victim's code to their own host.
+    allowedRedirectUris: []
+    # -- Appended to the list above, e.g. a self-hosted chat UI's callback
+    # ("https://chat.example.com/oauth/clients/*/callback").
+    extraRedirectUris: []
   resources:
     requests:
       memory: "64Mi"

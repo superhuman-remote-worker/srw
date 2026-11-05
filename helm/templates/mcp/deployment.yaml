@@ -74,6 +74,14 @@ spec:
                   optional: true
             - name: MCP_OIDC_CONFIG_URL
               value: "{{ include "srw.keycloakInternalUrl" . }}/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
+            {{- with .Values.mcp.oauth.allowedRedirectUris }}
+            - name: MCP_OAUTH_ALLOWED_REDIRECT_URIS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.mcp.oauth.extraRedirectUris }}
+            - name: MCP_OAUTH_EXTRA_REDIRECT_URIS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- end }}
             - name: MCP_BASE_URL
               value: {{ include "srw.mcpUrl" . | quote }}

@@ -31,7 +31,7 @@ from fastmcp.server.auth.oauth_proxy.models import (
     ClientCode,
 )
 from fastmcp.server.auth.oauth_proxy.ui import create_error_html
-from mcp.server.auth.provider import TokenError
+from mcp.server.auth.provider import RegistrationError, TokenError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
@@ -42,6 +42,65 @@ logger = logging.getLogger(__name__)
 # Template directory
 _TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+
+
+# Redirect URIs a client may send the authorization code to, in FastMCP's
+# pattern syntax: a loopback host without a port matches any port and path
+# (RFC 8252 §7.3), and an empty or "/" path matches any path.
+#
+# Without a list FastMCP accepts any safe redirect URI. It also synthesizes a
+# client for anyone who presents our upstream client id ("mcp-server", public
+# in the chart values) and lets that client redirect anywhere. One click on
+# the consent page by a user with a Keycloak session then sends their code to
+# an attacker. The list is therefore never left empty or None.
+#
+# Hosted entries are the callbacks documented by each vendor; every other
+# client (Claude Code, Codex, Gemini CLI, VS Code desktop, the MCP Inspector)
+# uses a loopback redirect.
+DEFAULT_ALLOWED_REDIRECT_URIS: tuple[str, ...] = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+    "https://chatgpt.com/connector/oauth/*",
+    "https://vscode.dev/redirect",
+    "https://www.cursor.com/agents/mcp/oauth/callback",
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+)
+
+
+def _split_patterns(raw: str) -> list[str]:
+    return [part for part in re.split(r"[\s,]+", raw or "") if part]
+
+
+def allowed_redirect_uris_from_env(
+    env: Any = None,
+) -> list[str]:
+    """Return the redirect-URI allowlist for the authorization server.
+
+    ``MCP_OAUTH_ALLOWED_REDIRECT_URIS`` replaces the defaults when it names at
+    least one pattern; ``MCP_OAUTH_EXTRA_REDIRECT_URIS`` is appended either
+    way (self-hosted chat UIs add their callback there). Both take comma- or
+    whitespace-separated patterns. A pattern without a scheme is dropped with a
+    warning rather than widening the list.
+    """
+    env = os.environ if env is None else env
+    patterns = _split_patterns(env.get("MCP_OAUTH_ALLOWED_REDIRECT_URIS", ""))
+    if not patterns:
+        patterns = list(DEFAULT_ALLOWED_REDIRECT_URIS)
+    patterns += _split_patterns(env.get("MCP_OAUTH_EXTRA_REDIRECT_URIS", ""))
+
+    allowed: list[str] = []
+    for pattern in patterns:
+        if "://" not in pattern:
+            logger.warning(
+                "Ignoring redirect URI pattern without a scheme: %r", pattern
+            )
+            continue
+        if pattern not in allowed:
+            allowed.append(pattern)
+    return allowed
 
 
 def _load_template() -> str:
@@ -130,6 +189,9 @@ class SRWOAuthProxy(OIDCProxy):
     ):
         # Disable built-in consent — we show our own after Keycloak login
         kwargs["require_authorization_consent"] = False
+        # Never None: None means "any redirect URI" (see the constant above).
+        if kwargs.get("allowed_client_redirect_uris") is None:
+            kwargs["allowed_client_redirect_uris"] = allowed_redirect_uris_from_env()
         super().__init__(**kwargs)
         self._mcp_verifier = mcp_verifier
         self._api_url = api_url or os.environ.get(
@@ -157,6 +219,22 @@ class SRWOAuthProxy(OIDCProxy):
             )
         )
         return routes
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        """Register a DCR client, logging a refused redirect URI at WARNING.
+
+        FastMCP logs the refusal at DEBUG; a registration aimed at a foreign
+        redirect is how the consent-phishing attack starts, so it should show.
+        """
+        try:
+            await super().register_client(client_info)
+        except RegistrationError as exc:
+            logger.warning(
+                "Refused client registration (client_name=%r): %s",
+                (getattr(client_info, "client_name", None) or "")[:80],
+                getattr(exc, "error_description", None) or exc,
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Override: intercept Keycloak callback to show scope/expiry consent
