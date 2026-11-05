@@ -46,8 +46,10 @@ ENV PYTHONUNBUFFERED=1 \
     SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
     SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
-# Create non-root user early so COPY --chown can reference it
-RUN groupadd -r srw && useradd -r -g srw srw
+# Create non-root user early so COPY --chown can reference it. Fixed IDs: the
+# chart's OAuth-state volume is group-owned by GID 10001 (fsGroup), which a
+# system-assigned ID could not promise.
+RUN groupadd -r -g 10001 srw && useradd -r -u 10001 -g srw srw
 
 WORKDIR /app
 

@@ -1751,6 +1751,16 @@ mcp:
     # -- Appended to the list above, e.g. a self-hosted chat UI's callback
     # ("https://chat.example.com/oauth/clients/*/callback").
     extraRedirectUris: []
+  # -- The OAuth server's state (dynamically registered clients, in-flight
+  # authorizations) on a volume instead of the container's /tmp, so a
+  # rollout does not unregister every connected client (G5). One
+  # ReadWriteOnce volume: the Deployment uses the Recreate strategy and must
+  # stay at one replica while this is on.
+  persistence:
+    enabled: true
+    size: 256Mi
+    # -- Empty = the cluster's default StorageClass.
+    storageClass: ""
   resources:
     requests:
       memory: "64Mi"
