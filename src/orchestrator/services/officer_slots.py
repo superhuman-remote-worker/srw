@@ -249,6 +249,15 @@ def below_floor_pools(
     """
     if ready_by_pool is None:
         return []
+    # The floor is auto-pull's queue. With auto-pull OFF an armed ticket is
+    # never dispatched, so a starved-pool marker only tells the officer to
+    # manufacture tickets nobody will pull: on k3d (2026-11-05) a new officer's
+    # first wake invented a "CI build" ticket for a project with no CI. The
+    # floor wake is already dormant in that state; the sitrep now agrees. Same
+    # predicate as ``officer_backlog.auto_pull_enabled`` (not imported: that
+    # module imports this one).
+    if officer_meta.get("auto_pull") not in (True, "true", "True", 1):
+        return []
     roster = roster_from_meta(officer_meta)
     if roster is None:
         return []
