@@ -284,6 +284,11 @@ body{
   .header,.body,.footer{padding-left:20px;padding-right:20px}
   .btn{min-height:44px}
 }
+.client-note{font-size:11px;color:var(--text-muted);margin-top:4px}
+.client-note.warn,.notice.warn{color:var(--deny)}
+.destination{padding:10px 14px;border:1px solid var(--surface-1);border-radius:var(--radius);margin-bottom:12px}
+.destination-host{font-family:var(--font-mono);font-size:13px;color:var(--text-primary);word-break:break-all}
+.notice{font-size:12px;line-height:1.45;margin-bottom:16px;padding:10px 12px;border:1px solid var(--deny);border-radius:var(--radius);background:var(--deny-glow)}
 </style>
 </head>
 <body>
@@ -296,6 +301,7 @@ body{
     <div class="header-text">
       <h1>{{client_name}}</h1>
       <p>is requesting access to your account</p>
+      {{client_note}}
     </div>
   </div>
 
@@ -313,6 +319,12 @@ body{
       </div>
     </div>
     <!--email_on-->
+
+    <div class="destination">
+      <div class="identity-label">Sends the authorization to</div>
+      <div class="destination-host">{{redirect_host}}</div>
+    </div>
+    {{loopback_warning}}
 
     <div class="field">
       <label for="scope">Access Scope</label>

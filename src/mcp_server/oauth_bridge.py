@@ -19,7 +19,7 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt as pyjwt
@@ -141,6 +141,47 @@ def _load_template() -> str:
         return f.read()
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+#: Consent responses refuse to be framed (clickjacking the Allow button) and
+#: are never cached. ``frame-ancestors`` only works as a header, not in the
+#: template's <meta> CSP.
+CONSENT_HEADERS = {
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+def describe_client(
+    client_id: str, client_name: str | None, redirect_uri: str
+) -> dict[str, Any]:
+    """What the consent page can truthfully say about the requesting app.
+
+    A CIMD client's id is the HTTPS URL of its metadata document, so its host
+    is vouched for by TLS (claude.ai, chatgpt.com, vscode.dev). A dynamically
+    registered client's name is whatever the registrant typed — anyone can
+    register "Claude" — so it is shown as the app's own claim, next to the
+    one fact that matters: the host the authorization code is sent to.
+    """
+    parsed_id = urlparse(client_id or "")
+    redirect = urlparse(redirect_uri or "")
+    redirect_host = (redirect.hostname or "").lower()
+    if redirect.port:
+        redirect_host = f"{redirect_host}:{redirect.port}"
+    if parsed_id.scheme == "https" and parsed_id.hostname:
+        display, verified = parsed_id.hostname.lower(), True
+    else:
+        display, verified = (client_name or "").strip()[:80] or "Unknown App", False
+    return {
+        "display_name": display,
+        "verified": verified,
+        "redirect_host": redirect_host or "unknown",
+        "loopback": (redirect.hostname or "").lower() in _LOOPBACK_HOSTS,
+    }
+
+
 def _render_consent(
     *,
     session_id: str,
@@ -149,6 +190,9 @@ def _render_consent(
     user_email: str,
     user_roles: list[str],
     is_admin: bool,
+    client_verified: bool = False,
+    redirect_host: str = "",
+    loopback: bool = False,
 ) -> str:
     """Render the consent template with placeholders replaced.
 
@@ -159,11 +203,27 @@ def _render_consent(
     a value that contains a placeholder is never expanded a second time.
     """
     template = _load_template()
+    client_note = (
+        '<p class="client-note">Identity verified by its web address</p>'
+        if client_verified
+        else '<p class="client-note warn">This name was chosen by the app itself '
+        "&#8212; check where it sends you below</p>"
+    )
+    loopback_warning = (
+        '<p class="notice warn">This app receives the authorization on this '
+        "computer (localhost). Continue only if you started this connection "
+        "yourself, from a program you trust.</p>"
+        if loopback
+        else ""
+    )
     replacements = {
         "session_id": html.escape(session_id, quote=True),
         "csrf_token": html.escape(csrf_token, quote=True),
         "client_name": html.escape(client_name, quote=True),
         "user_email": html.escape(user_email, quote=True),
+        "redirect_host": html.escape(redirect_host or "unknown", quote=True),
+        "client_note": client_note,
+        "loopback_warning": loopback_warning,
         "admin_option": (
             '<option value="all">Full Access (Admin)</option>' if is_admin else ""
         ),
@@ -182,6 +242,7 @@ class PendingAuth:
         "idp_tokens",
         "user_claims",
         "csrf_token",
+        "browser_binding",
         "created_at",
     )
 
@@ -191,11 +252,15 @@ class PendingAuth:
         idp_tokens: dict[str, Any],
         user_claims: dict[str, Any],
         csrf_token: str,
+        browser_binding: str = "",
     ):
         self.transaction = transaction
         self.idp_tokens = idp_tokens
         self.user_claims = user_claims
         self.csrf_token = csrf_token
+        # The consent cookie's value: the approval must come from the browser
+        # that was shown this page, not merely carry its form fields.
+        self.browser_binding = browser_binding
         self.created_at = time.time()
 
     @property
@@ -251,6 +316,32 @@ class SRWOAuthProxy(OIDCProxy):
             )
         )
         return routes
+
+    @property
+    def _consent_cookie_name(self) -> str:
+        # __Host- pins the cookie to this exact origin over HTTPS; a plain-HTTP
+        # development server cannot set it, so it gets an unprefixed name.
+        return "__Host-srw_consent" if self._consent_cookie_secure else "srw_consent"
+
+    @property
+    def _consent_cookie_secure(self) -> bool:
+        return str(self.base_url).lower().startswith("https://")
+
+    def _consent_response(
+        self, consent_html: str, browser_binding: str
+    ) -> HTMLResponse:
+        """The consent page: unframeable, uncached, bound to this browser."""
+        response = HTMLResponse(content=consent_html, headers=CONSENT_HEADERS)
+        response.set_cookie(
+            self._consent_cookie_name,
+            browser_binding,
+            max_age=600,
+            path="/",
+            secure=self._consent_cookie_secure,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         """Register a DCR client, logging a refused redirect URI at WARNING.
@@ -384,25 +475,30 @@ class SRWOAuthProxy(OIDCProxy):
                 except Exception:
                     pass
 
-            # Get client name from DCR registration
+            # Who is asking, and where the code goes (G13): a CIMD client by
+            # its verified host, a DCR client by its self-chosen name.
             dcr_client = await self.get_client(transaction["client_id"])
-            client_name = (
-                getattr(dcr_client, "client_name", None) if dcr_client else None
-            ) or "Unknown App"
+            client = describe_client(
+                transaction["client_id"],
+                getattr(dcr_client, "client_name", None) if dcr_client else None,
+                transaction.get("client_redirect_uri") or "",
+            )
 
             # Check admin status from Keycloak realm roles
             realm_access = user_claims.get("realm_access", {})
             roles = realm_access.get("roles", [])
             is_admin = "admin" in roles
 
-            # Store pending auth with CSRF token
+            # Store pending auth with CSRF token and browser binding
             session_id = secrets.token_urlsafe(32)
             csrf_token = secrets.token_urlsafe(32)
+            browser_binding = secrets.token_urlsafe(32)
             self._pending_auths[session_id] = PendingAuth(
                 transaction=transaction,
                 idp_tokens=idp_tokens,
                 user_claims=user_claims,
                 csrf_token=csrf_token,
+                browser_binding=browser_binding,
             )
 
             # Clean up expired pending auths
@@ -415,12 +511,15 @@ class SRWOAuthProxy(OIDCProxy):
             consent_html = _render_consent(
                 session_id=session_id,
                 csrf_token=csrf_token,
-                client_name=client_name,
+                client_name=client["display_name"],
                 user_email=user_claims.get("email", "Unknown"),
                 user_roles=roles,
                 is_admin=is_admin,
+                client_verified=client["verified"],
+                redirect_host=client["redirect_host"],
+                loopback=client["loopback"],
             )
-            return HTMLResponse(content=consent_html)
+            return self._consent_response(consent_html, browser_binding)
 
         except Exception as e:
             logger.error("Error in IdP callback: %s", e, exc_info=True)
@@ -469,11 +568,32 @@ class SRWOAuthProxy(OIDCProxy):
                 )
 
             # Verify CSRF token
-            if csrf_token != pending.csrf_token:
+            if not secrets.compare_digest(csrf_token, pending.csrf_token):
                 return HTMLResponse(
                     content=create_error_html(
                         error_title="Invalid Request",
                         error_message="CSRF token mismatch. Please try again.",
+                    ),
+                    status_code=400,
+                )
+
+            # The approval must come from the browser that saw the page.
+            presented = request.cookies.get(self._consent_cookie_name, "")
+            if not pending.browser_binding or not secrets.compare_digest(
+                presented, pending.browser_binding
+            ):
+                logger.warning(
+                    "Consent submitted without its browser binding (client=%s)",
+                    str(pending.transaction.get("client_id", ""))[:40],
+                )
+                return HTMLResponse(
+                    content=create_error_html(
+                        error_title="Invalid Request",
+                        error_message=(
+                            "This approval did not come from the browser that "
+                            "opened the authorization page. Start the "
+                            "connection again from your app."
+                        ),
                     ),
                     status_code=400,
                 )
