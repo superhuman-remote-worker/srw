@@ -1450,6 +1450,17 @@ Two deliberate boundaries:
 {{- end -}}
 
 {{/*
+Whether Keycloak can send mail: "true" or "false", a closed alphabet that is
+safe inside the postStart shell. SMTP_HOST reaches the Keycloak pod only with
+email.enabled, and the hook configures the realm's SMTP server only when that
+host is non-empty, so both must hold. The realm's verifyEmail follows this:
+without mail, a self-registered user would wait for a message never sent.
+*/}}
+{{- define "srw.keycloak.mailConfigured" -}}
+{{- if and .Values.email.enabled (trim (toString .Values.email.smtp.host)) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
 Resolved instance count for one database. Explicit `instances` wins; otherwise
 the profile decides. Everything downstream (anti-affinity, PDBs) reads THIS,
 never the profile name — a generated values file may set instances directly.
