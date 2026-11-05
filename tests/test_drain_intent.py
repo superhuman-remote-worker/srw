@@ -129,6 +129,82 @@ class TestPersistentDrainHandler:
         assert persistent_app._session_termination.drain_intent_handled is True
 
     @pytest.mark.asyncio
+    async def test_parked_officer_exits_for_recycler_without_retiring(self):
+        """An officer's drain must leave the thread to the persistent recycler.
+
+        Retiring clears agent_pod and rotates the generation the recycler's
+        handoff needs, which stranded every recycled officer under a hold it
+        could not release (k3d 2026-11-05).
+        """
+        from agent.api import persistent_app
+
+        client = self._attach_parked_session(persistent_app)
+        persistent_app._session.config.officer.enabled = True
+        termination = persistent_app._session_termination
+        with (
+            patch.object(termination, "terminate", new=AsyncMock()) as detach,
+            patch.object(termination, "begin_retirement", new=AsyncMock()) as begin,
+            patch.object(termination, "schedule_exit") as exit_,
+        ):
+            await termination.handle_heartbeat_intents(
+                {
+                    "intents": {
+                        "should_drain": True,
+                        "drain_reason": "persistent_recycle:gen-1",
+                    }
+                }
+            )
+        begin.assert_not_awaited()
+        client.suspend_thread.assert_not_awaited()
+        client.update_thread_status.assert_not_awaited()
+        detach.assert_awaited_once_with("drain", mark_thread=False, preserve_shell=True)
+        exit_.assert_called_once_with(delay=1.0, deregister=False)
+
+    @pytest.mark.asyncio
+    async def test_officer_whose_end_began_still_retires_on_drain(self):
+        """Decommission/deliberate End owns the life: the officer finishes it."""
+        from agent.api import persistent_app
+
+        self._attach_parked_session(persistent_app)
+        persistent_app._session.config.officer.enabled = True
+        persistent_app._session_identity._session_generation = (
+            "55555555-5555-4555-8555-555555555555"
+        )
+        persistent_app._session_identity._attach_token = (
+            "77777777-7777-4777-8777-777777777777"
+        )
+        termination = persistent_app._session_termination
+        termination.retirement_admission_identity = (
+            persistent_app._session_identity.retirement_identity()
+        )
+        with patch.object(
+            termination, "drain_suspend_session", new=AsyncMock()
+        ) as suspend:
+            await termination.handle_heartbeat_intents(
+                {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
+            )
+        suspend.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exit_without_deregister_keeps_the_agents_row(self):
+        from agent.api import persistent_app
+
+        client = self._attach_parked_session(persistent_app)
+        client.stop_heartbeat = MagicMock()
+        termination = persistent_app._session_termination
+        with (
+            patch.object(
+                termination, "deregister_before_exit", new=AsyncMock()
+            ) as deregister,
+            patch("agent.api.session_termination.os._exit") as hard_exit,
+        ):
+            termination.schedule_exit(delay=0, deregister=False)
+            await termination.pending_exit_task
+        deregister.assert_not_awaited()
+        client.stop_heartbeat.assert_called_once()
+        hard_exit.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
     async def test_parked_session_drain_suspends(self):
         from agent.api import persistent_app
 

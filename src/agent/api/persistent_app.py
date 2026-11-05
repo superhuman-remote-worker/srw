@@ -1655,9 +1655,18 @@ async def lifespan(app: FastAPI):
 
     # Detach any active session. Stateless lane: never mark the thread ended —
     # thread lifecycle belongs to the orchestrator, and the next claim (on any
-    # pod) picks the thread back up from thread_messages.
+    # pod) picks the thread back up from thread_messages. A background officer
+    # does not retire either: his recycler replaces this pod and needs the
+    # thread exactly as a crash leaves it (see officer_exits_without_retirement).
+    officer_leaves_thread = bool(
+        _session and _session_termination.officer_exits_without_retirement()
+    )
     if _session and attach_settled:
-        await _session_termination.terminate("shutdown", mark_thread=not stateless)
+        await _session_termination.terminate(
+            "shutdown",
+            mark_thread=not stateless and not officer_leaves_thread,
+            preserve_shell=True if officer_leaves_thread else None,
+        )
 
     await _session_termination.drain_loop_completion_tasks()
 
@@ -1671,7 +1680,8 @@ async def lifespan(app: FastAPI):
                         await _heartbeat_task
                     except asyncio.CancelledError:
                         pass
-                await _orchestrator_client.deregister()
+                if not officer_leaves_thread:
+                    await _orchestrator_client.deregister()
             await _orchestrator_client.close()
         except Exception as e:
             logger.warning(f"Orchestrator cleanup error: {e}")
