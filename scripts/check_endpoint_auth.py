@@ -131,6 +131,9 @@ GATE_NAMES = {
     "is_internal_service_call",
     "require_approved_user",
     "require_internal",
+    # ``require_internal`` refusing a delegated ``X-MCP-User-Id`` (N9): for
+    # endpoints that do no user authorization of their own.
+    "require_internal_service",
     "require_internal_or_job_access",
     "require_job_access",
     "require_project_member",
@@ -1125,6 +1128,7 @@ def _classify(
         "_require_infrastructure_fleet_admin": 2,
         "_dispatch_infrastructure_ingestion": 2,
         "require_internal": 2,
+        "require_internal_service": 2,
         "require_vm_guest": 2,
         "require_vm_cleanup_authority": 2,
         "require_vm_inventory_authority": 2,
@@ -1141,6 +1145,7 @@ def _classify(
     if primary in (
         "_dispatch_infrastructure_ingestion",
         "require_internal",
+        "require_internal_service",
         "require_vm_guest",
         "require_vm_cleanup_authority",
         "require_vm_inventory_authority",

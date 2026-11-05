@@ -96,6 +96,12 @@ def _knowledge_deps(
     )
 
 
+# What the member gate returns: ``(user, project)``. An admin, because a PATCH
+# that adds ``ready`` needs owner authority (D9) and these tests are about the
+# materialization behind the gate, not the gate.
+_ADMIN_CALLER = ({"id": "u-admin", "is_admin": True}, {"id": "p-1"})
+
+
 def _blob_sha(text: str) -> str:
     data = text.encode("utf-8")
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
@@ -1356,7 +1362,7 @@ class TestDeleteEndpoints:
         store.delete_note = AsyncMock(return_value=False)
         store_cls.return_value = store
         deps = _knowledge_deps(
-            member_gate=AsyncMock(return_value=None),
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
             store=_ledger_db(),
             gitea=g,
             vector=MagicMock(),
@@ -1392,7 +1398,7 @@ class TestDeleteEndpoints:
         store.delete_note = AsyncMock(return_value=False)
         store_cls.return_value = store
         deps = _knowledge_deps(
-            member_gate=AsyncMock(return_value=None),
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
             store=_ledger_db(),
             gitea=g,
             vector=MagicMock(),
@@ -1421,7 +1427,7 @@ class TestDeleteEndpoints:
         store.delete_kb_note = AsyncMock(return_value=True)
         store_cls.return_value = store
         deps = _knowledge_deps(
-            member_gate=AsyncMock(return_value=None),
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
             store=_ledger_db(),
             gitea=g,
             vector=MagicMock(),
@@ -1493,7 +1499,9 @@ class TestKnowledgeMutationEndpoint:
             "projection_state": "pending",
             "retry_state": "retryable",
         }
-        deps = _knowledge_deps(member_gate=AsyncMock(), vector=vector, store=db)
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER), vector=vector, store=db
+        )
         with (
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
@@ -1540,7 +1548,7 @@ class TestKnowledgeMutationEndpoint:
             "canonical_metadata_complete": True,
         }
         deps = _knowledge_deps(
-            member_gate=AsyncMock(),
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
             vector=vector,
             store=db,
             graph=SimpleNamespace(get=lambda: None),
@@ -1595,7 +1603,7 @@ class TestKnowledgeMutationEndpoint:
             "canonical_metadata_complete": True,
         }
         deps = _knowledge_deps(
-            member_gate=AsyncMock(),
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
             vector=vector,
             store=db,
             graph=SimpleNamespace(get=lambda: None),
@@ -1644,7 +1652,7 @@ class TestKnowledgeMutationEndpoint:
             "canonical_metadata_complete": True,
         }
         deps = _knowledge_deps(
-            member_gate=AsyncMock(),
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
             vector=vector,
             store=db,
             graph=SimpleNamespace(get=lambda: None),
@@ -1684,7 +1692,9 @@ class TestKnowledgeMutationEndpoint:
             "projection_state": "pending",
             "retry_state": "none",
         }
-        deps = _knowledge_deps(member_gate=AsyncMock(), vector=vector, store=db)
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER), vector=vector, store=db
+        )
         with (
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
@@ -1724,7 +1734,9 @@ class TestKnowledgeMutationEndpoint:
             "canonical_ready_at": "not-a-timestamp",
             "canonical_metadata_complete": True,
         }
-        deps = _knowledge_deps(member_gate=AsyncMock(), vector=vector, store=db)
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER), vector=vector, store=db
+        )
         with (
             patch(
                 "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",

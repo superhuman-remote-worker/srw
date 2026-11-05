@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
@@ -27,6 +27,7 @@ from orchestrator.schemas.knowledge import (
     KnowledgeSearchRequest,
 )
 from orchestrator.services.knowledge_projection import KnowledgeGraphHandle
+from shared.backlog_tags import OFFICER_ONLY_TAGS, normalize_tag
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle-free typing only
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
@@ -403,8 +404,16 @@ async def update_knowledge_note(
     body: KnowledgeNoteUpdate,
     *,
     dependencies: KnowledgeOperationDependencies,
+    owner_authority: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
-    """Update a knowledge note's status or tags. F5: member-only."""
+    """Update a knowledge note's status or tags (the router requires editor).
+
+    ``owner_authority`` answers whether the caller holds the project's owner
+    authority (owner or admin). It is asked only when the request adds or
+    removes an officer-only tag or targets a charter note; without it, both
+    are refused (403). ``ready`` arms backlog dispatch and the charter steers
+    the project's officer, so neither is an editor's call (D9).
+    """
     valid_statuses = {"active", "resolved", "superseded", "archived"}
     if body.status and body.status not in valid_statuses:
         raise HTTPException(
@@ -415,13 +424,30 @@ async def update_knowledge_note(
     if not (body.status or body.add_tags or body.remove_tags):
         return {"status": "no_changes"}
 
+    async def _has_owner_authority() -> bool:
+        return owner_authority is not None and bool(await owner_authority())
+
+    requested_tags = {
+        normalize_tag(str(tag))
+        for tag in [*(body.add_tags or []), *(body.remove_tags or [])]
+    }
+    officer_tags = sorted(requested_tags & OFFICER_ONLY_TAGS)
+    if officer_tags and not await _has_owner_authority():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Only the project owner can add or remove the {', '.join(officer_tags)} "
+                "tag: it controls backlog dispatch"
+            ),
+        )
+
     materialization: dict[str, Any] | None = None
     try:
         # The index proves the public note exists, but is never mutated before
         # the canonical git boundary succeeds.
         async with dependencies.vector_db.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT note_id FROM knowledge_index "
+                "SELECT note_id, note_type FROM knowledge_index "
                 "WHERE project_id = $1 AND note_id = $2",
                 project_id,
                 note_id,
@@ -431,6 +457,11 @@ async def update_knowledge_note(
                     status_code=404,
                     detail=f"Note '{note_id}' not found in project '{project_id}'",
                 )
+        if row.get("note_type") == "charter" and not await _has_owner_authority():
+            raise HTTPException(
+                status_code=403,
+                detail="Only the project owner can change the charter note",
+            )
 
         from orchestrator.services.kb_materialize import (
             materialize_knowledge_metadata_update,

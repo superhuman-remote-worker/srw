@@ -1469,6 +1469,23 @@ async def require_internal(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid internal key")
 
 
+async def require_internal_service(request: Request) -> None:
+    """Guard for endpoints only the service itself may call.
+
+    Like :func:`require_internal`, but a call that carries a delegated
+    ``X-MCP-User-Id`` is refused (403): the MCP server sends the internal key
+    with every tool call a user drives, so the key alone would let any MCP
+    token holder reach an endpoint that checks no user. Use it where the
+    endpoint performs no user authorization of its own (N9).
+    """
+    if not is_internal_call(request):
+        raise HTTPException(status_code=401, detail="Invalid internal key")
+    if not is_internal_service_call(request):
+        raise HTTPException(
+            status_code=403, detail="Internal service call required (no delegated user)"
+        )
+
+
 async def require_internal_or_job_access(
     request: Request,
     db,

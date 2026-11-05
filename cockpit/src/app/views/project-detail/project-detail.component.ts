@@ -471,20 +471,22 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       {{ 'projectDetail.knowledge.back' | transloco }}
                     </app-button>
                     <span class="grow-spacer"></span>
-                    <app-select
-                      size="sm"
-                      [fullWidth]="false"
-                      [value]="note.status"
-                      (changed)="updateNoteStatus(note.note_id, $event ?? '')"
-                    >
-                      <option value="active">{{ 'projectDetail.knowledge.statusActive' | transloco }}</option>
-                      <option value="resolved">{{ 'projectDetail.knowledge.statusResolved' | transloco }}</option>
-                      <option value="superseded">{{ 'projectDetail.knowledge.statusSuperseded' | transloco }}</option>
-                      <option value="archived">{{ 'projectDetail.knowledge.statusArchived' | transloco }}</option>
-                    </app-select>
-                    <app-button variant="danger" size="sm" (clicked)="deleteNote(note.note_id)">
-                      {{ 'projectDetail.knowledge.delete' | transloco }}
-                    </app-button>
+                    @if (canEditKnowledgeNote(note)) {
+                      <app-select
+                        size="sm"
+                        [fullWidth]="false"
+                        [value]="note.status"
+                        (changed)="updateNoteStatus(note.note_id, $event ?? '')"
+                      >
+                        <option value="active">{{ 'projectDetail.knowledge.statusActive' | transloco }}</option>
+                        <option value="resolved">{{ 'projectDetail.knowledge.statusResolved' | transloco }}</option>
+                        <option value="superseded">{{ 'projectDetail.knowledge.statusSuperseded' | transloco }}</option>
+                        <option value="archived">{{ 'projectDetail.knowledge.statusArchived' | transloco }}</option>
+                      </app-select>
+                      <app-button variant="danger" size="sm" (clicked)="deleteNote(note.note_id)">
+                        {{ 'projectDetail.knowledge.delete' | transloco }}
+                      </app-button>
+                    }
                   </div>
                   <div class="kb-detail-meta">
                     <span class="kb-type-badge" [attr.data-type]="note.note_type">{{ note.note_type }}</span>
@@ -2330,6 +2332,21 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly isSavingSettings = signal(false);
   /** Admin-only fields (e.g. workspace network tier) are hidden unless this is true. */
   readonly isAdmin = computed(() => !!this.userService.currentUser()?.is_admin);
+  /** The caller's role in this Project, from the member list (null = not a member). */
+  readonly myProjectRole = computed<ProjectMemberRole | null>(() => {
+    const me = this.userService.currentUser()?.id;
+    if (!me) return null;
+    return this.members().find((m) => m.user_id === me)?.role ?? null;
+  });
+  /** Mirrors the server's knowledge gates (routers/knowledge.py): changing or
+   *  deleting a note needs editor, a charter note needs the owner; admins pass
+   *  both. Viewers see the note read-only instead of buttons that answer 403. */
+  canEditKnowledgeNote(note: { note_type?: string | null }): boolean {
+    if (this.isAdmin()) return true;
+    const role = this.myProjectRole();
+    if (note.note_type === 'charter') return role === 'owner';
+    return role === 'owner' || role === 'editor';
+  }
   /** Worker mode base from GET /api/experts/worker_base — toggle fallback. */
   private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectMemoryShared = computed(() => {

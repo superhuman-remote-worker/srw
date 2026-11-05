@@ -9,7 +9,10 @@ Covers:
     DELETE /api/projects/{id}/knowledge/{note_id}
     POST   /api/projects/{id}/knowledge/export
 
-All seven require viewer-or-higher project membership. Tests focus on the
+Reads (summary, list, note, search) require viewer-or-higher project
+membership; reindex, export, PATCH and DELETE require editor; a PATCH that adds
+or removes an officer-only tag (``ready``, ``parallel-safe``) or targets a
+charter note requires the owner or an admin (G1/G1b, D9). Tests focus on the
 gate itself: cross-user 403, missing-project 404, member-passes-and-hits-the-
 inner-code. We don't exercise the vector-DB / Neo4j paths beyond confirming
 the gate fired (an inner 500 / 503 after the gate counts as success — it
@@ -346,3 +349,170 @@ class TestKnowledgeGatePositivePaths:
                     fake_request, str(project_a["id"]), dependencies=deps
                 )
         assert exc.value.status_code == 503
+
+
+def _as_member(fake_db, role: str) -> None:
+    """Give every non-admin caller ``role`` in every project."""
+    fake_db.get_user_role_in_project = AsyncMock(return_value=role)
+
+
+class TestKnowledgeRoleTiers:
+    """A viewer reads; an editor mutates; dispatch tags need the owner."""
+
+    @pytest.mark.asyncio
+    async def test_viewer_cannot_delete_reindex_export_or_patch(
+        self, user_b, project_a, fake_db, fake_request
+    ):
+        from orchestrator.routers.knowledge import (
+            delete_knowledge_note,
+            export_knowledge,
+            reindex_knowledge,
+            update_knowledge_note,
+        )
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
+
+        _as_member(fake_db, "viewer")
+        deps = _deps(fake_db, vector_db=_make_dud_vector_db())
+        pid = str(project_a["id"])
+        calls = [
+            lambda: delete_knowledge_note(fake_request, pid, "n", dependencies=deps),
+            lambda: reindex_knowledge(fake_request, pid, dependencies=deps),
+            lambda: export_knowledge(fake_request, pid, dependencies=deps),
+            lambda: update_knowledge_note(
+                fake_request,
+                pid,
+                "n",
+                KnowledgeNoteUpdate(status="resolved"),
+                dependencies=deps,
+            ),
+        ]
+        with _patch_caller(user_b):
+            for call in calls:
+                with pytest.raises(HTTPException) as exc:
+                    await call()
+                assert exc.value.status_code == 403
+                assert "editor" in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_viewer_still_searches(
+        self, user_b, project_a, fake_db, fake_request
+    ):
+        from orchestrator.routers.knowledge import search_knowledge
+        from orchestrator.schemas.knowledge import KnowledgeSearchRequest
+
+        _as_member(fake_db, "viewer")
+        deps = _deps(fake_db, vector_db=_make_dud_vector_db())
+        with _patch_caller(user_b):
+            with pytest.raises(HTTPException) as exc:
+                await search_knowledge(
+                    fake_request,
+                    str(project_a["id"]),
+                    KnowledgeSearchRequest(query="q"),
+                    dependencies=deps,
+                )
+        assert exc.value.status_code == 500  # past the gate
+
+    @pytest.mark.asyncio
+    async def test_editor_passes_the_gate_for_a_status_change(
+        self, user_b, project_a, fake_db, fake_request
+    ):
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
+
+        _as_member(fake_db, "editor")
+        deps = _deps(fake_db, vector_db=_make_dud_vector_db())
+        with _patch_caller(user_b):
+            with pytest.raises(HTTPException) as exc:
+                await update_knowledge_note(
+                    fake_request,
+                    str(project_a["id"]),
+                    "n",
+                    KnowledgeNoteUpdate(status="resolved"),
+                    dependencies=deps,
+                )
+        assert exc.value.status_code == 500  # past the gate
+
+    @pytest.mark.asyncio
+    async def test_editor_cannot_arm_ready(
+        self, user_b, project_a, fake_db, fake_request
+    ):
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
+
+        _as_member(fake_db, "editor")
+        deps = _deps(fake_db, vector_db=_make_dud_vector_db())
+        with _patch_caller(user_b):
+            with pytest.raises(HTTPException) as exc:
+                await update_knowledge_note(
+                    fake_request,
+                    str(project_a["id"]),
+                    "n",
+                    KnowledgeNoteUpdate(add_tags=["ready"]),
+                    dependencies=deps,
+                )
+        assert exc.value.status_code == 403
+        assert "ready" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_owner_may_arm_ready(self, user_a, project_a, fake_db, fake_request):
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
+
+        deps = _deps(fake_db, vector_db=_make_dud_vector_db())
+        with _patch_caller(user_a):  # user_a owns project_a
+            with pytest.raises(HTTPException) as exc:
+                await update_knowledge_note(
+                    fake_request,
+                    str(project_a["id"]),
+                    "n",
+                    KnowledgeNoteUpdate(add_tags=["ready"]),
+                    dependencies=deps,
+                )
+        assert exc.value.status_code == 500  # past both checks
+
+
+class TestInternalServiceGate:
+    """G2: the KB write lane refuses a call the MCP server makes for a user."""
+
+    def _request(self, headers: dict):
+        return SimpleNamespace(headers=headers)
+
+    @pytest.mark.asyncio
+    async def test_bare_internal_key_passes(self):
+        from orchestrator.security import access
+
+        with patch.object(access, "_INTERNAL_KEY", "k"):
+            await access.require_internal_service(
+                self._request({"X-Internal-Key": "k"})
+            )
+
+    @pytest.mark.asyncio
+    async def test_delegated_user_is_refused(self):
+        from orchestrator.security import access
+
+        request = self._request({"X-Internal-Key": "k", "X-MCP-User-Id": "u-1"})
+        with patch.object(access, "_INTERNAL_KEY", "k"):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_internal_service(request)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_missing_or_wrong_key_is_401(self):
+        from orchestrator.security import access
+
+        with patch.object(access, "_INTERNAL_KEY", "k"):
+            for headers in ({}, {"X-Internal-Key": "wrong"}):
+                with pytest.raises(HTTPException) as exc:
+                    await access.require_internal_service(self._request(headers))
+                assert exc.value.status_code == 401
+
+    def test_the_kb_write_lane_uses_it(self):
+        from orchestrator.routers.knowledge import KnowledgeDependencies
+        from orchestrator.security.access import require_internal_service
+
+        assert (
+            KnowledgeDependencies.__dataclass_fields__[
+                "require_internal_service"
+            ].default
+            is require_internal_service
+        )
