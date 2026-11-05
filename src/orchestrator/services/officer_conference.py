@@ -31,7 +31,6 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
-from uuid import uuid4
 
 from orchestrator.services import officer_notices
 from orchestrator.services.officer_metadata import thread_officer_meta
@@ -168,22 +167,17 @@ async def hold_officer_for_conference(
             reason="officer_hold",
             dependencies=dependencies.notice_dependencies(),
         )
-        from orchestrator.services import session_wake as _sw
-
         officer_thread = await dependencies.store.get_thread(officer_tid)
         if officer_thread is not None:
-            agent = await _sw._resolve_live_agent(dependencies.store, officer_thread)
-            if agent is not None:
-                await _sw._inject_live(
-                    agent,
-                    "[conference started — the Legate is meeting with your "
-                    "conference embodiment. Standing hold: take no scheduling "
-                    "actions; your timers and events queue durably and arrive "
-                    "with the session brief. If your backstop fires before "
-                    "the brief: sleep.]",
-                    delivery_id=str(uuid4()),
-                    db=dependencies.store,
-                )
+            await officer_notices.inject_officer_notice(
+                officer_thread,
+                "[conference started — the Legate is meeting with your "
+                "conference embodiment. Standing hold: take no scheduling "
+                "actions; your timers and events queue durably and arrive "
+                "with the session brief. If your backstop fires before "
+                "the brief: sleep.]",
+                dependencies=dependencies.notice_dependencies(),
+            )
     except Exception:
         logger.exception("conference hold: stamping failed (non-fatal)")
 
