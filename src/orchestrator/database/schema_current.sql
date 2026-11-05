@@ -30217,6 +30217,33 @@ CREATE SEQUENCE public.managed_repository_workspace_restore_work_claim_seq
 
 
 --
+-- Name: mcp_oauth_grants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.mcp_oauth_grants (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    access_token_id uuid NOT NULL,
+    oauth_client_id text NOT NULL,
+    refresh_token_hash text NOT NULL,
+    previous_refresh_hash text,
+    scope text NOT NULL,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_refreshed_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    CONSTRAINT mcp_oauth_grants_client_check CHECK ((oauth_client_id <> ''::text))
+);
+
+
+--
+-- Name: TABLE mcp_oauth_grants; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.mcp_oauth_grants IS 'OAuth connections of the MCP server: the hashed refresh token that renews access_token_id (an auth_tokens kind=mcp row rotated in place). A refresh token is never an access token. Replaying a rotated refresh token (previous_refresh_hash) revokes the grant.';
+
+
+--
 -- Name: message_delivery_attempts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -36125,6 +36152,22 @@ ALTER TABLE ONLY public.managed_repository_workspace_creation_reservations
 
 
 --
+-- Name: mcp_oauth_grants mcp_oauth_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: mcp_oauth_grants mcp_oauth_grants_refresh_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_refresh_hash_key UNIQUE (refresh_token_hash);
+
+
+--
 -- Name: auth_tokens mcp_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -40143,6 +40186,20 @@ CREATE INDEX managed_repository_workspace_creation_owner_history ON public.manag
 --
 
 CREATE UNIQUE INDEX managed_repository_workspace_restore_work_claim_unique ON public.managed_repository_workspace_creation_reservations USING btree (restore_work_claim_token) WHERE (restore_work_claim_token > 0);
+
+
+--
+-- Name: mcp_oauth_grants_access_token_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mcp_oauth_grants_access_token_idx ON public.mcp_oauth_grants USING btree (access_token_id);
+
+
+--
+-- Name: mcp_oauth_grants_previous_hash_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mcp_oauth_grants_previous_hash_idx ON public.mcp_oauth_grants USING btree (previous_refresh_hash) WHERE (previous_refresh_hash IS NOT NULL);
 
 
 --
@@ -44168,6 +44225,22 @@ ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
 
 ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
     ADD CONSTRAINT managed_repository_legacy_reconciliation_reconciliation_id_fkey FOREIGN KEY (reconciliation_id) REFERENCES public.managed_repository_legacy_reconciliations(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: mcp_oauth_grants mcp_oauth_grants_access_token_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_access_token_id_fkey FOREIGN KEY (access_token_id) REFERENCES public.auth_tokens(id) ON DELETE CASCADE;
+
+
+--
+-- Name: mcp_oauth_grants mcp_oauth_grants_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --

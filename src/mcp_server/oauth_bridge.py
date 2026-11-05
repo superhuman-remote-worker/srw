@@ -25,6 +25,7 @@ import httpx
 import jwt as pyjwt
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastmcp.server.auth import AccessToken, OIDCProxy, TokenVerifier
+from mcp.server.auth.provider import RefreshToken
 from fastmcp.server.auth.oauth_proxy.models import (
     DEFAULT_AUTH_CODE_EXPIRY_SECONDS,
     HTTP_TIMEOUT_SECONDS,
@@ -68,6 +69,36 @@ DEFAULT_ALLOWED_REDIRECT_URIS: tuple[str, ...] = (
     "http://127.0.0.1",
     "http://[::1]",
 )
+
+
+#: Access tokens minted for OAuth clients live this long; the refresh token
+#: renews them for as long as the user chose on the consent page. Short, so a
+#: leaked access token dies on its own (MCP authorization spec: SHOULD).
+DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
+
+#: Refresh tokens are not access tokens: a different prefix (the verifier and
+#: the orchestrator accept only ``srw_``) and a different table.
+REFRESH_TOKEN_PREFIX = "srwr_"
+
+
+def _access_token_ttl_seconds() -> int:
+    raw = os.environ.get("MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "")
+    try:
+        value = int(raw) if raw.strip() else DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    except ValueError:
+        logger.warning("Ignoring MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=%r", raw)
+        value = DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    return max(60, min(value, 7 * 86400))
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _epoch(value: Any) -> int | None:
+    if not value:
+        return None
+    return int(datetime.fromisoformat(str(value)).timestamp())
 
 
 def _split_patterns(raw: str) -> list[str]:
@@ -198,6 +229,7 @@ class SRWOAuthProxy(OIDCProxy):
             "COCKPIT_API_URL", "http://localhost:8085"
         )
         self._internal_key = internal_key or os.environ.get("MCP_INTERNAL_KEY", "")
+        self._access_ttl = _access_token_ttl_seconds()
         # In-memory store for pending authorizations (between Keycloak callback
         # and scope selection). Short-lived, single-use.
         self._pending_auths: dict[str, PendingAuth] = {}
@@ -588,37 +620,127 @@ class SRWOAuthProxy(OIDCProxy):
         if hasattr(client, "client_name") and client.client_name:
             client_name = client.client_name
 
-        # Create srw_* access token via orchestrator API
-        srw_data = await self._create_srw_token(
-            user_sub=user_info.get("sub", ""),
-            user_email=user_info.get("email", ""),
-            scope=scope,
-            origin=f"oauth:{client_name}",
-            expiry_days=expiry_days,
+        # One OAuth connection: a short-lived srw_* access token (an ordinary
+        # auth_tokens row) plus a srwr_* refresh token that renews it until
+        # the lifetime the user chose. The refresh token used to be another
+        # 365-day srw_* access token that FastMCP could never refresh with
+        # (G6): every expiry or 401 forced a new login.
+        now = datetime.now(timezone.utc)
+        grant_expires_at = (
+            now + timedelta(days=expiry_days) if expiry_days > 0 else None
         )
-        if not srw_data:
+        access_expires_at = now + timedelta(seconds=self._access_ttl)
+        if grant_expires_at is not None:
+            access_expires_at = min(access_expires_at, grant_expires_at)
+        access_token = f"srw_{secrets.token_urlsafe(32)}"
+        refresh_token = f"{REFRESH_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+        status, _ = await self._internal_post(
+            "/api/internal/mcp-oauth-grant",
+            {
+                "user_sub": user_info.get("sub", ""),
+                "user_email": user_info.get("email", ""),
+                "name": f"OAuth: {client_name}"[:200],
+                "oauth_client_id": client.client_id,
+                "scope": scope,
+                "origin": f"oauth:{client_name}"[:300],
+                "access_token_hash": _token_hash(access_token),
+                "access_token_prefix": access_token[:12],
+                "access_expires_at": access_expires_at.isoformat(),
+                "refresh_token_hash": _token_hash(refresh_token),
+                "grant_expires_at": (
+                    grant_expires_at.isoformat() if grant_expires_at else None
+                ),
+            },
+        )
+        if status != 200:
             raise TokenError("invalid_grant", "Failed to create access token")
 
-        # Create refresh token if Keycloak provided one
-        refresh_token_str = None
-        if code_model.idp_tokens.get("refresh_token"):
-            refresh_data = await self._create_srw_token(
-                user_sub=user_info.get("sub", ""),
-                user_email=user_info.get("email", ""),
-                scope=scope,
-                origin=f"oauth:{client_name}:refresh",
-                expiry_days=365,
-            )
-            if refresh_data:
-                refresh_token_str = refresh_data["token"]
-
         return OAuthToken(
-            access_token=srw_data["token"],
+            access_token=access_token,
             token_type="Bearer",
-            expires_in=expiry_days * 86400 if expiry_days > 0 else None,
+            expires_in=max(1, int((access_expires_at - now).total_seconds())),
             scope=scope,
-            refresh_token=refresh_token_str,
+            refresh_token=refresh_token,
         )
+
+    # ------------------------------------------------------------------
+    # Override: refresh tokens are SRW grants, not FastMCP JWTs
+    # ------------------------------------------------------------------
+
+    async def load_refresh_token(  # type: ignore[override]
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        """Resolve a srwr_* refresh token to its grant (None = invalid_grant).
+
+        The SDK then checks the grant belongs to the presenting client. An
+        orchestrator outage raises instead of answering None: a client told
+        ``invalid_grant`` throws the connection away and asks the user to log
+        in again, which an outage must not cause.
+        """
+        if not refresh_token.startswith(REFRESH_TOKEN_PREFIX):
+            return None
+        status, data = await self._internal_post(
+            "/api/internal/mcp-oauth-refresh/lookup",
+            {"refresh_token_hash": _token_hash(refresh_token)},
+        )
+        if status == 404:
+            return None
+        if status != 200 or not data:
+            raise RuntimeError(f"refresh-token lookup failed ({status})")
+        return RefreshToken(
+            token=refresh_token,
+            client_id=str(data["oauth_client_id"]),
+            scopes=[str(data["scope"])],
+            expires_at=_epoch(data.get("grant_expires_at")),
+        )
+
+    async def exchange_refresh_token(  # type: ignore[override]
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        """Rotate: a new access token and a new refresh token, old ones dead."""
+        access_token = f"srw_{secrets.token_urlsafe(32)}"
+        new_refresh = f"{REFRESH_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+        status, data = await self._internal_post(
+            "/api/internal/mcp-oauth-refresh/rotate",
+            {
+                "refresh_token_hash": _token_hash(refresh_token.token),
+                "new_refresh_token_hash": _token_hash(new_refresh),
+                "new_access_token_hash": _token_hash(access_token),
+                "new_access_token_prefix": access_token[:12],
+                "access_ttl_seconds": self._access_ttl,
+            },
+        )
+        if status == 404:
+            raise TokenError("invalid_grant", "refresh token is no longer valid")
+        if status != 200 or not data:
+            raise RuntimeError(f"refresh-token rotation failed ({status})")
+        expires_at = _epoch(data.get("access_expires_at"))
+        expires_in = (
+            max(1, expires_at - int(time.time())) if expires_at else self._access_ttl
+        )
+        return OAuthToken(
+            access_token=access_token,
+            token_type="Bearer",
+            expires_in=expires_in,
+            scope=str(data.get("scope") or " ".join(refresh_token.scopes)),
+            refresh_token=new_refresh,
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:  # type: ignore[override]
+        """OAuth /revoke: a refresh token ends its whole connection.
+
+        An access token presented here is left alone: the SDK only calls this
+        when the token's client matches, and srw_* access tokens carry the
+        user id there; the cockpit's token list revokes them.
+        """
+        if isinstance(token, RefreshToken):
+            await self._internal_post(
+                "/api/internal/mcp-oauth-refresh/revoke",
+                {"refresh_token_hash": _token_hash(token.token)},
+            )
 
     # ------------------------------------------------------------------
     # Override: validate srw_* tokens instead of FastMCP JWTs
@@ -635,60 +757,32 @@ class SRWOAuthProxy(OIDCProxy):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _create_srw_token(
-        self,
-        *,
-        user_sub: str,
-        user_email: str,
-        scope: str,
-        origin: str,
-        expiry_days: int,
-    ) -> dict[str, Any] | None:
-        """Create an srw_* token via the orchestrator's internal endpoint."""
-        token = f"srw_{secrets.token_urlsafe(32)}"
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        token_prefix = token[:12]
+    async def _internal_post(
+        self, path: str, payload: dict[str, Any]
+    ) -> tuple[int, dict[str, Any] | None]:
+        """POST to an orchestrator internal endpoint: ``(status, json)``.
 
-        expires_at = None
-        if expiry_days > 0:
-            expires_at = (
-                datetime.now(timezone.utc) + timedelta(days=expiry_days)
-            ).isoformat()
-
+        A transport failure is status 0, so callers can tell "the
+        orchestrator said no" (4xx) from "nobody answered".
+        """
         try:
             async with httpx.AsyncClient(
                 base_url=self._api_url, timeout=10.0
             ) as client:
                 resp = await client.post(
-                    "/api/internal/mcp-token-create",
-                    json={
-                        "user_sub": user_sub,
-                        "user_email": user_email,
-                        "name": f"OAuth: {origin}",
-                        "token_hash": token_hash,
-                        "token_prefix": token_prefix,
-                        "scope": scope,
-                        "origin": origin,
-                        "expires_at": expires_at,
-                    },
-                    headers={"X-Internal-Key": self._internal_key},
+                    path, json=payload, headers={"X-Internal-Key": self._internal_key}
                 )
-                if resp.status_code != 200:
-                    logger.error(
-                        "Failed to create srw_* token: %s %s",
-                        resp.status_code,
-                        resp.text,
-                    )
-                    return None
-                data = resp.json()
-                return {
-                    "token": token,
-                    "id": data.get("id"),
-                    "expires_in": expiry_days * 86400,
-                }
         except httpx.HTTPError as exc:
-            logger.error("Error creating srw_* token: %s", exc)
-            return None
+            logger.error("Orchestrator call %s failed: %s", path, exc)
+            return 0, None
+        if resp.status_code != 200:
+            if resp.status_code >= 500 or resp.status_code in (401, 403):
+                logger.error("Orchestrator call %s answered %s", path, resp.status_code)
+            return resp.status_code, None
+        try:
+            return 200, resp.json()
+        except ValueError:
+            return 0, None
 
     def _cleanup_pending(self) -> None:
         """Remove expired pending authorizations and stale consumed markers."""

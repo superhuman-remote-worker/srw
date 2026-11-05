@@ -30,6 +30,9 @@ from fastapi import HTTPException
 from orchestrator.schemas.tokens import (
     ApiKeyCreate,
     McpTokenCreate,
+    McpOAuthGrantCreate,
+    McpOAuthRefreshLookup,
+    McpOAuthRefreshRotate,
     McpTokenCreateInternal,
     McpTokenVerifyRequest,
     VALID_PAT_SCOPES,
@@ -56,6 +59,20 @@ class AccessTokenStore(Protocol):
     ) -> dict[str, Any]: ...
 
     async def list_mcp_tokens(self, user_id: str) -> list[dict[str, Any]]: ...
+
+    async def create_mcp_oauth_grant(self, **fields: Any) -> dict[str, Any]: ...
+
+    async def get_mcp_oauth_grant_by_refresh_hash(
+        self, refresh_token_hash: str
+    ) -> dict[str, Any] | None: ...
+
+    async def revoke_mcp_oauth_grant_on_replay(
+        self, refresh_token_hash: str
+    ) -> bool: ...
+
+    async def rotate_mcp_oauth_grant(self, **fields: Any) -> dict[str, Any] | None: ...
+
+    async def revoke_mcp_oauth_grant(self, refresh_token_hash: str) -> bool: ...
 
     async def revoke_mcp_token(self, token_id: str, user_id: str) -> bool: ...
 
@@ -263,6 +280,125 @@ async def create_internal_mcp_token(
     )
 
     return serialize_token_row(row)
+
+
+# =============================================================================
+# MCP OAuth grants — refresh tokens for OAuth-connected MCP clients (G6)
+# =============================================================================
+
+
+async def _resolve_oauth_user(
+    *, user_sub: str, user_email: str, dependencies: AccessTokenDependencies
+) -> dict[str, Any]:
+    """Look up (or JIT-create) the user an OAuth connection is minted for."""
+    user = await dependencies.store.get_user_by_keycloak_sub(user_sub)
+    if not user:
+        user = await dependencies.store.upsert_user_from_oidc(
+            sub=user_sub,
+            email=user_email,
+            display_name=user_email.split("@")[0] if user_email else "OAuth User",
+        )
+        schedule = dependencies.schedule_default_project_knowledge
+        if user and user.get("is_approved") and schedule is not None:
+            try:
+                schedule(user)
+            except Exception as exc:
+                logger.warning(
+                    "Knowledge vault for user %s's default project not scheduled: %s",
+                    user.get("id"),
+                    exc,
+                )
+    if not user:
+        raise HTTPException(status_code=400, detail="Could not resolve user")
+    return user
+
+
+async def create_internal_mcp_oauth_grant(
+    *, body: McpOAuthGrantCreate, dependencies: AccessTokenDependencies
+) -> dict[str, Any]:
+    """Create an OAuth connection: a short-lived access token plus its grant.
+
+    The bridge minted both plaintexts and sends their hashes; this process
+    never sees a secret.
+    """
+    user = await _resolve_oauth_user(
+        user_sub=body.user_sub, user_email=body.user_email, dependencies=dependencies
+    )
+    created = await dependencies.store.create_mcp_oauth_grant(
+        user_id=str(user["id"]),
+        name=body.name,
+        oauth_client_id=body.oauth_client_id,
+        scope=body.scope,
+        origin=body.origin,
+        access_token_hash=body.access_token_hash,
+        access_token_prefix=body.access_token_prefix,
+        access_expires_at=_parse_iso(body.access_expires_at),
+        refresh_token_hash=body.refresh_token_hash,
+        grant_expires_at=_parse_iso(body.grant_expires_at),
+    )
+    return serialize_token_row(created)
+
+
+async def lookup_internal_mcp_oauth_refresh(
+    *, body: McpOAuthRefreshLookup, dependencies: AccessTokenDependencies
+) -> dict[str, Any]:
+    """Resolve a refresh token to its live grant (404 when there is none).
+
+    A refresh token that was already rotated away is a replay: someone else
+    holds the grant too, so the whole connection is revoked (RFC 9700
+    §4.14.2) before answering 404.
+    """
+    grant = await dependencies.store.get_mcp_oauth_grant_by_refresh_hash(
+        body.refresh_token_hash
+    )
+    if grant is None:
+        if await dependencies.store.revoke_mcp_oauth_grant_on_replay(
+            body.refresh_token_hash
+        ):
+            logger.warning(
+                "MCP OAuth refresh token replayed — connection revoked "
+                "(hash prefix %s)",
+                body.refresh_token_hash[:12],
+            )
+        raise HTTPException(status_code=404, detail="Unknown refresh token")
+    return serialize_token_row(
+        {
+            "grant_id": grant["id"],
+            "user_id": grant["user_id"],
+            "oauth_client_id": grant["oauth_client_id"],
+            "scope": grant["scope"],
+            "grant_expires_at": grant["expires_at"],
+        }
+    )
+
+
+async def rotate_internal_mcp_oauth_refresh(
+    *, body: McpOAuthRefreshRotate, dependencies: AccessTokenDependencies
+) -> dict[str, Any]:
+    """Swap a grant's refresh token and access token (404 = invalid_grant)."""
+    rotated = await dependencies.store.rotate_mcp_oauth_grant(
+        refresh_token_hash=body.refresh_token_hash,
+        new_refresh_token_hash=body.new_refresh_token_hash,
+        new_access_token_hash=body.new_access_token_hash,
+        new_access_token_prefix=body.new_access_token_prefix,
+        access_ttl_seconds=body.access_ttl_seconds,
+    )
+    if rotated is None:
+        raise HTTPException(status_code=404, detail="Unknown refresh token")
+    return serialize_token_row(rotated)
+
+
+async def revoke_internal_mcp_oauth_grant(
+    *, body: McpOAuthRefreshLookup, dependencies: AccessTokenDependencies
+) -> dict[str, str]:
+    """End a connection by its refresh token (OAuth /revoke). Idempotent."""
+    revoked = await dependencies.store.revoke_mcp_oauth_grant(body.refresh_token_hash)
+    return {"status": "revoked" if revoked else "unknown"}
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """An ISO 8601 timestamp from the bridge, or None."""
+    return datetime.fromisoformat(value) if value else None
 
 
 # =============================================================================

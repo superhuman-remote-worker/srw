@@ -14,6 +14,16 @@ from fastmcp.server.auth import AccessToken, TokenVerifier
 logger = logging.getLogger(__name__)
 
 
+class TokenVerificationUnavailable(RuntimeError):
+    """The orchestrator could not answer whether a token is valid.
+
+    Raised instead of returning None: None becomes a 401, and an OAuth client
+    answers a 401 by refreshing (or, failing that, by asking the user to log
+    in again). An orchestrator restart must surface as a server error the
+    client retries, not as a revoked credential (G6b).
+    """
+
+
 class McpTokenVerifier(TokenVerifier):
     """Validate MCP bearer tokens against the orchestrator database."""
 
@@ -38,13 +48,22 @@ class McpTokenVerifier(TokenVerifier):
                     json={"token_hash": token_hash},
                     headers={"X-Internal-Key": self._internal_key},
                 )
-                if resp.status_code != 200:
-                    logger.debug("MCP token verification failed: %s", resp.status_code)
-                    return None
-                data = resp.json()
         except httpx.HTTPError as exc:
-            logger.warning("MCP token verification error: %s", exc)
+            logger.warning("MCP token verification unavailable: %s", exc)
+            raise TokenVerificationUnavailable(str(exc)) from exc
+
+        if resp.status_code >= 500:
+            logger.warning(
+                "MCP token verification unavailable: orchestrator answered %s",
+                resp.status_code,
+            )
+            raise TokenVerificationUnavailable(
+                f"orchestrator answered {resp.status_code}"
+            )
+        if resp.status_code != 200:
+            logger.debug("MCP token verification failed: %s", resp.status_code)
             return None
+        data = resp.json()
 
         return AccessToken(
             token=token_hash,

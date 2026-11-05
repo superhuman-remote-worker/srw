@@ -243,6 +243,10 @@ POST   /api/internal/infrastructure-metering/v1/watch/apply                     
 POST   /api/internal/infrastructure-metering/v1/watch/finish                            pat=refused         internal:_dispatch_infrastructure_ingestion
 GET    /api/internal/live/sessions/{session_id}/events                                  pat=refused         internal:require_internal
 POST   /api/internal/live/sessions/{session_id}/events                                  pat=refused         internal:require_internal
+POST   /api/internal/mcp-oauth-grant                                                    pat=refused         internal:require_internal_service
+POST   /api/internal/mcp-oauth-refresh/lookup                                           pat=refused         internal:require_internal_service
+POST   /api/internal/mcp-oauth-refresh/revoke                                           pat=refused         internal:require_internal_service
+POST   /api/internal/mcp-oauth-refresh/rotate                                           pat=refused         internal:require_internal_service
 POST   /api/internal/mcp-token-create                                                   pat=refused         internal:require_internal
 POST   /api/internal/mcp-token-verify                                                   pat=refused         internal:require_internal
 DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       pat=refused         gated:require_thread_owner

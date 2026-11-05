@@ -54864,6 +54864,213 @@ class PostgresDB:
             )
             return dict(row)
 
+    # =========================================================================
+    # MCP OAuth grants (refresh tokens) — knowledge_base_mcp_for_chat_uis.md G6
+    # =========================================================================
+
+    async def create_mcp_oauth_grant(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        oauth_client_id: str,
+        scope: str,
+        origin: str,
+        access_token_hash: str,
+        access_token_prefix: str,
+        access_expires_at,
+        refresh_token_hash: str,
+        grant_expires_at,
+    ) -> Dict[str, Any]:
+        """Create one OAuth connection: its access token row and its grant.
+
+        The access token is an ordinary ``kind='mcp'`` row (the token list,
+        revocation and request auth all work on it unchanged); the grant
+        holds the hashed refresh token that renews it. One transaction, so a
+        connection never exists half-made.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                token = await conn.fetchrow(
+                    """
+                    INSERT INTO auth_tokens (user_id, name, token_hash, token_prefix,
+                                             kind, scope, expires_at, origin)
+                    VALUES ($1, $2, $3, $4, 'mcp', $5, $6, $7)
+                    RETURNING id
+                    """,
+                    user_id,
+                    name,
+                    access_token_hash,
+                    access_token_prefix,
+                    scope,
+                    access_expires_at,
+                    origin,
+                )
+                grant = await conn.fetchrow(
+                    """
+                    INSERT INTO mcp_oauth_grants (user_id, access_token_id,
+                                                  oauth_client_id, refresh_token_hash,
+                                                  scope, expires_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id, expires_at
+                    """,
+                    user_id,
+                    token["id"],
+                    oauth_client_id,
+                    refresh_token_hash,
+                    scope,
+                    grant_expires_at,
+                )
+        return {
+            "grant_id": str(grant["id"]),
+            "access_token_id": str(token["id"]),
+            "grant_expires_at": grant["expires_at"],
+        }
+
+    async def get_mcp_oauth_grant_by_refresh_hash(
+        self, refresh_token_hash: str
+    ) -> Dict[str, Any] | None:
+        """The live grant a refresh token belongs to, or None.
+
+        Live means: not revoked, not past the lifetime the user chose, and its
+        access token row not revoked (revoking the connection in the token
+        list ends it).
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT g.id, g.user_id, g.oauth_client_id, g.scope, g.expires_at
+                FROM mcp_oauth_grants g
+                JOIN auth_tokens t ON t.id = g.access_token_id
+                WHERE g.refresh_token_hash = $1
+                  AND g.revoked_at IS NULL
+                  AND (g.expires_at IS NULL OR g.expires_at > now())
+                  AND t.revoked_at IS NULL
+                """,
+                refresh_token_hash,
+            )
+            return dict(row) if row else None
+
+    async def revoke_mcp_oauth_grant_on_replay(self, refresh_token_hash: str) -> bool:
+        """Revoke the grant whose *previous* refresh token was presented.
+
+        A rotated refresh token coming back means two parties hold the grant
+        (RFC 9700 §4.14.2): end it, access token included.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    UPDATE mcp_oauth_grants
+                       SET revoked_at = now()
+                     WHERE previous_refresh_hash = $1 AND revoked_at IS NULL
+                    RETURNING access_token_id
+                    """,
+                    refresh_token_hash,
+                )
+                if row is None:
+                    return False
+                await conn.execute(
+                    "UPDATE auth_tokens SET revoked_at = now() "
+                    "WHERE id = $1 AND revoked_at IS NULL",
+                    row["access_token_id"],
+                )
+        return True
+
+    async def rotate_mcp_oauth_grant(
+        self,
+        *,
+        refresh_token_hash: str,
+        new_refresh_token_hash: str,
+        new_access_token_hash: str,
+        new_access_token_prefix: str,
+        access_ttl_seconds: int,
+    ) -> Dict[str, Any] | None:
+        """Swap a live grant's refresh token and its access token, atomically.
+
+        The access token row is updated in place (new hash, prefix, expiry),
+        never re-inserted, so a connection stays one row in the token list.
+        Its expiry is ``now + access_ttl_seconds`` capped at the grant's own.
+        Returns ``{scope, access_expires_at, grant_expires_at}``, or None when
+        the refresh token is not the grant's current one (or the grant is not
+        live) — the caller answers ``invalid_grant``.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                grant = await conn.fetchrow(
+                    """
+                    SELECT g.id, g.access_token_id, g.scope, g.expires_at
+                    FROM mcp_oauth_grants g
+                    JOIN auth_tokens t ON t.id = g.access_token_id
+                    WHERE g.refresh_token_hash = $1
+                      AND g.revoked_at IS NULL
+                      AND (g.expires_at IS NULL OR g.expires_at > now())
+                      AND t.revoked_at IS NULL
+                    FOR UPDATE OF g
+                    """,
+                    refresh_token_hash,
+                )
+                if grant is None:
+                    return None
+                access_expires_at = await conn.fetchval(
+                    """
+                    UPDATE auth_tokens
+                       SET token_hash = $2,
+                           token_prefix = $3,
+                           -- LEAST ignores NULL: no grant expiry, no cap.
+                           expires_at = LEAST(
+                               now() + make_interval(secs => $4), $5::timestamptz
+                           )
+                     WHERE id = $1 AND revoked_at IS NULL
+                    RETURNING expires_at
+                    """,
+                    grant["access_token_id"],
+                    new_access_token_hash,
+                    new_access_token_prefix,
+                    float(access_ttl_seconds),
+                    grant["expires_at"],
+                )
+                if access_expires_at is None:
+                    return None
+                await conn.execute(
+                    """
+                    UPDATE mcp_oauth_grants
+                       SET previous_refresh_hash = refresh_token_hash,
+                           refresh_token_hash = $2,
+                           last_refreshed_at = now()
+                     WHERE id = $1
+                    """,
+                    grant["id"],
+                    new_refresh_token_hash,
+                )
+        return {
+            "scope": grant["scope"],
+            "access_expires_at": access_expires_at,
+            "grant_expires_at": grant["expires_at"],
+        }
+
+    async def revoke_mcp_oauth_grant(self, refresh_token_hash: str) -> bool:
+        """End a connection by its refresh token (OAuth /revoke)."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    UPDATE mcp_oauth_grants
+                       SET revoked_at = now()
+                     WHERE refresh_token_hash = $1 AND revoked_at IS NULL
+                    RETURNING access_token_id
+                    """,
+                    refresh_token_hash,
+                )
+                if row is None:
+                    return False
+                await conn.execute(
+                    "UPDATE auth_tokens SET revoked_at = now() "
+                    "WHERE id = $1 AND revoked_at IS NULL",
+                    row["access_token_id"],
+                )
+        return True
+
     async def get_mcp_token_by_hash(self, token_hash: str) -> Dict[str, Any] | None:
         """Look up an active MCP token by its hash. Returns None if revoked/expired/wrong kind."""
         async with self.acquire() as conn:
