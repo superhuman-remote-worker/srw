@@ -323,6 +323,7 @@ async def materialize_knowledge_note(
         embedding_service=svc,
         retrieval_messages=body.retrieval_messages,
         expected_blob_sha=body.expected_blob_sha,
+        mode=body.mode,
     )
 
 
@@ -447,8 +448,9 @@ async def update_knowledge_note(
         # the canonical git boundary succeeds.
         async with dependencies.vector_db.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT note_id, note_type FROM knowledge_index "
-                "WHERE project_id = $1 AND note_id = $2",
+                "SELECT note_id, note_type, path FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2 "
+                "ORDER BY path IS NULL LIMIT 1",
                 project_id,
                 note_id,
             )
@@ -475,6 +477,9 @@ async def update_knowledge_note(
             status=body.status,
             add_tags=body.add_tags,
             remove_tags=body.remove_tags,
+            # Where the row says the file is: a nested note, or one whose id
+            # is not its filename, is changed in place (G14).
+            path_hint=row.get("path"),
         )
         if materialization.get("canonical_state") != "canonical":
             raise HTTPException(
@@ -627,6 +632,31 @@ async def update_knowledge_note(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _indexed_note_path(
+    dependencies: KnowledgeOperationDependencies, project_id: str, note_id: str
+) -> str | None:
+    """The file the index says holds the note, or None (best-effort).
+
+    Lets the purge find a nested note, or one whose id is not its filename;
+    without it the delete falls back to locating the file by name.
+    """
+    try:
+        async with dependencies.vector_db.acquire() as conn:
+            path = await conn.fetchval(
+                "SELECT path FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2 AND path IS NOT NULL "
+                "LIMIT 1",
+                project_id,
+                note_id,
+            )
+    except Exception:  # noqa: BLE001 — the resolver still finds it by name
+        dependencies.logger.debug(
+            "indexed path lookup failed for %s/%s", project_id, note_id, exc_info=True
+        )
+        return None
+    return str(path) if path else None
+
+
 async def delete_knowledge_note(
     project_id: str, note_id: str, *, dependencies: KnowledgeOperationDependencies
 ) -> dict[str, Any]:
@@ -641,6 +671,7 @@ async def delete_knowledge_note(
     from shared.runtime.services.knowledge_store import KnowledgeStore
 
     store = KnowledgeStore(db=dependencies.vector_db, embedding_service=None)
+    path_hint = await _indexed_note_path(dependencies, project_id, note_id)
     try:
         result = await materialize_knowledge_note_delete(
             postgres_db=dependencies.store,
@@ -649,6 +680,7 @@ async def delete_knowledge_note(
             slug=note_id,
             reason="deleted from the cockpit",
             store=store,
+            path_hint=path_hint,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

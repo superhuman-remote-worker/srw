@@ -124,6 +124,7 @@ def _capture_materialize(result=None):
         job_id,
         retrieval_messages=None,
         expected_blob_sha=None,
+        mode=None,
     ):
         calls.append(
             {
@@ -133,6 +134,7 @@ def _capture_materialize(result=None):
                 "job_id": job_id,
                 "retrieval_messages": retrieval_messages,
                 "expected_blob_sha": expected_blob_sha,
+                "mode": mode,
             }
         )
         return dict(result or {"status": "committed", "path": f"knowledge/{slug}.md"})
@@ -433,6 +435,10 @@ class TestKbUpdate:
     def test_error_when_note_not_found(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.update_note.return_value = False
+        # Not in the graph and not in the index: a graph miss alone is not
+        # "missing" (hand-written notes never reach Neo4j, G15).
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_note_by_slug.return_value = None
 
         result = _invoke(_get_tool(tools, "kb_update"), {"note": "missing"})
         assert "not found" in result

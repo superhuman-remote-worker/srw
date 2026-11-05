@@ -1208,6 +1208,7 @@ def _post_vault_file(
     job_id: Optional[str],
     retrieval_messages: Optional[List[str]] = None,
     expected_blob_sha: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """POST one rendered note to the orchestrator's materialisation endpoint.
 
@@ -1243,6 +1244,12 @@ def _post_vault_file(
         # Compare-and-swap (kb_gardening G3): the endpoint refuses the write
         # if the repo no longer holds this blob at the path.
         payload["expected_blob_sha"] = str(expected_blob_sha)
+    if mode:
+        # "create" makes the endpoint refuse an existing note instead of
+        # overwriting it; "update" refuses a missing one instead of
+        # re-creating it. Either way an existing note is written where it
+        # lives, which may be a subfolder of the vault.
+        payload["mode"] = mode
 
     try:
         with httpx.Client(
@@ -1272,8 +1279,13 @@ def _materialize_note(
     expected_blob_sha: Optional[str] = None,
     *,
     project_id: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Commit a note as ``knowledge/<slug>.md`` in the project's KB repo.
+    """Commit a note to the project's KB repo, where the note lives.
+
+    A new note becomes ``knowledge/<slug>.md``; an existing one is rewritten
+    in place, which may be a subfolder. ``mode`` is ``"create"`` or
+    ``"update"`` (see ``_post_vault_file``).
 
     Renders ``note`` with the same serializer the file has always used, stamps
     in-note provenance (author/job/branch — squash-merge erases git
@@ -1336,6 +1348,7 @@ def _materialize_note(
         job_id,
         retrieval_messages=retrieval_messages,
         expected_blob_sha=expected_blob_sha,
+        mode=mode,
     )
 
     if str(result.get("status")) == "failed":
@@ -1397,6 +1410,20 @@ def _canonical_materialization_error(
     retry = result.get("retry_state") or "unknown"
     # Older endpoint shapes omit the field; they always recorded their intent.
     recorded = result.get("recorded", True)
+    if reason == "already-exists":
+        # A create raced another writer, or the note was hand-written into the
+        # vault without reaching this runtime's index yet. Nothing was written.
+        return (
+            f"Error: a note with id '{slug}' already exists in the knowledge "
+            "base, so it was NOT overwritten. kb_read it, then kb_update it — "
+            "or write yours under a different title."
+        )
+    if reason == "ambiguous-note-path":
+        return (
+            f"Error: several files in the vault are named '{slug}.md', so it is "
+            "unclear which note to change — nothing was written. A human has "
+            "to rename one of them or give it an explicit `id:`."
+        )
     if reason == "precondition-failed":
         # The compare-and-swap token did not match: another writer changed or
         # removed the note between this caller's read and its write. Nothing
@@ -2030,6 +2057,7 @@ def create_kb_tools(
                 # winning — or silently re-creating a deleted file.
                 expected_blob_sha=existing.get("blob_sha"),
                 project_id=project_id,
+                mode="update",
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(
@@ -2121,7 +2149,23 @@ def create_kb_tools(
                     "refusing the write. No changes were made."
                 )
             if not isinstance(existing, dict):
-                return f"Error: Note '{note}' not found in project."
+                # The reindexer never writes Neo4j, so a note that reached the
+                # vault by git (every hand-written note) has no graph copy.
+                # The index row is the note then; update it the way the
+                # graph-less tier does instead of calling it missing (G15).
+                return _update_existing_kgless(
+                    note,
+                    content,
+                    append,
+                    status,
+                    confidence,
+                    add_tags,
+                    add_links,
+                    priority=priority,
+                    remove_tags=remove_tags,
+                    set_tags=set_tags,
+                    project_id=project_id,
+                )
             refusal = _marker_refusal(existing, content, append, note)
             if refusal:
                 return refusal
@@ -2238,6 +2282,7 @@ def create_kb_tools(
                 existing.get("retrieval_messages"),
                 expected_blob_sha=(prior_row or {}).get("blob_sha"),
                 project_id=project_id,
+                mode="update",
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(
@@ -2425,12 +2470,30 @@ def create_kb_tools(
         # included — so a raw compare never matched there, and every rewrite
         # of the same note forked a hash-suffixed twin.
         candidate_slug = slugify(title)
-        if kg is None:
-            existing = _run_async(
-                ks.get_note_by_slug(uuid.UUID(project_id), candidate_slug)
-            )
-        else:
+        existing = None
+        if kg is not None:
             existing = kg.read_note(project_id, candidate_slug)
+        if not isinstance(existing, dict):
+            # Graph-less tier, or a note Neo4j never saw: every hand-written
+            # note reaches the vault by git, and the reindexer never writes
+            # the graph. Treating a graph miss as "no such note" made this
+            # create overwrite the human's file (G15).
+            try:
+                existing = _run_async(
+                    ks.get_note_by_slug(uuid.UUID(project_id), candidate_slug)
+                )
+            except Exception as exc:
+                if kg is None:
+                    raise
+                # The graph answered; the create below still cannot overwrite
+                # (the endpoint refuses mode="create" on an existing note).
+                logger.warning(
+                    "kb_write: index lookup of %r failed (%s) — relying on the "
+                    "endpoint's create check",
+                    candidate_slug,
+                    exc,
+                )
+                existing = None
         prior_content = existing.get("content") if isinstance(existing, dict) else ""
         if adds_redaction_marker(prior_content, content):
             return redaction_marker_refusal(f"note '{candidate_slug}'", "kb_write")
@@ -2587,7 +2650,12 @@ def create_kb_tools(
                 new_note["priority"] = rank
             _apply_ready_frontmatter(new_note, _new_tags.ready)
             materialization = _materialize_note(
-                context, slug, new_note, retrieval_messages, project_id=project_id
+                context,
+                slug,
+                new_note,
+                retrieval_messages,
+                project_id=project_id,
+                mode="create",
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(

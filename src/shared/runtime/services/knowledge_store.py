@@ -707,6 +707,24 @@ class KnowledgeStore:
         logger.debug(f"Upserted knowledge index: {note_id} (content changed)")
         return row_id
 
+    async def delete_pathless_note(self, project_id: uuid.UUID, note_id: str) -> bool:
+        """Delete a legacy born-pathless row (no file backs it) by note id.
+
+        The purge's cleanup of the index-only era. A row with a ``path`` is
+        the sweep's to manage by ``(kb_id, path)``: dropping it by note id
+        while its file is still on the branch only gets it resurrected.
+        """
+        result = await self.db.fetchval(
+            """
+            DELETE FROM knowledge_index
+            WHERE project_id = $1 AND note_id = $2 AND path IS NULL
+            RETURNING id
+            """,
+            project_id,
+            note_id,
+        )
+        return result is not None
+
     async def delete_note(self, project_id: uuid.UUID, note_id: str) -> bool:
         """Delete a note from the search index.
 
