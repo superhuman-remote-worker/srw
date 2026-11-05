@@ -118,6 +118,68 @@ def finalizer_release_patch(
     ]
 
 
+# A refused JSON Patch test: the object changed between our read and our patch.
+_STALE_PATCH_STATUSES = frozenset({409, 422})
+PVC_FINALIZER_RELEASE_ATTEMPTS = 3
+
+
+async def release_pvc_finalizer_exact(
+    core_api: Any,
+    *,
+    pvc_name: str,
+    expected_pvc_uid: str,
+    namespace: str,
+    attempts: int = PVC_FINALIZER_RELEASE_ATTEMPTS,
+) -> bool:
+    """Release only SRW's finalizer from one exact PVC UID.
+
+    The patch tests the UID, resourceVersion and finalizer list it was built
+    from. Right after a delete, Kubernetes' own ``pvc-protection`` controller
+    drops its finalizer and bumps the version between our read and our patch.
+    A refused test therefore re-reads the claim and rebuilds the patch from the
+    fresh object, at most ``attempts`` times. Every read re-checks the UID, so
+    a replacement PVC under the same name is never touched.
+    """
+
+    for _ in range(max(1, attempts)):
+        try:
+            claim = await run_bounded_k8s_call(
+                core_api.read_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=namespace,
+            )
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404
+        metadata = getattr(claim, "metadata", None)
+        uid = str(getattr(metadata, "uid", "") or "")
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        finalizers = [
+            str(value) for value in getattr(metadata, "finalizers", None) or []
+        ]
+        if uid != str(expected_pvc_uid) or not resource_version:
+            return False
+        patch = finalizer_release_patch(
+            uid=uid, resource_version=resource_version, finalizers=finalizers
+        )
+        if patch is None:
+            return True
+        try:
+            await run_bounded_k8s_mutation(
+                core_api.patch_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=namespace,
+                body=patch,
+            )
+            return True
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status == 404:
+                return True
+            if status not in _STALE_PATCH_STATUSES:
+                return False
+    return False
+
+
 def pod_containers_are_terminal(pod: Any) -> bool:
     """Require terminated regular, init and ephemeral containers in one read.
 
@@ -162,10 +224,13 @@ async def retire_terminal_claimant_pod(
 
     This is not process-zero recovery for an active actor. The caller must
     possess immutable settlement/handoff proof and current retirement authority,
-    or the exact pre-setup abort of a released, nonrestartable, claim-less life.
+    or the exact pre-setup abort of a released, nonrestartable life.
     A UID/RV patch binds all finalizer preconditions to the same fresh Pod read.
     ``pvc_name`` is the claim a claimant must still mount; ``None`` is a
     claim-less dedicated Pod, identified by its UID and labels alone.
+    ``require_nonrestartable`` also demands ``restartPolicy: Never`` and no
+    PVC other than ``pvc_name`` (none at all for a claim-less Pod), so the
+    exited life can never write again.
     """
 
     async def read():
@@ -198,10 +263,16 @@ async def retire_terminal_claimant_pod(
                 or (
                     getattr(getattr(pod, "spec", None), "restart_policy", None)
                     == "Never"
-                    and pvc_name is None
-                    and not any(
-                        getattr(volume, "persistent_volume_claim", None) is not None
-                        for volume in volumes
+                    and all(
+                        claim_name is not None and claim_name == pvc_name
+                        for claim_name in (
+                            getattr(claim, "claim_name", None)
+                            for claim in (
+                                getattr(volume, "persistent_volume_claim", None)
+                                for volume in volumes
+                            )
+                            if claim is not None
+                        )
                     )
                 )
             )
