@@ -55298,13 +55298,34 @@ class PostgresDB:
         Same cadence and lifecycle for both — kind='mcp' rows hit this
         path via the legacy MCP server flow; kind='api' rows hit it via
         the same cleanup loop in the orchestrator.
+
+        An OAuth connection's access row expires every hour and is renewed
+        in place by its grant (``mcp_oauth_grants``), which cascades on the
+        row's delete. While the grant can still renew it — the same "live"
+        test as :meth:`get_mcp_oauth_grant_by_refresh_hash` — the row stays,
+        or the first sweep after a connector goes idle would log it out
+        (G6c). Once the grant has expired or either side was revoked, the
+        expired row goes and takes the grant with it.
         """
         async with self.acquire() as conn:
             await conn.execute(
                 """
-                DELETE FROM auth_tokens
-                WHERE (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP)
-                   OR (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
+                DELETE FROM auth_tokens t
+                WHERE (
+                        t.expires_at IS NOT NULL
+                        AND t.expires_at < CURRENT_TIMESTAMP
+                        AND NOT (
+                            t.revoked_at IS NULL
+                            AND EXISTS (
+                                SELECT 1 FROM mcp_oauth_grants g
+                                 WHERE g.access_token_id = t.id
+                                   AND g.revoked_at IS NULL
+                                   AND (g.expires_at IS NULL
+                                        OR g.expires_at > CURRENT_TIMESTAMP)
+                            )
+                        )
+                      )
+                   OR (t.revoked_at IS NOT NULL AND t.revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
                 """
             )
             # Rotation grace: revoke kind='api' rows whose successor is

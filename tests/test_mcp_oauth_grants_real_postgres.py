@@ -247,6 +247,119 @@ async def test_revoke_by_refresh_token_ends_both(db):
     assert await db.get_mcp_token_by_hash(_h("srw_a1")) is None
 
 
+async def _expire_access_rows(db) -> None:
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE auth_tokens SET expires_at = now() - interval '2 hours'"
+        )
+
+
+async def _grant_count(db) -> int:
+    async with db.acquire() as conn:
+        return await conn.fetchval("SELECT count(*) FROM mcp_oauth_grants")
+
+
+@pytest.mark.asyncio
+async def test_the_token_sweep_keeps_an_idle_connection(db):
+    """G6c: a connector idle past its 1 h access token is still connected.
+
+    The hourly sweep used to delete the expired access row, and the grant
+    went with it (ON DELETE CASCADE), so claude.ai had to log in again.
+    """
+    user_id = await _user(db)
+    await _connect(db, user_id)
+    await _expire_access_rows(db)
+
+    await db.cleanup_expired_mcp_tokens()
+
+    assert await _token_rows(db, user_id) == 1
+    assert await db.get_mcp_oauth_grant_by_refresh_hash(_h("srwr_r1")) is not None
+    rotated = await db.rotate_mcp_oauth_grant(
+        refresh_token_hash=_h("srwr_r1"),
+        new_refresh_token_hash=_h("srwr_r2"),
+        new_access_token_hash=_h("srw_a2"),
+        new_access_token_prefix="srw_a2",
+        access_ttl_seconds=3600,
+    )
+    assert rotated is not None
+    assert await db.get_mcp_token_by_hash(_h("srw_a2")) is not None
+
+
+@pytest.mark.asyncio
+async def test_the_token_sweep_keeps_an_idle_connection_without_expiry(db):
+    user_id = await _user(db)
+    await _connect(db, user_id, grant_days=None)
+    await _expire_access_rows(db)
+
+    await db.cleanup_expired_mcp_tokens()
+
+    assert await db.get_mcp_oauth_grant_by_refresh_hash(_h("srwr_r1")) is not None
+
+
+@pytest.mark.asyncio
+async def test_the_token_sweep_removes_an_expired_connection(db):
+    user_id = await _user(db)
+    await _connect(db, user_id)
+    await _expire_access_rows(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE mcp_oauth_grants SET expires_at = now() - interval '1 minute'"
+        )
+
+    await db.cleanup_expired_mcp_tokens()
+
+    assert await _token_rows(db, user_id) == 0
+    assert await _grant_count(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_token_sweep_removes_a_connection_revoked_by_refresh_token(db):
+    user_id = await _user(db)
+    await _connect(db, user_id)
+    assert await db.revoke_mcp_oauth_grant(_h("srwr_r1")) is True
+    await _expire_access_rows(db)
+
+    await db.cleanup_expired_mcp_tokens()
+
+    assert await _token_rows(db, user_id) == 0
+    assert await _grant_count(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_token_sweep_removes_a_connection_revoked_in_the_token_list(db):
+    """The cockpit revokes only the access row; the grant row is left live."""
+    user_id = await _user(db)
+    created = await _connect(db, user_id)
+    assert await db.revoke_mcp_token(created["access_token_id"], str(user_id))
+    await _expire_access_rows(db)
+
+    await db.cleanup_expired_mcp_tokens()
+
+    assert await _token_rows(db, user_id) == 0
+    assert await _grant_count(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_token_sweep_still_removes_expired_tokens_without_a_grant(db):
+    user_id = await _user(db)
+    await _connect(db, user_id)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO auth_tokens (user_id, name, token_hash, token_prefix, kind, "
+            "scope, expires_at) VALUES ($1, 'static', $2, 'srw_static', 'mcp', 'user', "
+            "now() - interval '1 minute')",
+            user_id,
+            _h("srw_static"),
+        )
+    await _expire_access_rows(db)
+
+    await db.cleanup_expired_mcp_tokens()
+
+    # The static token is gone; the connection's access row stays.
+    assert await _token_rows(db, user_id) == 1
+    assert await _grant_count(db) == 1
+
+
 @pytest.mark.asyncio
 async def test_the_migration_revokes_the_old_365_day_refresh_rows(
     pg_dsn, _schema_applied
