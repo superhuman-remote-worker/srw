@@ -267,6 +267,44 @@ while IFS=$'\t' read -r id username actions; do
 done
 ```
 
+## The first administrator has no Git account
+
+**Symptom.** The initial administrator signs in to SRW, but opening Git fails
+with an error page, and repositories are never shared with them, including
+their projects' knowledge repositories. The Gitea log shows
+`CreateUser: name is reserved`, and the orchestrator logs
+`Gitea refused to create user '<name>' (status 422)`. Helm's install or
+upgrade notes print **WARNING: the initial administrator's name is reserved in
+Gitea**.
+
+**Cause.** Gitea names each account after the Keycloak username, and it
+refuses a set of reserved names, among them `admin`, `api`, `user`, `explore`
+and `ghost`, plus names ending in `.keys`, `.gpg`, `.rss`, `.atom` or `.png`,
+in any letter case. The initial administrator is
+`keycloak.bootstrapAdmin.username`. With the bundled Gitea, a fresh install now
+refuses a reserved name. An existing realm keeps the name it was created with,
+because the chart cannot rename a Keycloak user.
+
+**Fix.** Rename the user in Keycloak. In the Keycloak admin console, realm
+`srw`:
+
+1. Under **Realm settings → Login**, switch **Edit username** on. Keycloak
+   refuses a rename while it is off.
+2. Under **Users**, open the user, change **Username** to a name Gitea allows,
+   such as `srwadmin`, and select **Save**.
+3. Switch **Edit username** off again.
+4. Have the user sign in again, with the new name or their email address, and
+   open Git once, so Gitea creates their account.
+5. Open each of their projects in Cockpit. Opening a project shares its
+   repositories with its members again.
+
+SRW keeps working through the rename: it identifies users by their Keycloak
+ID and finds Git accounts by email address. Leave
+`keycloak.bootstrapAdmin.username` in your values as it is. The chart keeps
+the name it first installed with and refuses a change on upgrade, and it
+prints the warning on each upgrade, which you can ignore once the user is
+renamed.
+
 ## Local k3d: cloud or Keycloak sign-in fails after recreating the cluster
 
 **Symptom.** On a local k3d cluster, signing in to the cloud or Git through

@@ -58,7 +58,7 @@ def _resources(result: subprocess.CompletedProcess) -> dict:
     }
 
 
-@pytest.mark.parametrize("username", ["admin", "Team.Admin_1-test", "a" * 64])
+@pytest.mark.parametrize("username", ["srwadmin", "Team.Admin_1-test", "a" * 64])
 def test_chosen_username_imports_as_the_srw_administrator(tmp_path, username):
     resources = _resources(
         _render(tmp_path, {"bootstrapAdmin": {"username": username}})
@@ -266,7 +266,9 @@ def test_failures_are_logged_and_never_fail_the_hook(tmp_path, fail, message):
     assert any(call[:2] == ["update", "realms/srw"] for call in calls)
 
 
-def _render_existing_identity(tmp_path: Path, username: str, existing: dict):
+def _render_existing_identity(
+    tmp_path: Path, username: str, existing: dict, extra: dict | None = None
+):
     chart = tmp_path / "helper-chart"
     templates = chart / "templates"
     templates.mkdir(parents=True)
@@ -282,6 +284,7 @@ def _render_existing_identity(tmp_path: Path, username: str, existing: dict):
                     "devUsers": {"enabled": False},
                 },
                 "existingRealmConfigMap": existing,
+                **(extra or {}),
             }
         )
     )
@@ -342,3 +345,299 @@ def test_unreadable_existing_identity_fails_instead_of_resetting_to_test(
     result = _render_existing_identity(tmp_path, "", existing)
     assert result.returncode != 0
     assert "cannot read existing bootstrap username" in result.stderr
+
+
+# --- Names Gitea reserves --------------------------------------------------
+#
+# reservedUsernames and reservedUserPatterns in models/user/user.go of the Gitea
+# release helm/values.yaml pins (gitea/gitea:1.22-rootless), copied from
+# https://github.com/go-gitea/gitea/blob/v1.22.6/models/user/user.go
+# (identical in v1.22.0). Gitea lowercases and trims a name before comparing.
+
+GITEA_1_22_RESERVED_NAMES = [
+    ".",
+    "..",
+    ".well-known",
+    "admin",
+    "api",
+    "assets",
+    "attachments",
+    "avatar",
+    "avatars",
+    "captcha",
+    "commits",
+    "debug",
+    "error",
+    "explore",
+    "favicon.ico",
+    "ghost",
+    "issues",
+    "login",
+    "manifest.json",
+    "metrics",
+    "milestones",
+    "new",
+    "notifications",
+    "org",
+    "pulls",
+    "raw",
+    "repo",
+    "repo-avatars",
+    "robots.txt",
+    "search",
+    "serviceworker.js",
+    "ssh_info",
+    "swagger.v1.json",
+    "user",
+    "v2",
+    "gitea-actions",
+]
+GITEA_1_22_RESERVED_PATTERNS = ["*.keys", "*.gpg", "*.rss", "*.atom", "*.png"]
+
+
+def test_the_reserved_list_belongs_to_the_pinned_gitea_release():
+    # Bumping gitea.image past 1.22 means re-reading Gitea's list.
+    values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    assert values["gitea"]["image"].startswith("gitea/gitea:1.22")
+
+
+def _reserved_hits(tmp_path: Path, names: list[str]) -> dict[str, str]:
+    """Render srw.giteaReservedUsername for each name through a helper chart."""
+    chart = tmp_path / "reserved-chart"
+    templates = chart / "templates"
+    templates.mkdir(parents=True)
+    (chart / "Chart.yaml").write_text(
+        "apiVersion: v2\nname: reserved-test\nversion: 0.1.0\n"
+    )
+    shutil.copyfile(CHART / "templates/_helpers.tpl", templates / "_helpers.tpl")
+    (chart / "values.yaml").write_text(yaml.safe_dump({"names": names}))
+    (templates / "hits.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: hits\ndata:\n"
+        "  hits: |\n"
+        "    {{- range .Values.names }}\n"
+        '    {{ printf "%s=%s" . (include "srw.giteaReservedUsername" .) }}\n'
+        "    {{- end }}\n"
+    )
+    result = subprocess.run(
+        ["helm", "template", "reserved-test", str(chart)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    hits = _resources(result)["ConfigMap"]["data"]["hits"]
+    return dict(line.split("=", 1) for line in hits.splitlines())
+
+
+def test_every_gitea_reservation_is_recognised_in_any_case(tmp_path):
+    pattern_examples = {
+        f"Team{pattern[1:]}": pattern for pattern in GITEA_1_22_RESERVED_PATTERNS
+    }
+    names = [*GITEA_1_22_RESERVED_NAMES, "ADMIN", "Ghost", *pattern_examples]
+    hits = _reserved_hits(tmp_path, names)
+    for name in GITEA_1_22_RESERVED_NAMES:
+        assert hits[name] == f'name "{name}"'
+    assert hits["ADMIN"] == 'name "admin"'
+    assert hits["Ghost"] == 'name "ghost"'
+    for example, pattern in pattern_examples.items():
+        assert hits[example] == f'pattern "{pattern}"'
+
+
+def test_near_misses_are_not_reserved(tmp_path):
+    names = ["srwadmin", "admin1", "administrator", "test", "keys", "png", "a.keysx"]
+    assert _reserved_hits(tmp_path, names) == {name: "" for name in names}
+
+
+def _render_chart(
+    tmp_path: Path, values: dict, *flags: str
+) -> subprocess.CompletedProcess:
+    overrides = tmp_path / "overrides.yaml"
+    overrides.write_text(
+        yaml.safe_dump({"fullnameOverride": "srw", **values}), encoding="utf-8"
+    )
+    return subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(CHART),
+            "--namespace",
+            "srw",
+            "-f",
+            str(CHART / "ci/test-values.yaml"),
+            "-f",
+            str(overrides),
+            *flags,
+            "--show-only",
+            "templates/services/keycloak.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.parametrize(
+    "username,reservation",
+    [
+        ("admin", 'name "admin"'),
+        ("Admin", 'name "admin"'),
+        ("explore", 'name "explore"'),
+        ("deploy.keys", 'pattern "*.keys"'),
+    ],
+)
+def test_fresh_install_with_bundled_gitea_refuses_a_reserved_name(
+    tmp_path, username, reservation
+):
+    result = _render_chart(
+        tmp_path, {"keycloak": {"bootstrapAdmin": {"username": username}}}
+    )
+    assert result.returncode != 0
+    assert f'keycloak.bootstrapAdmin.username "{username}" is reserved in Gitea' in (
+        result.stderr
+    )
+    assert reservation in result.stderr
+    assert "Git sign-in and repository sharing" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "values,flags",
+    [
+        # An upgrade: the realm and this user already exist; the chart cannot
+        # rename them, so it warns in NOTES.txt instead of failing.
+        pytest.param({}, ("--is-upgrade",), id="upgrade"),
+        # The chart does not run an external Git server and cannot know its
+        # reserved names; NOTES.txt warns.
+        pytest.param({"gitea": {"internal": False}}, (), id="external-git"),
+        pytest.param({"gitea": {"enabled": False}}, (), id="no-git"),
+    ],
+)
+def test_a_reserved_name_does_not_fail_where_the_chart_cannot_fix_it(
+    tmp_path, values, flags
+):
+    result = _render_chart(
+        tmp_path,
+        {"keycloak": {"bootstrapAdmin": {"username": "admin"}}, **values},
+        *flags,
+    )
+    realm = json.loads(_resources(result)["ConfigMap"]["data"]["srw-realm.json"])
+    assert realm["users"][0]["username"] == "admin"
+
+
+BUNDLED_GITEA = {"gitea": {"enabled": True, "internal": True}}
+
+
+def test_an_existing_realm_keeps_a_reserved_name_even_on_install(tmp_path):
+    # The realm ConfigMap is there, so the realm is too: the chart cannot
+    # rename the user, and failing would leave the operator nothing to change.
+    result = _render_existing_identity(
+        tmp_path, "", _existing_realm("admin"), BUNDLED_GITEA
+    )
+    assert _resources(result)["ConfigMap"]["data"]["username"] == "admin"
+
+
+def test_without_a_realm_the_helper_refuses_a_reserved_name(tmp_path):
+    result = _render_existing_identity(tmp_path, "admin", {}, BUNDLED_GITEA)
+    assert result.returncode != 0
+    assert "reserved in Gitea" in result.stderr
+
+
+@pytest.fixture(scope="module")
+def notes_probe_chart(tmp_path_factory) -> Path:
+    """The real chart plus one manifest that emits the NOTES warning.
+
+    `helm template` does not render NOTES.txt, so the warning is a named
+    template rendered here into a ConfigMap (as tests/test_cnpg_backup_helm.py
+    does for srw.backupNotes).
+    """
+    chart = tmp_path_factory.mktemp("reserved-notes") / "chart"
+    shutil.copytree(CHART, chart)
+    (chart / "templates" / "zz-reserved-notes-probe.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-probe\ndata:\n"
+        "  notes: |\n"
+        '{{ include "srw.keycloakReservedUsernameNotes" . | indent 4 }}\n'
+    )
+    return chart
+
+
+def _reserved_notes(chart: Path, tmp_path: Path, values: dict, *flags: str) -> str:
+    overrides = tmp_path / "notes-overrides.yaml"
+    overrides.write_text(yaml.safe_dump({"fullnameOverride": "srw", **values}))
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(chart),
+            "--namespace",
+            "srw",
+            "-f",
+            str(CHART / "ci/test-values.yaml"),
+            "-f",
+            str(overrides),
+            *flags,
+            "--show-only",
+            "templates/zz-reserved-notes-probe.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return _resources(result)["ConfigMap"]["data"].get("notes") or ""
+
+
+def test_notes_txt_carries_the_reserved_name_warning():
+    notes = (CHART / "templates/NOTES.txt").read_text(encoding="utf-8")
+    assert 'include "srw.keycloakReservedUsernameNotes" .' in notes
+
+
+def test_upgrade_notes_point_a_reserved_name_at_the_recovery_steps(
+    notes_probe_chart, tmp_path
+):
+    notes = _reserved_notes(
+        notes_probe_chart,
+        tmp_path,
+        {"keycloak": {"bootstrapAdmin": {"username": "admin"}}},
+        "--is-upgrade",
+    )
+    assert "WARNING: the initial administrator's name is reserved in Gitea" in notes
+    assert 'keycloak.bootstrapAdmin.username is "admin"' in notes
+    assert "cannot rename that user" in notes
+    assert "docs/troubleshooting.md#the-first-administrator-has-no-git-account" in notes
+
+
+def test_external_git_notes_warn_on_install(notes_probe_chart, tmp_path):
+    notes = _reserved_notes(
+        notes_probe_chart,
+        tmp_path,
+        {
+            "keycloak": {"bootstrapAdmin": {"username": "Admin"}},
+            "gitea": {"internal": False},
+        },
+    )
+    assert 'keycloak.bootstrapAdmin.username is "Admin"' in notes
+    assert "external Git server" in notes
+    assert "cannot rename that user" not in notes
+
+
+@pytest.mark.parametrize(
+    "values,flags",
+    [
+        pytest.param(
+            {"keycloak": {"bootstrapAdmin": {"username": "srwadmin"}}},
+            ("--is-upgrade",),
+            id="allowed-name",
+        ),
+        pytest.param(
+            {
+                "keycloak": {"bootstrapAdmin": {"username": "admin"}},
+                "gitea": {"enabled": False},
+            },
+            ("--is-upgrade",),
+            id="no-git",
+        ),
+    ],
+)
+def test_notes_stay_quiet_without_a_reserved_name_or_git(
+    notes_probe_chart, tmp_path, values, flags
+):
+    assert _reserved_notes(notes_probe_chart, tmp_path, values, *flags).strip() == ""

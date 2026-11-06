@@ -882,7 +882,82 @@ The caller supplies lookup's result so selection/validation also works offline.
     {{- end -}}
   {{- end -}}
 {{- end -}}
+{{- /* A fresh install with the bundled Gitea refuses a name Gitea reserves.
+     Upgrades never fail here: the realm, and this user in it, already exist
+     and the chart cannot rename them; NOTES.txt warns instead. An existing
+     realm ConfigMap means the same thing on an install. */ -}}
+{{- $gitea := $ctx.Values.gitea | default dict -}}
+{{- if and $gitea.enabled $gitea.internal $ctx.Release.IsInstall (not .existingRealmConfigMap) -}}
+  {{- $reserved := include "srw.giteaReservedUsername" $username -}}
+  {{- if $reserved -}}
+    {{- fail (printf "keycloak.bootstrapAdmin.username %q is reserved in Gitea (%s; names are compared in lower case). The bundled Gitea would refuse to create this administrator's Git account, so Git sign-in and repository sharing would break for them. Choose another name, for example \"srwadmin\"." $username $reserved) -}}
+  {{- end -}}
+{{- end -}}
 {{- $username -}}
+{{- end -}}
+
+{{/*
+Which Gitea reservation a username hits: `name "admin"`, `pattern "*.keys"`,
+or empty. Gitea lowercases and trims a name, then refuses it when it equals a
+reserved name or matches a pattern ("*x" a suffix, "x*" a prefix), as
+db.IsUsableName does in models/db/name.go. The lists are reservedUsernames
+and reservedUserPatterns in models/user/user.go of the Gitea release the chart
+pins (gitea.image, 1.22; identical from v1.22.0 to v1.22.6):
+https://github.com/go-gitea/gitea/blob/v1.22.6/models/user/user.go
+Update both lists with the gitea.image pin. Keycloak usernames reach Gitea
+as preferred_username, both for browser SSO and for the accounts SRW creates.
+*/}}
+{{- define "srw.giteaReservedUsername" -}}
+{{- $name := . | toString | trim | lower -}}
+{{- $names := list "." ".." ".well-known" "admin" "api" "assets" "attachments" "avatar" "avatars" "captcha" "commits" "debug" "error" "explore" "favicon.ico" "ghost" "issues" "login" "manifest.json" "metrics" "milestones" "new" "notifications" "org" "pulls" "raw" "repo" "repo-avatars" "robots.txt" "search" "serviceworker.js" "ssh_info" "swagger.v1.json" "user" "v2" "gitea-actions" -}}
+{{- $patterns := list "*.keys" "*.gpg" "*.rss" "*.atom" "*.png" -}}
+{{- if has $name $names -}}
+name {{ $name | quote }}
+{{- else -}}
+  {{- $hit := "" -}}
+  {{- range $patterns -}}
+    {{- if and (not $hit) (or (and (hasPrefix "*" .) (hasSuffix (trimPrefix "*" .) $name)) (and (hasSuffix "*" .) (hasPrefix (trimSuffix "*" .) $name))) -}}
+      {{- $hit = . -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if $hit -}}pattern {{ $hit | quote }}{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+NOTES.txt warning for an initial administrator whose name Gitea reserves.
+With the bundled Gitea a fresh install already failed in
+srw.keycloakBootstrapAdminUsername, so this text is for upgrades of a realm
+that has the name. An external Git server is never a render failure: the chart
+does not run it, so it cannot know its version or reserved list. SRW still
+creates accounts there under the Keycloak username, so warn.
+*/}}
+{{- define "srw.keycloakReservedUsernameNotes" -}}
+{{- $gitea := .Values.gitea | default dict -}}
+{{- if and .Values.keycloak.enabled .Values.keycloak.internal $gitea.enabled -}}
+{{- $existingRealm := lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-keycloak-realm" (include "srw.fullname" .)) -}}
+{{- $username := include "srw.keycloakBootstrapAdminUsername" (dict "context" . "existingRealmConfigMap" $existingRealm) -}}
+{{- $reserved := include "srw.giteaReservedUsername" $username -}}
+{{- if $reserved }}
+
+WARNING: the initial administrator's name is reserved in Gitea
+==============================================================
+keycloak.bootstrapAdmin.username is {{ $username | quote }}, which Gitea reserves ({{ $reserved }}).
+{{- if $gitea.internal }}
+The realm already exists, so the chart cannot rename that user. While the
+Keycloak user keeps this name, Gitea refuses to create its Git account: Git
+sign-in fails for it, and repositories cannot be shared with it. Rename the
+user in Keycloak and keep keycloak.bootstrapAdmin.username unchanged; see
+docs/troubleshooting.md#the-first-administrator-has-no-git-account
+If you already renamed the user, nothing else is needed.
+{{- else }}
+SRW creates each user's account on the external Git server under their
+Keycloak username, and Gitea and Forgejo servers refuse reserved names. Before
+the first install, choose another name; on an existing realm, rename the user
+in Keycloak; see docs/troubleshooting.md#the-first-administrator-has-no-git-account
+{{- end }}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

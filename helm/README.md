@@ -29,7 +29,7 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 | `databases.vector` | pgvector for embeddings, citations, memories | internal or external |
 | `databases.keycloak` | Dedicated Postgres for the bundled Keycloak (only relevant when `keycloak.internal: true`) | internal or external |
 | `databases.audit` | Audit trail — LLM/agent/chat traces (optional but recommended) | internal or external |
-| `databases.neo4j` | Project knowledge graph (optional). `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
+| `databases.neo4j` | Project knowledge graph, **off by default** (`databases.neo4j.enabled`). The knowledge base runs on the Postgres store without it; Neo4j adds only the typed graph edges, note relationships and the knowledge export. `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
 | `keycloak` | OIDC provider | internal or external |
 | `gitea` | Git server for agent code workspaces | internal or external |
 | `opencloud` / `nextcloud` | Cloud storage backend | one or external |
@@ -57,7 +57,7 @@ first, especially on shared Fedora hosts or when volumes must use a separate dis
 Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
-- **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
+- **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit; Neo4j 5+ only if you enable the optional knowledge graph)
 - **CloudNativePG 1.30+ on Kubernetes 1.29+**, only if a bundled database uses
   `databases.<name>.engine: cnpg|migrating`; add the **Barman Cloud plugin**
   only for object-store backups — see
@@ -248,7 +248,7 @@ aimed at this release's own object store.
 ## Quick start (evaluation, single command)
 
 For a self-contained evaluation install with everything in-cluster (Postgres,
-Neo4j, Keycloak, Gitea, OpenCloud all bundled):
+Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
 helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
@@ -264,6 +264,11 @@ helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 `MCP_INTERNAL_KEY`, and `IDE_CREDENTIAL_KEY`, and create internal credentials.
 **This mode is for evaluation only** — see
 [Secrets](#secrets) for production options.
+
+Neo4j is not bundled unless you ask for it. To add the optional knowledge
+graph, set `databases.neo4j.enabled=true` and supply its credentials, which the
+chart does not generate: `secrets.values.NEO4J_USERNAME=neo4j` and
+`secrets.values.NEO4J_PASSWORD` (no `/` in it; see [Secret schema](#secret-schema)).
 
 The first login is the initial administrator, `keycloak.bootstrapAdmin.username`
 (`test` when empty), with the password you supply as `KC_REALM_ADMIN_PASSWORD`;
@@ -549,8 +554,9 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
   and memories all live in this instance (`srw_vector`); the citation engine
   is a native SRW subsystem on the vector pool, **not** a separate role or
   database. The former `srw_citations` / `citation_engine` database is retired.
-- `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
-  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
+- `NEO4J_USERNAME`, `NEO4J_PASSWORD` — only when `databases.neo4j.enabled`.
+  The bundled server, the agents and the orchestrator all read them. Both
+  live in Vault (mirroring the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
   expects `NEO4J_USERNAME=neo4j`; enterprise can use a different value.
   The Neo4j server image's `NEO4J_AUTH` is composed at pod-start from
@@ -614,12 +620,23 @@ your values file:
 ```yaml
 keycloak:
   bootstrapAdmin:
-    username: admin
+    username: srwadmin
 ```
 
 Use 1–64 ASCII letters, digits, dots, underscores, or hyphens, starting with a
 letter or digit. The name must differ from enabled `keycloak.devUsers` accounts,
-including case variants. Supply its password through `KC_REALM_ADMIN_PASSWORD`
+including case variants. It must also not be a name Gitea reserves, in any
+letter case: Gitea names each account after the Keycloak username and refuses
+`admin`, `api`, `user`, `explore`, `ghost` and the rest of its list, plus
+names ending in `.keys`, `.gpg`, `.rss`, `.atom` or `.png`. With the bundled
+Gitea, a fresh install with such a name fails to render, naming the reserved
+word. An upgrade does not fail, because the realm already exists; the install
+notes print a warning instead, and
+[The first administrator has no Git account](../docs/troubleshooting.md#the-first-administrator-has-no-git-account)
+has the recovery steps. With an external Git server, the chart cannot know its
+reserved names, so it only warns. A render without cluster access, such as
+`helm template` or Argo CD, counts as a fresh install and fails too: rename the
+user in Keycloak first, then render with the new name. Supply its password through `KC_REALM_ADMIN_PASSWORD`
 in your chosen Secret source. Keycloak requires at least 16 characters and a
 password different from the username. For bundled Keycloak 26.2 realm import,
 exclude double quotes, backslashes, control characters, and `${` sequences from
@@ -1824,6 +1841,10 @@ they are, and changing values later has no effect on them:
   newer charts keep the password the administrator chose. Rotating the Secret
   no longer changes it; see
   [Changing the initial administrator's password](#changing-the-initial-administrators-password).
+- **The initial administrator's name.** An upgrade keeps the name the realm was
+  created with, even one Gitea reserves (such as `admin`), and prints a warning
+  in the install notes. Rename that user in Keycloak; see
+  [The first administrator has no Git account](../docs/troubleshooting.md#the-first-administrator-has-no-git-account).
 
 ### Migration 0185 pinned-runtime cutover
 

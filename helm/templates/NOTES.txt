@@ -45,6 +45,7 @@ Set one of:
 {{- end }}
 {{- end }}
 {{- end }}
+{{- include "srw.keycloakReservedUsernameNotes" . }}
 
 Encryption key
 ==============
