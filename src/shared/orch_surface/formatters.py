@@ -3652,9 +3652,14 @@ def format_officer_note_result(data: dict[str, Any]) -> str:
             f"{_short_id(thread_id)}). He reads it when the hold lifts; "
             "nothing else delivers it in the meantime."
         )
+    # 'queued' is the only answer for a running officer too: every note goes
+    # through his durable inbox, and the wake drain hands it to a live runtime
+    # within seconds. Only without a live runtime does it wait for his wake.
     wake = data.get("next_wake_at")
-    when = f" at {wake}" if wake else " at his next wake"
+    when = f" ({wake})" if wake else ""
     return (
-        f"Note queued durably (thread {_short_id(thread_id)}) — he was not "
-        f"live. He reads it{when}."
+        f"Note queued in his durable inbox (thread {_short_id(thread_id)}). "
+        "A running officer gets it within seconds; if his runtime is down, he "
+        f"reads it when it is back or at his next wake{when}. It is not read "
+        "until it shows in his log."
     )
