@@ -106,3 +106,16 @@ async def test_alarm_without_a_job_wakes_nobody():
     broadcast.assert_not_awaited()
     store.get_job.assert_not_awaited()
     store.enqueue_session_wake_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unrouted_alarm_is_logged_once_per_cooldown(caplog):
+    alerts, _store, _broadcast, _kick = _alerts(officer=False)
+
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            await alerts.monitor(_alert())
+
+    assert (
+        sum("not routed to an officer" in r.getMessage() for r in caplog.records) == 1
+    )

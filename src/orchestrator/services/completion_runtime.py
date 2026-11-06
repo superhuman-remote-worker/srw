@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import logging
+import time
 from typing import Any
 
 from fastapi import HTTPException
@@ -40,6 +41,7 @@ class CompletionAlerts:
 
     def __init__(self, dependencies: CompletionAlertDependencies) -> None:
         self.dependencies = dependencies
+        self._unrouted_logged_at: dict[tuple[str, str], float] = {}
 
     async def sweep(self, message: str) -> None:
         digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:32]
@@ -97,11 +99,19 @@ class CompletionAlerts:
                     "completion monitor: officer lookup failed", exc_info=True
                 )
         if not officer:
-            logger.warning(
-                "completion monitor alert not routed to an officer (job %s): %s",
-                job_id,
-                str(getattr(alert, "message", ""))[:300],
-            )
+            # The monitor re-raises every tick (~30 s); one line per alert per
+            # cool-down is enough for an operator reading the log.
+            key = (str(alert.dedup_key), str(job_id))
+            now = time.monotonic()
+            if now - self._unrouted_logged_at.get(key, -1e9) >= (
+                COMPLETION_ALERT_COOLDOWN_SECONDS
+            ):
+                self._unrouted_logged_at[key] = now
+                logger.warning(
+                    "completion monitor alert not routed to an officer (job %s): %s",
+                    job_id,
+                    str(getattr(alert, "message", ""))[:300],
+                )
             return
         await store.enqueue_session_wake_event(
             str(officer["id"]),
