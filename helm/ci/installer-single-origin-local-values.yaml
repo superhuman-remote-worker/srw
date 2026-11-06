@@ -51,6 +51,7 @@ secrets:
     NEXTCLOUD_AGENT_PASSWORD: "15151515151515151515151515151515"
     NEXTCLOUD_S3_ACCESS_KEY: "unused"
     NEXTCLOUD_S3_SECRET_KEY: "unused"
+    CODEX_MANAGEMENT_KEY: "1717171717171717171717171717171717171717171717171717171717171717"
 
 # One browser origin, one chart-owned self-signed certificate, and no DNS or cert-manager.
 exposure:
@@ -67,10 +68,6 @@ exposure:
 sessionRouter:
   jwtSecret: "1616161616161616161616161616161616161616161616161616161616161616"
 
-keycloak:
-  enabled: true
-  internal: true
-
 gitea:
   enabled: true
   internal: true
@@ -78,17 +75,34 @@ gitea:
     externalService:
       enabled: false
 
+keycloak:
+  enabled: true
+  internal: true
+  bootstrapAdmin:
+    username: "srwadmin"
+
+searxng:
+  enabled: true
+crawl4ai:
+  enabled: false
+
+codexProxy:
+  enabled: true
+
 workspace:
   # No ReadWriteMany storage class here (k3s local-path is RWO-only): a RWX claim
   # would stay Pending forever.
   accessMode: ReadWriteOnce
   ephemeralStorageClass: local-path
+  # The home-allowed network tier keeps the chart's denies. List the node and
+  # load-balancer networks under "Other host or node networks" in the generator to add them.
 
 agent:
   pool:
-    # Spin workers up on demand; nothing idles on a single box.
-    minAgents: "0"
-    buffer: "0"
+    # One warm agent, and one spare while it works: the first job or dedicated
+    # Session skips the pod start (about 200 MiB idle). No slots are reserved.
+    minAgents: "1"
+    buffer: "1"
     reservedSessionSlots: "0"
     reservedJobSlots: "0"
     maxAgents: "3"
