@@ -770,14 +770,22 @@ orchestrator:
   # orchestrator/deployment.yaml — the ConfigMap's POSTGRES_*_CONNECTIONS carry
   # the small AGENT-pod sizing (agent.dbPool) and must not reach the
   # orchestrator. These match the code defaults; override only to tune.
-  # Budget per server: sum(maxes across replicas + agents) <= max_connections
-  # - 3 reserved - ~10 headroom. At the defaults (replicas=2,
-  # agent.pool.maxAgents=10, agent.dbPool.app.max=3), per server:
-  #   app    : 2*10 (orch) + 10*3 (agents) = 50   (fits default max_connections=100)
-  #   vector : 2*5  + 10*3 = 40
-  #   audit  : 2*4  + (agents keep the code default) = 8
-  # Scaling to ~30 agents pushes app to 2*10 + 30*3 = 110 -> raise Postgres
-  # max_connections, trim agent.dbPool.app.max, or front the app DB with
+  # Budget per server: every pool max across orchestrator replicas (R), agent
+  # pods (W = agent.pool.maxAgents) and stateless executors (E =
+  # agent.stateless.replicas) must fit max_connections - 3 reserved - ~10
+  # headroom. What each one opens at most:
+  #   orchestrator  app 10 + 20 dedicated advisory-lock sessions (5 lock
+  #                 domains x POSTGRES_DEDICATED_ADVISORY_LOCK_SLOTS 4),
+  #                 vector 5, audit 4 + a 5-connection read pool
+  #   agent pod     app 3 (agent.dbPool.app.max) + 1 checkpointer, vector 3,
+  #                 audit 2 (agents write the audit trail directly)
+  #   executor      app 3 + 4 fenced checkpoint pool, vector 3, audit 2
+  # So app = 30R + 4W + 7E + 13, vector = 5R + 3W + 3E + 13 and
+  # audit = 9R + 2W + 2E + 13. At the defaults (R=1, W=10, E=2): app 97,
+  # vector 54, audit 46, which fits the bundled max_connections of 100.
+  # More agents or a second orchestrator replica push app past it -> raise
+  # databases.postgres.maxConnections (the srw-cloud generator derives it from
+  # the worker count), trim agent.dbPool.app.max, or front the app DB with
   # pgbouncer (transaction mode; the advisory-lock migration runner + LISTEN
   # users stay on direct connections).
   dbPool:
@@ -3005,12 +3013,16 @@ keycloak:
   # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
   internal: true
   image: quay.io/keycloak/keycloak:26.2
-  # -- Initial SRW login for the bundled Keycloak realm. Password comes from
-  # KC_REALM_ADMIN_PASSWORD. This does not configure the Keycloak master admin.
+  # -- Initial SRW login for the bundled Keycloak realm. Its password comes from
+  # KC_REALM_ADMIN_PASSWORD, set once when Keycloak creates the user; rotating
+  # the Secret later does not change it. This does not configure the Keycloak
+  # master admin.
   bootstrapAdmin:
     # Empty preserves the existing realm ConfigMap's initial username during
     # connected Helm upgrades; a fresh install defaults to the historical test.
-    # Set before first install: 1-64 ASCII letters/digits/._-, starting alnum.
+    # Set before first install: 1-64 ASCII letters/digits/._-, starting alnum,
+    # and not a name Gitea reserves (admin, api, user, ...; see helm/README.md).
+    # With the bundled Gitea a fresh install with one fails to render.
     # Keep the same explicit value for offline/GitOps renders (no lookup).
     username: ""
   # -- Replica count for the bundled Keycloak. The pod runs in production mode
