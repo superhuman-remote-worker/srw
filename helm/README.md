@@ -1937,9 +1937,13 @@ exec` into the pod, `psql -U srw`) and delete the pod. Objects of other kinds
 (operators, collations, event triggers, ...) are never created by SRW; if you
 made one by hand as `srw`, the log warns that it stays with `postgres`.
 
-Rolling back to chart 0.1.0 afterwards works: SRW's role is no longer a
-superuser, but it owns everything SRW uses. To restore the old state as
-well, run `ALTER ROLE srw SUPERUSER` as `postgres`.
+A rollback to chart 0.1.0 keeps the split. That chart's database pods read
+`POSTGRES_USER`/`POSTGRES_PASSWORD` only at initdb, so they start unchanged,
+and SRW keeps connecting as `srw`, which owns everything SRW uses. The one
+exception is that chart's Canvas gateway role Job, which creates its login as
+`srw` and fails without superuser. To restore the old state, run `ALTER ROLE
+srw SUPERUSER` as `postgres` (this rollback path is reasoned from the
+templates, not tested).
 
 ### What an upgrade leaves alone in the bundled Keycloak realm
 
