@@ -896,6 +896,36 @@ async def test_agents_offline_fully_derivable_skips_the_fleet_fanout():
 
 
 @pytest.mark.asyncio
+async def test_a_session_runtime_going_offline_is_not_capacity_news():
+    """An Officer's replaced pod leaves its agents row behind on purpose, so
+    every recycle marks one session-bound agent offline. Unattributed, it
+    woke every officer with "1 agent(s) marked offline" (dev, 2026-11-06)."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+
+    def _mark(*args, **kwargs):
+        shutdown_event.set()
+        return [
+            {"agent_id": "officer-old-pod", "project_id": None, "thread_id": "t-1"},
+            {"agent_id": "session-pod", "project_id": "proj-a", "thread_id": "t-2"},
+        ]
+
+    db.mark_stale_agents_offline = AsyncMock(side_effect=_mark)
+
+    with (
+        patch.object(detector, "_kick_officer_event_drain"),
+        patch.object(detector, "notify_all_officers", AsyncMock()) as notify_all,
+        patch.object(detector, "notify_owning_officers", AsyncMock()) as notify_owning,
+    ):
+        await detector.stale_agent_detector(
+            shutdown_event, dependencies=_detector_dependencies(db)
+        )
+
+    notify_owning.assert_not_awaited()
+    notify_all.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_lease_recovery_uses_strict_audit_fingerprint_reader():
     shutdown_event = asyncio.Event()
     db = _mock_db(shutdown_event)

@@ -28956,9 +28956,11 @@ class PostgresDB:
             One row per agent marked offline: ``agent_id`` plus the
             ``project_id`` of the job it was serving — its current job when
             that row still exists, else its most recently updated assigned
-            job — or ``None`` when no project is derivable. The caller uses
-            the project to scope officer capacity wakes to the owning
-            project's officer instead of the whole roster.
+            job — or ``None`` when no project is derivable, and the
+            ``thread_id`` of the session it was bound to (``None`` for a
+            worker). The caller uses the project to scope officer capacity
+            wakes to the owning project's officer instead of the whole roster,
+            and the thread to leave session runtimes out of capacity news.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
 
@@ -28970,9 +28972,10 @@ class PostgresDB:
                     SET status = 'offline'
                     WHERE last_heartbeat < $1
                       AND status NOT IN ('offline', 'failed')
-                    RETURNING id, current_job_id
+                    RETURNING id, current_job_id, thread_id
                 )
                 SELECT marked.id AS agent_id,
+                       marked.thread_id AS thread_id,
                        COALESCE(current_job.project_id, last_job.project_id)
                            AS project_id
                   FROM marked
@@ -28994,6 +28997,9 @@ class PostgresDB:
                 "agent_id": str(row["agent_id"]),
                 "project_id": (
                     str(row["project_id"]) if row["project_id"] is not None else None
+                ),
+                "thread_id": (
+                    str(row["thread_id"]) if row["thread_id"] is not None else None
                 ),
             }
             for row in rows

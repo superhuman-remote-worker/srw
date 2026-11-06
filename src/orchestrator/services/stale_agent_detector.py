@@ -653,9 +653,17 @@ async def stale_agent_detector(
                 # a warm-pool agent dying genuinely is capacity news for every
                 # officer. 10-min debounce on 'fleet' keeps a flapping node
                 # from spamming.
+                #
+                # An agent bound to a session thread is that session's runtime,
+                # not worker capacity. An Officer's own replaced pod goes
+                # offline here after every recycle (he exits without
+                # deregistering so the recycler can reconcile him), and as an
+                # unattributed row it woke every officer about it.
                 offline_by_project: dict[str, int] = {}
                 unattributed_offline = 0
                 for agent_row in offline_agents:
+                    if agent_row.get("thread_id"):
+                        continue
                     agent_project = agent_row.get("project_id")
                     if agent_project:
                         offline_by_project[str(agent_project)] = (
