@@ -846,15 +846,42 @@ spec:
                     # kcadm here. The hook also ensures the OpenCloud client
                     # set + groups exist (idempotent).
                     KC="/opt/keycloak/bin/kcadm.sh"
+                    # When this container started, in epoch seconds. Keycloak
+                    # boots after this, so a user it creates on this start
+                    # (the realm import) has a later createdTimestamp.
+                    HOOK_STARTED=$(date +%s 2>/dev/null)
+                    case "$HOOK_STARTED" in ''|*[!0-9]*) HOOK_STARTED="" ;; esac
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080{{ if include "srw.singleOrigin" . }}/identity{{ end }} \
                       --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
-                    # --- Set realm admin password ---
-                    # Realm import does resolve ${KC_REALM_ADMIN_PASSWORD} on
-                    # first boot (verified on Keycloak 26.2), but we still
-                    # force-set on every start so Vault-rotated admin
-                    # passwords propagate without requiring a DB wipe.
-                    $KC set-password -r {{ .Values.keycloak.realm }} --username "$KC_REALM_ADMIN_USERNAME" --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
+                    # --- Realm admin password: only on the start that created it ---
+                    # The realm import creates the initial SRW administrator
+                    # (keycloak.bootstrapAdmin.username) on first boot, and
+                    # resolves ${KC_REALM_ADMIN_PASSWORD} as its password
+                    # (verified on Keycloak 26.2). This hook used to force-set
+                    # that password on every start so a rotated Secret would
+                    # propagate, but that also undid any password the admin
+                    # chose and kept the install's initial password valid for
+                    # good. Now it repeats the set only when the admin was
+                    # created after this container started, i.e. this start's
+                    # import created it. Later rotation is a manual step
+                    # (helm/README.md, Secret schema). Lookup or set failures
+                    # are logged, and none of them fails the hook.
+                    if ADMIN_JSON=$($KC get users -r {{ .Values.keycloak.realm }} -q "username=$KC_REALM_ADMIN_USERNAME" -q exact=true \
+                        --fields id,createdTimestamp 2>&1); then
+                      ADMIN_ID=$(printf '%s\n' "$ADMIN_JSON" | sed -n 's/.*"id" : "\([^"]*\)".*/\1/p' | head -1)
+                      ADMIN_CREATED=$(printf '%s\n' "$ADMIN_JSON" | sed -n 's/.*"createdTimestamp" : \([0-9][0-9]*\).*/\1/p' | head -1)
+                      if [ -z "$ADMIN_ID" ]; then
+                        echo "WARN: realm admin $KC_REALM_ADMIN_USERNAME not found in realm {{ .Values.keycloak.realm }} (renamed in Keycloak?); password not managed"
+                      elif [ -z "$ADMIN_CREATED" ] || [ -z "$HOOK_STARTED" ]; then
+                        echo "WARN: cannot tell when realm admin $KC_REALM_ADMIN_USERNAME was created; password left as it is"
+                      elif [ "$ADMIN_CREATED" -ge "${HOOK_STARTED}000" ]; then
+                        PW_OUT=$($KC set-password -r {{ .Values.keycloak.realm }} --userid "$ADMIN_ID" --new-password "$KC_REALM_ADMIN_PASSWORD" 2>&1) \
+                          || echo "WARN: kcadm set-password for new realm admin $KC_REALM_ADMIN_USERNAME failed: $PW_OUT"
+                      fi
+                    else
+                      echo "WARN: kcadm realm admin lookup for $KC_REALM_ADMIN_USERNAME failed: $ADMIN_JSON"
+                    fi
                     # --- Sync client secrets ---
                     # cockpit-bff is included so secret rotations in Vault
                     # propagate to KC on the next pod restart. The other

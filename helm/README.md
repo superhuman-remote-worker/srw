@@ -600,8 +600,11 @@ the operator that owns the external database.
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
 - `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.
-- `KC_REALM_ADMIN_PASSWORD` — password for the initial SRW administrator
-  selected by `keycloak.bootstrapAdmin.username` (bundled Keycloak).
+- `KC_REALM_ADMIN_PASSWORD` — initial password of the first SRW administrator
+  selected by `keycloak.bootstrapAdmin.username` (bundled Keycloak). Keycloak
+  sets it once, when it creates that user on the first install. Changing it in
+  the Secret later does not change the password; see
+  [Changing the initial administrator's password](#changing-the-initial-administrators-password).
 - `MCP_OIDC_CLIENT_SECRET` (if `mcp.enabled`)
 - `GITEA_OIDC_CLIENT_SECRET`, `NEXTCLOUD_OIDC_CLIENT_SECRET`, `OPENCLOUD_KEYCLOAK_CLIENT_SECRET`, `PGADMIN_OIDC_CLIENT_SECRET` (per enabled component)
 
@@ -631,8 +634,43 @@ ConfigMap, preserves its initial username when the value is empty, and rejects
 an explicit change. This setting seeds a new realm; it does not rename a user
 in an existing Keycloak database. Keep the same explicit value in offline or
 GitOps rendering, where Helm cannot read the existing ConfigMap. Create further
-administrators through SRW user management. Password reconciliation on pod
-restart continues to target the selected initial user.
+administrators through SRW user management.
+
+#### Changing the initial administrator's password
+
+`KC_REALM_ADMIN_PASSWORD` is the password the initial administrator starts
+with. Keycloak sets it when it creates the user on the first install, and the
+chart never sets it again: a restart or an upgrade keeps whatever password the
+administrator chose since. Rotating the value in the Secret therefore changes
+nothing on its own. (Chart 0.1.0 and earlier reset the password to the Secret
+value on every Keycloak restart.)
+
+Treat this account as the way in for the first login, not as a daily
+administrator: create the administrators who work on the install through SRW
+user management, and change this account's password after the first login.
+
+To change the password, the administrator signs in to the Keycloak Account
+Console (`https://auth.<domain>/realms/srw/account/`, or
+`https://<origin>/identity/realms/srw/account/` in single-origin mode) and
+updates it under **Account security → Signing in**. An operator can also reset
+it in the Keycloak admin console (realm `srw`, **Users →** the user →
+**Credentials → Reset password**, with **Temporary** off), or apply the value
+now in the Secret with kcadm. Keycloak reads the Secret at pod start, so
+restart Keycloak after changing it, then run the following. Replace
+`<username>` with the name Keycloak lists under **Users**; Keycloak stores
+usernames in lower case.
+
+```bash
+kubectl -n srw exec deploy/srw-keycloak -c keycloak -- sh -c '
+  KC=/opt/keycloak/bin/kcadm.sh
+  $KC config credentials --server "http://localhost:8080${KC_HTTP_RELATIVE_PATH:-}" \
+    --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" &&
+  $KC set-password -r srw --username "$1" --new-password "$KC_REALM_ADMIN_PASSWORD"' \
+  _ <username>
+```
+
+The Keycloak server administrator (`KEYCLOAK_ADMIN_USER` in the master realm)
+is a separate account and is not affected.
 
 The chart creates no test accounts. `keycloak.devUsers` seeds six accounts
 whose passwords are published in this repository; it exists for local k3d
@@ -1780,6 +1818,12 @@ they are, and changing values later has no effect on them:
   without a mail server. Change them in the Keycloak admin console under
   **Realm settings → Login**; see
   [Self-registered users are stuck at "Failed to send email"](../docs/troubleshooting.md#self-registered-users-are-stuck-at-failed-to-send-email).
+- **The initial administrator's password.** `KC_REALM_ADMIN_PASSWORD` applies
+  only when Keycloak creates the initial administrator. Chart 0.1.0 and
+  earlier reset that password to the Secret value on every Keycloak restart;
+  newer charts keep the password the administrator chose. Rotating the Secret
+  no longer changes it; see
+  [Changing the initial administrator's password](#changing-the-initial-administrators-password).
 
 ### Migration 0185 pinned-runtime cutover
 

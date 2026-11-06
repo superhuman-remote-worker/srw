@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -104,7 +105,31 @@ def test_bootstrap_admin_cannot_collide_with_enabled_development_users(tmp_path)
     assert "devUsers" in result.stderr
 
 
-def test_restart_reconciles_password_and_opencloud_membership_for_chosen_user(tmp_path):
+ADMIN_ID = "6f1c7a52-0d1e-4c3b-9a55-1f0e2d3c4b5a"
+REALM_ADMIN_PASSWORD = "long password 'quoted' $literal \\ ü"
+
+
+def _admin_lookup_json(created_ms: int | None) -> str:
+    """What `kcadm get users --fields id,createdTimestamp` prints (pretty JSON)."""
+    if created_ms is None:
+        return "[ ]\n"
+    return (
+        "[ {\n"
+        f'  "id" : "{ADMIN_ID}",\n'
+        f'  "createdTimestamp" : {created_ms}\n'
+        "} ]\n"
+    )
+
+
+def _run_post_start(
+    tmp_path: Path, *, created_ms: int | None, fail: tuple[str, ...] = ()
+) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
+    """Run the real postStart hook against a kcadm double.
+
+    The CLI is the external boundary: the double records every argv, answers
+    the realm admin lookup with a user created at ``created_ms`` (or no user),
+    and fails the steps named in ``fail`` the way kcadm does (stderr, exit 1).
+    """
     resources = _resources(
         _render(tmp_path, {"bootstrapAdmin": {"username": "Team.Admin_1"}})
     )
@@ -112,17 +137,30 @@ def test_restart_reconciles_password_and_opencloud_membership_for_chosen_user(tm
     script = container["lifecycle"]["postStart"]["exec"]["command"][-1]
     log = tmp_path / "kcadm.jsonl"
     kcadm = tmp_path / "kcadm"
-    # The CLI is the external boundary. Execute the entire real shell hook and
-    # capture its actual argv, including quoting and the selected lookup filter.
     kcadm.write_text(
         f"#!{sys.executable}\n"
         "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
         "with open(os.environ['KCADM_LOG'], 'a') as out:\n"
-        "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        "    out.write(json.dumps(args) + '\\n')\n"
+        "fail = os.environ.get('KCADM_FAIL', '').split(',')\n"
+        "if args[:2] == ['get', 'users'] and any('createdTimestamp' in a for a in args):\n"
+        "    if 'admin-lookup' in fail:\n"
+        "        sys.stderr.write('HTTP 503 Service Unavailable\\n')\n"
+        "        sys.exit(1)\n"
+        "    sys.stdout.write(os.environ['KCADM_ADMIN_JSON'])\n"
+        "elif args[:1] == ['set-password'] and 'set-password' in fail:\n"
+        "    sys.stderr.write('invalidPasswordMinLengthMessage\\n')\n"
+        "    sys.exit(1)\n",
         encoding="utf-8",
     )
     kcadm.chmod(0o755)
-    env = {"PATH": os.environ["PATH"], "KCADM_LOG": str(log)}
+    env = {
+        "PATH": os.environ["PATH"],
+        "KCADM_LOG": str(log),
+        "KCADM_ADMIN_JSON": _admin_lookup_json(created_ms),
+        "KCADM_FAIL": ",".join(fail),
+    }
     env.update(
         {item["name"]: item["value"] for item in container["env"] if "value" in item}
     )
@@ -130,7 +168,7 @@ def test_restart_reconciles_password_and_opencloud_membership_for_chosen_user(tm
         {
             "KEYCLOAK_ADMIN": "master-admin",
             "KEYCLOAK_ADMIN_PASSWORD": "master-password",
-            "KC_REALM_ADMIN_PASSWORD": "long password 'quoted' $literal \\ ü",
+            "KC_REALM_ADMIN_PASSWORD": REALM_ADMIN_PASSWORD,
             "OPENCLOUD_KEYCLOAK_CLIENT_SECRET": "opencloud-test-secret",
         }
     )
@@ -144,25 +182,88 @@ def test_restart_reconciles_password_and_opencloud_membership_for_chosen_user(tm
         result = subprocess.run(
             ["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20
         )
-    assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    password_call = next(call for call in calls if call[0] == "set-password")
-    assert password_call == [
-        "set-password",
-        "-r",
-        "srw",
-        "--username",
-        "Team.Admin_1",
-        "--new-password",
-        "long password 'quoted' $literal \\ ü",
-    ]
-    admin_lookup = next(
-        call for call in calls if call[:2] == ["get", "users"] and "-q" in call
+    return result, calls
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def test_first_start_sets_the_initial_password_of_the_admin_it_imported(tmp_path):
+    # The realm import created the admin after this container started.
+    result, calls = _run_post_start(tmp_path, created_ms=_now_ms() + 60_000)
+    assert result.returncode == 0, result.stderr
+    assert "WARN" not in result.stdout
+    lookup = next(
+        call
+        for call in calls
+        if call[:2] == ["get", "users"] and any("createdTimestamp" in a for a in call)
     )
-    assert "username=Team.Admin_1" in admin_lookup
-    assert "exact=true" in admin_lookup
+    assert "username=Team.Admin_1" in lookup
+    assert "exact=true" in lookup
+    # Matched by the id of the user the lookup found, not by name again.
+    assert [call for call in calls if call[0] == "set-password"] == [
+        [
+            "set-password",
+            "-r",
+            "srw",
+            "--userid",
+            ADMIN_ID,
+            "--new-password",
+            REALM_ADMIN_PASSWORD,
+        ]
+    ]
+    # Every lookup of the chosen admin is exact, OpenCloud membership included.
+    for call in calls:
+        if "username=Team.Admin_1" in call:
+            assert "exact=true" in call
     credentials = next(call for call in calls if call[:2] == ["config", "credentials"])
     assert credentials[credentials.index("--user") + 1] == "master-admin"
+
+
+def test_later_starts_keep_the_password_the_admin_chose(tmp_path):
+    # The admin was created a day before this start: a restart, an upgrade or
+    # a rotated Secret must not reset the password.
+    result, calls = _run_post_start(tmp_path, created_ms=_now_ms() - 86_400_000)
+    assert result.returncode == 0, result.stderr
+    assert [call for call in calls if call[0] == "set-password"] == []
+    assert "WARN" not in result.stdout
+
+
+def test_a_renamed_admin_is_logged_instead_of_silently_skipped(tmp_path):
+    result, calls = _run_post_start(tmp_path, created_ms=None)
+    assert result.returncode == 0, result.stderr
+    assert [call for call in calls if call[0] == "set-password"] == []
+    assert "WARN: realm admin Team.Admin_1 not found in realm srw" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "fail,message",
+    [
+        (
+            ("admin-lookup",),
+            "WARN: kcadm realm admin lookup for Team.Admin_1 failed: "
+            "HTTP 503 Service Unavailable",
+        ),
+        (
+            ("set-password",),
+            "WARN: kcadm set-password for new realm admin Team.Admin_1 failed: "
+            "invalidPasswordMinLengthMessage",
+        ),
+    ],
+)
+def test_failures_are_logged_and_never_fail_the_hook(tmp_path, fail, message):
+    # A non-zero postStart exit kills the Keycloak container, so a failed
+    # lookup or set is reported and the hook carries on.
+    result, calls = _run_post_start(
+        tmp_path, created_ms=_now_ms() + 60_000, fail=fail
+    )
+    assert result.returncode == 0, result.stderr
+    assert message in result.stdout
+    assert REALM_ADMIN_PASSWORD not in result.stdout
+    # The steps after the password still run.
+    assert any(call[:2] == ["update", "realms/srw"] for call in calls)
 
 
 def _render_existing_identity(tmp_path: Path, username: str, existing: dict):
