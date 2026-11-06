@@ -101,7 +101,9 @@ IMAGES = {
 
 
 def _start(image: str, user: str, password: str, dbname: str) -> PostgresContainer:
-    container = PostgresContainer(image, username=user, password=password, dbname=dbname)
+    container = PostgresContainer(
+        image, username=user, password=password, dbname=dbname
+    )
     try:
         container.start()
     except Exception as exc:  # pragma: no cover - depends on the host
@@ -117,7 +119,9 @@ def _start(image: str, user: str, password: str, dbname: str) -> PostgresContain
     return container
 
 
-def _script(container: PostgresContainer, extensions: str, *steps: str) -> tuple[int, str]:
+def _script(
+    container: PostgresContainer, extensions: str, *steps: str
+) -> tuple[int, str]:
     """Run the script as the image's initdb does: as postgres, server up.
 
     With ``steps``, source it and call only those functions, which leaves the
@@ -136,7 +140,8 @@ def _script(container: PostgresContainer, extensions: str, *steps: str) -> tuple
         command = [
             "bash",
             "-c",
-            "set -Eeuo pipefail; . /tmp/postgres-roles.sh; check_inputs; " + "; ".join(steps),
+            "set -Eeuo pipefail; . /tmp/postgres-roles.sh; check_inputs; "
+            + "; ".join(steps),
         ]
     else:
         command = ["bash", "/tmp/postgres-roles.sh", "initdb"]
@@ -146,7 +151,9 @@ def _script(container: PostgresContainer, extensions: str, *steps: str) -> tuple
     return result.exit_code, result.output.decode()
 
 
-async def _connect(container: PostgresContainer, user: str, password: str, database: str):
+async def _connect(
+    container: PostgresContainer, user: str, password: str, database: str
+):
     return await asyncpg.connect(
         host=container.get_container_host_ip(),
         port=int(container.get_exposed_port(5432)),
@@ -167,7 +174,9 @@ async def _assert_split(container: PostgresContainer, extensions: str) -> str:
                 " rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname !~ '^pg_'"
             )
         }
-        assert set(roles) == {"postgres", "srw"}, "the split's helper roles must be gone"
+        assert set(roles) == {"postgres", "srw"}, (
+            "the split's helper roles must be gone"
+        )
         assert roles["postgres"]["oid"] == 10 and roles["postgres"]["rolsuper"]
         app = roles["srw"]
         assert app["rolcanlogin"]
@@ -183,7 +192,8 @@ async def _assert_split(container: PostgresContainer, extensions: str) -> str:
         )
         assert (
             await admin.fetchval(
-                "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1", APP_DB
+                "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1",
+                APP_DB,
             )
             == "srw"
         )
@@ -258,7 +268,9 @@ class _Rollback(Exception):
     [
         pytest.param((), id="uninterrupted"),
         pytest.param(("split_create_roles",), id="killed-after-step-1"),
-        pytest.param(("split_create_roles", "split_hand_over"), id="killed-after-step-2"),
+        pytest.param(
+            ("split_create_roles", "split_hand_over"), id="killed-after-step-2"
+        ),
         pytest.param(
             ("split_create_roles", "split_hand_over", "split_rename"),
             id="killed-after-step-3",
@@ -273,7 +285,10 @@ async def test_legacy_volume_converts_and_resumes(image_key, stop_after):
         legacy = await _connect(container, "srw", LEGACY_PASSWORD, APP_DB)
         try:
             assert await legacy.fetchval("SELECT rolsuper FROM pg_roles WHERE oid = 10")
-            assert await legacy.fetchval("SELECT rolname FROM pg_roles WHERE oid = 10") == "srw"
+            assert (
+                await legacy.fetchval("SELECT rolname FROM pg_roles WHERE oid = 10")
+                == "srw"
+            )
             await legacy.execute(LEGACY_OBJECTS)
         finally:
             await legacy.close()
@@ -330,7 +345,10 @@ async def test_refuses_a_second_role_named_like_the_superuser():
         legacy = await _connect(container, "srw", LEGACY_PASSWORD, APP_DB)
         try:
             # Nothing changed: the legacy role is still the superuser.
-            assert await legacy.fetchval("SELECT rolname FROM pg_roles WHERE oid = 10") == "srw"
+            assert (
+                await legacy.fetchval("SELECT rolname FROM pg_roles WHERE oid = 10")
+                == "srw"
+            )
         finally:
             await legacy.close()
     finally:

@@ -114,8 +114,17 @@ def _pod_specs(documents: list[dict]):
     """(kind/name, pod spec) for everything that runs a pod."""
     for document in documents:
         spec = document.get("spec") or {}
-        if document["kind"] in {"Deployment", "StatefulSet", "DaemonSet", "Job", "ReplicaSet"}:
-            yield f"{document['kind']}/{document['metadata']['name']}", spec["template"]["spec"]
+        if document["kind"] in {
+            "Deployment",
+            "StatefulSet",
+            "DaemonSet",
+            "Job",
+            "ReplicaSet",
+        }:
+            yield (
+                f"{document['kind']}/{document['metadata']['name']}",
+                spec["template"]["spec"],
+            )
         elif document["kind"] == "CronJob":
             yield (
                 f"CronJob/{document['metadata']['name']}",
@@ -137,7 +146,9 @@ def _secret_readers(pod_spec: dict, secret: str) -> set[str]:
             for source in (volume.get("projected") or {}).get("sources", [])
         )
     }
-    for container in pod_spec.get("initContainers", []) + pod_spec.get("containers", []):
+    for container in pod_spec.get("initContainers", []) + pod_spec.get(
+        "containers", []
+    ):
         if any(
             (entry.get("secretRef") or {}).get("name") == secret
             for entry in container.get("envFrom", [])
@@ -182,7 +193,11 @@ def test_statefulset_makes_postgres_the_superuser_and_runs_the_split(key: str) -
 
     assert init["name"] == "postgres-roles"
     assert init["image"] == database["image"]
-    assert init["command"] == ["bash", "/srw-postgres-roles/postgres-roles.sh", "upgrade"]
+    assert init["command"] == [
+        "bash",
+        "/srw-postgres-roles/postgres-roles.sh",
+        "upgrade",
+    ]
     assert {(m["name"], m["mountPath"]) for m in init["volumeMounts"]} == {
         ("data", "/var/lib/postgresql/data"),
         ("postgres-roles", "/srw-postgres-roles"),
@@ -236,7 +251,8 @@ def test_superuser_secret_is_separate_generated_and_kept() -> None:
     [secret] = [
         document
         for document in documents
-        if document["kind"] == "Secret" and document["metadata"]["name"] == SUPERUSER_SECRET
+        if document["kind"] == "Secret"
+        and document["metadata"]["name"] == SUPERUSER_SECRET
     ]
     assert secret["metadata"]["annotations"]["helm.sh/resource-policy"] == "keep"
     assert set(secret["stringData"]) == {
@@ -260,7 +276,9 @@ def test_superuser_secret_is_separate_generated_and_kept() -> None:
 def test_operator_value_wins_and_never_reaches_the_application_secret() -> None:
     documents = _render(
         "secrets.create=true",
-        strings=("secrets.values.POSTGRES_SUPERUSER_PASSWORD=from-the-values-file-0123456789",),
+        strings=(
+            "secrets.values.POSTGRES_SUPERUSER_PASSWORD=from-the-values-file-0123456789",
+        ),
     )
     secrets = {
         document["metadata"]["name"]: document
@@ -275,7 +293,9 @@ def test_operator_value_wins_and_never_reaches_the_application_secret() -> None:
     for name, secret in secrets.items():
         if name == SUPERUSER_SECRET:
             continue
-        assert "POSTGRES_SUPERUSER_PASSWORD" not in (secret.get("stringData") or {}), name
+        assert "POSTGRES_SUPERUSER_PASSWORD" not in (secret.get("stringData") or {}), (
+            name
+        )
         assert "from-the-values-file-0123456789" not in yaml.safe_dump(secret), name
 
 
@@ -300,11 +320,15 @@ def test_no_application_pod_can_read_the_superuser_secret() -> None:
         )
     }
     canvas_job = {
-        name: containers for name, containers in readers.items() if "canvas-gateway-role" in name
+        name: containers
+        for name, containers in readers.items()
+        if "canvas-gateway-role" in name
     }
-    assert {name: containers for name, containers in readers.items() if name not in canvas_job} == (
-        database_pods
-    )
+    assert {
+        name: containers
+        for name, containers in readers.items()
+        if name not in canvas_job
+    } == (database_pods)
     assert list(canvas_job.values()) == [{"reconcile-legacy-identity"}]
 
 
@@ -313,7 +337,8 @@ def test_canvas_role_job_creates_its_login_as_the_superuser_only() -> None:
     [job] = [
         document
         for document in documents
-        if document["kind"] == "Job" and "canvas-gateway-role" in document["metadata"]["name"]
+        if document["kind"] == "Job"
+        and "canvas-gateway-role" in document["metadata"]["name"]
     ]
     users = {
         container["name"]: _env(container).get("PGUSER")
@@ -338,7 +363,9 @@ def test_cnpg_and_unsplit_databases_render_no_split() -> None:
     documents = _render()
     for component in UNSPLIT:
         statefulset = _statefulset(documents, component)
-        assert "initContainers" not in statefulset["spec"]["template"]["spec"], component
+        assert "initContainers" not in statefulset["spec"]["template"]["spec"], (
+            component
+        )
 
 
 def test_one_cnpg_database_keeps_the_others_split() -> None:
@@ -346,7 +373,9 @@ def test_one_cnpg_database_keeps_the_others_split() -> None:
     names = {d["metadata"]["name"] for d in documents if d["kind"] == "StatefulSet"}
     assert f"{FULLNAME}-pgvector" not in names
     for component in ("postgres", "auditdb"):
-        assert _statefulset(documents, component)["spec"]["template"]["spec"]["initContainers"]
+        assert _statefulset(documents, component)["spec"]["template"]["spec"][
+            "initContainers"
+        ]
 
 
 def test_app_role_named_like_the_superuser_fails_the_render() -> None:
