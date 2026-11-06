@@ -269,6 +269,20 @@ _MUTATION_CAPABILITIES = (
         authorization=_EDITOR_AUTH,
     ),
     _mutation(
+        "accept_job_diff",
+        "POST /api/jobs/{job_id}/accept",
+        "writes a pending-review job's project-folder diff into the project "
+        "cloud folder and completes the job",
+        authorization=_EDITOR_AUTH,
+        open_world=True,
+    ),
+    _mutation(
+        "reject_job_diff",
+        "POST /api/jobs/{job_id}/reject",
+        "discards a pending-review job's project-folder diff and completes the job",
+        authorization=_EDITOR_AUTH,
+    ),
+    _mutation(
         "resume_job_with_feedback",
         "POST /api/jobs/{job_id}/resume",
         "resumes agent execution and may append feedback",
@@ -498,6 +512,37 @@ _MUTATION_CAPABILITIES = (
         "queuing durably for his next wake",
         authorization=_OWNER_AUTH,
         open_world=True,
+    ),
+    _mutation(
+        "commission_officer",
+        "POST /api/projects/{project_id}/officer/commission",
+        "starts a standing project officer with his own pod that wakes, "
+        "dispatches worker jobs and spends tokens until decommissioned",
+        authorization=(
+            _OWNER_AUTH + "; unattended_operations grant enforced server-side"
+        ),
+        open_world=True,
+    ),
+    _mutation(
+        "decommission_officer",
+        "POST /api/projects/{project_id}/officer/decommission",
+        "ends the officer's session and leaves the post vacant; jobs keep running",
+        authorization=_OWNER_AUTH,
+        destructive=True,
+    ),
+    _mutation(
+        "hold_officer",
+        "POST /api/projects/{project_id}/officer/hold",
+        "pauses the officer: no wakes or dispatches until released",
+        authorization=_OWNER_AUTH,
+        idempotent=True,
+    ),
+    _mutation(
+        "release_officer",
+        "POST /api/projects/{project_id}/officer/release",
+        "lifts the officer's maintenance hold; queued events reach him",
+        authorization=_OWNER_AUTH,
+        idempotent=True,
     ),
     _mutation(
         "create_persistent_thread",

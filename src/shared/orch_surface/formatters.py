@@ -3571,6 +3571,69 @@ def _officer_recent_lines(recent: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_officer_commission_result(data: dict[str, Any]) -> str:
+    """Say who now holds the post and what he starts from."""
+    thread_id = data.get("thread_id")
+    lines = [
+        f"Officer commissioned (thread {_short_id(thread_id)}"
+        + (f', "{data["title"]}"' if data.get("title") else "")
+        + ")."
+    ]
+    if data.get("state_restored"):
+        lines.append("His state from the previous incarnation was restored.")
+    vacant = int(data.get("while_vacant") or 0)
+    if vacant:
+        lines.append(f"{vacant} event(s) recorded while the post was vacant reach him.")
+    lines.append(
+        "His first wake is the continuity brief. He has no order yet: give him "
+        "one with send_officer_note, and watch him with get_project_officer."
+    )
+    return "\n".join(lines)
+
+
+def format_officer_decommission_result(data: dict[str, Any]) -> str:
+    """A warning is not a decommission: say which one happened."""
+    jobs = list(data.get("in_flight_jobs") or [])
+    if data.get("status") == "in_flight":
+        listed = "\n".join(
+            f"- {_short_id(j.get('job_id'))} {j.get('status') or ''} "
+            f"{j.get('title') or ''}".rstrip()
+            for j in jobs
+        )
+        return (
+            "NOT decommissioned: "
+            + (data.get("warning") or f"{len(jobs)} job(s) in flight.")
+            + (f"\n{listed}" if listed else "")
+            + "\nThose jobs keep running either way; call again with force=true "
+            "to stand him down."
+        )
+    tail = (
+        f" {len(jobs)} job(s) left running; their completions wait on the vacant post."
+        if jobs
+        else ""
+    )
+    return (
+        f"Officer decommissioned (thread {_short_id(data.get('thread_id'))}). "
+        "His state is kept on the post; commission_officer brings him back with "
+        "it." + tail
+    )
+
+
+def format_officer_hold_result(data: dict[str, Any]) -> str:
+    """Hold or release, and whether he was told."""
+    told = (
+        "He was told."
+        if data.get("notified")
+        else "He was not live; he finds it at his next wake."
+    )
+    if data.get("status") == "released":
+        return f"Hold released (thread {_short_id(data.get('thread_id'))}). {told}"
+    return (
+        f"Officer on maintenance hold (thread {_short_id(data.get('thread_id'))}): "
+        "no wakes, no dispatches until release_officer. " + told
+    )
+
+
 def format_officer_note_result(data: dict[str, Any]) -> str:
     """State how a note landed. 'Sent' is not an outcome here."""
     delivered = data.get("delivered")

@@ -140,6 +140,10 @@ spec:
           job_control:
             - create_job
             - approve_job
+            # A job whose work changed the project's cloud folder ends in a
+            # pending diff that approve_job refuses; these two decide it.
+            - accept_job_diff
+            - reject_job_diff
             - resume_job_with_feedback
             - cancel_job
             - pause_job
