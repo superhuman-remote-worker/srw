@@ -104,6 +104,68 @@ This keeps each enabled internal PostgreSQL database on one chart-owned
 StatefulSet. It is appropriate for evaluation, local development, and
 non-HA/self-hosted installations that accept single-node database availability.
 
+### Bundled Postgres roles
+
+On the `statefulset` engine, SRW's three database servers (`postgres`,
+`vector`, `audit`) each have two roles:
+
+| role | what it is | password |
+|---|---|---|
+| `postgres` | the bootstrap superuser, for maintenance only | `<release>-db-superuser` Secret, keys `POSTGRES_SUPERUSER_PASSWORD`, `VECTOR_POSTGRES_SUPERUSER_PASSWORD`, `AUDIT_POSTGRES_SUPERUSER_PASSWORD` |
+| `srw` (`*_POSTGRES_USER`) | SRW's own role: `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, owner of its database and of every schema object in it | the application Secret, `*_POSTGRES_PASSWORD` |
+
+This is how CloudNativePG already runs these databases. The orchestrator,
+agents, executors, migrations and pgAdmin connect as `srw` only. The
+superuser Secret is read by the three database pods and, when it provisions
+the Dynamic Canvas login on the app database, by one init container of the
+Canvas gateway's role Job (`CREATE ROLE` needs a superuser). Agent pods take
+the application Secret whole through `envFrom`, which is why the superuser
+passwords are not in it.
+
+The superuser creates the extensions the migrations need, before they run:
+`uuid-ossp` and `btree_gist` in `srw`; `uuid-ossp`, `vector` and `pg_trgm` in
+`srw_vector`; none in `srw_audit`. Extensions are owned by `postgres`. `vector`
+is not a trusted extension, so `srw` could not create it itself. A future
+migration that needs another untrusted extension must add it to
+`srw.postgresRolesDatabases` in `templates/databases/_postgres-roles.tpl`
+(a chart test fails until it does).
+
+**How the passwords are set.** The chart generates each superuser password
+once and keeps it, like its other generated credentials. A value in
+`secrets.values` (for example `secrets.values.POSTGRES_SUPERUSER_PASSWORD`)
+wins, in every Secret mode; the chart routes it to the superuser Secret, never
+to the application Secret. Do not put these keys in an ESO bundle or a
+pre-existing application Secret: agents would receive them.
+
+Every start of a database pod runs the `postgres-roles` init container, which
+sets both `postgres`'s and `srw`'s passwords from their Secrets. To rotate
+either one, change the Secret and restart that database pod, then restart the
+pods that connect as `srw`.
+
+**Maintenance as the superuser.** Inside the database pod the Unix socket
+needs no password:
+
+```bash
+kubectl -n srw exec -it srw-postgres-0 -c postgres -- psql -U postgres -d srw
+kubectl -n srw exec -it srw-pgvector-0 -c pgvector -- psql -U postgres -d srw_vector
+kubectl -n srw exec -it srw-auditdb-0 -c auditdb -- psql -U postgres -d srw_audit
+```
+
+Over the network (a port-forward, a backup tool), use the password:
+
+```bash
+kubectl -n srw get secret srw-db-superuser \
+  -o jsonpath='{.data.POSTGRES_SUPERUSER_PASSWORD}' | base64 -d
+```
+
+An object you create as `postgres` in an SRW database belongs to `postgres`,
+and a later migration that alters it fails. Create objects for SRW as `srw`
+(`SET ROLE srw;` after connecting as `postgres`), or hand them over with
+`ALTER ... OWNER TO srw`.
+
+Gitea's, Keycloak's and Nextcloud's bundled databases are unchanged: their
+application role is still the image's superuser.
+
 ### HA installation: install CNPG first
 
 The SRW chart owns its namespaced `Cluster`, `DatabaseRole`, credential, backup,
@@ -549,8 +611,8 @@ key — both layouts coexist (the app falls back to the URL if user+password
 aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`
 - `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD` — pgvector has its
-  own superuser password (separate from the main Postgres) so a credential
-  leak on one instance doesn't compromise the other. Citations, embeddings,
+  own password (separate from the main Postgres) so a credential leak on one
+  instance doesn't compromise the other. Citations, embeddings,
   and memories all live in this instance (`srw_vector`); the citation engine
   is a native SRW subsystem on the vector pool, **not** a separate role or
   database. The former `srw_citations` / `citation_engine` database is retired.
@@ -569,6 +631,11 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 For external-mode databases (`internal: false`), the host/port/db come
 from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
+
+`POSTGRES_SUPERUSER_PASSWORD`, `VECTOR_POSTGRES_SUPERUSER_PASSWORD` and
+`AUDIT_POSTGRES_SUPERUSER_PASSWORD` are **not** application Secret keys. The
+chart keeps them in `<release>-db-superuser`; see
+[Bundled Postgres roles](#bundled-postgres-roles).
 
 An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
 receives the application `POSTGRES_*` credential. For a chart-owned
@@ -599,7 +666,9 @@ only while `viewer.enabled=true`.
 
 External PostgreSQL remains operator-provisioned because the Helm release does
 not own its control plane. The legacy bundled StatefulSet keeps its existing
-development-only identity branch until that engine is retired. Keep the
+development-only identity branch until that engine is retired; that one step
+logs in as the bundled database's superuser, because SRW's role there cannot
+create roles. Keep the
 gateway's database lifecycle, Secret rotation, and backup policy aligned with
 the operator that owns the external database.
 
@@ -1821,6 +1890,56 @@ helm upgrade srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 
 The chart preserves `APP_ENCRYPTION_KEY` across upgrades when `secrets.create=true`
 via `lookup`. ESO mode reads from Vault on each refresh interval.
+
+### Bundled Postgres: SRW's role stops being a superuser
+
+Chart 0.1.0 and earlier ran SRW's role on the `statefulset` engine as the
+image's bootstrap superuser. The first upgrade to a newer chart converts each
+of the three SRW databases in place; see
+[Bundled Postgres roles](#bundled-postgres-roles) for the result. Nothing to
+do by hand, and it works the same under Fleet or another GitOps tool.
+
+What happens:
+
+- The `postgres`, `pgvector` and `auditdb` pods restart once. The new
+  `postgres-roles` init container starts a temporary server that listens on
+  the pod's Unix socket only, so no client is connected while roles change.
+- It renames the bootstrap superuser `srw` to `postgres` and gives it the
+  password from `<release>-db-superuser`. It creates a new ordinary role,
+  hands it the database and every schema, table, sequence, view, function and
+  type the old role owned (extensions stay with `postgres`), and names it
+  `srw` with the unchanged application password. Renaming is necessary:
+  PostgreSQL 16 refuses to remove superuser from the bootstrap role, and on 15
+  that role would still own the system catalogs.
+- The init container logs each step (`kubectl -n srw logs srw-postgres-0 -c
+  postgres-roles`). It takes seconds; it locks every relation of the database
+  in one transaction, so it does not run beside live traffic.
+
+Every step is idempotent and reads its state from the catalog, so a pod killed
+during the conversion finishes it on the next start, and later starts change
+nothing. At every point the bootstrap role is a superuser with a known
+password: the old application password until the rename, the superuser
+Secret's after it, and always the trusted Unix socket inside the pod.
+
+Check the result:
+
+```bash
+kubectl -n srw exec srw-postgres-0 -c postgres -- psql -U postgres -Atc \
+  "SELECT rolname, rolsuper FROM pg_roles WHERE rolname IN ('postgres', 'srw')"
+# postgres|t
+# srw|f
+```
+
+If the init container fails, the database pod stays in `Init:` and SRW is
+down; its log names the problem. The one known cause is a role already named
+`postgres` that is not the bootstrap superuser: rename or drop it (`kubectl
+exec` into the pod, `psql -U srw`) and delete the pod. Objects of other kinds
+(operators, collations, event triggers, ...) are never created by SRW; if you
+made one by hand as `srw`, the log warns that it stays with `postgres`.
+
+Rolling back to chart 0.1.0 afterwards works: SRW's role is no longer a
+superuser, but it owns everything SRW uses. To restore the old state as
+well, run `ALTER ROLE srw SUPERUSER` as `postgres`.
 
 ### What an upgrade leaves alone in the bundled Keycloak realm
 

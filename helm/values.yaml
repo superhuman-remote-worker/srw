@@ -1855,6 +1855,11 @@ secrets:
   # -- Mode 3: Reference a pre-existing K8s Secret by name
   existingSecret: ""
   # -- Mode 2: Chart creates a Secret from the values below (dev/testing only)
+  #    POSTGRES_SUPERUSER_PASSWORD, VECTOR_POSTGRES_SUPERUSER_PASSWORD and
+  #    AUDIT_POSTGRES_SUPERUSER_PASSWORD are the exception, in every mode: the
+  #    bundled databases' superuser passwords go to <release>-db-superuser,
+  #    never into this Secret (agents read it whole). Empty = generated once
+  #    and kept. See helm/README.md "Bundled Postgres roles".
   create: false
   values: {}
   # -- Separate existing secret for VM SSH key (optional)
