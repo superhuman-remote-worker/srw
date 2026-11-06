@@ -1,13 +1,15 @@
-"""A kb_update on the graph tier keeps a link whose target note is not written yet.
+"""Links to notes not written yet, on the graph tier, against a real Neo4j.
 
-Against a real ``neo4j:5-community``: ``create_note`` MATCHes a link's target
-before it writes the edge, so a forward reference never reaches the graph and
-lives in the note's file alone. ``kb_update`` re-renders the whole file, and
-built its links block from the graph's edges, so the first update dropped the
-link (dev, 11-04). The stored row the update reads is made the way the
-reindexer makes it: from the file the write sent, through ``note_fields``.
+An edge needs both notes, so a forward reference used to reach the file alone:
+``kb_update`` re-rendered the file from the graph's edges and dropped it (dev,
+11-04), and it never became an edge even once its target was written (dev,
+11-06). The graph now keeps such a link pending on its source and makes the
+edge when the target is created; an update hands the graph every link of the
+file it lacks, which also heals notes written before pending links existed.
 
-Skips without a container runtime or the neo4j driver.
+The stored row an update reads is made the way the reindexer makes it: from
+the file the write sent, through ``note_fields``. Runs ``neo4j:5-community``;
+skips without a container runtime or the neo4j driver.
 """
 
 from __future__ import annotations
@@ -163,3 +165,74 @@ def test_a_forward_link_survives_an_append_on_the_graph_tier(kg):
     assert "**REFERENCES:** [not-written-yet](not-written-yet.md)" in body
     assert body.count("[in-the-graph](in-the-graph.md)") == 1
     assert body.index("Rotate keys.") < body.index("## Relationships")
+
+
+def _pending(kg, project_id, slug):
+    return kg.read_note(project_id, slug)["pending_relationships"]
+
+
+def test_a_forward_link_becomes_an_edge_once_its_target_is_written(kg):
+    project_id = str(uuid.uuid4())
+    tools, _ = _tools(kg, project_id)
+
+    result, _ = _call(
+        tools["kb_write"],
+        {
+            "title": "Auth",
+            "type": "decision",
+            "content": "We use JWT.",
+            "links": [{"target": "token-rotation", "type": "REFERENCES"}],
+        },
+    )
+    assert result.startswith("Created"), result
+    assert _edges(kg, project_id, "auth") == set()
+    assert _pending(kg, project_id, "auth") == [
+        {"type": "REFERENCES", "target": "token-rotation"}
+    ]
+    # The reader still sees the link while its target is missing.
+    assert "- **REFERENCES** → [[token-rotation]]" in tools["kb_read"].invoke(
+        {"note": "auth"}
+    )
+
+    result, _ = _call(
+        tools["kb_write"],
+        {"title": "Token Rotation", "type": "learning", "content": "Monthly."},
+    )
+    assert result.startswith("Created"), result
+    assert _edges(kg, project_id, "auth") == {("REFERENCES", "token-rotation")}
+    assert _pending(kg, project_id, "auth") == []
+    read = tools["kb_read"].invoke({"note": "token-rotation"})
+    assert "[[auth]] (Auth) **REFERENCES** → this" in read
+
+
+def test_an_update_makes_the_edge_an_older_write_never_made(kg):
+    project_id = str(uuid.uuid4())
+    tools, ctx = _tools(kg, project_id)
+
+    _, sent = _call(
+        tools["kb_write"],
+        {
+            "title": "Old Note",
+            "type": "decision",
+            "content": "Written before pending links.",
+            "links": [{"target": "its-target", "type": "DEPENDS_ON"}],
+        },
+    )
+    written = sent[-1]
+    # What a graph written before this change holds: no edge, nothing pending.
+    kg._db.execute_write(
+        "MATCH (a:Note {project_id: $pid, id: 'old-note'}) REMOVE a.pending_links",
+        {"pid": project_id},
+    )
+    _call(
+        tools["kb_write"],
+        {"title": "Its Target", "type": "learning", "content": "Exists now."},
+    )
+    assert _edges(kg, project_id, "old-note") == set()
+
+    ctx.knowledge_store.get_note_by_slug.return_value = _indexed_row(
+        "old-note", written
+    )
+    result, _ = _call(tools["kb_update"], {"note": "old-note", "append": "Touched."})
+    assert result.startswith("Updated **"), result
+    assert _edges(kg, project_id, "old-note") == {("DEPENDS_ON", "its-target")}

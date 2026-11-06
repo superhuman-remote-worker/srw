@@ -2300,6 +2300,21 @@ def create_kb_tools(
             # best-effort degradation contract without letting it falsify the
             # durable Git/pgvector convergence ledger.
             graph_error: Optional[Exception] = None
+            # Every link the file now holds that is not an edge yet: the new
+            # ones, and any the graph never made (its target did not exist
+            # then, or the note predates pending links). The graph makes the
+            # edge where the target exists and keeps the rest pending.
+            graph_edges = {
+                (str(rel.get("type") or "REFERENCES"), str(rel.get("target")))
+                for rel in existing.get("relationships") or []
+                if isinstance(rel, dict)
+            }
+            links_to_project = [
+                rel
+                for rel in relationships
+                if (str(rel.get("type") or "REFERENCES"), str(rel["target"]))
+                not in graph_edges
+            ]
             try:
                 updated = kg.update_note(
                     project_id=project_id,
@@ -2311,7 +2326,7 @@ def create_kb_tools(
                     add_tags=[
                         tag for tag in tag_change.tags if tag not in _prior_normalized
                     ],
-                    add_links=add_links,
+                    add_links=links_to_project,
                     remove_tags=[
                         tag for tag in _prior_normalized if tag not in tag_change.tags
                     ],
@@ -3041,7 +3056,9 @@ def create_kb_tools(
 
             # Relationships
             rels = data.get("relationships", [])
-            if rels:
+            # Graph tier: links whose target is not in the graph yet.
+            pending = data.get("pending_relationships") or []
+            if rels or pending:
                 lines.extend(["", "## Outgoing Relationships"])
                 for r in rels:
                     target = _qualified(binding, r["target"])
@@ -3049,6 +3066,9 @@ def create_kb_tools(
                         f"- **{r['type']}** → [[{target}]] "
                         f"({r.get('target_title', '')})"
                     )
+                for r in pending:
+                    target = _qualified(binding, r["target"])
+                    lines.append(f"- **{r['type']}** → [[{target}]]")
 
             incoming = data.get("incoming_relationships", [])
             if incoming:

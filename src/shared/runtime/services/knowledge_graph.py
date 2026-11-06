@@ -96,6 +96,10 @@ RELATIONSHIP_TYPES = frozenset(
     }
 )
 
+# A link whose target note does not exist yet is kept on its source note as
+# "<TYPE>|<target>" in ``pending_links`` until the target is written.
+_PENDING_SEP = "|"
+
 
 def slugify(title: str, max_length: int = 80) -> str:
     """Generate a URL-safe slug from a title.
@@ -288,20 +292,65 @@ class KnowledgeGraphDB:
             if rel_type not in RELATIONSHIP_TYPES:
                 logger.warning(f"Unknown relationship type: {rel_type}, skipping")
                 continue
-            # Use APOC or dynamic relationship - fallback to individual queries
-            self._db.execute_write(
-                f"""
-                MATCH (a:Note {{project_id: $pid, id: $src}})
-                MATCH (b:Note {{project_id: $pid, id: $tgt}})
-                MERGE (a)-[:{rel_type}]->(b)
-                """,
-                {"pid": project_id, "src": slug, "tgt": target},
-            )
+            self._link(project_id, slug, rel_type, target)
+
+        # Links other notes made to this one before it existed.
+        self._resolve_pending_links(project_id, slug)
 
         logger.debug(
             f"Created knowledge note: {slug} (type={note_type}, project={project_id})"
         )
         return slug
+
+    def _link(self, project_id: str, src: str, rel_type: str, target: str) -> None:
+        """Write one outgoing link of ``src``, whether or not ``target`` exists.
+
+        An edge needs both nodes, and a note may link to one written later. The
+        link is then kept on ``src`` as a pending entry, which
+        ``_resolve_pending_links`` turns into the edge when the target is
+        created; making the edge clears the entry. ``rel_type`` must already be
+        one of ``RELATIONSHIP_TYPES``: it is spliced into the query.
+        """
+        self._db.execute_write(
+            f"""
+            MATCH (a:Note {{project_id: $pid, id: $src}})
+            OPTIONAL MATCH (b:Note {{project_id: $pid, id: $tgt}})
+            FOREACH (_ IN CASE WHEN b IS NULL THEN [] ELSE [1] END |
+                MERGE (a)-[:{rel_type}]->(b))
+            WITH a, b,
+                 [p IN coalesce(a.pending_links, []) WHERE p <> $entry] AS rest
+            SET a.pending_links = CASE
+                WHEN b IS NULL THEN rest + $entry
+                WHEN size(rest) = 0 THEN null
+                ELSE rest
+            END
+            """,
+            {
+                "pid": project_id,
+                "src": src,
+                "tgt": target,
+                "entry": f"{rel_type}{_PENDING_SEP}{target}",
+            },
+        )
+
+    def _resolve_pending_links(self, project_id: str, note_id: str) -> None:
+        """Make the edges other notes asked for before ``note_id`` existed."""
+        suffix = f"{_PENDING_SEP}{note_id}"
+        rows = self._db.execute_query(
+            """
+            MATCH (a:Note {project_id: $pid})
+            WHERE any(p IN coalesce(a.pending_links, []) WHERE p ENDS WITH $suffix)
+            RETURN a.id AS src,
+                   [p IN a.pending_links WHERE p ENDS WITH $suffix] AS entries
+            """,
+            {"pid": project_id, "suffix": suffix},
+        )
+        for row in rows or []:
+            for entry in row.get("entries") or []:
+                rel_type, _, target = entry.partition(_PENDING_SEP)
+                # ENDS WITH also matches a target that merely ends in this id.
+                if target == note_id and rel_type in RELATIONSHIP_TYPES:
+                    self._link(project_id, row["src"], rel_type, note_id)
 
     # =========================================================================
     # Read
@@ -345,6 +394,15 @@ class KnowledgeGraphDB:
 
         props["tags"] = record.get("tags", [])
         props["keywords"] = record.get("keywords", [])
+        # Links to notes not written yet (see ``_link``): no edge, no title.
+        props["pending_relationships"] = [
+            {"type": rel_type, "target": target}
+            for rel_type, _, target in (
+                str(entry).partition(_PENDING_SEP)
+                for entry in props.pop("pending_links", None) or []
+            )
+            if target
+        ]
 
         # Get outgoing relationships
         rels = self._db.execute_query(
@@ -552,14 +610,7 @@ class KnowledgeGraphDB:
             target = link.get("target")
             if not target or rel_type not in RELATIONSHIP_TYPES:
                 continue
-            self._db.execute_write(
-                f"""
-                MATCH (a:Note {{project_id: $pid, id: $src}})
-                MATCH (b:Note {{project_id: $pid, id: $tgt}})
-                MERGE (a)-[:{rel_type}]->(b)
-                """,
-                {"pid": project_id, "src": note_id, "tgt": target},
-            )
+            self._link(project_id, note_id, rel_type, target)
 
         logger.debug(f"Updated knowledge note: {note_id}")
         return True
