@@ -59749,8 +59749,27 @@ class PostgresDB:
                 error,
             )
 
+    async def assert_project_deletable(self, project_id: str) -> None:
+        """Raise the 409 ``delete_project`` would raise, deleting nothing.
+
+        The project delete calls this before it removes anything outside the
+        database (the vault repo, the search index). ``delete_project`` runs
+        the same checks again in its own transaction, so work admitted in
+        between is still refused there.
+        """
+        from orchestrator.services.manifest_retirement import (
+            assert_project_retirable,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await assert_project_retirable(conn, UUID(project_id))
+
     async def delete_project(self, project_id: str) -> bool:
         """Delete a project (cascades to members, repos).
+
+        Its jobs and its own datasources stay, detached. All of it happens in
+        one transaction: a refused delete changes nothing.
 
         Args:
             project_id: Project UUID
@@ -59779,12 +59798,17 @@ class PostgresDB:
                 # junction child) before the project FK cascade reaches the
                 # same rows. Stable ordering also prevents two project deletes
                 # sharing connectors from acquiring parent locks inversely.
+                # The project's own datasources are detached below, so they
+                # are locked here, in the same order.
                 await conn.fetch(
                     """
                     SELECT d.id
                     FROM datasources d
-                    JOIN project_datasources pd ON pd.datasource_id = d.id
-                    WHERE pd.project_id = $1
+                    WHERE d.project_id = $1
+                       OR EXISTS (
+                           SELECT 1 FROM project_datasources pd
+                           WHERE pd.datasource_id = d.id AND pd.project_id = $1
+                       )
                     ORDER BY d.id
                     FOR UPDATE OF d
                     """,
@@ -59813,6 +59837,23 @@ class PostgresDB:
                     """,
                     uuid_val,
                     project_managed_keys(uuid_val),
+                )
+                # Jobs and datasources have no ON DELETE action on project_id.
+                # Detaching them here, not before this transaction, keeps them
+                # in the project when the delete is refused.
+                await conn.execute(
+                    """
+                    UPDATE jobs SET project_id = NULL
+                    WHERE id IN (
+                        SELECT id FROM jobs WHERE project_id = $1
+                        ORDER BY id FOR UPDATE
+                    )
+                    """,
+                    uuid_val,
+                )
+                await conn.execute(
+                    "UPDATE datasources SET project_id = NULL WHERE project_id = $1",
+                    uuid_val,
                 )
                 result = await conn.execute(
                     "DELETE FROM projects WHERE id = $1",

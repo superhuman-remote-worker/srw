@@ -341,6 +341,7 @@ def _project_store(delete):
         yield SimpleNamespace(execute=AsyncMock())
 
     return SimpleNamespace(
+        assert_project_deletable=AsyncMock(),
         get_project_repositories=AsyncMock(return_value=[]),
         acquire=acquire,
         delete_project=delete,

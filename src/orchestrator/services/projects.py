@@ -747,6 +747,11 @@ async def delete_project(
     if project.get("is_default"):
         raise HTTPException(status_code=400, detail="Cannot delete a default project")
 
+    # The vault repo cannot come back, and its delete must come before the
+    # row's (a retry needs the row). So the refusal comes first: a project
+    # with a resumable session or unfinished work stays whole.
+    await store.assert_project_deletable(project_id)
+
     # Clean up managed repos
     repos = await store.get_project_repositories(project_id)
     for repo in repos:
@@ -758,27 +763,6 @@ async def delete_project(
                     status_code=503,
                     detail="Repository credential revocation is retryable",
                 )
-
-    # Clean up knowledge_index in vector DB (no FK cascade across databases)
-    try:
-        async with dependencies.vector_db.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id)
-            )
-    except Exception as e:
-        logger.warning(
-            f"Failed to clean up knowledge_index for project {project_id}: {e}"
-        )
-
-    # Detach referencing rows that lack ON DELETE CASCADE/SET NULL
-    uuid_val = UUID(project_id)
-    async with store.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val
-        )
-        await conn.execute(
-            "UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val
-        )
 
     # The project's per-folder principals go before its folder does (their
     # rows outlive the project; what this cannot finish, the sweep does).
@@ -792,6 +776,19 @@ async def delete_project(
     success = await store.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    # Nothing cascades into the vector DB. This runs after the row, so a
+    # refused delete keeps the index; what a failure here leaves, no search
+    # reaches.
+    try:
+        async with dependencies.vector_db.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id)
+            )
+    except Exception as e:
+        logger.warning(
+            f"Failed to clean up knowledge_index for project {project_id}: {e}"
+        )
 
     # Nothing cascades into Neo4j. This runs after the row is gone, so a
     # refused delete leaves the graph alone; what it cannot remove (Neo4j

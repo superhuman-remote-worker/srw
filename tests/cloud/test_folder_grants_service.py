@@ -192,6 +192,7 @@ async def test_deleting_a_project_revokes_its_grants_before_the_row_goes(
 
     monkeypatch.setattr(folder_grants, "revoke_folder_grants", revoke)
     store = SimpleNamespace(
+        assert_project_deletable=AsyncMock(),
         get_project_repositories=AsyncMock(return_value=[]),
         acquire=_acquire,
         delete_project=delete,
