@@ -53,11 +53,14 @@ data:
       "registrationAllowed": true,
       "registrationEmailAsUsername": false,
       {{- /* Only with mail: otherwise "Register" ends at a verification
-           message that is never sent. The postStart hook re-asserts it. */}}
+           message that is never sent, and "Forgot password?" at a reset
+           mail that is never sent. Seeded once, like the whole realm: no
+           restart rewrites them, so an admin's choice in Realm settings ->
+           Login stands. Existing realms: docs/troubleshooting.md. */}}
       "verifyEmail": {{ include "srw.keycloak.mailConfigured" . }},
       "loginWithEmailAllowed": true,
       "duplicateEmailsAllowed": false,
-      "resetPasswordAllowed": true,
+      "resetPasswordAllowed": {{ include "srw.keycloak.mailConfigured" . }},
       "editUsernameAllowed": false,
       {{- /* TLS terminates at the ingress, so "all" would reject in-cluster
            plaintext traffic. "external" is Keycloak's own default: HTTPS
@@ -990,15 +993,11 @@ spec:
                       $KC create "realms/{{ .Values.keycloak.realm }}/clear-realm-cache" 2>&1 || \
                         echo "WARN: kcadm clear-realm-cache failed"
                     fi
-                    # --- Email verification follows SMTP ---
-                    # The realm import sets verifyEmail only on first boot; this
-                    # keeps an existing realm in step when email.* changes, so an
-                    # install without mail never asks a new user to verify an
-                    # address it cannot write to. Self-registration stays on;
-                    # SRW's own admin approval still gates new accounts.
-                    $KC update "realms/{{ .Values.keycloak.realm }}" \
-                      -s "verifyEmail={{ include "srw.keycloak.mailConfigured" . }}" 2>/dev/null || \
-                      echo "WARN: kcadm verifyEmail update failed"
+                    # verifyEmail and resetPasswordAllowed are deliberately NOT
+                    # synced here. The realm import seeds them from email.* on
+                    # first boot only; an existing realm keeps whatever its
+                    # admin chose, including SMTP set up by hand in the
+                    # Keycloak UI, which a per-start rewrite would override.
                     # --- Sync session/token lifespans ---
                     # Same self-heal pattern as SMTP: realm-import only seeds
                     # these on first boot, so existing deployments would keep

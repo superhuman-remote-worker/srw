@@ -1767,6 +1767,20 @@ helm upgrade srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 The chart preserves `APP_ENCRYPTION_KEY` across upgrades when `secrets.create=true`
 via `lookup`. ESO mode reads from Vault on each refresh interval.
 
+### What an upgrade leaves alone in the bundled Keycloak realm
+
+Keycloak imports the `srw` realm once, on the first install. Some realm
+settings come only from that import, so an upgrade or a restart leaves them as
+they are, and changing values later has no effect on them:
+
+- **Email verification and password reset.** A new realm asks new users to
+  verify their address, and offers **Forgot password?**, only when
+  `email.enabled` is true and `email.smtp.host` is set. Chart 0.1.0 and earlier
+  switched both on regardless, which strands self-registered users on installs
+  without a mail server. Change them in the Keycloak admin console under
+  **Realm settings → Login**; see
+  [Self-registered users are stuck at "Failed to send email"](../docs/troubleshooting.md#self-registered-users-are-stuck-at-failed-to-send-email).
+
 ### Migration 0185 pinned-runtime cutover
 
 Migration 0185 is not rolling-compatible with pre-0185 pinned-runtime writers.

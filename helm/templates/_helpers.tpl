@@ -1451,10 +1451,12 @@ Two deliberate boundaries:
 
 {{/*
 Whether Keycloak can send mail: "true" or "false", a closed alphabet that is
-safe inside the postStart shell. SMTP_HOST reaches the Keycloak pod only with
+safe as a bare JSON boolean. SMTP_HOST reaches the Keycloak pod only with
 email.enabled, and the hook configures the realm's SMTP server only when that
-host is non-empty, so both must hold. The realm's verifyEmail follows this:
-without mail, a self-registered user would wait for a message never sent.
+host is non-empty, so both must hold. The realm import's verifyEmail and
+resetPasswordAllowed follow this: without mail, a self-registered user would
+wait for a verification message never sent, and "Forgot password?" would
+promise a reset mail never sent. New realms only; nothing re-applies it later.
 */}}
 {{- define "srw.keycloak.mailConfigured" -}}
 {{- if and .Values.email.enabled (trim (toString .Values.email.smtp.host)) -}}true{{- else -}}false{{- end -}}
