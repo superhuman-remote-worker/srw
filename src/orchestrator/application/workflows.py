@@ -357,6 +357,21 @@ def officer_watchdog_dependencies(
         persistent_agent_reconciliation_enabled=(
             lambda: resources.settings.persistent_agent_reconciliation_enabled
         ),
+        stand_down_officer=lambda thread_id, thread: (
+            controls_composition.thread_retirement_operations(
+                resources
+            ).end_thread_flow(
+                thread_id,
+                thread,
+                permanent=False,
+                force=True,
+                officer_retire_reason=(
+                    officer_watchdog_service.SELF_RETIRED_OFFICER_REASON
+                ),
+                officer_post_required=True,
+                include_officer_handoff=True,
+            )
+        ),
     )
 
 

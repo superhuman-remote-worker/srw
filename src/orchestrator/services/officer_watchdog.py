@@ -54,6 +54,9 @@ class OfficerWatchdogDependencies:
     conclude_conference_if_any: Callable[[dict[str, Any]], Awaitable[None]]
     officer_runtime_verification_enabled: Callable[[], bool]
     persistent_agent_reconciliation_enabled: Callable[[], bool]
+    # (thread_id, thread) -> the decommission stand-down result. The same
+    # end_thread_flow funnel as POST .../officer/decommission with force.
+    stand_down_officer: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
 
 
 OFFICER_WATCHDOG_INTERVAL_S = int(os.getenv("OFFICER_WATCHDOG_INTERVAL_S", "60"))
@@ -118,11 +121,89 @@ async def maintain_officer_runtime_authorization(
     return outcome
 
 
+SELF_RETIRED_OFFICER_REASON = "self_retired_runtime"
+
+
+async def stand_down_self_retired_officer(
+    officer_row: dict[str, Any], *, dependencies: OfficerWatchdogDependencies
+) -> bool:
+    """Decommission an officer whose own pod retired him, and tell the owner.
+
+    Nothing in the orchestrator suspends a commissioned officer: the attention
+    sweeper exempts him and the recycler replaces his pod under an unchanged
+    thread. A 'suspended' officer is therefore a pod that retired itself, which
+    an agent image from before 2026-11-06 does on every drain and SIGTERM. Its
+    first recycle (the upgrade itself) left the officer suspended behind a
+    hold nothing could release, waking every two hours to an authorization
+    error (Better Resavio on main dev, 2026-08-30 to 2026-11-06). No path
+    revives a suspended pinned officer, so the post is stood down the way
+    decommission does it, his state kept for a recommission, and the owner is
+    paged to recommission him. Returns True when the stand-down ran.
+    """
+    thread_id = str(officer_row["id"])
+    if dependencies.stand_down_officer is None:
+        return False
+    thread = await dependencies.store.get_thread(thread_id)
+    metadata = (thread or {}).get("metadata") or {}
+    if (
+        thread is None
+        or thread.get("status") != "suspended"
+        or thread.get("runtime_retirement_token") is not None
+        or thread.get("agent_id") is not None
+        # A suspended thread that still names its pod is the recycler's to
+        # replace; only a settled self-retirement clears the marker.
+        or (isinstance(metadata, dict) and metadata.get("agent_pod"))
+        or not thread_uses_pinned_execution(thread)
+        or not await dependencies.store.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM thread_runtime_retirement_outcomes "
+            "WHERE thread_id=$1::uuid AND disposition='suspended' "
+            "AND outcome='settled' AND NOT permanent)",
+            thread_id,
+        )
+    ):
+        return False
+    logger.warning(
+        "officer watchdog: officer thread %s retired itself (suspended); "
+        "standing the post down for a recommission",
+        thread_id[:8],
+    )
+    await dependencies.stand_down_officer(thread_id, thread)
+    try:
+        await dependencies.dispatch_officer_page(
+            officer_row,
+            thread_id,
+            category="officer_runtime",
+            dedup_key=f"officer_self_retired:{thread_id}",
+            subject="Your officer was stood down and needs recommissioning",
+            message_md=(
+                "His pod ran an agent version from before 2026-11-06, which "
+                "retires itself when it is replaced instead of handing over. "
+                "That happened during an upgrade, so the post was stood down "
+                "the way a decommission does it. His state is kept: "
+                "recommission him from the project's Centurion tab to continue. "
+                "Jobs he had dispatched keep running."
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "officer watchdog: stand-down page failed for thread %s",
+            thread_id[:8],
+        )
+    return True
+
+
 async def officer_watchdog_check_one(
     officer_row: dict, session_wake_svc, *, dependencies: OfficerWatchdogDependencies
 ) -> None:
     """One officer thread's watchdog pass — see officer_watchdog below."""
     thread_id = str(officer_row["id"])
+    if officer_row.get("status") == "suspended" and (
+        await stand_down_self_retired_officer(officer_row, dependencies=dependencies)
+    ):
+        # Before the authorization check: a self-retired officer has no
+        # runtime to authorize, and that check would page the owner about it
+        # every two hours instead of fixing it.
+        return
     # P0 runtime authority is maintained before hold/timer decisions. A held
     # Officer is still commissioned and may remain asleep for days; letting a
     # conference hold skip credential maintenance would simply move the 24 h
@@ -298,9 +379,11 @@ async def officer_watchdog(
 
 __all__ = [
     "OFFICER_WAKE_GRACE_MINUTES",
+    "SELF_RETIRED_OFFICER_REASON",
     "OFFICER_WATCHDOG_INTERVAL_S",
     "OfficerWatchdogDependencies",
     "maintain_officer_runtime_authorization",
     "officer_watchdog",
     "officer_watchdog_check_one",
+    "stand_down_self_retired_officer",
 ]
