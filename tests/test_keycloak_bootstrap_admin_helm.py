@@ -8,7 +8,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -105,30 +104,16 @@ def test_bootstrap_admin_cannot_collide_with_enabled_development_users(tmp_path)
     assert "devUsers" in result.stderr
 
 
-ADMIN_ID = "6f1c7a52-0d1e-4c3b-9a55-1f0e2d3c4b5a"
 REALM_ADMIN_PASSWORD = "long password 'quoted' $literal \\ ü"
 
 
-def _admin_lookup_json(created_ms: int | None) -> str:
-    """What `kcadm get users --fields id,createdTimestamp` prints (pretty JSON)."""
-    if created_ms is None:
-        return "[ ]\n"
-    return (
-        "[ {\n"
-        f'  "id" : "{ADMIN_ID}",\n'
-        f'  "createdTimestamp" : {created_ms}\n'
-        "} ]\n"
-    )
-
-
 def _run_post_start(
-    tmp_path: Path, *, created_ms: int | None, fail: tuple[str, ...] = ()
+    tmp_path: Path, *, fail: tuple[str, ...] = ()
 ) -> tuple[subprocess.CompletedProcess, list[list[str]]]:
     """Run the real postStart hook against a kcadm double.
 
-    The CLI is the external boundary: the double records every argv, answers
-    the realm admin lookup with a user created at ``created_ms`` (or no user),
-    and fails the steps named in ``fail`` the way kcadm does (stderr, exit 1).
+    The CLI is the external boundary: the double records every argv and fails
+    the kcadm verbs named in ``fail`` the way kcadm does (stderr, exit 1).
     """
     resources = _resources(
         _render(tmp_path, {"bootstrapAdmin": {"username": "Team.Admin_1"}})
@@ -144,13 +129,8 @@ def _run_post_start(
         "with open(os.environ['KCADM_LOG'], 'a') as out:\n"
         "    out.write(json.dumps(args) + '\\n')\n"
         "fail = os.environ.get('KCADM_FAIL', '').split(',')\n"
-        "if args[:2] == ['get', 'users'] and any('createdTimestamp' in a for a in args):\n"
-        "    if 'admin-lookup' in fail:\n"
-        "        sys.stderr.write('HTTP 503 Service Unavailable\\n')\n"
-        "        sys.exit(1)\n"
-        "    sys.stdout.write(os.environ['KCADM_ADMIN_JSON'])\n"
-        "elif args[:1] == ['set-password'] and 'set-password' in fail:\n"
-        "    sys.stderr.write('invalidPasswordMinLengthMessage\\n')\n"
+        "if args[:1] and args[0] in fail:\n"
+        "    sys.stderr.write('HTTP 503 Service Unavailable\\n')\n"
         "    sys.exit(1)\n",
         encoding="utf-8",
     )
@@ -158,7 +138,6 @@ def _run_post_start(
     env = {
         "PATH": os.environ["PATH"],
         "KCADM_LOG": str(log),
-        "KCADM_ADMIN_JSON": _admin_lookup_json(created_ms),
         "KCADM_FAIL": ",".join(fail),
     }
     env.update(
@@ -186,83 +165,23 @@ def _run_post_start(
     return result, calls
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def test_first_start_sets_the_initial_password_of_the_admin_it_imported(tmp_path):
-    # The realm import created the admin after this container started.
-    result, calls = _run_post_start(tmp_path, created_ms=_now_ms() + 60_000)
+def test_no_start_sets_or_resets_the_realm_admin_password(tmp_path):
+    # The first-boot realm import sets KC_REALM_ADMIN_PASSWORD (see
+    # test_chosen_username_imports_as_the_srw_administrator; verified on a
+    # fresh Keycloak 26.2.5). A restart, an upgrade or a rotated Secret must
+    # keep the password the admin chose, so the hook never sets it.
+    result, calls = _run_post_start(tmp_path)
     assert result.returncode == 0, result.stderr
-    assert "WARN" not in result.stdout
-    lookup = next(
-        call
-        for call in calls
-        if call[:2] == ["get", "users"] and any("createdTimestamp" in a for a in call)
-    )
-    assert "username=Team.Admin_1" in lookup
-    assert "exact=true" in lookup
-    # Matched by the id of the user the lookup found, not by name again.
-    assert [call for call in calls if call[0] == "set-password"] == [
-        [
-            "set-password",
-            "-r",
-            "srw",
-            "--userid",
-            ADMIN_ID,
-            "--new-password",
-            REALM_ADMIN_PASSWORD,
-        ]
-    ]
-    # Every lookup of the chosen admin is exact, OpenCloud membership included.
+    assert [call for call in calls if call[0] == "set-password"] == []
+    assert not any(REALM_ADMIN_PASSWORD in arg for call in calls for arg in call)
+    assert REALM_ADMIN_PASSWORD not in result.stdout
+    # Every lookup of the chosen admin is exact (OpenCloud group membership).
     for call in calls:
         if "username=Team.Admin_1" in call:
             assert "exact=true" in call
     credentials = next(call for call in calls if call[:2] == ["config", "credentials"])
     assert credentials[credentials.index("--user") + 1] == "master-admin"
-
-
-def test_later_starts_keep_the_password_the_admin_chose(tmp_path):
-    # The admin was created a day before this start: a restart, an upgrade or
-    # a rotated Secret must not reset the password.
-    result, calls = _run_post_start(tmp_path, created_ms=_now_ms() - 86_400_000)
-    assert result.returncode == 0, result.stderr
-    assert [call for call in calls if call[0] == "set-password"] == []
-    assert "WARN" not in result.stdout
-
-
-def test_a_renamed_admin_is_logged_instead_of_silently_skipped(tmp_path):
-    result, calls = _run_post_start(tmp_path, created_ms=None)
-    assert result.returncode == 0, result.stderr
-    assert [call for call in calls if call[0] == "set-password"] == []
-    assert "WARN: realm admin Team.Admin_1 not found in realm srw" in result.stdout
-
-
-@pytest.mark.parametrize(
-    "fail,message",
-    [
-        (
-            ("admin-lookup",),
-            "WARN: kcadm realm admin lookup for Team.Admin_1 failed: "
-            "HTTP 503 Service Unavailable",
-        ),
-        (
-            ("set-password",),
-            "WARN: kcadm set-password for new realm admin Team.Admin_1 failed: "
-            "invalidPasswordMinLengthMessage",
-        ),
-    ],
-)
-def test_failures_are_logged_and_never_fail_the_hook(tmp_path, fail, message):
-    # A non-zero postStart exit kills the Keycloak container, so a failed
-    # lookup or set is reported and the hook carries on.
-    result, calls = _run_post_start(
-        tmp_path, created_ms=_now_ms() + 60_000, fail=fail
-    )
-    assert result.returncode == 0, result.stderr
-    assert message in result.stdout
-    assert REALM_ADMIN_PASSWORD not in result.stdout
-    # The steps after the password still run.
+    # The steps that follow still run.
     assert any(call[:2] == ["update", "realms/srw"] for call in calls)
 
 
