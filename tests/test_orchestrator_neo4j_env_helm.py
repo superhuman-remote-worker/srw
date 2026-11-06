@@ -91,6 +91,7 @@ def test_its_credentials_come_from_the_secret_the_default_connector_uses():
 
 def test_without_neo4j_the_url_is_unset_and_the_client_stays_off():
     documents = _render("databases.neo4j.enabled=false")
-    ref = _orchestrator_env(documents)["NEO4J_URL"]["valueFrom"]["configMapKeyRef"]
-    assert ref["optional"] is True
-    assert "NEO4J_URL" not in _config_maps(documents)[ref["name"]]
+    # The whole Neo4j env block sits behind databases.neo4j.enabled.
+    assert not [name for name in _orchestrator_env(documents) if "NEO4J" in name]
+    for data in _config_maps(documents).values():
+        assert "NEO4J_URL" not in data
