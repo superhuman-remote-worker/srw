@@ -10815,6 +10815,104 @@ async def test_two_desired_image_changes_chain_without_releasing_hold(db):
 
 
 @pytest.mark.asyncio
+async def test_a_replacement_that_exits_before_ready_is_replaced(db):
+    """k3d 2026-11-06: the replacement booted while the orchestrator was
+    restarting, took the binding, read the outage as "workspace not ready"
+    and exited. The recycle then waited on that terminal Pod, failed
+    replacement_not_ready every five minutes and resumed the same wait. The
+    exited replacement is now the old authority of a fresh generation, and
+    the officer gets a working pod without anyone acting."""
+    ids = await _seed(db, protected_agent_pod=True)
+    provisioner = FakeProvisioner(db)
+    provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        observation=PersistentPodObservation.from_status(
+            ids["thread"], provisioner.current
+        ),
+        expected_project_id=ids["project"],
+    )
+
+    async def drain_and_provision() -> tuple[dict, str]:
+        assert (
+            await recycler.acknowledge_parked_boundary(
+                thread_id=ids["thread"], agent_id=None
+            )
+        ).acknowledged
+        provisioner.current = {
+            **provisioner.current,
+            "phase": "Succeeded",
+            "ready": False,
+            "terminating": True,
+        }
+        await _reconcile_until_phase(
+            recycler,
+            thread_id=ids["thread"],
+            reason="image_drift",
+            expected_build_sha=provisioner.expected_build_sha,
+            expected_project_id=ids["project"],
+            phases={"awaiting_replacement"},
+        )
+        state, _ = await _recycle_state(db, ids["thread"])
+        return state, provisioner.current["pod_uid"]
+
+    first, first_uid = await drain_and_provision()
+    await _bind_replacement_agent(db, thread_id=ids["thread"], pod_uid=first_uid)
+    provisioner.current = _terminal_pod_status(
+        ids["thread"],
+        uid=first_uid,
+        build="new-build",
+        generation=first["generation"],
+    )
+
+    restarted = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert restarted.phase == "awaiting_old_pod_exit"
+    state, metadata = await _recycle_state(db, ids["thread"])
+    assert state["generation"] != first["generation"]
+    assert state["old_pod_uid"] == first_uid
+    assert state["replacement_restarts"] == 1
+    hold = metadata["config_override"]["officer"]["hold"]
+    assert hold["_persistent_recycle_generation"] == state["generation"]
+
+    await _reconcile_until_phase(
+        recycler,
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+        phases={"awaiting_replacement"},
+    )
+    second, _ = await _recycle_state(db, ids["thread"])
+    second_uid = provisioner.current["pod_uid"]
+    assert second_uid != first_uid
+    await _bind_replacement_agent(db, thread_id=ids["thread"], pod_uid=second_uid)
+    provisioner.current = _pod_status(
+        ids["thread"],
+        uid=second_uid,
+        build="new-build",
+        generation=second["generation"],
+        ready=True,
+    )
+    complete = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert complete.phase == "complete"
+    _, metadata = await _recycle_state(db, ids["thread"])
+    assert metadata["config_override"]["officer"]["hold"] is None
+
+
+@pytest.mark.asyncio
 async def test_preparation_stage_preserves_deadline_and_allows_session_end(db):
     from orchestrator.services.vm_provisioner import VMProvisioner
     from shared.workspace_preparation import preparation_request
