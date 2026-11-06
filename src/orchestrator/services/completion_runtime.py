@@ -18,6 +18,13 @@ from typing import Any
 
 from fastapi import HTTPException
 
+logger = logging.getLogger(__name__)
+
+# One stuck-completion alarm per officer per hour at most. Must stay under the
+# wake outbox's sent-row retention (session_wake._OFFICER_SENT_RETENTION_SECONDS,
+# 3600 s), which is what the repeat check reads.
+COMPLETION_ALERT_COOLDOWN_SECONDS = 3300.0
+
 
 @dataclass(frozen=True, slots=True)
 class CompletionAlertDependencies:
@@ -61,10 +68,47 @@ class CompletionAlerts:
         self.dependencies.kick_officer_event_drain(self.dependencies.store)
 
     async def monitor(self, alert: Any) -> None:
-        await self.dependencies.notify_all_officers(
-            self.dependencies.store,
+        """Tell the one officer who can act on a stuck completion, rarely.
+
+        The monitor samples the globally oldest unfinalized command on every
+        tick under one fixed dedup key. Broadcast to every officer with no
+        cool-down, it woke each of them every ~30 s about another project's job
+        (99.7% of one officer's sitreps, ~723k tokens in 15 min on a test officer:
+        officer_visibility_streamline.md; still live on main dev 2026-11-06 for a
+        69-day-old Better Resavio command). Now only the officer commanding the
+        job's project hears it, at most once per cool-down; an alert without a
+        job, or for a project without an officer, stays in the log.
+        """
+        store = self.dependencies.store
+        job_id = getattr(alert, "job_id", None)
+        project_id = None
+        if job_id:
+            try:
+                job = await store.get_job(str(job_id))
+                project_id = (job or {}).get("project_id")
+            except Exception:
+                logger.warning("completion monitor: job lookup failed", exc_info=True)
+        officer = None
+        if project_id:
+            try:
+                officer = await store.get_officer_thread_for_project(str(project_id))
+            except Exception:
+                logger.warning(
+                    "completion monitor: officer lookup failed", exc_info=True
+                )
+        if not officer:
+            logger.warning(
+                "completion monitor alert not routed to an officer (job %s): %s",
+                job_id,
+                str(getattr(alert, "message", ""))[:300],
+            )
+            return
+        await store.enqueue_session_wake_event(
+            str(officer["id"]),
             source="completion_monitor",
-            dedup_key=str(alert.dedup_key),
+            dedup_key=f"{alert.dedup_key}:{job_id}",
+            project_id=str(project_id),
+            suppress_if_delivered_within_seconds=COMPLETION_ALERT_COOLDOWN_SECONDS,
             payload={
                 "kind": str(alert.kind),
                 "summary": str(alert.message)[:1000],
@@ -79,7 +123,7 @@ class CompletionAlerts:
                 ),
             },
         )
-        self.dependencies.kick_officer_event_drain(self.dependencies.store)
+        self.dependencies.kick_officer_event_drain(store)
 
 
 @dataclass(frozen=True, slots=True)
