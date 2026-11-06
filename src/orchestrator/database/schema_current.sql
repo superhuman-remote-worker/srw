@@ -7228,7 +7228,16 @@ BEGIN
     ELSIF OLD.runtime_retirement_token IS NOT NULL
           AND OLD.runtime_retirement_permanent = false
           AND NEW.runtime_retirement_token IS NULL
-          AND NEW.status = 'suspended' THEN
+          AND NEW.status = 'suspended'
+          -- Not the marker-only abort of an unauthorized preflight on a
+          -- thread that was already suspended: that keeps its generation.
+          AND NOT (
+              OLD.status = 'suspended'
+              AND OLD.runtime_retirement_authorized_at IS NULL
+              AND OLD.runtime_retirement_stage_receipt IS NULL
+              AND OLD.runtime_retirement_local_quiescence IS NULL
+              AND OLD.runtime_retirement_external_cleanup IS NULL
+          ) THEN
         -- Suspension is a settled, preparable successor state.  Force the
         -- rotation here even for old/direct SQL so no caller can reopen it
         -- under the retired generation (or choose its own generation).

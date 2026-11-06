@@ -6307,6 +6307,48 @@ async def test_pinned_retirement_disposition_is_immutable_and_enforced(db):
 
 
 @pytest.mark.asyncio
+async def test_refused_end_on_a_suspended_thread_aborts_without_rotation(db):
+    """A no-force Officer decommission with jobs in flight begins an End
+    preflight on the already-suspended officer thread, then aborts it. The
+    suspension-settle rotation used to match that marker-only abort, and the
+    ownership guard turned the refusal into a 500 (dev, Better Resavio,
+    2026-11-06); the stale-preflight reaper failed the same way every sweep."""
+    ids = await _seed(db, protected_agent_pod=True)
+    first = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="suspended"
+    )
+    await _authorize_and_ack(db, ids, first, settle_status="suspended")
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=first["token"],
+        generation=first["generation"],
+        final_status="suspended",
+    )
+    suspended = await db.get_thread(ids["thread"])
+    assert suspended["status"] == "suspended"
+
+    end = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="ended"
+    )
+    assert end["state"] == "pending"
+    assert await db.abort_pinned_thread_retirement(
+        ids["thread"], token=end["token"], generation=end["generation"]
+    )
+
+    after = await db.get_thread(ids["thread"])
+    assert after["status"] == "suspended"
+    assert after["runtime_retirement_token"] is None
+    assert after["runtime_generation"] == suspended["runtime_generation"]
+
+    # The End can still run afterwards, from the same generation.
+    again = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="ended"
+    )
+    assert again["state"] == "pending"
+    assert again["generation"] == str(suspended["runtime_generation"])
+
+
+@pytest.mark.asyncio
 async def test_direct_soft_suspension_forces_generation_and_clears_ownership(db):
     ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(
