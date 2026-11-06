@@ -157,6 +157,7 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
         knowledge_graph.connect.side_effect = RuntimeError("neo4j unavailable")
 
         with (
+            patch.dict(os.environ, {"NEO4J_URL": "bolt://srw-neo4j:7688"}),
             patch(
                 "shared.runtime.services.embedding_service.get_kb_embedding_service",
                 return_value=embedding_service,
@@ -181,6 +182,47 @@ class TestWorkerKnowledgeSetupWithoutNeo4j:
         assert context.project_id == "project-1"
         assert agent._knowledge_graph is None
         assert agent._kb_degraded is False
+
+    def test_unconfigured_neo4j_skips_the_graph_tier_without_dialling(self, caplog):
+        """No NEO4J_URL (Neo4j is off by default) means no localhost:7687 dial."""
+        import logging
+
+        from agent.agent import UniversalAgent
+
+        agent = UniversalAgent.__new__(UniversalAgent)
+        agent.vector_conn = MagicMock(name="vector_conn")
+        agent._current_job_id = "00000000-0000-0000-0000-000000000001"
+        agent.config = SimpleNamespace(agent_id="test-agent")
+        agent._kb_degraded = False
+        agent._knowledge_graph = None
+        context = SimpleNamespace(
+            knowledge_graph=None,
+            knowledge_store=None,
+            project_id=None,
+        )
+        knowledge_store = MagicMock(name="knowledge_store")
+        env = {k: v for k, v in os.environ.items() if k != "NEO4J_URL"}
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("shared.runtime.services.embedding_service.get_kb_embedding_service"),
+            patch(
+                "shared.runtime.services.knowledge_store.KnowledgeStore",
+                return_value=knowledge_store,
+            ),
+            patch(
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB"
+            ) as graph_cls,
+            caplog.at_level(logging.INFO),
+        ):
+            agent._setup_job_knowledge(context, "project-1")
+
+        graph_cls.assert_not_called()
+        assert context.knowledge_store is knowledge_store
+        assert context.knowledge_graph is None
+        assert agent._kb_degraded is False
+        assert "NEO4J_URL is not set" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_missing_vector_connection_marks_store_degraded(self):
         """A genuinely unavailable retrieval store still fails honestly."""

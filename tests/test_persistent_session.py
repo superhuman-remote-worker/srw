@@ -7,6 +7,7 @@ swap_backend(), get_workspace_content(), cleanup().
 """
 
 import asyncio
+import os
 import threading
 import time
 import uuid
@@ -3530,6 +3531,7 @@ class TestSetupKnowledge:
         knowledge_graph.connect.return_value = False
 
         with (
+            patch.dict(os.environ, {"NEO4J_URL": "bolt://srw-neo4j:7688"}),
             patch(
                 "shared.runtime.services.embedding_service.get_kb_embedding_service",
                 return_value=embedding_service,
@@ -3552,6 +3554,36 @@ class TestSetupKnowledge:
         assert session.knowledge_store is knowledge_store
         assert session._knowledge_graph is None
         assert session._kb_degraded is False
+
+    def test_unconfigured_neo4j_skips_the_graph_tier_without_dialling(self, caplog):
+        """No NEO4J_URL (Neo4j is off by default) means no localhost:7687 dial."""
+        import logging
+
+        session = _make_session()
+        session.project_ids = [str(uuid.uuid4())]
+        knowledge_store = MagicMock(name="knowledge_store")
+        env = {k: v for k, v in os.environ.items() if k != "NEO4J_URL"}
+
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("shared.runtime.services.embedding_service.get_kb_embedding_service"),
+            patch(
+                "shared.runtime.services.knowledge_store.KnowledgeStore",
+                return_value=knowledge_store,
+            ),
+            patch(
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB"
+            ) as graph_cls,
+            caplog.at_level(logging.INFO),
+        ):
+            session._setup_knowledge(MagicMock(name="vector_conn"))
+
+        graph_cls.assert_not_called()
+        assert session.knowledge_store is knowledge_store
+        assert session._knowledge_graph is None
+        assert session._kb_degraded is False
+        assert "NEO4J_URL is not set" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_embedding_failure_marks_store_degraded(self):
         session = _make_session()
