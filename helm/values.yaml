@@ -2813,9 +2813,23 @@ databases:
         memory: "512Mi"
         cpu: "500m"
   neo4j:
-    enabled: true
+    # -- Optional knowledge graph, OFF by default. The Postgres store (pgvector
+    #    instance) carries the whole knowledge base without it: agents' kb_write,
+    #    kb_read, kb_list, kb_search and kb_related, and the orchestrator's note
+    #    list, get, update and delete all run there. Postgres also needs no
+    #    extra license: Neo4j Community is GPLv3 and Enterprise is commercial.
+    #    Turn it on only for what has no Postgres equivalent: the typed graph
+    #    edges behind kb_contradictions, kb_provenance and kb_unanswered, the
+    #    relationship list on the orchestrator's note read, and the project
+    #    knowledge export (which answers 503 without Neo4j).
+    #    When on, NEO4J_URL plus NEO4J_USERNAME/NEO4J_PASSWORD from the Secret
+    #    reach both the agents and the orchestrator, and the orchestrator seeds
+    #    a "Default Neo4j" datasource from the same connection.
+    enabled: false
+    # -- true runs the bundled StatefulSet; false uses externalUrl below.
     internal: true
-    # -- Full Neo4j Bolt URL for external mode. Example: "bolt://my-neo4j.db.svc:7687"
+    # -- Full Neo4j Bolt URL for external mode (internal: false); required then.
+    #    Example: "bolt://my-neo4j.db.svc:7687"
     externalUrl: ""
     # -- Auth credentials for the bundled Neo4j: both NEO4J_USERNAME and
     # NEO4J_PASSWORD live in the Secret (Vault), mirroring how the
