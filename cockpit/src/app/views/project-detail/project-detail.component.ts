@@ -510,11 +510,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   @if (note.relationships && note.relationships.length > 0) {
                     <div class="kb-relationships">
                       <h4>{{ 'projectDetail.knowledge.relationships' | transloco }}</h4>
-                      @for (rel of note.relationships; track rel.target_id) {
+                      @for (rel of note.relationships; track rel.type + ':' + rel.target) {
                         <div class="kb-rel-item">
                           <span class="kb-rel-type">{{ rel.type }}</span>
-                          <button class="kb-rel-link" (click)="openNote(rel.target_id)">
-                            {{ rel.target_title || rel.target_id }}
+                          <button class="kb-rel-link" (click)="openNote(rel.target)">
+                            {{ rel.target_title || rel.target }}
                           </button>
                         </div>
                       }

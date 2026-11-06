@@ -2295,13 +2295,14 @@ export interface KnowledgeNote {
 }
 
 /**
- * Knowledge note relationship (from Neo4j).
+ * An outgoing link of a knowledge note that is an edge in the knowledge graph,
+ * as `KnowledgeGraphDB.read_note` returns it. Links to notes not written yet
+ * have no edge; they are in the note's content.
  */
 export interface KnowledgeRelationship {
   type: string;
-  direction: string;
-  target_id: string;
-  target_title?: string;
+  target: string;
+  target_title?: string | null;
 }
 
 /**
