@@ -222,11 +222,13 @@ def _get_mcp_caller_ctx() -> CallerCtx:
         return CallerCtx(kind="mcp", auth_failed=True)
 
 
-def _format_action_error(action: str, target: str, error: Exception) -> str:
+def _format_action_error(
+    action: str, target: str, error: Exception, *, target_kind: str = "job"
+) -> str:
     """Keep an ambiguous mutation distinct from a confirmed failure."""
     if isinstance(error, MutationOutcomeUnknown):
         return f"Action '{action}' has an unknown outcome for {target}:\n{error}"
-    return fmt.format_action_error(action, target, error)
+    return fmt.format_action_error(action, target, error, target_kind=target_kind)
 
 
 # =============================================================================
@@ -2472,7 +2474,9 @@ async def get_project_officer(project_id: str, recent: int = 10) -> str:
     try:
         post = await client.get_project_officer(project_id)
     except Exception as e:
-        return _format_action_error("get_project_officer", project_id, e)
+        return _format_action_error(
+            "get_project_officer", project_id, e, target_kind="project"
+        )
 
     thread_id = (post.get("officer") or {}).get("thread_id")
     tail = None
@@ -2517,7 +2521,9 @@ async def send_officer_note(project_id: str, message: str) -> str:
     try:
         result = await client.send_officer_note(project_id, message)
     except Exception as e:
-        return _format_action_error("send_officer_note", project_id, e)
+        return _format_action_error(
+            "send_officer_note", project_id, e, target_kind="project"
+        )
     return fmt.format_officer_note_result(result)
 
 
@@ -2585,7 +2591,9 @@ async def commission_officer(
     try:
         result = await client.commission_officer(project_id, kit)
     except Exception as e:
-        return _format_action_error("commission_officer", project_id, e)
+        return _format_action_error(
+            "commission_officer", project_id, e, target_kind="project"
+        )
     return fmt.format_officer_commission_result(result)
 
 
@@ -2614,7 +2622,9 @@ async def decommission_officer(
             project_id, force=force, reason=reason
         )
     except Exception as e:
-        return _format_action_error("decommission_officer", project_id, e)
+        return _format_action_error(
+            "decommission_officer", project_id, e, target_kind="project"
+        )
     return fmt.format_officer_decommission_result(result)
 
 
@@ -2636,7 +2646,9 @@ async def hold_officer(project_id: str, note: str | None = None) -> str:
     try:
         result = await client.hold_officer(project_id, note)
     except Exception as e:
-        return _format_action_error("hold_officer", project_id, e)
+        return _format_action_error(
+            "hold_officer", project_id, e, target_kind="project"
+        )
     return fmt.format_officer_hold_result(result)
 
 
@@ -2656,7 +2668,9 @@ async def release_officer(project_id: str) -> str:
     try:
         result = await client.release_officer(project_id)
     except Exception as e:
-        return _format_action_error("release_officer", project_id, e)
+        return _format_action_error(
+            "release_officer", project_id, e, target_kind="project"
+        )
     return fmt.format_officer_hold_result(result)
 
 

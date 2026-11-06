@@ -261,3 +261,23 @@ async def test_a_centurion_session_points_at_commission(config_name):
 
     client.create_persistent_thread.assert_not_awaited()
     assert "commission_officer" in text
+
+
+@pytest.mark.asyncio
+async def test_an_officer_tool_error_names_the_project_not_a_job():
+    import httpx
+
+    request = httpx.Request("POST", "http://orchestrator.test/x")
+    response = httpx.Response(
+        409, request=request, json={"detail": {"code": "turn_in_flight"}}
+    )
+    client = AsyncMock()
+    client.decommission_officer.side_effect = httpx.HTTPStatusError(
+        "conflict", request=request, response=response
+    )
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        text = await _mcp_server_mod.decommission_officer(PROJECT_ID)
+
+    assert f"failed for project {PROJECT_ID}" in text
+    assert "turn_in_flight" in text

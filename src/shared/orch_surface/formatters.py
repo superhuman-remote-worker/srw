@@ -1177,8 +1177,10 @@ def format_datasource_test(datasource_id: str, result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_action_error(action: str, job_id: str, error: Exception) -> str:
-    """Format an action error."""
+def format_action_error(
+    action: str, job_id: str, error: Exception, *, target_kind: str = "job"
+) -> str:
+    """Format an action error. ``target_kind`` names what ``job_id`` is."""
     error_msg = str(error)
 
     # Extract detail from httpx HTTPStatusError
@@ -1189,7 +1191,7 @@ def format_action_error(action: str, job_id: str, error: Exception) -> str:
         except Exception:
             error_msg = f"HTTP {error.response.status_code}: {error_msg}"  # type: ignore[union-attr]
 
-    return f"Action '{action}' failed for job {job_id}:\n{error_msg}"
+    return f"Action '{action}' failed for {target_kind} {job_id}:\n{error_msg}"
 
 
 # =============================================================================
