@@ -1577,6 +1577,62 @@ class TestKnowledgeMutationEndpoint:
         db.finish_knowledge_projection.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_a_note_the_graph_never_held_updates_without_a_warning(
+        self, fake_request, caplog
+    ):
+        # Only agent-written notes reach Neo4j; a hand-written note has no
+        # copy there, and that is not a failed projection.
+        from orchestrator.routers.knowledge import update_knowledge_note
+        from orchestrator.schemas.knowledge import KnowledgeNoteUpdate
+
+        vector, _ = self._vector()
+        intent_id = str(uuid.uuid4())
+        db = AsyncMock()
+        db.finish_knowledge_projection.return_value = {
+            "id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": "synced",
+        }
+        canonical = {
+            "status": "committed",
+            "intent_id": intent_id,
+            "canonical_state": "canonical",
+            "projection_state": "pending",
+            "retry_state": "none",
+            "canonical_status": "resolved",
+            "canonical_tags": [],
+            "canonical_ready_at": None,
+            "canonical_metadata_complete": True,
+        }
+        kg = MagicMock()
+        kg.update_note.return_value = False
+        deps = _knowledge_deps(
+            member_gate=AsyncMock(return_value=_ADMIN_CALLER),
+            vector=vector,
+            store=db,
+            graph=SimpleNamespace(get=lambda: kg),
+        )
+        with (
+            caplog.at_level(logging.DEBUG, logger="tests.kb_materialize"),
+            patch(
+                "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
+                AsyncMock(return_value=canonical),
+            ),
+        ):
+            result = await update_knowledge_note(
+                fake_request,
+                PROJECT,
+                SLUG,
+                KnowledgeNoteUpdate(status="resolved"),
+                dependencies=deps,
+            )
+
+        assert result["status"] == "updated"
+        kg.update_note.assert_called_once_with(PROJECT, SLUG, status="resolved")
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "has no copy" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_tag_projection_uses_exact_canonical_tags_and_ready_time(
         self, fake_request
     ):

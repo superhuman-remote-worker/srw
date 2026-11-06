@@ -592,9 +592,15 @@ async def update_knowledge_note(
                     update_kwargs["add_tags"] = body.add_tags
                 if body.remove_tags:
                     update_kwargs["remove_tags"] = body.remove_tags
-                if update_kwargs:
-                    if not kg.update_note(project_id, note_id, **update_kwargs):
-                        raise RuntimeError("graph note disappeared during projection")
+                # Only agent-written notes have a graph copy (the reindexer
+                # never writes Neo4j), so a miss is the normal case for a
+                # hand-written note, not a failure.
+                if update_kwargs and not kg.update_note(
+                    project_id, note_id, **update_kwargs
+                ):
+                    dependencies.logger.debug(
+                        "Neo4j has no copy of %s; nothing to update", note_id
+                    )
             except Exception as e:
                 dependencies.logger.warning(
                     "Neo4j update failed for %s: %s", note_id, e
