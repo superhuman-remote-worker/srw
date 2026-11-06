@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 REASON_DISABLED = "disabled"
 REASON_CAPABILITY = "capability"
 REASON_UNKNOWN = "unknown"
+# ``endpoint_key``: the model resolves, but its endpoint's stored API key did
+# not decrypt (the encryption key was rotated, or the row was copied from
+# another installation). Carried as :class:`EndpointKeyUnreadable`, which
+# names the endpoint for the message.
+REASON_ENDPOINT_KEY = "endpoint_key"
 
 MODEL_UNAVAILABLE_CODE = "model.unavailable"
 
@@ -124,6 +129,46 @@ def slot_model(slot: ModelSlot) -> str | None:
     return str(model)
 
 
+class EndpointKeyUnreadable(str):
+    """:data:`REASON_ENDPOINT_KEY`, naming the endpoint whose stored key did
+    not decrypt.
+
+    A ``str`` equal to the constant, so every seam that passes a reason along
+    (``inject_model_credentials``' return, ``UnavailableModel.reason``,
+    comparisons with the ``REASON_*`` constants) carries it unchanged; the
+    message and :meth:`UnavailableModel.as_dict` read :attr:`endpoint`.
+    """
+
+    endpoint: str
+
+    def __new__(cls, endpoint: str) -> "EndpointKeyUnreadable":
+        reason = super().__new__(cls, REASON_ENDPOINT_KEY)
+        reason.endpoint = str(endpoint)
+        return reason
+
+    def __getnewargs__(self) -> tuple[str]:  # copy / pickle keep the endpoint
+        return (self.endpoint,)
+
+
+def endpoint_key_unreadable(
+    endpoint_row: dict[str, Any] | None, endpoint_id: str
+) -> EndpointKeyUnreadable | None:
+    """The refusal for an endpoint row whose stored key did not decrypt, else
+    ``None``.
+
+    The decrypted ``api_key`` is ``None`` both for a key that did not decrypt
+    and for an endpoint registered without one; only the store's
+    ``api_key_stored`` flag (whether the row holds a ciphertext, set before it
+    decrypts — ``PostgresDB.get_user_llm_endpoint``) tells them apart. An
+    endpoint registered without a key is not refused: it runs keyless.
+    """
+    if not endpoint_row or endpoint_row.get("api_key"):
+        return None
+    if endpoint_row.get("api_key_stored") is not True:
+        return None
+    return EndpointKeyUnreadable(endpoint_row.get("label") or endpoint_id)
+
+
 @dataclass(frozen=True)
 class UnavailableModel:
     slot: str
@@ -131,7 +176,11 @@ class UnavailableModel:
     reason: str
 
     def as_dict(self) -> dict[str, str]:
-        return {"slot": self.slot, "model": self.model, "reason": self.reason}
+        out = {"slot": self.slot, "model": self.model, "reason": str(self.reason)}
+        endpoint = getattr(self.reason, "endpoint", None)
+        if endpoint:
+            out["endpoint"] = endpoint
+        return out
 
 
 def slot_display(slot: str) -> str:
@@ -198,7 +247,44 @@ def render_unavailable_message(
     where: str | None = None,
     is_admin: bool = False,
 ) -> str:
-    """The § Messages text of the design note, for one or more entries."""
+    """The § Messages text of the design note, for one or more entries.
+
+    An endpoint whose stored key did not decrypt is named first, once however
+    many slots use it: choosing another model is not the fix, re-adding the
+    key is. Any other entries follow in their own wording.
+    """
+    key_entries = [e for e in entries if e.reason == REASON_ENDPOINT_KEY]
+    model_entries = [e for e in entries if e.reason != REASON_ENDPOINT_KEY]
+    parts: list[str] = []
+    if key_entries:
+        parts.append(_endpoint_key_text(key_entries))
+    if model_entries:
+        parts.append(_model_text(model_entries, where=where))
+    text = " ".join(parts)
+    if is_admin and any(e.reason == REASON_DISABLED for e in entries):
+        text += " You can re-enable it in Settings → Models → Catalog."
+    return _clip(text)
+
+
+def _endpoint_key_text(entries: list[UnavailableModel]) -> str:
+    labels: list[str] = []
+    for entry in entries:
+        label = getattr(entry.reason, "endpoint", None) or entry.model
+        if label not in labels:
+            labels.append(label)
+    if len(labels) == 1:
+        return (
+            f"The model endpoint '{labels[0]}' has a stored API key that can't "
+            "be decrypted. Re-add the key in Admin → Models."
+        )
+    listed = ", ".join(f"'{label}'" for label in labels)
+    return (
+        f"The model endpoints {listed} have stored API keys that can't be "
+        "decrypted. Re-add the keys in Admin → Models."
+    )
+
+
+def _model_text(entries: list[UnavailableModel], *, where: str | None) -> str:
     place = where or "the settings"
     if len(entries) == 1:
         entry = entries[0]
@@ -224,9 +310,7 @@ def render_unavailable_message(
             f"These models are no longer available: {listed}. "
             f"Choose other models in {place}, or ask your administrator."
         )
-    if is_admin and any(e.reason == REASON_DISABLED for e in entries):
-        text += " You can re-enable it in Settings → Models → Catalog."
-    return _clip(text)
+    return text
 
 
 def keeps_explicit_transport(section: dict[str, Any], reason: str) -> bool:
@@ -354,13 +438,16 @@ __all__ = [
     "MODEL_UNAVAILABLE_CODE",
     "REASON_CAPABILITY",
     "REASON_DISABLED",
+    "REASON_ENDPOINT_KEY",
     "REASON_UNKNOWN",
     "WHERE_ACCOUNT",
     "WHERE_JOB",
     "WHERE_SESSION",
+    "EndpointKeyUnreadable",
     "ModelSlot",
     "ModelUnavailable",
     "UnavailableModel",
+    "endpoint_key_unreadable",
     "keeps_explicit_transport",
     "model_slots",
     "model_unavailable_reason",

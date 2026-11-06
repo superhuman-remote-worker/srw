@@ -31,6 +31,7 @@ from orchestrator.services.live.dispatch import live_session_config
 from orchestrator.services.model_availability import (
     ModelUnavailable,
     UnavailableModel,
+    endpoint_key_unreadable,
     keeps_explicit_transport,
     stale_account_model_reason,
     unresolved_model_reason,
@@ -196,7 +197,24 @@ async def inject_dispatch_credentials(
         if meta.provider:
             llm_over["provider"] = meta.provider
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-        if endpoint_row:
+        unreadable = endpoint_key_unreadable(endpoint_row, meta.endpoint_id)
+        if unreadable is not None:
+            # Same refusal as inject_model_credentials, which credentials every
+            # other slot: a stored key that did not decrypt is never replaced
+            # by sending the base URL without it.
+            logger.error(
+                "Dispatch: job %s main model %r refused: endpoint %r (%s) has a "
+                "stored API key that did not decrypt; re-add the key in Admin → "
+                "Models.",
+                job_id,
+                model_id,
+                unreadable.endpoint,
+                meta.endpoint_id,
+            )
+            unavailable.append(
+                UnavailableModel(slot="llm", model=str(model_id), reason=unreadable)
+            )
+        elif endpoint_row:
             if endpoint_row.get("base_url"):
                 llm_over["base_url"] = endpoint_row["base_url"]
             if endpoint_row.get("api_key"):
