@@ -2823,8 +2823,9 @@ databases:
     #    relationship list on the orchestrator's note read, and the project
     #    knowledge export (which answers 503 without Neo4j).
     #    When on, NEO4J_URL plus NEO4J_USERNAME/NEO4J_PASSWORD from the Secret
-    #    reach both the agents and the orchestrator, and the orchestrator seeds
-    #    a "Default Neo4j" datasource from the same connection.
+    #    reach both the agents and the orchestrator. The "Default Neo4j"
+    #    datasource is seeded from them only by `python -m orchestrator.init`,
+    #    which the chart does not run.
     enabled: false
     # -- true runs the bundled StatefulSet; false uses externalUrl below.
     internal: true
