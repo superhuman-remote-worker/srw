@@ -20,9 +20,12 @@ RUNTIME_AUTHORITY_MIGRATION = (
 )
 
 
-def test_automatic_persistent_reconciliation_defaults_false() -> None:
+def test_lifecycle_flag_defaults() -> None:
+    """Officer pod reconciliation ships on: without it a dead Officer pod is
+    never replaced (the watchdog only logs), which left a fresh install's
+    Officer stranded after any pod loss. The other fences stay dark."""
     values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
-    assert values["orchestrator"]["persistentAgentReconciliationEnabled"] is False
+    assert values["orchestrator"]["persistentAgentReconciliationEnabled"] is True
     assert values["orchestrator"]["officerRuntimeVerificationEnabled"] is False
     assert values["orchestrator"]["officerAutoPullReleaseEnabled"] is False
     assert values["orchestrator"]["runtimeAuthorityMigrationMaintenanceAck"] is False
@@ -319,7 +322,7 @@ def test_flag_renders_through_configmap_and_orchestrator_environment() -> None:
             "-f",
             str(CHART / "ci" / "test-values.yaml"),
             "--set",
-            "orchestrator.persistentAgentReconciliationEnabled=true",
+            "orchestrator.persistentAgentReconciliationEnabled=false",
         ],
         check=True,
         capture_output=True,
@@ -332,7 +335,7 @@ def test_flag_renders_through_configmap_and_orchestrator_environment() -> None:
         if doc.get("kind") == "ConfigMap"
         and "PERSISTENT_AGENT_RECONCILIATION_ENABLED" in (doc.get("data") or {})
     )
-    assert configmap["data"]["PERSISTENT_AGENT_RECONCILIATION_ENABLED"] == "true"
+    assert configmap["data"]["PERSISTENT_AGENT_RECONCILIATION_ENABLED"] == "false"
 
     deployment = next(
         doc

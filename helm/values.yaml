@@ -680,10 +680,10 @@ orchestrator:
   # and before inline finalization. Keep at zero outside an intentional test.
   completionFinalizerInlineDelaySeconds: 0
   # -- Automatic image-drift and missing-pod reconciliation for commissioned
-  # Officer runtimes. First rollout stays dark until every orchestrator
-  # replica serves the parked-boundary acknowledgement contract; the
-  # owner/admin manual recycle endpoint remains available while false.
-  persistentAgentReconciliationEnabled: false
+  # Officer runtimes. With it off, a dead Officer pod is never replaced and a
+  # new agent image never reaches a running Officer; only the owner/admin
+  # manual recycle endpoint moves him. Set false only to hold Officers still.
+  persistentAgentReconciliationEnabled: true
   # -- Admin-only, exact-binding runtime-grant verification plans. This is a
   # deployed-test seam, never an Officer/model capability; every profile ships
   # disabled and a bounded gate enables it only for the test interval.
