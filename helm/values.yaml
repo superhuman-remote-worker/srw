@@ -3813,10 +3813,22 @@ codexProxy:
   # now rejects Opus 5.5 below Claude Code 2.1.280 (`claude_code_version_too_old`,
   # which v7.3.13's 2.1.258 profile hit); v7.3.15+ presents 2.1.280. From
   # v7.3.17 Claude reasoning is only visible when the request asks for it
-  # (`include_reasoning`, sent by the loader's OpenAI factory). After ANY move
-  # of this pin, run scripts/subscription-proxy-probe.py ONCE against the new
-  # proxy.
-  image: docker.io/eceasy/cli-proxy-api:v7.3.20
+  # (`include_reasoning`, sent by the loader's OpenAI factory).
+  #
+  # Pinned at v8.0.57 (2026-11-05), the first 8.x: a strict descendant of
+  # v7.3.20 (661 commits ahead, 0 behind) that keeps IsRequestScoped(), still
+  # presents Claude Code 2.1.280, and lists every model SRW routes through it
+  # (claude-opus-5-5, claude-sonnet-5-5, gpt-6.1-sol, gpt-6-astra, gpt-6-luna).
+  # v8 adds a nested config layout and a /v8 management API but still loads
+  # this legacy-only config unchanged from a read-only mount and still serves
+  # every /v0/management route SRW calls (auth-files, *-auth-url with
+  # is_webui, get-auth-status, oauth-callback, model-definitions); upstream
+  # marks /v0/management deprecated, so plan the move before it is removed.
+  # /v0/management/config now answers in the v8 layout (SRW never reads it).
+  # Checked side by side against v7.3.20 in Docker on 2026-11-06. After ANY
+  # move of this pin, run scripts/subscription-proxy-probe.py ONCE against the
+  # new proxy.
+  image: docker.io/eceasy/cli-proxy-api:v8.0.57
   storageSize: "1Gi"
   # Retries INSIDE the proxy, on 403/408/500/502/503/504. An unset key yields 0
   # (Go zero value) despite upstream's config.example.yaml documenting 3.
