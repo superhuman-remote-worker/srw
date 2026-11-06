@@ -1,0 +1,61 @@
+{{- if include "srw.postgresRolesEnabled" . }}
+{{- /*
+The script behind the role split (see _postgres-roles.tpl), mounted into the
+bundled app, pgvector and audit StatefulSets.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres-roles
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-roles") | nindent 4 }}
+data:
+  postgres-roles.sh: |
+{{ .Files.Get "files/postgres-roles.sh" | indent 4 }}
+---
+{{- /*
+The bootstrap superuser's password for each bundled SRW database server.
+
+Its own Secret, never the application Secret: agent pods take that one whole
+through envFrom, and no application pod references this one. The database pods
+are its only readers, plus the Canvas gateway's role Job when it provisions a
+login on the bundled app database (CREATE ROLE needs it).
+
+Same keep-existing semantics as the chart's other generated credentials: an
+operator value in secrets.values wins, otherwise the stored value is kept,
+otherwise one is generated. The postgres-roles init container sets the
+password from this Secret on every database start, so a changed value takes
+effect at the next restart of that database pod and can never lock the
+database out.
+*/ -}}
+{{- $name := include "srw.postgresSuperuserSecretName" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $databases := include "srw.postgresRolesDatabases" . | fromYaml }}
+{{- $passwords := dict }}
+{{- range $key := list "postgres" "vector" "audit" }}
+{{- $secretKey := (index $databases $key).superuserPasswordKey }}
+{{- $password := index ($.Values.secrets.values | default dict) $secretKey | default "" }}
+{{- if and (not $password) $existing $existing.data (index $existing.data $secretKey) }}
+{{- $password = index $existing.data $secretKey | b64dec }}
+{{- end }}
+{{- if and (not $password) (include "srw.dbRendersStatefulset" (dict "context" $ "key" $key)) }}
+{{- $password = randAlphaNum 32 }}
+{{- end }}
+{{- with $password }}
+{{- $_ := set $passwords $secretKey . }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-roles") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+type: Opaque
+stringData:
+  {{- range $key, $value := $passwords }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- end }}
