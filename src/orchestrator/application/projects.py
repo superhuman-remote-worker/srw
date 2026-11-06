@@ -166,6 +166,7 @@ def projects_dependencies(
             main_cloud_router=resources.main_cloud_router,
             logger=logger,
             provisioning=project_provisioning_dependencies(resources),
+            graph=resources.knowledge_graph,
             with_validated_tool_overrides=session_tool_policy.with_validated_tool_overrides,
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),

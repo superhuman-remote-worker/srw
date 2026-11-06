@@ -157,6 +157,7 @@ def _proj_deps(
     return ProjectsDependencies(
         store=db,
         operations=projects.ProjectDependencies(
+            graph=MagicMock(get=MagicMock(return_value=None)),
             store=db,
             vector_db=MagicMock(),
             forge=forge,

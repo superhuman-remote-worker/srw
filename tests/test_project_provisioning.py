@@ -735,6 +735,7 @@ class TestRemovedMemberLeavesTheCloudGroup:
         )
         provisioning_deps = _deps()
         deps = projects.ProjectDependencies(
+            graph=MagicMock(get=MagicMock(return_value=None)),
             store=store,
             vector_db=MagicMock(),
             forge=SimpleNamespace(is_initialized=False),

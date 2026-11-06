@@ -785,29 +785,50 @@ class KnowledgeGraphDB:
     # Cleanup
     # =========================================================================
 
-    def delete_project_knowledge(self, project_id: str) -> int:
-        """Delete all knowledge nodes for a project.
+    def delete_project_knowledge(
+        self, project_id: str, *, batch_size: int = 1000
+    ) -> int:
+        """Delete every node a project owns: its notes, tags and keywords.
 
-        Used by orchestrator's delete_project() path.
+        Runs when a project is deleted, and in the sweep that removes what a
+        deleted project left behind. Deletes ``batch_size`` nodes per
+        transaction, so a large project never needs one transaction holding
+        all of it.
 
         Args:
             project_id: Project UUID
+            batch_size: Nodes deleted per transaction
 
         Returns:
             Number of nodes deleted
         """
-        result = self._db.execute_write(
+        deleted = 0
+        while True:
+            result = self._db.execute_write(
+                """
+                MATCH (n {project_id: $pid})
+                WITH n LIMIT $batch
+                DETACH DELETE n
+                RETURN count(n) AS cnt
+                """,
+                {"pid": project_id, "batch": batch_size},
+            )
+            count = int(result[0]["cnt"]) if result else 0
+            deleted += count
+            if count < batch_size:
+                break
+        logger.info(f"Deleted {deleted} knowledge nodes for project {project_id}")
+        return deleted
+
+    def knowledge_project_ids(self) -> List[str]:
+        """Every project id the graph holds a node for."""
+        rows = self._db.execute_query(
             """
-            MATCH (n {project_id: $pid})
-            WITH n, count(n) AS cnt
-            DETACH DELETE n
-            RETURN cnt
-            """,
-            {"pid": project_id},
+            MATCH (n) WHERE n.project_id IS NOT NULL
+            RETURN DISTINCT n.project_id AS pid
+            """
         )
-        count = result[0]["cnt"] if result else 0
-        logger.info(f"Deleted {count} knowledge nodes for project {project_id}")
-        return count
+        return [str(row["pid"]) for row in rows or [] if row.get("pid")]
 
     def get_note_content_hash(self, content: str) -> str:
         """Generate SHA-256 hash of note content."""

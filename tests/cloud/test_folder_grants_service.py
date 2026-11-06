@@ -132,6 +132,7 @@ async def test_the_sweep_loop_reads_the_router_each_tick_and_survives_a_failure(
 
 def _project_dependencies(store):
     return projects.ProjectDependencies(
+        graph=MagicMock(get=MagicMock(return_value=None)),
         store=store,
         vector_db=SimpleNamespace(acquire=_acquire),
         forge=SimpleNamespace(is_initialized=False),

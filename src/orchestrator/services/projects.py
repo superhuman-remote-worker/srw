@@ -51,7 +51,7 @@ from orchestrator.security.access import (
     restore_hidden_config_values,
     user_can_access_datasource,
 )
-from orchestrator.services import project_provisioning
+from orchestrator.services import knowledge_graph_cleanup, project_provisioning
 from orchestrator.services.cloud import ProjectFolderHandle, folder_grants
 from orchestrator.services.cloud.identity import (
     get_home_browser_url_cached,
@@ -190,6 +190,8 @@ class ProjectDependencies:
     main_cloud_router: Any
     logger: Any
     provisioning: project_provisioning.ProjectProvisioningDependencies
+    #: The app's ``KnowledgeGraphHandle``; ``get()`` is None without Neo4j.
+    graph: Any
     with_validated_tool_overrides: Callable[
         [dict[str, Any] | None], dict[str, Any] | None
     ]
@@ -790,6 +792,13 @@ async def delete_project(
     success = await store.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    # Nothing cascades into Neo4j. This runs after the row is gone, so a
+    # refused delete leaves the graph alone; what it cannot remove (Neo4j
+    # unreachable), the orphan sweep does.
+    await knowledge_graph_cleanup.delete_project_graph_knowledge(
+        project_id, graph=dependencies.graph
+    )
 
     # Clean up Keycloak group
     if dependencies.keycloak_groups.is_initialized:

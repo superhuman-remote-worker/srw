@@ -45,6 +45,7 @@ from orchestrator.services import (
     infrastructure_activation_policy,
     infrastructure_metering,
     job_dispatcher,
+    knowledge_graph_cleanup,
     knowledge_index as knowledge_index_operations,
     knowledge_projection as knowledge_projection_operations,
     lifecycle as instance_lifecycle,
@@ -149,6 +150,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "session_wake_sweeper",
     "default_project_knowledge_backfill",
     "kb_reindex_sweeper",
+    "knowledge_graph_orphan_sweep",
     "pricing_sync",
     "cloud_pricing_sync",
     "workspace_metering",
@@ -921,6 +923,18 @@ async def start_background_tasks(
     tasks.start_leader_gated(
         "kb_reindex_sweeper",
         _kb_sweeper_coro,
+    )
+
+    # Removes the Neo4j knowledge of deleted projects that the project delete
+    # could not (Neo4j unreachable, or deleted before it cleaned the graph).
+    # Leader-gated: one replica sweeps.
+    tasks.start_leader_gated(
+        "knowledge_graph_orphan_sweep",
+        functools.partial(
+            knowledge_graph_cleanup.orphaned_graph_knowledge_sweep_loop,
+            store=resources.postgres_db,
+            graph=resources.knowledge_graph,
+        ),
     )
 
     # LLM $/token pricing sync: seed usage_rates from OpenRouter × the model
