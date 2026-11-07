@@ -623,9 +623,12 @@ export type {JobCloudAction};
   `,
   styles: [
     `
+      /* Inset from the header's bottom border and from the table head: the
+         filters are their own band, not a fringe of either. */
       .filter-row {
         position: relative;
-        padding: 0 1rem 0.5rem;
+        flex-shrink: 0;
+        padding: 0.75rem 1rem;
       }
 
       .table-anchor {
@@ -704,18 +707,6 @@ export type {JobCloudAction};
       .title {
         font-weight: 600;
         color: var(--text-primary, var(--text-primary));
-      }
-
-      .filter-chips {
-        display: flex;
-        gap: 4px;
-        flex-wrap: wrap;
-      }
-
-      .filter-chips .count {
-        opacity: 0.7;
-        font-size: 10px;
-        margin-left: 2px;
       }
 
       .header-actions {
@@ -1151,63 +1142,11 @@ export type {JobCloudAction};
           gap: 6px 8px;
         }
 
-        /* One-line title bar: the title and the action cluster share row 1 (the
-           actions are pushed right by their margin-left:auto), and the filter
-           chips drop to row 2 via order:1 below. */
+        /* One-line title bar: the title and the action cluster share one row
+           (the actions are pushed right by their margin-left:auto). */
         .snapshot-stats {
           /* Low signal on a phone — often just "0 snapshots". Reclaim the space. */
           display: none;
-        }
-
-        /* Filter chips: a single horizontally-scrollable row instead of wrapping
-           to three rows (~102px). order:1 puts it on its own line below the
-           title + actions; it then scrolls sideways. */
-        .filter-chips {
-          order: 1;
-          gap: 6px;
-          flex-wrap: nowrap;
-          flex-basis: 100%;
-          overflow-x: auto;
-          -webkit-overflow-scrolling: touch;
-          scrollbar-width: none;
-          padding-bottom: 2px;
-          /* Soft-fade the right edge so a partially-visible chip reads as
-             "swipe for more" rather than looking cut off at the screen edge.
-             The mask is fixed to the strip box (not the content), so it always
-             feathers the rightmost ~24px of the visible row. */
-          -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
-          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
-        }
-
-        .filter-chips::-webkit-scrollbar {
-          display: none;
-        }
-
-        .filter-chips app-chip {
-          flex-shrink: 0;
-        }
-
-        /* Trailing scroll space so that, when scrolled fully right, the last
-           chip sits past the fade zone and stays fully legible (otherwise the
-           end of the list would look faded too). */
-        .filter-chips app-chip:last-child {
-          margin-right: 28px;
-        }
-
-        /* The global mobile rule gives every selectable chip a 44px touch target,
-           which is chunky for a scrollable filter strip. Scope a more compact
-           size to this strip so more chips fit on screen: shorter, tighter
-           padding, slightly smaller text. (::ng-deep reaches the chip's inner
-           button; the .filter-chips prefix keeps it local to the Jobs header.) */
-        .filter-chips ::ng-deep .app-chip__btn[data-selectable] {
-          min-height: 0;
-          height: 30px;
-          padding: 0 7px;
-          font-size: 10px;
-        }
-
-        .filter-chips .count {
-          font-size: 9px;
         }
 
         .table-container {

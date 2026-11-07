@@ -9,10 +9,11 @@
 
   position: absolute;
 
-  // An explicit gutter, not the container's padding: absolute positioning
+  // Left-anchored, under the search + Filters cluster that opens it. An
+  // explicit gutter, not the container's padding: absolute positioning
   // resolves against the padding box, so a padded ancestor does not inset an
-  // absolutely positioned child and the panel would sit flush to the window.
-  right: v.$space-md;
+  // absolutely positioned child and the panel would sit flush to the edge.
+  left: v.$space-md;
   top: calc(100% + #{v.$space-xs});
   z-index: v.$z-overlay;
   display: flex;
@@ -70,4 +71,13 @@
   font-size: v.$font-size-xs;
   line-height: v.$line-height-base;
   color: var(--text-muted);
+}
+
+// Phones: span the row between equal gutters instead of a 22rem box that
+// leaves twice the gap on one side.
+@media (max-width: v.$breakpoint-md) {
+  .job-panel {
+    right: v.$space-md;
+    width: auto;
+  }
 }

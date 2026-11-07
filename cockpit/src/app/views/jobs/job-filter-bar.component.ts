@@ -15,6 +15,7 @@ import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {TranslocoDirective} from '@jsverse/transloco';
 import {AppInputComponent} from '../../ui/input';
 import {AppButtonComponent} from '../../ui/button';
+import {AppIconComponent} from '../../ui/icon';
 import {JobFilterToken, JobListFilters, KNOWN_JOB_STATUSES} from './job-filters';
 
 /**
@@ -32,93 +33,98 @@ import {JobFilterToken, JobListFilters, KNOWN_JOB_STATUSES} from './job-filters'
   selector: 'app-job-filter-bar',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [TranslocoDirective, AppInputComponent, AppButtonComponent],
+  imports: [TranslocoDirective, AppInputComponent, AppButtonComponent, AppIconComponent],
   template: `
     <div class="job-filters" *transloco="let t">
-      <div class="job-filters__row">
-        <div
-          class="job-filters__chips"
-          role="group"
-          [attr.aria-label]="t('jobs.filter.statusGroup')"
+      <!-- Row 1: the status vocabulary, read as a quiet strip. A status with
+           jobs is a button; an empty one is muted text, so a fresh install
+           does not render as a wall of greyed-out pills. -->
+      <div
+        class="job-filters__chips"
+        role="group"
+        [attr.aria-label]="t('jobs.filter.statusGroup')"
+      >
+        <button
+          type="button"
+          class="job-chip"
+          [attr.aria-pressed]="filters().status.length === 0"
+          (click)="clearStatuses.emit()"
         >
+          {{ t('jobs.filter.all') }}
+          @if (totalCount() !== null) {
+            <span class="job-chip__count">{{ totalCount() }}</span>
+          }
+        </button>
+        @for (status of statuses; track status) {
           <button
             type="button"
             class="job-chip"
-            [attr.aria-pressed]="filters().status.length === 0"
-            (click)="clearStatuses.emit()"
+            [attr.aria-pressed]="isStatusOn(status)"
+            [disabled]="isDeadEnd(status)"
+            (click)="statusToggle.emit(status)"
           >
-            {{ t('jobs.filter.all') }}
-            @if (totalCount() !== null) {
-              <span class="job-chip__count">{{ totalCount() }}</span>
-            }
+            {{ t('jobs.status.' + status) }}
+            <span class="job-chip__count">{{ countFor(status) }}</span>
           </button>
-          @for (status of statuses; track status) {
-            <button
-              type="button"
-              class="job-chip"
-              [attr.aria-pressed]="isStatusOn(status)"
-              [disabled]="isDeadEnd(status)"
-              (click)="statusToggle.emit(status)"
-            >
-              {{ t('jobs.status.' + status) }}
-              <span class="job-chip__count">{{ countFor(status) }}</span>
-            </button>
-          }
-        </div>
-
-        <div class="job-filters__tools">
-          <app-input
-            class="job-filters__search"
-            size="sm"
-            type="search"
-            [fullWidth]="false"
-            [value]="search()"
-            [placeholder]="t('jobs.filter.searchPlaceholder')"
-            [ariaLabel]="t('jobs.filter.searchLabel')"
-            (valueChange)="searchInput.emit($event)"
-          />
-          <app-button
-            #panelTrigger
-            size="sm"
-            variant="secondary"
-            [attr.aria-expanded]="panelOpen()"
-            (clicked)="togglePanel.emit()"
-          >
-            {{ t('jobs.filter.more') }}
-            @if (tokens().length) {
-              <span class="job-filters__badge">{{ tokens().length }}</span>
-            }
-          </app-button>
-        </div>
+        }
       </div>
 
-      @if (tokens().length) {
-        <div
-          class="job-filters__tokens"
-          role="group"
-          [attr.aria-label]="t('jobs.filter.appliedGroup')"
+      <!-- Row 2: search, the Filters trigger, and what is applied, side by
+           side. The tokens sit next to the button that edits them. -->
+      <div class="job-filters__bar">
+        <app-input
+          class="job-filters__search"
+          size="sm"
+          type="search"
+          [fullWidth]="false"
+          [value]="search()"
+          [placeholder]="t('jobs.filter.searchPlaceholder')"
+          [ariaLabel]="t('jobs.filter.searchLabel')"
+          (valueChange)="searchInput.emit($event)"
+        />
+        <app-button
+          #panelTrigger
+          class="job-filters__trigger"
+          size="sm"
+          variant="secondary"
+          [attr.aria-expanded]="panelOpen()"
+          (clicked)="togglePanel.emit()"
         >
-          @for (token of tokens(); track token.id) {
-            <button
-              #tokenButton
-              type="button"
-              class="job-token"
-              [attr.aria-label]="
-                t('jobs.filter.removeToken', {
-                  filter: t(token.labelKey, token.labelParams ?? {}),
-                })
-              "
-              (click)="onRemove(token, $index)"
-            >
-              <span aria-hidden="true">{{ t(token.labelKey, token.labelParams ?? {}) }}</span>
-              <span class="job-token__x" aria-hidden="true">×</span>
-            </button>
+          <app-icon size="sm">tune</app-icon>
+          {{ t('jobs.filter.more') }}
+          @if (tokens().length) {
+            <span class="job-filters__badge">{{ tokens().length }}</span>
           }
-          <button type="button" class="job-token job-token--clear" (click)="clearAll.emit()">
-            {{ t('jobs.filter.clearAll') }}
-          </button>
-        </div>
-      }
+        </app-button>
+
+        @if (tokens().length) {
+          <div
+            class="job-filters__tokens"
+            role="group"
+            [attr.aria-label]="t('jobs.filter.appliedGroup')"
+          >
+            @for (token of tokens(); track token.id) {
+              <button
+                #tokenButton
+                type="button"
+                class="job-token"
+                [attr.aria-label]="
+                  t('jobs.filter.removeToken', {
+                    filter: t(token.labelKey, token.labelParams ?? {}),
+                  })
+                "
+                (click)="onRemove(token, $index)"
+              >
+                <span aria-hidden="true">{{ t(token.labelKey, token.labelParams ?? {}) }}</span>
+                <span class="job-token__x" aria-hidden="true">×</span>
+              </button>
+            }
+            <button type="button" class="job-token job-token--clear" (click)="clearAll.emit()">
+              {{ t('jobs.filter.clearAll') }}
+            </button>
+          </div>
+        }
+      </div>
     </div>
   `,
   styleUrl: './job-filter-bar.component.scss',
