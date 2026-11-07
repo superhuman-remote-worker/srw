@@ -771,6 +771,7 @@
       "user": "Von einer Person erstellt",
       "session": "Aus einer Sitzung gestartet",
       "automation": "Automatisierung",
+      "telephony": "Telefonanruf",
       "loop": "Schleife",
       "officer": "Officer",
       "subjob": "Teilauftrag",

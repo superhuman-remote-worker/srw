@@ -771,6 +771,7 @@
       "user": "Submitted by a person",
       "session": "Started from a session",
       "automation": "Automation",
+      "telephony": "Phone call",
       "loop": "Loop",
       "officer": "Officer",
       "subjob": "Sub-job",
