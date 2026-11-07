@@ -29,6 +29,7 @@ from orchestrator.services import knowledge_graph_cleanup as cleanup
 from orchestrator.services import projects
 from shared.runtime.database import neo4j_db
 from shared.runtime.services.knowledge_graph import KnowledgeGraphDB
+from tests._project_delete_stubs import fake_deletion_store
 
 _PASSWORD = "kb-graph-cleanup"
 
@@ -335,17 +336,11 @@ def _project_dependencies(store, graph):
     )
 
 
-def _project_store(delete):
-    @asynccontextmanager
-    async def acquire():
-        yield SimpleNamespace(execute=AsyncMock())
+def _project_store(delete=None, *, begin=None):
+    async def deleted(_project_id):
+        return True
 
-    return SimpleNamespace(
-        assert_project_deletable=AsyncMock(),
-        get_project_repositories=AsyncMock(return_value=[]),
-        acquire=acquire,
-        delete_project=delete,
-    )
+    return fake_deletion_store(delete_project=delete or deleted, begin=begin)
 
 
 @pytest.mark.asyncio
@@ -392,7 +387,9 @@ async def test_a_refused_project_delete_leaves_the_graph_alone(monkeypatch):
         await projects.delete_project(
             PROJECT_ID,
             project={"id": PROJECT_ID, "is_default": False},
-            dependencies=_project_dependencies(_project_store(refuse), _handle(graph)),
+            dependencies=_project_dependencies(
+                _project_store(begin=refuse), _handle(graph)
+            ),
         )
 
     graph.delete_project_knowledge.assert_not_called()

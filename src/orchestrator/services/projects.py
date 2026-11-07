@@ -51,7 +51,7 @@ from orchestrator.security.access import (
     restore_hidden_config_values,
     user_can_access_datasource,
 )
-from orchestrator.services import knowledge_graph_cleanup, project_provisioning
+from orchestrator.services import project_deletion, project_provisioning
 from orchestrator.services.cloud import ProjectFolderHandle, folder_grants
 from orchestrator.services.cloud.identity import (
     get_home_browser_url_cached,
@@ -427,9 +427,12 @@ async def list_projects(
     try:
         if is_admin and user_id is None:
             async with store.acquire() as conn:
+                # A project being deleted answers every call with 409 until its
+                # row is gone, so the listing leaves it out (as for members).
                 rows = await conn.fetch(
                     "SELECT * FROM projects WHERE "
                     f"{project_status_filter_sql('$1')} "
+                    "AND deletion_requested_at IS NULL "
                     "ORDER BY updated_at DESC LIMIT 100",
                     statuses,
                 )
@@ -739,104 +742,40 @@ async def delete_project(
     *,
     project: dict[str, Any],
     dependencies: ProjectDependencies,
+    requested_by: str | None = None,
+    expected_resource: tuple[str, int] | None = None,
 ) -> dict[str, str]:
-    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects."""
-    store = dependencies.store
-    logger = dependencies.logger
+    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects.
 
+    The delete is decided first, in one transaction that touches nothing
+    outside the database: the refusal checks (409), ``expected_resource``'s
+    version when the manifest API deletes (409), then the mark that makes
+    the project refuse new work. Then this request drives the teardown:
+    managed repositories, folder grants, the row, the search index, the
+    Keycloak group and the main-cloud folder. ``{"status": "deleted"}`` once
+    the row is gone; ``{"status": "deleting", ...}`` when a step before it
+    must be retried, which the project deletion sweeper does. Steps after
+    the row that fail are retried the same way.
+    """
     if project.get("is_default"):
         raise HTTPException(status_code=400, detail="Cannot delete a default project")
 
-    # The vault repo cannot come back, and its delete must come before the
-    # row's (a retry needs the row). So the refusal comes first: a project
-    # with a resumable session or unfinished work stays whole.
-    await store.assert_project_deletable(project_id)
-
-    # Clean up managed repos
-    repos = await store.get_project_repositories(project_id)
-    for repo in repos:
-        if repo.get("is_managed"):
-            if not await revoke_and_delete_managed_repository(
-                store, dependencies.forge, repo["name"]
-            ):
-                raise HTTPException(
-                    status_code=503,
-                    detail="Repository credential revocation is retryable",
-                )
-
-    # The project's per-folder principals go before its folder does (their
-    # rows outlive the project; what this cannot finish, the sweep does).
-    await folder_grants.revoke_folder_grants(
-        store,
-        dependencies.main_cloud_router,
-        reason="project_deleted",
-        project_id=project_id,
+    deletion = await dependencies.store.begin_project_deletion(
+        project_id, requested_by=requested_by, expected_resource=expected_resource
     )
-
-    success = await store.delete_project(project_id)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to delete project")
-
-    # Nothing cascades into the vector DB. This runs after the row, so a
-    # refused delete keeps the index; what a failure here leaves, no search
-    # reaches.
-    try:
-        async with dependencies.vector_db.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id)
-            )
-    except Exception as e:
-        logger.warning(
-            f"Failed to clean up knowledge_index for project {project_id}: {e}"
-        )
-
-    # Nothing cascades into Neo4j. This runs after the row is gone, so a
-    # refused delete leaves the graph alone; what it cannot remove (Neo4j
-    # unreachable), the orphan sweep does.
-    await knowledge_graph_cleanup.delete_project_graph_knowledge(
-        project_id, graph=dependencies.graph
+    outcome = await project_deletion.drive_project_deletion(
+        project_id, dependencies=dependencies, claimed=deletion
     )
-
-    # Clean up Keycloak group
-    if dependencies.keycloak_groups.is_initialized:
-        await dependencies.keycloak_groups.delete_project_group(project_id)
-
-    # Clean up main-cloud project folder via the row's backend dispatch.
-    #
-    # The DB row is already gone by this point, so raising here would report a
-    # delete that actually happened as a 500. An unresolvable installation
-    # authority means we cannot say *which* installation holds the folder, and
-    # deleting from a guessed one is unacceptable — so leave the folder in
-    # place, say so, and let the delete stand.
-    backend = dependencies.main_cloud_router.for_project_optional(project)
-    handle_str = project.get("main_cloud_folder_handle") or (
-        str(project["nextcloud_folder_id"])
-        if project.get("nextcloud_folder_id")
-        else None
-    )
-    if backend is None:
-        if handle_str:
-            logger.warning(
-                "Project %s deleted, but its main-cloud folder (%s on provider "
-                "%r) was left in place: no resolvable backend instance for the "
-                "row. The folder needs manual cleanup.",
-                project_id,
-                handle_str,
-                project.get("main_cloud_backend"),
-            )
-    elif handle_str and backend.is_initialized:
-        try:
-            handle = ProjectFolderHandle.from_db(
-                handle_str,
-                backend=project.get("main_cloud_backend") or backend.backend_id,
-            )
-            await backend.delete_project_folder(handle)
-        except Exception as e:
-            logger.warning(
-                f"Failed to delete main-cloud folder for project {project_id}: {e}"
-            )
-
-    return {"status": "deleted"}
+    if outcome.status == project_deletion.DELETED:
+        return {"status": "deleted"}
+    return {
+        "status": "deleting",
+        "detail": (
+            "The project is being deleted and refuses new work; the rest of "
+            "the deletion is retried in the background"
+            + (f" ({outcome.error})." if outcome.error else ".")
+        ),
+    }
 
 
 # =============================================================================

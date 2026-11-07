@@ -613,6 +613,63 @@ class TestProjectStatusFilterSql:
         assert "COALESCE(p.status, 'active')" in sql
 
 
+@pytest.fixture
+def deleting_project(project_a):
+    project_a["deletion_requested_at"] = "2026-11-07T10:00:00+00:00"
+    return project_a
+
+
+class TestRequireProjectDeleting:
+    """A project whose delete was decided answers only its own delete."""
+
+    @pytest.mark.asyncio
+    async def test_every_call_is_refused_reads_too(
+        self, user_a, deleting_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_a):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_member(
+                    fake_request, fake_db, str(deleting_project["id"])
+                )
+        assert exc.value.status_code == 409
+        assert exc.value.detail == access.PROJECT_DELETING_DETAIL
+
+    @pytest.mark.asyncio
+    async def test_the_owner_gate_refuses_too(
+        self, user_admin, deleting_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_admin):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_owner(
+                    fake_request, fake_db, str(deleting_project["id"])
+                )
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_the_delete_itself_passes(
+        self, user_admin, deleting_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_admin):
+            _, project = await access.require_project_owner(
+                fake_request,
+                fake_db,
+                str(deleting_project["id"]),
+                allow_deleting=True,
+            )
+        assert project is deleting_project
+
+    @pytest.mark.asyncio
+    async def test_authorization_ranks_above_the_deletion(
+        self, user_b, deleting_project, fake_db, fake_request
+    ):
+        with _patch_caller(user_b):
+            with pytest.raises(HTTPException) as exc:
+                await access.require_project_member(
+                    fake_request, fake_db, str(deleting_project["id"])
+                )
+        assert exc.value.status_code == 403
+
+
 class TestRequireProjectMemberArchived:
     @pytest.mark.asyncio
     async def test_default_allows_archived(

@@ -1609,6 +1609,7 @@ async def kb_sweep_tick(
             JOIN projects AS p ON p.id = pr.project_id
             WHERE pr.role = ANY($1::text[])
               AND p.status = 'active'
+              AND p.deletion_requested_at IS NULL
             ORDER BY pr.project_id
             """,
             list(_KB_REPO_ROLES),

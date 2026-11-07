@@ -147,28 +147,37 @@ def schedule_default_project_knowledge(
     )
 
 
-def projects_dependencies(
+def project_dependencies(
     resources: ApplicationResources,
-) -> projects_routes.ProjectsDependencies:
-    """Compose the project lifecycle, membership and repository adapters.
+) -> projects_operations.ProjectDependencies:
+    """The project operations' collaborators.
 
+    Shared by the project routes, the manifest API's Project delete and the
+    project deletion sweeper, so all three delete with the same ports.
     ``with_validated_tool_overrides`` is injected rather than duplicated: job
     create, session create and project create must keep answering identically
     about which tool categories a stored override may name.
     """
+    return projects_operations.ProjectDependencies(
+        store=resources.postgres_db,
+        vector_db=resources.vector_db,
+        forge=resources.gitea_client,
+        keycloak_groups=resources.keycloak_groups,
+        main_cloud_router=resources.main_cloud_router,
+        logger=logger,
+        provisioning=project_provisioning_dependencies(resources),
+        graph=resources.knowledge_graph,
+        with_validated_tool_overrides=session_tool_policy.with_validated_tool_overrides,
+    )
+
+
+def projects_dependencies(
+    resources: ApplicationResources,
+) -> projects_routes.ProjectsDependencies:
+    """Compose the project lifecycle, membership and repository adapters."""
     return projects_routes.ProjectsDependencies(
         store=resources.postgres_db,
-        operations=projects_operations.ProjectDependencies(
-            store=resources.postgres_db,
-            vector_db=resources.vector_db,
-            forge=resources.gitea_client,
-            keycloak_groups=resources.keycloak_groups,
-            main_cloud_router=resources.main_cloud_router,
-            logger=logger,
-            provisioning=project_provisioning_dependencies(resources),
-            graph=resources.knowledge_graph,
-            with_validated_tool_overrides=session_tool_policy.with_validated_tool_overrides,
-        ),
+        operations=project_dependencies(resources),
         require_admin=functools.partial(access_composition.require_admin, resources),
         require_approved_user=auth.require_approved_user,
         require_project_member=access.require_project_member,

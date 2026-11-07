@@ -59494,7 +59494,7 @@ class PostgresDB:
                        nextcloud_folder_id,
                        main_cloud_backend, main_cloud_backend_instance_id,
                        main_cloud_folder_handle, main_cloud_folder_error,
-                       network_tier,
+                       network_tier, deletion_requested_at,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = projects.id) AS job_count,
                        created_at, updated_at
                 FROM projects
@@ -59560,7 +59560,8 @@ class PostgresDB:
                 keep seeing archived projects. ``GET /api/projects`` is the
                 one caller that narrows, and it passes ``['active']`` unless
                 the client asked otherwise. Unknown/NULL statuses always
-                survive the filter (see ``project_status_filter_sql``).
+                survive the filter (see ``project_status_filter_sql``). A
+                narrowed listing also leaves out projects being deleted.
 
         Returns:
             List of project dicts with aggregate counts, ordered by
@@ -59583,7 +59584,12 @@ class PostgresDB:
             from orchestrator.security.access import project_status_filter_sql
 
             params.append(list(statuses))
-            status_clause = f" AND {project_status_filter_sql('$3', column='p.status')}"
+            # The listing also drops a project whose delete was decided: it
+            # answers every request with 409 until its row is gone.
+            status_clause = (
+                f" AND {project_status_filter_sql('$3', column='p.status')}"
+                " AND p.deletion_requested_at IS NULL"
+            )
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -59749,27 +59755,79 @@ class PostgresDB:
                 error,
             )
 
-    async def assert_project_deletable(self, project_id: str) -> None:
-        """Raise the 409 ``delete_project`` would raise, deleting nothing.
+    async def begin_project_deletion(
+        self,
+        project_id: str,
+        *,
+        requested_by: Optional[str] = None,
+        expected_resource: Optional[tuple[str, int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Decide a project delete, deleting nothing (one transaction).
 
-        The project delete calls this before it removes anything outside the
-        database (the vault repo, the search index). ``delete_project`` runs
-        the same checks again in its own transaction, so work admitted in
-        between is still refused there.
+        The refusal checks, then ``expected_resource``'s version, then the
+        mark and the ``project_deletions`` row. Returns that row when this
+        call decided the delete (its lease is held), None when an earlier
+        decision stands. Raises 404, 400 (a default project) or 409. See
+        ``services.project_deletion.begin_project_deletion``.
         """
-        from orchestrator.services.manifest_retirement import (
-            assert_project_retirable,
-        )
+        from orchestrator.services import project_deletion
 
         async with self.acquire() as conn:
             async with conn.transaction():
-                await assert_project_retirable(conn, UUID(project_id))
+                return await project_deletion.begin_project_deletion(
+                    conn,
+                    UUID(project_id),
+                    requested_by=requested_by,
+                    expected_resource=expected_resource,
+                )
+
+    async def claim_project_deletion(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Take the lease on an unfinished, due project deletion."""
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.claim_project_deletion(conn, UUID(project_id))
+
+    async def get_project_deletion(self, project_id: str) -> Optional[Dict[str, Any]]:
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.get_project_deletion(conn, UUID(project_id))
+
+    async def settle_project_deletion(
+        self,
+        project_id: str,
+        *,
+        pending_steps: Optional[list[str]],
+        error: Optional[str],
+    ) -> None:
+        """Close a project deletion, or release its lease until the backoff."""
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            await project_deletion.settle_project_deletion(
+                conn, UUID(project_id), pending_steps=pending_steps, error=error
+            )
+
+    async def due_project_deletions(self) -> list[UUID]:
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.due_project_deletions(conn)
+
+    async def purge_completed_project_deletions(self) -> int:
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.purge_completed_project_deletions(conn)
 
     async def delete_project(self, project_id: str) -> bool:
         """Delete a project (cascades to members, repos).
 
         Its jobs and its own datasources stay, detached. All of it happens in
-        one transaction: a refused delete changes nothing.
+        one transaction: a refused delete changes nothing. A decided delete
+        (``begin_project_deletion``) also records, in that transaction, what
+        its steps after the row must remove.
 
         Args:
             project_id: Project UUID
@@ -59855,12 +59913,24 @@ class PostgresDB:
                     "UPDATE datasources SET project_id = NULL WHERE project_id = $1",
                     uuid_val,
                 )
-                result = await conn.execute(
-                    "DELETE FROM projects WHERE id = $1",
+                deleted = await conn.fetchrow(
+                    """
+                    DELETE FROM projects WHERE id = $1
+                    RETURNING main_cloud_backend, main_cloud_backend_instance_id,
+                              main_cloud_folder_handle, nextcloud_folder_id
+                    """,
                     uuid_val,
                 )
+                if deleted is not None:
+                    # A decided delete records, with the row, what is left
+                    # outside the database (services.project_deletion).
+                    from orchestrator.services.project_deletion import (
+                        record_row_deleted,
+                    )
 
-        return result == "DELETE 1"
+                    await record_row_deleted(conn, uuid_val, dict(deleted))
+
+        return deleted is not None
 
     # -- Project Members --
 

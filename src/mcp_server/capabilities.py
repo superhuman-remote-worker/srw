@@ -257,7 +257,10 @@ _MUTATION_CAPABILITIES = (
     _mutation(
         "manifest_delete",
         "DELETE /api/resources/{resource_id}?expected_version",
-        "deletes an authorized resource at the observed version; active/managed dependencies can block deletion",
+        "deletes an authorized resource at the observed version; active/managed "
+        "dependencies can block deletion; a Project is deleted with its vault, "
+        "search index, graph, Keycloak group and cloud folder, and may finish "
+        "in the background",
         authorization="approved user; resource owner/project editor and dependency guards enforced",
         destructive=True,
         idempotent=True,
@@ -361,7 +364,8 @@ _MUTATION_CAPABILITIES = (
     _mutation(
         "delete_project",
         "DELETE /api/projects/{project_id}",
-        "permanently removes project data, repositories, and knowledge",
+        "permanently removes project data, repositories, and knowledge; may "
+        "finish in the background",
         authorization=_OWNER_AUTH,
         destructive=True,
     ),

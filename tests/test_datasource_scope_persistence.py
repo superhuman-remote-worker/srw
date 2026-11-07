@@ -955,24 +955,42 @@ async def test_delete_project_removes_its_own_connectors_before_project_row():
     conn.fetch.return_value = []
     conn.fetchval.return_value = False
     conn.execute.return_value = "DELETE 1"
+    # The row delete returns what the deletion's later steps need.
+    conn.fetchrow.return_value = {
+        "main_cloud_backend": None,
+        "main_cloud_backend_instance_id": None,
+        "main_cloud_folder_handle": None,
+        "nextcloud_folder_id": None,
+    }
     db = _make_db(conn)
 
     assert await db.delete_project(PROJECT_A)
 
     conn.transaction.assert_called_once()
-    statements = [call.args[0] for call in conn.execute.await_args_list]
+    statements = [
+        (name, call.args[0])
+        for name, call in (
+            (call[0], call)
+            for call in conn.mock_calls
+            if call[0] in ("execute", "fetchrow")
+        )
+    ]
     native_index = next(
         index
-        for index, sql in enumerate(statements)
+        for index, (_name, sql) in enumerate(statements)
         if "DELETE FROM datasources" in sql
     )
     project_index = next(
-        index for index, sql in enumerate(statements) if "DELETE FROM projects" in sql
+        index
+        for index, (_name, sql) in enumerate(statements)
+        if "DELETE FROM projects" in sql
     )
     assert native_index < project_index
-    native_sql, native_project_id, managed_keys = conn.execute.await_args_list[
-        native_index
-    ].args
+    native_sql, native_project_id, managed_keys = next(
+        call.args
+        for call in conn.execute.await_args_list
+        if "DELETE FROM datasources" in call.args[0]
+    )
     assert "WHERE managed_key = ANY($2::text[])" in native_sql
     assert "type = 'kb'" in native_sql
     assert "WHEN config->>'native_project_id' ~*" in native_sql

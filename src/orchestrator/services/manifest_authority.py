@@ -19,7 +19,11 @@ from orchestrator.services.connector_secrets import (
     is_own_connector_secret,
 )
 from orchestrator.services.datasource_policy import GENERIC_UNAVAILABLE_DETAIL
-from orchestrator.services.project_status import project_is_archived
+from orchestrator.services.project_status import (
+    PROJECT_DELETING_DETAIL,
+    project_is_archived,
+    project_is_deleting,
+)
 
 
 class ManifestAuthority:
@@ -39,7 +43,7 @@ class ManifestAuthority:
             detail=detail,
         )
 
-    async def scope(self, scope=None, *, write=False):
+    async def scope(self, scope=None, *, write=False, allow_deleting=False):
         scope = dict(scope or self.account)
         if scope["kind"] == "Account":
             if scope["name"] in ("me", "personal"):
@@ -88,6 +92,9 @@ class ManifestAuthority:
                     await self.deny(
                         "Project membership does not permit this resource operation."
                     )
+            # A decided delete only ever finishes; only that delete writes.
+            if write and project_is_deleting(project) and not allow_deleting:
+                raise HTTPException(409, PROJECT_DELETING_DETAIL)
             if write and project_is_archived(project):
                 raise HTTPException(
                     409,
@@ -95,7 +102,9 @@ class ManifestAuthority:
                 )
         return scope
 
-    async def resource(self, row, *, write=False, reference=False):
+    async def resource(
+        self, row, *, write=False, reference=False, allow_deleting=False
+    ):
         """Authority over a resource row: read (default), write, or with
         ``reference`` naming it from another document."""
         if row["kind"] == "Expert" and row.get("linked_id") and not write:
@@ -153,10 +162,16 @@ class ManifestAuthority:
         # portable Project document is in its creator's Account scope.
         if row["kind"] == "Project" and row.get("linked_id"):
             await self.scope(
-                {"kind": "Project", "name": str(row["linked_id"])}, write=write
+                {"kind": "Project", "name": str(row["linked_id"])},
+                write=write,
+                allow_deleting=allow_deleting,
             )
         else:
-            await self.scope(row["document"]["metadata"]["scope"], write=write)
+            await self.scope(
+                row["document"]["metadata"]["scope"],
+                write=write,
+                allow_deleting=allow_deleting,
+            )
 
     async def secret(self, scope, *, name=None):
         """Authority to attach the secret ``name`` in ``scope`` to a process.

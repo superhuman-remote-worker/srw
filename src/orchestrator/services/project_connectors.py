@@ -850,9 +850,12 @@ async def heal_project_connectors(db) -> dict[str, int]:
     """
     counts: dict[str, int] = {}
     drifted: list[str] = []
+    # A project whose delete was decided refuses resource writes until it
+    # is gone (migration 0565); it is not healed.
     rows = await db.fetch(
-        "SELECT linked_id FROM srw_resources WHERE kind='Project' "
-        "AND linked_id IS NOT NULL AND deleted_at IS NULL ORDER BY linked_id"
+        "SELECT r.linked_id FROM srw_resources r JOIN projects p ON p.id=r.linked_id "
+        "WHERE r.kind='Project' AND r.deleted_at IS NULL "
+        "AND p.deletion_requested_at IS NULL ORDER BY r.linked_id"
     )
     for row in rows:
         project_id = str(row["linked_id"])

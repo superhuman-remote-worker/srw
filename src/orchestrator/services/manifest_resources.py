@@ -31,11 +31,18 @@ from shared.manifests.resolution import content_revision
 
 
 class ManifestResourceService:
-    def __init__(self, db, *, admit_job=None, project_activation=None):
+    def __init__(
+        self, db, *, admit_job=None, project_activation=None, delete_project=None
+    ):
         self.db = db
         self.store = ManifestStore(db)
         self.admit_job = admit_job
         self.project_activation = project_activation
+        #: ``delete_project(project_id, *, user, expected_resource)``: the
+        #: project delete (``services.projects.delete_project``), so a
+        #: linked Project leaves what a REST delete leaves. Required: without
+        #: it a Project delete answers 503 rather than deleting only the row.
+        self.delete_project = delete_project
 
     async def full_fidelity(self, row, user):
         """Whether ``user`` reads ``row``'s stored document unredacted.
@@ -485,13 +492,24 @@ class ManifestResourceService:
         return {"resources": visible}
 
     async def delete(self, resource_id, user, *, expected_version, request=None):
+        """Delete a resource at ``expected_version``.
+
+        A linked Project is deleted by the project delete, outside any
+        catalog transaction (its external calls must not hold the catalog
+        lock). Its version is compared in the delete's decision transaction,
+        before anything outside the database is touched. The body is
+        ``{"deleted": true, "uid": ...}`` once the project row is gone, or
+        ``{"deleted": false, "deleting": true, ...}`` (HTTP 202) when the
+        decided delete must finish in the background.
+        """
         row = await self.store.by_id(resource_id)
         if not row:
             raise HTTPException(404, "Resource does not exist.")
+        linked_project = row["kind"] == "Project" and row.get("linked_id")
         await ManifestAuthority(self.db, user, request=request).resource(
-            row, write=True
+            row, write=True, allow_deleting=bool(linked_project)
         )
-        if row["kind"] == "Project" and row.get("linked_id"):
+        if linked_project:
             role = await self.db.get_user_role_in_project(
                 str(row["linked_id"]), str(user["id"])
             )
@@ -499,16 +517,21 @@ class ManifestResourceService:
                 await ManifestAuthority(self.db, user, request=request).deny(
                     "Project deletion requires its owner."
                 )
-            async with self.db.transaction_scope():
-                await self.store.lock_catalog()
-                current = await self.store.by_id(resource_id)
-                if not current or current["resource_version"] != expected_version:
-                    raise HTTPException(
-                        409,
-                        "Resource version changed; read the current resource and retry.",
-                    )
-                await self.db.delete_project(str(row["linked_id"]))
-            return {"deleted": True, "uid": str(row["id"])}
+            if self.delete_project is None:
+                raise HTTPException(503, "Project deletion is unavailable.")
+            result = await self.delete_project(
+                str(row["linked_id"]),
+                user=user,
+                expected_resource=(str(row["id"]), expected_version),
+            )
+            if result.get("status") == "deleted":
+                return {"deleted": True, "uid": str(row["id"])}
+            return {
+                "deleted": False,
+                "deleting": True,
+                "uid": str(row["id"]),
+                "detail": result.get("detail"),
+            }
         await self.store.delete(row, expected_version=expected_version)
         return {"deleted": True, "uid": str(row["id"])}
 

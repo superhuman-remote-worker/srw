@@ -14,6 +14,7 @@ from orchestrator.services import projects
 from orchestrator.services.cloud import folder_grants, ro_probe
 from orchestrator.services.cloud.base import CanaryFixture
 from orchestrator.services.cloud.handles import ProjectFolderHandle
+from tests._project_delete_stubs import fake_deletion_store
 
 PROJECT_ID = "22222222-2222-4222-8222-222222222222"
 USER_ID = "33333333-3333-4333-8333-333333333333"
@@ -191,12 +192,7 @@ async def test_deleting_a_project_revokes_its_grants_before_the_row_goes(
         return True
 
     monkeypatch.setattr(folder_grants, "revoke_folder_grants", revoke)
-    store = SimpleNamespace(
-        assert_project_deletable=AsyncMock(),
-        get_project_repositories=AsyncMock(return_value=[]),
-        acquire=_acquire,
-        delete_project=delete,
-    )
+    store = fake_deletion_store(delete_project=delete)
 
     await projects.delete_project(
         PROJECT_ID,

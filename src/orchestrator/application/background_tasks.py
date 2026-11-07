@@ -57,6 +57,7 @@ from orchestrator.services import (
     pinned_k8s_reconciliation as pinned_k8s_reconciliation_service,
     project_loop_advance as project_loop_advance_service,
     project_loop_spawn as project_loop_spawn_service,
+    project_deletion,
     project_loop_sweeper,
     retention_sweepers,
     ro_reader_reconciler,
@@ -151,6 +152,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "default_project_knowledge_backfill",
     "kb_reindex_sweeper",
     "knowledge_graph_orphan_sweep",
+    "project_deletion_sweep",
     "pricing_sync",
     "cloud_pricing_sync",
     "workspace_metering",
@@ -934,6 +936,20 @@ async def start_background_tasks(
             knowledge_graph_cleanup.orphaned_graph_knowledge_sweep_loop,
             store=resources.postgres_db,
             graph=resources.knowledge_graph,
+        ),
+    )
+
+    # Finish decided project deletes: the steps a request could not finish
+    # (Gitea, Keycloak, the main cloud or the vector DB down; the request
+    # gone). Leader-gated: one replica sweeps, and a lease keeps it off a
+    # deletion a request is driving.
+    tasks.start_leader_gated(
+        "project_deletion_sweep",
+        functools.partial(
+            project_deletion.project_deletion_sweep_loop,
+            dependencies=functools.partial(
+                projects_composition.project_dependencies, resources
+            ),
         ),
     )
 

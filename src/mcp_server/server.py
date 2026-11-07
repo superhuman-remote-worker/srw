@@ -727,6 +727,12 @@ async def manifest_delete(resource_id: str, expected_version: int) -> str:
     """Delete an authorized resource only at the observed resourceVersion.
 
     Active execution dependencies and project ownership can prevent deletion.
+    Deleting a Project deletes the project, as delete_project does: its vault
+    repository, search index, knowledge graph, Keycloak group and cloud folder
+    go with it. When part of that must be retried, the reply says
+    "deleting": true; the project then refuses every other call and finishes
+    in the background. After an "outcome unknown" error, read the resource:
+    404 means it was deleted.
     This is a resource operation; Job cancellation uses the existing cancel tool.
     """
     try:
@@ -1728,7 +1734,9 @@ async def delete_project(project_id: str) -> str:
     """Permanently delete a project and its associated data.
 
     Cannot delete default projects. This is irreversible — all project
-    data including repos and knowledge base entries will be removed.
+    data including repos and knowledge base entries will be removed. When
+    part of the deletion must be retried, the project refuses every other
+    call and the deletion finishes in the background.
 
     Args:
         project_id: Project UUID
@@ -1739,6 +1747,9 @@ async def delete_project(project_id: str) -> str:
     client = _get_client()
     result = await client.delete_project(project_id)
     s = result.get("status", "unknown")
+    if s == "deleting":
+        detail = result.get("detail") or "it finishes in the background."
+        return f"Project {project_id} is being deleted: {detail}"
     return f"Project {project_id} deleted ({s})."
 
 
