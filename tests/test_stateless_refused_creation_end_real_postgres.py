@@ -543,3 +543,256 @@ async def test_permanent_end_of_an_upgraded_session_purges_its_old_virtual_files
 
     (target,), _ = purge.call_args
     assert target.prefix == f"threads/{case.thread_id}/"
+
+
+def _pods_get_scheduled_and_ready(monkeypatch):
+    """Pods carry the conditions startup tracking reads (as on k3d and dev)."""
+    from datetime import datetime, timezone
+
+    cluster = continuation.DelayedWorkspaceCluster
+    original_create = cluster.create_namespaced_pod
+    original_ready = cluster.become_ready
+
+    def scheduled(self, *, body, **kwargs):
+        pod = original_create(self, body=body, **kwargs)
+        pod.spec.node_name = "node8"
+        pod.status.conditions = [
+            SimpleNamespace(
+                type="PodScheduled",
+                status="True",
+                last_transition_time=datetime.now(timezone.utc),
+            )
+        ]
+        return pod
+
+    def ready(self):
+        original_ready(self)
+        self.objects["pod"].status.conditions.append(
+            SimpleNamespace(
+                type="Ready",
+                status="True",
+                last_transition_time=datetime.now(timezone.utc),
+            )
+        )
+
+    monkeypatch.setattr(cluster, "create_namespaced_pod", scheduled)
+    monkeypatch.setattr(cluster, "become_ready", ready)
+
+
+async def refused_resume_case(database, actor, monkeypatch):
+    """A Session whose first Pod ran, soft Ended and Resumed; the cluster then
+    refuses the resumed Pod (an admission policy added in between). Found on
+    local k3d 2026-11-04: End answered 503, also forced."""
+    from dataclasses import replace
+
+    from orchestrator.services import stateless_session_retirement as protocol
+
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    with monkeypatch.context() as first_pod:
+        _pods_get_scheduled_and_ready(first_pod)
+        case = await continuation.workspace_attempt(
+            database, actor, monkeypatch, first_wait="ready", seeded=True
+        )
+    # Served turns and a per-turn commit, as after real chat.
+    await database.execute(
+        "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+        "VALUES($1::uuid,'session_turn','done',2)",
+        case.thread_id,
+    )
+    await database.execute(
+        "INSERT INTO thread_turn_commits(thread_id,seq,commit_sha) "
+        "VALUES($1::uuid,4,'0123abcd')",
+        case.thread_id,
+    )
+
+    async def residents(thread, *, terminal_token, **_):
+        return protocol.ResidentRetirementProof(
+            authority=protocol.resolve_shell_retirement_authority(
+                thread, terminal_token=terminal_token
+            )
+        )
+
+    async def shell(thread, *, terminal_token, **_):
+        return protocol.resolve_shell_retirement_authority(
+            thread, terminal_token=terminal_token
+        )
+
+    monkeypatch.setattr(protocol, "retire_stateless_workspace_residents", residents)
+    monkeypatch.setattr(protocol, "retire_stateless_session_shell", shell)
+    monkeypatch.setattr(protocol, "verify_stateless_workspace_residents_retired", shell)
+    terminal_capture = case.provisioner.capture_terminal_workspace_identity
+
+    async def capture_after_seed_disappears(owner):
+        captured = await terminal_capture(owner)
+        case.cluster.objects.pop("seed", None)
+        absent = await case.provisioner.capture_workspace_teardown_identity(owner)
+        return replace(captured, seed_configmap_uid=absent.seed_configmap_uid)
+
+    monkeypatch.setattr(
+        case.provisioner,
+        "capture_terminal_workspace_identity",
+        capture_after_seed_disappears,
+    )
+    case.dependencies = replace(
+        failed_start.retirement_dependencies(database, case),
+        build_agent_cloud_mount=AsyncMock(return_value=None),
+    )
+    assert await resumed_end(database, case) == {"status": "ended"}
+    assert sorted(case.cluster.objects) == ["pvc"]
+    case.predecessor = await continuation.reservation(database, case.thread_id)
+    assert await resume_case(database, case, actor) == {
+        "status": "created",
+        "thread_id": case.thread_id,
+    }
+
+    def refuse(*, body, **_):
+        case.cluster.pod_create_calls += 1
+        raise _refusal()
+
+    monkeypatch.setattr(case.cluster, "create_namespaced_pod", refuse)
+    calls = case.cluster.pod_create_calls
+    await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    assert case.cluster.pod_create_calls == calls + 1
+    case.creation = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_creation_reservations "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid AND settled_at IS NULL",
+        case.thread_id,
+    )
+    assert case.creation["phase"] == "mutating"
+    assert case.creation["pod_uid"] is None
+    assert str(case.creation["pvc_uid"]) == case.pvc_uid
+    assert sorted(case.cluster.objects) == ["pvc", "seed"]
+    return case
+
+
+async def _latest_reservation(database, thread_id):
+    return await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_creation_reservations "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "ORDER BY reservation_generation DESC LIMIT 1",
+        thread_id,
+    )
+
+
+async def resumed_end(database, case, *, permanent=False, force=False):
+    return await thread_retirement.end_thread_flow(
+        case.thread_id,
+        await database.get_thread(case.thread_id),
+        permanent=permanent,
+        force=force,
+        dependencies=case.dependencies,
+    )
+
+
+@pytest.mark.asyncio
+async def test_soft_end_settles_a_resumed_refused_creation_and_keeps_the_volume(
+    database, actor, monkeypatch
+):
+    case = await refused_resume_case(database, actor, monkeypatch)
+
+    assert await resumed_end(database, case) == {"status": "ended"}
+
+    # The PVC the first Pod used is the Session's files: soft End keeps it.
+    assert sorted(case.cluster.objects) == ["pvc"]
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+    ended = await database.get_thread(case.thread_id)
+    meta = metadata(ended)
+    assert ended["status"] == "ended"
+    assert "_runtime_creation" not in meta["workspace_container"]
+    assert meta["_workspace_binding"]["backing_id"] == (
+        f"k8s-pvc:agent-workspaces:{case.pvc_uid}"
+    )
+    settled = meta["_stateless_workspace_retirement_settled"]
+    assert settled["unpublished_creation"]["reservation_id"] == str(case.creation["id"])
+    assert settled["backing_id"] == f"k8s-pvc:agent-workspaces:{case.pvc_uid}"
+    creation = await _latest_reservation(database, case.thread_id)
+    assert creation["id"] == case.creation["id"]
+    assert (creation["phase"], creation["result_kind"]) == ("aborted", "aborted")
+    assert creation["cancel_resource_policy"] == "preserve"
+
+    # A duplicate End changes nothing.
+    assert await resumed_end(database, case) == {"status": "ended"}
+    assert await database.get_thread(case.thread_id) == ended
+
+
+@pytest.mark.asyncio
+async def test_resume_after_a_resumed_refusal_is_a_clear_refusal(
+    database, actor, monkeypatch
+):
+    """As after a first-generation refusal. A fresh create on the kept PVC
+    would not be continued to Ready in the background: that lineage expects
+    the creation before it to be the one whose Pod ran (seen on k3d)."""
+    case = await refused_resume_case(database, actor, monkeypatch)
+    assert await resumed_end(database, case) == {"status": "ended"}
+    ended = await database.get_thread(case.thread_id)
+
+    with pytest.raises(HTTPException) as refused:
+        await resume_case(database, case, actor)
+
+    assert refused.value.status_code == 409
+    assert "refused this Session's workspace" in refused.value.detail
+    assert await database.get_thread(case.thread_id) == ended
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+
+
+@pytest.mark.asyncio
+async def test_permanent_end_removes_a_resumed_refusal_and_its_volume(
+    database, actor, monkeypatch
+):
+    case = await refused_resume_case(database, actor, monkeypatch)
+
+    assert await resumed_end(database, case, permanent=True) == {"status": "deleted"}
+
+    assert case.cluster.objects == {}
+    assert await database.get_thread(case.thread_id) is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_end_after_soft_end_reclaims_a_resumed_refusals_volume(
+    database, actor, monkeypatch
+):
+    case = await refused_resume_case(database, actor, monkeypatch)
+    assert await resumed_end(database, case) == {"status": "ended"}
+
+    assert await resumed_end(database, case, permanent=True) == {"status": "deleted"}
+
+    assert case.cluster.objects == {}
+    assert await database.get_thread(case.thread_id) is None
+
+
+@pytest.mark.asyncio
+async def test_begin_refuses_a_resumed_refusal_naming_another_binding(
+    database, actor, monkeypatch
+):
+    """The retained lineage is rechecked under Begin's locks."""
+    case = await refused_resume_case(database, actor, monkeypatch)
+    unpublished = (
+        await case.provisioner.capture_unpublished_stateless_creation_retirement(
+            case.owner
+        )
+    )
+    assert unpublished["retained"] == {
+        "predecessor_reservation_id": str(case.predecessor["id"]),
+        "predecessor_cleanup_id": unpublished["retained"]["predecessor_cleanup_id"],
+        "pvc_uid": case.pvc_uid,
+        "binding_generation": metadata(await database.get_thread(case.thread_id))[
+            "_workspace_binding"
+        ]["generation"],
+    }
+    before = await database.get_thread(case.thread_id)
+    changed = {
+        **unpublished,
+        "retained": {**unpublished["retained"], "binding_generation": str(uuid4())},
+    }
+
+    with pytest.raises(RuntimeError):
+        await database.begin_stateless_thread_workspace_retirement(
+            case.thread_id, force=True, unpublished_creation=changed
+        )
+
+    assert await database.get_thread(case.thread_id) == before

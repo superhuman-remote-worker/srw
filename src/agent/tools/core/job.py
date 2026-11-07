@@ -27,7 +27,9 @@ from typing import Annotated, Any, Dict, List, Optional
 from langchain_core.tools import InjectedToolCallId, tool
 
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.managers.todo import todo_headline
 from agent.tools.context import ToolContext
+from agent.tools.core.todo import close_last_pending_todo
 
 from shared.tool_catalog.definitions import (
     JOB_TOOLS_METADATA as JOB_TOOLS_METADATA,
@@ -139,8 +141,9 @@ def create_job_tools(context: ToolContext) -> List[Any]:
         """Signal that the job is complete and ready for human review.
 
         This tool marks the current strategic phase as "final". The job will
-        complete after all remaining strategic todos are done (summarize,
-        record learnings, update plan.md).
+        complete after all remaining strategic todos are done. When the todo
+        you are working on is the only one still pending, this call completes
+        it and the job finishes; no `todo_complete` is needed.
 
         IMPORTANT: This tool can only be called during a strategic phase.
         If called from tactical phase, it will be rejected.
@@ -262,9 +265,28 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                         # completion. Propagate. (Defect 8)
                         raise
                     except Exception:
-                        validation_warnings.append(
-                            f"Deliverable '{deliverable}' could not be read"
-                        )
+                        # A binary deliverable (a SQLite database, an image, a
+                        # PDF) is not text: read_file cannot decode it, which
+                        # used to refuse a correct seal as "could not be read"
+                        # and leave the model two bad exits — a sub-0.5
+                        # confidence or a blocking message to a human (bench
+                        # run srw-claude-eff-02, M3 output/shop.db, 2026-11-04).
+                        # Its byte size answers the same "exists and is not
+                        # trivial" question.
+                        try:
+                            size = workspace.get_size(resolved)
+                        except WorkspaceUnavailableError:
+                            raise
+                        except Exception:
+                            size = None
+                        if size is None:
+                            validation_warnings.append(
+                                f"Deliverable '{deliverable}' could not be read"
+                            )
+                        elif size < 50:
+                            validation_warnings.append(
+                                f"Deliverable '{deliverable}' appears empty or trivial ({size} bytes)"
+                            )
 
             # Reject high confidence with validation warnings
             if validation_warnings and confidence > 0.5:
@@ -354,13 +376,27 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             logger.info(f"Deliverables: {deliverables}")
 
             # Check if there are no pending todos - if so, job will complete immediately
-            # after this tool returns (on_strategic_phase_complete will be called)
+            # after this tool returns (on_strategic_phase_complete will be called).
+            # The one todo still pending is the one that asked for this call
+            # ("close or continue"): complete it here rather than cost the
+            # model a request for a todo_complete that only records this call.
             pending_count = 0
+            closed = None
             if context.has_todo():
-                pending = context.todo_manager.list_pending()
-                pending_count = len(pending)
+                closed = close_last_pending_todo(
+                    context, "Marked the job final with job_complete."
+                )
+                pending_count = len(context.todo_manager.list_pending())
 
             citation_line = _citation_delivery_line(citation_delivery)
+            if pending_count == 0 and closed is not None:
+                return (
+                    f"Phase marked as final. Completed the last todo "
+                    f"({todo_headline(closed.content)}) - job will complete now.\n\n"
+                    f"Summary: {summary}\n"
+                    f"Deliverables: {len(deliverables)} files\n"
+                    f"Confidence: {confidence:.0%}" + citation_line
+                )
             if pending_count == 0:
                 return (
                     "Phase marked as final. No remaining todos - job will complete now.\n\n"

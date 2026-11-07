@@ -362,6 +362,12 @@ DISPATCH_ENV_KEY_NAMES = frozenset(
 # leaves it out when the row names none; ``""`` reads as none too.
 SERVED_MODEL_ENV_KEY_NAMES = tuple(f"{p}_SERVED_MODEL" for p in _DISPATCH_ENV_PREFIXES)
 
+# The client factory the citation slot's catalog row names (``anthropic`` for a
+# row on the anthropic-messages shape; absent means the OpenAI chat client).
+# Only this slot is written from the row: ``EMBEDDING_PROVIDER`` already means
+# local or openrouter.
+CITATION_PROVIDER_ENV_KEY = "CITATION_LLM_PROVIDER"
+
 
 def served_model_from_env(
     prefix: str, env: Optional[Mapping[str, str]] = None
@@ -381,10 +387,13 @@ def clear_served_model_env(prefixes: Optional[Iterable[str]] = None) -> None:
     are reused, and a later block that pins its own ``{PREFIX}_MODEL`` may
     carry no served string, so every export seam clears these before
     applying a block — the previous model's upstream name must never pair
-    with the next model.
+    with the next model. The citation slot's provider comes from the same row
+    and is dropped with it.
     """
     for prefix in _DISPATCH_ENV_PREFIXES if prefixes is None else prefixes:
         os.environ.pop(f"{prefix}_SERVED_MODEL", None)
+        if prefix == "CITATION_LLM":
+            os.environ.pop(CITATION_PROVIDER_ENV_KEY, None)
 
 
 # Set on a chat client built for a catalog row with a served model, so a

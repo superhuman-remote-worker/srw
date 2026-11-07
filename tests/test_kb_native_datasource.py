@@ -107,6 +107,7 @@ def _projects_deps(store, gitea=None, **gates) -> ProjectsDependencies:
     return ProjectsDependencies(
         store=store,
         operations=ProjectDependencies(
+            graph=MagicMock(get=MagicMock(return_value=None)),
             store=store,
             vector_db=MagicMock(),
             forge=forge,

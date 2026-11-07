@@ -520,7 +520,7 @@ class TestProgressAndSummaryHonesty:
 
         assert "Liveness: active — last activity 2026-08-14T11:58:00+00:00" in output
         assert "audit activity 2m ago" in output
-        assert "Elapsed since creation: 2m 0s" in output
+        assert "Duration: 2m 0s" in output
         assert "0.0%" not in output and "Progress:" not in output.replace(
             f"Progress for job {JOB_ID}", ""
         )

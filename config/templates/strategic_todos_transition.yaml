@@ -9,9 +9,10 @@ todos:
     content: >-
       VERIFY THE RESULT — finish this before deciding whether to continue.
 
-      Read and apply `skills/verify-before-done/SKILL.md`. Verify the current
-      outputs against the original requirements in instructions.md and any
-      runtime-declared required deliverables. Do not update plan.md or plan
+      Apply `skills/verify-before-done/SKILL.md` (delivered at the start of the
+      tactical phase; read the file only if it is no longer in your context).
+      Verify the current outputs against the original requirements in
+      instructions.md and any runtime-declared required deliverables. Do not update plan.md or plan
       another phase yet.
 
       Complete this todo with `todo_complete`. Record the skill's concise
@@ -36,9 +37,9 @@ todos:
       deliverables complete, then call job_complete with the deliverable paths
       and any verification limitations.
 
-      Take exactly one branch. After the chosen lifecycle tool succeeds,
-      complete this todo with a concise `completion_note`; do not complete it
-      before job_complete or next_phase_todos succeeds.
+      Take exactly one branch. When this is the last pending todo, the
+      lifecycle tool completes it for you; do not call todo_complete for it
+      before job_complete or next_phase_todos has succeeded.
 
       COMPLETION CRITERIA: Verified gaps produced a corrective tactical phase,
       or a verified complete result produced job completion.

@@ -3420,20 +3420,29 @@ class OrchestratorClient:
                 body["workspace_runtime_incarnation"] = canonical_workspace_incarnation
             r = await self._client.post(url, json=body)
             if r.status_code != 200:
+                logger.info(
+                    "Thread→agent release not confirmed for %s (HTTP %s)",
+                    thread_id,
+                    r.status_code,
+                )
                 return False
             try:
                 payload = r.json()
             except Exception:
                 return False
-            return bool(
-                isinstance(payload, dict)
-                and payload.get("status")
-                in {
-                    "released",
-                    "already_detached",
-                    "retirement_acknowledged",
-                }
+            status = payload.get("status") if isinstance(payload, dict) else None
+            if status in {
+                "released",
+                "already_detached",
+                "retirement_acknowledged",
+            }:
+                return True
+            logger.info(
+                "Thread→agent release not confirmed for %s (status %r)",
+                thread_id,
+                status,
             )
+            return False
         except Exception as e:
             logger.warning(f"Thread→agent release failed (non-fatal): {e}")
             return False

@@ -462,7 +462,8 @@ class PersistentLoopCallbacks:
     # tool-execution failures (tool not found, exception during ainvoke). The
     # transport may use it to render the call with an error treatment instead
     # of the success styling. Defaults to False for backwards compatibility
-    # with older callers.
+    # with older callers. A result that does not report what the call did
+    # also passes ``result_state`` (shared/tool_result_state.py).
     on_tool_result: Callable[..., Awaitable[None]]
 
     # Ask client for permission to run a tool. Returns a PermissionOutcome —
@@ -2577,8 +2578,10 @@ async def _execute_turn(
             try:
                 await _persist(message)
                 if started:
+                    # The frame carries the marker too: the live card and a
+                    # reload's replay of this turn label the call with it.
                     await callbacks.on_tool_result(
-                        name, content, call_id, is_error=True
+                        name, content, call_id, is_error=True, result_state=state
                     )
             except Exception:
                 logger.warning(

@@ -7,12 +7,17 @@ startup.
 Route order is load-bearing: ``/knowledge/summary`` is declared before
 ``/knowledge/{note_id}``, or the note-id route swallows it.
 
-Gate tiers, unchanged from main: reads and the member-facing commands are
-``require_project_member``; ``materialize``, its projection report and the
-purge lane are ``require_internal`` (agent/operator callers with
-``X-Internal-Key``, no user identity); a PATCH additionally refuses an archived
-project because editing a note is a content mutation while deleting one is
-teardown.
+Gate tiers: reads are ``require_project_member`` at viewer; reindex, export,
+PATCH and DELETE need editor (a viewer used to be able to purge notes and arm
+``ready``, G1/G1b); adding or removing an officer-only tag (``ready``,
+``parallel-safe``) or changing a charter note needs the project owner or an
+admin (D9). ``materialize``, its projection report and the purge lane are
+``require_internal_service``: the bare ``X-Internal-Key`` of an agent/operator
+caller, refused when the MCP server forwards a delegated user (G2). A PATCH
+additionally refuses an archived project because editing a note is a content
+mutation while deleting one is teardown.
+
+Design: knowledge-base/knowledge/features/knowledge_base_mcp_for_chat_uis.md §4.1.
 """
 
 from __future__ import annotations
@@ -29,7 +34,10 @@ from orchestrator.schemas.knowledge import (
     KnowledgeProjectionRequest,
     KnowledgeSearchRequest,
 )
-from orchestrator.security.access import require_internal, require_project_member
+from orchestrator.security.access import (
+    require_internal_service,
+    require_project_member,
+)
 from orchestrator.services import knowledge_operations
 
 router = APIRouter()
@@ -42,7 +50,7 @@ class KnowledgeDependencies:
     store: Any
     operations: knowledge_operations.KnowledgeOperationDependencies
     require_project_member: Callable[..., Awaitable[Any]] = require_project_member
-    require_internal: Callable[..., Awaitable[Any]] = require_internal
+    require_internal_service: Callable[..., Awaitable[Any]] = require_internal_service
 
 
 def get_knowledge_dependencies(request: Request) -> KnowledgeDependencies:
@@ -120,10 +128,12 @@ async def reindex_knowledge(
 
     The ``kb reindex --full`` operator hatch (§5): ``full=true`` re-embeds the
     whole vault (model/chunker migration, corrupt-index recovery); the default
-    incremental run only touches notes whose git blob changed. F5: member-only,
-    same gate as the sibling knowledge endpoints.
+    incremental run only touches notes whose git blob changed. Editor or
+    higher: a full run re-embeds the whole vault.
     """
-    await dependencies.require_project_member(request, dependencies.store, project_id)
+    await dependencies.require_project_member(
+        request, dependencies.store, project_id, min_role="editor"
+    )
     return await knowledge_operations.reindex_knowledge(
         project_id, full=full, dependencies=dependencies.operations
     )
@@ -152,7 +162,7 @@ async def materialize_knowledge_note(
     searchable already — ``false`` with an ``index_reason`` means the commit
     landed and the sweep will finish the job.
     """
-    await dependencies.require_internal(request)
+    await dependencies.require_internal_service(request)
     return await knowledge_operations.materialize_knowledge_note(
         project_id, body, dependencies=dependencies.operations
     )
@@ -168,7 +178,7 @@ async def record_knowledge_projection(
     dependencies: KnowledgeDependencies = Depends(get_knowledge_dependencies),
 ) -> dict[str, Any]:
     """Record projection truth after a canonical internal knowledge write."""
-    await dependencies.require_internal(request)
+    await dependencies.require_internal_service(request)
     return await knowledge_operations.record_knowledge_projection(
         project_id, intent_id, body, dependencies=dependencies.operations
     )
@@ -199,14 +209,33 @@ async def update_knowledge_note(
     *,
     dependencies: KnowledgeDependencies = Depends(get_knowledge_dependencies),
 ) -> dict[str, Any]:
-    """Update a knowledge note's status or tags. F5: member-only."""
+    """Update a knowledge note's status or tags. Editor or higher.
+
+    Officer-only tags (``ready`` arms backlog dispatch, ``parallel-safe``
+    exempts a ticket from the singleton rule) and charter notes additionally
+    need the project owner or an admin (D9); the check runs only when the
+    request touches one of them.
+    """
     # An archived project is read-only, and a note edit is a content mutation
     # rather than teardown — deleting a note stays allowed, editing one does not.
-    await dependencies.require_project_member(
-        request, dependencies.store, project_id, allow_archived=False
+    user, _project = await dependencies.require_project_member(
+        request, dependencies.store, project_id, min_role="editor", allow_archived=False
     )
+
+    async def owner_authority() -> bool:
+        if user.get("is_admin"):
+            return True
+        role = await dependencies.store.get_user_role_in_project(
+            project_id, str(user["id"])
+        )
+        return role == "owner"
+
     return await knowledge_operations.update_knowledge_note(
-        project_id, note_id, body, dependencies=dependencies.operations
+        project_id,
+        note_id,
+        body,
+        dependencies=dependencies.operations,
+        owner_authority=owner_authority,
     )
 
 
@@ -220,12 +249,14 @@ async def delete_knowledge_note(
 ) -> dict[str, Any]:
     """Purge a knowledge note: file-removal commit, then both index stores.
 
-    F5: member-only. A human's delete is immediate and unconditional (no
+    Editor or higher. A human's delete is immediate and unconditional (no
     compare-and-swap token) — that authority is the point of the cockpit
     button. Before kb_gardening G2 this removed only the index row, and the
     next sweep resurrected the note from the file it never touched.
     """
-    await dependencies.require_project_member(request, dependencies.store, project_id)
+    await dependencies.require_project_member(
+        request, dependencies.store, project_id, min_role="editor"
+    )
     return await knowledge_operations.delete_knowledge_note(
         project_id, note_id, dependencies=dependencies.operations
     )
@@ -245,7 +276,7 @@ async def delete_knowledge_note_internal(
     ``row_deleted``. Agents do not call this directly — ``kb_delete`` is a
     tombstone — it exists for the purge lane and for operator tooling.
     """
-    await dependencies.require_internal(request)
+    await dependencies.require_internal_service(request)
     return await knowledge_operations.delete_knowledge_note_internal(
         project_id, body, dependencies=dependencies.operations
     )
@@ -260,12 +291,12 @@ async def export_knowledge(
 ) -> dict[str, Any]:
     """Export project knowledge base as Obsidian-compatible markdown files.
 
-    F5: member-only. Same access requirement as the per-note read endpoint
-    — the bulk export is equivalent to scraping the list and getting each
-    note individually, so a tighter gate wouldn't close a real gap.
+    Editor or higher, as the MCP capability contract declares: the export
+    reads nothing a viewer cannot read note by note, but it writes a copy of
+    the whole vault to the orchestrator's disk, which is not a viewer's call.
     """
     _, project = await dependencies.require_project_member(
-        request, dependencies.store, project_id
+        request, dependencies.store, project_id, min_role="editor"
     )
 
     return await knowledge_operations.export_knowledge(

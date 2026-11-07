@@ -396,6 +396,23 @@ class TestRoute:
         assert out["freshness"]["live"] is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["pending_review", "paused", "waiting_for_reply"]
+    )
+    async def test_job_waiting_on_a_human_is_not_live(self, route_env, status):
+        """Not terminal, but nothing runs: the panel must not say 'still running'."""
+        route_env.job["status"] = status
+        out = await route_env.call()
+        assert out["freshness"]["live"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["created", "reviewing", "waiting"])
+    async def test_job_the_system_still_works_is_live(self, route_env, status):
+        route_env.job["status"] = status
+        out = await route_env.call()
+        assert out["freshness"]["live"] is True
+
+    @pytest.mark.asyncio
     async def test_window_is_zulu_not_plus_offset(self, route_env):
         """A `+00:00` offset re-encodes as a space in a query string (422 on the
         round trip); the jobs list hit exactly that with its `as_of` watermark."""

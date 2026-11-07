@@ -994,6 +994,29 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: DEFAULT_DS_NEO4J_READ_ONLY
                   optional: true
+            # The orchestrator's own knowledge-graph client (a note's
+            # relationships, graph updates and deletes from the REST API, the
+            # KB export) reads these; the DEFAULT_DS_* copies above only seed
+            # the default connector. The ConfigMap key exists only while Neo4j
+            # is enabled, so without Neo4j the client stays off.
+            - name: NEO4J_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEO4J_URL
+                  optional: true
+            - name: NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_USERNAME
+                  optional: true
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_PASSWORD
+                  optional: true
             {{- if or .Values.nextcloud.enabled (eq (default "" .Values.cloud.externalBackend) "nextcloud") }}
             # Nextcloud — bundled (nextcloud.enabled=true) or external
             # (cloud.externalBackend=nextcloud). Skipped entirely otherwise so

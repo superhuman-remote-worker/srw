@@ -2,6 +2,9 @@
 {{- if and .Values.mcp.requireImageDigest (not .Values.image.mcp.digest) }}
 {{- fail "mcp.requireImageDigest=true requires image.mcp.digest (sha256:...)" }}
 {{- end }}
+{{- if and .Values.mcp.persistence.enabled (gt (int .Values.mcp.replicas) 1) }}
+{{- fail "mcp.persistence.enabled needs mcp.replicas=1: the OAuth state volume is ReadWriteOnce and in-flight logins are held per process" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,6 +17,11 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.mcp.replicas }}
+  {{- if .Values.mcp.persistence.enabled }}
+  # One ReadWriteOnce OAuth-state volume: the old pod must let go of it first.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mcp") | nindent 6 }}
@@ -28,6 +36,11 @@ spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.mcp.persistence.enabled }}
+      securityContext:
+        # The image's srw group (docker/Dockerfile.mcp pins GID 10001).
+        fsGroup: 10001
       {{- end }}
       initContainers:
         - name: wait-for-orchestrator
@@ -44,6 +57,10 @@ spec:
               value: "http://{{ include "srw.fullname" . }}-orchestrator:8085"
             - name: XDG_DATA_HOME
               value: "/tmp/.local/share"
+            {{- if .Values.mcp.persistence.enabled }}
+            - name: FASTMCP_HOME
+              value: "/var/lib/srw-mcp/fastmcp"
+            {{- end }}
             - name: MCP_TRANSPORT
               value: "http"
             - name: MCP_HOST
@@ -74,6 +91,14 @@ spec:
                   optional: true
             - name: MCP_OIDC_CONFIG_URL
               value: "{{ include "srw.keycloakInternalUrl" . }}/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
+            {{- with .Values.mcp.oauth.allowedRedirectUris }}
+            - name: MCP_OAUTH_ALLOWED_REDIRECT_URIS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.mcp.oauth.extraRedirectUris }}
+            - name: MCP_OAUTH_EXTRA_REDIRECT_URIS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- end }}
             - name: MCP_BASE_URL
               value: {{ include "srw.mcpUrl" . | quote }}
@@ -109,4 +134,41 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.mcp.resources | nindent 12 }}
+          {{- if .Values.mcp.persistence.enabled }}
+          volumeMounts:
+            - name: oauth-state
+              mountPath: /var/lib/srw-mcp
+          {{- end }}
+      {{- if .Values.mcp.persistence.enabled }}
+      volumes:
+        - name: oauth-state
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-mcp-oauth-state
+      {{- end }}
+{{- if .Values.mcp.persistence.enabled }}
+---
+# The MCP OAuth server's state (G5): dynamically registered clients and
+# in-flight authorizations. Kept across uninstall like the other credential
+# volumes; FastMCP encrypts it with a key derived from the OIDC client secret.
+# Named "-mcp-oauth-state": the first claim ("-mcp-oauth", 256Mi) never bound
+# on Longhorn/XFS (minimum 300Mi) and a Pending claim's size cannot be
+# changed, so a resized claim needs a new name. The old one holds no data.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-mcp-oauth-state
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mcp") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with .Values.mcp.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.mcp.persistence.size }}
+{{- end }}
 {{- end }}

@@ -141,3 +141,32 @@ async def test_repeated_stop_preserves_the_running_attach_rollback(runtime, dedi
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_officer_shutdown_leaves_the_thread_to_his_recycler(monkeypatch, runtime):
+    """SIGTERM must not retire a background officer's thread or delete his
+    agents row: the persistent recycler needs both to replace the pod. A
+    self-retirement stranded every recycled or deleted officer pod under a
+    hold nothing could release (k3d 2026-11-05)."""
+    entered = asyncio.Event()
+    thread = str(uuid4())
+
+    async def attach(_thread):
+        pa._session = SimpleNamespace(
+            config=SimpleNamespace(officer=SimpleNamespace(enabled=True))
+        )
+        entered.set()
+
+    monkeypatch.setattr(pa._session_attach, "attach", attach)
+    app = pa.create_persistent_app("session_base", thread_id=thread)
+    context = pa.lifespan(app)
+    await context.__aenter__()
+    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(pa._session_attach.startup_task, 1)
+    await asyncio.wait_for(context.__aexit__(None, None, None), 5)
+
+    pa._session_termination.terminate.assert_awaited_once_with(
+        "shutdown", mark_thread=False, preserve_shell=True
+    )
+    runtime.deregister.assert_not_awaited()

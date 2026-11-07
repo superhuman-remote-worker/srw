@@ -45,42 +45,35 @@ POD_UID = "ff660077-0000-4000-8000-000000000006"
 
 
 def test_wake_service_has_no_direct_pod_ip_injection() -> None:
-    """Kubernetes wakes must enter the durable inbox, never a raw Pod IP."""
+    """Kubernetes wakes must enter the durable inbox, never a raw Pod IP.
+
+    The old raw-IP primitive ``_inject_live`` was removed from the wake service
+    on 2026-08-27, but two officer callers kept naming it; the AttributeError
+    was swallowed and every hold/release/conference notice silently vanished
+    for two months. So the guard is two-sided: nothing may call it, and every
+    ``_sw.<name>`` a sibling reaches for must actually exist.
+    """
 
     repository = Path(__file__).resolve().parents[1]
-    calls: list[tuple[str, int]] = []
-    # R1.B07 moved both sanctioned callers out of `main`: the conference hold
-    # stand-by notice and the Legate one-liner. The guard follows them rather
-    # than narrowing — the property is "exactly these two, each with the exact
-    # DB recheck, and none inside the wake service itself".
-    for relative in (
+    callers = (
         "src/orchestrator/services/session_wake.py",
-        "src/orchestrator/main.py",
         "src/orchestrator/services/officer_conference.py",
         "src/orchestrator/services/officer_notices.py",
-    ):
+    )
+    for relative in callers:
         tree = ast.parse((repository / relative).read_text())
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            function = node.func
-            name = (
-                function.id
-                if isinstance(function, ast.Name)
-                else function.attr
-                if isinstance(function, ast.Attribute)
-                else ""
-            )
-            if name != "_inject_live":
-                continue
-            calls.append((relative, node.lineno))
-            assert any(keyword.arg == "db" for keyword in node.keywords), (
-                f"{relative}:{node.lineno} bypasses the exact DB recheck"
-            )
-    assert all(
-        relative != "src/orchestrator/services/session_wake.py" for relative, _ in calls
-    )
-    assert len(calls) == 2
+            if isinstance(node, ast.Attribute) and node.attr == "_inject_live":
+                raise AssertionError(f"{relative}:{node.lineno} names _inject_live")
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "_sw"
+            ):
+                assert hasattr(session_wake, node.attr), (
+                    f"{relative}:{node.lineno} calls session_wake.{node.attr}, "
+                    "which does not exist"
+                )
 
 
 # --------------------------------------------------------------------------

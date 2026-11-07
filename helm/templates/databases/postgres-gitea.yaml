@@ -54,6 +54,14 @@ spec:
       containers:
         - name: postgres
           image: {{ .Values.databases.gitea.image }}
+          {{- with .Values.databases.gitea.maxConnections }}
+          # The same max_connections CloudNativePG gets via srw.dbParameters.
+          # No `command`: the image's docker-entrypoint.sh prepends `postgres`
+          # when the first argument is a flag.
+          args:
+            - "-c"
+            - {{ printf "max_connections=%v" . | quote }}
+          {{- end }}
           ports:
             - containerPort: 5432
           env:

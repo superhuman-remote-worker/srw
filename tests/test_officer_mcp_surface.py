@@ -334,3 +334,31 @@ def test_the_post_shows_what_he_has_spent_against_his_ceiling():
     )
     assert "12,345" in text
     assert "100,000" in text
+
+
+@pytest.mark.asyncio
+async def test_the_lifecycle_clients_post_to_the_officer_routes():
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (request.method, request.url.path, json.loads(request.content or b"{}"))
+        )
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = _client(handler)
+    try:
+        await client.commission_officer(PROJECT_ID, {"brain": {"model": "m"}})
+        await client.decommission_officer(PROJECT_ID, force=True, reason="done")
+        await client.hold_officer(PROJECT_ID, "window")
+        await client.release_officer(PROJECT_ID)
+    finally:
+        await client.close()
+
+    base = f"/api/projects/{PROJECT_ID}/officer"
+    assert seen == [
+        ("POST", f"{base}/commission", {"brain": {"model": "m"}}),
+        ("POST", f"{base}/decommission", {"force": True, "reason": "done"}),
+        ("POST", f"{base}/hold", {"note": "window"}),
+        ("POST", f"{base}/release", {}),
+    ]

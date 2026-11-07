@@ -280,8 +280,8 @@ def _parse_created_at(value: Any) -> Optional[datetime]:
 def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str, Any]:
     """Map a parsed note file onto ``upsert_kb_note`` arguments.
 
-    The inverse of ``_render_note_md``'s frontmatter (id/type/tags/keywords/
-    confidence/status/priority/created/superseded_by), hardened for
+    The inverse of ``_render_note_md``'s frontmatter (id/type/description/
+    tags/keywords/confidence/status/priority/created/superseded_by), hardened for
     human-authored files: a missing frontmatter block derives the id from the
     filename stem and the title from the first H1; values outside the
     CHECK-constraint vocabularies (valid_note_type / valid_note_status) — and
@@ -371,6 +371,12 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
 
     confidence = fm.get("confidence")
     superseded_by = fm.get("superseded_by")
+    # A hand-edited file can hold any YAML here; a scalar (a date, a number)
+    # is still a description, a mapping or list is not one.
+    raw_description = fm.get("description")
+    description: Optional[str] = None
+    if raw_description is not None and not isinstance(raw_description, (dict, list)):
+        description = str(raw_description).strip() or None
 
     return {
         "note_id": note_id,
@@ -399,6 +405,9 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         # alone" — the same sentinel as priority. A replay is not an
         # authorization event, so this never falls back to now().
         "ready_at": _parse_created_at(fm.get("ready_at")),
+        # Stored as-is, no sentinel: the file is the only source, so a file
+        # without the line has no description (see upsert_kb_note).
+        "description": description,
     }
 
 
@@ -547,6 +556,7 @@ async def index_single_note(
             created_at=fields["created_at"],
             modified_at=fields["modified_at"],
             ready_at=fields["ready_at"],
+            description=fields["description"],
         )
         await store.replace_note_chunks(
             note_row=note_row,
@@ -1599,6 +1609,7 @@ async def kb_sweep_tick(
             JOIN projects AS p ON p.id = pr.project_id
             WHERE pr.role = ANY($1::text[])
               AND p.status = 'active'
+              AND p.deletion_requested_at IS NULL
             ORDER BY pr.project_id
             """,
             list(_KB_REPO_ROLES),

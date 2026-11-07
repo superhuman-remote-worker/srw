@@ -4,14 +4,16 @@
 todos:
   - id: 1
     content: >-
-      EXPLORE THE TASK: Read the brief and the instructions before doing anything else.
+      EXPLORE THE TASK: Understand the brief and the workspace before doing anything else.
 
-      Steps:
-      (1) Use read_file to read task_brief.md — the task and its required deliverables.
-      (2) Use read_file to read instructions.md in full.
-      (3) Use read_file to read README.md in the workspace root — it lists every attached
+      The task brief (with its required deliverables) and instructions.md are already in
+      your opening message, in full. Work from that message: do not read_file
+      task_brief.md or instructions.md again unless a compaction has removed it.
+
+      Steps (one turn — call them in parallel):
+      (1) Use read_file to read README.md in the workspace root — it lists every attached
           repository with its clone name (repos/<name>/), base branch and writability.
-      (4) Use list_files on documents/ to inventory input material.
+      (2) Use list_files on documents/ to inventory input material.
 
       {% if has_tool("kb_write") -%}
       Persist what must survive compaction with kb_write:
@@ -19,15 +21,13 @@ todos:
       - Hard rules from the brief (forbidden actions, branch/PR conventions) → type="decision", tag="pinned"
       Search first (kb_search) so you do not duplicate notes from earlier jobs in this project.
 
-      COMPLETION CRITERIA: task_brief.md, instructions.md and README.md read in full; a
-      deliverables note exists (verify with kb_list).
+      COMPLETION CRITERIA: README.md read in full; a deliverables note exists.
       {% else -%}
       Persist what must survive compaction in notes/task_rules.md: required deliverables
       (exact paths, formats) under "## Deliverables"; hard rules from the brief under
       "## Hard Rules".
 
-      COMPLETION CRITERIA: task_brief.md, instructions.md and README.md read in full;
-      notes/task_rules.md exists.
+      COMPLETION CRITERIA: README.md read in full; notes/task_rules.md exists.
       {%- endif %}
 
       INSTEAD OF: Starting to edit code now — you do not yet know the conventions or the

@@ -3212,6 +3212,97 @@ if os.path.exists(sentinel):
             with pytest.raises(WorkspaceUnavailableError, match="exit code 79"):
                 backend.shell_send("closed", "C-c", enter=False)
 
+    def test_pane_that_exits_while_its_command_is_typed_is_a_tool_error(
+        self, remote_backend
+    ):
+        """Dev job 6a6494eb: with a working_dir, ``kill -9 $$`` runs at the
+        typed newline and tmux's Enter finds no pane; the job paused."""
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        backend._tabs["git"] = _RemoteTab("git", pane_id="%2")
+
+        def execute(command, **_kwargs):
+            if "tmux send-keys" in command:
+                return "", 1
+            if command.startswith("tmux has-session"):
+                return "", 0
+            if command.startswith("tmux list-panes"):
+                return "", 0
+            if "tmux kill-window" in command:
+                return "", 0
+            raise AssertionError("Unexpected remote command")
+
+        with patch.object(backend, "_exec_with_status", side_effect=execute):
+            with pytest.raises(ShellEndedError) as ended:
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_0123456789ab__",
+                    command="kill -9 $$\nprintf done",
+                )
+
+        assert str(ended.value).startswith(
+            "The shell in tab 'default' exited while your command ran"
+        )
+        assert "whole shell session" not in str(ended.value)
+        assert backend._shell_initialized is True
+        assert list(backend._tabs) == ["git"]
+
+    def test_session_that_ends_while_its_command_is_typed_is_rebuilt(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        def execute(command, **_kwargs):
+            if "tmux send-keys" in command or command.startswith("tmux has-session"):
+                return "", 1
+            raise AssertionError("Unexpected remote command")
+
+        def rebuild():
+            backend._tabs["default"] = _RemoteTab("default", pane_id="%0")
+            backend._shell_initialized = True
+
+        with (
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+            patch.object(backend, "_init_shell", side_effect=rebuild) as init_shell,
+        ):
+            with pytest.raises(ShellEndedError) as ended:
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_0123456789ab__",
+                    command="kill -9 $$\nprintf done",
+                )
+
+        init_shell.assert_called_once_with()
+        assert not isinstance(ended.value, WorkspaceUnavailableError)
+        assert "exited while your command ran" in str(ended.value)
+        assert "whole shell session ended with it" in str(ended.value)
+        assert "Nothing ran in this call" not in str(ended.value)
+
+    def test_reserve_and_send_fence_failure_still_pauses(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(17)
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with (
+            patch.object(backend, "_exec_with_status", return_value=("", 75)),
+            patch.object(backend, "_tmux_pane_gone") as probe,
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 75"):
+                backend._reserve_and_send_shell_command(
+                    "default",
+                    expected=None,
+                    sentinel="__DONE_0123456789ab__",
+                    command="echo hi",
+                )
+
+        probe.assert_not_called()
+
     @pytest.mark.parametrize("probe_failure", ("tmux", "transport"))
     def test_capture_probe_server_failure_keeps_workspace_error_semantics(
         self, remote_backend, probe_failure
@@ -4771,6 +4862,45 @@ class TestRemoteBackendShellRun:
         assert "exited while your command ran" in message
         assert "whole shell session ended with it" in message
         assert not isinstance(ended.value, WorkspaceUnavailableError)
+
+    def test_command_that_ends_its_shell_in_a_working_dir_is_a_tool_error(
+        self, remote_backend
+    ):
+        """Dev job 6a6494eb paused here: the send itself found no pane."""
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        backend._tabs["git"] = _RemoteTab("git", pane_id="%2")
+        sends = []
+
+        def execute(command, **_kwargs):
+            if "tmux send-keys" in command:
+                sends.append(command)
+                return "", 1
+            if command.startswith("tmux has-session"):
+                return "", 0
+            if command.startswith("tmux list-panes"):
+                return "%2\n", 0
+            if "tmux kill-window" in command:
+                return "", 0
+            raise AssertionError("Unexpected remote command")
+
+        with (
+            patch.object(
+                backend, "_tmux_capture", return_value=[f"agent@host:{self._ROOT}$"]
+            ),
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+        ):
+            with pytest.raises(ShellEndedError) as ended:
+                backend.shell_run("kill -9 $$", tab_name="default", working_dir=".")
+
+        assert len(sends) == 1
+        # The newline that lets bash run the command before tmux's Enter.
+        assert "kill -9 $$\n" in sends[0]
+        assert str(ended.value).startswith(
+            "The shell in tab 'default' exited while your command ran"
+        )
+        assert not isinstance(ended.value, WorkspaceUnavailableError)
+        assert list(backend._tabs) == ["git"]
 
     def test_tab_missing_after_readoption_is_a_tool_error(self, remote_backend):
         """Re-adopted session, but the command's window is gone."""

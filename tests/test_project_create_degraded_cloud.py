@@ -113,6 +113,7 @@ def _dependencies(db: MagicMock, cloud: MagicMock) -> projects.ProjectDependenci
     forge = SimpleNamespace(is_initialized=False)
     keycloak = SimpleNamespace(is_initialized=False)
     return projects.ProjectDependencies(
+        graph=MagicMock(get=MagicMock(return_value=None)),
         store=db,
         vector_db=MagicMock(),
         forge=forge,

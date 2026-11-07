@@ -1,4 +1,5 @@
-"""Pure archived-project classification and its existing refusal detail."""
+"""Pure project lifecycle classification (archived, being deleted) and the
+refusal details the request gates give."""
 
 from typing import Any
 
@@ -21,3 +22,19 @@ def project_is_archived(project: Any) -> bool:
     if not isinstance(project, dict):
         return False
     return str(project.get("status") or "").strip().lower() == "archived"
+
+
+#: The refusal a project whose delete was decided gives every request but
+#: the delete itself (migration 0565, ``services.project_deletion``).
+PROJECT_DELETING_DETAIL = "This project is being deleted."
+
+
+def project_is_deleting(project: Any) -> bool:
+    """Whether ``project`` (a row dict) carries a decided delete.
+
+    The mark is never cleared: the request or the deletion sweeper finishes
+    the delete, so a marked project only ever goes away.
+    """
+    return (
+        isinstance(project, dict) and project.get("deletion_requested_at") is not None
+    )

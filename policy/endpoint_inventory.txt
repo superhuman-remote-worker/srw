@@ -243,6 +243,10 @@ POST   /api/internal/infrastructure-metering/v1/watch/apply                     
 POST   /api/internal/infrastructure-metering/v1/watch/finish                            pat=refused         internal:_dispatch_infrastructure_ingestion
 GET    /api/internal/live/sessions/{session_id}/events                                  pat=refused         internal:require_internal
 POST   /api/internal/live/sessions/{session_id}/events                                  pat=refused         internal:require_internal
+POST   /api/internal/mcp-oauth-grant                                                    pat=refused         internal:require_internal_service
+POST   /api/internal/mcp-oauth-refresh/lookup                                           pat=refused         internal:require_internal_service
+POST   /api/internal/mcp-oauth-refresh/revoke                                           pat=refused         internal:require_internal_service
+POST   /api/internal/mcp-oauth-refresh/rotate                                           pat=refused         internal:require_internal_service
 POST   /api/internal/mcp-token-create                                                   pat=refused         internal:require_internal
 POST   /api/internal/mcp-token-verify                                                   pat=refused         internal:require_internal
 DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       pat=refused         gated:require_thread_owner
@@ -458,6 +462,7 @@ GET    /api/projects/{project_id}/datasources                                   
 DELETE /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
 PATCH  /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
 POST   /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/ensure-repo-access                                    pat=admin           gated:require_project_member
 DELETE /api/projects/{project_id}/expert-defaults/{expert_type}                         pat=admin           gated:require_project_owner
 PUT    /api/projects/{project_id}/expert-defaults/{expert_type}                         pat=admin           gated:require_project_owner
 GET    /api/projects/{project_id}/experts                                               pat=jobs:read       gated:require_project_member
@@ -466,10 +471,10 @@ GET    /api/projects/{project_id}/job-records                                   
 GET    /api/projects/{project_id}/jobs                                                  pat=jobs:read       gated:require_project_member
 POST   /api/projects/{project_id}/jobs                                                  pat=jobs:write      gated:require_project_member
 GET    /api/projects/{project_id}/knowledge                                             pat=knowledge:read  gated:require_project_member
-POST   /api/projects/{project_id}/knowledge/delete                                      pat=refused         internal:require_internal
+POST   /api/projects/{project_id}/knowledge/delete                                      pat=refused         internal:require_internal_service
 POST   /api/projects/{project_id}/knowledge/export                                      pat=knowledge:read  gated:require_project_member
-POST   /api/projects/{project_id}/knowledge/materialize                                 pat=refused         internal:require_internal
-POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          pat=refused         internal:require_internal
+POST   /api/projects/{project_id}/knowledge/materialize                                 pat=refused         internal:require_internal_service
+POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          pat=refused         internal:require_internal_service
 POST   /api/projects/{project_id}/knowledge/reindex                                     pat=knowledge:write gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/repository                                  pat=admin           gated:require_project_owner
 POST   /api/projects/{project_id}/knowledge/search                                      pat=knowledge:read  gated:require_project_member

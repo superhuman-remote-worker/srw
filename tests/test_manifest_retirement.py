@@ -10,6 +10,7 @@ import pytest
 from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.services.manifest_store import resource_key
 from tests import test_manifest_native_full_schema as full_schema
+from tests._project_delete_stubs import delete_project_hook
 
 actor = full_schema.actor
 database = full_schema.database
@@ -83,7 +84,9 @@ async def test_project_removal_retires_child_and_preserves_revision_history(
 async def test_external_user_default_blocks_project_retirement_atomically(
     database, actor, whole_project
 ):
-    service = ManifestResourceService(database)
+    service = ManifestResourceService(
+        database, delete_project=delete_project_hook(database)
+    )
     document = project_document()
     first = await apply(service, document, actor)
     parent = project_row(first)

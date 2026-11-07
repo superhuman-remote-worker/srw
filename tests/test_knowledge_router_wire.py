@@ -12,11 +12,13 @@ are the ones a handler move can quietly change:
 * that a PATCH refuses an archived project (``allow_archived=False``) while a
   DELETE does not — editing a note is a content mutation, deleting one is
   teardown;
+* that every knowledge mutation (reindex, export, PATCH, DELETE) needs editor,
+  and that ``ready``/``parallel-safe`` tags and charter notes need the owner;
 * that the gate runs before any store work.
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -96,7 +98,7 @@ def _wire(*, conn=None, member_gate=None, internal_gate=None, graph=None, store=
         store=db,
         operations=ops,
         require_project_member=member,
-        require_internal=internal,
+        require_internal_service=internal,
     )
     app = mount_router(
         router, factories={"knowledge_dependencies_factory": lambda: deps}
@@ -278,8 +280,8 @@ def test_patch_refuses_an_archived_project_but_delete_does_not():
 
     patch_kwargs = wired.calls.member[0][1]
     delete_kwargs = wired.calls.member[1][1]
-    assert patch_kwargs == {"allow_archived": False}
-    assert delete_kwargs == {}
+    assert patch_kwargs == {"min_role": "editor", "allow_archived": False}
+    assert delete_kwargs == {"min_role": "editor"}
 
 
 def test_patch_rejects_a_status_outside_the_vocabulary():
@@ -505,3 +507,151 @@ def test_list_notes_filters_use_the_type_alias():
     assert "note_type = $2" in count_sql
     assert "status = $3" in count_sql
     assert "$4 = ANY(tags)" in count_sql
+
+
+# =============================================================================
+# Role tiers (G1/G1b, D9): mutations need editor; dispatch tags and the
+# charter need the project owner or an admin
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("post", f"/api/projects/{PROJECT_ID}/knowledge/reindex"),
+        ("post", f"/api/projects/{PROJECT_ID}/knowledge/export"),
+        ("patch", f"/api/projects/{PROJECT_ID}/knowledge/note-1"),
+        ("delete", f"/api/projects/{PROJECT_ID}/knowledge/note-1"),
+    ],
+)
+def test_every_knowledge_mutation_asks_the_gate_for_editor(method, path):
+    wired = _wire(conn=_conn(fetchrow=AsyncMock(return_value=None)))
+    kwargs = {"json": {"status": "resolved"}} if method == "patch" else {}
+
+    getattr(wired.client, method)(path, **kwargs)
+
+    assert wired.calls.member[0][1]["min_role"] == "editor"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", f"/api/projects/{PROJECT_ID}/knowledge/summary"),
+        ("get", f"/api/projects/{PROJECT_ID}/knowledge"),
+        ("get", f"/api/projects/{PROJECT_ID}/knowledge/note-1"),
+        ("post", f"/api/projects/{PROJECT_ID}/knowledge/search"),
+    ],
+)
+def test_reads_stay_open_to_viewers(method, path):
+    wired = _wire()
+    kwargs = {"json": {"query": "x"}} if method == "post" else {}
+
+    getattr(wired.client, method)(path, **kwargs)
+
+    assert "min_role" not in wired.calls.member[0][1]
+
+
+def _role_store(role):
+    return SimpleNamespace(
+        finish_knowledge_projection=AsyncMock(return_value={"synced": True}),
+        get_user_role_in_project=AsyncMock(return_value=role),
+    )
+
+
+@pytest.mark.parametrize("tags", [["ready"], ["Parallel-Safe"]])
+@pytest.mark.parametrize("field", ["add_tags", "remove_tags"])
+def test_an_editor_cannot_touch_a_dispatch_tag(tags, field):
+    conn = _conn(
+        fetchrow=AsyncMock(return_value={"note_id": "n", "note_type": "issue"})
+    )
+    wired = _wire(conn=conn, store=_role_store("editor"))
+
+    response = wired.client.patch(
+        f"/api/projects/{PROJECT_ID}/knowledge/n", json={field: tags}
+    )
+
+    assert response.status_code == 403
+    assert "project owner" in response.json()["detail"]
+    conn.fetchrow.assert_not_awaited()
+
+
+def test_an_editor_keeps_ordinary_tags_and_status():
+    conn = _conn(fetchrow=AsyncMock(return_value=None))
+    store = _role_store("editor")
+    wired = _wire(conn=conn, store=store)
+
+    response = wired.client.patch(
+        f"/api/projects/{PROJECT_ID}/knowledge/n",
+        json={"status": "resolved", "add_tags": ["subject/notes"]},
+    )
+
+    # Past the authority checks: the missing note is the next answer.
+    assert response.status_code == 404
+    store.get_user_role_in_project.assert_not_awaited()
+
+
+def test_the_owner_may_arm_ready():
+    conn = _conn(fetchrow=AsyncMock(return_value=None))
+    wired = _wire(conn=conn, store=_role_store("owner"))
+
+    response = wired.client.patch(
+        f"/api/projects/{PROJECT_ID}/knowledge/n", json={"add_tags": ["ready"]}
+    )
+
+    assert response.status_code == 404
+    conn.fetchrow.assert_awaited_once()
+
+
+def test_an_admin_may_arm_ready_without_a_membership_role():
+    async def admin_gate(request, _store, project_id, **kwargs):
+        return ({"id": "admin", "is_admin": True}, PROJECT)
+
+    store = _role_store(None)
+    wired = _wire(
+        conn=_conn(fetchrow=AsyncMock(return_value=None)),
+        member_gate=admin_gate,
+        store=store,
+    )
+
+    response = wired.client.patch(
+        f"/api/projects/{PROJECT_ID}/knowledge/n", json={"add_tags": ["ready"]}
+    )
+
+    assert response.status_code == 404
+    store.get_user_role_in_project.assert_not_awaited()
+
+
+def test_an_editor_cannot_change_the_charter():
+    conn = _conn(
+        fetchrow=AsyncMock(return_value={"note_id": "charter", "note_type": "charter"})
+    )
+    wired = _wire(conn=conn, store=_role_store("editor"))
+
+    response = wired.client.patch(
+        f"/api/projects/{PROJECT_ID}/knowledge/charter", json={"status": "resolved"}
+    )
+
+    assert response.status_code == 403
+    assert (
+        response.json()["detail"]
+        == "Only the project owner can change the charter note"
+    )
+
+
+def test_the_owner_passes_the_charter_check():
+    conn = _conn(
+        fetchrow=AsyncMock(return_value={"note_id": "charter", "note_type": "charter"})
+    )
+    wired = _wire(conn=conn, store=_role_store("owner"))
+
+    with patch(
+        "orchestrator.services.kb_materialize.materialize_knowledge_metadata_update",
+        AsyncMock(return_value={"canonical_state": "failed", "reason": "stub"}),
+    ) as materialize:
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}/knowledge/charter", json={"status": "resolved"}
+        )
+
+    # Through the authority checks to the git boundary (stubbed to fail).
+    materialize.assert_awaited_once()
+    assert response.status_code == 409

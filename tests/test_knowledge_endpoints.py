@@ -1189,7 +1189,7 @@ def _materialize_deps():
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
         ),
-        require_internal=AsyncMock(return_value=None),
+        require_internal_service=AsyncMock(return_value=None),
     )
 
 

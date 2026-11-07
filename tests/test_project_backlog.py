@@ -81,6 +81,7 @@ def _capture_materialize():
         job_id,
         retrieval_messages=None,
         expected_blob_sha=None,
+        mode=None,
     ):
         rendered[slug] = content
         return {"status": "committed", "path": f"knowledge/{slug}.md"}
@@ -1804,6 +1805,12 @@ class TestCloseBacklogTicket:
         )
         gitea.create_or_update_file = AsyncMock(return_value=True)
         gitea.change_files = AsyncMock(return_value=True)
+        # The metadata write finds the note's file in the tree first.
+        gitea.list_tree = AsyncMock(
+            return_value=[
+                {"path": "knowledge/feature-x.md", "type": "blob", "sha": "abc"}
+            ]
+        )
 
         with caplog.at_level(
             logging.DEBUG, logger="orchestrator.services.project_backlog"

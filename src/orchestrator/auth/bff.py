@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import logging
 import os
 import secrets
@@ -18,7 +19,7 @@ from datetime import datetime, timedelta, UTC
 from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from orchestrator.security.auth import (
     SESSION_COOKIE,
@@ -36,6 +37,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Auth (BFF)"])
 
 PRE_AUTH_COOKIE = "srw_pre_auth"
+
+# How long a started login may sit on the Keycloak form. The cookie and the
+# srw_pre_auth_states row share it so neither outlives the other. 15 minutes
+# covers looking up a password and a first login with registration, email
+# verification and required actions (Keycloak caps each action page at its
+# 5-minute login action timeout and the whole form at its 30-minute login
+# timeout). A longer window weakens nothing: the row is single-use, the PKCE
+# verifier never leaves the server, and the state check binds the callback to
+# this browser however long the cookie lives. A login slower than this still
+# recovers through the restart below.
+PRE_AUTH_TTL_S = 900
+
+# Appended to the state of a login the callback restarted after its pre-auth
+# state went missing. It rides inside ``state`` because that is the one value
+# Keycloak hands back unchanged; a marker cookie would be lost exactly when the
+# browser blocks cookies, one of the ways the pre-auth cookie goes missing. The
+# ``.`` never occurs in ``token_urlsafe`` output, so no plain state carries it.
+_RESTARTED_STATE_SUFFIX = ".restarted"
 
 # Env knobs ---------------------------------------------------------------
 
@@ -146,7 +165,7 @@ def _set_pre_auth_cookie(resp: Response, pre_auth_id: str) -> None:
     resp.set_cookie(
         PRE_AUTH_COOKIE,
         pre_auth_id,
-        max_age=300,
+        max_age=PRE_AUTH_TTL_S,
         path="/auth",
         domain=_cookie_domain(),
         secure=_cookie_secure(),
@@ -163,6 +182,80 @@ def _clear_pre_auth_cookie(resp: Response) -> None:
     )
 
 
+async def _parked_return_to(postgres_db, state: str) -> str:
+    """The return path the login that issued ``state`` parked, else ``/``.
+
+    Read from the row that login wrote (it outlives its cookie until the
+    hourly cleanup), never from the callback request, and sanitized again.
+    Best effort: a failed lookup costs only the deep link, not the restart.
+    """
+    try:
+        async with postgres_db.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT return_to FROM srw_pre_auth_states WHERE state = $1 LIMIT 1",
+                state,
+            )
+    except Exception as e:
+        logger.warning("Could not recover the pre-auth return path: %s", e)
+        return "/"
+    return _safe_return_to(raw)
+
+
+_LOGIN_RESTART_FAILED_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign-in did not complete</title>
+<style>
+body { font-family: system-ui, sans-serif; line-height: 1.5;
+       max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }
+</style>
+</head>
+<body>
+<h1>Sign-in did not complete</h1>
+<p>Your browser came back from the sign-in page without the cookie that ties
+the sign-in to it, and a second automatic attempt failed the same way.</p>
+<p>This usually means the browser blocks cookies for this site, or the
+sign-in was finished in another tab. Allow cookies for this site, close other
+sign-in tabs, and try again.</p>
+<p><a href="__LOGIN_HREF__">Sign in again</a></p>
+</body>
+</html>
+"""
+
+
+async def _lost_pre_auth(postgres_db, state: str, reason: str) -> Response:
+    """Answer a callback whose pre-auth state is gone.
+
+    The cookie expired on a slow Keycloak form, another tab already used
+    it, or the browser blocks cookies. None of these is an attack, and the
+    Keycloak session is usually valid, so a fresh /auth/login signs the user
+    in without the form. It restarts once: a login this callback already
+    restarted stops on a readable page instead of bouncing forever.
+    """
+    return_to = await _parked_return_to(postgres_db, state)
+    if state.endswith(_RESTARTED_STATE_SUFFIX):
+        logger.warning(
+            "BFF callback: pre-auth state %s again after a restarted login; "
+            "showing the sign-in error page",
+            reason,
+        )
+        href = html.escape("/auth/login?" + urlencode({"return_to": return_to}))
+        resp: Response = HTMLResponse(
+            _LOGIN_RESTART_FAILED_PAGE.replace("__LOGIN_HREF__", href),
+            status_code=400,
+        )
+    else:
+        logger.info("BFF callback: pre-auth state %s; restarting login", reason)
+        # Relative, so it stays on the origin that served this callback,
+        # which is where /auth/login lives.
+        query = urlencode({"return_to": return_to, "restarted": "1"})
+        resp = RedirectResponse(f"/auth/login?{query}", status_code=302)
+    _clear_pre_auth_cookie(resp)
+    return resp
+
+
 # Endpoints ---------------------------------------------------------------
 
 
@@ -172,12 +265,15 @@ async def login(
     request: Request,
     return_to: str | None = None,
     ui_locales: str | None = None,
+    restarted: bool = False,
 ) -> Response:
     """Kick off an OAuth code+PKCE flow against Keycloak.
 
     The browser navigates directly to this endpoint (no SPA token involved).
     We generate state + a PKCE verifier, park them in ``srw_pre_auth_states``
     and a short-lived cookie, then 302 to Keycloak's /authorize endpoint.
+    ``restarted`` is set by the callback when it restarts a login whose
+    pre-auth state was lost, so a second loss stops instead of looping.
     """
     postgres_db = _store(request)
 
@@ -188,12 +284,15 @@ async def login(
         )
 
     state = secrets.token_urlsafe(32)
+    if restarted:
+        state += _RESTARTED_STATE_SUFFIX
     verifier = secrets.token_urlsafe(64)
     safe_return = _safe_return_to(return_to)
     pre_auth_id = await postgres_db.create_srw_pre_auth(
         state=state,
         pkce_verifier=verifier,
         return_to=safe_return,
+        ttl_seconds=PRE_AUTH_TTL_S,
     )
 
     params: dict[str, str] = {
@@ -253,11 +352,12 @@ async def callback(
 
     pre_auth_id = request.cookies.get(PRE_AUTH_COOKIE)
     if not pre_auth_id:
-        raise HTTPException(status_code=400, detail="Missing pre-auth state")
+        return await _lost_pre_auth(postgres_db, state, "cookie missing")
 
     pre = await postgres_db.consume_srw_pre_auth(pre_auth_id)
     if not pre:
-        raise HTTPException(status_code=400, detail="Pre-auth state expired or used")
+        return await _lost_pre_auth(postgres_db, state, "expired or used")
+    # A present but different state is CSRF protection, not expiry: refuse.
     if not secrets.compare_digest(pre["state"], state):
         raise HTTPException(status_code=400, detail="State mismatch")
 

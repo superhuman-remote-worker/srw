@@ -124,6 +124,9 @@ export interface JobSummary {
   creation_order?: number | null;
   repo_name?: string | null;
   branch_name?: string | null;
+  /** The repository's Gitea page under the installation's real owner; null
+   *  without a repository. Absent from older responses. */
+  gitea_url?: string | null;
   priority?: number;
   created_at: string;
   audit_count?: number | null;

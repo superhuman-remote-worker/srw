@@ -245,6 +245,19 @@ class TestNoteFields:
         assert f["keywords"] == ["JWT"]
         assert f["confidence"] == "high"
         assert f["superseded_by"] == "chose-paseto"
+        assert f["description"] == "Why JWT"
+
+    def test_description_absent_or_not_a_scalar_is_none(self):
+        body = "# T\n\nb"
+        assert note_fields("knowledge/a.md", {"id": "a"}, body)["description"] is None
+        assert note_fields("knowledge/a.md", None, body)["description"] is None
+        for value in ({"k": "v"}, ["a", "b"], "   "):
+            fm = {"id": "a", "description": value}
+            assert note_fields("knowledge/a.md", fm, body)["description"] is None
+
+    def test_a_scalar_description_is_kept_as_text(self):
+        fm = {"id": "a", "description": 2026}
+        assert note_fields("knowledge/a.md", fm, "b")["description"] == "2026"
 
     def test_no_frontmatter_derives_from_path_and_body(self):
         # Human-authored note with no frontmatter: id from the filename stem,
@@ -416,6 +429,36 @@ class TestIndexSingleNote:
         stamp_args = store.stamp_note_indexed.await_args.args
         assert stamp_args[1] == "cafe1234"
         assert stamp_args[2] == EMBEDDING_VERSION
+
+    def test_an_agent_rendered_description_with_backslashes_reaches_the_row(self):
+        # End to end over the two halves: the agent's renderer writes the
+        # file, the indexer parses it. A backslash used to make the
+        # frontmatter unparseable, so the note never indexed at all.
+        from agent.tools.knowledge.knowledge_tools import _render_note_md
+
+        description = r"Config lives in C:\Users\srw\app.yaml; match \d+."
+        store = _index_store()
+        outcome = asyncio.run(
+            index_single_note(
+                store=store,
+                embedding_service=_embedder(),
+                kb_id=uuid.uuid4(),
+                path="knowledge/cfg.md",
+                text=_render_note_md(
+                    {
+                        "id": "cfg",
+                        "type": "learning",
+                        "title": "Config",
+                        "description": description,
+                        "content": "Body.",
+                    }
+                ),
+                blob_sha="sha",
+                embedding_stamp=EMBEDDING_VERSION,
+            )
+        )
+        assert outcome.status == "indexed"
+        assert store.upsert_kb_note.await_args.kwargs["description"] == description
 
     def test_malformed_frontmatter_returns_malformed_and_writes_nothing(self):
         store = _index_store()

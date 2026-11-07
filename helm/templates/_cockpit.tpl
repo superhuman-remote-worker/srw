@@ -11,6 +11,9 @@
   window['env']['canvasViewerHostSuffix'] = {{ if and .Values.canvas.livePreview.enabled .Values.canvas.livePreview.viewer.enabled .Values.canvas.livePreview.viewer.hostSuffix }}{{ .Values.canvas.livePreview.viewer.hostSuffix | quote }}{{ else }}null{{ end }};
   // Exact foreign iframe origin; null keeps Office Canvas dark-shipped.
   window['env']['canvasOfficeOrigin'] = {{ if and .Values.collabora.enabled .Values.collabora.publicUrl }}{{ .Values.collabora.publicUrl | quote }}{{ else }}null{{ end }};
+  {{- /* A fallback only. Managed repos belong to GITEA_ADMIN_USER, which may
+         come from an existing Secret the chart cannot read, so `/srw` is just
+         its default; Cockpit links a job's repo by the API's `gitea_url`. */}}
   window['env']['giteaUrl'] = '{{ include "srw.gitUrl" . }}/srw';
   window['env']['dozzleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.dozzleHost" . }}';
   window['env']['minioConsoleUrl'] = '{{ include "srw.urlScheme" . }}://{{ include "srw.minioHost" . }}';

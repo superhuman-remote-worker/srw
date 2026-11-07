@@ -299,6 +299,7 @@ def access_token_dependencies(
         ),
         require_approved_user=auth.require_approved_user,
         require_internal=access.require_internal,
+        require_internal_service=access.require_internal_service,
     )
 
 

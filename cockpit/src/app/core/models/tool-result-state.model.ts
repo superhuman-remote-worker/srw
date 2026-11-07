@@ -10,27 +10,30 @@ import type {ToolCardOutcome} from './tool-card.model';
  *   lost while it ran, or the owner decided on a cut-off call.
  * - `not_run`: its result row says it never started.
  *
- * The last two come from `thread_messages.metrics.tool_result_state`. Contract:
+ * The last two come from `thread_messages.metrics.tool_result_state`, and live
+ * from the `result_state` of the call's `tool.completed` frame. Contract:
  * `src/shared/tool_result_state.py`.
  */
 export type ToolResultState = 'missing' | 'unknown' | 'not_run';
 
+/** A state a result row (or its `tool.completed` frame) can carry. */
+export type MarkedToolResultState = Exclude<ToolResultState, 'missing'>;
+
 const MARKED_STATES: ReadonlySet<string> = new Set(['unknown', 'not_run']);
 
+/** The state a `tool.completed` frame's `result_state` names, or null. */
+export function parseMarkedToolResultState(value: unknown): MarkedToolResultState | null {
+    return typeof value === 'string' && MARKED_STATES.has(value) ? (value as MarkedToolResultState) : null;
+}
+
 /** The state a result row's marker names for this call, or null. */
-export function parseToolResultState(
-    metrics: unknown,
-    toolCallId: string,
-): Exclude<ToolResultState, 'missing'> | null {
+export function parseToolResultState(metrics: unknown, toolCallId: string): MarkedToolResultState | null {
     if (!metrics || typeof metrics !== 'object') return null;
     const marker = (metrics as Record<string, unknown>)['tool_result_state'];
     if (!marker || typeof marker !== 'object') return null;
     const m = marker as Record<string, unknown>;
     if (m['tool_call_id'] !== toolCallId) return null;
-    const state = m['state'];
-    return typeof state === 'string' && MARKED_STATES.has(state)
-        ? (state as Exclude<ToolResultState, 'missing'>)
-        : null;
+    return parseMarkedToolResultState(m['state']);
 }
 
 /** The card's status pill for that state, in place of "completed". */

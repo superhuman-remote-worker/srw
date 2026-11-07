@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 #: Authenticate the caller. Bound by the router to ``require_approved_user``.
 ApproveCaller = Callable[[], Awaitable[dict[str, Any]]]
 
+#: How many of a user's projects one login re-grants. ``get_projects_for_user``
+#: lists the default project first, then the most recently updated, so the
+#: Gitea work a login starts stays bounded however many projects the account
+#: belongs to; opening any other project in Cockpit re-grants that one.
+LOGIN_REGRANT_PROJECT_LIMIT = 25
+
 
 @dataclass(frozen=True)
 class WorkspaceOperationDependencies:
@@ -100,6 +106,114 @@ async def ensure_workspace_access(
         raise
     except Exception as e:
         logger.exception(f"Failed to ensure workspace access for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def grant_project_repo_access(
+    *, store: Any, forge: Any, project_id: str, email: str
+) -> dict[str, bool]:
+    """Grant one user every managed repository of one project.
+
+    The one place that decides a project member's Gitea access: adding a
+    member, Cockpit opening the project and the login re-grant all call it, so
+    they cannot drift apart. Each managed repository gets the forge's default
+    grant, whatever the member's role; an attached (unmanaged) repository is
+    not SRW's to share. Returns each managed repository's name and whether it
+    was granted.
+    """
+    results: dict[str, bool] = {}
+    for repo in await store.get_project_repositories(project_id):
+        if repo.get("is_managed"):
+            results[repo["name"]] = await forge.grant_user_repo_access(
+                email, repo["name"]
+            )
+    return results
+
+
+async def regrant_user_project_repos(
+    *,
+    store: Any,
+    forge: Any,
+    user_id: str,
+    email: str,
+    limit: int = LOGIN_REGRANT_PROJECT_LIMIT,
+) -> int:
+    """Re-grant a user the managed repositories of their projects.
+
+    A creation-time grant that failed (no Gitea account yet) is otherwise never
+    retried. Runs from the login's background task; capped at ``limit``
+    projects, and one failing project does not stop the rest. Returns how many
+    repositories were granted.
+    """
+    granted = 0
+    for project in await store.get_projects_for_user(user_id, limit=limit):
+        project_id = str(project["id"])
+        try:
+            results = await grant_project_repo_access(
+                store=store, forge=forge, project_id=project_id, email=email
+            )
+        except Exception as e:
+            logger.warning(
+                "Gitea access to project %s not re-granted to user %s: %s",
+                project_id,
+                user_id,
+                e,
+            )
+            continue
+        granted += sum(results.values())
+    return granted
+
+
+async def ensure_project_repo_access(
+    *,
+    project_id: str,
+    require_project_member: ApproveCaller,
+    dependencies: WorkspaceOperationDependencies,
+) -> dict[str, Any]:
+    """Ensure the current member has Gitea access to the project's managed repos.
+
+    Called by the cockpit when it opens a project, the counterpart of
+    :func:`ensure_workspace_access` for the project's knowledge vault and jobs
+    repo. Degrades like it: every missing precondition is a ``200`` with a
+    ``reason``. Only an owner or member is granted; the gate's admin bypass is
+    not membership.
+    """
+    try:
+        user = await require_project_member()
+
+        if not dependencies.forge.is_initialized:
+            return {"granted": False, "reason": "gitea_unavailable"}
+
+        email = user.get("email")
+        if not email:
+            return {"granted": False, "reason": "no_email"}
+
+        role = await dependencies.store.get_user_role_in_project(
+            project_id, str(user["id"])
+        )
+        if role is None:
+            return {"granted": False, "reason": "not_a_member"}
+
+        results = await grant_project_repo_access(
+            store=dependencies.store,
+            forge=dependencies.forge,
+            project_id=project_id,
+            email=email,
+        )
+        if not results:
+            return {"granted": False, "reason": "no_repo"}
+        granted = all(results.values())
+        return {
+            "granted": granted,
+            "reason": "ok" if granted else "user_not_in_gitea",
+            "repos": [name for name, ok in results.items() if ok],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            f"Failed to ensure repository access for project {project_id}: {e}"
+        )
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

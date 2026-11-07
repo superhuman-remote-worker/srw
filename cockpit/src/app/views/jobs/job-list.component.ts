@@ -66,6 +66,7 @@ import {
 } from './job-filters';
 import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 import {newRequestId} from '../../core/util/request-id';
+import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
 
 /**
  * Angular's ParamMap keeps repeated keys, which is how multi-value filters
@@ -1861,15 +1862,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   getWorkspaceUrl(job: JobSummary): string | null {
-    const giteaUrl = environment.giteaUrl;
-    if (!giteaUrl) return null;
-    const repoName = job.repo_name?.trim();
-    // No repository means no workspace page: a guessed name is a dead link.
-    if (!repoName) return null;
-    if (job.branch_name) {
-      return `${giteaUrl}/${repoName}/src/branch/${job.branch_name}`;
-    }
-    return `${giteaUrl}/${repoName}`;
+    return jobWorkspaceUrl(job, environment.giteaUrl);
   }
 
   openWorkspace(job: JobSummary): void {

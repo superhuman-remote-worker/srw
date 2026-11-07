@@ -80,6 +80,80 @@ async def approve_job(
 
 
 @descriptor(
+    effect="external",
+    group="job_control",
+    plane="job_control",
+    caller_defaults=_MCP_OFFICER,
+    grant="explicit",
+    gate=_EXPLICIT_GATE,
+)
+async def accept_job_diff(
+    client: AsyncCockpitClient, caller: CallerCtx, job_id: str
+) -> str:
+    """Accept a job's project-folder changes: write them into the project's cloud folder.
+
+    MUTATION: for a pending_review job whose work changed files in the
+    project's cloud folder (approve_job refuses those with "pending
+    project-cloud diff"). Writes each changed file back to the folder, then
+    completes the job. Review the job's evidence first; this cannot be undone
+    from here. Refused if someone changed the same folder since the job
+    started: those paths need a human to reconcile them.
+
+    Args:
+        job_id: Job UUID (or unique visible prefix)
+
+    Returns:
+        How many files were written and deleted, and the job's new status
+    """
+    try:
+        resolved = await resolve_job_id(client, caller, job_id)
+        result = await client.accept_job_diff(resolved)
+        return (
+            f"Diff accepted for job {short_id(resolved)}: "
+            f"{int(result.get('applied') or 0)} file(s) written, "
+            f"{int(result.get('deleted') or 0)} deleted in the project folder. "
+            f"Job is {result.get('status', 'completed')}."
+        )
+    except Exception as error:
+        return format_action_error("accept diff", job_id, error)
+
+
+@descriptor(
+    effect="external",
+    group="job_control",
+    plane="job_control",
+    caller_defaults=_MCP_OFFICER,
+    grant="explicit",
+    gate=_EXPLICIT_GATE,
+)
+async def reject_job_diff(
+    client: AsyncCockpitClient, caller: CallerCtx, job_id: str
+) -> str:
+    """Reject a job's project-folder changes: discard them and complete the job.
+
+    MUTATION: for a pending_review job with a pending project-cloud diff.
+    Nothing is written to the cloud folder; the job's commits stay as the
+    record of what it tried. To have the work redone instead, use
+    resume_job_with_feedback.
+
+    Args:
+        job_id: Job UUID (or unique visible prefix)
+
+    Returns:
+        Rejection confirmation and the job's new status
+    """
+    try:
+        resolved = await resolve_job_id(client, caller, job_id)
+        result = await client.reject_job_diff(resolved)
+        return (
+            f"Diff rejected for job {short_id(resolved)}; nothing was written. "
+            f"Job is {result.get('status', 'completed')}."
+        )
+    except Exception as error:
+        return format_action_error("reject diff", job_id, error)
+
+
+@descriptor(
     effect="external", group="job_control", plane="job_control", caller_defaults=_ALL
 )
 async def resume_job_with_feedback(

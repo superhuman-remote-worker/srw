@@ -317,13 +317,28 @@ def _bindings_source(config_path: str) -> dict:
     return _srw_config_fragment(yaml.safe_load(_P(config_path).read_text()))
 
 
-def test_worker_base_binds_todo_guide_as_skill():
+def test_worker_base_delivers_the_lifecycle_skills_at_phase_start():
+    """todo-guide and verify-before-done ride the phase start on the worker
+    base: a before_tool gate refused the first lifecycle call of a phase and
+    cost a request each time (bench run srw-claude-eff-01, 2026-11-04)."""
     cfg = _bindings_source("worker_base")
     entries = cfg["instruction_files"]
-    todo = [e for e in entries if e.get("skill") == "todo-guide"]
-    assert len(todo) == 1
-    assert todo[0]["trigger"] == "before_tool:next_phase_todos"
-    assert todo[0]["enforce"] is True
+    lifecycle = {
+        e["skill"]: e
+        for e in entries
+        if e.get("skill") in ("todo-guide", "verify-before-done")
+    }
+    assert [e.get("skill") for e in entries].count("todo-guide") == 1
+    assert [e.get("skill") for e in entries].count("verify-before-done") == 1
+    assert lifecycle["todo-guide"]["trigger"] == "phase_start:strategic"
+    assert lifecycle["verify-before-done"]["trigger"] == "phase_start:tactical"
+    for entry in lifecycle.values():
+        assert entry["enforce"] is False
+    assert not any(
+        e.get("trigger", "").startswith("before_tool:")
+        and e.get("skill") in ("todo-guide", "verify-before-done")
+        for e in entries
+    )
     assert not any(e.get("file") == "todo_guide.md" for e in entries)
 
 
@@ -347,7 +362,6 @@ def test_interactive_designer_uses_an_action_gate_not_setup_injection():
 @pytest.mark.parametrize(
     "config_path",
     [
-        "worker_base",
         "config/experts/scholar/config.yaml",
         "config/experts/product-qa/config.yaml",
         "config/experts/designer/config.yaml",

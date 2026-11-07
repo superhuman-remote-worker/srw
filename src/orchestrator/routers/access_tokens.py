@@ -14,10 +14,13 @@ from fastapi import APIRouter, Depends, Request
 from orchestrator.schemas.tokens import (
     ApiKeyCreate,
     McpTokenCreate,
+    McpOAuthGrantCreate,
+    McpOAuthRefreshLookup,
+    McpOAuthRefreshRotate,
     McpTokenCreateInternal,
     McpTokenVerifyRequest,
 )
-from orchestrator.security.access import require_internal
+from orchestrator.security.access import require_internal, require_internal_service
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import access_tokens
 
@@ -30,6 +33,7 @@ class AccessTokenDependencies:
     tokens: access_tokens.AccessTokenDependencies
     require_approved_user: Callable[..., Awaitable[Any]] = require_approved_user
     require_internal: Callable[..., Awaitable[Any]] = require_internal
+    require_internal_service: Callable[..., Awaitable[Any]] = require_internal_service
 
 
 def get_access_token_dependencies(request: Request) -> AccessTokenDependencies:
@@ -115,6 +119,68 @@ async def internal_mcp_token_create(
     """
     await dependencies.require_internal(request)
     return await access_tokens.create_internal_mcp_token(
+        body=body, dependencies=dependencies.tokens
+    )
+
+
+# =============================================================================
+# MCP OAuth grants — the bridge's refresh tokens (G6). Internal service calls
+# only: the bridge sends the bare X-Internal-Key, never a delegated user.
+# =============================================================================
+
+
+@router.post("/api/internal/mcp-oauth-grant")
+async def internal_mcp_oauth_grant_create(
+    request: Request,
+    body: McpOAuthGrantCreate,
+    *,
+    dependencies: AccessTokenDependencies = Depends(get_access_token_dependencies),
+) -> dict[str, Any]:
+    """Create an OAuth connection: its access token row and refresh grant."""
+    await dependencies.require_internal_service(request)
+    return await access_tokens.create_internal_mcp_oauth_grant(
+        body=body, dependencies=dependencies.tokens
+    )
+
+
+@router.post("/api/internal/mcp-oauth-refresh/lookup")
+async def internal_mcp_oauth_refresh_lookup(
+    request: Request,
+    body: McpOAuthRefreshLookup,
+    *,
+    dependencies: AccessTokenDependencies = Depends(get_access_token_dependencies),
+) -> dict[str, Any]:
+    """Resolve a refresh token to its live grant; 404 when there is none."""
+    await dependencies.require_internal_service(request)
+    return await access_tokens.lookup_internal_mcp_oauth_refresh(
+        body=body, dependencies=dependencies.tokens
+    )
+
+
+@router.post("/api/internal/mcp-oauth-refresh/rotate")
+async def internal_mcp_oauth_refresh_rotate(
+    request: Request,
+    body: McpOAuthRefreshRotate,
+    *,
+    dependencies: AccessTokenDependencies = Depends(get_access_token_dependencies),
+) -> dict[str, Any]:
+    """Swap a connection's refresh and access tokens; 404 = invalid_grant."""
+    await dependencies.require_internal_service(request)
+    return await access_tokens.rotate_internal_mcp_oauth_refresh(
+        body=body, dependencies=dependencies.tokens
+    )
+
+
+@router.post("/api/internal/mcp-oauth-refresh/revoke")
+async def internal_mcp_oauth_refresh_revoke(
+    request: Request,
+    body: McpOAuthRefreshLookup,
+    *,
+    dependencies: AccessTokenDependencies = Depends(get_access_token_dependencies),
+) -> dict[str, str]:
+    """End a connection by its refresh token (OAuth /revoke)."""
+    await dependencies.require_internal_service(request)
+    return await access_tokens.revoke_internal_mcp_oauth_grant(
         body=body, dependencies=dependencies.tokens
     )
 

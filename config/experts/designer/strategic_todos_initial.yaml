@@ -6,14 +6,16 @@ todos:
     content: >-
       UNDERSTAND: Read the task description and feature requirements.
 
+      The task brief and instructions.md are already in your opening message, in full.
+      Read them there, every line; do not read_file task_brief.md or instructions.md
+      again unless a compaction has removed that message. Pay attention to: target
+      screens/views, user flows, states to handle, existing patterns to match, and any
+      design constraints.
+
       Steps:
-      (1) Use read_file to read task_brief.md — this is the feature description.
-      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
-          Pay attention to: target screens/views, user flows, states to handle,
-          existing patterns to match, and any design constraints.
-      (3) Use list_files on documents/ to inventory all input materials
+      (1) Use list_files on documents/ to inventory all input materials
           (wireframes, screenshots, requirement docs, reference images).
-      (4) Read any provided reference documents or mockups.
+      (2) Read any provided reference documents or mockups.
 
       Then persist critical rules as knowledge notes:
       - Feature requirements and acceptance criteria → kb_write with type="goal", tag="feature"
@@ -22,7 +24,7 @@ todos:
       - States to handle (empty, error, loading, etc.) → kb_write with type="decision", tag="states"
 
       COMPLETION CRITERIA: Knowledge notes created for feature requirements,
-      constraints, and user flows. task_brief.md and instructions.md read in full.
+      constraints, and user flows. The brief and instructions in the opening message have been read in full.
 
       INSTEAD OF: Starting to create mockups — this phase is research only.
 

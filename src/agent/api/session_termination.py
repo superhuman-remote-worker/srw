@@ -330,6 +330,54 @@ class SessionTerminationCoordinator:
             await asyncio.sleep(min(0.05, remaining))
         return True
 
+    def officer_exits_without_retirement(self) -> bool:
+        """Whether this runtime leaves its thread to the officer recycler.
+
+        A background officer's lifecycle owner is the orchestrator's persistent
+        recycler. It replaces a dedicated pod by proving the old one terminal
+        against the thread's ``agent_pod`` marker and runtime generation, then
+        handing off to a successor under the same generation. The generic pinned
+        retirement (begin → local quiescence → settle ``suspended``) clears that
+        marker and rotates the generation, so after an officer retired himself
+        the recycler could never finish: a deploy's drift recycle stuck in
+        ``fencing_old_authority`` and a pod delete ended ``blocked``
+        (``pinned_pod_protection_unresolved``), both under a maintenance hold
+        nothing could release (k3d 2026-11-05; main dev since 2026-08-30).
+
+        So an officer exits WITHOUT retiring the thread, unless an End the
+        orchestrator began (decommission, a deliberate end) owns this life —
+        that retirement always finishes as before.
+        """
+
+        return bool(
+            self._ports.officer_config() is not None
+            and not self._ports.stateless_mode()
+            and not self.retirement_admission_closed()
+        )
+
+    async def exit_officer_for_recycler(self, reason: str) -> None:
+        """Tear the officer session down locally and exit process zero.
+
+        No thread status write, no retirement and no deregistration: the thread,
+        its ``agent_pod`` marker and the agents row stay exactly as a crash
+        leaves them, which is the state the recycler reconciles (terminal pod →
+        exact delete → successor → healthy binding releases its hold). Durable
+        input this runtime had queued stays in the ledger for the successor.
+        """
+
+        try:
+            await self.terminate(reason, mark_thread=False, preserve_shell=True)
+        except Exception as e:
+            # Exiting is still right: process zero is what the recycler needs,
+            # and a half-torn-down officer would only stall the replacement.
+            self._logger.warning(f"Officer teardown before exit failed: {e}")
+        self._logger.info(
+            "Officer runtime exiting for its recycler (reason=%s); the thread "
+            "is left to the replacement",
+            reason,
+        )
+        self.schedule_exit(delay=1.0, deregister=False)
+
     async def handle_heartbeat_intents(self, response: dict[str, Any]) -> None:
         """Heartbeat-response callback: react to orchestrator-set intents.
 
@@ -385,6 +433,15 @@ class SessionTerminationCoordinator:
                 reason,
             )
             self.schedule_exit(delay=1.0)
+            return
+
+        if self.officer_exits_without_retirement():
+            self._logger.info(
+                "Drain intent received from orchestrator (reason=%s) — officer "
+                "session parked; exiting for the recycler without retiring",
+                reason,
+            )
+            await self.exit_officer_for_recycler("drain")
             return
 
         self._logger.info(
@@ -666,15 +723,25 @@ class SessionTerminationCoordinator:
         except Exception as e:
             self._logger.warning(f"Best-effort deregister before exit failed: {e}")
 
-    def schedule_exit(self, delay: float = 1.0) -> None:
-        """Schedule process exit after a short delay (allows final I/O to flush)."""
+    def schedule_exit(self, delay: float = 1.0, *, deregister: bool = True) -> None:
+        """Schedule process exit after a short delay (allows final I/O to flush).
+
+        ``deregister=False`` keeps the agents row: an officer leaving for its
+        recycler must look like a crash, whose reciprocal binding the recycler
+        verifies before it replaces the pod.
+        """
 
         if self.pending_exit_task and not self.pending_exit_task.done():
             self.pending_exit_task.cancel()
 
         async def _exit():
             await asyncio.sleep(delay)
-            await self.deregister_before_exit()
+            if deregister:
+                await self.deregister_before_exit()
+            else:
+                client = self._ports.orchestrator_client()
+                if client is not None:
+                    client.stop_heartbeat()
             self._logger.info("Session complete — exiting process")
             os._exit(0)
 

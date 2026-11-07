@@ -6,7 +6,7 @@ import json
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response
 from starlette.concurrency import run_in_threadpool
 
 from orchestrator.schemas.manifests import (
@@ -175,18 +175,24 @@ async def get_resource(
 async def delete_resource(
     resource_id: UUID,
     request: Request,
+    response: Response,
     expected_version: int = Query(ge=1),
     *,
     dependencies: ManifestDependencies = Depends(get_manifest_dependencies),
 ) -> dict:
+    """Delete a resource. A Project's delete answers 202 (``"deleting":
+    true``) when it was decided but finishes in the background."""
     user = await dependencies.require_approved_user(request)
-    return await _resource_call(
+    result = await _resource_call(
         _resources(dependencies).delete,
         resource_id,
         user,
         expected_version=expected_version,
         request=request,
     )
+    if isinstance(result, dict) and result.get("deleting"):
+        response.status_code = 202
+    return result
 
 
 def _secret_request_schema():

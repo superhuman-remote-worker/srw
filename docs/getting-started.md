@@ -69,6 +69,9 @@ The ZIP contains:
   default StorageClass, and a CNI that enforces NetworkPolicy (Calico, Cilium,
   Antrea, OVN, or k3s with kube-router; Flannel alone ignores policies). Budget
   the same 8 vCPU and 16 GiB for the namespace.
+- **CPU architecture:** x86-64 (`linux/amd64`) nodes. SRW's images are built
+  for amd64 only, so ARM hosts (arm64, such as a Raspberry Pi or AWS Graviton)
+  cannot run them.
 - **On the machine you install from:** Bash, `kubectl`, Helm 3.12 or newer,
   `ssh-keygen` and `base64`.
 - **DNS and network:** with a domain, point a wildcard record `*.<domain>` and
@@ -104,6 +107,11 @@ username with the `KC_REALM_ADMIN_PASSWORD` from `values.yaml` (Evaluation) or
 `APP_ENCRYPTION_KEY`. Do that now: every stored API key is encrypted with it
 and is unrecoverable without it.
 
+With **Self-signed HTTPS through proxy**, the browser shows a certificate
+warning the first time you open the Cockpit address, because the chart signed
+the certificate itself. Accept it once for that address. Upgrades keep the
+certificate until the address changes or it nears its one-year expiry.
+
 The [Helm chart guide](../helm/README.md) covers the same installation by hand,
 every value it sets, upgrades and VM workspaces.
 
@@ -115,8 +123,16 @@ extraction, curation and titles) and **rerank** (memory recall ordering). One
 OpenRouter API key can supply all four. [Models](models.md) lists suitable
 models and other providers.
 
-You add models in Cockpit after the first login (below). The form's **Use AI
-subscriptions** option instead installs a proxy that lets you connect a
+With an OpenRouter key, SRW can be ready at the first login: in the form, open
+**Preconfigure model access**, tick **Preconfigure providers or an endpoint**
+and select OpenRouter. The form never asks for the key itself; the download
+carries `OPENROUTER_API_KEY: CHANGE_ME` in `values.yaml` (Evaluation) or
+`srw-secrets.yaml` (Production). Replace it with your key before running
+`install.sh`, and the chart seeds an OpenRouter chat model, Qwen3 Embedding 8B
+and Qwen3 Reranker 8B and pins the four defaults.
+
+Otherwise you add models in Cockpit after the first login (below). The form's
+**Use AI subscriptions** option instead installs a proxy that lets you connect a
 supported subscription account under **Settings → AI Subscriptions**; a
 subscription may not supply every capability, so you may still need a
 provider for the rest.

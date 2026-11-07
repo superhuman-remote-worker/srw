@@ -62,6 +62,25 @@ V1_USAGE_COMPAT_PREDICATE = (
     "AND unit IN ('vcpu-hour', 'gib-hour')))"
 )
 
+# The LLM pricing backfill (scripts/backfill_llm_pricing.py) never rewrites a
+# row: it cancels each unpriced original with a negative ``unpriced-reversal``
+# and adds an equal ``priced-replacement``, both under this source. SUM(quantity)
+# and SUM(cost_usd) net out by themselves; a row COUNT does not, and showed every
+# repriced call three times, two of them unpriced. A fully repriced job then read
+# "priced 472 of 788 events" and kept its "the real cost is higher" caveat.
+PRICING_CORRECTION_SOURCE = "llm-pricing-correction-v1"
+
+# Event count net of pricing corrections, for any GROUP BY over raw
+# ``usage_events``. Each reversal is subtracted twice, once for itself and once
+# for the original it cancels, so a repriced call counts once, as its priced
+# replacement. Every column a group or filter can use (ts, dims, category,
+# resource, unit) is copied from the original, so the three rows always share
+# a group. Column-unqualified, like the predicate above.
+NET_EVENT_COUNT_SQL = (
+    "(COUNT(*) - 2 * COUNT(*) FILTER (WHERE source = "
+    f"'{PRICING_CORRECTION_SOURCE}' AND source_id LIKE '%:unpriced-reversal'))"
+)
+
 
 # Distinguishes "memoized as None" from "never looked up" in the caches below.
 _UNSET = object()
@@ -1081,7 +1100,8 @@ class UsageLedger:
 
         sql = (
             "SELECT category, unit, SUM(quantity) AS quantity, "
-            "COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS events "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            f"{NET_EVENT_COUNT_SQL} AS events "
             f"FROM usage_events WHERE {' AND '.join(clauses)} "
             "GROUP BY category, unit ORDER BY category, unit"
         )
@@ -1151,7 +1171,8 @@ class UsageLedger:
             clauses.append(f"project_id = ${len(params)}")
         sql = (
             f"SELECT {col} AS key, unit, SUM(quantity) AS quantity, "
-            "COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS events "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            f"{NET_EVENT_COUNT_SQL} AS events "
             f"FROM usage_events WHERE {' AND '.join(clauses)} "
             f"GROUP BY {col}, unit ORDER BY {col}"
         )
@@ -1219,7 +1240,8 @@ class UsageLedger:
             "(WHERE unit IN "
             "('prompt-token', 'cached-prompt-token', 'completion-token')), 0) "
             "AS tokens, "
-            "COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS events "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            f"{NET_EVENT_COUNT_SQL} AS events "
             f"FROM usage_events WHERE {' AND '.join(clauses)} "
             f"GROUP BY date_trunc('day', ts AT TIME ZONE 'UTC'), {col} "
             "ORDER BY date_trunc('day', ts AT TIME ZONE 'UTC')"
@@ -1283,7 +1305,7 @@ class UsageLedger:
             "SUM(quantity) AS quantity, "
             "SUM(cost_usd) AS cost_usd, "
             "COUNT(*) FILTER (WHERE cost_usd IS NOT NULL) AS priced_events, "
-            "COUNT(*) AS events, "
+            f"{NET_EVENT_COUNT_SQL} AS events, "
             "MIN(ts) AS first_ts, MAX(ts) AS last_ts "
             "FROM usage_events "
             "WHERE ref_kind = $1 AND ref_id = ANY($2::uuid[]) "

@@ -51,14 +51,24 @@ export class AdminModelsService {
    * context-window field's "family default" placeholder. */
   readonly familyDefaults = signal<Record<string, number>>({});
   readonly loading = signal(false);
+  /** Bumped per `loadModels()`; a response from an older call is dropped. */
+  private loadSeq = 0;
 
+  /**
+   * Every mutation reloads the list, so two quick toggles race two GETs. Only
+   * the newest call's answer lands: an older one arriving last would put the
+   * first toggle's state back on screen. A failed reload keeps the rows that
+   * are already shown rather than emptying the catalog.
+   */
   loadModels(): void {
+    const seq = ++this.loadSeq;
     this.loading.set(true);
     this.http
       .get<CatalogModel[]>(`${this.baseUrl}/admin/providers/models`)
-      .pipe(catchError(() => of([] as CatalogModel[])))
+      .pipe(catchError(() => of(null)))
       .subscribe((rows) => {
-        this.models.set(rows);
+        if (seq !== this.loadSeq) return;
+        if (rows) this.models.set(rows);
         this.loading.set(false);
       });
   }

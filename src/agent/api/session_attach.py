@@ -86,6 +86,10 @@ logger = logging.getLogger("agent.api.persistent_app")
 # Backoff between attempts of an exact failed-attach cleanup or release: the
 # first retry is immediate, later ones cap at a few seconds.
 EXACT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
+# A clean dedicated exit waits this long for its attach release. After that it
+# exits anyway: the stopped Pod is itself the zero proof the orchestrator's
+# offline retirement uses, while a process kept alive only ends as a SIGKILL.
+DEDICATED_EXIT_RELEASE_TIMEOUT_SECONDS = 60.0
 
 
 def subagent_batch_settle_advertised(value: Any) -> bool:
@@ -2686,11 +2690,27 @@ class SessionAttachCoordinator:
             raise EventJournalUnavailable(
                 "failed attach release receipt belongs to a different runtime"
             )
-        confirmed = await self.release_receipt_until_confirmed(
-            thread_id,
-            runtime_generation=receipt.get("session_runtime_generation"),
-            runtime_attach_token=receipt.get("session_runtime_attach_token"),
-        )
+        try:
+            confirmed = await asyncio.wait_for(
+                self.release_receipt_until_confirmed(
+                    thread_id,
+                    runtime_generation=receipt.get("session_runtime_generation"),
+                    runtime_attach_token=receipt.get("session_runtime_attach_token"),
+                ),
+                timeout=DEDICATED_EXIT_RELEASE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # The orchestrator keeps answering without confirming (for example
+            # while a VM it cannot yet retire is recorded for this runtime).
+            # The receipt stays held; exiting hands this runtime to the
+            # orchestrator's offline retirement.
+            self._logger.warning(
+                "Attach release for thread %s still unconfirmed after %ds; "
+                "exiting anyway so the orchestrator retires this runtime",
+                thread_id,
+                int(DEDICATED_EXIT_RELEASE_TIMEOUT_SECONDS),
+            )
+            return
         if not confirmed:
             raise EventJournalUnavailable(
                 "failed attach release remains unconfirmed; exit suppressed"

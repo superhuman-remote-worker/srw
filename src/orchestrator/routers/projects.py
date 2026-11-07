@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 
 from orchestrator.schemas.datasources import ProjectDatasourceSettings
 from orchestrator.schemas.projects import (
@@ -310,18 +310,31 @@ async def put_project_connector_defaults(
 async def delete_project(
     project_id: str,
     request: Request,
+    response: Response,
     *,
     dependencies: ProjectsDependencies = Depends(get_projects_dependencies),
 ) -> dict[str, str]:
-    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects."""
+    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects.
+
+    200 ``{"status": "deleted"}`` once the project row is gone. 202
+    ``{"status": "deleting", "detail": ...}`` when the delete was decided but
+    a step before the row must be retried: the project refuses new work from
+    then on, and the deletion sweeper (or another DELETE) finishes it.
+    """
     # H5: pre-fix, anyone could cascade-delete any project (repos,
     # Keycloak groups, cloud folders, knowledge index, ...).
-    _, project = await dependencies.require_project_owner(
-        request, dependencies.store, project_id
+    user, project = await dependencies.require_project_owner(
+        request, dependencies.store, project_id, allow_deleting=True
     )
-    return await projects.delete_project(
-        project_id, project=project, dependencies=dependencies.operations
+    result = await projects.delete_project(
+        project_id,
+        project=project,
+        dependencies=dependencies.operations,
+        requested_by=str(user["id"]),
     )
+    if result.get("status") == "deleting":
+        response.status_code = 202
+    return result
 
 
 # =============================================================================

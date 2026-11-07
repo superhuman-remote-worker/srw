@@ -714,3 +714,92 @@ class TestBootWsWatchdogOfficerExemption:
             mod._session_termination.schedule_exit = original_exit
             _reset_agent_globals()
         assert terminated == ["boot_ws_timeout"]
+
+
+def _self_retired_thread(**overrides):
+    thread = {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "status": "suspended",
+        "execution_lane": "pinned",
+        "project_id": "33333333-3333-4333-8333-333333333333",
+        "user_id": "44444444-4444-4444-8444-444444444444",
+        "agent_id": None,
+        "runtime_retirement_token": None,
+        "config_name": "centurion",
+        "metadata": {"config_override": {"officer": {"enabled": True}}},
+    }
+    thread.update(overrides)
+    return thread
+
+
+@pytest.mark.asyncio
+async def test_a_self_retired_officer_is_stood_down_and_the_owner_paged(monkeypatch):
+    """A pre-2026-11-06 agent image suspends its own officer thread when its
+    pod is replaced. Nothing revives a suspended pinned officer, so the post
+    is stood down like a decommission (state kept) and the owner is paged to
+    recommission, instead of an authorization page every two hours."""
+    from orchestrator.services import officer_watchdog
+
+    thread = _self_retired_thread()
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    db.fetchval = AsyncMock(return_value=True)
+    maintenance = AsyncMock()
+    monkeypatch.setattr(
+        officer_watchdog, "maintain_officer_runtime_authorization", maintenance
+    )
+    recycler = MagicMock()
+    recycler.request_and_reconcile = AsyncMock()
+    dependencies = _watchdog_deps(db, MagicMock(), recycler, reconciliation=True)
+    dependencies.stand_down_officer = AsyncMock(return_value={"status": "ended"})
+
+    await officer_watchdog.officer_watchdog_check_one(
+        thread, MagicMock(), dependencies=dependencies
+    )
+
+    dependencies.stand_down_officer.assert_awaited_once_with(thread["id"], thread)
+    page = dependencies.dispatch_officer_page.await_args
+    assert page.kwargs["dedup_key"] == f"officer_self_retired:{thread['id']}"
+    assert "recommission" in page.kwargs["message_md"]
+    maintenance.assert_not_awaited()
+    recycler.request_and_reconcile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"agent_id": "55555555-5555-4555-8555-555555555555"},
+        {"metadata": {"agent_pod": {"pod_uid": "old"}, "config_override": {}}},
+        {"runtime_retirement_token": "66666666-6666-4666-8666-666666666666"},
+    ],
+)
+async def test_a_suspended_officer_that_still_owns_his_pod_goes_to_the_recycler(
+    monkeypatch, overrides
+):
+    from orchestrator.services import officer_watchdog
+
+    thread = _self_retired_thread(**overrides)
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    db.fetchval = AsyncMock(return_value=True)
+    db.get_pending_officer_timer = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        officer_watchdog,
+        "maintain_officer_runtime_authorization",
+        AsyncMock(return_value=SimpleNamespace(notification_due=False)),
+    )
+    wake = MagicMock()
+    wake._resolve_live_agent = AsyncMock(return_value=None)
+    provisioner = MagicMock(is_available=True, expected_build_sha="current")
+    recycler = MagicMock()
+    recycler.observe = AsyncMock(return_value=None)
+    recycler.request_and_reconcile = AsyncMock()
+    dependencies = _watchdog_deps(db, provisioner, recycler, reconciliation=True)
+    dependencies.stand_down_officer = AsyncMock()
+
+    await officer_watchdog.officer_watchdog_check_one(
+        thread, wake, dependencies=dependencies
+    )
+
+    dependencies.stand_down_officer.assert_not_awaited()

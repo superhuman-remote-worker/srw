@@ -4,9 +4,9 @@ Extracted verbatim from ``orchestrator.main`` (R1.B07 lane O, census group
 ``S_OFFICER``). Two one-way deliveries the Post lifecycle and the conference
 machinery both need:
 
-* :func:`inject_officer_notice` — a best-effort one-liner through the agent's
-  ``/api/input``. It **bypasses holds by design**: Legate input always reaches
-  him. Never raises.
+* :func:`inject_officer_notice` — a best-effort one-liner into the live
+  runtime's durable input inbox. It **bypasses holds by design**: Legate input
+  always reaches him. Never raises.
 * :func:`deliver_staged_officer_routes` — durable route fallback intents,
   delivered only *after* their transaction committed. A failed dispatch leaves
   ``user_delivery_at`` null, which is the routing reconciler's retry contract,
@@ -36,23 +36,46 @@ async def inject_officer_notice(
     *,
     dependencies: OfficerNoticeDependencies,
 ) -> bool:
-    """Best-effort one-liner via the agent's /api/input (bypasses holds by
-    design — Legate input always reaches him). Never raises."""
+    """Best-effort one-liner to a live officer (bypasses holds by design —
+    Legate input always reaches him). Never raises.
+
+    The notice enters the same durable input ledger as every server-injected
+    officer wake (``persist_thread_input_delivery``); the exact live runtime
+    claims it, so a recyclable Pod IP is never treated as the recipient. It is
+    sent only while a ready runtime serves the thread: a notice for a down
+    officer would replay as a stale turn on his next attach, and his sitrep
+    already carries the durable state. Returns True when the ledger accepted
+    it for that thread.
+
+    Until 2026-11 this called ``session_wake._inject_live``, which the
+    runtime-authority tranche removed on 2026-08-27; the AttributeError was
+    swallowed here, so every hold, release, post-update and conference notice
+    was silently dropped.
+    """
     try:
         from orchestrator.services import session_wake as _sw
 
-        agent = await _sw._resolve_live_agent(dependencies.store, officer_thread)
+        thread_id = str(officer_thread["id"])
+        # Callers hold the Post's thread projection, which carries no runtime
+        # authority; the live probe needs the full row (as the watchdog reads).
+        thread = await dependencies.store.get_thread(thread_id)
+        if thread is None:
+            return False
+        agent = await _sw._resolve_live_agent(dependencies.store, thread)
         if agent is None:
             return False
-        outcome = await _sw._inject_live(
-            agent,
-            text,
+        result = await dependencies.store.persist_thread_input_delivery(
+            thread_id=thread_id,
             delivery_id=str(uuid4()),
-            db=dependencies.store,
+            role="event",
+            content=text,
+            # One source contract for every server-injected persistent input
+            # (see session_wake._deliver_durable).
+            source="officer_wake",
         )
-        return outcome == _sw.WakeDeliveryResult.EXECUTED
+        return _sw._delivery_state_for_thread(result, thread_id) is not None
     except Exception:
-        logger.debug("officer notice: inject failed (non-fatal)", exc_info=True)
+        logger.warning("officer notice: delivery failed (non-fatal)", exc_info=True)
         return False
 
 

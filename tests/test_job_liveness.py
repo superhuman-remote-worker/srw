@@ -18,9 +18,11 @@ import pytest
 
 from orchestrator.services.job_liveness import (
     STALL_THRESHOLD_MINUTES,
+    compute_job_elapsed_seconds,
     compute_job_liveness,
     compute_jobs_liveness,
     get_liveness_policy,
+    job_elapsed_seconds,
 )
 from orchestrator.services import sitrep
 from shared.orch_surface import formatters as fmt
@@ -343,3 +345,151 @@ class TestThresholdAndBatch:
         assert results[jobs[1]["id"]]["state"] == "terminal"
         # One distinct agent → exactly one lookup for the whole batch.
         assert db.get_agent.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Duration: the /progress ``elapsed_seconds`` stops when the work does.
+# ---------------------------------------------------------------------------
+
+CREATED = datetime(2026, 11, 2, 9, 28, 25, tzinfo=timezone.utc)
+LAST_STEP = datetime(2026, 11, 2, 12, 2, 15, tzinfo=timezone.utc)
+LATER = datetime(2026, 11, 2, 15, 3, 0, tzinfo=timezone.utc)
+RAN_FOR = (LAST_STEP - CREATED).total_seconds()  # 2h 33m 50s
+
+
+def _stopped_job(status: str, **stamps) -> dict:
+    return {"status": status, "created_at": CREATED.isoformat(), **stamps}
+
+
+def _exploding_audit_reader():
+    reader = SimpleNamespace()
+    reader.is_available = True
+    reader.get_audit_time_range = AsyncMock(
+        side_effect=AssertionError("a running job must not read the audit store")
+    )
+    return reader
+
+
+class TestJobElapsed:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["created", "processing", "reviewing", "waiting"]
+    )
+    async def test_running_job_counts_to_now_without_reading_audit(self, status):
+        elapsed = await compute_job_elapsed_seconds(
+            JOB_ID,
+            _stopped_job(status, updated_at=LAST_STEP.isoformat()),
+            audit_reader=_exploding_audit_reader(),
+            now=LATER,
+        )
+        assert elapsed == (LATER - CREATED).total_seconds()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["pending_review", "paused", "waiting_for_reply"]
+    )
+    async def test_job_waiting_on_a_human_stops_at_its_last_step(self, status):
+        """The reported bug: a pending_review job kept counting for hours."""
+        elapsed = await compute_job_elapsed_seconds(
+            JOB_ID,
+            _stopped_job(status, updated_at=LATER.isoformat()),
+            audit_reader=_audit_reader(end=LAST_STEP),
+            now=LATER + timedelta(days=3),
+        )
+        assert elapsed == RAN_FOR
+
+    @pytest.mark.asyncio
+    async def test_reviewed_completion_does_not_count_the_review_wait(self):
+        """completed_at is the approval, a day after the agent finished."""
+        approved = LAST_STEP + timedelta(days=1)
+        elapsed = await compute_job_elapsed_seconds(
+            JOB_ID,
+            _stopped_job(
+                "completed",
+                completed_at=approved.isoformat(),
+                updated_at=approved.isoformat(),
+            ),
+            audit_reader=_audit_reader(end=LAST_STEP),
+            now=approved + timedelta(hours=1),
+        )
+        assert elapsed == RAN_FOR
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "stamps"),
+        [
+            ("completed", {"completed_at": LAST_STEP, "updated_at": LATER}),
+            ("failed", {"failed_at": LAST_STEP, "updated_at": LATER}),
+            # A stale completed_at from an earlier run is not this stop's stamp.
+            (
+                "pending_review",
+                {
+                    "completed_at": CREATED + timedelta(minutes=5),
+                    "updated_at": LAST_STEP,
+                },
+            ),
+            ("cancelled", {"updated_at": LAST_STEP}),
+        ],
+    )
+    async def test_audit_store_down_falls_back_to_the_status_stamp(
+        self, status, stamps
+    ):
+        elapsed = await compute_job_elapsed_seconds(
+            JOB_ID,
+            _stopped_job(status, **{k: v.isoformat() for k, v in stamps.items()}),
+            audit_reader=_audit_reader(end=None, available=False),
+            now=LATER + timedelta(days=1),
+        )
+        assert elapsed == RAN_FOR
+
+    def test_end_is_clamped_to_now_and_never_before_creation(self):
+        future = _stopped_job(
+            "completed", completed_at=(LATER + timedelta(hours=1)).isoformat()
+        )
+        assert (
+            job_elapsed_seconds(future, last_activity=None, now=LATER)
+            == (LATER - CREATED).total_seconds()
+        )
+        assert (
+            job_elapsed_seconds(
+                _stopped_job("failed"),
+                last_activity=CREATED - timedelta(minutes=1),
+                now=LATER,
+            )
+            == 0.0
+        )
+
+    def test_no_creation_stamp_is_unknown_not_zero(self):
+        assert (
+            job_elapsed_seconds({"status": "processing"}, last_activity=None, now=LATER)
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_progress_route_reports_the_stopped_duration(self):
+        from orchestrator.services import job_inspection
+
+        store = SimpleNamespace(
+            get_job_progress=AsyncMock(
+                return_value={
+                    "job_id": JOB_ID,
+                    "status": "pending_review",
+                    "progress_percent": None,
+                    "eta_seconds": None,
+                    "created_at": CREATED.isoformat(),
+                    "updated_at": LAST_STEP.isoformat(),
+                    "completed_at": None,
+                    "failed_at": None,
+                }
+            ),
+            get_agent=AsyncMock(return_value=None),
+        )
+        payload = await job_inspection.get_job_progress(
+            job_id=JOB_ID,
+            authorized_job={"id": JOB_ID, "status": "pending_review"},
+            dependencies=SimpleNamespace(
+                store=store, audit_reader=_audit_reader(end=LAST_STEP)
+            ),
+        )
+        assert payload["elapsed_seconds"] == RAN_FOR
+        assert payload["state"] == "waiting"

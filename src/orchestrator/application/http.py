@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import UUID
 
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ from fastapi.responses import JSONResponse
 from orchestrator.logging_config import CorrelationIdMiddleware
 from orchestrator.security.csrf import CSRFMiddleware
 from orchestrator.services.gitea import GiteaPathError
+from orchestrator.services.project_status import PROJECT_DELETING_DETAIL
 from shared.anti_framing import TrustedParentAntiFramingMiddleware
 from shared.runtime.core.model_registry import UnknownModelError
 
@@ -105,6 +107,27 @@ async def gitea_path_error_handler(
     ``/repo/contents`` proxies.
     """
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+#: The fence trigger's constraint (``services.project_deletion``).
+PROJECT_DELETION_CONSTRAINT = "project_deletion_in_progress"
+
+
+async def project_deletion_fence_handler(
+    request: Request, exc: asyncpg.CheckViolationError
+) -> JSONResponse:
+    """A write that lost the race with a decided project delete: 409.
+
+    The request gates refuse a project being deleted before any write; the
+    database fence (``project_deletion_in_progress``, migration 0565) refuses
+    a write that read the project just before the mark was committed. Every
+    other check violation is re-raised, so it keeps the composed 500.
+    """
+    if getattr(exc, "constraint_name", None) == PROJECT_DELETION_CONSTRAINT:
+        return JSONResponse(
+            status_code=409, content={"detail": PROJECT_DELETING_DETAIL}
+        )
+    raise exc
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -272,6 +295,9 @@ def install(app: FastAPI) -> None:
 
     app.add_exception_handler(UnknownModelError, unknown_model_handler)
     app.add_exception_handler(GiteaPathError, gitea_path_error_handler)
+    app.add_exception_handler(
+        asyncpg.CheckViolationError, project_deletion_fence_handler
+    )
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
     app.middleware("http")(request_logging_middleware)

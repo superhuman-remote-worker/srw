@@ -142,6 +142,7 @@ def _wire(
         **(provisioning_over or {}),
     )
     operations = projects.ProjectDependencies(
+        graph=MagicMock(get=MagicMock(return_value=None)),
         store=db,
         vector_db=MagicMock(),
         forge=SimpleNamespace(is_initialized=False),

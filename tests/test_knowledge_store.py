@@ -1077,6 +1077,23 @@ class TestGetNoteBySlug:
         assert await store.get_note_by_slug(uuid.uuid4(), "nope") is None
 
     @pytest.mark.asyncio
+    async def test_returns_the_files_description(self):
+        # kb_update re-renders the file from this dict; without the field an
+        # explicit description became the body's first sentence.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = {
+            "note_id": "n1",
+            "title": "N1",
+            "note_type": "decision",
+            "status": "active",
+            "content": "body",
+            "description": "Why we chose JWT.",
+        }
+        out = await store.get_note_by_slug(uuid.uuid4(), "n1")
+        assert "description" in mock_db.fetchrow.call_args[0][0]
+        assert out["description"] == "Why we chose JWT."
+
+    @pytest.mark.asyncio
     async def test_exposes_the_blob_sha_as_the_cas_token(self):
         # kb_gardening G3: kb_update/kb_delete send this back as
         # expected_blob_sha so a concurrent rewrite fails loudly.
@@ -1414,6 +1431,7 @@ class TestListNotesFull:
                 "superseded_by": "n2",
                 "created_at": None,
                 "modified_at": None,
+                "description": "Why we chose JWT.",
             }
         ]
         out = await store.list_notes_full(uuid.uuid4())
@@ -1434,6 +1452,8 @@ class TestListNotesFull:
                 "superseded_by": "n2",
                 "created": None,
                 "modified": None,
+                # kb_index writes it into index.md; kb_lint renders it.
+                "description": "Why we chose JWT.",
             }
         ]
 

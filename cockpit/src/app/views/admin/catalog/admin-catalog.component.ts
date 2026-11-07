@@ -219,12 +219,23 @@ export function mergePricingId(
   return Object.keys(next).length ? next : null;
 }
 
-/** The API shapes an endpoint-backed model can be called with. */
-export const CLIENT_PROTOCOLS: readonly {value: string; label: string}[] = [
-  {value: 'openai-chat', label: 'OpenAI Chat Completions (openai-chat)'},
-  {value: 'openai-responses', label: 'OpenAI Responses (openai-responses)'},
-  {value: 'anthropic-messages', label: 'Anthropic Messages (anthropic-messages)'},
+/**
+ * The API shapes an endpoint-backed model can be called with. `label` is the
+ * add form's wording; `short` fits a catalog table cell, with the full label
+ * as its tooltip.
+ */
+export const CLIENT_PROTOCOLS: readonly {value: string; label: string; short: string}[] = [
+  {value: 'openai-chat', label: 'OpenAI Chat Completions (openai-chat)', short: 'Chat Completions'},
+  {value: 'openai-responses', label: 'OpenAI Responses (openai-responses)', short: 'Responses'},
+  {value: 'anthropic-messages', label: 'Anthropic Messages (anthropic-messages)', short: 'Anthropic Messages'},
 ];
+
+/**
+ * Capabilities served through a model's LLM slot, the only call the API shape
+ * governs (dispatch writes `client_protocol` into the `llm` section). A search,
+ * speech, embedding or rerank row is never called with it.
+ */
+const API_SHAPE_CAPABILITIES: readonly CatalogCapability[] = ['chat', 'auxiliary', 'vision'];
 
 /**
  * Merge an API shape into an existing `params_json`, preserving every other
@@ -290,7 +301,10 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
         <section class="admin-section">
           <h2 class="section-title">Catalog rows</h2>
 
-          @if (models.loading()) {
+          <!-- Only the first load swaps the table for a placeholder. Every edit
+               reloads the list, and dropping the rows meanwhile shrank the page
+               under the scroll position, so each toggle jumped to the top. -->
+          @if (models.loading() && models.models().length === 0) {
             <p class="muted">Loading…</p>
           } @else if (models.models().length === 0) {
             <p class="empty-state">
@@ -298,87 +312,101 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               in sessions and jobs.
             </p>
           } @else {
-            @if (protocolError()) {
-              <p class="protocol-error" role="alert">{{ protocolError() }}</p>
+            @if (rowError()) {
+              <p class="row-error" role="alert">{{ rowError() }}</p>
             }
+            <!-- One grid for every group: each header and row is a subgrid of
+                 it, so a column sits at the same x in every row of the page. -->
+            <div class="catalog-grid">
             @for (group of groupedModels(); track group.key) {
               <div class="provider-group">
                 <h3 class="group-title">{{ group.label }}</h3>
-                <div class="model-table">
-                  <div class="model-header">
-                    <span class="col-display">Display label</span>
-                    <span class="col-id">Model ID</span>
-                    <span class="col-capability">Capabilities</span>
-                    <span class="col-family">Family</span>
-                    <span class="col-context">Context</span>
-                    <span class="col-pricing">Pricing</span>
-                    <span class="col-protocol">API shape</span>
-                    <span class="col-enabled">Enabled</span>
-                    <span class="col-actions"></span>
-                  </div>
-                  @for (m of group.rows; track m.id) {
-                    <div class="model-row">
-                      <span class="col-display">
-                        {{ m.display_label }}
-                        <app-helm-managed-badge [managed]="m.managed_by_helm" [drift]="m.helm_drift" />
-                      </span>
-                      <span
-                        class="col-id mono"
-                        [title]="m.served_model_id ? 'Sent to the provider as ' + m.served_model_id : ''"
-                      >{{ m.model_id }}@if (m.served_model_id) { → {{ m.served_model_id }}}</span>
-                      <span class="col-capability">
-                        <span class="cap-badges">
-                          @for (cap of rowCapabilities(m); track cap) {
-                            <app-badge tone="neutral" size="xs">{{ cap }}</app-badge>
-                          }
-                        </span>
-                      </span>
-                      <span class="col-family">{{ m.family }}</span>
-                      <span
-                        class="col-context"
-                        [class.muted]="m.context_window_source === 'family_default'"
-                        [title]="m.context_window_source === 'family_default' ? 'Family default' : 'Explicit per-model cap'"
-                      >{{ fmtTokens(m.resolved_context_window) }}</span>
-                      <span class="col-pricing">
-                        <button
-                          type="button"
-                          class="pricing-cell"
-                          [class.muted]="pricingModeOf(m.params_json) !== 'map'"
-                          [class.mono]="pricingModeOf(m.params_json) === 'map'"
-                          [title]="pricingHint(m)"
-                          [attr.aria-label]="'Pricing source for ' + m.display_label + ': ' + pricingLabelOf(m.params_json) + '. Edit.'"
-                          (click)="openPricing(m)"
-                        >{{ pricingLabelOf(m.params_json) }}</button>
-                      </span>
-                      <span class="col-protocol">
-                        @if (m.provider_kind === 'endpoint') {
-                          <!-- app-select keeps its own value after a pick; re-creating it
-                               on a resync snaps it back to the row's shape: the stored
-                               one, else the one the agent really calls it with. -->
-                          @for (epoch of [protocolResync()]; track epoch) {
-                            <app-select
-                              [value]="m.client_protocol || m.effective_client_protocol || null"
-                              [ariaLabel]="'API shape for ' + m.display_label"
-                              (changed)="setProtocol(m, $event)"
-                            >
-                              @for (p of clientProtocols; track p.value) {
-                                <option [value]="p.value">{{ p.label }}</option>
-                              }
-                            </app-select>
-                          }
-                        } @else {
-                          <span class="muted" title="Set by the provider, not editable here">—</span>
+                <div class="model-header">
+                  <span class="col-display">Display label</span>
+                  <span class="col-id">Model ID</span>
+                  <span class="col-capability">Capabilities</span>
+                  <span class="col-family">Family</span>
+                  <span class="col-context">Context</span>
+                  <span class="col-pricing">Pricing</span>
+                  <span class="col-protocol">API shape</span>
+                  <span class="col-enabled">Enabled</span>
+                  <span class="col-actions"></span>
+                </div>
+                @for (m of group.rows; track m.id) {
+                  <div class="model-row">
+                    <span class="col-display">
+                      {{ m.display_label }}
+                      <app-helm-managed-badge [managed]="m.managed_by_helm" [drift]="m.helm_drift" />
+                    </span>
+                    <span
+                      class="col-id mono"
+                      [title]="m.served_model_id ? 'Sent to the provider as ' + m.served_model_id : ''"
+                    >{{ m.model_id }}@if (m.served_model_id) { → {{ m.served_model_id }}}</span>
+                    <span class="col-capability">
+                      <span class="cap-badges">
+                        @for (cap of rowCapabilities(m); track cap) {
+                          <app-badge tone="neutral" size="xs">{{ cap }}</app-badge>
                         }
                       </span>
-                      <span class="col-enabled">
+                    </span>
+                    <span class="col-family">{{ m.family }}</span>
+                    <span
+                      class="col-context"
+                      [class.muted]="m.context_window_source === 'family_default'"
+                      [title]="m.context_window_source === 'family_default' ? 'Family default' : 'Explicit per-model cap'"
+                    >{{ fmtTokens(m.resolved_context_window) }}</span>
+                    <span class="col-pricing">
+                      <button
+                        type="button"
+                        class="pricing-cell"
+                        [class.muted]="pricingModeOf(m.params_json) !== 'map'"
+                        [class.mono]="pricingModeOf(m.params_json) === 'map'"
+                        [title]="pricingHint(m)"
+                        [attr.aria-label]="'Pricing source for ' + m.display_label + ': ' + pricingLabelOf(m.params_json) + '. Edit.'"
+                        (click)="openPricing(m)"
+                      >{{ pricingLabelOf(m.params_json) }}</button>
+                    </span>
+                    <span class="col-protocol">
+                      @if (m.provider_kind !== 'endpoint') {
+                        <span class="muted" title="Set by the provider, not editable here">—</span>
+                      } @else if (!takesApiShape(m)) {
+                        <span class="muted" title="Only chat models are called with an API shape">—</span>
+                      } @else {
+                        <!-- app-select keeps its own value after a pick; re-creating it
+                             on a resync snaps it back to the row's shape: the stored
+                             one, else the one the agent really calls it with. Keyed by
+                             row + resync count, so only this row's control is rebuilt; the
+                             key is read in the list (not in track) so a bump re-renders. -->
+                        @for (control of [{key: resyncKey(m)}]; track control.key) {
+                          <app-select
+                            [value]="m.client_protocol || m.effective_client_protocol || null"
+                            [ariaLabel]="'API shape for ' + m.display_label"
+                            (changed)="setProtocol(m, $event)"
+                          >
+                            @for (p of clientProtocols; track p.value) {
+                              <option [value]="p.value" [title]="p.label">{{ p.short }}</option>
+                            }
+                          </app-select>
+                        }
+                      }
+                    </span>
+                    <span class="col-enabled">
+                      <!-- Re-created on a resync for the same reason as the select:
+                           a cancelled or refused toggle must not stay ticked. -->
+                      @for (control of [{key: resyncKey(m)}]; track control.key) {
                         <app-checkbox
                           size="sm"
                           [checked]="m.enabled"
                           [ariaLabel]="'Enabled: ' + m.display_label"
                           (changed)="toggleEnabled(m, $event)"
                         />
-                      </span>
-                      <span class="col-actions">
+                      }
+                    </span>
+                    <span class="col-actions">
+                      <span class="row-buttons">
+                        <!-- The loading button hides its label behind a spinner, so the
+                             label stays "Test": a longer one would only widen the
+                             shared column, and shift every row, while the test runs. -->
                         <app-button
                           variant="secondary"
                           size="sm"
@@ -386,7 +414,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                           [disabled]="testing() === m.id"
                           (clicked)="testRow(m.id)"
                         >
-                          {{ testing() === m.id ? 'Testing…' : 'Test' }}
+                          Test
                         </app-button>
                         <app-button
                           variant="danger"
@@ -395,20 +423,25 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         >
                           Delete
                         </app-button>
-                        @if (testResults()[m.id]; as result) {
+                      </span>
+                      @if (testResults()[m.id]; as result) {
+                        <!-- Its own line, sized to the cell: a long provider error
+                             must not widen the column for every row. -->
+                        <span class="test-result" [title]="result.ok ? 'OK' : (result.error || 'failed')">
                           <app-badge
                             [tone]="result.ok ? 'success' : 'danger'"
                             size="xs"
                           >
-                            {{ result.ok ? 'OK' : (result.error || 'failed') }}
+                            <span class="test-result-text">{{ result.ok ? 'OK' : (result.error || 'failed') }}</span>
                           </app-badge>
-                        }
-                      </span>
-                    </div>
-                  }
-                </div>
+                        </span>
+                      }
+                    </span>
+                  </div>
+                }
               </div>
             }
+            </div>
           }
         </section>
 
@@ -964,6 +997,9 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
   styles: [`
     :host {
       display: block;
+      /* The table collapses to cards by the width it really has, which the
+         sidebar changes independently of the viewport. */
+      container: catalog / inline-size;
     }
     .admin-models {
       display: block;
@@ -980,33 +1016,58 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       margin: 0 0 12px 0;
       color: var(--text-primary);
     }
-    .provider-group { margin-bottom: 18px; }
+    /* One set of column tracks for the whole catalog. Headers and rows are
+       subgrids of it, so every column lines up across rows and provider
+       groups; before, each row was its own grid and the flexible columns
+       shrank to whatever that row's text allowed. Text columns share the
+       space left after the content-sized ones and wrap inside it. */
+    .catalog-grid {
+      display: grid;
+      grid-template-columns:
+        minmax(110px, 1fr)    /* display label */
+        minmax(130px, 1.3fr)  /* model id */
+        minmax(100px, 1fr)    /* capabilities */
+        auto                  /* family */
+        auto                  /* context */
+        auto                  /* pricing, capped by .pricing-cell */
+        auto                  /* api shape */
+        auto                  /* enabled */
+        auto;                 /* actions */
+      column-gap: 12px;
+    }
+    .provider-group {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: subgrid;
+      row-gap: 4px;
+      margin-bottom: 18px;
+    }
     .group-title {
+      grid-column: 1 / -1;
       font-size: 13px;
       font-weight: 600;
       color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.06em;
-      margin: 12px 0 6px 0;
+      margin: 12px 0 2px 0;
     }
-    .protocol-error {
+    .row-error {
       color: var(--danger, #c0392b);
       font-size: 13px;
       margin: 0 0 8px;
     }
-    .model-table {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
     .model-header,
     .model-row {
+      grid-column: 1 / -1;
       display: grid;
-      grid-template-columns: 1.4fr 2fr 160px 100px 100px 150px 210px 70px 260px;
-      gap: 8px;
+      grid-template-columns: subgrid;
       align-items: center;
       padding: 8px 12px;
       font-size: 13px;
+    }
+    .model-row > * {
+      min-width: 0;
+      overflow-wrap: anywhere;
     }
     .model-header {
       font-weight: 600;
@@ -1038,6 +1099,15 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    /* A mapped OpenRouter id can be long; its column is content-sized, so the
+       cap here is the column's cap. The full id is in the tooltip. */
+    .col-pricing .pricing-cell {
+      max-width: 160px;
+    }
+    .col-family,
+    .col-context {
+      white-space: nowrap;
+    }
     .pricing-cell:hover,
     .pricing-cell:focus-visible {
       background: var(--hover);
@@ -1065,9 +1135,31 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     .muted { color: var(--text-muted); }
     .col-actions {
       display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    .row-buttons {
+      display: flex;
       gap: 8px;
       align-items: center;
-      flex-wrap: wrap;
+    }
+    /* contain: inline-size takes the result out of the column's content
+       width (a column flexbox is as wide as its widest item), so a long error
+       ellipsizes on its own line under the buttons instead of widening the
+       shared column, and shifting every row, after a test. */
+    .test-result {
+      align-self: stretch;
+      contain: inline-size;
+      display: flex;
+    }
+    .test-result app-badge {
+      max-width: 100%;
+    }
+    .test-result-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .cap-badges {
       display: flex;
@@ -1268,13 +1360,21 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       color: var(--text-muted);
       font-variant-numeric: tabular-nums;
     }
-    @media (max-width: 720px) {
-      /* The catalog table is a 7-column grid (1.4fr 2fr 160px 100px 100px 70px
-         260px = 690px of fixed columns alone), so at phone widths Family /
-         Context / Enabled / Test / Delete fall off the right edge and the
-         host's overflow:auto quietly hides them. Collapse each row into a
-         stacked card so every field and control stays on-screen. Desktop
-         (>720px) keeps the table grid untouched. */
+    @container catalog (max-width: 1100px) {
+      /* Below this width the nine columns no longer fit: the content-sized
+         ones get squeezed (the API-shape select truncates, Delete reaches the
+         row edge). The widest table, measured on k3d with a 160px mapped
+         pricing id plus the longest family name in the config matrix
+         (gemini-3.8-flash), needs ~1,089px. Collapse each row into a stacked
+         card so every field and control stays whole. */
+      .catalog-grid,
+      .provider-group {
+        display: flex;
+        flex-direction: column;
+      }
+      .provider-group {
+        gap: 4px;
+      }
       .model-header {
         display: none;
       }
@@ -1285,6 +1385,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
          family right); Test/Delete span the bottom. */
       .model-row {
         grid-template-columns: 1fr auto;
+        grid-column: auto;
         align-items: start;
         column-gap: 8px;
         row-gap: 6px;
@@ -1363,11 +1464,17 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
         content: 'API shape: ';
         color: var(--text-muted);
       }
+      .col-protocol app-select {
+        display: block;
+        max-width: 280px;
+      }
       .col-actions {
         grid-column: 1 / -1;
         grid-row: 7;
         margin-top: 2px;
       }
+    }
+    @media (max-width: 720px) {
       /* Stack the cramped two-up form rows (two ~137px fields side-by-side). */
       .form-row.two-col {
         flex-direction: column;
@@ -1432,10 +1539,23 @@ export class AdminCatalogComponent implements OnInit {
   readonly clientProtocols = CLIENT_PROTOCOLS;
   /** API shape for a new endpoint-backed model (ignored for provider rows). */
   readonly formClientProtocol = signal('openai-chat');
-  /** Last failed API-shape edit on a row; cleared by the next attempt. */
-  readonly protocolError = signal('');
-  /** Bumped to re-create the row selects so they show the stored shape again. */
-  readonly protocolResync = signal(0);
+  /** Last failed inline edit on a row (API shape, enabled); cleared by the next attempt. */
+  readonly rowError = signal('');
+  /**
+   * Per-row count, bumped to re-create that row's select and checkbox: both
+   * keep their own value after a click, so a cancelled or refused edit would
+   * otherwise stay on screen. Only the row that changed is rebuilt.
+   */
+  private readonly resyncCounts = signal<ReadonlyMap<string, number>>(new Map());
+
+  /** The key a row's inline controls are tracked by; it changes on a resync. */
+  resyncKey(m: CatalogModel): string {
+    return `${m.id}:${this.resyncCounts().get(m.id) ?? 0}`;
+  }
+
+  private resyncRow(id: string): void {
+    this.resyncCounts.update((prev) => new Map(prev).set(id, (prev.get(id) ?? 0) + 1));
+  }
   // True when the operator picked "Custom…" (or the backend is unrecognized);
   // then formVoice is a free-text voice id rather than a catalog selection.
   readonly formVoiceCustom = signal(false);
@@ -1740,6 +1860,11 @@ export class AdminCatalogComponent implements OnInit {
     return m.capabilities ?? [];
   }
 
+  /** True for a row whose API shape the agent uses: a chat-slot model. */
+  takesApiShape(m: CatalogModel): boolean {
+    return this.rowCapabilities(m).some((c) => API_SHAPE_CAPABILITIES.includes(c));
+  }
+
   /** Toggle one capability checkbox in the create/edit form. Maintains
    * CATALOG_CAPABILITIES order so the array sent to the backend is
    * deterministic regardless of click order. */
@@ -1916,25 +2041,36 @@ export class AdminCatalogComponent implements OnInit {
   }
 
   toggleEnabled(model: CatalogModel, checked: boolean): void {
-    if (!this.confirmHelmOverride(model)) return;
-    this.models.updateModel(model.id, {enabled: checked}).subscribe();
+    this.rowError.set('');
+    if (!this.confirmHelmOverride(model)) {
+      this.resyncRow(model.id);
+      return;
+    }
+    this.models.updateModel(model.id, {enabled: checked}).subscribe({
+      error: (err) => {
+        const fallback = checked ? 'Failed to enable the model.' : 'Failed to disable the model.';
+        this.rowError.set(`${model.display_label}: ${catalogErrorDetail(err, fallback)}`);
+        this.models.loadModels();
+        this.resyncRow(model.id);
+      },
+    });
   }
 
   setProtocol(model: CatalogModel, protocol: string | null): void {
-    this.protocolError.set('');
+    this.rowError.set('');
     if (protocol === null || !this.confirmHelmOverride(model)) {
-      this.protocolResync.update((n) => n + 1);
+      this.resyncRow(model.id);
       return;
     }
     this.models
       .updateModel(model.id, {params_json: mergeRoutingProtocol(model.params_json, protocol)})
       .subscribe({
         error: (err) => {
-          this.protocolError.set(
+          this.rowError.set(
             `${model.display_label}: ${catalogErrorDetail(err, 'Failed to change the API shape.')}`,
           );
           this.models.loadModels();
-          this.protocolResync.update((n) => n + 1);
+          this.resyncRow(model.id);
         },
       });
   }

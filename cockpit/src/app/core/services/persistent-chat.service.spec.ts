@@ -11107,6 +11107,37 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       expect(service.runningTools()).toEqual([]);
     });
 
+    // A workspace loss closes the running call with "Result unknown"; the live
+    // card and a reload's replay of the turn read its state from the frame.
+    it('keeps the result state a tool.completed frame carries', () => {
+      const { service } = createService();
+      (service as any)._handleEvent({
+        method: 'tool.started',
+        params: { id: 'c1', tool: 'shell_execute', args: { command: 'sleep 150' } },
+      });
+      (service as any)._handleEvent({
+        method: 'tool.completed',
+        params: { id: 'c1', result: 'Result unknown: …', is_error: true, result_state: 'unknown' },
+      });
+      (service as any)._handleEvent({
+        method: 'tool.started',
+        params: { id: 'c2', tool: 'shell_execute', args: {} },
+      });
+      (service as any)._handleEvent({
+        method: 'tool.completed',
+        params: { id: 'c2', result: 'ok', result_state: 'finished' },
+      });
+      const calls = service
+        .turns()
+        .filter(isAssistantTurn)
+        .flatMap((t) => t.events)
+        .filter(isToolCall);
+      expect(calls.map((c) => [c.id, c.status, c.resultState])).toEqual([
+        ['c1', 'error', 'unknown'],
+        ['c2', 'completed', undefined],
+      ]);
+    });
+
     it('leaves the snapshot alone on a session.state that names neither field', () => {
       const { service } = createService();
       service.runningTools.set([{ id: 'c1', tool: 'run_command', args: {} }]);

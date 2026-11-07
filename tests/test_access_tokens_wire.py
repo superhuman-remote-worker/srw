@@ -76,11 +76,18 @@ class Harness:
         self.store = FakeStore()
         self.user = {"id": USER_ID, "real_is_admin": False}
         self.internal_error: HTTPException | None = None
+        self.service_gate_calls: list[str] = []
 
     async def require_approved_user(self, request, db):
         return self.user
 
     async def require_internal(self, request):
+        if self.internal_error is not None:
+            raise self.internal_error
+        return None
+
+    async def require_internal_service(self, request):
+        self.service_gate_calls.append(request.url.path)
         if self.internal_error is not None:
             raise self.internal_error
         return None
@@ -92,6 +99,7 @@ class Harness:
             tokens=access_token_operations.AccessTokenDependencies(store=self.store),
             require_approved_user=self.require_approved_user,
             require_internal=self.require_internal,
+            require_internal_service=self.require_internal_service,
         )
 
     def app(self):
@@ -909,8 +917,159 @@ def test_the_access_token_router_serves_exactly_its_own_surface():
         ("/api/mcp-tokens/{token_id}", ("DELETE",)),
         ("/api/internal/mcp-token-verify", ("POST",)),
         ("/api/internal/mcp-token-create", ("POST",)),
+        ("/api/internal/mcp-oauth-grant", ("POST",)),
+        ("/api/internal/mcp-oauth-refresh/lookup", ("POST",)),
+        ("/api/internal/mcp-oauth-refresh/rotate", ("POST",)),
+        ("/api/internal/mcp-oauth-refresh/revoke", ("POST",)),
         ("/api/api-keys", ("POST",)),
         ("/api/api-keys", ("GET",)),
         ("/api/api-keys/{token_id}", ("DELETE",)),
         ("/api/api-keys/{token_id}/rotate", ("POST",)),
     }
+
+
+# =============================================================================
+# MCP OAuth grants (G6): the bridge's refresh tokens. The SQL semantics run on
+# real PostgreSQL in tests/test_mcp_oauth_grants_real_postgres.py; these pin
+# the HTTP boundary.
+# =============================================================================
+
+H64 = "a" * 64
+GRANT_ROUTES = [
+    (
+        "/api/internal/mcp-oauth-grant",
+        {
+            "user_sub": "kc-1",
+            "name": "OAuth: Claude",
+            "oauth_client_id": "dcr-1",
+            "origin": "oauth:Claude",
+            "access_token_hash": H64,
+            "access_token_prefix": "srw_abc",
+            "access_expires_at": "2026-11-05T12:00:00+00:00",
+            "refresh_token_hash": "b" * 64,
+            "grant_expires_at": "2026-12-05T11:00:00+00:00",
+        },
+    ),
+    ("/api/internal/mcp-oauth-refresh/lookup", {"refresh_token_hash": H64}),
+    (
+        "/api/internal/mcp-oauth-refresh/rotate",
+        {
+            "refresh_token_hash": H64,
+            "new_refresh_token_hash": "b" * 64,
+            "new_access_token_hash": "c" * 64,
+            "new_access_token_prefix": "srw_new",
+            "access_ttl_seconds": 3600,
+        },
+    ),
+    ("/api/internal/mcp-oauth-refresh/revoke", {"refresh_token_hash": H64}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,body", GRANT_ROUTES)
+async def test_grant_routes_are_internal_service_only(harness, path, body):
+    """A delegated MCP user never reaches them; the store is not touched."""
+    harness.internal_error = HTTPException(status_code=403, detail="no delegated user")
+
+    async with _client(harness) as client:
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 403
+    assert harness.service_gate_calls == [path]
+
+
+@pytest.mark.asyncio
+async def test_grant_create_resolves_the_user_and_stores_hashes_only(harness):
+    stored = {}
+
+    async def create(**fields):
+        stored.update(fields)
+        return {"grant_id": "g-1", "access_token_id": "t-1", "grant_expires_at": None}
+
+    harness.store.set(
+        "get_user_by_keycloak_sub", _async({"id": USER_ID, "is_approved": True})
+    ).set("create_mcp_oauth_grant", create)
+
+    async with _client(harness) as client:
+        path, body = _route_body("/api/internal/mcp-oauth-grant")
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 200, response.text
+    assert stored["user_id"] == str(USER_ID)
+    assert stored["access_token_hash"] == H64
+    assert stored["access_expires_at"] == datetime(2026, 11, 5, 12, tzinfo=timezone.utc)
+    assert "token" not in response.json()
+
+
+@pytest.mark.asyncio
+async def test_lookup_of_an_unknown_refresh_token_is_404_after_the_replay_check(
+    harness,
+):
+    replay_checked = []
+
+    async def on_replay(refresh_hash):
+        replay_checked.append(refresh_hash)
+        return True
+
+    harness.store.set("get_mcp_oauth_grant_by_refresh_hash", _async(None)).set(
+        "revoke_mcp_oauth_grant_on_replay", on_replay
+    )
+
+    async with _client(harness) as client:
+        path, body = _route_body("/api/internal/mcp-oauth-refresh/lookup")
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 404
+    assert replay_checked == [H64]
+
+
+@pytest.mark.asyncio
+async def test_lookup_answers_client_scope_and_expiry(harness):
+    harness.store.set(
+        "get_mcp_oauth_grant_by_refresh_hash",
+        _async(
+            {
+                "id": UUID(int=7),
+                "user_id": USER_ID,
+                "oauth_client_id": "dcr-1",
+                "scope": "user",
+                "expires_at": CREATED,
+            }
+        ),
+    )
+
+    async with _client(harness) as client:
+        path, body = _route_body("/api/internal/mcp-oauth-refresh/lookup")
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 200
+    assert response.json()["oauth_client_id"] == "dcr-1"
+    assert response.json()["grant_expires_at"] == str(CREATED)
+
+
+@pytest.mark.asyncio
+async def test_rotation_of_a_dead_refresh_token_is_404(harness):
+    harness.store.set("rotate_mcp_oauth_grant", _async(None))
+
+    async with _client(harness) as client:
+        path, body = _route_body("/api/internal/mcp-oauth-refresh/rotate")
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 404
+
+
+def _route_body(path):
+    return path, dict(GRANT_ROUTES)[path]
+
+
+def _client(harness):
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness.app()), base_url="http://test"
+    )
+
+
+def _async(value):
+    async def _method(*args, **kwargs):
+        return value
+
+    return _method

@@ -86,6 +86,12 @@ class PublicJobListItem(BaseModel):
     priority: int
     repo_name: str | None
     branch_name: str | None
+    gitea_url: str | None = Field(
+        description=(
+            "Browser URL of the job's Gitea repository under the installation's "
+            "real repository owner; null without a repository or a public Gitea URL."
+        )
+    )
     merge_status: str | None
     diff_status: str | None
     cloud_diff_baseline_commit: str | None

@@ -117,6 +117,7 @@
     "write_file"
   ],
   "centurion": [
+    "accept_job_diff",
     "acknowledge_job_message",
     "approve_job",
     "browser_back",
@@ -182,6 +183,7 @@
     "pause_job",
     "read_file",
     "read_job_evidence",
+    "reject_job_diff",
     "rename_file",
     "reply_to_job_message",
     "resume_job_with_feedback",

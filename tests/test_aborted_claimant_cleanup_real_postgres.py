@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from orchestrator.services.historical_agent_pod_cleanup import (
-    retire_aborted_unclaimed_agent_pod,
+    retire_aborted_agent_pod,
 )
 
 from orchestrator import main
@@ -312,7 +312,7 @@ async def test_aborted_claimant_cleanup_refuses_unproven_or_changed_life(
         except RuntimeError:
             pass
     else:
-        assert not await retire_aborted_unclaimed_agent_pod(
+        assert not await retire_aborted_agent_pod(
             db,
             pod_name=old["pod_name"],
             pod_uid=old["pod_uid"],
@@ -345,7 +345,7 @@ async def test_aborted_claimant_cleanup_retries_only_captured_life(
         expected_runtime_retirement_token=permanent["token"],
         expected_runtime_generation=permanent["generation"],
     )
-    assert await retire_aborted_unclaimed_agent_pod(
+    assert await retire_aborted_agent_pod(
         db,
         pod_name=old["pod_name"],
         pod_uid=old["pod_uid"],
@@ -384,7 +384,7 @@ async def test_aborted_reaper_rechecks_release_authority_before_effect(
 
     monkeypatch.setattr(db, "get_thread", observe_thread)
     monkeypatch.setattr(db, "fetchrow", observe_intent)
-    assert not await retire_aborted_unclaimed_agent_pod(
+    assert not await retire_aborted_agent_pod(
         db,
         pod_name=old["pod_name"],
         pod_uid=old["pod_uid"],
@@ -418,7 +418,7 @@ async def test_aborted_cleanup_refuses_nonzero_release_projection(
                 permanent, cleanup_agent_pod=False
             )
     else:
-        assert not await retire_aborted_unclaimed_agent_pod(
+        assert not await retire_aborted_agent_pod(
             db,
             pod_name=old["pod_name"],
             pod_uid=old["pod_uid"],

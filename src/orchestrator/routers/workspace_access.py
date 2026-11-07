@@ -30,6 +30,7 @@ from orchestrator.schemas.workspace_access import JobWorkspaceUpgradeRequest
 from orchestrator.security.access import (
     require_internal,
     require_job_access,
+    require_project_member,
 )
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import workspace_access
@@ -51,6 +52,7 @@ class WorkspaceAccessDependencies:
     require_approved_user: Callable[..., Awaitable[Any]] = require_approved_user
     require_job_access: Callable[..., Awaitable[Any]] = require_job_access
     require_internal: Callable[..., Awaitable[Any]] = require_internal
+    require_project_member: Callable[..., Awaitable[Any]] = require_project_member
 
 
 def get_workspace_access_dependencies(request: Request) -> WorkspaceAccessDependencies:
@@ -231,6 +233,38 @@ async def ensure_workspace_access(
     return await workspace_access.ensure_workspace_access(
         job_id=job_id,
         require_approved_user=approve_caller,
+        dependencies=dependencies.operations,
+    )
+
+
+@router.post("/api/projects/{project_id}/ensure-repo-access")
+async def ensure_project_repo_access(
+    request: Request,
+    project_id: str,
+    *,
+    dependencies: WorkspaceAccessDependencies = Depends(
+        get_workspace_access_dependencies
+    ),
+) -> dict[str, Any]:
+    """Ensure the current member has Gitea access to the project's managed repos.
+
+    Called by the cockpit when it opens a project. Re-attempts the grant that
+    may have failed when the project, or the caller's membership, was created
+    (e.g. their Gitea account did not exist yet), so the knowledge vault does
+    not 404 for its own owner.
+    """
+
+    # Bound, not awaited here, for the same reason as ensure-workspace-access:
+    # an unexpected gate failure must surface as the operation's logged 500.
+    async def approve_member() -> dict[str, Any]:
+        user, _project = await dependencies.require_project_member(
+            request, dependencies.store, project_id
+        )
+        return user
+
+    return await workspace_access.ensure_project_repo_access(
+        project_id=project_id,
+        require_project_member=approve_member,
         dependencies=dependencies.operations,
     )
 

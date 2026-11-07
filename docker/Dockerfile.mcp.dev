@@ -33,7 +33,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONSAFEPATH=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-RUN groupadd -r srw && useradd -r -g srw srw
+# Same fixed IDs as Dockerfile.mcp (the OAuth-state volume's fsGroup).
+RUN groupadd -r -g 10001 srw && useradd -r -u 10001 -g srw srw
 
 WORKDIR /app
 

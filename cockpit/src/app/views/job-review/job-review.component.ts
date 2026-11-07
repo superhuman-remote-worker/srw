@@ -18,6 +18,7 @@ import {
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
 import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
+import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
 import {
   checkoutCaptureState,
   jobCloudAction,
@@ -1001,15 +1002,7 @@ export class JobReviewComponent {
 
   getJobWorkspaceUrl(): string | null {
     const currentJob = this.job();
-    const giteaUrl = environment.giteaUrl;
-    if (!giteaUrl || !currentJob) return null;
-    const repoName = currentJob.repo_name?.trim();
-    // No repository means no workspace page: a guessed name is a dead link.
-    if (!repoName) return null;
-    if (currentJob.branch_name) {
-      return `${giteaUrl}/${repoName}/src/branch/${currentJob.branch_name}`;
-    }
-    return `${giteaUrl}/${repoName}`;
+    return currentJob ? jobWorkspaceUrl(currentJob, environment.giteaUrl) : null;
   }
 
   openJobWorkspace(): void {

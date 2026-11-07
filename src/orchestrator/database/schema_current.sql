@@ -7228,7 +7228,16 @@ BEGIN
     ELSIF OLD.runtime_retirement_token IS NOT NULL
           AND OLD.runtime_retirement_permanent = false
           AND NEW.runtime_retirement_token IS NULL
-          AND NEW.status = 'suspended' THEN
+          AND NEW.status = 'suspended'
+          -- Not the marker-only abort of an unauthorized preflight on a
+          -- thread that was already suspended: that keeps its generation.
+          AND NOT (
+              OLD.status = 'suspended'
+              AND OLD.runtime_retirement_authorized_at IS NULL
+              AND OLD.runtime_retirement_stage_receipt IS NULL
+              AND OLD.runtime_retirement_local_quiescence IS NULL
+              AND OLD.runtime_retirement_external_cleanup IS NULL
+          ) THEN
         -- Suspension is a settled, preparable successor state.  Force the
         -- rotation here even for old/direct SQL so no caller can reopen it
         -- under the retired generation (or choose its own generation).
@@ -8844,6 +8853,105 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: fence_project_deletion(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fence_project_deletion() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM public.refuse_if_project_deleting(
+        ARRAY[NEW.project_id], TG_ARGV[0] = 'lock'
+    );
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION fence_project_deletion(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.fence_project_deletion() IS 'Fence of a decided project delete for rows that carry project_id.';
+
+
+--
+-- Name: fence_project_deletion_execution(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fence_project_deletion_execution() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+BEGIN
+    PERFORM public.refuse_if_project_deleting(
+        ARRAY(
+            SELECT DISTINCT ids.project_id FROM (
+                SELECT unnest(NEW.project_ids) AS project_id
+                UNION
+                SELECT r.project_id FROM public.srw_resources AS r
+                 WHERE r.project_id IS NOT NULL
+                   AND (r.id = NEW.resource_id
+                        OR r.id IN (
+                            SELECT (d->>'uid')::uuid
+                              FROM jsonb_array_elements(
+                                       CASE WHEN jsonb_typeof(NEW.dependencies) = 'array'
+                                            THEN NEW.dependencies
+                                            ELSE '[]'::jsonb END) AS d
+                             WHERE d->>'uid' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
+            ) AS ids
+             WHERE ids.project_id IS NOT NULL
+        ),
+        true
+    );
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: FUNCTION fence_project_deletion_execution(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.fence_project_deletion_execution() IS 'Fence of a decided project delete for executions: their projects and the projects of the resources they were resolved from.';
+
+
+--
+-- Name: fence_project_deletion_expert_pointer(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fence_project_deletion_expert_pointer() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    pointer_project uuid;
+BEGIN
+    IF TG_TABLE_NAME = 'project_experts' THEN
+        pointer_project := NEW.project_id;
+    END IF;
+    PERFORM public.refuse_if_project_deleting(
+        ARRAY(
+            SELECT DISTINCT r.project_id FROM public.srw_resources AS r
+             WHERE r.kind = 'Expert'
+               AND r.linked_id = NEW.expert_id
+               AND r.deleted_at IS NULL
+               AND r.project_id IS NOT NULL
+               AND r.project_id IS DISTINCT FROM pointer_project
+        ),
+        true
+    );
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION fence_project_deletion_expert_pointer(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.fence_project_deletion_expert_pointer() IS 'Fence of a decided project delete for pointers to its Experts from outside it.';
 
 
 --
@@ -19592,6 +19700,54 @@ COMMENT ON FUNCTION public.record_compute_authority_confirmation_gap() IS 'Opens
 
 
 --
+-- Name: refuse_if_project_deleting(uuid[], boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.refuse_if_project_deleting(project_ids uuid[], with_lock boolean) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    marked boolean;
+BEGIN
+    IF project_ids IS NULL OR cardinality(project_ids) = 0 THEN
+        RETURN;
+    END IF;
+    IF with_lock THEN
+        -- Lock first, in a statement of its own: a filter on the mark in the
+        -- locking query is pushed below the lock and skips a row that an
+        -- open decision is marking, without waiting for it.
+        PERFORM 1
+           FROM public.projects AS p
+          WHERE p.id = ANY(project_ids)
+          ORDER BY p.id
+            FOR SHARE;
+    END IF;
+    -- A new statement, so a new snapshot: it sees a decision that committed
+    -- while the lock above waited.
+    SELECT EXISTS (
+        SELECT 1 FROM public.projects AS p
+         WHERE p.id = ANY(project_ids)
+           AND p.deletion_requested_at IS NOT NULL
+    ) INTO marked;
+    IF marked THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            CONSTRAINT = 'project_deletion_in_progress',
+            MESSAGE = 'This project is being deleted',
+            HINT = 'A project accepts no new work or changes while it is deleted.';
+    END IF;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION refuse_if_project_deleting(project_ids uuid[], with_lock boolean); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.refuse_if_project_deleting(project_ids uuid[], with_lock boolean) IS 'Raises project_deletion_in_progress (23514) when any of the projects carries deletion_requested_at. with_lock reads them FOR SHARE.';
+
+
+--
 -- Name: reject_managed_repository_process_zero_json(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -20900,18 +21056,18 @@ CREATE FUNCTION public.stateless_unpublished_creation_settled_without_pod(reques
            AND requested_state #>> '{workspace_container,provisioner}' = 'k8s'
            AND requested_state #>> '{workspace_container,_runtime_incarnation}'
                IS NULL
-           AND COALESCE(requested_state -> '_workspace_binding', '{}'::JSONB)
-               = '{}'::JSONB
-           AND r.id::TEXT = COALESCE(
-               requested_state #>> ARRAY[
-                   '_stateless_claim_retirement', 'unpublished_creation',
-                   'reservation_id'
-               ],
-               requested_state #>> ARRAY[
-                   '_stateless_workspace_retirement_settled',
-                   'unpublished_creation', 'reservation_id'
-               ]
+           AND (
+               COALESCE(requested_state -> '_workspace_binding', '{}'::JSONB)
+                   = '{}'::JSONB
+               OR (
+                   r.cancel_resource_policy = 'terminal_reclaim'
+                   AND m.marker #>> '{retained,pvc_uid}' = r.pvc_uid::TEXT
+                   AND requested_state #>> '{_workspace_binding,backing_id}'
+                       = 'k8s-pvc:' || (m.marker ->> 'namespace') || ':'
+                         || r.pvc_uid::TEXT
+               )
            )
+           AND r.id::TEXT = m.marker ->> 'reservation_id'
            AND r.operation_kind = 'create'
            AND r.settled_at IS NOT NULL
            AND r.phase = 'aborted'
@@ -20926,6 +21082,17 @@ CREATE FUNCTION public.stateless_unpublished_creation_settled_without_pod(reques
                OR r.cancel_resource_policy = 'terminal_reclaim'
            )
           FROM public.managed_repository_workspace_creation_reservations AS r
+         CROSS JOIN LATERAL (
+             SELECT COALESCE(
+                 requested_state #> ARRAY[
+                     '_stateless_claim_retirement', 'unpublished_creation'
+                 ],
+                 requested_state #> ARRAY[
+                     '_stateless_workspace_retirement_settled',
+                     'unpublished_creation'
+                 ]
+             ) AS marker
+         ) AS m
          WHERE r.owner_kind = 'thread'
            AND r.owner_id = requested_thread
            AND r.scope = 'workspace_container'
@@ -30206,6 +30373,33 @@ CREATE SEQUENCE public.managed_repository_workspace_restore_work_claim_seq
 
 
 --
+-- Name: mcp_oauth_grants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.mcp_oauth_grants (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    access_token_id uuid NOT NULL,
+    oauth_client_id text NOT NULL,
+    refresh_token_hash text NOT NULL,
+    previous_refresh_hash text,
+    scope text NOT NULL,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_refreshed_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    CONSTRAINT mcp_oauth_grants_client_check CHECK ((oauth_client_id <> ''::text))
+);
+
+
+--
+-- Name: TABLE mcp_oauth_grants; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.mcp_oauth_grants IS 'OAuth connections of the MCP server: the hashed refresh token that renews access_token_id (an auth_tokens kind=mcp row rotated in place). A refresh token is never an access token. Replaying a rotated refresh token (previous_refresh_hash) revokes the grant.';
+
+
+--
 -- Name: message_delivery_attempts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -30792,6 +30986,33 @@ COMMENT ON COLUMN public.project_datasources.access IS 'The project''s default l
 
 
 --
+-- Name: project_deletions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_deletions (
+    project_id uuid NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    requested_by uuid,
+    row_deleted_at timestamp with time zone,
+    targets jsonb DEFAULT '{}'::jsonb NOT NULL,
+    pending_steps text[] DEFAULT '{}'::text[] NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    last_error text,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT project_deletions_completed_check CHECK (((completed_at IS NULL) OR ((row_deleted_at IS NOT NULL) AND (cardinality(pending_steps) = 0)))),
+    CONSTRAINT project_deletions_steps_check CHECK ((pending_steps <@ ARRAY['index'::text, 'keycloak_group'::text, 'cloud_folder'::text]))
+);
+
+
+--
+-- Name: TABLE project_deletions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_deletions IS 'One row per decided project delete. Before row_deleted_at the project row still exists and the teardown removes its managed repositories, folder grants and row; after it, pending_steps names the external state still to remove (search index and watermark, Keycloak group, main-cloud folder). completed_at closes the row; the sweeper drops closed rows after 30 days.';
+
+
+--
 -- Name: project_experts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -31075,6 +31296,7 @@ CREATE TABLE public.projects (
     main_cloud_backend_instance_id uuid,
     manifest_resource_id uuid,
     main_cloud_folder_error text,
+    deletion_requested_at timestamp with time zone,
     CONSTRAINT projects_network_tier_check CHECK ((network_tier = ANY (ARRAY['internet-only'::text, 'home-allowed'::text]))),
     CONSTRAINT valid_project_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'archived'::character varying])::text[])))
 );
@@ -31084,7 +31306,7 @@ CREATE TABLE public.projects (
 -- Name: COLUMN projects.status; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.projects.status IS 'Project lifecycle: active|archived, enforced by valid_project_status since 0169. Archiving is an explicit owner action and hides the project from the default GET /api/projects list (?status= opts it back in); deletion is a hard row delete, never a status. The column remains NULLABLE on purpose — a CHECK passes on NULL, and the API fails toward showing an unclassifiable row rather than hiding it.';
+COMMENT ON COLUMN public.projects.status IS 'Project lifecycle: active|archived, enforced by valid_project_status since 0169. Archiving is an explicit owner action and hides the project from the default GET /api/projects list (?status= opts it back in). Deletion is not a status: a decided delete sets deletion_requested_at until the row is gone (0565). The column remains NULLABLE on purpose — a CHECK passes on NULL, and the API fails toward showing an unclassifiable row rather than hiding it.';
 
 
 --
@@ -31099,6 +31321,13 @@ COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress 
 --
 
 COMMENT ON COLUMN public.projects.main_cloud_folder_error IS 'Why the project''s main-cloud folder could not be created: the error kind of the last failed attempt (already_exists, permission_denied, unavailable, ...). NULL when none failed or once one succeeded. Written by project cloud provisioning, shown on the project page.';
+
+
+--
+-- Name: COLUMN projects.deletion_requested_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.projects.deletion_requested_at IS 'Set by the transaction that decides a project delete (owner or admin, refusal checks passed). Never cleared: the request or the project deletion sweeper finishes the delete, from project_deletions. While set, nothing that would refuse the row delete can land in the project (project_deletion_in_progress).';
 
 
 --
@@ -36114,6 +36343,22 @@ ALTER TABLE ONLY public.managed_repository_workspace_creation_reservations
 
 
 --
+-- Name: mcp_oauth_grants mcp_oauth_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: mcp_oauth_grants mcp_oauth_grants_refresh_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_refresh_hash_key UNIQUE (refresh_token_hash);
+
+
+--
 -- Name: auth_tokens mcp_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -36343,6 +36588,14 @@ ALTER TABLE ONLY public.project_contacts
 
 ALTER TABLE ONLY public.project_datasources
     ADD CONSTRAINT project_datasources_pkey PRIMARY KEY (project_id, datasource_id);
+
+
+--
+-- Name: project_deletions project_deletions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_deletions
+    ADD CONSTRAINT project_deletions_pkey PRIMARY KEY (project_id);
 
 
 --
@@ -40135,6 +40388,20 @@ CREATE UNIQUE INDEX managed_repository_workspace_restore_work_claim_unique ON pu
 
 
 --
+-- Name: mcp_oauth_grants_access_token_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mcp_oauth_grants_access_token_idx ON public.mcp_oauth_grants USING btree (access_token_id);
+
+
+--
+-- Name: mcp_oauth_grants_previous_hash_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mcp_oauth_grants_previous_hash_idx ON public.mcp_oauth_grants USING btree (previous_refresh_hash) WHERE (previous_refresh_hash IS NOT NULL);
+
+
+--
 -- Name: pinned_job_deliveries_job; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -40146,6 +40413,13 @@ CREATE INDEX pinned_job_deliveries_job ON public.pinned_job_deliveries USING btr
 --
 
 CREATE INDEX pinned_job_wait_receipts_job ON public.pinned_job_wait_receipts USING btree (job_id, source_kind, source_id);
+
+
+--
+-- Name: project_deletions_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX project_deletions_due_idx ON public.project_deletions USING btree (next_attempt_at) WHERE (completed_at IS NULL);
 
 
 --
@@ -42312,6 +42586,20 @@ CREATE TRIGGER trg_agents_revoke_runtime_actor_grants BEFORE DELETE ON public.ag
 
 
 --
+-- Name: application_expert_defaults trg_application_expert_defaults_project_deletion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_application_expert_defaults_project_deletion BEFORE INSERT OR UPDATE OF expert_id ON public.application_expert_defaults FOR EACH ROW WHEN ((new.expert_id IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion_expert_pointer();
+
+
+--
+-- Name: automations trg_automations_project_deletion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_automations_project_deletion BEFORE INSERT OR UPDATE OF expert_id ON public.automations FOR EACH ROW WHEN ((new.expert_id IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion_expert_pointer();
+
+
+--
 -- Name: canvas_origin_sessions trg_canvas_origin_session_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -42372,6 +42660,13 @@ CREATE TRIGGER trg_container_startup_stage_receipt BEFORE INSERT OR UPDATE ON pu
 --
 
 CREATE TRIGGER trg_docker_workspace_reuse_requires_process_zero BEFORE UPDATE OF status, owner_kind, owner_id, lease_id, quarantine_reason ON public.docker_workspace_leases FOR EACH ROW EXECUTE FUNCTION public.enforce_docker_workspace_reuse_process_zero();
+
+
+--
+-- Name: srw_execution_specs trg_execution_specs_project_deletion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_execution_specs_project_deletion BEFORE INSERT OR UPDATE OF project_ids, resource_id, dependencies ON public.srw_execution_specs FOR EACH ROW EXECUTE FUNCTION public.fence_project_deletion_execution();
 
 
 --
@@ -42487,6 +42782,20 @@ CREATE TRIGGER trg_jobs_process_zero_owner_resurrection BEFORE INSERT ON public.
 
 
 --
+-- Name: jobs trg_jobs_project_deletion_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_jobs_project_deletion_insert BEFORE INSERT ON public.jobs FOR EACH ROW WHEN ((new.project_id IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion('lock');
+
+
+--
+-- Name: jobs trg_jobs_project_deletion_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_jobs_project_deletion_update BEFORE UPDATE OF project_id, status ON public.jobs FOR EACH ROW WHEN (((new.project_id IS NOT NULL) AND ((new.project_id IS DISTINCT FROM old.project_id) OR (((old.status)::text = ANY ((ARRAY['completed'::character varying, 'failed'::character varying, 'cancelled'::character varying])::text[])) AND ((new.status)::text <> ALL ((ARRAY['completed'::character varying, 'failed'::character varying, 'cancelled'::character varying])::text[])))))) EXECUTE FUNCTION public.fence_project_deletion('read');
+
+
+--
 -- Name: jobs trg_jobs_reject_managed_repository_process_zero_json; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -42592,6 +42901,34 @@ CREATE TRIGGER trg_pinned_workspace_provision_stop_authority BEFORE INSERT OR DE
 
 
 --
+-- Name: project_experts trg_project_experts_project_deletion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_project_experts_project_deletion BEFORE INSERT OR UPDATE OF expert_id, default_for ON public.project_experts FOR EACH ROW WHEN ((new.default_for IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion_expert_pointer();
+
+
+--
+-- Name: project_repositories trg_project_repositories_project_deletion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_project_repositories_project_deletion BEFORE INSERT ON public.project_repositories FOR EACH ROW EXECUTE FUNCTION public.fence_project_deletion('lock');
+
+
+--
+-- Name: srw_resources trg_resources_project_deletion_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_resources_project_deletion_insert BEFORE INSERT ON public.srw_resources FOR EACH ROW WHEN (((new.project_id IS NOT NULL) AND (new.deleted_at IS NULL))) EXECUTE FUNCTION public.fence_project_deletion('lock');
+
+
+--
+-- Name: srw_resources trg_resources_project_deletion_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_resources_project_deletion_update BEFORE UPDATE ON public.srw_resources FOR EACH ROW WHEN (((new.project_id IS NOT NULL) AND (new.deleted_at IS NULL))) EXECUTE FUNCTION public.fence_project_deletion('read');
+
+
+--
 -- Name: runtime_actor_grants trg_runtime_actor_grants_officer_agent_binding; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -42690,6 +43027,20 @@ CREATE TRIGGER trg_threads_process_zero_owner_resurrection BEFORE INSERT ON publ
 
 
 --
+-- Name: threads trg_threads_project_deletion_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_threads_project_deletion_insert BEFORE INSERT ON public.threads FOR EACH ROW WHEN ((new.project_id IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion('lock');
+
+
+--
+-- Name: threads trg_threads_project_deletion_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_threads_project_deletion_update BEFORE UPDATE OF project_id, status ON public.threads FOR EACH ROW WHEN (((new.project_id IS NOT NULL) AND ((new.project_id IS DISTINCT FROM old.project_id) OR (((old.status)::text = 'ended'::text) AND ((new.status)::text <> 'ended'::text))))) EXECUTE FUNCTION public.fence_project_deletion('read');
+
+
+--
 -- Name: threads trg_threads_reject_managed_repository_process_zero_json; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -42708,6 +43059,13 @@ CREATE TRIGGER trg_threads_require_workspace_creation_reservation_on_insert BEFO
 --
 
 CREATE TRIGGER trg_threads_validate_workspace_runtime_generation BEFORE UPDATE OF execution_lane, runtime_generation ON public.threads FOR EACH ROW EXECUTE FUNCTION public.prevent_stateless_runtime_generation_with_live_workspace();
+
+
+--
+-- Name: user_expert_defaults trg_user_expert_defaults_project_deletion; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_user_expert_defaults_project_deletion BEFORE INSERT OR UPDATE OF expert_id ON public.user_expert_defaults FOR EACH ROW WHEN ((new.expert_id IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion_expert_pointer();
 
 
 --
@@ -42750,6 +43108,20 @@ CREATE TRIGGER trg_workspace_cleanup_validate_owner_generation BEFORE INSERT OR 
 --
 
 CREATE TRIGGER trg_workspace_creation_validate_owner_generation BEFORE INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.validate_non_pinned_workspace_owner_generation();
+
+
+--
+-- Name: srw_workspace_instances trg_workspace_instances_project_deletion_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_workspace_instances_project_deletion_insert BEFORE INSERT ON public.srw_workspace_instances FOR EACH ROW WHEN ((new.project_id IS NOT NULL)) EXECUTE FUNCTION public.fence_project_deletion('lock');
+
+
+--
+-- Name: srw_workspace_instances trg_workspace_instances_project_deletion_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_workspace_instances_project_deletion_update BEFORE UPDATE OF project_id ON public.srw_workspace_instances FOR EACH ROW WHEN (((new.project_id IS NOT NULL) AND (new.project_id IS DISTINCT FROM old.project_id))) EXECUTE FUNCTION public.fence_project_deletion('read');
 
 
 --
@@ -44157,6 +44529,22 @@ ALTER TABLE ONLY public.managed_repository_legacy_reconciliations
 
 ALTER TABLE ONLY public.managed_repository_legacy_reconciliation_rearms
     ADD CONSTRAINT managed_repository_legacy_reconciliation_reconciliation_id_fkey FOREIGN KEY (reconciliation_id) REFERENCES public.managed_repository_legacy_reconciliations(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: mcp_oauth_grants mcp_oauth_grants_access_token_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_access_token_id_fkey FOREIGN KEY (access_token_id) REFERENCES public.auth_tokens(id) ON DELETE CASCADE;
+
+
+--
+-- Name: mcp_oauth_grants mcp_oauth_grants_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mcp_oauth_grants
+    ADD CONSTRAINT mcp_oauth_grants_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --

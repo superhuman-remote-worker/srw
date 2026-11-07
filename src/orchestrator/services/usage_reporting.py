@@ -39,6 +39,7 @@ from orchestrator.services.infrastructure_metering.queries import (
 from orchestrator.services.infrastructure_metering.read_model import (
     UsageReadCutoverInactive,
 )
+from orchestrator.services.job_liveness import RUNNING_JOB_STATUSES
 from orchestrator.services.usage_ledger import cache_hit_ratio_from_rows
 
 JOB_USAGE_WINDOW_SLACK = timedelta(minutes=5)
@@ -46,8 +47,6 @@ JOB_USAGE_WINDOW_SLACK = timedelta(minutes=5)
 # The materializer's poll interval (120s, llm_usage_poll_loop) plus its aging
 # window (60s). A running job's figure is at worst this far behind the truth.
 JOB_USAGE_LAG_SECONDS = 180
-
-JOB_USAGE_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 # usage_events.unit -> the token bucket it belongs to. Reasoning tokens are a
 # subset of the completion total and ride in `details`, so they are deliberately
@@ -211,7 +210,9 @@ async def job_usage(
     status = str(job.get("status") or "")
     freshness = {
         "as_of": now.isoformat().replace("+00:00", "Z"),
-        "live": status not in JOB_USAGE_TERMINAL_STATUSES,
+        # Only a job the system is still working adds usage. pending_review,
+        # paused and waiting_for_reply are not terminal, but nothing runs.
+        "live": status in RUNNING_JOB_STATUSES,
         "lag_seconds": JOB_USAGE_LAG_SECONDS,
     }
 

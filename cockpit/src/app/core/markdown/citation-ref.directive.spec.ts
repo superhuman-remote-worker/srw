@@ -5,6 +5,7 @@ import {MARKED_EXTENSIONS, SANITIZE, MarkdownComponent, provideMarkdown} from 'n
 import {afterEach, beforeEach, describe, expect, it} from 'vitest';
 
 import {PersistentChatService, ThreadCitation} from '../services/persistent-chat.service';
+import {WorkspaceFileDownloadService} from '../services/workspace-file-download.service';
 import {citationExtension} from './citation-extension';
 import {CitationRefDirective} from './citation-ref.directive';
 import {CitationScope, citationIdsIn} from './citation-scope';
@@ -50,7 +51,11 @@ describe('CitationRefDirective', () => {
                     markedExtensions: [{provide: MARKED_EXTENSIONS, multi: true, useValue: citationExtension()}],
                     sanitize: {provide: SANITIZE, useValue: sanitizeMarkdownHtml},
                 }),
-                {provide: PersistentChatService, useValue: {citationsByCid, citationsLoaded, citationFocus}},
+                {
+                    provide: PersistentChatService,
+                    useValue: {citationsByCid, citationsLoaded, citationFocus, threadId: signal('thread-1')},
+                },
+                {provide: WorkspaceFileDownloadService, useValue: {open: () => Promise.resolve(true)}},
                 {provide: TranslocoService, useValue: {translate: (k: string) => k}},
             ],
         });

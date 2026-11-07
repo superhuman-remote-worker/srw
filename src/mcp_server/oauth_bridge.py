@@ -19,19 +19,20 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt as pyjwt
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastmcp.server.auth import AccessToken, OIDCProxy, TokenVerifier
+from mcp.server.auth.provider import RefreshToken
 from fastmcp.server.auth.oauth_proxy.models import (
     DEFAULT_AUTH_CODE_EXPIRY_SECONDS,
     HTTP_TIMEOUT_SECONDS,
     ClientCode,
 )
 from fastmcp.server.auth.oauth_proxy.ui import create_error_html
-from mcp.server.auth.provider import TokenError
+from mcp.server.auth.provider import RegistrationError, TokenError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
@@ -44,11 +45,141 @@ _TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
 
+# Redirect URIs a client may send the authorization code to, in FastMCP's
+# pattern syntax: a loopback host without a port matches any port and path
+# (RFC 8252 §7.3), and an empty or "/" path matches any path.
+#
+# Without a list FastMCP accepts any safe redirect URI. It also synthesizes a
+# client for anyone who presents our upstream client id ("mcp-server", public
+# in the chart values) and lets that client redirect anywhere. One click on
+# the consent page by a user with a Keycloak session then sends their code to
+# an attacker. The list is therefore never left empty or None.
+#
+# Hosted entries are the callbacks documented by each vendor; every other
+# client (Claude Code, Codex, Gemini CLI, VS Code desktop, the MCP Inspector)
+# uses a loopback redirect.
+DEFAULT_ALLOWED_REDIRECT_URIS: tuple[str, ...] = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+    "https://chatgpt.com/connector/oauth/*",
+    "https://vscode.dev/redirect",
+    "https://www.cursor.com/agents/mcp/oauth/callback",
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+)
+
+
+#: Access tokens minted for OAuth clients live this long; the refresh token
+#: renews them for as long as the user chose on the consent page. Short, so a
+#: leaked access token dies on its own (MCP authorization spec: SHOULD).
+DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
+
+#: Refresh tokens are not access tokens: a different prefix (the verifier and
+#: the orchestrator accept only ``srw_``) and a different table.
+REFRESH_TOKEN_PREFIX = "srwr_"
+
+
+def _access_token_ttl_seconds() -> int:
+    raw = os.environ.get("MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "")
+    try:
+        value = int(raw) if raw.strip() else DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    except ValueError:
+        logger.warning("Ignoring MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=%r", raw)
+        value = DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+    return max(60, min(value, 7 * 86400))
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _epoch(value: Any) -> int | None:
+    if not value:
+        return None
+    return int(datetime.fromisoformat(str(value)).timestamp())
+
+
+def _split_patterns(raw: str) -> list[str]:
+    return [part for part in re.split(r"[\s,]+", raw or "") if part]
+
+
+def allowed_redirect_uris_from_env(
+    env: Any = None,
+) -> list[str]:
+    """Return the redirect-URI allowlist for the authorization server.
+
+    ``MCP_OAUTH_ALLOWED_REDIRECT_URIS`` replaces the defaults when it names at
+    least one pattern; ``MCP_OAUTH_EXTRA_REDIRECT_URIS`` is appended either
+    way (self-hosted chat UIs add their callback there). Both take comma- or
+    whitespace-separated patterns. A pattern without a scheme is dropped with a
+    warning rather than widening the list.
+    """
+    env = os.environ if env is None else env
+    patterns = _split_patterns(env.get("MCP_OAUTH_ALLOWED_REDIRECT_URIS", ""))
+    if not patterns:
+        patterns = list(DEFAULT_ALLOWED_REDIRECT_URIS)
+    patterns += _split_patterns(env.get("MCP_OAUTH_EXTRA_REDIRECT_URIS", ""))
+
+    allowed: list[str] = []
+    for pattern in patterns:
+        if "://" not in pattern:
+            logger.warning(
+                "Ignoring redirect URI pattern without a scheme: %r", pattern
+            )
+            continue
+        if pattern not in allowed:
+            allowed.append(pattern)
+    return allowed
+
+
 def _load_template() -> str:
     """Load the consent HTML template."""
     path = os.path.join(_TEMPLATE_DIR, "consent.html")
     with open(path) as f:
         return f.read()
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+#: Consent responses refuse to be framed (clickjacking the Allow button) and
+#: are never cached. ``frame-ancestors`` only works as a header, not in the
+#: template's <meta> CSP.
+CONSENT_HEADERS = {
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+def describe_client(
+    client_id: str, client_name: str | None, redirect_uri: str
+) -> dict[str, Any]:
+    """What the consent page can truthfully say about the requesting app.
+
+    A CIMD client's id is the HTTPS URL of its metadata document, so its host
+    is vouched for by TLS (claude.ai, chatgpt.com, vscode.dev). A dynamically
+    registered client's name is whatever the registrant typed — anyone can
+    register "Claude" — so it is shown as the app's own claim, next to the
+    one fact that matters: the host the authorization code is sent to.
+    """
+    parsed_id = urlparse(client_id or "")
+    redirect = urlparse(redirect_uri or "")
+    redirect_host = (redirect.hostname or "").lower()
+    if redirect.port:
+        redirect_host = f"{redirect_host}:{redirect.port}"
+    if parsed_id.scheme == "https" and parsed_id.hostname:
+        display, verified = parsed_id.hostname.lower(), True
+    else:
+        display, verified = (client_name or "").strip()[:80] or "Unknown App", False
+    return {
+        "display_name": display,
+        "verified": verified,
+        "redirect_host": redirect_host or "unknown",
+        "loopback": (redirect.hostname or "").lower() in _LOOPBACK_HOSTS,
+    }
 
 
 def _render_consent(
@@ -59,6 +190,9 @@ def _render_consent(
     user_email: str,
     user_roles: list[str],
     is_admin: bool,
+    client_verified: bool = False,
+    redirect_host: str = "",
+    loopback: bool = False,
 ) -> str:
     """Render the consent template with placeholders replaced.
 
@@ -69,11 +203,27 @@ def _render_consent(
     a value that contains a placeholder is never expanded a second time.
     """
     template = _load_template()
+    client_note = (
+        '<p class="client-note">Identity verified by its web address</p>'
+        if client_verified
+        else '<p class="client-note warn">This name was chosen by the app itself '
+        "&#8212; check where it sends you below</p>"
+    )
+    loopback_warning = (
+        '<p class="notice warn">This app receives the authorization on this '
+        "computer (localhost). Continue only if you started this connection "
+        "yourself, from a program you trust.</p>"
+        if loopback
+        else ""
+    )
     replacements = {
         "session_id": html.escape(session_id, quote=True),
         "csrf_token": html.escape(csrf_token, quote=True),
         "client_name": html.escape(client_name, quote=True),
         "user_email": html.escape(user_email, quote=True),
+        "redirect_host": html.escape(redirect_host or "unknown", quote=True),
+        "client_note": client_note,
+        "loopback_warning": loopback_warning,
         "admin_option": (
             '<option value="all">Full Access (Admin)</option>' if is_admin else ""
         ),
@@ -92,6 +242,7 @@ class PendingAuth:
         "idp_tokens",
         "user_claims",
         "csrf_token",
+        "browser_binding",
         "created_at",
     )
 
@@ -101,11 +252,15 @@ class PendingAuth:
         idp_tokens: dict[str, Any],
         user_claims: dict[str, Any],
         csrf_token: str,
+        browser_binding: str = "",
     ):
         self.transaction = transaction
         self.idp_tokens = idp_tokens
         self.user_claims = user_claims
         self.csrf_token = csrf_token
+        # The consent cookie's value: the approval must come from the browser
+        # that was shown this page, not merely carry its form fields.
+        self.browser_binding = browser_binding
         self.created_at = time.time()
 
     @property
@@ -130,12 +285,16 @@ class SRWOAuthProxy(OIDCProxy):
     ):
         # Disable built-in consent — we show our own after Keycloak login
         kwargs["require_authorization_consent"] = False
+        # Never None: None means "any redirect URI" (see the constant above).
+        if kwargs.get("allowed_client_redirect_uris") is None:
+            kwargs["allowed_client_redirect_uris"] = allowed_redirect_uris_from_env()
         super().__init__(**kwargs)
         self._mcp_verifier = mcp_verifier
         self._api_url = api_url or os.environ.get(
             "COCKPIT_API_URL", "http://localhost:8085"
         )
         self._internal_key = internal_key or os.environ.get("MCP_INTERNAL_KEY", "")
+        self._access_ttl = _access_token_ttl_seconds()
         # In-memory store for pending authorizations (between Keycloak callback
         # and scope selection). Short-lived, single-use.
         self._pending_auths: dict[str, PendingAuth] = {}
@@ -157,6 +316,48 @@ class SRWOAuthProxy(OIDCProxy):
             )
         )
         return routes
+
+    @property
+    def _consent_cookie_name(self) -> str:
+        # __Host- pins the cookie to this exact origin over HTTPS; a plain-HTTP
+        # development server cannot set it, so it gets an unprefixed name.
+        return "__Host-srw_consent" if self._consent_cookie_secure else "srw_consent"
+
+    @property
+    def _consent_cookie_secure(self) -> bool:
+        return str(self.base_url).lower().startswith("https://")
+
+    def _consent_response(
+        self, consent_html: str, browser_binding: str
+    ) -> HTMLResponse:
+        """The consent page: unframeable, uncached, bound to this browser."""
+        response = HTMLResponse(content=consent_html, headers=CONSENT_HEADERS)
+        response.set_cookie(
+            self._consent_cookie_name,
+            browser_binding,
+            max_age=600,
+            path="/",
+            secure=self._consent_cookie_secure,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        """Register a DCR client, logging a refused redirect URI at WARNING.
+
+        FastMCP logs the refusal at DEBUG; a registration aimed at a foreign
+        redirect is how the consent-phishing attack starts, so it should show.
+        """
+        try:
+            await super().register_client(client_info)
+        except RegistrationError as exc:
+            logger.warning(
+                "Refused client registration (client_name=%r): %s",
+                (getattr(client_info, "client_name", None) or "")[:80],
+                getattr(exc, "error_description", None) or exc,
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Override: intercept Keycloak callback to show scope/expiry consent
@@ -274,25 +475,30 @@ class SRWOAuthProxy(OIDCProxy):
                 except Exception:
                     pass
 
-            # Get client name from DCR registration
+            # Who is asking, and where the code goes (G13): a CIMD client by
+            # its verified host, a DCR client by its self-chosen name.
             dcr_client = await self.get_client(transaction["client_id"])
-            client_name = (
-                getattr(dcr_client, "client_name", None) if dcr_client else None
-            ) or "Unknown App"
+            client = describe_client(
+                transaction["client_id"],
+                getattr(dcr_client, "client_name", None) if dcr_client else None,
+                transaction.get("client_redirect_uri") or "",
+            )
 
             # Check admin status from Keycloak realm roles
             realm_access = user_claims.get("realm_access", {})
             roles = realm_access.get("roles", [])
             is_admin = "admin" in roles
 
-            # Store pending auth with CSRF token
+            # Store pending auth with CSRF token and browser binding
             session_id = secrets.token_urlsafe(32)
             csrf_token = secrets.token_urlsafe(32)
+            browser_binding = secrets.token_urlsafe(32)
             self._pending_auths[session_id] = PendingAuth(
                 transaction=transaction,
                 idp_tokens=idp_tokens,
                 user_claims=user_claims,
                 csrf_token=csrf_token,
+                browser_binding=browser_binding,
             )
 
             # Clean up expired pending auths
@@ -305,12 +511,15 @@ class SRWOAuthProxy(OIDCProxy):
             consent_html = _render_consent(
                 session_id=session_id,
                 csrf_token=csrf_token,
-                client_name=client_name,
+                client_name=client["display_name"],
                 user_email=user_claims.get("email", "Unknown"),
                 user_roles=roles,
                 is_admin=is_admin,
+                client_verified=client["verified"],
+                redirect_host=client["redirect_host"],
+                loopback=client["loopback"],
             )
-            return HTMLResponse(content=consent_html)
+            return self._consent_response(consent_html, browser_binding)
 
         except Exception as e:
             logger.error("Error in IdP callback: %s", e, exc_info=True)
@@ -359,11 +568,32 @@ class SRWOAuthProxy(OIDCProxy):
                 )
 
             # Verify CSRF token
-            if csrf_token != pending.csrf_token:
+            if not secrets.compare_digest(csrf_token, pending.csrf_token):
                 return HTMLResponse(
                     content=create_error_html(
                         error_title="Invalid Request",
                         error_message="CSRF token mismatch. Please try again.",
+                    ),
+                    status_code=400,
+                )
+
+            # The approval must come from the browser that saw the page.
+            presented = request.cookies.get(self._consent_cookie_name, "")
+            if not pending.browser_binding or not secrets.compare_digest(
+                presented, pending.browser_binding
+            ):
+                logger.warning(
+                    "Consent submitted without its browser binding (client=%s)",
+                    str(pending.transaction.get("client_id", ""))[:40],
+                )
+                return HTMLResponse(
+                    content=create_error_html(
+                        error_title="Invalid Request",
+                        error_message=(
+                            "This approval did not come from the browser that "
+                            "opened the authorization page. Start the "
+                            "connection again from your app."
+                        ),
                     ),
                     status_code=400,
                 )
@@ -510,37 +740,127 @@ class SRWOAuthProxy(OIDCProxy):
         if hasattr(client, "client_name") and client.client_name:
             client_name = client.client_name
 
-        # Create srw_* access token via orchestrator API
-        srw_data = await self._create_srw_token(
-            user_sub=user_info.get("sub", ""),
-            user_email=user_info.get("email", ""),
-            scope=scope,
-            origin=f"oauth:{client_name}",
-            expiry_days=expiry_days,
+        # One OAuth connection: a short-lived srw_* access token (an ordinary
+        # auth_tokens row) plus a srwr_* refresh token that renews it until
+        # the lifetime the user chose. The refresh token used to be another
+        # 365-day srw_* access token that FastMCP could never refresh with
+        # (G6): every expiry or 401 forced a new login.
+        now = datetime.now(timezone.utc)
+        grant_expires_at = (
+            now + timedelta(days=expiry_days) if expiry_days > 0 else None
         )
-        if not srw_data:
+        access_expires_at = now + timedelta(seconds=self._access_ttl)
+        if grant_expires_at is not None:
+            access_expires_at = min(access_expires_at, grant_expires_at)
+        access_token = f"srw_{secrets.token_urlsafe(32)}"
+        refresh_token = f"{REFRESH_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+        status, _ = await self._internal_post(
+            "/api/internal/mcp-oauth-grant",
+            {
+                "user_sub": user_info.get("sub", ""),
+                "user_email": user_info.get("email", ""),
+                "name": f"OAuth: {client_name}"[:200],
+                "oauth_client_id": client.client_id,
+                "scope": scope,
+                "origin": f"oauth:{client_name}"[:300],
+                "access_token_hash": _token_hash(access_token),
+                "access_token_prefix": access_token[:12],
+                "access_expires_at": access_expires_at.isoformat(),
+                "refresh_token_hash": _token_hash(refresh_token),
+                "grant_expires_at": (
+                    grant_expires_at.isoformat() if grant_expires_at else None
+                ),
+            },
+        )
+        if status != 200:
             raise TokenError("invalid_grant", "Failed to create access token")
 
-        # Create refresh token if Keycloak provided one
-        refresh_token_str = None
-        if code_model.idp_tokens.get("refresh_token"):
-            refresh_data = await self._create_srw_token(
-                user_sub=user_info.get("sub", ""),
-                user_email=user_info.get("email", ""),
-                scope=scope,
-                origin=f"oauth:{client_name}:refresh",
-                expiry_days=365,
-            )
-            if refresh_data:
-                refresh_token_str = refresh_data["token"]
-
         return OAuthToken(
-            access_token=srw_data["token"],
+            access_token=access_token,
             token_type="Bearer",
-            expires_in=expiry_days * 86400 if expiry_days > 0 else None,
+            expires_in=max(1, int((access_expires_at - now).total_seconds())),
             scope=scope,
-            refresh_token=refresh_token_str,
+            refresh_token=refresh_token,
         )
+
+    # ------------------------------------------------------------------
+    # Override: refresh tokens are SRW grants, not FastMCP JWTs
+    # ------------------------------------------------------------------
+
+    async def load_refresh_token(  # type: ignore[override]
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        """Resolve a srwr_* refresh token to its grant (None = invalid_grant).
+
+        The SDK then checks the grant belongs to the presenting client. An
+        orchestrator outage raises instead of answering None: a client told
+        ``invalid_grant`` throws the connection away and asks the user to log
+        in again, which an outage must not cause.
+        """
+        if not refresh_token.startswith(REFRESH_TOKEN_PREFIX):
+            return None
+        status, data = await self._internal_post(
+            "/api/internal/mcp-oauth-refresh/lookup",
+            {"refresh_token_hash": _token_hash(refresh_token)},
+        )
+        if status == 404:
+            return None
+        if status != 200 or not data:
+            raise RuntimeError(f"refresh-token lookup failed ({status})")
+        return RefreshToken(
+            token=refresh_token,
+            client_id=str(data["oauth_client_id"]),
+            scopes=[str(data["scope"])],
+            expires_at=_epoch(data.get("grant_expires_at")),
+        )
+
+    async def exchange_refresh_token(  # type: ignore[override]
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        """Rotate: a new access token and a new refresh token, old ones dead."""
+        access_token = f"srw_{secrets.token_urlsafe(32)}"
+        new_refresh = f"{REFRESH_TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+        status, data = await self._internal_post(
+            "/api/internal/mcp-oauth-refresh/rotate",
+            {
+                "refresh_token_hash": _token_hash(refresh_token.token),
+                "new_refresh_token_hash": _token_hash(new_refresh),
+                "new_access_token_hash": _token_hash(access_token),
+                "new_access_token_prefix": access_token[:12],
+                "access_ttl_seconds": self._access_ttl,
+            },
+        )
+        if status == 404:
+            raise TokenError("invalid_grant", "refresh token is no longer valid")
+        if status != 200 or not data:
+            raise RuntimeError(f"refresh-token rotation failed ({status})")
+        expires_at = _epoch(data.get("access_expires_at"))
+        expires_in = (
+            max(1, expires_at - int(time.time())) if expires_at else self._access_ttl
+        )
+        return OAuthToken(
+            access_token=access_token,
+            token_type="Bearer",
+            expires_in=expires_in,
+            scope=str(data.get("scope") or " ".join(refresh_token.scopes)),
+            refresh_token=new_refresh,
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:  # type: ignore[override]
+        """OAuth /revoke: a refresh token ends its whole connection.
+
+        An access token presented here is left alone: the SDK only calls this
+        when the token's client matches, and srw_* access tokens carry the
+        user id there; the cockpit's token list revokes them.
+        """
+        if isinstance(token, RefreshToken):
+            await self._internal_post(
+                "/api/internal/mcp-oauth-refresh/revoke",
+                {"refresh_token_hash": _token_hash(token.token)},
+            )
 
     # ------------------------------------------------------------------
     # Override: validate srw_* tokens instead of FastMCP JWTs
@@ -557,60 +877,32 @@ class SRWOAuthProxy(OIDCProxy):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _create_srw_token(
-        self,
-        *,
-        user_sub: str,
-        user_email: str,
-        scope: str,
-        origin: str,
-        expiry_days: int,
-    ) -> dict[str, Any] | None:
-        """Create an srw_* token via the orchestrator's internal endpoint."""
-        token = f"srw_{secrets.token_urlsafe(32)}"
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        token_prefix = token[:12]
+    async def _internal_post(
+        self, path: str, payload: dict[str, Any]
+    ) -> tuple[int, dict[str, Any] | None]:
+        """POST to an orchestrator internal endpoint: ``(status, json)``.
 
-        expires_at = None
-        if expiry_days > 0:
-            expires_at = (
-                datetime.now(timezone.utc) + timedelta(days=expiry_days)
-            ).isoformat()
-
+        A transport failure is status 0, so callers can tell "the
+        orchestrator said no" (4xx) from "nobody answered".
+        """
         try:
             async with httpx.AsyncClient(
                 base_url=self._api_url, timeout=10.0
             ) as client:
                 resp = await client.post(
-                    "/api/internal/mcp-token-create",
-                    json={
-                        "user_sub": user_sub,
-                        "user_email": user_email,
-                        "name": f"OAuth: {origin}",
-                        "token_hash": token_hash,
-                        "token_prefix": token_prefix,
-                        "scope": scope,
-                        "origin": origin,
-                        "expires_at": expires_at,
-                    },
-                    headers={"X-Internal-Key": self._internal_key},
+                    path, json=payload, headers={"X-Internal-Key": self._internal_key}
                 )
-                if resp.status_code != 200:
-                    logger.error(
-                        "Failed to create srw_* token: %s %s",
-                        resp.status_code,
-                        resp.text,
-                    )
-                    return None
-                data = resp.json()
-                return {
-                    "token": token,
-                    "id": data.get("id"),
-                    "expires_in": expiry_days * 86400,
-                }
         except httpx.HTTPError as exc:
-            logger.error("Error creating srw_* token: %s", exc)
-            return None
+            logger.error("Orchestrator call %s failed: %s", path, exc)
+            return 0, None
+        if resp.status_code != 200:
+            if resp.status_code >= 500 or resp.status_code in (401, 403):
+                logger.error("Orchestrator call %s answered %s", path, resp.status_code)
+            return resp.status_code, None
+        try:
+            return 200, resp.json()
+        except ValueError:
+            return 0, None
 
     def _cleanup_pending(self) -> None:
         """Remove expired pending authorizations and stale consumed markers."""

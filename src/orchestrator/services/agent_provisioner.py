@@ -52,6 +52,7 @@ from orchestrator.services.pinned_k8s_effect import (
     protect_planned_pinned_pod_authority,
     protect_legacy_pinned_agent_authority as protect_legacy_pinned_objects,
     release_planned_pinned_pod_authority,
+    release_pvc_finalizer_exact,
     retire_terminal_claimant_pod,
     run_bounded_k8s_call,
     run_bounded_k8s_mutation,
@@ -1904,37 +1905,12 @@ class AgentProvisioner:
     ) -> bool:
         """Release only SRW's finalizer from one exact PVC UID."""
 
-        try:
-            claim = await run_bounded_k8s_call(
-                self._core_api.read_namespaced_persistent_volume_claim,
-                name=pvc_name,
-                namespace=namespace,
-            )
-        except Exception as exc:
-            return getattr(exc, "status", None) == 404
-        metadata = getattr(claim, "metadata", None)
-        uid = str(getattr(metadata, "uid", "") or "")
-        resource_version = str(getattr(metadata, "resource_version", "") or "")
-        finalizers = [
-            str(value) for value in getattr(metadata, "finalizers", None) or []
-        ]
-        if uid != str(expected_pvc_uid) or not resource_version:
-            return False
-        patch = finalizer_release_patch(
-            uid=uid, resource_version=resource_version, finalizers=finalizers
+        return await release_pvc_finalizer_exact(
+            self._core_api,
+            pvc_name=pvc_name,
+            expected_pvc_uid=expected_pvc_uid,
+            namespace=namespace,
         )
-        if patch is None:
-            return True
-        try:
-            await run_bounded_k8s_mutation(
-                self._core_api.patch_namespaced_persistent_volume_claim,
-                name=pvc_name,
-                namespace=namespace,
-                body=patch,
-            )
-            return True
-        except Exception as exc:
-            return getattr(exc, "status", None) == 404
 
     async def delete_agent_pod_exact(
         self,
@@ -2608,7 +2584,7 @@ class AgentProvisioner:
                     if self._db is None:
                         continue
                     from orchestrator.services.historical_agent_pod_cleanup import (
-                        retire_aborted_unclaimed_agent_pod,
+                        retire_aborted_agent_pod,
                         retire_soft_ended_agent_pod,
                     )
 
@@ -2619,7 +2595,7 @@ class AgentProvisioner:
                             namespace=self._namespace,
                             agent_provisioner=self,
                         )
-                        if await retire_aborted_unclaimed_agent_pod(
+                        if await retire_aborted_agent_pod(
                             self._db, **identity
                         ) or await retire_soft_ended_agent_pod(self._db, **identity):
                             stats[category] += 1

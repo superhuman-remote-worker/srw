@@ -2295,13 +2295,14 @@ export interface KnowledgeNote {
 }
 
 /**
- * Knowledge note relationship (from Neo4j).
+ * An outgoing link of a knowledge note that is an edge in the knowledge graph,
+ * as `KnowledgeGraphDB.read_note` returns it. Links to notes not written yet
+ * have no edge; they are in the note's content.
  */
 export interface KnowledgeRelationship {
   type: string;
-  direction: string;
-  target_id: string;
-  target_title?: string;
+  target: string;
+  target_title?: string | null;
 }
 
 /**
@@ -2544,6 +2545,9 @@ export interface Job {
   worktree_path?: string | null;
   repo_name?: string | null;
   branch_name?: string | null;
+  /** The repository's Gitea page under the installation's real owner; null
+   *  without a repository. Absent from older responses. */
+  gitea_url?: string | null;
   merge_status?: string | null;
   delivery_status?: string | null;
   delivery_ref?: string | null;
@@ -3106,12 +3110,18 @@ export interface JobProgress {
   sources?: JobLivenessSource[];
   /** Always null from the current producer; kept for shape compatibility. */
   progress_percent: number | null;
-  elapsed_seconds: number;
+  /**
+   * Seconds from creation to now while the system works the job; once it
+   * stops (finished, or waiting on a human) the clock ends at its last audited
+   * step. Null only when the row has no creation time.
+   */
+  elapsed_seconds: number | null;
   /** Always null from the current producer; kept for shape compatibility. */
   eta_seconds?: number | null;
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
+  failed_at?: string | null;
 }
 
 // =============================================================================
