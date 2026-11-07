@@ -86,7 +86,12 @@ def _access_token_ttl_seconds() -> int:
     try:
         value = int(raw) if raw.strip() else DEFAULT_ACCESS_TOKEN_TTL_SECONDS
     except ValueError:
-        logger.warning("Ignoring MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=%r", raw)
+        # The value is not echoed: the variable name reads as a credential to
+        # log scanners, and a misplaced secret pasted here must not reach logs.
+        logger.warning(
+            "Ignoring MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: not an integer; using %d",
+            DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
+        )
         value = DEFAULT_ACCESS_TOKEN_TTL_SECONDS
     return max(60, min(value, 7 * 86400))
 
