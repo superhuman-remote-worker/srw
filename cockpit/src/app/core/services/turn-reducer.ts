@@ -9,6 +9,7 @@ import {
     Turn,
     TurnEvent,
 } from '../models/turn.model';
+import type {MarkedToolResultState} from '../models/tool-result-state.model';
 import {ChatAttachment} from './persistent-chat.service';
 
 /**
@@ -68,6 +69,8 @@ export type ReducerAction =
         toolUseId: string;
         result?: string;
         isError?: boolean;
+        /** The result does not report what the call did (its frame's `result_state`). */
+        resultState?: MarkedToolResultState;
         timestamp: number;
     }
     | {
@@ -437,7 +440,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 status: action.isError ? 'error' : 'completed',
                 result: action.result,
                 resultStatus: action.isError ? 'error' : 'ok',
-                resultState: undefined,
+                resultState: action.resultState,
                 durationMs: Math.max(0, action.timestamp - existing.startedAt),
             });
             // A reload during the call holds it in a history turn that the
@@ -458,6 +461,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                         status: action.isError ? 'error' : 'completed',
                         result: action.result,
                         resultStatus: action.isError ? 'error' : 'ok',
+                        resultState: action.resultState,
                         startedAt: action.timestamp,
                         durationMs: 0,
                     };

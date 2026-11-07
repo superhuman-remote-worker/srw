@@ -1061,8 +1061,11 @@ async def migrate_projects(db):
     migrated = preserved = deferred = 0
     async with db.transaction_scope():
         await ManifestStore(db).lock_catalog()
+        # A project whose delete was decided refuses resource writes until
+        # it is gone (migration 0565); it is not migrated.
         projects = await db.fetch(
-            "SELECT id,manifest_resource_id,default_config_name,default_config_override FROM projects ORDER BY id FOR UPDATE"
+            "SELECT id,manifest_resource_id,default_config_name,default_config_override FROM projects "
+            "WHERE deletion_requested_at IS NULL ORDER BY id FOR UPDATE"
         )
         for row in projects:
             existing = await ManifestStore(db).by_link("Project", row["id"])

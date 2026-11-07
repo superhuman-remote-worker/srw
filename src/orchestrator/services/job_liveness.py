@@ -28,6 +28,10 @@ States: ``active | waiting | paused | suspected_stuck | unavailable``
 plus ``terminal`` for completed/failed/cancelled jobs — a deliberate
 extension of the §5 set, because reporting a completed job as "waiting"
 would itself be a manufactured fact.
+
+``compute_job_elapsed_seconds`` answers the companion question, "how long
+has this job run?", from the same audit last-write: a job that stopped
+working stops its clock when its work did, not when the row was last touched.
 """
 
 from __future__ import annotations
@@ -137,6 +141,16 @@ HEARTBEAT_FRESH_SECONDS = get_liveness_policy().heartbeat_fresh_seconds
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
+# Statuses in which the system is still working the job — queued, running,
+# under critic review, or waiting on its own subjobs — so its clock runs
+# against now. Every other status means the work stopped: it finished, or it
+# is waiting on a human (pending_review, paused, waiting_for_reply).
+RUNNING_JOB_STATUSES = frozenset({"created", "processing", "reviewing", "waiting"})
+
+# The row stamp that marks when a stopped job's work ended, used only when the
+# audit store has no last write. Other stopped statuses fall back to updated_at.
+_STOP_STAMP_BY_STATUS = {"completed": "completed_at", "failed": "failed_at"}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -212,6 +226,60 @@ async def _audit_last_write(
     if not time_range:
         return None, True
     return _aware(time_range.get("end")), True
+
+
+def job_elapsed_seconds(
+    job: dict[str, Any],
+    *,
+    last_activity: Optional[datetime],
+    now: datetime,
+) -> Optional[float]:
+    """Seconds from ``created_at`` to now (running) or to the end of the work.
+
+    A stopped job ends at its last audited step. No stamp on the jobs row
+    says when the work ended: ``completed_at`` is written when the job turns
+    ``completed``, which for a reviewed job is the approval, hours or days
+    after the agent finished; ``updated_at`` moves on any write, including the
+    offline-agent GC's FK cascade. Those stamps are only the fallback for a
+    job the audit store has nothing on (store down, or no step ever ran).
+
+    Queue time before dispatch is included, as it always was. A job resumed
+    after it stopped counts the gap before the resume: there is no status
+    history to subtract it from.
+    """
+    started = _aware(job.get("created_at"))
+    if started is None:
+        return None
+    status = str(job.get("status") or "")
+    if status in RUNNING_JOB_STATUSES:
+        ended = now
+    else:
+        stamp = _STOP_STAMP_BY_STATUS.get(status)
+        ended = (
+            last_activity
+            or (_aware(job.get(stamp)) if stamp else None)
+            or _aware(job.get("updated_at"))
+            or now
+        )
+    return max(0.0, (min(ended, now) - started).total_seconds())
+
+
+async def compute_job_elapsed_seconds(
+    job_id: str,
+    job: dict[str, Any],
+    *,
+    audit_reader: Any = None,
+    now: datetime | None = None,
+) -> Optional[float]:
+    """:func:`job_elapsed_seconds`, reading the audit last write a stopped job needs.
+
+    A running job never touches the audit store: its clock reads ``now``.
+    """
+    now = now or _now()
+    last_activity: Optional[datetime] = None
+    if str(job.get("status") or "") not in RUNNING_JOB_STATUSES:
+        last_activity, _ = await _audit_last_write(audit_reader, job_id)
+    return job_elapsed_seconds(job, last_activity=last_activity, now=now)
 
 
 async def _agent_heartbeat(

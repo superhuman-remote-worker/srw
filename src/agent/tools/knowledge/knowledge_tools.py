@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Sequence, Union
 
 import httpx
+import yaml
 from langchain_core.tools import tool
 
 from shared.backlog_tags import (
@@ -927,9 +928,19 @@ def _derive_description(content: str) -> str:
 
 
 def _yaml_quote(value: str) -> str:
-    """Quote a free-text YAML scalar, escaping quotes and collapsing newlines."""
-    flat = " ".join(str(value).splitlines()).replace('"', '\\"')
-    return f'"{flat}"'
+    """Quote a free-text YAML scalar on one line, collapsing newlines.
+
+    The YAML library does the escaping. The hand-rolled version escaped ``"``
+    but not ``\\``, which is the escape character inside a double-quoted
+    scalar: a Windows path or a regex in a description or tag made the whole
+    frontmatter unparseable (the orchestrator refused the write as
+    ``malformed-frontmatter``), and ``\\n`` or ``\\t`` quietly became a
+    newline or a tab.
+    """
+    flat = " ".join(str(value).splitlines())
+    return yaml.safe_dump(
+        flat, default_style='"', width=float("inf"), allow_unicode=True
+    ).rstrip("\n")
 
 
 def _render_note_md(note: Dict[str, Any]) -> str:
@@ -1016,6 +1027,128 @@ def _render_note_md(note: Dict[str, Any]) -> str:
     return "\n".join(fm) + "\n".join(body) + "\n"
 
 
+# What `_render_note_md` adds around the authored body, recognised on the way
+# back. The reindexer stores the whole file body as the row's ``content`` — the
+# ``# Title`` line and the ``## Relationships`` block included — so a note read
+# back from the row is not the content its author wrote.
+_RELATIONSHIPS_HEADING = "## Relationships"
+_REL_LINE_RE = re.compile(r"\*\*([^*\n]+):\*\* (.+)")
+_REL_LINKS_RE = re.compile(
+    r"\[[^\]\n]*\]\([^)\n]+?\.md\)(?:, \[[^\]\n]*\]\([^)\n]+?\.md\))*"
+)
+_REL_TARGET_RE = re.compile(r"\[[^\]\n]*\]\(([^)\n]+?)\.md\)")
+_TITLE_LINE_RE = re.compile(r"#\s+(.+)")
+
+
+def _relationship_line(line: str) -> Optional[List[Dict[str, str]]]:
+    """The links on one ``**TYPE:** [t](t.md), ...`` line, or None if it is not one."""
+    match = _REL_LINE_RE.fullmatch(line.strip())
+    if not match or not _REL_LINKS_RE.fullmatch(match.group(2)):
+        return None
+    rel_type = match.group(1).strip()
+    return [
+        {"type": rel_type, "target": target}
+        for target in _REL_TARGET_RE.findall(match.group(2))
+    ]
+
+
+def _split_relationships(content: str) -> tuple[str, List[Dict[str, str]]]:
+    """Separate the generated ``## Relationships`` block(s) from a note body.
+
+    Re-rendering a body that still carried its block appended a second one,
+    with ``append`` text landing between the two. Only a block in exactly the
+    generated shape is taken: the heading, then one or more link lines, ending
+    at a blank line, another heading or the end of the note. A section an
+    author wrote under that heading in their own words stays where it is.
+
+    Returns the body without the block(s), and their links in order. A body
+    without one comes back unchanged.
+    """
+    lines = (content or "").split("\n")
+    kept: List[str] = []
+    links: List[Dict[str, str]] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == _RELATIONSHIPS_HEADING:
+            j = i + 1
+            found: List[Dict[str, str]] = []
+            while j < len(lines):
+                parsed = _relationship_line(lines[j])
+                if parsed is None:
+                    break
+                found.extend(parsed)
+                j += 1
+            ends_cleanly = (
+                j == len(lines)
+                or not lines[j].strip()
+                or lines[j].lstrip().startswith("#")
+            )
+            if found and ends_cleanly:
+                links.extend(found)
+                # Close the gap the block leaves to a single blank line.
+                while kept and not kept[-1].strip():
+                    kept.pop()
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if kept and j < len(lines):
+                    kept.append("")
+                i = j
+                continue
+        kept.append(lines[i])
+        i += 1
+    if not links:
+        return content or "", []
+    return "\n".join(kept), links
+
+
+def _merge_relationships(
+    *groups: Optional[Sequence[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Concatenate relationship lists, dropping repeats of the same (type, target)."""
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for group in groups:
+        for rel in group or []:
+            if not isinstance(rel, dict) or not rel.get("target"):
+                continue
+            key = (str(rel.get("type") or "REFERENCES"), str(rel["target"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(rel)
+    return merged
+
+
+def _carried_description(stored: Optional[str], stored_content: str) -> Optional[str]:
+    """The description a rewrite keeps, or None to derive it from the new body.
+
+    The row holds whatever the file said, and the renderer fills a missing
+    description with the body's first sentence, so ``stored`` is either the
+    author's own or that derivation. Keep the author's. A derived one follows
+    the body, or replacing the content would freeze the old first sentence as
+    the description.
+    """
+    if not stored or stored == _derive_description(stored_content):
+        return None
+    return stored
+
+
+def _authored_body(content: Optional[str], titles: Sequence[Optional[str]]) -> str:
+    """A note body without what ``_render_note_md`` adds, for comparing two bodies.
+
+    Drops the generated relationships block, a leading ``# Title`` line that
+    matches one of ``titles``, and surrounding whitespace. Two bodies equal
+    under this render to the same file.
+    """
+    body, _ = _split_relationships(content or "")
+    body = body.strip()
+    first, _, rest = body.partition("\n")
+    match = _TITLE_LINE_RE.fullmatch(first.strip())
+    if match and match.group(1).strip() in {str(t).strip() for t in titles if t}:
+        body = rest.strip()
+    return body
+
+
 def _note_provenance(context: ToolContext) -> Dict[str, Optional[str]]:
     """Resolve in-note provenance (author role, job, git branch) from context."""
     author: Optional[str] = None
@@ -1075,6 +1208,7 @@ def _post_vault_file(
     job_id: Optional[str],
     retrieval_messages: Optional[List[str]] = None,
     expected_blob_sha: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """POST one rendered note to the orchestrator's materialisation endpoint.
 
@@ -1110,6 +1244,12 @@ def _post_vault_file(
         # Compare-and-swap (kb_gardening G3): the endpoint refuses the write
         # if the repo no longer holds this blob at the path.
         payload["expected_blob_sha"] = str(expected_blob_sha)
+    if mode:
+        # "create" makes the endpoint refuse an existing note instead of
+        # overwriting it; "update" refuses a missing one instead of
+        # re-creating it. Either way an existing note is written where it
+        # lives, which may be a subfolder of the vault.
+        payload["mode"] = mode
 
     try:
         with httpx.Client(
@@ -1139,8 +1279,13 @@ def _materialize_note(
     expected_blob_sha: Optional[str] = None,
     *,
     project_id: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Commit a note as ``knowledge/<slug>.md`` in the project's KB repo.
+    """Commit a note to the project's KB repo, where the note lives.
+
+    A new note becomes ``knowledge/<slug>.md``; an existing one is rewritten
+    in place, which may be a subfolder. ``mode`` is ``"create"`` or
+    ``"update"`` (see ``_post_vault_file``).
 
     Renders ``note`` with the same serializer the file has always used, stamps
     in-note provenance (author/job/branch — squash-merge erases git
@@ -1203,6 +1348,7 @@ def _materialize_note(
         job_id,
         retrieval_messages=retrieval_messages,
         expected_blob_sha=expected_blob_sha,
+        mode=mode,
     )
 
     if str(result.get("status")) == "failed":
@@ -1264,6 +1410,20 @@ def _canonical_materialization_error(
     retry = result.get("retry_state") or "unknown"
     # Older endpoint shapes omit the field; they always recorded their intent.
     recorded = result.get("recorded", True)
+    if reason == "already-exists":
+        # A create raced another writer, or the note was hand-written into the
+        # vault without reaching this runtime's index yet. Nothing was written.
+        return (
+            f"Error: a note with id '{slug}' already exists in the knowledge "
+            "base, so it was NOT overwritten. kb_read it, then kb_update it — "
+            "or write yours under a different title."
+        )
+    if reason == "ambiguous-note-path":
+        return (
+            f"Error: several files in the vault are named '{slug}.md', so it is "
+            "unclear which note to change — nothing was written. A human has "
+            "to rename one of them or give it an explicit `id:`."
+        )
     if reason == "precondition-failed":
         # The compare-and-swap token did not match: another writer changed or
         # removed the note between this caller's read and its write. Nothing
@@ -1441,9 +1601,9 @@ def _store_note_markdown(row: Dict[str, Any], root: str) -> Dict[str, str]:
     ``{"path", "text"}`` — the shape ``lint_kb``/``external_url_map`` consume.
     The path is the row's real file path when the reindexer has stamped one,
     otherwise the flat vault path the note will land at, so a finding is always
-    anchored somewhere the agent can act on. ``description`` is intentionally
-    left out: the index has no such column, so ``_render_note_md`` derives it
-    from the body exactly as it does on the write path.
+    anchored somewhere the agent can act on. A row without a stored
+    ``description`` (the file had none, or it was indexed before the column
+    existed) gets one derived from the body, as on the write path.
     """
     return {
         "path": row.get("path") or f"{root}/{row.get('id')}.md",
@@ -1452,6 +1612,7 @@ def _store_note_markdown(row: Dict[str, Any], root: str) -> Dict[str, str]:
                 "id": row.get("id"),
                 "type": row.get("type") or "unknown",
                 "title": row.get("title"),
+                "description": row.get("description"),
                 "content": row.get("content") or "",
                 "tags": row.get("tags") or [],
                 "keywords": row.get("keywords") or [],
@@ -1770,9 +1931,10 @@ def create_kb_tools(
         Python (the graph does this in Cypher), write the OKF file back.
 
         Same return contract and status/confidence validation as the Neo4j path.
-        ``add_links`` round-trip as generic body links via the reindexer — the
-        graph-only relationship *type* is not preserved (no Neo4j to hold it),
-        consistent with the honest graph-tier degrade elsewhere in PR4c.
+        With no graph to hold them, a note's links live only in the file's
+        generated ``## Relationships`` block. They are read back from that
+        block (types included), kept across a content replacement as the graph
+        path keeps its edges, and rendered once with ``add_links`` merged in.
 
         ``project_id`` names the knowledge base to read and rewrite in; omitted,
         it is the session's default writable native scope. It must be threaded
@@ -1813,12 +1975,19 @@ def create_kb_tools(
                     return authorization.tool_message()
                 machine_tags_authorized = True
 
+            # The row's content is the whole file body, links block included.
+            # Lift the block out so it is rendered once, at the end, with the
+            # new links merged in — re-rendering it as body text appended a
+            # second block and put `append` text between the two.
+            stored_content = existing.get("content") or ""
+            stored_body, stored_links = _split_relationships(stored_content)
             if content is not None:
-                new_content = content
+                composed = content
             elif append is not None:
-                new_content = (existing.get("content") or "") + "\n\n" + append
+                composed = stored_body.rstrip("\n") + "\n\n" + append
             else:
-                new_content = existing.get("content") or ""
+                composed = stored_body
+            new_content, inline_links = _split_relationships(composed)
 
             new_status = status or existing.get("status") or "active"
             new_confidence = (
@@ -1853,13 +2022,17 @@ def create_kb_tools(
                 "id": note,
                 "type": new_type,
                 "title": new_title,
-                "description": existing.get("description"),
+                "description": _carried_description(
+                    existing.get("description"), stored_content
+                ),
                 "content": new_content,
                 "tags": merged_tags,
                 "keywords": existing.get("keywords", []),
                 "confidence": new_confidence,
                 "status": new_status,
-                "relationships": add_links or [],
+                "relationships": _merge_relationships(
+                    stored_links, inline_links, add_links
+                ),
             }
             if new_type in _TICKET_TYPES:
                 updated_note["priority"] = new_priority
@@ -1884,6 +2057,7 @@ def create_kb_tools(
                 # winning — or silently re-creating a deleted file.
                 expected_blob_sha=existing.get("blob_sha"),
                 project_id=project_id,
+                mode="update",
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(
@@ -1975,7 +2149,23 @@ def create_kb_tools(
                     "refusing the write. No changes were made."
                 )
             if not isinstance(existing, dict):
-                return f"Error: Note '{note}' not found in project."
+                # The reindexer never writes Neo4j, so a note that reached the
+                # vault by git (every hand-written note) has no graph copy.
+                # The index row is the note then; update it the way the
+                # graph-less tier does instead of calling it missing (G15).
+                return _update_existing_kgless(
+                    note,
+                    content,
+                    append,
+                    status,
+                    confidence,
+                    add_tags,
+                    add_links,
+                    priority=priority,
+                    remove_tags=remove_tags,
+                    set_tags=set_tags,
+                    project_id=project_id,
+                )
             refusal = _marker_refusal(existing, content, append, note)
             if refusal:
                 return refusal
@@ -2004,12 +2194,19 @@ def create_kb_tools(
                 officer_authority=machine_tags_authorized,
             )
             _prior_normalized = normalize_tags(prior_tags)
+            # The graph holds the authored body and its edges. Split any
+            # generated links block out anyway (a body pasted back from
+            # kb_read carries one), so the file gets exactly one, at the end.
+            stored_body, stored_links = _split_relationships(
+                existing.get("content") or ""
+            )
             if content is not None:
-                new_content = content
+                composed = content
             elif append is not None:
-                new_content = (existing.get("content") or "") + "\n\n" + append
+                composed = stored_body.rstrip("\n") + "\n\n" + append
             else:
-                new_content = existing.get("content") or ""
+                composed = stored_body
+            new_content, inline_links = _split_relationships(composed)
             new_type = existing.get("type") or "learning"
             new_status = status or existing.get("status") or "active"
             new_confidence = (
@@ -2037,13 +2234,27 @@ def create_kb_tools(
                     else (prior_row or {}).get("priority", DEFAULT_PRIORITY_RANK)
                 )
 
-            relationships = list(existing.get("relationships") or [])
-            relationships.extend(add_links or [])
+            prior_fields = prior_row if isinstance(prior_row, dict) else {}
+            # The graph only holds edges whose target note exists (create_note
+            # MATCHes it), so a link written ahead of its target lives in the
+            # file alone. Merge the row's links block too, or this rewrite
+            # drops it.
+            _, file_links = _split_relationships(prior_fields.get("content") or "")
+            relationships = _merge_relationships(
+                existing.get("relationships"),
+                file_links,
+                stored_links,
+                inline_links,
+                add_links,
+            )
             desired = {
                 "id": note,
                 "type": new_type,
                 "title": existing.get("title") or note,
-                "description": existing.get("description"),
+                # The graph has no description; the row holds the file's.
+                "description": _carried_description(
+                    prior_fields.get("description"), prior_fields.get("content") or ""
+                ),
                 "content": new_content,
                 "tags": tag_change.tags,
                 "keywords": existing.get("keywords") or [],
@@ -2071,6 +2282,7 @@ def create_kb_tools(
                 existing.get("retrieval_messages"),
                 expected_blob_sha=(prior_row or {}).get("blob_sha"),
                 project_id=project_id,
+                mode="update",
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(
@@ -2088,6 +2300,21 @@ def create_kb_tools(
             # best-effort degradation contract without letting it falsify the
             # durable Git/pgvector convergence ledger.
             graph_error: Optional[Exception] = None
+            # Every link the file now holds that is not an edge yet: the new
+            # ones, and any the graph never made (its target did not exist
+            # then, or the note predates pending links). The graph makes the
+            # edge where the target exists and keeps the rest pending.
+            graph_edges = {
+                (str(rel.get("type") or "REFERENCES"), str(rel.get("target")))
+                for rel in existing.get("relationships") or []
+                if isinstance(rel, dict)
+            }
+            links_to_project = [
+                rel
+                for rel in relationships
+                if (str(rel.get("type") or "REFERENCES"), str(rel["target"]))
+                not in graph_edges
+            ]
             try:
                 updated = kg.update_note(
                     project_id=project_id,
@@ -2099,7 +2326,7 @@ def create_kb_tools(
                     add_tags=[
                         tag for tag in tag_change.tags if tag not in _prior_normalized
                     ],
-                    add_links=add_links,
+                    add_links=links_to_project,
                     remove_tags=[
                         tag for tag in _prior_normalized if tag not in tag_change.tags
                     ],
@@ -2247,23 +2474,51 @@ def create_kb_tools(
                 )
 
         # Exact-duplicate short-circuit (Step 1 hardening, docs §11.1): a
-        # same-slug write with byte-identical content is a pure no-op for every
+        # same-slug write with identical content is a pure no-op for every
         # writer — skip the gate and the create. This kills the run-8 twin-file
         # duplication for bare loop agents the verdict gate never reaches.
         # `read_note` returns the note dict (or None); a non-dict means no match.
+        #
+        # "Identical" is compared on the authored body. Without Neo4j the
+        # existing note comes from the row, whose content is the whole file
+        # body — the `# Title` line and links block the renderer added
+        # included — so a raw compare never matched there, and every rewrite
+        # of the same note forked a hash-suffixed twin.
         candidate_slug = slugify(title)
-        if kg is None:
-            existing = _run_async(
-                ks.get_note_by_slug(uuid.UUID(project_id), candidate_slug)
-            )
-        else:
+        existing = None
+        if kg is not None:
             existing = kg.read_note(project_id, candidate_slug)
+        if not isinstance(existing, dict):
+            # Graph-less tier, or a note Neo4j never saw: every hand-written
+            # note reaches the vault by git, and the reindexer never writes
+            # the graph. Treating a graph miss as "no such note" made this
+            # create overwrite the human's file (G15).
+            try:
+                existing = _run_async(
+                    ks.get_note_by_slug(uuid.UUID(project_id), candidate_slug)
+                )
+            except Exception as exc:
+                if kg is None:
+                    raise
+                # The graph answered; the create below still cannot overwrite
+                # (the endpoint refuses mode="create" on an existing note).
+                logger.warning(
+                    "kb_write: index lookup of %r failed (%s) — relying on the "
+                    "endpoint's create check",
+                    candidate_slug,
+                    exc,
+                )
+                existing = None
         prior_content = existing.get("content") if isinstance(existing, dict) else ""
         if adds_redaction_marker(prior_content, content):
             return redaction_marker_refusal(f"note '{candidate_slug}'", "kb_write")
-        if isinstance(existing, dict) and _content_hash(content) == _content_hash(
-            existing.get("content", "")
-        ):
+        same_body_titles = (
+            title,
+            existing.get("title") if isinstance(existing, dict) else None,
+        )
+        if isinstance(existing, dict) and _authored_body(
+            content, same_body_titles
+        ) == _authored_body(existing.get("content"), same_body_titles):
             # "Nothing to write" is not "nothing to do". A note whose first
             # write deferred its index (oversized, KB lock held, embedding
             # provider down) sits here canonical-but-unsearchable, and
@@ -2410,7 +2665,12 @@ def create_kb_tools(
                 new_note["priority"] = rank
             _apply_ready_frontmatter(new_note, _new_tags.ready)
             materialization = _materialize_note(
-                context, slug, new_note, retrieval_messages, project_id=project_id
+                context,
+                slug,
+                new_note,
+                retrieval_messages,
+                project_id=project_id,
+                mode="create",
             )
             if not _canonical_materialization_succeeded(materialization):
                 return _canonical_materialization_error(
@@ -2796,7 +3056,9 @@ def create_kb_tools(
 
             # Relationships
             rels = data.get("relationships", [])
-            if rels:
+            # Graph tier: links whose target is not in the graph yet.
+            pending = data.get("pending_relationships") or []
+            if rels or pending:
                 lines.extend(["", "## Outgoing Relationships"])
                 for r in rels:
                     target = _qualified(binding, r["target"])
@@ -2804,6 +3066,9 @@ def create_kb_tools(
                         f"- **{r['type']}** → [[{target}]] "
                         f"({r.get('target_title', '')})"
                     )
+                for r in pending:
+                    target = _qualified(binding, r["target"])
+                    lines.append(f"- **{r['type']}** → [[{target}]]")
 
             incoming = data.get("incoming_relationships", [])
             if incoming:
@@ -3763,10 +4028,11 @@ def create_kb_tools(
                     {
                         "id": note_id,
                         "type": row.get("type") or "misc",
-                        # The index has no description column, so derive it the
-                        # same way the write path does when frontmatter omits
-                        # one — the bullets stay populated either way.
-                        "description": _derive_description(content),
+                        # The file's own description when the row has one;
+                        # otherwise derive it the way the write path does when
+                        # frontmatter omits one, so the bullets stay populated.
+                        "description": row.get("description")
+                        or _derive_description(content),
                         "title": row.get("title") or note_title(content) or note_id,
                     }
                 )

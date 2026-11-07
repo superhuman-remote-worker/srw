@@ -157,6 +157,7 @@ CREATE TABLE public.knowledge_index (
     embedding_version text,
     priority smallint DEFAULT 1 NOT NULL,
     ready_at timestamp with time zone,
+    description text,
     CONSTRAINT knowledge_index_priority_valid CHECK (((priority >= 0) AND (priority <= 2))),
     CONSTRAINT valid_note_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'resolved'::character varying, 'superseded'::character varying, 'archived'::character varying])::text[]))),
     CONSTRAINT valid_note_type CHECK (((note_type)::text = ANY ((ARRAY['goal'::character varying, 'plan'::character varying, 'decision'::character varying, 'learning'::character varying, 'code'::character varying, 'source'::character varying, 'question'::character varying, 'state'::character varying, 'retrospective'::character varying, 'datasource'::character varying, 'feature'::character varying, 'issue'::character varying, 'idea'::character varying, 'charter'::character varying, 'report'::character varying])::text[])))

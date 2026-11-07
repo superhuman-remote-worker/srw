@@ -16,6 +16,7 @@ from orchestrator.schemas.job_list import JOB_LIST_RESPONSES
 from orchestrator.security.access import require_job_access, require_project_member
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import job_queries, job_reads
+from orchestrator.services.gitea import repo_web_url
 from orchestrator.services.vm_idle_public import read_vm_idle_states
 
 router = APIRouter()
@@ -153,6 +154,9 @@ async def list_jobs(
             if job.get("status") in {"completed", "failed", "cancelled"}
             else creations.get(UUID(str(job["id"])))
         )
+        # Built here, where the repository owner is known; Cockpit cannot
+        # compose it (the chart does not know GITEA_ADMIN_USER).
+        job["gitea_url"] = repo_web_url(job.get("repo_name"))
     return result
 
 
@@ -185,6 +189,7 @@ async def get_job(
         if job.get("status") in {"completed", "failed", "cancelled"}
         else creations.get(UUID(job_id))
     )
+    result["gitea_url"] = repo_web_url(result.get("repo_name"))
     return result
 
 

@@ -132,6 +132,7 @@ from shared.permission_modes import (
     normalize_permission_mode,
 )
 from shared.tool_catalog import tool_effect
+from shared.tool_result_state import TOOL_RESULT_STATES
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
@@ -1654,9 +1655,19 @@ async def lifespan(app: FastAPI):
 
     # Detach any active session. Stateless lane: never mark the thread ended —
     # thread lifecycle belongs to the orchestrator, and the next claim (on any
-    # pod) picks the thread back up from thread_messages.
+    # pod) picks the thread back up from thread_messages. A background officer
+    # does not retire either: his recycler replaces this pod and needs the
+    # thread exactly as a crash leaves it (see officer_exits_without_retirement).
+    officer_leaves_thread = bool(
+        _session and _session_termination.officer_exits_without_retirement()
+    )
     if _session and attach_settled:
-        await _session_termination.terminate("shutdown", mark_thread=not stateless)
+        if officer_leaves_thread:
+            await _session_termination.terminate(
+                "shutdown", mark_thread=False, preserve_shell=True
+            )
+        else:
+            await _session_termination.terminate("shutdown", mark_thread=not stateless)
 
     await _session_termination.drain_loop_completion_tasks()
 
@@ -1670,7 +1681,8 @@ async def lifespan(app: FastAPI):
                         await _heartbeat_task
                     except asyncio.CancelledError:
                         pass
-                await _orchestrator_client.deregister()
+                if not officer_leaves_thread:
+                    await _orchestrator_client.deregister()
             await _orchestrator_client.close()
         except Exception as e:
             logger.warning(f"Orchestrator cleanup error: {e}")
@@ -6081,6 +6093,7 @@ async def _loop_on_tool_result(
     result: str,
     tool_call_id: str,
     is_error: bool = False,
+    result_state: Optional[str] = None,
 ) -> None:
     global _tool_inflight
     # Only this call ended: siblings of a parallel batch are still running.
@@ -6091,15 +6104,17 @@ async def _loop_on_tool_result(
     _tool_inflight = bool(_tool_inflight_calls)
     # Truncate large results for transport (full result is in message history)
     display_result = result[:2000] + "..." if len(result) > 2000 else result
-    _broadcast(
-        "tool.completed",
-        {
-            "tool": tool_name,
-            "result": display_result,
-            "id": tool_call_id,
-            "is_error": is_error,
-        },
-    )
+    frame: Dict[str, Any] = {
+        "tool": tool_name,
+        "result": display_result,
+        "id": tool_call_id,
+        "is_error": is_error,
+    }
+    # A result that does not report what the call did (its outcome is unknown,
+    # or it never ran) says so, as its history row's marker does.
+    if result_state in TOOL_RESULT_STATES:
+        frame["result_state"] = result_state
+    _broadcast("tool.completed", frame)
 
     # Notify frontend of file checkpoint availability after writes
     if tool_name in ("write_file", "edit_file") and _session is not None:

@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from fastapi import HTTPException
 
@@ -27,6 +27,7 @@ from orchestrator.schemas.knowledge import (
     KnowledgeSearchRequest,
 )
 from orchestrator.services.knowledge_projection import KnowledgeGraphHandle
+from shared.backlog_tags import OFFICER_ONLY_TAGS, normalize_tag
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle-free typing only
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
@@ -322,6 +323,7 @@ async def materialize_knowledge_note(
         embedding_service=svc,
         retrieval_messages=body.retrieval_messages,
         expected_blob_sha=body.expected_blob_sha,
+        mode=body.mode,
     )
 
 
@@ -403,8 +405,16 @@ async def update_knowledge_note(
     body: KnowledgeNoteUpdate,
     *,
     dependencies: KnowledgeOperationDependencies,
+    owner_authority: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
-    """Update a knowledge note's status or tags. F5: member-only."""
+    """Update a knowledge note's status or tags (the router requires editor).
+
+    ``owner_authority`` answers whether the caller holds the project's owner
+    authority (owner or admin). It is asked only when the request adds or
+    removes an officer-only tag or targets a charter note; without it, both
+    are refused (403). ``ready`` arms backlog dispatch and the charter steers
+    the project's officer, so neither is an editor's call (D9).
+    """
     valid_statuses = {"active", "resolved", "superseded", "archived"}
     if body.status and body.status not in valid_statuses:
         raise HTTPException(
@@ -415,14 +425,32 @@ async def update_knowledge_note(
     if not (body.status or body.add_tags or body.remove_tags):
         return {"status": "no_changes"}
 
+    async def _has_owner_authority() -> bool:
+        return owner_authority is not None and bool(await owner_authority())
+
+    requested_tags = {
+        normalize_tag(str(tag))
+        for tag in [*(body.add_tags or []), *(body.remove_tags or [])]
+    }
+    officer_tags = sorted(requested_tags & OFFICER_ONLY_TAGS)
+    if officer_tags and not await _has_owner_authority():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Only the project owner can add or remove the {', '.join(officer_tags)} "
+                "tag: it controls backlog dispatch"
+            ),
+        )
+
     materialization: dict[str, Any] | None = None
     try:
         # The index proves the public note exists, but is never mutated before
         # the canonical git boundary succeeds.
         async with dependencies.vector_db.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT note_id FROM knowledge_index "
-                "WHERE project_id = $1 AND note_id = $2",
+                "SELECT note_id, note_type, path FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2 "
+                "ORDER BY path IS NULL LIMIT 1",
                 project_id,
                 note_id,
             )
@@ -431,6 +459,11 @@ async def update_knowledge_note(
                     status_code=404,
                     detail=f"Note '{note_id}' not found in project '{project_id}'",
                 )
+        if row.get("note_type") == "charter" and not await _has_owner_authority():
+            raise HTTPException(
+                status_code=403,
+                detail="Only the project owner can change the charter note",
+            )
 
         from orchestrator.services.kb_materialize import (
             materialize_knowledge_metadata_update,
@@ -444,6 +477,9 @@ async def update_knowledge_note(
             status=body.status,
             add_tags=body.add_tags,
             remove_tags=body.remove_tags,
+            # Where the row says the file is: a nested note, or one whose id
+            # is not its filename, is changed in place (G14).
+            path_hint=row.get("path"),
         )
         if materialization.get("canonical_state") != "canonical":
             raise HTTPException(
@@ -556,9 +592,15 @@ async def update_knowledge_note(
                     update_kwargs["add_tags"] = body.add_tags
                 if body.remove_tags:
                     update_kwargs["remove_tags"] = body.remove_tags
-                if update_kwargs:
-                    if not kg.update_note(project_id, note_id, **update_kwargs):
-                        raise RuntimeError("graph note disappeared during projection")
+                # Only agent-written notes have a graph copy (the reindexer
+                # never writes Neo4j), so a miss is the normal case for a
+                # hand-written note, not a failure.
+                if update_kwargs and not kg.update_note(
+                    project_id, note_id, **update_kwargs
+                ):
+                    dependencies.logger.debug(
+                        "Neo4j has no copy of %s; nothing to update", note_id
+                    )
             except Exception as e:
                 dependencies.logger.warning(
                     "Neo4j update failed for %s: %s", note_id, e
@@ -596,6 +638,31 @@ async def update_knowledge_note(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _indexed_note_path(
+    dependencies: KnowledgeOperationDependencies, project_id: str, note_id: str
+) -> str | None:
+    """The file the index says holds the note, or None (best-effort).
+
+    Lets the purge find a nested note, or one whose id is not its filename;
+    without it the delete falls back to locating the file by name.
+    """
+    try:
+        async with dependencies.vector_db.acquire() as conn:
+            path = await conn.fetchval(
+                "SELECT path FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2 AND path IS NOT NULL "
+                "LIMIT 1",
+                project_id,
+                note_id,
+            )
+    except Exception:  # noqa: BLE001 — the resolver still finds it by name
+        dependencies.logger.debug(
+            "indexed path lookup failed for %s/%s", project_id, note_id, exc_info=True
+        )
+        return None
+    return str(path) if path else None
+
+
 async def delete_knowledge_note(
     project_id: str, note_id: str, *, dependencies: KnowledgeOperationDependencies
 ) -> dict[str, Any]:
@@ -610,6 +677,7 @@ async def delete_knowledge_note(
     from shared.runtime.services.knowledge_store import KnowledgeStore
 
     store = KnowledgeStore(db=dependencies.vector_db, embedding_service=None)
+    path_hint = await _indexed_note_path(dependencies, project_id, note_id)
     try:
         result = await materialize_knowledge_note_delete(
             postgres_db=dependencies.store,
@@ -618,6 +686,7 @@ async def delete_knowledge_note(
             slug=note_id,
             reason="deleted from the cockpit",
             store=store,
+            path_hint=path_hint,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

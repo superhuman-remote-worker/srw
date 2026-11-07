@@ -2033,6 +2033,8 @@ def create_execute_node(
                             "model": phase_model,
                         },
                         "iteration": iteration + 1,
+                        # Without it check_todos routes straight back to execute.
+                        "should_stop": True,
                     }
 
                 # --- No-tool-call circuit breaker ---
@@ -2113,6 +2115,8 @@ def create_execute_node(
                             "content_sample": sample,
                         },
                         "iteration": iteration + 1,
+                        # Without it check_todos routes straight back to execute.
+                        "should_stop": True,
                     }
 
                 # --- Response degeneration validation ---

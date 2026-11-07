@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest';
 import {ToolCallEvent} from './turn.model';
-import {parseToolResultState, toolResultStateOutcome} from './tool-result-state.model';
+import {parseMarkedToolResultState, parseToolResultState, toolResultStateOutcome} from './tool-result-state.model';
 import {toolCardViewFromEvent} from '../tools/tool-card-adapters';
 
 // A call whose history holds no result it produced must not read "completed"
@@ -31,6 +31,15 @@ describe('parseToolResultState', () => {
         expect(parseToolResultState({tool_result_state: {state: 'finished', tool_call_id: 'c1'}}, 'c1')).toBeNull();
         expect(parseToolResultState({input_tokens: 4}, 'c1')).toBeNull();
         expect(parseToolResultState(null, 'c1')).toBeNull();
+    });
+});
+
+describe('parseMarkedToolResultState', () => {
+    it("reads a tool.completed frame's result_state", () => {
+        expect(parseMarkedToolResultState('unknown')).toBe('unknown');
+        expect(parseMarkedToolResultState('not_run')).toBe('not_run');
+        expect(parseMarkedToolResultState('missing')).toBeNull();
+        expect(parseMarkedToolResultState(undefined)).toBeNull();
     });
 });
 

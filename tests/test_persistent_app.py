@@ -309,6 +309,48 @@ class TestParallelToolCallsInFlight:
         assert [c["id"] for c in pa._welcome_running_tools(session)] == ["d1"]
 
 
+class TestToolCompletedResultState:
+    """A result that does not report what the call did carries its state on
+    the ``tool.completed`` frame, so the live card and a reload's replay of
+    the turn label the call as the history does
+    (session_unknown_tool_result_needs_admin.md)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        import agent.api.persistent_app as pa
+
+        monkeypatch.setattr(pa, "_tool_inflight", False)
+        monkeypatch.setattr(pa, "_tool_inflight_calls", set())
+        broadcast = MagicMock()
+        monkeypatch.setattr(pa, "_broadcast", broadcast)
+        return pa, broadcast
+
+    @pytest.mark.asyncio
+    async def test_the_frame_carries_the_state(self, _isolated):
+        pa, broadcast = _isolated
+        await pa._loop_on_tool_result(
+            "shell_execute",
+            "Result unknown: …",
+            "c1",
+            is_error=True,
+            result_state="unknown",
+        )
+        method, frame = broadcast.call_args.args
+        assert method == "tool.completed"
+        assert frame["result_state"] == "unknown"
+        assert frame["is_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_or_unknown_state_adds_nothing(self, _isolated):
+        pa, broadcast = _isolated
+        await pa._loop_on_tool_result("shell_execute", "ok", "c1")
+        assert "result_state" not in broadcast.call_args.args[1]
+        await pa._loop_on_tool_result(
+            "shell_execute", "ok", "c2", result_state="finished"
+        )
+        assert "result_state" not in broadcast.call_args.args[1]
+
+
 class TestInflightToolCall:
     """inflight_tool_call() identifies the command a (re)attaching client should
     surface as 'running' from the agent's in-memory messages (which aren't yet

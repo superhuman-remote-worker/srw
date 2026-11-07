@@ -126,6 +126,16 @@ class TestBelowFloorPools:
         # to arm tickets against a number nobody measured.
         assert below_floor_pools(META, None) == []
 
+    def test_no_floor_while_auto_pull_is_off(self):
+        """Armed tickets never dispatch without auto-pull, so a floor marker
+        only asked the officer for filler (k3d 2026-11-05: an invented CI
+        ticket on a project with no CI)."""
+        meta = {**META, "auto_pull": False}
+        assert below_floor_pools(meta, {"researchers": 0, "executors": 0}) == []
+        assert "BELOW FLOOR" not in capacity_lines(
+            meta, {}, ready_by_pool={"researchers": 0, "executors": 0}
+        )
+
     def test_uncategorized_slots_have_no_floor(self):
         meta = {"slots": {"adhoc": {"count": 3}, "researchers": POOLS["researchers"]}}
         assert below_floor_pools(meta, {"researchers": 2}) == []

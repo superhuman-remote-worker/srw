@@ -612,7 +612,9 @@ class ModelCatalogService:
         """Probe a catalog row's transport.
 
         For ``provider_kind='endpoint'``, calls ``GET {endpoint.base_url}/models``
-        via the existing endpoint-probe helper. For ``provider_kind='system'``,
+        via the existing endpoint-probe helper; on a 404 there (TEI has no
+        model list) an embedding or rerank row is judged by one minimal call
+        of its own capability instead. For ``provider_kind='system'``,
         confirms the ``system_api_keys`` row exists and returns ``ok=True``
         without round-tripping the provider — vendor-specific health probes
         are out of scope for v1.
@@ -634,6 +636,20 @@ class ModelCatalogService:
             result = await self.probe(
                 base_url=endpoint["base_url"], api_key=endpoint.get("api_key")
             )
+            if result.status == 404:
+                from orchestrator.services.llm_endpoint_probe import (
+                    capability_to_probe,
+                    probe_endpoint_capability,
+                )
+
+                capability = capability_to_probe(row.get("capabilities"))
+                if capability is not None:
+                    result = await probe_endpoint_capability(
+                        base_url=endpoint["base_url"],
+                        api_key=endpoint.get("api_key"),
+                        capability=capability,
+                        model=row.get("served_model_id") or row["model_id"],
+                    )
             return {
                 "ok": result.ok,
                 "status": result.status,

@@ -190,7 +190,11 @@ class JobRunner:
             )
             cwd = _local_cwd(workspace.root, self.run_dir)
             options = job_options(spec, tools=tools, env=env, cwd=cwd)
-            progress(f"starting Claude Code (model {spec.model.model})")
+            served = spec.model.upstream_model
+            progress(
+                f"starting Claude Code (model {spec.model.model}"
+                + (f", served as {served})" if served != spec.model.model else ")")
+            )
             outcome = await run_session(
                 spec.prompt,
                 options,

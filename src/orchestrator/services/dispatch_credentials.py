@@ -67,6 +67,8 @@ from shared.runtime.core.model_registry import (
     effective_client_protocol,
 )
 from shared.runtime.core.transport_resolution import (
+    CITATION_PROVIDER_ENV_KEY,
+    NO_KEY_SENTINEL,
     env_endpoint_names,
     provider_base_url,
     same_endpoint,
@@ -411,7 +413,9 @@ async def inject_env_key_credentials(
     flat env vars (vision, whisper, tts, ...) rather than structured config
     sections. Endpoint-backed models (origin in {'custom','system','catalog'}
     with an endpoint_id) contribute the inline base_url+api_key from the
-    endpoint row, which overwrites any pre-set endpoint name; built-ins and
+    endpoint row, which overwrites any pre-set endpoint name (a row the store
+    marks ``api_key_stored=False`` gets ``NO_KEY_SENTINEL`` as its key; one whose
+    stored key did not decrypt is refused); built-ins and
     system-anchored catalog rows resolve the api_key via
     ``resolved_keys[provider]`` (setdefault) together with the provider's own
     OpenAI-compatible base URL (``transport_resolution.provider_base_url``).
@@ -444,6 +448,14 @@ async def inject_env_key_credentials(
         env_keys[f"{prefix}_SERVED_MODEL"] = meta.served_model_id
     else:
         env_keys.pop(f"{prefix}_SERVED_MODEL", None)
+    if prefix == "CITATION_LLM":
+        # The flat citation client speaks OpenAI chat unless told otherwise; a
+        # row on the Anthropic shape names its client the way a model section's
+        # ``provider`` does.
+        if meta is not None and meta.provider == "anthropic":
+            env_keys[CITATION_PROVIDER_ENV_KEY] = "anthropic"
+        else:
+            env_keys.pop(CITATION_PROVIDER_ENV_KEY, None)
 
     if (
         meta is not None
@@ -454,6 +466,13 @@ async def inject_env_key_credentials(
         if endpoint_row:
             base_url = endpoint_row.get("base_url")
             api_key = endpoint_row.get("api_key")
+            if base_url and not api_key and endpoint_row.get("api_key_stored") is False:
+                # Registered without a key (a local TEI / vLLM over HTTP): the
+                # store says no ciphertext exists, so this is not a failed
+                # decrypt. Send the keyless sentinel the agent's clients already
+                # know — the citation client refuses a custom host with no key
+                # of its own — so every flat-env slot reaches the endpoint.
+                api_key = NO_KEY_SENTINEL
             if base_url and not api_key:
                 # The endpoint is configured but its stored key didn't decrypt
                 # (get_user_llm_endpoint -> _decrypt_stored already logged the

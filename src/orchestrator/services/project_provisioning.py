@@ -28,6 +28,7 @@ from fastapi import HTTPException
 
 from orchestrator.schemas.projects import ExternalKnowledgeBase
 from orchestrator.services import project_cloud_connectors
+from orchestrator.services.project_status import project_is_deleting
 from orchestrator.services.cloud import (
     CloudBackendError,
     CloudBackendErrorKind,
@@ -290,6 +291,12 @@ async def ensure_project_cloud_resources(
 
     project_id_str = str(project["id"])
     project_name = project["name"]
+    # A heal fired by a page open must not give a deleted project, or one
+    # whose delete was decided, its group or folder back: the teardown is
+    # removing them (services.project_deletion).
+    current = await store.get_project(project_id_str)
+    if current is None or project_is_deleting(current):
+        return project
     group_name = f"project-{project_id_str}"
     if project.get("main_cloud_backend"):
         backend = dependencies.main_cloud_router.for_project_optional(project)
@@ -339,8 +346,9 @@ async def ensure_project_cloud_resources(
         lock = dependencies.repair.heal_locks.setdefault(project_id_str, asyncio.Lock())
         async with lock:
             fresh = await store.get_project(project_id_str)
-            if fresh:
-                project = fresh
+            if fresh is None or project_is_deleting(fresh):
+                return project
+            project = fresh
             if not (
                 project.get("main_cloud_folder_handle")
                 or project.get("nextcloud_folder_id")

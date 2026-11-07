@@ -325,6 +325,12 @@ describe('JobReviewComponent delivery section', () => {
     expect(fixture.componentInstance.getJobWorkspaceUrl()).toMatch(/\/my-repo$/);
   });
 
+  it("links the server's repository URL, which names the installation's owner", async () => {
+    const giteaUrl = 'https://srw.example.org/git/srw-admin/job-29c28492';
+    await render(undefined, OPEN_STATUS, undefined, {gitea_url: giteaUrl});
+    expect(fixture.componentInstance.getJobWorkspaceUrl()).toBe(giteaUrl);
+  });
+
   it('creates the server-derived session and navigates to it', async () => {
     await render();
 

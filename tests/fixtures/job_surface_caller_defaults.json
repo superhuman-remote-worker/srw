@@ -1,6 +1,7 @@
 {
   "mcp": {
     "job_control": [
+      "accept_job_diff",
       "acknowledge_job_message",
       "approve_job",
       "assign_job",
@@ -10,6 +11,7 @@
       "escalate_job_message",
       "pause_job",
       "promote_job",
+      "reject_job_diff",
       "reply_to_job_message",
       "resume_job_with_feedback",
       "send_message_to_job",
@@ -50,12 +52,14 @@
   },
   "officer": {
     "job_control": [
+      "accept_job_diff",
       "acknowledge_job_message",
       "approve_job",
       "cancel_job",
       "create_job",
       "escalate_job_message",
       "pause_job",
+      "reject_job_diff",
       "reply_to_job_message",
       "resume_job_with_feedback",
       "send_message_to_job",

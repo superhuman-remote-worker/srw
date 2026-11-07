@@ -174,6 +174,16 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         # Cap depth at 3 to prevent excessive output
         depth = max(0, min(3, depth))
 
+        def _expand(dir_item: str) -> bool:
+            """Whether a listed directory's contents are shown below it.
+
+            Git's object store is listed but never expanded: its HEAD,
+            refs/ and objects/ tell the model nothing about the task and
+            cost a page of tokens on every root listing. Listing ``.git``
+            itself still shows them.
+            """
+            return dir_item.rstrip("/").rsplit("/", 1)[-1] != ".git"
+
         def _strip_prefix(item_path: str, base_path: str) -> str:
             """Strip parent directory prefix from workspace-relative path.
 
@@ -206,7 +216,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             # Add directories and optionally their contents
             for d in dirs:
                 lines.append(f"{indent}{_strip_prefix(d, dir_path)}")
-                if current_depth < depth:
+                if current_depth < depth and _expand(d):
                     # d is already workspace-relative, use directly
                     sub_lines = list_recursive(
                         d.rstrip("/"), current_depth + 1, indent + "  "
@@ -238,7 +248,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 lines.append("Directories:")
                 for d in dirs:
                     lines.append(f"  {_strip_prefix(d, path)}")
-                    if depth > 0:
+                    if depth > 0 and _expand(d):
                         # d is already workspace-relative, use directly
                         sub_lines = list_recursive(d.rstrip("/"), 1, "    ")
                         lines.extend(sub_lines)

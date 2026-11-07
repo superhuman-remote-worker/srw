@@ -204,5 +204,8 @@ async def test_workspace_loss_leaves_no_call_without_a_result():
     # The started call's card closes as failed; the unstarted one never opened.
     on_tool_result.assert_awaited_once()
     assert on_tool_result.await_args.args[:2] == ("boom", results["c1"])
-    assert on_tool_result.await_args.kwargs == {"is_error": True}
+    assert on_tool_result.await_args.kwargs == {
+        "is_error": True,
+        "result_state": RESULT_UNKNOWN,
+    }
     assert on_error.called

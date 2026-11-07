@@ -51,6 +51,14 @@ spec:
       containers:
         - name: auditdb
           image: {{ .Values.databases.audit.image }}
+          {{- with .Values.databases.audit.maxConnections }}
+          # The same max_connections CloudNativePG gets via srw.dbParameters.
+          # No `command`: the image's docker-entrypoint.sh prepends `postgres`
+          # when the first argument is a flag.
+          args:
+            - "-c"
+            - {{ printf "max_connections=%v" . | quote }}
+          {{- end }}
           ports:
             - containerPort: 5432
           env:

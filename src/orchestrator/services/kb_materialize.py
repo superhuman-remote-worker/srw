@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
@@ -224,6 +225,112 @@ async def _path_exists(
     return False, None
 
 
+@dataclass(frozen=True)
+class _NoteLocation:
+    """Where a note lives on the branch, as far as the tree shows.
+
+    ``exists`` is ``None`` when the tree could not be read (the path is then
+    the flat guess); ``ambiguous`` lists the candidates when several files
+    carry the note's name and nothing else tells them apart.
+    """
+
+    path: str
+    exists: Optional[bool]
+    blob_sha: Optional[str]
+    ambiguous: Tuple[str, ...] = ()
+
+
+def _note_stem(path: str) -> str:
+    name = path.rsplit("/", 1)[-1]
+    return name[:-3] if name.endswith(".md") else name
+
+
+async def _resolve_note_path(
+    repo_client: Any,
+    repo_name: str,
+    branch: str,
+    slug: str,
+    *,
+    expected_blob_sha: Optional[str] = None,
+    path_hint: Optional[str] = None,
+) -> _NoteLocation:
+    """Find the file that holds note ``slug`` anywhere under ``knowledge/``.
+
+    Writes used to go to ``knowledge/<slug>.md`` unconditionally, but a vault
+    keeps most hand-written notes in subfolders (86 % of the SRW design vault
+    on 2026-11-04). An update of such a note was refused forever, or, with no
+    compare-and-swap token, forked a second file with the same id beside it
+    (G14). Resolution order, first match wins:
+
+    1. ``path_hint``: the indexed path of the note, supplied by a server-side
+       caller that read the row. Used only if the tree holds that file.
+    2. The blob the caller read (``expected_blob_sha``): pins the exact file
+       even when the note's id is not its filename.
+    3. The flat path ``knowledge/<slug>.md``.
+    4. The single file whose name is ``<slug>.md`` in any subfolder. Several
+       such files with nothing else to choose between them are ``ambiguous``
+       and the caller must refuse rather than guess.
+
+    Nothing found means the note does not exist yet: the flat path, where a
+    new note is created.
+    """
+    flat = note_repo_path(slug)
+    try:
+        tree = await repo_client.list_tree(repo_name, branch)
+    except Exception as e:  # noqa: BLE001 — a probe failure is not fatal
+        logger.warning(
+            "kb-materialize: tree read raised for %s@%s: %r", repo_name, branch, e
+        )
+        return _NoteLocation(flat, None, None)
+    if tree is None:
+        return _NoteLocation(flat, None, None)
+
+    blobs: dict[str, Optional[str]] = {}
+    for entry in tree:
+        entry_path = str(entry.get("path") or "")
+        if (
+            entry.get("type") == "blob"
+            and entry_path.startswith(KNOWLEDGE_PREFIX)
+            and entry_path.endswith(".md")
+        ):
+            blobs[entry_path] = entry.get("sha")
+
+    hint = str(path_hint or "").strip()
+    if hint and hint in blobs:
+        return _NoteLocation(hint, True, blobs[hint])
+
+    expected = str(expected_blob_sha or "").strip()
+    if expected:
+        same_blob = [path for path, sha in blobs.items() if sha == expected]
+        if flat in same_blob:
+            return _NoteLocation(flat, True, expected)
+        named = [path for path in same_blob if _note_stem(path) == slug]
+        if len(named) == 1:
+            return _NoteLocation(named[0], True, expected)
+        if len(same_blob) == 1:
+            return _NoteLocation(same_blob[0], True, expected)
+
+    if flat in blobs:
+        return _NoteLocation(flat, True, blobs[flat])
+    named = sorted(path for path in blobs if _note_stem(path) == slug)
+    if len(named) == 1:
+        return _NoteLocation(named[0], True, blobs[named[0]])
+    if named:
+        return _NoteLocation(flat, False, None, ambiguous=tuple(named))
+    return _NoteLocation(flat, False, None)
+
+
+def _ambiguous_result(slug: str, location: _NoteLocation, **fields: Any) -> dict:
+    logger.error(
+        "kb-materialize: refusing to change note %r — %d files carry its name "
+        "(%s); give one an explicit frontmatter id or rename it",
+        slug,
+        len(location.ambiguous),
+        ", ".join(location.ambiguous[:5]),
+    )
+    return _result(_STATUS_FAILED, reason="ambiguous-note-path", **fields)
+
+
 async def _materialize_knowledge_note_once(
     *,
     postgres_db: Any,
@@ -235,8 +342,14 @@ async def _materialize_knowledge_note_once(
     resolved_repo: Any = None,
     repo_client: Any = None,
     expected_blob_sha: Optional[str] = None,
+    mode: Optional[str] = None,
+    path_hint: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Commit one rendered note to ``knowledge/<slug>.md`` in the project's KB repo.
+    """Commit one rendered note to the project's KB repo, at the note's path.
+
+    The path is the file that already holds the note, wherever it sits under
+    ``knowledge/`` (:func:`_resolve_note_path`), or ``knowledge/<slug>.md``
+    for a new note.
 
     Args:
         postgres_db: App-DB facade, passed straight to ``resolve_kb_repo``.
@@ -256,6 +369,14 @@ async def _materialize_knowledge_note_once(
             ``kb_update`` silently re-creates a deleted note). A concurrent
             writer therefore fails loudly instead of being overwritten.
             ``None`` keeps the historical last-writer-wins behaviour.
+        mode: ``"create"`` refuses (``failed/already-exists``, permanent) when
+            the note already exists, so a create can never overwrite a note it
+            did not read (G15). ``"update"`` refuses
+            (``failed/precondition-failed``) when the note is gone instead of
+            re-creating it. ``None`` is the historical upsert, kept for agents
+            that predate the field.
+        path_hint: The note's indexed path, from a server-side caller that read
+            its row (see :func:`_resolve_note_path`).
 
     Returns:
         ``{status, reason, repo, branch, path, operation}``. ``status`` is one
@@ -348,8 +469,41 @@ async def _materialize_knowledge_note_once(
                 path=path,
             )
 
-    exists, blob_sha = await _path_exists(repo_client, repo_name, branch, path)
+    location = await _resolve_note_path(
+        repo_client,
+        repo_name,
+        branch,
+        slug,
+        expected_blob_sha=expected_blob_sha,
+        path_hint=path_hint,
+    )
+    if location.ambiguous:
+        return _ambiguous_result(
+            slug, location, repo=repo_name, branch=branch, path=path
+        )
+    path, exists, blob_sha = location.path, location.exists, location.blob_sha
     expected = str(expected_blob_sha or "").strip() or None
+    if mode == "create" and exists:
+        logger.info(
+            "kb-materialize: create of %s refused — the note already exists at %s",
+            slug,
+            path,
+        )
+        return _result(
+            _STATUS_FAILED,
+            reason="already-exists",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+        )
+    if mode == "update" and exists is False and not expected:
+        return _result(
+            _STATUS_FAILED,
+            reason="precondition-failed",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+        )
     if expected:
         if exists is None:
             # A guess is fine for an unconditional write (it costs one retry);
@@ -411,10 +565,12 @@ async def _materialize_knowledge_note_once(
 
     # A conditional write is never flipped to the opposite operation: the
     # refusal IS the answer (the file moved), and retrying as ``create`` on an
-    # existing path would only manufacture a second refusal.
+    # existing path would only manufacture a second refusal. Neither is an
+    # explicit create or update: flipping a refused create into an update is
+    # exactly how a create overwrites a note it never read.
     attempts = (
         (operation,)
-        if expected
+        if expected or mode in ("create", "update")
         else (operation, "create" if operation == "update" else "update")
     )
     for attempt, op in enumerate(attempts):
@@ -463,7 +619,16 @@ async def _materialize_knowledge_note_once(
                 operation=op,
             )
 
-    if expected:
+    if mode == "create" and not expected:
+        return _result(
+            _STATUS_FAILED,
+            reason="already-exists",
+            repo=repo_name,
+            branch=branch,
+            path=path,
+            operation=operation,
+        )
+    if expected or mode == "update":
         logger.info(
             "kb-materialize: forge refused conditional write of %s@%s — the "
             "blob moved between the caller's read and its write",
@@ -580,6 +745,7 @@ async def _attempt_content_intent(
     job_id: Optional[str],
     expected_blob_sha: Optional[str] = None,
     resolved_repo: Any = None,
+    mode: Optional[str] = None,
 ) -> dict[str, Any]:
     permanent_reason: str | None = None
     if slug_error(slug):
@@ -609,6 +775,7 @@ async def _attempt_content_intent(
                 job_id=job_id,
                 expected_blob_sha=expected_blob_sha,
                 resolved_repo=resolved_repo,
+                mode=mode,
             )
         except Exception as exc:
             logger.error(
@@ -625,11 +792,15 @@ async def _attempt_content_intent(
     # ``no-repo`` is permanent for the same reason a repo-less project always
     # is (WP5.3) — reached here only via the rare fallback documented on
     # ``_materialize_knowledge_note_once``'s own no-repo branch.
+    # ``already-exists`` and ``ambiguous-note-path`` are decisions about the
+    # tree, not hiccups: replaying the same bytes cannot change either answer.
     permanent = permanent_reason is not None or outcome.get("reason") in {
         "invalid-slug",
         "empty-content",
         "precondition-failed",
         "no-repo",
+        "already-exists",
+        "ambiguous-note-path",
     }
     return await _finish_attempt(
         postgres_db=postgres_db,
@@ -675,6 +846,7 @@ async def _index_note_inline(
     intent_id: Optional[str],
     retrieval_messages: Optional[list[str]] = None,
     job_id: Optional[str] = None,
+    path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Index a just-committed note so it is searchable when the write returns.
 
@@ -698,8 +870,11 @@ async def _index_note_inline(
 
     Never raises. Every failure degrades to "committed but not yet indexed",
     which is exactly the state the sweep already knows how to heal.
+
+    ``path`` is where the commit landed (a nested note stays in its folder);
+    omitted, the flat ``knowledge/<slug>.md``.
     """
-    path = note_repo_path(slug)
+    path = str(path or "").strip() or note_repo_path(slug)
     try:
         kb_id = uuid.UUID(str(project_id))
     except (TypeError, ValueError):
@@ -792,6 +967,7 @@ async def _materialize_note_canonical(
     content: str,
     job_id: Optional[str] = None,
     expected_blob_sha: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> dict[str, Any]:
     """Persist intent, cross canonical git, and return both truth legs.
 
@@ -890,6 +1066,7 @@ async def _materialize_note_canonical(
         job_id=job_id,
         expected_blob_sha=expected_blob_sha,
         resolved_repo=resolved_repo,
+        mode=mode,
     )
 
 
@@ -905,6 +1082,7 @@ async def materialize_knowledge_note(
     embedding_service: Any = None,
     retrieval_messages: Optional[list[str]] = None,
     expected_blob_sha: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> dict[str, Any]:
     """Commit one note and, when an indexer is supplied, index it inline.
 
@@ -921,6 +1099,9 @@ async def materialize_knowledge_note(
     ``retrieval_messages`` forwards to the inline index call (``None`` leaves
     any already-stored value alone) — see :func:`_index_note_inline`. So does
     ``job_id``, which names the commit *and* stamps the row's provenance.
+
+    ``mode`` (``"create"``/``"update"``/``None``) is the caller's intent; see
+    :func:`_materialize_knowledge_note_once`.
     """
     result = await _materialize_note_canonical(
         postgres_db=postgres_db,
@@ -930,6 +1111,7 @@ async def materialize_knowledge_note(
         content=content,
         job_id=job_id,
         expected_blob_sha=expected_blob_sha,
+        mode=mode,
     )
     if not _is_canonical(result):
         return {**result, "indexed": False, "index_reason": "not-canonical"}
@@ -945,6 +1127,7 @@ async def materialize_knowledge_note(
         retrieval_messages=retrieval_messages,
         job_id=job_id,
         intent_id=result.get("intent_id"),
+        path=result.get("path"),
     )
     return {**result, **index_state}
 
@@ -954,16 +1137,21 @@ def metadata_mutation_content(
     status: str | None = None,
     add_tags: list[str] | None = None,
     remove_tags: list[str] | None = None,
+    path: str | None = None,
 ) -> str:
-    return json.dumps(
-        {
-            "status": status,
-            "add_tags": [str(tag) for tag in (add_tags or [])],
-            "remove_tags": [str(tag) for tag in (remove_tags or [])],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    """The ledger payload of a metadata mutation.
+
+    ``path`` (the note's indexed path) is included only when known, so a
+    mutation without one keeps the content hash it always had.
+    """
+    mutation: dict[str, Any] = {
+        "status": status,
+        "add_tags": [str(tag) for tag in (add_tags or [])],
+        "remove_tags": [str(tag) for tag in (remove_tags or [])],
+    }
+    if path:
+        mutation["path"] = str(path)
+    return json.dumps(mutation, sort_keys=True, separators=(",", ":"))
 
 
 def _canonical_metadata_fields(content: str, slug: str) -> dict[str, Any]:
@@ -1012,6 +1200,7 @@ async def _read_canonical_metadata(
     gitea_client: Any,
     project_id: str,
     slug: str,
+    path_hint: Optional[str] = None,
 ) -> dict[str, Any]:
     """Reread canonical truth for an intent another actor already committed.
 
@@ -1028,14 +1217,25 @@ async def _read_canonical_metadata(
         repo_client = await kb_client_for_repo(postgres_db, gitea_client, resolved)
         from orchestrator.services.project_backlog import _read_note_file
 
-        current, _ = await _read_note_file(repo_client, resolved, note_repo_path(slug))
+        location = await _resolve_note_path(
+            repo_client,
+            resolved.repo,
+            resolved.branch or "main",
+            slug,
+            path_hint=path_hint,
+        )
+        if location.ambiguous:
+            return _ambiguous_result(slug, location, operation="metadata-update")
+        current = None
+        if location.exists is not False:
+            current, _ = await _read_note_file(repo_client, resolved, location.path)
         if current is None:
             return _result(
                 _STATUS_FAILED,
                 reason="canonical-file-missing",
                 repo=resolved.repo,
                 branch=resolved.branch,
-                path=note_repo_path(slug),
+                path=location.path,
                 operation="metadata-update",
             )
         metadata = _canonical_metadata_fields(current, slug)
@@ -1045,7 +1245,7 @@ async def _read_canonical_metadata(
                 reason="already-canonical",
                 repo=resolved.repo,
                 branch=resolved.branch,
-                path=note_repo_path(slug),
+                path=location.path,
                 operation="metadata-update",
             ),
             **metadata,
@@ -1090,10 +1290,20 @@ async def _attempt_metadata_intent(
                 _rewrite_status,
             )
 
-            current, _ = await _read_note_file(
-                repo_client, resolved, note_repo_path(slug)
+            location = await _resolve_note_path(
+                repo_client,
+                resolved.repo,
+                resolved.branch or "main",
+                slug,
+                path_hint=mutation.get("path"),
             )
-            if current is None:
+            current = None
+            if location.exists is not False and not location.ambiguous:
+                current, _ = await _read_note_file(repo_client, resolved, location.path)
+            if location.ambiguous:
+                outcome = _ambiguous_result(slug, location, operation="metadata-update")
+                permanent = True
+            elif current is None:
                 outcome = _result(_STATUS_FAILED, reason="canonical-file-missing")
                 permanent = True
             else:
@@ -1116,7 +1326,7 @@ async def _attempt_metadata_intent(
                                 reason="unchanged",
                                 repo=resolved.repo,
                                 branch=resolved.branch,
-                                path=note_repo_path(slug),
+                                path=location.path,
                                 operation="metadata-update",
                             )
                             rendered = current
@@ -1156,6 +1366,10 @@ async def _attempt_metadata_intent(
                         )
                         outcome = {}
                     if not outcome:
+                        # The blob just read pins the write to the same file
+                        # (a nested note stays where it is) and makes the
+                        # read-modify-write atomic: a concurrent change turns
+                        # into a retryable miss, re-applied to the new text.
                         outcome = await _materialize_knowledge_note_once(
                             postgres_db=postgres_db,
                             gitea_client=gitea_client,
@@ -1164,6 +1378,8 @@ async def _attempt_metadata_intent(
                             content=rendered,
                             resolved_repo=resolved,
                             repo_client=repo_client,
+                            expected_blob_sha=location.blob_sha,
+                            path_hint=location.path,
                         )
     except ValueError:
         outcome = _result(_STATUS_FAILED, reason="malformed-frontmatter")
@@ -1208,9 +1424,16 @@ async def materialize_knowledge_metadata_update(
     status: str | None = None,
     add_tags: list[str] | None = None,
     remove_tags: list[str] | None = None,
+    path_hint: str | None = None,
 ) -> dict[str, Any]:
+    """Apply a status/tag change to the note's canonical file, ledgered.
+
+    ``path_hint`` is the note's indexed path when the caller read its row; it
+    lets a note whose id is not its filename be found (see
+    :func:`_resolve_note_path`).
+    """
     payload = metadata_mutation_content(
-        status=status, add_tags=add_tags, remove_tags=remove_tags
+        status=status, add_tags=add_tags, remove_tags=remove_tags, path=path_hint
     )
     content_hash = "metadata:" + hashlib.sha256(payload.encode()).hexdigest()
     try:
@@ -1241,6 +1464,7 @@ async def materialize_knowledge_metadata_update(
             gitea_client=gitea_client,
             project_id=project_id,
             slug=slug,
+            path_hint=path_hint,
         )
         return {
             **canonical,
@@ -1297,8 +1521,14 @@ async def _delete_note_once(
     job_id: Optional[str],
     reason: Optional[str],
     expected_blob_sha: Optional[str],
+    path_hint: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Remove ``knowledge/<slug>.md`` from the project's KB repo — once.
+    """Remove the note's file from the project's KB repo — once.
+
+    The file is found wherever it sits under ``knowledge/``
+    (:func:`_resolve_note_path`); before that, a nested note's delete found
+    nothing at the flat path, reported ``absent`` as success, and the next
+    sweep resurrected the row from the untouched file (G16).
 
     Returns the same ``{status, reason, repo, branch, path, operation}`` shape
     as the write path. Outcomes:
@@ -1357,7 +1587,19 @@ async def _delete_note_once(
             path=path,
         )
 
-    exists, tree_sha = await _path_exists(repo_client, repo_name, branch, path)
+    location = await _resolve_note_path(
+        repo_client,
+        repo_name,
+        branch,
+        slug,
+        expected_blob_sha=expected_blob_sha,
+        path_hint=path_hint,
+    )
+    if location.ambiguous:
+        return _ambiguous_result(
+            slug, location, repo=repo_name, branch=branch, path=path, operation="delete"
+        )
+    path, exists, tree_sha = location.path, location.exists, location.blob_sha
     if exists is None:
         # Unlike a write (where a guess degrades to one wasted call), a delete
         # against an unknown tree could remove a note nobody looked at. Refuse.
@@ -1447,6 +1689,7 @@ async def _attempt_delete_intent(
             job_id=job_id,
             reason=mutation.get("reason"),
             expected_blob_sha=mutation.get("expected_blob_sha"),
+            path_hint=mutation.get("path"),
         )
     except Exception as exc:  # noqa: BLE001 — never let the ledger dangle
         logger.error(
@@ -1457,7 +1700,11 @@ async def _attempt_delete_intent(
             exc_info=True,
         )
         outcome = _result(_STATUS_FAILED, reason="materializer-exception")
-    permanent = outcome.get("reason") in {"invalid-slug", "precondition-failed"}
+    permanent = outcome.get("reason") in {
+        "invalid-slug",
+        "precondition-failed",
+        "ambiguous-note-path",
+    }
     return await _finish_attempt(
         postgres_db=postgres_db,
         intent=intent,
@@ -1472,6 +1719,9 @@ async def _drop_note_rows(*, store: Any, project_id: str, slug: str, path: str) 
     Both keyings, because both row shapes exist: path-backed rows the sweep
     manages (``(kb_id, path)``; ``kb_id`` doubles as the project id for a
     native vault) and legacy born-pathless rows (``(project_id, note_id)``).
+    The second must stay pathless-only: dropping every row with the note's id
+    used to remove a row whose file was still on the branch (a nested note
+    the delete never reached), and the next sweep put it back (G16).
     Best-effort: a failure here leaves a row the next sweep's tree-diff reaps.
     """
     try:
@@ -1490,7 +1740,7 @@ async def _drop_note_rows(*, store: Any, project_id: str, slug: str, path: str) 
         )
         return False
     try:
-        dropped = bool(await store.delete_note(project_uuid, slug)) or dropped
+        dropped = bool(await store.delete_pathless_note(project_uuid, slug)) or dropped
     except Exception:  # noqa: BLE001
         logger.debug(
             "kb-materialize: legacy row cleanup skipped for %s/%s", project_id, slug
@@ -1508,6 +1758,7 @@ async def materialize_knowledge_note_delete(
     reason: Optional[str] = None,
     expected_blob_sha: Optional[str] = None,
     store: Any = None,
+    path_hint: Optional[str] = None,
 ) -> dict[str, Any]:
     """Purge one note: file-removal commit first, then drop its index rows.
 
@@ -1522,15 +1773,19 @@ async def materialize_knowledge_note_delete(
     caller read (``knowledge_index.blob_sha``) and the delete refuses if the
     tree holds anything else. Omit it only for a human-authorised purge.
 
+    ``path_hint`` is the note's indexed path when the caller read its row
+    (see :func:`_resolve_note_path`); it rides in the ledger payload so a
+    sweep retry deletes the same file.
+
     Returns the write path's result shape plus ``row_deleted``.
     """
-    payload = json.dumps(
-        {
-            "reason": " ".join(str(reason or "").split())[:500] or None,
-            "expected_blob_sha": str(expected_blob_sha or "").strip() or None,
-        },
-        sort_keys=True,
-    )
+    mutation: dict[str, Any] = {
+        "reason": " ".join(str(reason or "").split())[:500] or None,
+        "expected_blob_sha": str(expected_blob_sha or "").strip() or None,
+    }
+    if path_hint:
+        mutation["path"] = str(path_hint)
+    payload = json.dumps(mutation, sort_keys=True)
     content_hash = "delete:" + hashlib.sha256(payload.encode()).hexdigest()
     try:
         intent = await postgres_db.begin_knowledge_materialization(

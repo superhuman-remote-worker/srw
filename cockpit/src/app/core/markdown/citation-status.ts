@@ -1,4 +1,5 @@
 import type {ThreadCitation} from '../services/persistent-chat.service';
+import {normalizeWorkspacePath} from './link-extension';
 
 /**
  * What a reader is told about a citation's state, in the chip, the popover
@@ -50,6 +51,28 @@ export function citationReasonLabel(reason: string | null | undefined): string |
 export function citationSourceUrl(c: Pick<ThreadCitation, 'source_identifier'>): string | null {
     const id = c.source_identifier;
     return id && /^https?:\/\//i.test(id) ? id : null;
+}
+
+/**
+ * The session-workspace path of a cited document (`uploads/credit.pdf`), or
+ * null when the source is not one. A document's identifier is its
+ * workspace-relative path (overhaul D2); an absolute path is the temporary
+ * copy older records carry, already deleted, and a scheme (`https:`, …) is
+ * not a workspace file either.
+ */
+export function citationWorkspacePath(
+    c: Pick<ThreadCitation, 'source_type' | 'source_identifier'>,
+): string | null {
+    if (c.source_type !== 'document') return null;
+    const id = (c.source_identifier ?? '').trim();
+    if (!id || id.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(id)) return null;
+    return normalizeWorkspacePath(id);
+}
+
+/** The 1-based page a locator names, or undefined. */
+export function citationPage(locator: Record<string, unknown> | null | undefined): number | undefined {
+    const page = Number(locator?.['page']);
+    return Number.isInteger(page) && page > 0 ? page : undefined;
 }
 
 /** "page 4, §3.2" from a locator; empty when it names no place. */

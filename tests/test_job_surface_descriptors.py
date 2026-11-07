@@ -84,10 +84,11 @@ def test_descriptor_inventory_is_unique_complete_and_classified() -> None:
     # 43 = the 37 unified descriptors + E4's three job_evidence tools
     # (get_job_completion_report, list_job_evidence, read_job_evidence)
     # + M3's three officer message actions (reply_to_job_message,
-    # escalate_job_message, acknowledge_job_message).
+    # escalate_job_message, acknowledge_job_message) + the project-folder
+    # diff decision (accept_job_diff, reject_job_diff).
     names = [item.name for item in JOB_DESCRIPTORS]
     assert names == sorted(names)
-    assert len(names) == len(set(names)) == 43
+    assert len(names) == len(set(names)) == 45
     assert {item.group for item in JOB_DESCRIPTORS} == {
         "job_control",
         "job_inspection",
@@ -122,12 +123,14 @@ def test_officer_defaults_follow_the_plane_boundary() -> None:
         if item.plane == "job_control" and "officer" in item.caller_defaults
     }
     assert officer_control == {
+        "accept_job_diff",
         "acknowledge_job_message",
         "approve_job",
         "cancel_job",
         "create_job",
         "escalate_job_message",
         "pause_job",
+        "reject_job_diff",
         "reply_to_job_message",
         "resume_job_with_feedback",
         "send_message_to_job",

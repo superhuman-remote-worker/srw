@@ -222,11 +222,13 @@ def _get_mcp_caller_ctx() -> CallerCtx:
         return CallerCtx(kind="mcp", auth_failed=True)
 
 
-def _format_action_error(action: str, target: str, error: Exception) -> str:
+def _format_action_error(
+    action: str, target: str, error: Exception, *, target_kind: str = "job"
+) -> str:
     """Keep an ambiguous mutation distinct from a confirmed failure."""
     if isinstance(error, MutationOutcomeUnknown):
         return f"Action '{action}' has an unknown outcome for {target}:\n{error}"
-    return fmt.format_action_error(action, target, error)
+    return fmt.format_action_error(action, target, error, target_kind=target_kind)
 
 
 # =============================================================================
@@ -252,7 +254,11 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # recipes are refused: Slice A3, shared/orch_surface/workspace_choice.py).
 # "15": list_connector_drivers, the connector driver capability matrix
 # (connector drivers D2).
-MCP_TOOL_SCHEMA_REVISION = "15"
+# "16": commission_officer, decommission_officer, hold_officer,
+# release_officer (the Legate's lifecycle side of the officer post);
+# create_persistent_thread refuses config_name "centurion"; accept_job_diff and
+# reject_job_diff decide a job's pending project-folder diff (MCP + officer).
+MCP_TOOL_SCHEMA_REVISION = "16"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -721,6 +727,12 @@ async def manifest_delete(resource_id: str, expected_version: int) -> str:
     """Delete an authorized resource only at the observed resourceVersion.
 
     Active execution dependencies and project ownership can prevent deletion.
+    Deleting a Project deletes the project, as delete_project does: its vault
+    repository, search index, knowledge graph, Keycloak group and cloud folder
+    go with it. When part of that must be retried, the reply says
+    "deleting": true; the project then refuses every other call and finishes
+    in the background. After an "outcome unknown" error, read the resource:
+    404 means it was deleted.
     This is a resource operation; Job cancellation uses the existing cancel tool.
     """
     try:
@@ -1722,7 +1734,9 @@ async def delete_project(project_id: str) -> str:
     """Permanently delete a project and its associated data.
 
     Cannot delete default projects. This is irreversible — all project
-    data including repos and knowledge base entries will be removed.
+    data including repos and knowledge base entries will be removed. When
+    part of the deletion must be retried, the project refuses every other
+    call and the deletion finishes in the background.
 
     Args:
         project_id: Project UUID
@@ -1733,6 +1747,9 @@ async def delete_project(project_id: str) -> str:
     client = _get_client()
     result = await client.delete_project(project_id)
     s = result.get("status", "unknown")
+    if s == "deleting":
+        detail = result.get("detail") or "it finishes in the background."
+        return f"Project {project_id} is being deleted: {detail}"
     return f"Project {project_id} deleted ({s})."
 
 
@@ -2468,7 +2485,9 @@ async def get_project_officer(project_id: str, recent: int = 10) -> str:
     try:
         post = await client.get_project_officer(project_id)
     except Exception as e:
-        return _format_action_error("get_project_officer", project_id, e)
+        return _format_action_error(
+            "get_project_officer", project_id, e, target_kind="project"
+        )
 
     thread_id = (post.get("officer") or {}).get("thread_id")
     tail = None
@@ -2513,8 +2532,157 @@ async def send_officer_note(project_id: str, message: str) -> str:
     try:
         result = await client.send_officer_note(project_id, message)
     except Exception as e:
-        return _format_action_error("send_officer_note", project_id, e)
+        return _format_action_error(
+            "send_officer_note", project_id, e, target_kind="project"
+        )
     return fmt.format_officer_note_result(result)
+
+
+@mcp_tool
+async def commission_officer(
+    project_id: str,
+    model: str | None = None,
+    reasoning_level: str | None = None,
+    slots: dict[str, dict[str, Any]] | None = None,
+    auto_pull: bool | None = None,
+    sleep_min_minutes: int | None = None,
+    sleep_max_minutes: int | None = None,
+    daily_token_ceiling: int | None = None,
+    worker_spend_ceiling_daily: float | None = None,
+) -> str:
+    """Commission the project's officer (Centurion): a standing agent that runs the project.
+
+    MUTATION: starts a long-running agent with its own pod that wakes on a
+    timer and on project events, dispatches worker jobs into his slots,
+    reviews them, and reports to the project owner. It spends model tokens
+    until decommissioned. This is the only way to start a Centurion; a
+    session created with the centurion config is a plain chat without any of
+    that. Needs project ownership and the unattended_operations grant.
+
+    A post that held an officer before restores his state. Every field you
+    omit keeps the post's saved value. Give him his order afterwards with
+    send_officer_note; stand him down with decommission_officer.
+
+    Args:
+        project_id: Project UUID whose post to fill
+        model: His own model (list_models shows the choices)
+        reasoning_level: His reasoning effort, e.g. "low", "medium", "high"
+        slots: Worker capacity by slot name, e.g.
+            {"build": {"count": 1, "model": "gpt-6.1-sol"}}. Each slot takes
+            count (required), model, backend, category (researcher | tester |
+            executor, makes it an auto-pull pool) and spend_ceiling_daily.
+        auto_pull: Let the post fill categorized slots from ready tickets
+        sleep_min_minutes: Shortest sleep he may choose
+        sleep_max_minutes: Longest sleep he may choose
+        daily_token_ceiling: His own daily token budget
+        worker_spend_ceiling_daily: Daily USD ceiling on his workers' spend
+
+    Returns:
+        The commissioned thread, and whether earlier state was restored.
+    """
+    kit: dict[str, Any] = {}
+    brain = {
+        key: value
+        for key, value in (("model", model), ("reasoning_level", reasoning_level))
+        if value
+    }
+    if brain:
+        kit["brain"] = brain
+    for key, value in (
+        ("slots", slots),
+        ("auto_pull", auto_pull),
+        ("sleep_min_minutes", sleep_min_minutes),
+        ("sleep_max_minutes", sleep_max_minutes),
+        ("daily_token_ceiling", daily_token_ceiling),
+        ("worker_spend_ceiling_daily", worker_spend_ceiling_daily),
+    ):
+        if value is not None:
+            kit[key] = value
+    client = _get_client()
+    try:
+        result = await client.commission_officer(project_id, kit)
+    except Exception as e:
+        return _format_action_error(
+            "commission_officer", project_id, e, target_kind="project"
+        )
+    return fmt.format_officer_commission_result(result)
+
+
+@mcp_tool
+async def decommission_officer(
+    project_id: str, force: bool = False, reason: str | None = None
+) -> str:
+    """Decommission the project's officer: end his session and leave the post vacant.
+
+    MUTATION: his session ends; his state stays on the post, so
+    commission_officer later brings him back with it. Jobs he dispatched keep
+    running either way. Without force, a post with jobs in flight answers with
+    a warning listing them and does NOT decommission.
+
+    Args:
+        project_id: Project UUID whose officer to stand down
+        force: Proceed even with jobs in flight (they are not cancelled)
+        reason: Recorded on his incarnation entry
+
+    Returns:
+        Whether he was decommissioned, or the in-flight warning.
+    """
+    client = _get_client()
+    try:
+        result = await client.decommission_officer(
+            project_id, force=force, reason=reason
+        )
+    except Exception as e:
+        return _format_action_error(
+            "decommission_officer", project_id, e, target_kind="project"
+        )
+    return fmt.format_officer_decommission_result(result)
+
+
+@mcp_tool
+async def hold_officer(project_id: str, note: str | None = None) -> str:
+    """Put the project's officer on a maintenance hold (pause, not retire).
+
+    MUTATION: while held he gets no wakes and can dispatch nothing; events
+    queue for him. Only release_officer lifts it.
+
+    Args:
+        project_id: Project UUID whose officer to hold
+        note: Shown on his card as the reason
+
+    Returns:
+        The hold, and whether he was told.
+    """
+    client = _get_client()
+    try:
+        result = await client.hold_officer(project_id, note)
+    except Exception as e:
+        return _format_action_error(
+            "hold_officer", project_id, e, target_kind="project"
+        )
+    return fmt.format_officer_hold_result(result)
+
+
+@mcp_tool
+async def release_officer(project_id: str) -> str:
+    """Release the project officer's maintenance hold.
+
+    MUTATION: he resumes; events queued during the hold reach him at once.
+
+    Args:
+        project_id: Project UUID whose officer to release
+
+    Returns:
+        The release, and whether he was told.
+    """
+    client = _get_client()
+    try:
+        result = await client.release_officer(project_id)
+    except Exception as e:
+        return _format_action_error(
+            "release_officer", project_id, e, target_kind="project"
+        )
+    return fmt.format_officer_hold_result(result)
 
 
 # =============================================================================
@@ -2582,6 +2750,14 @@ async def create_persistent_thread(
     Returns:
         Created thread ID and status
     """
+    if config_name.strip().lower().rsplit("/", 1)[-1] == "centurion":
+        # Seen on dev 2026-11-06: a GPT supervisor asked for a Centurion this
+        # way and got a plain stateless chat with the officer switched off.
+        return (
+            "Refusing to create the session: the Centurion runs only as a "
+            "commissioned project officer. Use commission_officer(project_id) "
+            "to start him and send_officer_note to give him orders."
+        )
     client = _get_client()
     # Same rule and words as the orchestrator's 422, checked here first so the
     # workspace lookup below never searches without the session's project.

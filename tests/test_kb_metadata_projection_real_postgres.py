@@ -212,7 +212,11 @@ def _knowledge_deps(*, ledger, vector_pool, gitea) -> KnowledgeDependencies:
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
         ),
-        require_project_member=AsyncMock(),
+        # An admin: adding ``ready`` arms dispatch and needs owner authority
+        # (D9), which is what these BP-13 scenarios model.
+        require_project_member=AsyncMock(
+            return_value=({"id": "u-admin", "is_admin": True}, {})
+        ),
     )
 
 

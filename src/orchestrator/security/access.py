@@ -50,7 +50,9 @@ from orchestrator.security.config_redaction import (  # noqa: F401 — re-export
 )
 from orchestrator.services.project_status import (
     PROJECT_ARCHIVED_DETAIL as PROJECT_ARCHIVED_DETAIL,
+    PROJECT_DELETING_DETAIL as PROJECT_DELETING_DETAIL,
     project_is_archived as project_is_archived,
+    project_is_deleting as project_is_deleting,
 )
 from shared.connectors.builtin import spec_for_row
 
@@ -534,6 +536,7 @@ async def require_project_member(
     *,
     min_role: Role = "viewer",
     allow_archived: bool = True,
+    allow_deleting: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Require caller to be a project member at ``min_role`` or higher.
 
@@ -548,6 +551,10 @@ async def require_project_member(
     projects: an archive you cannot open is a trap, not a lifecycle state.
     The lifecycle assertion runs LAST, after authorization, so it can never
     tell a non-member that the project exists.
+
+    A project whose delete was decided refuses (409) every call unless
+    ``allow_deleting`` — only the delete itself passes it. Such a project
+    never comes back: the request or the deletion sweeper removes it.
     """
     user = await require_approved_user(request, db)
     project = await db.get_project(project_id)
@@ -573,6 +580,8 @@ async def require_project_member(
                 resource_id=project_id,
                 detail=f"Project role '{min_role}' or higher required",
             )
+    if not allow_deleting and project_is_deleting(project):
+        raise HTTPException(status_code=409, detail=PROJECT_DELETING_DETAIL)
     if not allow_archived and project_is_archived(project):
         raise await _archived_conflict(request, db, user, resource_id=project_id)
     return user, project
@@ -584,6 +593,7 @@ async def require_project_owner(
     project_id: str,
     *,
     allow_archived: bool = True,
+    allow_deleting: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Owner-or-admin gate on a project. Returns ``(user, project)``.
 
@@ -594,7 +604,8 @@ async def require_project_owner(
 
     ``allow_archived`` behaves exactly as on :func:`require_project_member`:
     default True, so teardown (DELETE, detach, decommission) and the
-    unarchive PATCH keep working on an archived project.
+    unarchive PATCH keep working on an archived project. So does
+    ``allow_deleting``: only the project DELETE passes it.
     """
     user = await require_approved_user(request, db)
     project = await db.get_project(project_id)
@@ -620,6 +631,8 @@ async def require_project_owner(
                 resource_id=project_id,
                 detail="Project owner role required",
             )
+    if not allow_deleting and project_is_deleting(project):
+        raise HTTPException(status_code=409, detail=PROJECT_DELETING_DETAIL)
     if not allow_archived and project_is_archived(project):
         raise await _archived_conflict(request, db, user, resource_id=project_id)
     return user, project
@@ -1467,6 +1480,23 @@ async def require_internal(request: Request) -> None:
     """
     if not is_internal_call(request):
         raise HTTPException(status_code=401, detail="Invalid internal key")
+
+
+async def require_internal_service(request: Request) -> None:
+    """Guard for endpoints only the service itself may call.
+
+    Like :func:`require_internal`, but a call that carries a delegated
+    ``X-MCP-User-Id`` is refused (403): the MCP server sends the internal key
+    with every tool call a user drives, so the key alone would let any MCP
+    token holder reach an endpoint that checks no user. Use it where the
+    endpoint performs no user authorization of its own (N9).
+    """
+    if not is_internal_call(request):
+        raise HTTPException(status_code=401, detail="Invalid internal key")
+    if not is_internal_service_call(request):
+        raise HTTPException(
+            status_code=403, detail="Internal service call required (no delegated user)"
+        )
 
 
 async def require_internal_or_job_access(

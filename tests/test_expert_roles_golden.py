@@ -220,6 +220,29 @@ _POST_SPLIT_OVERLAY_BINDINGS: dict[str, tuple[str, ...]] = {
     "worker": ("strategic-phase", "tactical-phase"),
     "session": (),
 }
+#: Bindings whose overlay TRIGGER changed after the baseline was frozen (role
+#: -> skill names): present in the baseline in their old form, so they are
+#: stripped by ``skill`` from BOTH sides, never asserted present (an expert
+#: that restates its own list may not carry them at all). The worker overlay's
+#: new form is pinned by tests/test_skill_bindings.py.
+_POST_SPLIT_BINDING_CHANGES: dict[str, tuple[str, ...]] = {
+    # Claude efficiency round (2026-11-04): todo-guide and verify-before-done
+    # moved from before_tool gates to phase_start delivery (a gate refused
+    # the phase's first lifecycle call and cost a request).
+    "worker": ("todo-guide", "verify-before-done"),
+    "session": (),
+}
+
+
+def _without_changed_bindings(data: dict, role: str) -> dict:
+    """``data`` minus the ``_POST_SPLIT_BINDING_CHANGES`` bindings (both sides)."""
+    changed = _POST_SPLIT_BINDING_CHANGES.get(role, ())
+    entries = data.get("instruction_files")
+    if not changed or not isinstance(entries, list):
+        return data
+    out = copy.deepcopy(data)
+    out["instruction_files"] = [e for e in entries if e.get("skill") not in changed]
+    return out
 
 
 def _bundled_configs() -> list[tuple[str, Path, str | None]]:
@@ -324,7 +347,7 @@ def _without_post_split_removals(data: dict, role: str, *, require: bool) -> dic
         assert present or not require, f"{dotted} is listed as removed but absent"
         if present:
             _delete_dotted(out, dotted)
-    return out
+    return _without_changed_bindings(out, role)
 
 
 def _without_post_split_bindings(data: dict, role: str, *, require: bool) -> dict:
@@ -333,7 +356,7 @@ def _without_post_split_bindings(data: dict, role: str, *, require: bool) -> dic
     each one is present first (the post-split side); the pre-split side of an
     expert that RESTATES the bindings in its own leaf carries them too and is
     stripped without the assertion."""
-    out = copy.deepcopy(data)
+    out = _without_changed_bindings(copy.deepcopy(data), role)
     bindings = _POST_SPLIT_OVERLAY_BINDINGS.get(role, ())
     if not bindings:
         return out
@@ -381,7 +404,9 @@ def _effective(
     blob = serialize_resolved_config(cfg, model=cfg.llm.model)
     out = {k: blob[k] for k in ("agent", "prompts", "instructions")}
     if role is not None:
-        out["agent"] = _without_effective_additions(out["agent"], role)
+        out["agent"] = _without_changed_bindings(
+            _without_effective_additions(out["agent"], role), role
+        )
     return out
 
 

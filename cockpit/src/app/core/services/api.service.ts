@@ -2112,6 +2112,22 @@ export class ApiService {
   }
 
   /**
+   * Ensure the current member has Gitea access to a project's managed repos
+   * (its knowledge vault above all). Called when the project opens; a grant
+   * that failed when the project was created is retried here.
+   */
+  ensureProjectRepoAccess(projectId: string): Observable<{ granted: boolean } | null> {
+    return this.http
+      .post<{ granted: boolean }>(`${this.baseUrl}/projects/${projectId}/ensure-repo-access`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to ensure repository access for project ${projectId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
    * Start an IDE session for a job (restores snapshot into a fresh VM).
    */
   startIdeSession(jobId: string): Observable<IdeSessionStatus | null> {

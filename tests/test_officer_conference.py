@@ -251,6 +251,96 @@ class TestConferenceConclude:
         )  # no raise
 
 
+class TestConferenceBrief:
+    """The brief wake carries the meeting, not just a pointer (k3d 2026-11-05).
+
+    The background officer used to get "direction agreed there is now in
+    force — re-read any notes updated during the meeting", cut to 160 chars
+    in his sitrep, with no word of what was agreed or which notes changed.
+    """
+
+    TRANSCRIPT = [
+        {"role": "human", "content": "Approve textkit once tests pass."},
+        {"role": "ai", "content": "", "tool_calls": [{"name": "kb_write"}]},
+        {
+            "role": "tool",
+            "content": "Created knowledge note: **project:decision-approve-textkit**"
+            " (type=decision) [canonical=canonical, indexed=yes]",
+        },
+        {
+            "role": "tool",
+            "content": "Updated **project:state-century**: content appended",
+        },
+        {"role": "tool", "content": "Refused: not a note"},
+        {"role": "human", "content": "Then add truncate() as the next job."},
+        {"role": "ai", "content": "Recorded both decisions."},
+    ]
+
+    def test_transcript_becomes_a_brief(self):
+        brief = officer_conference.conference_brief_from_transcript(self.TRANSCRIPT)
+        assert brief["legate_messages"] == [
+            "Approve textkit once tests pass.",
+            "Then add truncate() as the next job.",
+        ]
+        assert brief["final_reply"] == "Recorded both decisions."
+        assert brief["kb_notes"] == [
+            "project:decision-approve-textkit",
+            "project:state-century",
+        ]
+
+    def test_the_newest_legate_words_survive_the_budget(self, monkeypatch):
+        monkeypatch.setattr(officer_conference, "BRIEF_MAX_LEGATE_CHARS", 10)
+        brief = officer_conference.conference_brief_from_transcript(
+            [
+                {"role": "human", "content": "old old old old"},
+                {"role": "human", "content": "newest"},
+            ]
+        )
+        assert brief["legate_messages"] == ["newest"]
+
+    @pytest.mark.asyncio
+    async def test_conclude_enqueues_the_brief(self):
+        held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
+        db = SimpleNamespace()
+        db.get_officer_thread_for_project = AsyncMock(return_value=held)
+        db.set_project_officer_hold = AsyncMock(
+            return_value={"thread": _officer_row(), "routes": []}
+        )
+        db.get_thread_messages_history = AsyncMock(return_value=self.TRANSCRIPT)
+        db.enqueue_session_wake_event = AsyncMock(return_value=True)
+
+        await officer_conference.conclude_conference_if_any(
+            _conference_row(status="ended"), dependencies=_conference_deps(db)
+        )
+
+        db.get_thread_messages_history.assert_awaited_once_with(CONF_TID)
+        payload = db.enqueue_session_wake_event.await_args.kwargs["payload"]
+        assert payload["legate_messages"][-1] == "Then add truncate() as the next job."
+        assert payload["final_reply"] == "Recorded both decisions."
+        assert "project:decision-approve-textkit" in payload["kb_notes"]
+        assert payload["summary"].startswith("conference concluded")
+
+    @pytest.mark.asyncio
+    async def test_unreadable_transcript_still_releases_with_the_pointer(self):
+        held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
+        db = SimpleNamespace()
+        db.get_officer_thread_for_project = AsyncMock(return_value=held)
+        db.set_project_officer_hold = AsyncMock(
+            return_value={"thread": _officer_row(), "routes": []}
+        )
+        db.get_thread_messages_history = AsyncMock(side_effect=RuntimeError("db"))
+        db.enqueue_session_wake_event = AsyncMock(return_value=True)
+
+        await officer_conference.conclude_conference_if_any(
+            _conference_row(status="ended"), dependencies=_conference_deps(db)
+        )
+
+        db.set_project_officer_hold.assert_awaited_once()
+        payload = db.enqueue_session_wake_event.await_args.kwargs["payload"]
+        assert "legate_messages" not in payload
+        assert payload["summary"].startswith("conference concluded")
+
+
 class TestWatchdogHold:
     @pytest.fixture(autouse=True)
     def _runtime_authorization_is_healthy(self, monkeypatch):

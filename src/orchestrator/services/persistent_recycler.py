@@ -38,6 +38,9 @@ _RECYCLE_KEY = "recycle"
 #: hold it is refused by 0185's ``threads_agent_pod_authority_shape``.
 _RECYCLE_METADATA_KEY = "persistent_recycle"
 _HOLD_GENERATION_KEY = "_persistent_recycle_generation"
+# Replacements that exit before becoming ready get a fresh generation this many
+# times per recycle; past it the generation fails visibly as before.
+_MAX_REPLACEMENT_RESTARTS = 3
 _ACTIVE_PHASES = {
     "awaiting_old_pod_exit",
     "fencing_old_authority",
@@ -811,6 +814,12 @@ class PersistentThreadRecycler:
                     "replacement_authority_mismatch",
                     resume_phase="awaiting_replacement",
                 )
+            if observation.terminal:
+                restarted = await self._restart_after_exited_replacement(
+                    thread_id, current, observation
+                )
+                if restarted is not None:
+                    return self._result(thread_id, restarted)
             if not self._replacement_matches(
                 observation,
                 current,
@@ -1012,6 +1021,121 @@ class PersistentThreadRecycler:
                     json.dumps(metadata),
                 )
                 return recycle if result == "UPDATE 1" else None
+
+    async def _restart_after_exited_replacement(
+        self,
+        thread_id: str,
+        current: dict[str, Any],
+        observation: PersistentPodObservation,
+    ) -> dict[str, Any] | None:
+        """Retire a replacement that took the binding and then exited.
+
+        A replacement that registers, is bound to the thread and then exits
+        before it is ready (k3d 2026-11-06: it booted while the orchestrator
+        was restarting, read that as "workspace not ready" and quit) stays a
+        terminal Pod under the finalizer. Waiting on it can never succeed, and
+        the retry resumed the same wait, so the recycle failed every five
+        minutes for good. That Pod is now exactly what a crashed officer pod
+        is: the old authority of a new generation. The exact old-pod path
+        (terminal proof, exact delete, fenced handoff, provisioning) replaces
+        it. Returns None, leaving the existing failure, when the binding is
+        not the replacement's or the restart budget is spent.
+        """
+        thread_uuid = uuid.UUID(str(thread_id))
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                locked = await self._lock_authority(conn, thread_uuid=thread_uuid)
+                if locked is None:
+                    return None
+                thread, post, agent = locked
+                metadata = _json_object(thread.get("metadata"))
+                agent_pod = _json_object(metadata.get("agent_pod"))
+                recycle = _read_recycle_record(metadata)
+                if not self._same_state(recycle, current, "awaiting_replacement"):
+                    return None
+                if (
+                    agent is None
+                    or str(agent.get("thread_id") or "") != str(thread_uuid)
+                    or str(agent.get("pod_uid") or "") != observation.pod_uid
+                    or str(agent_pod.get("pod_uid") or "") != observation.pod_uid
+                ):
+                    return None
+                restarts = int(recycle.get("replacement_restarts") or 0)
+                if restarts >= _MAX_REPLACEMENT_RESTARTS:
+                    return None
+
+                generation = str(uuid.uuid4())
+                officer = self._officer_config(metadata)
+                if post is not None and bool(recycle.get("hold_owned")):
+                    hold = officer.get("hold")
+                    if not isinstance(hold, dict) or hold.get(
+                        _HOLD_GENERATION_KEY
+                    ) != recycle.get("generation"):
+                        return None
+                    hold[_HOLD_GENERATION_KEY] = generation
+                    officer["hold"] = hold
+                    config = _json_object(metadata.get("config_override"))
+                    config["officer"] = officer
+                    metadata["config_override"] = config
+
+                now = _iso()
+                next_recycle = {
+                    key: recycle.get(key)
+                    for key in (
+                        "reason",
+                        "expected_build_sha",
+                        "target_image_ref",
+                        "config_name",
+                        "hold_owned",
+                        "preexisting_hold",
+                    )
+                    if key in recycle
+                }
+                next_recycle.update(
+                    {
+                        "generation": generation,
+                        "runtime_generation": str(
+                            thread.get("runtime_generation") or ""
+                        ),
+                        "namespace": str(
+                            agent_pod.get("namespace") or recycle.get("namespace") or ""
+                        ),
+                        "old_runtime_attach_token": str(
+                            thread.get("runtime_attach_token") or ""
+                        ),
+                        "phase": "awaiting_old_pod_exit",
+                        "observed_build_sha": observation.build_sha,
+                        "old_pod_uid": observation.pod_uid,
+                        "old_agent_id": str(agent["id"]),
+                        "project_id": (
+                            str(thread.get("project_id"))
+                            if thread.get("project_id")
+                            else None
+                        ),
+                        "attempt": 0,
+                        "replacement_restarts": restarts + 1,
+                        "started_at": now,
+                        "drain_wait_started_at": now,
+                        "updated_at": now,
+                        "last_failure": None,
+                        "notification": {"state": "none"},
+                        "previous_attempt": {
+                            "generation": recycle.get("generation"),
+                            "exited_pod_uid": observation.pod_uid,
+                            "observed_at": now,
+                        },
+                    }
+                )
+                _publish_recycle_record(metadata, next_recycle)
+                await self._write_thread_metadata(conn, thread["id"], metadata)
+                logger.warning(
+                    "persistent recycle: replacement %s of thread %s exited "
+                    "before it was ready; retiring it under generation %s",
+                    observation.pod_uid[:8],
+                    str(thread_id)[:8],
+                    generation[:8],
+                )
+                return next_recycle
 
     async def _chain_target_generation_locked(
         self,

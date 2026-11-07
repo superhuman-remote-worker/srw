@@ -14,6 +14,7 @@ of asking for the failure to be raised instead of swallowed.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,16 +34,31 @@ class KnowledgeGraphHandle:
     ``_get_knowledge_graph()``. Semantics are unchanged: the first successful
     connect is cached for the process, and a deployment without Neo4j keeps
     returning ``None`` while every caller degrades gracefully.
+
+    An unset or empty ``NEO4J_URL`` is the "not configured" signal (the
+    same test ``orchestrator.init.get_neo4j_config`` uses): no connect is attempted,
+    so ``KnowledgeGraphDB``'s ``localhost:7687`` default is never dialled,
+    and one INFO line says so. A configured URL with a missing driver or a
+    refused connection still warns on every call, as before.
     """
 
     def __init__(self, *, logger: Any) -> None:
         self._logger = logger
         self._graph: Any | None = None
+        self._reported_not_configured = False
 
     def get(self) -> Any | None:
         """Lazily initialise and return the KnowledgeGraphDB singleton."""
         if self._graph is not None:
             return self._graph
+        if not os.getenv("NEO4J_URL", "").strip():
+            if not self._reported_not_configured:
+                self._reported_not_configured = True
+                self._logger.info(
+                    "Knowledge graph projection off: NEO4J_URL is not set "
+                    "(Neo4j not configured)"
+                )
+            return None
         try:
             from shared.runtime.services.knowledge_graph import KnowledgeGraphDB
 

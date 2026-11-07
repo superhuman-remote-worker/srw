@@ -117,9 +117,20 @@ async def _retire_exact_candidates(
 
 
 def _exact_pre_setup_abort(
-    intent: Mapping[str, Any], outcomes: Sequence[Mapping[str, Any]]
+    intent: Mapping[str, Any],
+    outcomes: Sequence[Mapping[str, Any]],
+    claim: Mapping[str, Any] | None = None,
 ) -> str | None:
-    """An immutable abort releases only its captured life, never remote writers."""
+    """An immutable abort releases only its captured life, never remote writers.
+
+    The agent sends ``agent_attach_not_started_v1`` only before its one-way
+    ``setup_started`` latch, when no session, backend, workspace request or
+    writer exists, so the life started nothing outside its own Pod. Without
+    ``claim`` the intent must be claim-less. With ``claim`` it must carry
+    exactly that agent workspace claim; the shared PVC stays with the claim,
+    and the caller retires the Pod only once it is terminal and cannot
+    restart, so the exited life can never write it again.
+    """
 
     related = [
         outcome
@@ -141,7 +152,17 @@ def _exact_pre_setup_abort(
         and outcome["release_kind"] == "process_zero"
         and outcome["quiescence_protocol"] == "agent_attach_not_started_v1"
         and intent["status"] == "published"
-        and intent["workspace_claim_id"] is None
+        and (
+            intent["workspace_claim_id"] is None
+            if claim is None
+            else (
+                intent["workspace_claim_id"] is not None
+                and str(intent["workspace_claim_id"]) == str(claim["claim_id"])
+                and str(intent["thread_id"]) == str(claim["thread_id"])
+                and intent["namespace"] == claim["namespace"]
+                and intent["provisioner"] == claim["provisioner"]
+            )
+        )
         and intent["protection_protocol"] == "finalizer_v1"
         and intent["provisioner"] in {"agent", "persistent"}
         and intent["namespace"]
@@ -422,7 +443,32 @@ async def retire_soft_ended_agent_pod(
     return True
 
 
-async def retire_aborted_unclaimed_agent_pod(
+async def _aborted_life_claim(
+    db: Any, intent: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Return the exact recorded workspace claim an aborted life mounted."""
+
+    if intent["workspace_claim_id"] is None:
+        return None
+    claim = await db.fetchrow(
+        "SELECT * FROM thread_agent_workspace_claims WHERE claim_id=$1::uuid",
+        intent["workspace_claim_id"],
+    )
+    if (
+        claim is None
+        or claim["thread_id"] != intent["thread_id"]
+        or claim["namespace"] != intent["namespace"]
+        or claim["provisioner"] != intent["provisioner"]
+        or claim["protection_protocol"] != "finalizer_v1"
+        or claim["status"] not in {"ready", "fenced", "reclaimed"}
+        or not claim["pvc_name"]
+        or not claim["pvc_uid"]
+    ):
+        raise RuntimeError("aborted claimant workspace claim is not exact")
+    return dict(claim)
+
+
+async def retire_aborted_agent_pod(
     db: Any, *, pod_name: str, pod_uid: str, namespace: str, agent_provisioner: Any
 ) -> bool:
     """Retry exact terminal abort cleanup in the existing Pod reaper.
@@ -431,12 +477,13 @@ async def retire_aborted_unclaimed_agent_pod(
     remain the durable obligation; no current generation is adopted, and no
     synthetic End or process-zero receipt is written. A missing Pod is already
     settled; an unknown replacement is refused and no replacement is touched.
+    A claim-bearing life must mount its own recorded claim and no other PVC;
+    the claim and its PVC stay as they are.
     """
 
     hints = await db.fetch(
         "SELECT * FROM thread_agent_pod_provision_intents WHERE pod_name=$1 "
-        "AND pod_uid=$2 AND namespace=$3 AND status='published' "
-        "AND workspace_claim_id IS NULL LIMIT 2",
+        "AND pod_uid=$2 AND namespace=$3 AND status='published' LIMIT 2",
         pod_name,
         pod_uid,
         namespace,
@@ -458,7 +505,8 @@ async def retire_aborted_unclaimed_agent_pod(
             thread_id,
         )
         try:
-            old_agent_id = _exact_pre_setup_abort(hint, outcomes)
+            claim = await _aborted_life_claim(db, hint)
+            old_agent_id = _exact_pre_setup_abort(hint, outcomes, claim)
             if old_agent_id is None:
                 return False
 
@@ -482,10 +530,13 @@ async def retire_aborted_unclaimed_agent_pod(
                     "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
                     thread_id,
                 )
+                if fresh is None or dict(fresh) != dict(hint):
+                    raise RuntimeError("aborted claimant authority changed")
+                fresh_claim = await _aborted_life_claim(db, fresh)
                 if (
-                    fresh is None
-                    or dict(fresh) != dict(hint)
-                    or _exact_pre_setup_abort(fresh, fresh_outcomes) != old_agent_id
+                    fresh_claim != claim
+                    or _exact_pre_setup_abort(fresh, fresh_outcomes, fresh_claim)
+                    != old_agent_id
                 ):
                     raise RuntimeError("aborted claimant authority changed")
 
@@ -494,7 +545,7 @@ async def retire_aborted_unclaimed_agent_pod(
                 thread_id=thread_id,
                 candidates=[(hint, old_agent_id)],
                 intents=intents,
-                pvc_name=None,
+                pvc_name=str(claim["pvc_name"]) if claim is not None else None,
                 assert_current=assert_released_life,
                 agent_provisioner=agent_provisioner,
                 nonrestartable_attempts=frozenset({str(hint["attempt_id"])}),
@@ -515,8 +566,10 @@ async def retire_historical_claimant_pods(
     """Remove old terminal claimant Pods before fencing their shared PVC.
 
     A published intent identifies a Pod, but does not prove its actor settled.
-    Join it to the server-captured soft outcome or an exact recycle handoff.
-    Neither a missing actor row nor a matching generation alone is authority.
+    Join it to the server-captured soft outcome, an exact recycle handoff, or
+    the exact pre-setup abort of a life that mounted this claim (that Pod must
+    also be nonrestartable). Neither a missing actor row nor a matching
+    generation alone is authority.
     """
 
     await assert_current()
@@ -542,8 +595,13 @@ async def retire_historical_claimant_pods(
         claim["thread_id"],
         claim["claim_id"],
     )
+    aborts = await db.fetch(
+        "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
+        claim["thread_id"],
+    )
     # Validate the entire set before making the first historical mutation.
     candidates = []
+    aborted_attempts = set()
     for intent in intents:
         attempt = str(intent["attempt_id"])
         if _is_current_intent(intent, current_pod):
@@ -568,7 +626,12 @@ async def retire_historical_claimant_pods(
             for handoff in handoffs
         )
         if not (old_agent_id or recycle_proof or agentless_proof):
-            raise RuntimeError("historical claimant lacks immutable actor settlement")
+            old_agent_id = _exact_pre_setup_abort(intent, aborts, claim)
+            if old_agent_id is None:
+                raise RuntimeError(
+                    "historical claimant lacks immutable actor settlement"
+                )
+            aborted_attempts.add(attempt)
         candidates.append((intent, old_agent_id))
 
     await _retire_exact_candidates(
@@ -579,6 +642,7 @@ async def retire_historical_claimant_pods(
         pvc_name=claim["pvc_name"],
         assert_current=assert_current,
         agent_provisioner=agent_provisioner,
+        nonrestartable_attempts=frozenset(aborted_attempts),
     )
 
 

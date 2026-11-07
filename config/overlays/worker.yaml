@@ -73,21 +73,19 @@ instruction_files:
   - skill: tactical-phase
     trigger: phase_start:tactical
     enforce: false
+  # The two lifecycle skills ride the phase start too, instead of a
+  # before_tool gate that refused the first next_phase_todos / todo_complete /
+  # job_complete of a phase and delivered the text with the refusal: three
+  # extra requests per job, every one re-reading the whole context (bench run
+  # srw-claude-eff-01, 2026-11-04: 3.4 refusals per job on Claude → 0.2, no
+  # quality change in hidden checks or blind judging). The text is in context before the first call needs it.
+  # The transition phase's verify todo points at the tactical phase's copy.
   - skill: todo-guide
-    trigger: before_tool:next_phase_todos
-    enforce: true
+    trigger: phase_start:strategic
+    enforce: false
   - skill: verify-before-done
-    trigger: before_tool:todo_complete
-    enforce: true
-    phases: [tactical]
-    read_scope: phase
-    max_read_age_turns: 20
-  - skill: verify-before-done
-    trigger: before_tool:job_complete
-    enforce: true
-    phases: [strategic]
-    read_scope: phase
-    max_read_age_turns: 20
+    trigger: phase_start:tactical
+    enforce: false
   # Cite-as-you-write: bound to the citation tools (not a phase) so it also fires
   # in persistent sessions, which have no phase loop. enforce=true → the agent must
   # read it before its first citation. See knowledge-history/done/citation_engine_integration.md Phase 4.

@@ -51,7 +51,7 @@ from orchestrator.security.access import (
     restore_hidden_config_values,
     user_can_access_datasource,
 )
-from orchestrator.services import project_provisioning
+from orchestrator.services import project_deletion, project_provisioning
 from orchestrator.services.cloud import ProjectFolderHandle, folder_grants
 from orchestrator.services.cloud.identity import (
     get_home_browser_url_cached,
@@ -72,6 +72,7 @@ from orchestrator.services.managed_repository_authority import (
 from orchestrator.services.officer_metadata import (
     thread_officer_meta as _thread_officer_meta,
 )
+from orchestrator.services.workspace_access import grant_project_repo_access
 from shared.connectors.builtin import spec_for_row
 from shared.connectors.contract import AccessContext, strict_access
 from shared.connectors.platform import (
@@ -189,6 +190,8 @@ class ProjectDependencies:
     main_cloud_router: Any
     logger: Any
     provisioning: project_provisioning.ProjectProvisioningDependencies
+    #: The app's ``KnowledgeGraphHandle``; ``get()`` is None without Neo4j.
+    graph: Any
     with_validated_tool_overrides: Callable[
         [dict[str, Any] | None], dict[str, Any] | None
     ]
@@ -424,9 +427,12 @@ async def list_projects(
     try:
         if is_admin and user_id is None:
             async with store.acquire() as conn:
+                # A project being deleted answers every call with 409 until its
+                # row is gone, so the listing leaves it out (as for members).
                 rows = await conn.fetch(
                     "SELECT * FROM projects WHERE "
                     f"{project_status_filter_sql('$1')} "
+                    "AND deletion_requested_at IS NULL "
                     "ORDER BY updated_at DESC LIMIT 100",
                     statuses,
                 )
@@ -736,100 +742,40 @@ async def delete_project(
     *,
     project: dict[str, Any],
     dependencies: ProjectDependencies,
+    requested_by: str | None = None,
+    expected_resource: tuple[str, int] | None = None,
 ) -> dict[str, str]:
-    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects."""
-    store = dependencies.store
-    logger = dependencies.logger
+    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects.
 
+    The delete is decided first, in one transaction that touches nothing
+    outside the database: the refusal checks (409), ``expected_resource``'s
+    version when the manifest API deletes (409), then the mark that makes
+    the project refuse new work. Then this request drives the teardown:
+    managed repositories, folder grants, the row, the search index, the
+    Keycloak group and the main-cloud folder. ``{"status": "deleted"}`` once
+    the row is gone; ``{"status": "deleting", ...}`` when a step before it
+    must be retried, which the project deletion sweeper does. Steps after
+    the row that fail are retried the same way.
+    """
     if project.get("is_default"):
         raise HTTPException(status_code=400, detail="Cannot delete a default project")
 
-    # Clean up managed repos
-    repos = await store.get_project_repositories(project_id)
-    for repo in repos:
-        if repo.get("is_managed"):
-            if not await revoke_and_delete_managed_repository(
-                store, dependencies.forge, repo["name"]
-            ):
-                raise HTTPException(
-                    status_code=503,
-                    detail="Repository credential revocation is retryable",
-                )
-
-    # Clean up knowledge_index in vector DB (no FK cascade across databases)
-    try:
-        async with dependencies.vector_db.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id)
-            )
-    except Exception as e:
-        logger.warning(
-            f"Failed to clean up knowledge_index for project {project_id}: {e}"
-        )
-
-    # Detach referencing rows that lack ON DELETE CASCADE/SET NULL
-    uuid_val = UUID(project_id)
-    async with store.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val
-        )
-        await conn.execute(
-            "UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val
-        )
-
-    # The project's per-folder principals go before its folder does (their
-    # rows outlive the project; what this cannot finish, the sweep does).
-    await folder_grants.revoke_folder_grants(
-        store,
-        dependencies.main_cloud_router,
-        reason="project_deleted",
-        project_id=project_id,
+    deletion = await dependencies.store.begin_project_deletion(
+        project_id, requested_by=requested_by, expected_resource=expected_resource
     )
-
-    success = await store.delete_project(project_id)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to delete project")
-
-    # Clean up Keycloak group
-    if dependencies.keycloak_groups.is_initialized:
-        await dependencies.keycloak_groups.delete_project_group(project_id)
-
-    # Clean up main-cloud project folder via the row's backend dispatch.
-    #
-    # The DB row is already gone by this point, so raising here would report a
-    # delete that actually happened as a 500. An unresolvable installation
-    # authority means we cannot say *which* installation holds the folder, and
-    # deleting from a guessed one is unacceptable — so leave the folder in
-    # place, say so, and let the delete stand.
-    backend = dependencies.main_cloud_router.for_project_optional(project)
-    handle_str = project.get("main_cloud_folder_handle") or (
-        str(project["nextcloud_folder_id"])
-        if project.get("nextcloud_folder_id")
-        else None
+    outcome = await project_deletion.drive_project_deletion(
+        project_id, dependencies=dependencies, claimed=deletion
     )
-    if backend is None:
-        if handle_str:
-            logger.warning(
-                "Project %s deleted, but its main-cloud folder (%s on provider "
-                "%r) was left in place: no resolvable backend instance for the "
-                "row. The folder needs manual cleanup.",
-                project_id,
-                handle_str,
-                project.get("main_cloud_backend"),
-            )
-    elif handle_str and backend.is_initialized:
-        try:
-            handle = ProjectFolderHandle.from_db(
-                handle_str,
-                backend=project.get("main_cloud_backend") or backend.backend_id,
-            )
-            await backend.delete_project_folder(handle)
-        except Exception as e:
-            logger.warning(
-                f"Failed to delete main-cloud folder for project {project_id}: {e}"
-            )
-
-    return {"status": "deleted"}
+    if outcome.status == project_deletion.DELETED:
+        return {"status": "deleted"}
+    return {
+        "status": "deleting",
+        "detail": (
+            "The project is being deleted and refuses new work; the rest of "
+            "the deletion is retried in the background"
+            + (f" ({outcome.error})." if outcome.error else ".")
+        ),
+    }
 
 
 # =============================================================================
@@ -897,12 +843,12 @@ async def add_project_member(
         if dependencies.forge.is_initialized:
             try:
                 if user and user.get("email"):
-                    repos = await store.get_project_repositories(project_id)
-                    for repo in repos:
-                        if repo.get("is_managed"):
-                            await dependencies.forge.grant_user_repo_access(
-                                user["email"], repo["name"]
-                            )
+                    await grant_project_repo_access(
+                        store=store,
+                        forge=dependencies.forge,
+                        project_id=project_id,
+                        email=user["email"],
+                    )
             except Exception as e:
                 logger.warning(
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"

@@ -3673,14 +3673,27 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 "and run the file instead."
             )
         pane = self._tmux_pane_target(tab_name)
+        pane_id = self._tabs[tab_name].pane_id
+        assert pane_id is not None
         expected_value = expected or ""
-        output = self._tmux_mutate_checked(
-            self._pending_guard_cas_shell(pane, expected_value)
-            + self._pending_guard_set_shell(pane, sentinel)
-            + f"\ntmux send-keys -t {pane} -l {shlex.quote(command)}\n"
-            f"tmux send-keys -t {pane} Enter",
-            operation=f"reserve and send command on {tab_name}",
-        )
+        try:
+            output = self._tmux_mutate_checked(
+                self._pending_guard_cas_shell(pane, expected_value)
+                + self._pending_guard_set_shell(pane, sentinel)
+                + f"\ntmux send-keys -t {pane} -l {shlex.quote(command)}\n"
+                f"tmux send-keys -t {pane} Enter",
+                operation=f"reserve and send command on {tab_name}",
+                pane_context=(tab_name, pane_id),
+            )
+        except ShellEndedError as ended:
+            # With a working_dir the typed text has a newline before the
+            # sentinel line, so bash runs the command before tmux sends
+            # Enter; a command that ends its own shell (``kill -9 $$``)
+            # fails that Enter every time.
+            raise self._shell_ended_by_command(tab_name, session_reset=False) from ended
+        except ShellSessionLostError as lost:
+            self._ensure_shell()
+            raise self._shell_ended_by_command(tab_name, session_reset=True) from lost
         self._warn_if_stale_guard_cleared(tab_name, output)
         tab = self._tabs.get(tab_name)
         if tab is None:
@@ -4582,18 +4595,24 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             return tab
         session_reset = self._shell_creations != creations
         if tab is None or tab.pane_id != pane_id or session_reset:
-            logger.warning(
-                "shell_ended_mid_command: session=%s tab=%s session_reset=%s",
-                self._session_name,
-                tab_name,
-                session_reset,
-            )
-            # This error tells the model; a reattach notice would repeat it.
-            self._lost_tab_notices.discard(tab_name)
-            raise ShellEndedError(
-                command_shell_ended_message(tab_name, session_reset=session_reset)
-            )
+            raise self._shell_ended_by_command(tab_name, session_reset=session_reset)
         return None
+
+    def _shell_ended_by_command(
+        self, tab_name: str, *, session_reset: bool
+    ) -> ShellEndedError:
+        """Log and build the tool error for a shell that ended under a command."""
+        logger.warning(
+            "shell_ended_mid_command: session=%s tab=%s session_reset=%s",
+            self._session_name,
+            tab_name,
+            session_reset,
+        )
+        # This error tells the model; a reattach notice would repeat it.
+        self._lost_tab_notices.discard(tab_name)
+        return ShellEndedError(
+            command_shell_ended_message(tab_name, session_reset=session_reset)
+        )
 
     def _tmux_send_keys(self, tab_name: str, text: str, enter: bool = True) -> None:
         """Send keys to a remote tmux pane."""
@@ -4882,8 +4901,8 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     all_lines = self._tmux_capture(tab_name)
                 except ShellEndedError as ended:
                     # The pane exited under the command; the session lives on.
-                    raise ShellEndedError(
-                        command_shell_ended_message(tab_name, session_reset=False)
+                    raise self._shell_ended_by_command(
+                        tab_name, session_reset=False
                     ) from ended
                 except WorkspaceUnavailableError as lost:
                     resumed_tab = (

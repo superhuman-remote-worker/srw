@@ -651,3 +651,17 @@ def test_job_options_use_the_spec():
     assert options.include_partial_messages is False
     plain = job_options(_job_spec(None), tools=tools, env={}, cwd=Path("/tmp"))
     assert plain.system_prompt == {"type": "preset", "preset": "claude_code"}
+
+
+def test_job_options_send_the_served_model():
+    pytest.importorskip("claude_agent_sdk")
+    from dataclasses import replace
+
+    from srw_claude_code_harness.tools import make_tools
+
+    spec = _job_spec(None)
+    spec = replace(spec, model=replace(spec.model, model="m-row", served_model="m"))
+    options = job_options(
+        spec, tools=make_tools(_stub_workspace(), ["Bash"]), env={}, cwd=Path("/tmp")
+    )
+    assert options.model == "m"

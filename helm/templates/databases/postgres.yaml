@@ -54,6 +54,11 @@ spec:
             - "tcp_keepalives_interval=10"
             - "-c"
             - "tcp_keepalives_count=3"
+            {{- with .Values.databases.postgres.maxConnections }}
+            # The same max_connections CloudNativePG gets via srw.dbParameters.
+            - "-c"
+            - {{ printf "max_connections=%v" . | quote }}
+            {{- end }}
           ports:
             - containerPort: 5432
           env:

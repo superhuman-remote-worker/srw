@@ -10,9 +10,11 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 import httpx
+
 import pytest
 
 from tests import test_manifest_native_full_schema as full_schema
+from tests._project_delete_stubs import delete_project_hook
 
 actor = full_schema.actor
 database = full_schema.database
@@ -294,7 +296,11 @@ async def test_project_gate_against_real_routes_and_full_postgres_schema(
     async def activate(prepared, user, **kwargs):
         return await validate_project_activation(database, prepared, user, **kwargs)
 
-    resources = ManifestResourceService(database, project_activation=activate)
+    resources = ManifestResourceService(
+        database,
+        project_activation=activate,
+        delete_project=delete_project_hook(database),
+    )
     app = FastAPI()
     app.state.manifest_dependencies_factory = lambda: ManifestDependencies(
         ManifestService(), approved, resources=resources

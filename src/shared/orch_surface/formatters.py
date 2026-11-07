@@ -1177,8 +1177,10 @@ def format_datasource_test(datasource_id: str, result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_action_error(action: str, job_id: str, error: Exception) -> str:
-    """Format an action error."""
+def format_action_error(
+    action: str, job_id: str, error: Exception, *, target_kind: str = "job"
+) -> str:
+    """Format an action error. ``target_kind`` names what ``job_id`` is."""
     error_msg = str(error)
 
     # Extract detail from httpx HTTPStatusError
@@ -1189,7 +1191,7 @@ def format_action_error(action: str, job_id: str, error: Exception) -> str:
         except Exception:
             error_msg = f"HTTP {error.response.status_code}: {error_msg}"  # type: ignore[union-attr]
 
-    return f"Action '{action}' failed for job {job_id}:\n{error_msg}"
+    return f"Action '{action}' failed for {target_kind} {job_id}:\n{error_msg}"
 
 
 # =============================================================================
@@ -1480,7 +1482,7 @@ def _liveness_lines(data: dict[str, Any]) -> list[str]:
     if elapsed is not None:
         mins = int(elapsed) // 60
         secs = int(elapsed) % 60
-        lines.append(f"Elapsed since creation: {mins}m {secs}s")
+        lines.append(f"Duration: {mins}m {secs}s")
     for source in data.get("sources") or []:
         if not isinstance(source, dict):
             continue
@@ -3571,6 +3573,69 @@ def _officer_recent_lines(recent: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_officer_commission_result(data: dict[str, Any]) -> str:
+    """Say who now holds the post and what he starts from."""
+    thread_id = data.get("thread_id")
+    lines = [
+        f"Officer commissioned (thread {_short_id(thread_id)}"
+        + (f', "{data["title"]}"' if data.get("title") else "")
+        + ")."
+    ]
+    if data.get("state_restored"):
+        lines.append("His state from the previous incarnation was restored.")
+    vacant = int(data.get("while_vacant") or 0)
+    if vacant:
+        lines.append(f"{vacant} event(s) recorded while the post was vacant reach him.")
+    lines.append(
+        "His first wake is the continuity brief. He has no order yet: give him "
+        "one with send_officer_note, and watch him with get_project_officer."
+    )
+    return "\n".join(lines)
+
+
+def format_officer_decommission_result(data: dict[str, Any]) -> str:
+    """A warning is not a decommission: say which one happened."""
+    jobs = list(data.get("in_flight_jobs") or [])
+    if data.get("status") == "in_flight":
+        listed = "\n".join(
+            f"- {_short_id(j.get('job_id'))} {j.get('status') or ''} "
+            f"{j.get('title') or ''}".rstrip()
+            for j in jobs
+        )
+        return (
+            "NOT decommissioned: "
+            + (data.get("warning") or f"{len(jobs)} job(s) in flight.")
+            + (f"\n{listed}" if listed else "")
+            + "\nThose jobs keep running either way; call again with force=true "
+            "to stand him down."
+        )
+    tail = (
+        f" {len(jobs)} job(s) left running; their completions wait on the vacant post."
+        if jobs
+        else ""
+    )
+    return (
+        f"Officer decommissioned (thread {_short_id(data.get('thread_id'))}). "
+        "His state is kept on the post; commission_officer brings him back with "
+        "it." + tail
+    )
+
+
+def format_officer_hold_result(data: dict[str, Any]) -> str:
+    """Hold or release, and whether he was told."""
+    told = (
+        "He was told."
+        if data.get("notified")
+        else "He was not live; he finds it at his next wake."
+    )
+    if data.get("status") == "released":
+        return f"Hold released (thread {_short_id(data.get('thread_id'))}). {told}"
+    return (
+        f"Officer on maintenance hold (thread {_short_id(data.get('thread_id'))}): "
+        "no wakes, no dispatches until release_officer. " + told
+    )
+
+
 def format_officer_note_result(data: dict[str, Any]) -> str:
     """State how a note landed. 'Sent' is not an outcome here."""
     delivered = data.get("delivered")
@@ -3589,9 +3654,14 @@ def format_officer_note_result(data: dict[str, Any]) -> str:
             f"{_short_id(thread_id)}). He reads it when the hold lifts; "
             "nothing else delivers it in the meantime."
         )
+    # 'queued' is the only answer for a running officer too: every note goes
+    # through his durable inbox, and the wake drain hands it to a live runtime
+    # within seconds. Only without a live runtime does it wait for his wake.
     wake = data.get("next_wake_at")
-    when = f" at {wake}" if wake else " at his next wake"
+    when = f" ({wake})" if wake else ""
     return (
-        f"Note queued durably (thread {_short_id(thread_id)}) — he was not "
-        f"live. He reads it{when}."
+        f"Note queued in his durable inbox (thread {_short_id(thread_id)}). "
+        "A running officer gets it within seconds; if his runtime is down, he "
+        f"reads it when it is back or at his next wake{when}. It is not read "
+        "until it shows in his log."
     )

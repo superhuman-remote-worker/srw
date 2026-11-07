@@ -268,6 +268,21 @@ def _endpoint_is_subscription_proxy(endpoint: Mapping[str, Any]) -> bool:
     )
 
 
+def _capability_probe_target(
+    rows: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    """The (capability, upstream model) an endpoint without a model list is
+    tested by: its first embedding or rerank row, enabled rows first. ``None``
+    when it has neither, so chat endpoints never spend a completion."""
+    from orchestrator.services.llm_endpoint_probe import capability_to_probe
+
+    for row in sorted(rows, key=lambda row: not row.get("enabled", True)):
+        capability = capability_to_probe(row.get("capabilities"))
+        if capability and not _service_adapter(row):
+            return capability, row.get("served_model_id") or row["model_id"]
+    return None
+
+
 @dataclass(frozen=True)
 class ProviderCatalogService:
     store: ProviderCatalogStore
@@ -495,7 +510,12 @@ class ProviderCatalogService:
         return {"status": "deleted"}
 
     async def test_provider_endpoint(self, endpoint_id: str) -> dict[str, Any]:
-        """Probe a system endpoint by calling ``GET {base_url}/models`` server-side."""
+        """Probe a system endpoint server-side.
+
+        ``GET {base_url}/models`` first. A 404 there only means the server has
+        no model list (TEI): an endpoint with an embedding or rerank row is
+        then judged by one minimal call of that capability instead.
+        """
         endpoint = await self.store.get_system_llm_endpoint(endpoint_id)
         if endpoint is None:
             raise HTTPException(status_code=404, detail="System endpoint not found")
@@ -504,6 +524,24 @@ class ProviderCatalogService:
             base_url=endpoint["base_url"],
             api_key=endpoint.get("api_key"),
         )
+        if result.status == 404:
+            target = _capability_probe_target(
+                await self.store.list_models(
+                    provider_kind="endpoint", provider_ref=str(endpoint["id"])
+                )
+            )
+            if target is not None:
+                from orchestrator.services.llm_endpoint_probe import (
+                    probe_endpoint_capability,
+                )
+
+                capability, model = target
+                result = await probe_endpoint_capability(
+                    base_url=endpoint["base_url"],
+                    api_key=endpoint.get("api_key"),
+                    capability=capability,
+                    model=model,
+                )
         return {
             "ok": result.ok,
             "status": result.status,

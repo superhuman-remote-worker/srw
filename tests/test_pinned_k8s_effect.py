@@ -14,6 +14,8 @@ from orchestrator.services.pinned_k8s_effect import (
     legacy_pinned_namespace_candidates,
     protect_legacy_pinned_agent_authority,
     release_planned_pinned_pod_authority,
+    release_pvc_finalizer_exact,
+    retire_terminal_claimant_pod,
     run_bounded_k8s_mutation,
 )
 
@@ -292,3 +294,222 @@ async def test_terminal_warm_delete_cannot_delete_same_name_successor():
     assert api.pod.metadata.uid == "successor-uid"
     assert api.pod.metadata.deletion_timestamp is None
     assert api.pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+
+
+class _Status(Exception):
+    def __init__(self, status):
+        super().__init__(f"Kubernetes status {status}")
+        self.status = status
+
+
+class _PvcApi:
+    """One PVC whose JSON Patch tests behave like the API server's."""
+
+    PVC_PROTECTION = "kubernetes.io/pvc-protection"
+
+    def __init__(self, *, before_patch=None, refusal=409):
+        self.claim = SimpleNamespace(
+            metadata=SimpleNamespace(
+                uid="pvc-u1",
+                resource_version="7",
+                finalizers=[PINNED_AUTHORITY_FINALIZER, self.PVC_PROTECTION],
+            )
+        )
+        self.before_patch = before_patch
+        self.refusal = refusal
+        self.patches = 0
+
+    def read_namespaced_persistent_volume_claim(
+        self, *, name, namespace, _request_timeout=None
+    ):
+        del name, namespace, _request_timeout
+        if self.claim is None:
+            raise _Status(404)
+        return self.claim
+
+    def patch_namespaced_persistent_volume_claim(
+        self, *, name, namespace, body, _request_timeout=None
+    ):
+        del name, namespace, _request_timeout
+        self.patches += 1
+        if self.before_patch is not None:
+            self.before_patch(self)
+        if self.claim is None:
+            raise _Status(404)
+        tests = {op["path"]: op["value"] for op in body if op["op"] == "test"}
+        metadata = self.claim.metadata
+        if (
+            tests["/metadata/uid"] != metadata.uid
+            or tests["/metadata/resourceVersion"] != metadata.resource_version
+            or tests["/metadata/finalizers"] != metadata.finalizers
+        ):
+            raise _Status(self.refusal)
+        metadata.finalizers = list(body[-1]["value"])
+        metadata.resource_version = str(int(metadata.resource_version) + 1)
+
+
+async def _release(api, **kwargs):
+    return await release_pvc_finalizer_exact(
+        api,
+        pvc_name="pvc-agent-s-1",
+        expected_pvc_uid=kwargs.pop("expected_pvc_uid", "pvc-u1"),
+        namespace="agents-a",
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", [409, 422])
+async def test_pvc_finalizer_release_rereads_after_the_protection_controller_races(
+    refusal,
+):
+    """Kubernetes drops pvc-protection right after a delete (dev 2026-11-05)."""
+
+    def protection_controller_runs_once(api):
+        api.before_patch = None
+        api.claim.metadata.finalizers = [PINNED_AUTHORITY_FINALIZER]
+        api.claim.metadata.resource_version = "8"
+
+    api = _PvcApi(before_patch=protection_controller_runs_once, refusal=refusal)
+    assert await _release(api)
+    assert api.patches == 2
+    assert api.claim.metadata.finalizers == []
+
+
+@pytest.mark.asyncio
+async def test_pvc_finalizer_release_gives_up_after_bounded_stale_refusals():
+    def always_changes(api):
+        api.claim.metadata.resource_version = str(
+            int(api.claim.metadata.resource_version) + 1
+        )
+
+    api = _PvcApi(before_patch=always_changes)
+    assert not await _release(api, attempts=3)
+    assert api.patches == 3
+    assert PINNED_AUTHORITY_FINALIZER in api.claim.metadata.finalizers
+
+
+@pytest.mark.asyncio
+async def test_pvc_finalizer_release_does_not_retry_other_refusals():
+    def forbidden(_api):
+        raise _Status(403)
+
+    api = _PvcApi(before_patch=forbidden)
+    assert not await _release(api)
+    assert api.patches == 1
+
+
+@pytest.mark.asyncio
+async def test_pvc_finalizer_release_never_touches_a_same_name_replacement():
+    def replaced(api):
+        api.before_patch = None
+        api.claim = SimpleNamespace(
+            metadata=SimpleNamespace(
+                uid="pvc-u2",
+                resource_version="1",
+                finalizers=[PINNED_AUTHORITY_FINALIZER],
+            )
+        )
+
+    api = _PvcApi(before_patch=replaced)
+    assert not await _release(api)
+    assert api.patches == 1
+    assert api.claim.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+
+
+@pytest.mark.asyncio
+async def test_pvc_finalizer_release_counts_a_vanished_claim_as_released():
+    def collected(api):
+        api.claim = None
+
+    api = _PvcApi(before_patch=collected)
+    assert await _release(api)
+    api = _PvcApi()
+    api.claim = None
+    assert await _release(api)
+
+
+@pytest.mark.asyncio
+async def test_pvc_finalizer_release_is_idempotent_once_released():
+    api = _PvcApi()
+    api.claim.metadata.finalizers = [_PvcApi.PVC_PROTECTION]
+    assert await _release(api)
+    assert api.patches == 0
+
+
+class _TerminalPodApi:
+    def __init__(self, *, volumes, restart_policy="Never"):
+        self.pod = SimpleNamespace(
+            metadata=SimpleNamespace(
+                uid="pod-u1",
+                resource_version="3",
+                labels={"srw.io/provision-attempt": "a1"},
+                finalizers=[PINNED_AUTHORITY_FINALIZER],
+                deletion_timestamp="2026-11-05T19:00:00Z",
+            ),
+            spec=SimpleNamespace(
+                containers=[SimpleNamespace(name="agent")],
+                init_containers=[],
+                ephemeral_containers=[],
+                volumes=volumes,
+                restart_policy=restart_policy,
+            ),
+            status=SimpleNamespace(
+                container_statuses=[
+                    SimpleNamespace(
+                        name="agent",
+                        state=SimpleNamespace(terminated=SimpleNamespace()),
+                    )
+                ]
+            ),
+        )
+        self.released = False
+
+    def read_namespaced_pod(self, *, name, namespace, _request_timeout=None):
+        del name, namespace, _request_timeout
+        if self.released:
+            raise _Status(404)
+        return self.pod
+
+    def patch_namespaced_pod(self, *, name, namespace, body, _request_timeout=None):
+        del name, namespace, _request_timeout
+        assert body[-1]["value"] == []
+        self.released = True
+
+
+def _pvc(name):
+    return SimpleNamespace(persistent_volume_claim=SimpleNamespace(claim_name=name))
+
+
+_SCRATCH = SimpleNamespace(persistent_volume_claim=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pvc_name", "volumes", "restart_policy", "released"),
+    [
+        # A claim-bearing pre-setup abort mounts only its own claim.
+        ("pvc-own", [_pvc("pvc-own"), _SCRATCH], "Never", True),
+        ("pvc-own", [_pvc("pvc-own"), _pvc("pvc-other")], "Never", False),
+        ("pvc-own", [_pvc("pvc-own")], "Always", False),
+        ("pvc-own", [_pvc("pvc-other")], "Never", False),
+        # The claim-less case keeps refusing every PVC.
+        (None, [_SCRATCH], "Never", True),
+        (None, [_pvc("pvc-own")], "Never", False),
+        (None, [_SCRATCH], "OnFailure", False),
+    ],
+)
+async def test_nonrestartable_retirement_allows_only_the_pods_own_claim(
+    pvc_name, volumes, restart_policy, released
+):
+    api = _TerminalPodApi(volumes=volumes, restart_policy=restart_policy)
+    await retire_terminal_claimant_pod(
+        api,
+        pod_name="srw-agent-s-1",
+        pod_uid="pod-u1",
+        namespace="agents-a",
+        expected_labels={"srw.io/provision-attempt": "a1"},
+        pvc_name=pvc_name,
+        require_nonrestartable=True,
+    )
+    assert api.released is released

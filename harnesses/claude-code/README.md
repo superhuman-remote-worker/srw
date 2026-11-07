@@ -44,7 +44,9 @@ idle, or after 600 seconds without a Job.
 
 ## The model
 
-The Job's model arrives in the start request. This image speaks only the
+The Job's model arrives in the start request. When the catalog row serves the
+model under another name (its served model ID), that name is the one sent to
+the provider. This image speaks only the
 Anthropic Messages API, so the model must be a catalog model whose **API shape**
 is `anthropic-messages` (Admin → Models). Set that shape on an endpoint-backed
 model to point the harness at an Anthropic-compatible server or the

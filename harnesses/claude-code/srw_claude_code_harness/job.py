@@ -30,6 +30,13 @@ class ModelRoute:
     client_protocol: str | None
     base_url: str | None
     api_key: str | None = field(repr=False)
+    # The name the provider knows when the catalog row's id differs from it
+    # (``models.served_model_id``, sent as ``llm.served_model``).
+    served_model: str | None = None
+
+    @property
+    def upstream_model(self) -> str:
+        return self.served_model or self.model
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,7 @@ def parse_job_start(
             client_protocol=_text(llm.get("client_protocol")),
             base_url=_text(llm.get("base_url")),
             api_key=_text(llm.get("api_key")),
+            served_model=_text(llm.get("served_model")),
         ),
         workspace=WorkspaceAccess(
             host=host,

@@ -273,12 +273,14 @@ class TestCreateNote:
         mock_db.execute_query.side_effect = [
             [{"n.id": "chose-jwt"}],  # base slug collides
             [],  # suffixed slug is free
+            [],  # no note was waiting to link to it
         ]
         r1 = kg.create_note("proj-1", "Chose JWT", "decision", "same-body")
 
         kg2, mock_db2 = _make_kg()
         mock_db2.execute_query.side_effect = [
             [{"n.id": "chose-jwt"}],
+            [],
             [],
         ]
         r2 = kg2.create_note("proj-1", "Chose JWT", "decision", "same-body")
@@ -289,10 +291,10 @@ class TestCreateNote:
     def test_collision_different_content_diverges(self):
         # Same title, different content → different suffix (both notes kept).
         kg, mock_db = _make_kg()
-        mock_db.execute_query.side_effect = [[{"n.id": "t"}], []]
+        mock_db.execute_query.side_effect = [[{"n.id": "t"}], [], []]
         r1 = kg.create_note("proj-1", "T", "decision", "body-A")
         kg2, mock_db2 = _make_kg()
-        mock_db2.execute_query.side_effect = [[{"n.id": "t"}], []]
+        mock_db2.execute_query.side_effect = [[{"n.id": "t"}], [], []]
         r2 = kg2.create_note("proj-1", "T", "decision", "body-B")
         assert r1 != r2
 
@@ -403,6 +405,55 @@ class TestCreateNote:
         result = kg.create_note("proj-1", "My Note", "learning", "content")
         assert result == "my-note"
 
+    def test_a_link_records_its_target_while_it_does_not_exist(self):
+        # One write per link, not a MATCH that skips a missing target: the
+        # write makes the edge or keeps the link pending on the source.
+        kg, mock_db = _make_kg()
+        mock_db.execute_query.return_value = []
+        kg.create_note(
+            "proj-1",
+            "Title",
+            "decision",
+            "content",
+            links=[{"target": "later", "type": "REFERENCES"}],
+        )
+        (call,) = [
+            c for c in mock_db.execute_write.call_args_list if "REFERENCES" in c[0][0]
+        ]
+        query, params = call[0]
+        assert "OPTIONAL MATCH (b:Note" in query
+        assert "pending_links" in query
+        assert params["entry"] == "REFERENCES|later"
+
+    def test_creating_a_note_links_the_notes_that_waited_for_it(self):
+        kg, mock_db = _make_kg()
+        mock_db.execute_query.side_effect = [
+            [],  # slug is free
+            [{"src": "early", "entries": ["SUPPORTS|chose-jwt"]}],
+        ]
+        kg.create_note("proj-1", "Chose JWT", "decision", "content")
+        lookup = mock_db.execute_query.call_args_list[1][0]
+        assert lookup[1] == {"pid": "proj-1", "suffix": "|chose-jwt"}
+        (call,) = [
+            c for c in mock_db.execute_write.call_args_list if "SUPPORTS" in c[0][0]
+        ]
+        assert call[0][1]["src"] == "early"
+        assert call[0][1]["tgt"] == "chose-jwt"
+
+    def test_a_target_that_only_ends_in_the_new_id_is_not_linked(self):
+        # "x|chose-jwt" ends with "|chose-jwt" but names another note.
+        kg, mock_db = _make_kg()
+        mock_db.execute_query.side_effect = [
+            [],
+            [{"src": "early", "entries": ["SUPPORTS|x|chose-jwt", "BOGUS|chose-jwt"]}],
+        ]
+        kg.create_note("proj-1", "Chose JWT", "decision", "content")
+        assert not [
+            c
+            for c in mock_db.execute_write.call_args_list
+            if "SUPPORTS" in c[0][0] or "BOGUS" in c[0][0]
+        ]
+
 
 # =============================================================================
 # 10.6: read_note()
@@ -449,6 +500,20 @@ class TestReadNote:
         ]
         result = kg.read_note("proj-1", "note-1")
         assert result["id"] == "note-1"
+
+    def test_pending_links_come_back_as_relationships_without_an_edge(self):
+        kg, mock_db = _make_kg()
+        node = {"id": "note-1", "pending_links": ["REFERENCES|later", "bad"]}
+        mock_db.execute_query.side_effect = [
+            [{"n": node, "tags": [], "keywords": []}],
+            [],
+            [],
+        ]
+        result = kg.read_note("proj-1", "note-1")
+        assert result["pending_relationships"] == [
+            {"type": "REFERENCES", "target": "later"}
+        ]
+        assert "pending_links" not in result
 
     def test_empty_props_for_unknown_node_type(self):
         kg, mock_db = _make_kg()

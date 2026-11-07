@@ -2,12 +2,15 @@ import {DOCUMENT, Injectable, inject} from '@angular/core';
 import {TranslocoService} from '@jsverse/transloco';
 
 import {PersistentChatService, ThreadCitation} from '../services/persistent-chat.service';
+import {WorkspaceFileDownloadService} from '../services/workspace-file-download.service';
 import {
     citationLocatorText,
+    citationPage,
     citationReasonLabel,
     citationSourceUrl,
     citationState,
     citationStateLabel,
+    citationWorkspacePath,
 } from './citation-status';
 import {openCitationSnapshot} from './citation-snapshot';
 
@@ -23,6 +26,7 @@ import {openCitationSnapshot} from './citation-snapshot';
 export class CitationPopover {
     private readonly doc = inject(DOCUMENT);
     private readonly chat = inject(PersistentChatService);
+    private readonly files = inject(WorkspaceFileDownloadService);
     private readonly i18n = inject(TranslocoService);
 
     private el: HTMLElement | null = null;
@@ -108,12 +112,24 @@ export class CitationPopover {
         }
 
         const actions = this.node('div', 'cpop-actions');
+        // Open source: the web page, else the cited document in this session's
+        // workspace. A cloud document with a backed-up original gets "view
+        // original" instead — that copy is what was cited.
+        const workspacePath = url || citation.has_snapshot ? null : citationWorkspacePath(citation);
+        const threadId = this.chat.threadId();
         if (url) {
             const open = this.button(t('chat.citations.popover.openSource'), () => {
                 window.open(url, '_blank', 'noopener');
                 this.close();
             });
             actions.append(open);
+        } else if (workspacePath && threadId) {
+            actions.append(
+                this.button(t('chat.citations.popover.openSource'), () => {
+                    void this.files.open(threadId, workspacePath, {page: citationPage(citation.locator)});
+                    this.close();
+                }),
+            );
         }
         if (citation.has_snapshot) {
             actions.append(

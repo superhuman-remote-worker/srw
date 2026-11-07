@@ -735,6 +735,7 @@ class TestRemovedMemberLeavesTheCloudGroup:
         )
         provisioning_deps = _deps()
         deps = projects.ProjectDependencies(
+            graph=MagicMock(get=MagicMock(return_value=None)),
             store=store,
             vector_db=MagicMock(),
             forge=SimpleNamespace(is_initialized=False),
@@ -850,6 +851,7 @@ class TestMemberSyncDegradation:
                 ),
             )
         )
+        deps.store.get_project = AsyncMock(return_value=project)
 
         result = await provisioning.ensure_project_cloud_resources(
             project, dependencies=deps
@@ -859,9 +861,42 @@ class TestMemberSyncDegradation:
         deps.logger.warning.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "current",
+        [None, {"id": PROJECT_ID, "deletion_requested_at": "2026-11-07T10:00:00Z"}],
+        ids=["deleted", "being-deleted"],
+    )
+    async def test_a_deleted_project_gets_no_group_or_folder_back(self, current):
+        """A heal a page open fired just before the delete must not re-create
+        what the deletion's teardown removes."""
+        keycloak = SimpleNamespace(
+            is_initialized=True,
+            ensure_project_group=AsyncMock(side_effect=AssertionError("re-created")),
+        )
+        deps = _deps(
+            keycloak_groups=keycloak,
+            main_cloud_router=SimpleNamespace(
+                for_project_optional=MagicMock(
+                    side_effect=AssertionError("reached the cloud")
+                ),
+                for_owner=MagicMock(side_effect=AssertionError("reached the cloud")),
+            ),
+        )
+        deps.store.get_project = AsyncMock(return_value=current)
+        project = {"id": PROJECT_ID, "name": "Going", "is_default": False}
+
+        result = await provisioning.ensure_project_cloud_resources(
+            project, dependencies=deps
+        )
+
+        assert result is project
+        keycloak.ensure_project_group.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_a_member_sweep_failure_never_propagates(self):
         store = MagicMock()
         store.get_project_members = AsyncMock(side_effect=RuntimeError("db gone"))
+        store.get_project = AsyncMock(side_effect=lambda _pid: {"id": PROJECT_ID})
         backend = SimpleNamespace(
             is_initialized=True,
             backend_id="opencloud",

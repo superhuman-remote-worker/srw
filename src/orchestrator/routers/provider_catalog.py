@@ -189,7 +189,8 @@ async def admin_test_provider_endpoint(
         get_provider_catalog_dependencies
     ),
 ) -> dict[str, Any]:
-    """Probe a system endpoint by calling ``GET {base_url}/models`` server-side."""
+    """Probe a system endpoint server-side: ``GET {base_url}/models``, or on a
+    404 there one minimal embedding/rerank call when its rows declare one."""
     await dependencies.require_admin(request)
     return await dependencies.service.test_provider_endpoint(endpoint_id=endpoint_id)
 

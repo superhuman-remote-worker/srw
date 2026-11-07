@@ -75,7 +75,13 @@ async def retire_removed_children(db, manager_id, retained_ids):
     )
 
 
-async def retire_project_resources(conn, project_id):
+async def assert_project_retirable(conn, project_id):
+    """Raise the 409 that refuses the Project's deletion; change nothing.
+
+    Runs in the caller's transaction and holds its locks until that ends. The
+    project delete also runs it before it deletes anything outside the
+    database, so a refused delete leaves the Project whole.
+    """
     # The same lock orders legacy Project deletion against native apply.
     await lock_manifest_execution_catalog(conn)
     resources = await conn.fetch(
@@ -114,6 +120,10 @@ async def retire_project_resources(conn, project_id):
                 409,
                 "A saved resource outside this Project still references its definitions.",
             )
+
+
+async def retire_project_resources(conn, project_id):
+    await assert_project_retirable(conn, project_id)
     await conn.execute(
         """UPDATE srw_resources SET deleted_at=COALESCE(deleted_at,now()),project_id=NULL,
         updated_at=now(),resource_version=resource_version+1 WHERE project_id=$1""",

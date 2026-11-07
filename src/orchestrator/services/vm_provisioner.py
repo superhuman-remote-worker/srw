@@ -3198,6 +3198,7 @@ class VMProvisioner:
         expected_rootdisk_pvc_uid: str | None = None,
         entity_type: str = "job",
         parent_cleanup: Mapping[str, Any] | None = None,
+        record_deleted_status: bool = True,
     ) -> bool:
         generation = _provision_generation(provision_generation)
         if entity_type == "job" and purge_disk:
@@ -3249,6 +3250,8 @@ class VMProvisioner:
                 kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
             if parent_cleanup is not None:
                 kwargs["parent_cleanup"] = dict(parent_cleanup)
+            if not record_deleted_status:
+                kwargs["record_deleted_status"] = False
             return await self._delete_http(job_id, **kwargs)
 
         return False
@@ -3286,6 +3289,56 @@ class VMProvisioner:
             **(
                 {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
             ),
+        )
+
+    async def prove_legacy_thread_vm_absent(
+        self, thread_id: str, *, provision_generation: str
+    ) -> bool:
+        """Delete a legacy-failed thread VM generation, then prove it absent.
+
+        A legacy create that failed with an unknown transport outcome may still
+        have made a VM. The controller runs create and delete for one name
+        under the same lock and refuses a signed request older than its replay
+        window, so once that window has passed a delete either removes what a
+        late create made or finds nothing; 404 counts as done. Only a signed
+        absence observation after the delete is proof: VM, VMI, launcher Pod
+        and rootdisk all gone. True only then; anything ambiguous is False and
+        retryable.
+        """
+
+        generation = _provision_generation(provision_generation)
+        if generation is None:
+            return False
+        if await self._current_provision_generation("thread", thread_id) != generation:
+            return False
+        before = await self._probe_vm_teardown_identity(thread_id, generation)
+        if before.disposition not in {"absent", "present"} or before.identity is None:
+            return False
+        if not await self._delete_vm_with_identity(
+            thread_id,
+            purge_disk=True,
+            provision_generation=generation,
+            expected_vm_uid=(
+                before.identity.vm_uid if before.disposition == "present" else None
+            ),
+            expected_rootdisk_pvc_uid=(
+                before.identity.rootdisk_pvc_uid
+                if before.rootdisk_identity_known
+                else None
+            ),
+            entity_type="thread",
+            record_deleted_status=False,
+        ):
+            return False
+        after = await self._probe_vm_teardown_identity(thread_id, generation)
+        return bool(
+            after.disposition == "absent"
+            and after.identity is not None
+            and after.runtime_absence_known
+            and after.vmi_absent
+            and after.launcher_absent
+            and after.rootdisk_identity_known
+            and after.identity.rootdisk_pvc_uid is None
         )
 
     async def release_vm(
@@ -4002,8 +4055,13 @@ class VMProvisioner:
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
         parent_cleanup: Mapping[str, Any] | None = None,
+        record_deleted_status: bool = True,
     ) -> bool:
-        """Delete a VM by sending DELETE to the co-located VM controller."""
+        """Delete a VM by sending DELETE to the co-located VM controller.
+
+        ``record_deleted_status=False`` leaves the owner's VM record to the
+        caller, which settles it only after its own absence proof.
+        """
         if self._http_client is None:
             return False
 
@@ -4082,7 +4140,9 @@ class VMProvisioner:
                     raise RuntimeError(
                         "VM controller delete response generation mismatch"
                     )
-            if generation is not None:
+            if not record_deleted_status:
+                pass
+            elif generation is not None:
                 await self._set_context_if_generation(
                     entity_type, job_id, generation, {"status": "deleted"}
                 )

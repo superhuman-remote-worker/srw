@@ -155,6 +155,44 @@ class TestBuildPriceResolver:
         assert resolve("gateway/foo") is None
         assert resolve("foo") is None
 
+    def test_dashed_anthropic_version_matches_the_dotted_openrouter_id(self):
+        """Anthropic's API id ``claude-opus-5-5`` is OpenRouter's
+        ``anthropic/claude-opus-5.5``. Neither the exact nor the suffix index
+        bridges the separator, so every ``x-y`` Claude model went unpriced: a
+        6.7M-token Opus job on dev reported its side model's $0.05 as the cost.
+        The ``:batch`` variant must not be picked up instead."""
+        resolve = _build_price_resolver(
+            {
+                "anthropic/claude-opus-5.5": self._P,
+                "anthropic/claude-opus-5.5:batch": self._Q,
+                "anthropic/claude-haiku-4.5": self._Q,
+            }
+        )
+        assert resolve("claude-opus-5-5") is self._P
+        assert resolve("Claude-Opus-5-5") is self._P
+        assert resolve("claude-haiku-4-5") is self._Q
+        # A dotted catalog id still takes the exact-suffix path.
+        assert resolve("claude-opus-5.5") is self._P
+
+    def test_loose_version_match_is_digit_dot_digit_only(self):
+        """Only a dot between two digits is a version separator; a name that
+        differs elsewhere must not start matching."""
+        resolve = _build_price_resolver({"openai/gpt-5.5": self._P})
+        assert resolve("gpt-5-5") is self._P
+        assert resolve("gpt-55") is None
+        assert resolve("gpt5-5") is None
+
+    def test_loose_version_collision_fails_closed(self):
+        """Two catalog ids that differ only by separator are ambiguous for a
+        spelling that matches neither exactly, so it stays unpriced."""
+        resolve = _build_price_resolver(
+            {"a/foo-1.5.2": self._P, "b/foo-1-5.2": self._Q}
+        )
+        assert resolve("foo-1-5-2") is None
+        # Each exact spelling still resolves to its own provider.
+        assert resolve("foo-1.5.2") is self._P
+        assert resolve("foo-1-5.2") is self._Q
+
     def test_none_empty_and_absent(self):
         resolve = _build_price_resolver({"openai/gpt-5.5": self._P})
         assert resolve(None) is None
@@ -328,6 +366,29 @@ class TestSyncLlmRates:
         )
         assert n == 3
         assert ("gpt-5.5", "prompt-token", Decimal("0.0000025")) in conn.inserts
+
+    @pytest.mark.asyncio
+    async def test_dashed_claude_catalog_id_is_seeded_under_its_own_name(self):
+        """The rate lands under the catalog id the ledger records
+        (``claude-opus-5-5``), not under OpenRouter's dotted spelling."""
+        conn = FakeConn()
+        n = await sync_llm_rates(
+            FakePool(conn),
+            [("claude-opus-5-5", None)],
+            prices={
+                "anthropic/claude-opus-5.5": LlmTokenPrices(
+                    Decimal("0.000004"), Decimal("0.00002"), Decimal("0.0000002")
+                )
+            },
+            now=self._TS,
+        )
+        assert n == 3
+        assert ("claude-opus-5-5", "prompt-token", Decimal("0.000004")) in conn.inserts
+        assert (
+            "claude-opus-5-5",
+            "cached-prompt-token",
+            Decimal("0.0000002"),
+        ) in conn.inserts
 
     @pytest.mark.asyncio
     async def test_bare_pricing_id_matches_by_suffix(self):

@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -125,6 +126,8 @@ async def retire_orphaned_pinned_runtime(
     )
     if not thread_id or not generation or not agent_id:
         return False
+    if _offline_retirement_backed_off(thread_id, generation):
+        return False
     settle_status: Literal["ended", "suspended"] = (
         "suspended"
         if str(candidate.get("status") or "") in {"awaiting_user", "suspended"}
@@ -152,14 +155,83 @@ async def retire_orphaned_pinned_runtime(
         )
     except HTTPException as exc:
         if exc.status_code == 409:
-            logger.info(
-                "Offline-runtime retirement lost authority for thread %s; "
-                "preserving the current runtime",
-                thread_id,
-            )
+            _note_offline_retirement_refusal(thread_id, generation, exc.detail)
             return False
         raise
+    _offline_retirement_backoff.pop((thread_id, generation), None)
     return True
+
+
+# A 409 from these reasons means the runtime moved on or is about to: the
+# sweep correctly leaves it alone and tries the next life on its own.
+_OFFLINE_RETIREMENT_AUTHORITY_REASONS = frozenset(
+    {
+        "conflict",
+        "authority_changed",
+        "generation_changed",
+        "agent_changed",
+        "agent_recovered",
+        "pinned_runtime_identity_mismatch",
+        "active_workspace_access",
+    }
+)
+# Retried every sweep without growing the backoff: End is mid-proof.
+_OFFLINE_RETIREMENT_TRANSIENT_REASONS = frozenset({"legacy_vm_absence_pending"})
+OFFLINE_RETIREMENT_REFUSAL_BACKOFF_SECONDS = (300.0, 3600.0)
+# (thread, runtime generation) -> (monotonic retry time, current backoff).
+_offline_retirement_backoff: dict[tuple[str, str], tuple[float, float]] = {}
+
+
+def _offline_retirement_refusal_reason(detail: Any) -> tuple[str, str]:
+    if isinstance(detail, Mapping):
+        code = str(detail.get("code") or "conflict")
+        return code, str(detail.get("reason") or code)
+    return "conflict", "conflict"
+
+
+def _offline_retirement_backed_off(thread_id: str, generation: str) -> bool:
+    entry = _offline_retirement_backoff.get((thread_id, generation))
+    return entry is not None and time.monotonic() < entry[0]
+
+
+def _note_offline_retirement_refusal(
+    thread_id: str, generation: str, detail: Any
+) -> None:
+    code, reason = _offline_retirement_refusal_reason(detail)
+    key = (thread_id, generation)
+    if reason in _OFFLINE_RETIREMENT_AUTHORITY_REASONS or code in (
+        _OFFLINE_RETIREMENT_AUTHORITY_REASONS
+    ):
+        _offline_retirement_backoff.pop(key, None)
+        logger.info(
+            "Offline-runtime retirement lost authority for thread %s (%s); "
+            "preserving the current runtime",
+            thread_id,
+            reason,
+        )
+        return
+    if reason in _OFFLINE_RETIREMENT_TRANSIENT_REASONS:
+        logger.info(
+            "Offline-runtime retirement for thread %s is waiting (%s)",
+            thread_id,
+            reason,
+        )
+        return
+    # Begin refused this exact runtime for a reason no later sweep can lift
+    # alone (a malformed or incompatible shape). Say so, then back off.
+    first, ceiling = OFFLINE_RETIREMENT_REFUSAL_BACKOFF_SECONDS
+    previous = _offline_retirement_backoff.get(key)
+    delay = first if previous is None else min(previous[1] * 2, ceiling)
+    _offline_retirement_backoff[key] = (time.monotonic() + delay, delay)
+    logger.warning(
+        "Offline-runtime retirement refused for thread %s (%s: %s); its agent "
+        "Pod and workspace stay held until an operator resolves it. Next "
+        "attempt in %ds",
+        thread_id,
+        code,
+        reason,
+        int(delay),
+    )
 
 
 async def retry_pending_pinned_retirement(
@@ -581,9 +653,17 @@ async def stale_agent_detector(
                 # a warm-pool agent dying genuinely is capacity news for every
                 # officer. 10-min debounce on 'fleet' keeps a flapping node
                 # from spamming.
+                #
+                # An agent bound to a session thread is that session's runtime,
+                # not worker capacity. An Officer's own replaced pod goes
+                # offline here after every recycle (he exits without
+                # deregistering so the recycler can reconcile him), and as an
+                # unattributed row it woke every officer about it.
                 offline_by_project: dict[str, int] = {}
                 unattributed_offline = 0
                 for agent_row in offline_agents:
+                    if agent_row.get("thread_id"):
+                        continue
                     agent_project = agent_row.get("project_id")
                     if agent_project:
                         offline_by_project[str(agent_project)] = (

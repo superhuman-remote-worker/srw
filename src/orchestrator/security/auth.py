@@ -413,6 +413,7 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
                 email=email,
                 preferred_username=preferred_username,
                 display_name=display_name,
+                db=db,
             )
         )
     else:
@@ -781,6 +782,34 @@ def _schedule_default_project_vault(user: Mapping[str, Any]) -> None:
         )
 
 
+async def _regrant_project_repos(db: Any, user: Mapping[str, Any]) -> None:
+    """Re-grant the user the managed repositories of their projects.
+
+    A project's knowledge vault is granted to its creator once, at creation;
+    if their Gitea account did not exist then, nothing else retries it. Capped
+    and best effort: a failure is logged and never fails the login.
+    """
+    try:
+        email = user.get("email")
+        user_id = user.get("id")
+        if db is None or not email or not user_id:
+            return
+        gitea_client = _resolve_provisioning_backend(_forge_provider, "forge")
+        if gitea_client is None or not gitea_client.is_initialized:
+            return
+        from orchestrator.services.workspace_access import regrant_user_project_repos
+
+        await regrant_user_project_repos(
+            store=db, forge=gitea_client, user_id=str(user_id), email=email
+        )
+    except Exception as e:
+        logger.warning(
+            "Gitea access to the projects of user %s not re-granted: %s",
+            user.get("id"),
+            e,
+        )
+
+
 async def _ensure_gitea_user_then_vault(
     user: Mapping[str, Any],
     *,
@@ -788,11 +817,14 @@ async def _ensure_gitea_user_then_vault(
     email: str,
     preferred_username: str | None,
     display_name: str,
+    db: Any = None,
 ) -> None:
-    """The user's Gitea account, then their default project's vault.
+    """The user's Gitea account, then their default project's vault, then
+    (given the store) their projects' managed repositories.
 
     In this order because the vault grants its owner read access by Gitea
-    account, which a first-time user only has once the ensure ran.
+    account, which a first-time user only has once the ensure ran; the
+    re-grant needs that account for the same reason.
     """
     await _ensure_gitea_user(
         sub=sub,
@@ -801,6 +833,7 @@ async def _ensure_gitea_user_then_vault(
         display_name=display_name,
     )
     _schedule_default_project_vault(user)
+    await _regrant_project_repos(db, user)
 
 
 async def _get_user_from_mcp_headers(request: Request, db) -> dict:

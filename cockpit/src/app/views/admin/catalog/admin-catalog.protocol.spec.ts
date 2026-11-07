@@ -203,6 +203,30 @@ describe('API shape', () => {
     expect(fixture.nativeElement.querySelector('.model-row .col-protocol')).not.toBeNull();
   });
 
+  it('hides the select for an endpoint row that is not a chat model', () => {
+    // A SearXNG search adapter on an endpoint: dispatch never calls it with an
+    // API shape, so offering "Chat Completions" there would be fiction.
+    models.models.set([
+      row({capabilities: ['search'], client_protocol: null, effective_client_protocol: 'openai-chat'}),
+    ]);
+    const fixture = setup(makeProviders([ENDPOINT]));
+    fixture.detectChanges();
+    const cell = fixture.nativeElement.querySelector('.model-row .col-protocol');
+    expect(cell.querySelector('app-select')).toBeNull();
+    expect(cell.textContent).toContain('—');
+  });
+
+  it('shows the short shape name in the row and the full one as its tooltip', () => {
+    models.models.set([row()]);
+    const fixture = setup(makeProviders([ENDPOINT]));
+    fixture.detectChanges();
+    const option = fixture.nativeElement.querySelector(
+      '.model-row .col-protocol option[value="openai-chat"]',
+    ) as HTMLOptionElement;
+    expect(option.textContent?.trim()).toBe('Chat Completions');
+    expect(option.title).toBe('OpenAI Chat Completions (openai-chat)');
+  });
+
   it('drives the row select through the template and patches the row', () => {
     models.models.set([row()]);
     const fixture = setup(makeProviders([ENDPOINT]));
@@ -222,20 +246,20 @@ describe('API shape', () => {
     );
     const fixture = setup(makeProviders([ENDPOINT]));
     const component = fixture.componentInstance;
-    const before = component.protocolResync();
+    const before = component.resyncKey(row());
     component.setProtocol(row(), 'anthropic-messages');
     expect(models.loadModels).toHaveBeenCalled();
-    expect(component.protocolResync()).toBe(before + 1);
-    expect(component.protocolError()).toContain('client_protocol not allowed');
+    expect(component.resyncKey(row())).not.toBe(before);
+    expect(component.rowError()).toContain('client_protocol not allowed');
   });
 
   it('resyncs the select without a PATCH when the Helm override is cancelled', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     const component = setup(makeProviders([ENDPOINT])).componentInstance;
-    const before = component.protocolResync();
+    const before = component.resyncKey(row());
     component.setProtocol(row({managed_by_helm: true}), 'anthropic-messages');
     expect(models.updateModel).not.toHaveBeenCalled();
-    expect(component.protocolResync()).toBe(before + 1);
+    expect(component.resyncKey(row())).not.toBe(before);
   });
 
   it('shows the add-form API shape for a plain endpoint but not the subscription proxy', () => {

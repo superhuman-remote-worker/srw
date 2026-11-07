@@ -32,6 +32,35 @@ logger = logging.getLogger(__name__)
 
 MAX_COMPLETION_NOTE_CHARS = 1000
 
+
+def close_last_pending_todo(context: ToolContext, note: str) -> Any:
+    """Complete the one todo still pending after a lifecycle tool succeeded.
+
+    ``next_phase_todos`` and ``job_complete`` are the last act of the todo that
+    asks for them ("stage the execution phase", "close or continue"). When that
+    todo is the only one pending, a successful call completes it, so the model
+    does not spend a whole request on a ``todo_complete`` that only records the
+    call it just made. With more than one todo pending nothing is completed:
+    the phase still has work left. Runs the same side effects as
+    ``todo_complete`` (progress commit, queued-reply drain). Returns the
+    completed TodoItem, or None.
+    """
+    mgr = context.todo_manager
+    pending = mgr.list_pending()
+    if len(pending) != 1:
+        return None
+    todo = mgr.complete(pending[0].id, notes=[note])
+    if todo is None:
+        return None
+    committer = getattr(context, "progress_committer", None)
+    if committer is not None:
+        committer.on_todo_complete(todo.id, todo.content)
+    request_drain = getattr(context, "request_reply_drain", None)
+    if callable(request_drain):
+        request_drain()
+    return todo
+
+
 # Tool metadata for registry
 # Phase availability:
 #   - "strategic": Available only in strategic mode (planning)
@@ -71,9 +100,10 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         - Todo count against the configured bounds (workers: 2-20)
         - Each todo content (minimum 10 characters)
 
-        After calling this tool, complete your current strategic todo by
-        invoking the `todo_complete` tool. The phase transition will then
-        apply the staged todos.
+        When the todo you are working on is the only strategic todo still
+        pending, this call completes it and the tactical phase starts with the
+        staged todos; no `todo_complete` is needed. Otherwise complete the
+        remaining strategic todos first.
 
         Args:
             todos: List of task descriptions. Each must be at least 10 characters.
@@ -123,16 +153,32 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             # Use TodoManager's staging method which handles validation
             result = todo_mgr.stage_tactical_todos(todos, phase_name)
 
-            # The staged batch (ids are assigned when the next phase starts),
-            # then the full current strategic list (D18).
+            # The staged batch (ids are assigned when the next phase starts).
             staged = "\n".join(f"  - {t.content}" for t in todo_mgr.list_staged())
-            message = f"{result}\n{staged}\n\n{todo_mgr.format_for_injection()}"
 
-            # Check if all other strategic todos are complete
-            remaining = [t for t in todo_mgr.list_pending()]
-            if len(remaining) <= 1:
-                # Only the current todo (create todos) remains
-                return f"{message}\n\nAll strategic todos complete. Invoke the `todo_complete` tool to transition to tactical phase."
+            # The planning todo that asked for this call is the last one
+            # pending: close it here instead of costing the model a request.
+            # The strategic list is then finished, so it is not repeated; the
+            # tactical phase opens with its own list (D17-D19).
+            closed = close_last_pending_todo(
+                context, "Staged the next tactical phase with next_phase_todos."
+            )
+            if closed is not None:
+                return (
+                    f"{result}\n{staged}\n\n"
+                    f"Completed: {todo_headline(closed.content)}\n"
+                    "That was the last strategic todo, so this call completed "
+                    "it. The tactical phase starts next with the staged todos."
+                )
+
+            # ...otherwise the full current strategic list (D18).
+            message = f"{result}\n{staged}\n\n{todo_mgr.format_for_injection()}"
+            remaining = todo_mgr.list_pending()
+            if not remaining:
+                return (
+                    f"{message}\n\nAll strategic todos complete. The tactical "
+                    "phase starts next with the staged todos."
+                )
             else:
                 return (
                     f"{message}\n\nRemaining strategic todos before transition: "

@@ -138,3 +138,146 @@ async def test_newest_first_reads_the_end_of_a_long_log_in_one_call():
     assert kwargs["before"]
     assert kwargs.get("offset", 0) == 0
     assert "newest" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: an MCP-driven supervisor can start and stop the officer itself.
+# On dev (2026-11-06) a GPT supervisor had no commission tool, created a
+# "centurion" chat session instead and got a plain stateless chat.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commission_sends_only_the_kit_fields_given():
+    client = AsyncMock()
+    client.commission_officer.return_value = {
+        "status": "commissioned",
+        "thread_id": THREAD_ID,
+        "title": "Centurion — Better Resavio",
+        "state_restored": True,
+        "while_vacant": 2,
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        text = await _mcp_server_mod.commission_officer(
+            PROJECT_ID,
+            model="gpt-6.1-sol",
+            slots={"build": {"count": 1}},
+            auto_pull=False,
+        )
+
+    client.commission_officer.assert_awaited_once_with(
+        PROJECT_ID,
+        {
+            "brain": {"model": "gpt-6.1-sol"},
+            "slots": {"build": {"count": 1}},
+            "auto_pull": False,
+        },
+    )
+    assert "commissioned" in text.lower()
+    assert "restored" in text
+    assert "send_officer_note" in text
+
+
+@pytest.mark.asyncio
+async def test_commission_with_no_kit_keeps_the_saved_post():
+    client = AsyncMock()
+    client.commission_officer.return_value = {"thread_id": THREAD_ID}
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        await _mcp_server_mod.commission_officer(PROJECT_ID)
+
+    client.commission_officer.assert_awaited_once_with(PROJECT_ID, {})
+
+
+@pytest.mark.asyncio
+async def test_a_decommission_warning_is_not_reported_as_done():
+    client = AsyncMock()
+    client.decommission_officer.return_value = {
+        "status": "in_flight",
+        "warning": "1 job(s) in flight on this post.",
+        "in_flight_jobs": [
+            {"job_id": "c0b6adb0-0000-0000-0000-000000000000", "status": "processing"}
+        ],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        text = await _mcp_server_mod.decommission_officer(PROJECT_ID)
+
+    client.decommission_officer.assert_awaited_once_with(
+        PROJECT_ID, force=False, reason=None
+    )
+    assert text.startswith("NOT decommissioned")
+    assert "force=true" in text
+
+
+@pytest.mark.asyncio
+async def test_decommission_reports_the_vacant_post():
+    client = AsyncMock()
+    client.decommission_officer.return_value = {
+        "status": "decommissioned",
+        "thread_id": THREAD_ID,
+        "in_flight_jobs": [],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        text = await _mcp_server_mod.decommission_officer(PROJECT_ID, force=True)
+
+    assert text.startswith("Officer decommissioned")
+
+
+@pytest.mark.asyncio
+async def test_hold_and_release_say_whether_he_was_told():
+    client = AsyncMock()
+    client.hold_officer.return_value = {
+        "status": "held",
+        "thread_id": THREAD_ID,
+        "notified": True,
+    }
+    client.release_officer.return_value = {
+        "status": "released",
+        "thread_id": THREAD_ID,
+        "notified": False,
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        held = await _mcp_server_mod.hold_officer(PROJECT_ID, "deploy window")
+        released = await _mcp_server_mod.release_officer(PROJECT_ID)
+
+    client.hold_officer.assert_awaited_once_with(PROJECT_ID, "deploy window")
+    assert "maintenance hold" in held and "He was told." in held
+    assert released.startswith("Hold released") and "next wake" in released
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_name", ["centurion", "Centurion", "experts/centurion"])
+async def test_a_centurion_session_points_at_commission(config_name):
+    client = AsyncMock()
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        text = await _mcp_server_mod.create_persistent_thread(
+            title="Centurion test", config_name=config_name, project_id=PROJECT_ID
+        )
+
+    client.create_persistent_thread.assert_not_awaited()
+    assert "commission_officer" in text
+
+
+@pytest.mark.asyncio
+async def test_an_officer_tool_error_names_the_project_not_a_job():
+    import httpx
+
+    request = httpx.Request("POST", "http://orchestrator.test/x")
+    response = httpx.Response(
+        409, request=request, json={"detail": {"code": "turn_in_flight"}}
+    )
+    client = AsyncMock()
+    client.decommission_officer.side_effect = httpx.HTTPStatusError(
+        "conflict", request=request, response=response
+    )
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=client):
+        text = await _mcp_server_mod.decommission_officer(PROJECT_ID)
+
+    assert f"failed for project {PROJECT_ID}" in text
+    assert "turn_in_flight" in text

@@ -295,6 +295,11 @@ _UNTAKEN_REQUEST_SQL = (
     "SELECT 1 FROM thread_events receipt WHERE receipt.thread_id=r.thread_id "
     "AND receipt.control_request_id=r.id))"
 )
+# A job-transition wake repeated for the same <job8>:<status> key within this
+# window is one event reported by two completion paths, not a new transition
+# (officer double-wake, 2026-11-05). Kept short so a genuine re-entry into the
+# same status (resume → pending_review again) is never swallowed.
+OFFICER_JOB_TRANSITION_REPEAT_SECONDS = 60.0
 _CHECKPOINT_DELETE_BATCH = 1000
 _CHECKPOINT_DELETE_MAX_BATCHES = 1000
 _CHECKPOINT_RETENTION_SOURCE_PREFIX = "checkpoint_retention_prune:v1:"
@@ -27349,6 +27354,112 @@ class PostgresDB:
                 )
                 return result == "UPDATE 1"
 
+    async def drop_legacy_failed_thread_vm_marker(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        provision_generation: str,
+        proof: Dict[str, Any],
+    ) -> bool:
+        """Replace a proven-empty legacy VM marker with its absence proof.
+
+        The caller has just deleted the generation's VM by name, observed it,
+        its runtime and its rootdisk absent (``prove_legacy_thread_vm_absent``)
+        and recorded that generation's VM process-zero receipt. Without
+        ``metadata.vm`` End retires the Session as a bound VM life with no VM
+        (migration 0529). False, changing nothing, unless the row is the same
+        open pinned life, its marker is still that legacy shape for that
+        generation, the receipt exists, and no VM ledger names the thread: any
+        of those is VM authority this proof does not cover.
+        """
+
+        from shared.pinned_vm_creation_retirement import legacy_failed_vm_generation
+
+        try:
+            parsed_thread = UUID(str(thread_id))
+            runtime = _canonical_uuid_text(
+                runtime_generation, label="thread runtime generation"
+            )
+            generation = _canonical_uuid_text(
+                provision_generation, label="thread VM provision generation"
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                from orchestrator.services.vm_thread_retained_resume import (
+                    lock_owner_on_conn,
+                )
+
+                await lock_owner_on_conn(conn, parsed_thread)
+                row = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id=$1::uuid "
+                    "AND execution_lane='pinned' AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL "
+                    "AND status IN ('created','active','awaiting_user','suspended') "
+                    "FOR UPDATE",
+                    parsed_thread,
+                    UUID(runtime),
+                )
+                if row is None:
+                    return False
+                metadata = row["metadata"]
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        return False
+                if not isinstance(metadata, dict):
+                    return False
+                if legacy_failed_vm_generation(metadata.get("vm")) != generation:
+                    return False
+                if not await conn.fetchval(
+                    "SELECT public.managed_repository_process_zero_receipt_exists("
+                    "'thread',$1,'vm','vm',$2)",
+                    parsed_thread,
+                    generation,
+                ):
+                    return False
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vm_creation_retries r "
+                    "    WHERE r.owner_kind='thread' AND r.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_resource_waiters w "
+                    "    WHERE w.owner_kind='thread' AND w.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_thread_creation_owners o "
+                    "    WHERE o.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_thread_retained_resumes r "
+                    "    WHERE r.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_idle_operations i "
+                    "    WHERE i.owner_kind='thread' AND i.owner_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_idle_access_leases l "
+                    "    WHERE l.owner_kind='thread' AND l.owner_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_workspace_recoveries r "
+                    "    WHERE r.owner_kind='thread' AND r.owner_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_resource_thread_cleanup_authorities a "
+                    "    WHERE a.thread_id=$1) "
+                    "OR EXISTS (SELECT 1 FROM vm_workspace_cleanup_admissions a "
+                    "    WHERE a.owner_kind='thread' AND a.owner_id=$1)",
+                    parsed_thread,
+                ):
+                    return False
+                metadata["vm_legacy_absence"] = {
+                    **proof,
+                    "version": 1,
+                    "provision_generation": generation,
+                    "marker": metadata.pop("vm"),
+                }
+                result = await conn.execute(
+                    "UPDATE threads SET metadata=$3::jsonb,"
+                    "last_activity=CURRENT_TIMESTAMP "
+                    "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token IS NULL",
+                    parsed_thread,
+                    UUID(runtime),
+                    json.dumps(metadata),
+                )
+                return result == "UPDATE 1"
+
     async def list_thread_vm_readiness_candidates(self, *, ready: bool = False) -> list:
         status_clause = (
             'metadata @> \'{"vm":{"status":"ready"}}\'::jsonb'
@@ -27769,13 +27880,15 @@ class PostgresDB:
         fabricated ``progress_percent=0`` — no percentage telemetry exists,
         so the field is now an honest ``None`` (kept for payload-shape
         compatibility) and the ``/progress`` route composes the real
-        liveness verdict from ``services.job_liveness``.
+        liveness verdict and ``elapsed_seconds`` from
+        ``services.job_liveness``: how long a stopped job ran needs the audit
+        store's last write, which this store cannot read.
 
         Args:
             job_id: Job UUID as string
 
         Returns:
-            Dict with status/timestamps/elapsed, or None if job not found
+            Dict with status/timestamps, or None if job not found
         """
         try:
             uuid_val = UUID(job_id)
@@ -27786,7 +27899,8 @@ class PostgresDB:
             job = await conn.fetchrow(
                 """
                 SELECT id, description, status, completion_outcome_kind,
-                       config_name, assigned_agent_id, created_at, updated_at, completed_at
+                       config_name, assigned_agent_id, created_at, updated_at,
+                       completed_at, failed_at
                 FROM jobs WHERE id = $1
                 """,
                 uuid_val,
@@ -27794,13 +27908,8 @@ class PostgresDB:
             if not job:
                 return None
 
-        # Calculate elapsed time
-        created_at = job["created_at"]
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        elapsed = now - created_at
-        elapsed_seconds = elapsed.total_seconds()
+        def iso(column: str) -> str | None:
+            return job[column].isoformat() if job[column] else None
 
         return {
             "job_id": str(job["id"]),
@@ -27808,13 +27917,11 @@ class PostgresDB:
             "completion_outcome_kind": job["completion_outcome_kind"],
             # Honest nulls: never manufacture 0% / a fake ETA (E1).
             "progress_percent": None,
-            "elapsed_seconds": elapsed_seconds,
             "eta_seconds": None,
-            "created_at": job["created_at"].isoformat() if job["created_at"] else None,
-            "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
-            "completed_at": job["completed_at"].isoformat()
-            if job["completed_at"]
-            else None,
+            "created_at": iso("created_at"),
+            "updated_at": iso("updated_at"),
+            "completed_at": iso("completed_at"),
+            "failed_at": iso("failed_at"),
         }
 
     async def get_processing_jobs(
@@ -28849,9 +28956,11 @@ class PostgresDB:
             One row per agent marked offline: ``agent_id`` plus the
             ``project_id`` of the job it was serving — its current job when
             that row still exists, else its most recently updated assigned
-            job — or ``None`` when no project is derivable. The caller uses
-            the project to scope officer capacity wakes to the owning
-            project's officer instead of the whole roster.
+            job — or ``None`` when no project is derivable, and the
+            ``thread_id`` of the session it was bound to (``None`` for a
+            worker). The caller uses the project to scope officer capacity
+            wakes to the owning project's officer instead of the whole roster,
+            and the thread to leave session runtimes out of capacity news.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
 
@@ -28863,9 +28972,10 @@ class PostgresDB:
                     SET status = 'offline'
                     WHERE last_heartbeat < $1
                       AND status NOT IN ('offline', 'failed')
-                    RETURNING id, current_job_id
+                    RETURNING id, current_job_id, thread_id
                 )
                 SELECT marked.id AS agent_id,
+                       marked.thread_id AS thread_id,
                        COALESCE(current_job.project_id, last_job.project_id)
                            AS project_id
                   FROM marked
@@ -28887,6 +28997,9 @@ class PostgresDB:
                 "agent_id": str(row["agent_id"]),
                 "project_id": (
                     str(row["project_id"]) if row["project_id"] is not None else None
+                ),
+                "thread_id": (
+                    str(row["thread_id"]) if row["thread_id"] is not None else None
                 ),
             }
             for row in rows
@@ -31081,12 +31194,19 @@ class PostgresDB:
         payload: Optional[Dict[str, Any]] = None,
         project_id: Optional[str] = None,
         fire_at: Optional[datetime] = None,
+        suppress_if_delivered_within_seconds: Optional[float] = None,
     ) -> bool:
         """Enqueue (or, for timers, re-file) an officer wake event.
 
         Never raises on bad ids — wake enqueueing must not break the calling
         transition path. Returns True when a row was inserted or a pending
         timer re-filed; False on coalesce/no-op.
+
+        ``suppress_if_delivered_within_seconds`` widens the dedup beyond the
+        pending-only unique index: the insert is also skipped while an equal
+        row is in flight (``sending``) or was delivered within that window.
+        Callers that may describe an event another path already enqueued use
+        it — see :meth:`_enqueue_session_wake_event_on_conn`.
         """
         try:
             thread_uuid = UUID(thread_id)
@@ -31108,6 +31228,9 @@ class PostgresDB:
                 payload_json=payload_json,
                 project_uuid=project_uuid,
                 fire_at=fire_at,
+                suppress_if_delivered_within_seconds=(
+                    suppress_if_delivered_within_seconds
+                ),
             )
 
     async def _enqueue_session_wake_event_on_conn(
@@ -31120,8 +31243,53 @@ class PostgresDB:
         payload_json: str,
         project_uuid: Optional[UUID] = None,
         fire_at: Optional[datetime] = None,
+        suppress_if_delivered_within_seconds: Optional[float] = None,
     ) -> bool:
-        """Connection-owned wake INSERT for post-authoritative transactions."""
+        """Connection-owned wake INSERT for post-authoritative transactions.
+
+        The unique index only covers ``pending`` rows, so an equal event that
+        arrives while the first is claimed (``sending``) or just after it was
+        delivered becomes a second row and a second paid turn. That is exactly
+        what happened to every officer-dispatched job completion: the
+        completion hook and the jobs-outbox backstop enqueue the same
+        ``<job8>:<status>`` key milliseconds apart, the hook's row is already
+        claimed by then, and both were delivered (k3d, 2026-11-05). Callers
+        that can repeat an event pass ``suppress_if_delivered_within_seconds``
+        to also skip the insert while an equal row is in flight or was sent
+        within that window. Timers never take it: a re-filed sleep is new.
+        """
+
+        if suppress_if_delivered_within_seconds is not None and source != "timer":
+            row = await conn.fetchrow(
+                """
+                INSERT INTO session_wake_events
+                    (thread_id, project_id, source, dedup_key, payload, fire_at)
+                SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::jsonb,
+                       $6::timestamptz
+                 WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM session_wake_events prior
+                        WHERE prior.thread_id = $1::uuid
+                          AND prior.source = $3::text
+                          AND prior.dedup_key = $4::text
+                          AND (prior.state = 'sending'
+                               OR (prior.state = 'sent'
+                                   AND prior.sent_at > NOW() - make_interval(
+                                       secs => $7::double precision))))
+                ON CONFLICT (thread_id, source, dedup_key)
+                    WHERE state = 'pending'
+                DO NOTHING
+                RETURNING id
+                """,
+                thread_uuid,
+                project_uuid,
+                source,
+                dedup_key,
+                payload_json,
+                fire_at,
+                float(suppress_if_delivered_within_seconds),
+            )
+            return row is not None
 
         if source == "timer":
             row = await conn.fetchrow(
@@ -34689,6 +34857,13 @@ class PostgresDB:
                             conn,
                             current_thread_id,
                             source="job_transition",
+                            # maybe_wake_session is called from several
+                            # completion paths for one transition; a repeat
+                            # while the first wake is in flight is the same
+                            # event, not a new one.
+                            suppress_if_delivered_within_seconds=(
+                                OFFICER_JOB_TRANSITION_REPEAT_SECONDS
+                            ),
                             dedup_key=dedup_key,
                             payload_json=json.dumps(
                                 {
@@ -44216,7 +44391,18 @@ class PostgresDB:
                             from shared.vm_creation_issuance import (
                                 canonical_configuration_digest,
                             )
+                            from shared.pinned_vm_creation_retirement import (
+                                legacy_failed_vm_generation,
+                            )
 
+                            if legacy_failed_vm_generation(vm_context) is not None:
+                                # A legacy create left no source to retire.
+                                # End first proves its VM absent and drops the
+                                # marker (vm_thread_legacy_absence).
+                                return {
+                                    "state": "malformed",
+                                    "reason": "legacy_vm_absence_unproven",
+                                }
                             request_id = _canonical_uuid_text(
                                 vm_context.get("creation_request_id"),
                                 label="thread VM creation request",
@@ -47211,6 +47397,11 @@ class PostgresDB:
         a runtime or Pod UID and its Pod effect was never observed. Admission
         also needs every effect past its ambiguity window, so no late create
         can still land. Returns the locked reservation row, else None.
+
+        A Resumed Session's refusal names its ``retained`` lineage: the
+        earlier creation whose Pod ran and settled, that runtime's preserve
+        cleanup, and the binding to the PVC both creations recorded. Those
+        replace the first-generation rule that nothing else ever existed.
         """
         from shared.session_retirement import (
             active_claim_authority,
@@ -47225,17 +47416,42 @@ class PostgresDB:
             metadata = _strict_json_object(thread["metadata"], label="thread metadata")
         except RuntimeError:
             return None
+        retained = unpublished.get("retained")
         workspace = metadata.get("workspace_container")
+        binding = metadata.get("_workspace_binding")
+        if retained is None:
+            lineage_matches = bool(
+                not binding
+                and isinstance(workspace, dict)
+                and workspace.get("_canvas_workspace_generation") is None
+                and workspace.get("_creation_reservation_id")
+                in {None, unpublished["reservation_id"]}
+            )
+        else:
+            lineage_matches = bool(
+                isinstance(binding, dict)
+                and isinstance(workspace, dict)
+                and binding.get("kind") == "remote"
+                and binding.get("backing_id")
+                == f"k8s-pvc:{unpublished['namespace']}:{retained['pvc_uid']}"
+                and binding.get("generation") == retained["binding_generation"]
+                and workspace.get("namespace") == unpublished["namespace"]
+                and workspace.get("_canvas_workspace_generation")
+                in {None, retained["binding_generation"]}
+                and workspace.get("_creation_reservation_id")
+                in {
+                    None,
+                    unpublished["reservation_id"],
+                    retained["predecessor_reservation_id"],
+                }
+            )
         if (
-            thread["execution_lane"] != "stateless"
+            not lineage_matches
+            or thread["execution_lane"] != "stateless"
             or str(thread["runtime_generation"]) != unpublished["generation"]
             or not isinstance(workspace, dict)
             or workspace.get("provisioner") != "k8s"
             or workspace.get(_STATELESS_RUNTIME_INCARNATION_KEY) is not None
-            or workspace.get("_creation_reservation_id")
-            not in {None, unpublished["reservation_id"]}
-            or metadata.get("_workspace_binding")
-            or workspace.get("_canvas_workspace_generation") is not None
             or workspace.get("_snapshot_restore_required", False) is not False
         ):
             return None
@@ -47244,9 +47460,13 @@ class PostgresDB:
         )
         if admission:
             # The same queue and claim history the initial End admits,
-            # including a container upgrade's (C1) served lite turns.
+            # including a container upgrade's (C1) served lite turns. A
+            # Resumed Session has served turns by definition.
             upgrade_history = bool(
-                workspace_upgrade_seed_from(metadata) is not None
+                (
+                    retained is not None
+                    or workspace_upgrade_seed_from(metadata) is not None
+                )
                 and queue is not None
                 and queue["state"] != "leased"
                 and queue["leased_by"] is None
@@ -47318,6 +47538,8 @@ class PostgresDB:
                 creation["operation_kind"] != "create",
                 creation["runtime_incarnation"] is not None,
                 creation["pod_uid"] is not None,
+                retained is not None
+                and str(creation["pvc_uid"]) != retained["pvc_uid"],
             )
         ):
             return None
@@ -47334,14 +47556,19 @@ class PostgresDB:
             or pod_effect.get("observed_uid") is not None
         ):
             return None
-        if await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
-            "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$2::uuid) "
-            "OR EXISTS(SELECT 1 FROM thread_turn_commits WHERE thread_id=$1::uuid) "
-            "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
-            "WHERE owner_kind='thread' AND owner_id=$1::uuid)",
-            thread["id"],
-            unpublished["reservation_id"],
+        if retained is None:
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$2::uuid) "
+                "OR EXISTS(SELECT 1 FROM thread_turn_commits WHERE thread_id=$1::uuid) "
+                "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid)",
+                thread["id"],
+                unpublished["reservation_id"],
+            ):
+                return None
+        elif not await self._unpublished_creation_lineage_is_current_on_conn(
+            conn, thread["id"], creation, retained
         ):
             return None
         if admission:
@@ -47387,6 +47614,71 @@ class PostgresDB:
             return None
         return dict(creation)
 
+    @staticmethod
+    async def _unpublished_creation_lineage_is_current_on_conn(
+        conn: Any,
+        owner_id: Any,
+        creation: Any,
+        retained: dict[str, Any],
+    ) -> bool:
+        """The storage a Resumed Session's refused create was to reuse.
+
+        Its immediate predecessor ran a Pod and settled; soft End then retired
+        that runtime with a settled preserve cleanup that kept the same PVC,
+        and nothing has been created or cleaned up since. Such an End is
+        final (Resume refuses it), so no second refusal can follow.
+        """
+        predecessor = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["predecessor_reservation_id"],
+            owner_id,
+        )
+        cleanup = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["predecessor_cleanup_id"],
+            owner_id,
+        )
+        if predecessor is None or cleanup is None:
+            return False
+        return not (
+            predecessor["operation_kind"] != "create"
+            or predecessor["result_kind"] != "settled"
+            or predecessor["settled_at"] is None
+            or predecessor["cancel_requested_at"] is not None
+            or predecessor["runtime_incarnation"] is None
+            or str(predecessor["pvc_uid"]) != retained["pvc_uid"]
+            or predecessor["reservation_generation"]
+            >= creation["reservation_generation"]
+            or cleanup["thread_runtime_generation"]
+            != predecessor["thread_runtime_generation"]
+            or cleanup["runtime_incarnation"] != predecessor["runtime_incarnation"]
+            or str(cleanup["pvc_uid"]) != retained["pvc_uid"]
+            or cleanup["resource_policy"] != "preserve"
+            or cleanup["target_disposition"] != "deleted"
+            or cleanup["reclaim_shared_resources"] is not False
+            or cleanup["result_kind"] != "settled"
+            or cleanup["settled_at"] is None
+            or cleanup["cleanup_completed_at"] is None
+            or await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND scope='workspace_container' "
+                "AND id NOT IN ($2::uuid,$3::uuid) AND reservation_generation >= $4) "
+                "OR EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND id<>$5::uuid "
+                "AND (settled_at IS NULL OR intent_generation > $6))",
+                owner_id,
+                predecessor["id"],
+                creation["id"],
+                predecessor["reservation_generation"],
+                cleanup["id"],
+                cleanup["intent_generation"],
+            )
+        )
+
     async def get_stateless_unpublished_creation_candidate(
         self, thread_id: str, *, namespace: str
     ) -> dict[str, Any] | None:
@@ -47415,6 +47707,50 @@ class PostgresDB:
                     "reservation_generation": int(creation["reservation_generation"]),
                     "namespace": namespace,
                 }
+                # A Resumed Session: the create was to reuse the storage its
+                # previous runtime left behind.
+                predecessor = await conn.fetchrow(
+                    "SELECT id, pvc_uid, runtime_incarnation "
+                    "FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND scope='workspace_container' AND id<>$2::uuid "
+                    "ORDER BY reservation_generation DESC LIMIT 1",
+                    thread["id"],
+                    creation["id"],
+                )
+                if predecessor is not None:
+                    cleanup = (
+                        await conn.fetchval(
+                            "SELECT id FROM managed_repository_workspace_cleanup_intents "
+                            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                            "AND scope='workspace_container' "
+                            "AND runtime_incarnation=$2::uuid "
+                            "ORDER BY intent_generation DESC LIMIT 1",
+                            thread["id"],
+                            predecessor["runtime_incarnation"],
+                        )
+                        if predecessor["runtime_incarnation"] is not None
+                        else None
+                    )
+                    try:
+                        binding = _strict_json_object(
+                            thread["metadata"], label="thread metadata"
+                        ).get("_workspace_binding")
+                    except RuntimeError:
+                        return None
+                    if (
+                        cleanup is None
+                        or predecessor["pvc_uid"] is None
+                        or not isinstance(binding, dict)
+                        or not isinstance(binding.get("generation"), str)
+                    ):
+                        return None
+                    unpublished["retained"] = {
+                        "predecessor_reservation_id": str(predecessor["id"]),
+                        "predecessor_cleanup_id": str(cleanup),
+                        "pvc_uid": str(predecessor["pvc_uid"]),
+                        "binding_generation": binding["generation"],
+                    }
                 if not await self._unpublished_creation_retirement_is_current_on_conn(
                     conn, thread, unpublished, admission=True
                 ):
@@ -54601,6 +54937,213 @@ class PostgresDB:
             )
             return dict(row)
 
+    # =========================================================================
+    # MCP OAuth grants (refresh tokens) — knowledge_base_mcp_for_chat_uis.md G6
+    # =========================================================================
+
+    async def create_mcp_oauth_grant(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        oauth_client_id: str,
+        scope: str,
+        origin: str,
+        access_token_hash: str,
+        access_token_prefix: str,
+        access_expires_at,
+        refresh_token_hash: str,
+        grant_expires_at,
+    ) -> Dict[str, Any]:
+        """Create one OAuth connection: its access token row and its grant.
+
+        The access token is an ordinary ``kind='mcp'`` row (the token list,
+        revocation and request auth all work on it unchanged); the grant
+        holds the hashed refresh token that renews it. One transaction, so a
+        connection never exists half-made.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                token = await conn.fetchrow(
+                    """
+                    INSERT INTO auth_tokens (user_id, name, token_hash, token_prefix,
+                                             kind, scope, expires_at, origin)
+                    VALUES ($1, $2, $3, $4, 'mcp', $5, $6, $7)
+                    RETURNING id
+                    """,
+                    user_id,
+                    name,
+                    access_token_hash,
+                    access_token_prefix,
+                    scope,
+                    access_expires_at,
+                    origin,
+                )
+                grant = await conn.fetchrow(
+                    """
+                    INSERT INTO mcp_oauth_grants (user_id, access_token_id,
+                                                  oauth_client_id, refresh_token_hash,
+                                                  scope, expires_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id, expires_at
+                    """,
+                    user_id,
+                    token["id"],
+                    oauth_client_id,
+                    refresh_token_hash,
+                    scope,
+                    grant_expires_at,
+                )
+        return {
+            "grant_id": str(grant["id"]),
+            "access_token_id": str(token["id"]),
+            "grant_expires_at": grant["expires_at"],
+        }
+
+    async def get_mcp_oauth_grant_by_refresh_hash(
+        self, refresh_token_hash: str
+    ) -> Dict[str, Any] | None:
+        """The live grant a refresh token belongs to, or None.
+
+        Live means: not revoked, not past the lifetime the user chose, and its
+        access token row not revoked (revoking the connection in the token
+        list ends it).
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT g.id, g.user_id, g.oauth_client_id, g.scope, g.expires_at
+                FROM mcp_oauth_grants g
+                JOIN auth_tokens t ON t.id = g.access_token_id
+                WHERE g.refresh_token_hash = $1
+                  AND g.revoked_at IS NULL
+                  AND (g.expires_at IS NULL OR g.expires_at > now())
+                  AND t.revoked_at IS NULL
+                """,
+                refresh_token_hash,
+            )
+            return dict(row) if row else None
+
+    async def revoke_mcp_oauth_grant_on_replay(self, refresh_token_hash: str) -> bool:
+        """Revoke the grant whose *previous* refresh token was presented.
+
+        A rotated refresh token coming back means two parties hold the grant
+        (RFC 9700 §4.14.2): end it, access token included.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    UPDATE mcp_oauth_grants
+                       SET revoked_at = now()
+                     WHERE previous_refresh_hash = $1 AND revoked_at IS NULL
+                    RETURNING access_token_id
+                    """,
+                    refresh_token_hash,
+                )
+                if row is None:
+                    return False
+                await conn.execute(
+                    "UPDATE auth_tokens SET revoked_at = now() "
+                    "WHERE id = $1 AND revoked_at IS NULL",
+                    row["access_token_id"],
+                )
+        return True
+
+    async def rotate_mcp_oauth_grant(
+        self,
+        *,
+        refresh_token_hash: str,
+        new_refresh_token_hash: str,
+        new_access_token_hash: str,
+        new_access_token_prefix: str,
+        access_ttl_seconds: int,
+    ) -> Dict[str, Any] | None:
+        """Swap a live grant's refresh token and its access token, atomically.
+
+        The access token row is updated in place (new hash, prefix, expiry),
+        never re-inserted, so a connection stays one row in the token list.
+        Its expiry is ``now + access_ttl_seconds`` capped at the grant's own.
+        Returns ``{scope, access_expires_at, grant_expires_at}``, or None when
+        the refresh token is not the grant's current one (or the grant is not
+        live) — the caller answers ``invalid_grant``.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                grant = await conn.fetchrow(
+                    """
+                    SELECT g.id, g.access_token_id, g.scope, g.expires_at
+                    FROM mcp_oauth_grants g
+                    JOIN auth_tokens t ON t.id = g.access_token_id
+                    WHERE g.refresh_token_hash = $1
+                      AND g.revoked_at IS NULL
+                      AND (g.expires_at IS NULL OR g.expires_at > now())
+                      AND t.revoked_at IS NULL
+                    FOR UPDATE OF g
+                    """,
+                    refresh_token_hash,
+                )
+                if grant is None:
+                    return None
+                access_expires_at = await conn.fetchval(
+                    """
+                    UPDATE auth_tokens
+                       SET token_hash = $2,
+                           token_prefix = $3,
+                           -- LEAST ignores NULL: no grant expiry, no cap.
+                           expires_at = LEAST(
+                               now() + make_interval(secs => $4), $5::timestamptz
+                           )
+                     WHERE id = $1 AND revoked_at IS NULL
+                    RETURNING expires_at
+                    """,
+                    grant["access_token_id"],
+                    new_access_token_hash,
+                    new_access_token_prefix,
+                    float(access_ttl_seconds),
+                    grant["expires_at"],
+                )
+                if access_expires_at is None:
+                    return None
+                await conn.execute(
+                    """
+                    UPDATE mcp_oauth_grants
+                       SET previous_refresh_hash = refresh_token_hash,
+                           refresh_token_hash = $2,
+                           last_refreshed_at = now()
+                     WHERE id = $1
+                    """,
+                    grant["id"],
+                    new_refresh_token_hash,
+                )
+        return {
+            "scope": grant["scope"],
+            "access_expires_at": access_expires_at,
+            "grant_expires_at": grant["expires_at"],
+        }
+
+    async def revoke_mcp_oauth_grant(self, refresh_token_hash: str) -> bool:
+        """End a connection by its refresh token (OAuth /revoke)."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    UPDATE mcp_oauth_grants
+                       SET revoked_at = now()
+                     WHERE refresh_token_hash = $1 AND revoked_at IS NULL
+                    RETURNING access_token_id
+                    """,
+                    refresh_token_hash,
+                )
+                if row is None:
+                    return False
+                await conn.execute(
+                    "UPDATE auth_tokens SET revoked_at = now() "
+                    "WHERE id = $1 AND revoked_at IS NULL",
+                    row["access_token_id"],
+                )
+        return True
+
     async def get_mcp_token_by_hash(self, token_hash: str) -> Dict[str, Any] | None:
         """Look up an active MCP token by its hash. Returns None if revoked/expired/wrong kind."""
         async with self.acquire() as conn:
@@ -54761,13 +55304,34 @@ class PostgresDB:
         Same cadence and lifecycle for both — kind='mcp' rows hit this
         path via the legacy MCP server flow; kind='api' rows hit it via
         the same cleanup loop in the orchestrator.
+
+        An OAuth connection's access row expires every hour and is renewed
+        in place by its grant (``mcp_oauth_grants``), which cascades on the
+        row's delete. While the grant can still renew it — the same "live"
+        test as :meth:`get_mcp_oauth_grant_by_refresh_hash` — the row stays,
+        or the first sweep after a connector goes idle would log it out
+        (G6c). Once the grant has expired or either side was revoked, the
+        expired row goes and takes the grant with it.
         """
         async with self.acquire() as conn:
             await conn.execute(
                 """
-                DELETE FROM auth_tokens
-                WHERE (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP)
-                   OR (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
+                DELETE FROM auth_tokens t
+                WHERE (
+                        t.expires_at IS NOT NULL
+                        AND t.expires_at < CURRENT_TIMESTAMP
+                        AND NOT (
+                            t.revoked_at IS NULL
+                            AND EXISTS (
+                                SELECT 1 FROM mcp_oauth_grants g
+                                 WHERE g.access_token_id = t.id
+                                   AND g.revoked_at IS NULL
+                                   AND (g.expires_at IS NULL
+                                        OR g.expires_at > CURRENT_TIMESTAMP)
+                            )
+                        )
+                      )
+                   OR (t.revoked_at IS NOT NULL AND t.revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
                 """
             )
             # Rotation grace: revoke kind='api' rows whose successor is
@@ -55743,6 +56307,10 @@ class PostgresDB:
         if row is None:
             return None
         result = dict(row)
+        # Whether a key is stored at all, decrypted or not: dispatch tells an
+        # endpoint registered without a key from one whose key failed to
+        # decrypt by this, never by the decrypted value (None for both).
+        result["api_key_stored"] = result.get("api_key") is not None
         result["api_key"] = _decrypt_stored(
             result.get("api_key"), field=f"llm_endpoints[{result['id']}].api_key"
         )
@@ -58926,7 +59494,7 @@ class PostgresDB:
                        nextcloud_folder_id,
                        main_cloud_backend, main_cloud_backend_instance_id,
                        main_cloud_folder_handle, main_cloud_folder_error,
-                       network_tier,
+                       network_tier, deletion_requested_at,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = projects.id) AS job_count,
                        created_at, updated_at
                 FROM projects
@@ -58992,7 +59560,8 @@ class PostgresDB:
                 keep seeing archived projects. ``GET /api/projects`` is the
                 one caller that narrows, and it passes ``['active']`` unless
                 the client asked otherwise. Unknown/NULL statuses always
-                survive the filter (see ``project_status_filter_sql``).
+                survive the filter (see ``project_status_filter_sql``). A
+                narrowed listing also leaves out projects being deleted.
 
         Returns:
             List of project dicts with aggregate counts, ordered by
@@ -59015,7 +59584,12 @@ class PostgresDB:
             from orchestrator.security.access import project_status_filter_sql
 
             params.append(list(statuses))
-            status_clause = f" AND {project_status_filter_sql('$3', column='p.status')}"
+            # The listing also drops a project whose delete was decided: it
+            # answers every request with 409 until its row is gone.
+            status_clause = (
+                f" AND {project_status_filter_sql('$3', column='p.status')}"
+                " AND p.deletion_requested_at IS NULL"
+            )
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -59181,8 +59755,79 @@ class PostgresDB:
                 error,
             )
 
+    async def begin_project_deletion(
+        self,
+        project_id: str,
+        *,
+        requested_by: Optional[str] = None,
+        expected_resource: Optional[tuple[str, int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Decide a project delete, deleting nothing (one transaction).
+
+        The refusal checks, then ``expected_resource``'s version, then the
+        mark and the ``project_deletions`` row. Returns that row when this
+        call decided the delete (its lease is held), None when an earlier
+        decision stands. Raises 404, 400 (a default project) or 409. See
+        ``services.project_deletion.begin_project_deletion``.
+        """
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await project_deletion.begin_project_deletion(
+                    conn,
+                    UUID(project_id),
+                    requested_by=requested_by,
+                    expected_resource=expected_resource,
+                )
+
+    async def claim_project_deletion(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Take the lease on an unfinished, due project deletion."""
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.claim_project_deletion(conn, UUID(project_id))
+
+    async def get_project_deletion(self, project_id: str) -> Optional[Dict[str, Any]]:
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.get_project_deletion(conn, UUID(project_id))
+
+    async def settle_project_deletion(
+        self,
+        project_id: str,
+        *,
+        pending_steps: Optional[list[str]],
+        error: Optional[str],
+    ) -> None:
+        """Close a project deletion, or release its lease until the backoff."""
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            await project_deletion.settle_project_deletion(
+                conn, UUID(project_id), pending_steps=pending_steps, error=error
+            )
+
+    async def due_project_deletions(self) -> list[UUID]:
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.due_project_deletions(conn)
+
+    async def purge_completed_project_deletions(self) -> int:
+        from orchestrator.services import project_deletion
+
+        async with self.acquire() as conn:
+            return await project_deletion.purge_completed_project_deletions(conn)
+
     async def delete_project(self, project_id: str) -> bool:
         """Delete a project (cascades to members, repos).
+
+        Its jobs and its own datasources stay, detached. All of it happens in
+        one transaction: a refused delete changes nothing. A decided delete
+        (``begin_project_deletion``) also records, in that transaction, what
+        its steps after the row must remove.
 
         Args:
             project_id: Project UUID
@@ -59211,12 +59856,17 @@ class PostgresDB:
                 # junction child) before the project FK cascade reaches the
                 # same rows. Stable ordering also prevents two project deletes
                 # sharing connectors from acquiring parent locks inversely.
+                # The project's own datasources are detached below, so they
+                # are locked here, in the same order.
                 await conn.fetch(
                     """
                     SELECT d.id
                     FROM datasources d
-                    JOIN project_datasources pd ON pd.datasource_id = d.id
-                    WHERE pd.project_id = $1
+                    WHERE d.project_id = $1
+                       OR EXISTS (
+                           SELECT 1 FROM project_datasources pd
+                           WHERE pd.datasource_id = d.id AND pd.project_id = $1
+                       )
                     ORDER BY d.id
                     FOR UPDATE OF d
                     """,
@@ -59246,12 +59896,41 @@ class PostgresDB:
                     uuid_val,
                     project_managed_keys(uuid_val),
                 )
-                result = await conn.execute(
-                    "DELETE FROM projects WHERE id = $1",
+                # Jobs and datasources have no ON DELETE action on project_id.
+                # Detaching them here, not before this transaction, keeps them
+                # in the project when the delete is refused.
+                await conn.execute(
+                    """
+                    UPDATE jobs SET project_id = NULL
+                    WHERE id IN (
+                        SELECT id FROM jobs WHERE project_id = $1
+                        ORDER BY id FOR UPDATE
+                    )
+                    """,
                     uuid_val,
                 )
+                await conn.execute(
+                    "UPDATE datasources SET project_id = NULL WHERE project_id = $1",
+                    uuid_val,
+                )
+                deleted = await conn.fetchrow(
+                    """
+                    DELETE FROM projects WHERE id = $1
+                    RETURNING main_cloud_backend, main_cloud_backend_instance_id,
+                              main_cloud_folder_handle, nextcloud_folder_id
+                    """,
+                    uuid_val,
+                )
+                if deleted is not None:
+                    # A decided delete records, with the row, what is left
+                    # outside the database (services.project_deletion).
+                    from orchestrator.services.project_deletion import (
+                        record_row_deleted,
+                    )
 
-        return result == "DELETE 1"
+                    await record_row_deleted(conn, uuid_val, dict(deleted))
+
+        return deleted is not None
 
     # -- Project Members --
 

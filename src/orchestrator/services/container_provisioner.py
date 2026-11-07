@@ -8283,12 +8283,18 @@ class ContainerProvisioner:
                         pvc_name=pvc_name,
                         allow_any_storage_class=True,
                     )
-                    self._require_workspace_creation_reservation_annotation(
-                        pvc, reservation_id=reservation_id
-                    )
+                    # A Resumed Session's PVC came from an earlier creation,
+                    # whose name its annotation carries; both creations
+                    # recorded its UID.
+                    if "retained" not in unpublished:
+                        self._require_workspace_creation_reservation_annotation(
+                            pvc, reservation_id=reservation_id
+                        )
                 except WorkspaceRuntimeAuthorityError:
                     return False
-                if storage["pvc_uid"] not in {None, pvc_uid}:
+                if storage["pvc_uid"] not in {None, pvc_uid} or (
+                    "retained" in unpublished and storage["pvc_uid"] != pvc_uid
+                ):
                     return False
                 outcome = await self._delete_pvc_outcome(
                     pvc_name, expected_owner=owner, expected_uid=pvc_uid

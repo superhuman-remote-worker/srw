@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -127,18 +128,32 @@ def _build_price_resolver(
     This lets a bare catalog ``model_id`` (``gpt-5.6-terra``) auto-match
     ``openai/gpt-5.6-terra`` with no admin mapping, while every existing
     exact-match and force-unprice path is preserved unchanged.
+
+    The last step compares version separators loosely: Anthropic's API ids write
+    a minor version with a dash (``claude-opus-5-5``) where OpenRouter writes a
+    dot (``anthropic/claude-opus-5.5``). Without it every ``x-y`` Claude model
+    went unpriced and a 6.7M-token Opus job showed only its side model's $0.05.
+    The loose index has its own uniqueness check, so a catalog listing both
+    spellings stays unpriced rather than guessed.
     """
     by_full: dict[str, LlmTokenPrices] = {}
     suffix_counts: Counter = Counter()
+    loose_counts: Counter = Counter()
     for full_id in prices:
         fl = full_id.lower()
         by_full[fl] = prices[full_id]
-        suffix_counts[fl.split("/", 1)[-1]] += 1
+        suffix = fl.split("/", 1)[-1]
+        suffix_counts[suffix] += 1
+        loose_counts[_loose_version(suffix)] += 1
     by_suffix: dict[str, LlmTokenPrices] = {}
+    by_loose: dict[str, LlmTokenPrices] = {}
     for full_id in prices:
         suffix = full_id.lower().split("/", 1)[-1]
         if suffix_counts[suffix] == 1:  # unique → safe to match by bare suffix
             by_suffix[suffix] = prices[full_id]
+        loose = _loose_version(suffix)
+        if loose_counts[loose] == 1:
+            by_loose[loose] = prices[full_id]
 
     def resolve(candidate: Optional[str]) -> Optional[LlmTokenPrices]:
         if not candidate:
@@ -153,9 +168,24 @@ def _build_price_resolver(
         # missed, leaving OpenRouter's own models the ones auto-detection could
         # not price. Fail-closed is unaffected: ambiguity is a property of the
         # BARE suffix, and a full id is unambiguous by construction.
-        return by_full.get(c) or by_full.get(stripped) or by_suffix.get(stripped)
+        return (
+            by_full.get(c)
+            or by_full.get(stripped)
+            or by_suffix.get(stripped)
+            or by_loose.get(_loose_version(stripped))
+        )
 
     return resolve
+
+
+# A dot between two digits: the version separator OpenRouter uses where
+# Anthropic's API ids use a dash (``claude-opus-5.5`` vs ``claude-opus-5-5``).
+_VERSION_DOT = re.compile(r"(?<=\d)\.(?=\d)")
+
+
+def _loose_version(model_suffix: str) -> str:
+    """``model_suffix`` with every digit.digit separator written as a dash."""
+    return _VERSION_DOT.sub("-", model_suffix)
 
 
 async def fetch_openrouter_prices(

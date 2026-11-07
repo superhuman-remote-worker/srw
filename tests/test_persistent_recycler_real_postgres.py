@@ -6307,6 +6307,48 @@ async def test_pinned_retirement_disposition_is_immutable_and_enforced(db):
 
 
 @pytest.mark.asyncio
+async def test_refused_end_on_a_suspended_thread_aborts_without_rotation(db):
+    """A no-force Officer decommission with jobs in flight begins an End
+    preflight on the already-suspended officer thread, then aborts it. The
+    suspension-settle rotation used to match that marker-only abort, and the
+    ownership guard turned the refusal into a 500 (dev, Better Resavio,
+    2026-11-06); the stale-preflight reaper failed the same way every sweep."""
+    ids = await _seed(db, protected_agent_pod=True)
+    first = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="suspended"
+    )
+    await _authorize_and_ack(db, ids, first, settle_status="suspended")
+    assert await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=first["token"],
+        generation=first["generation"],
+        final_status="suspended",
+    )
+    suspended = await db.get_thread(ids["thread"])
+    assert suspended["status"] == "suspended"
+
+    end = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="ended"
+    )
+    assert end["state"] == "pending"
+    assert await db.abort_pinned_thread_retirement(
+        ids["thread"], token=end["token"], generation=end["generation"]
+    )
+
+    after = await db.get_thread(ids["thread"])
+    assert after["status"] == "suspended"
+    assert after["runtime_retirement_token"] is None
+    assert after["runtime_generation"] == suspended["runtime_generation"]
+
+    # The End can still run afterwards, from the same generation.
+    again = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status="ended"
+    )
+    assert again["state"] == "pending"
+    assert again["generation"] == str(suspended["runtime_generation"])
+
+
+@pytest.mark.asyncio
 async def test_direct_soft_suspension_forces_generation_and_clears_ownership(db):
     ids = await _seed(db, protected_agent_pod=True)
     authority = await db.begin_pinned_thread_retirement(
@@ -10770,6 +10812,104 @@ async def test_two_desired_image_changes_chain_without_releasing_hold(db):
         "example.test/agent:sha-build-two",
         "example.test/agent:sha-build-three",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_that_exits_before_ready_is_replaced(db):
+    """k3d 2026-11-06: the replacement booted while the orchestrator was
+    restarting, took the binding, read the outage as "workspace not ready"
+    and exited. The recycle then waited on that terminal Pod, failed
+    replacement_not_ready every five minutes and resumed the same wait. The
+    exited replacement is now the old authority of a fresh generation, and
+    the officer gets a working pod without anyone acting."""
+    ids = await _seed(db, protected_agent_pod=True)
+    provisioner = FakeProvisioner(db)
+    provisioner.current = _pod_status(ids["thread"], uid="old-pod", build="old-build")
+    recycler = PersistentThreadRecycler(db=db, provisioner=provisioner)
+    await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        observation=PersistentPodObservation.from_status(
+            ids["thread"], provisioner.current
+        ),
+        expected_project_id=ids["project"],
+    )
+
+    async def drain_and_provision() -> tuple[dict, str]:
+        assert (
+            await recycler.acknowledge_parked_boundary(
+                thread_id=ids["thread"], agent_id=None
+            )
+        ).acknowledged
+        provisioner.current = {
+            **provisioner.current,
+            "phase": "Succeeded",
+            "ready": False,
+            "terminating": True,
+        }
+        await _reconcile_until_phase(
+            recycler,
+            thread_id=ids["thread"],
+            reason="image_drift",
+            expected_build_sha=provisioner.expected_build_sha,
+            expected_project_id=ids["project"],
+            phases={"awaiting_replacement"},
+        )
+        state, _ = await _recycle_state(db, ids["thread"])
+        return state, provisioner.current["pod_uid"]
+
+    first, first_uid = await drain_and_provision()
+    await _bind_replacement_agent(db, thread_id=ids["thread"], pod_uid=first_uid)
+    provisioner.current = _terminal_pod_status(
+        ids["thread"],
+        uid=first_uid,
+        build="new-build",
+        generation=first["generation"],
+    )
+
+    restarted = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert restarted.phase == "awaiting_old_pod_exit"
+    state, metadata = await _recycle_state(db, ids["thread"])
+    assert state["generation"] != first["generation"]
+    assert state["old_pod_uid"] == first_uid
+    assert state["replacement_restarts"] == 1
+    hold = metadata["config_override"]["officer"]["hold"]
+    assert hold["_persistent_recycle_generation"] == state["generation"]
+
+    await _reconcile_until_phase(
+        recycler,
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+        phases={"awaiting_replacement"},
+    )
+    second, _ = await _recycle_state(db, ids["thread"])
+    second_uid = provisioner.current["pod_uid"]
+    assert second_uid != first_uid
+    await _bind_replacement_agent(db, thread_id=ids["thread"], pod_uid=second_uid)
+    provisioner.current = _pod_status(
+        ids["thread"],
+        uid=second_uid,
+        build="new-build",
+        generation=second["generation"],
+        ready=True,
+    )
+    complete = await recycler.request_and_reconcile(
+        thread_id=ids["thread"],
+        reason="image_drift",
+        expected_build_sha="new-build",
+        expected_project_id=ids["project"],
+    )
+    assert complete.phase == "complete"
+    _, metadata = await _recycle_state(db, ids["thread"])
+    assert metadata["config_override"]["officer"]["hold"] is None
 
 
 @pytest.mark.asyncio

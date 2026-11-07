@@ -44,6 +44,53 @@ def initial_vm_creation_retirement_source(context):
     return source
 
 
+# Any of these names a VM, a retained disk or a durable creation source, so a
+# marker carrying one is never the bare legacy leftover recognized below.
+_LEGACY_FAILED_VM_AUTHORITY_FIELDS = (
+    "vm_uid",
+    "_runtime_incarnation",
+    "rootdisk_pvc_uid",
+    "identity_provision_generation",
+    "ssh_host",
+    "ssh_port",
+    "creation_request_id",
+    "workspace_storage",
+    "idle_wake_operation_id",
+    "idle_wake_request_id",
+    "idle_predecessor_pvc_uid",
+    "_canvas_workspace_generation",
+)
+
+
+def legacy_failed_vm_generation(vm) -> str | None:
+    """Return the generation of a VM marker the legacy create path left behind.
+
+    Without durable creation (``VM_CREATION_RETRY_ENABLED`` off, or NATS mode)
+    a failed dispatch or an expired preparation leaves ``status: failed`` with
+    a provision generation and nothing else: no creation request, no admitted
+    VM identity. A later delete of that generation turns it ``deleted``.
+    Retirement cannot settle such a marker, so it must first be proven to have
+    nothing behind it; that proof first claims the generation
+    (``retiring_process_zero``). Recognizing the shape grants nothing itself.
+    """
+    if not isinstance(vm, Mapping) or vm.get("status") not in {
+        "failed",
+        "deleted",
+        "retiring_process_zero",
+    }:
+        return None
+    if vm.get("identity_authenticated") is True or vm.get("rootdisk") == "kept":
+        return None
+    if any(vm.get(field) is not None for field in _LEGACY_FAILED_VM_AUTHORITY_FIELDS):
+        return None
+    generation = vm.get("provision_generation")
+    try:
+        canonical = str(UUID(str(generation)))
+    except (TypeError, ValueError):
+        return None
+    return canonical if canonical == generation else None
+
+
 def pre_registration_vm_agent_zero_source(context):
     """Recognize a never-issued VM life with only its published Agent Pod.
 

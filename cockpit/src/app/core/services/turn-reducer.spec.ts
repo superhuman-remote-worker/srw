@@ -798,6 +798,24 @@ describe('turn-reducer — tool calls', () => {
         expect(state.activeAssistantTurnId).toBeNull();
     });
 
+    it('tool_completed keeps the result state its frame carries', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'tool_started', toolUseId: 'tc1', tool: 'shell_execute', args: {}, timestamp: 1050},
+            {
+                type: 'tool_completed',
+                toolUseId: 'tc1',
+                result: 'Result unknown: …',
+                isError: true,
+                resultState: 'unknown',
+                timestamp: 1100,
+            },
+        ]);
+        const tc = activeTurn(state).events.find(isToolCall)!;
+        expect(tc.status).toBe('error');
+        expect(tc.resultState).toBe('unknown');
+    });
+
     it('tool_started closes any open thinking event before pushing the tool call', () => {
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},

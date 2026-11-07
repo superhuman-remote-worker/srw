@@ -7,6 +7,7 @@ import {
     PersistentChatService,
     ThreadCitation,
 } from '../../../core/services/persistent-chat.service';
+import {WorkspaceFileDownloadService} from '../../../core/services/workspace-file-download.service';
 
 function citation(over: Partial<ThreadCitation> = {}): ThreadCitation {
     return {
@@ -28,21 +29,28 @@ describe('CitationsPanelComponent', () => {
     let mockChat: {
         citationsByCid: typeof citationsByCid;
         citationFocus: ReturnType<typeof signal<number | null>>;
+        threadId: ReturnType<typeof signal<string | null>>;
         fetchCitationDrift: ReturnType<typeof vi.fn>;
         fetchCitationSnapshotBlob: ReturnType<typeof vi.fn>;
     };
+    let files: {open: ReturnType<typeof vi.fn>};
 
     beforeEach(() => {
         citationsByCid = signal(new Map<number, ThreadCitation>());
         mockChat = {
             citationsByCid,
             citationFocus: signal<number | null>(null),
+            threadId: signal<string | null>('thread-1'),
             fetchCitationDrift: vi.fn(),
             fetchCitationSnapshotBlob: vi.fn(),
         };
+        files = {open: vi.fn().mockResolvedValue(true)};
         TestBed.resetTestingModule();
         TestBed.configureTestingModule({
-            providers: [{provide: PersistentChatService, useValue: mockChat}],
+            providers: [
+                {provide: PersistentChatService, useValue: mockChat},
+                {provide: WorkspaceFileDownloadService, useValue: files},
+            ],
         });
     });
 
@@ -82,6 +90,24 @@ describe('CitationsPanelComponent', () => {
         expect(rows.find((r) => r.id === 1)!.isWebLink).toBe(true);
         expect(rows.find((r) => r.id === 2)!.isWebLink).toBe(false);
         expect(rows.find((r) => r.id === 3)!.isWebLink).toBe(false);
+    });
+
+    it('gives a workspace document "open source", but not a web page, a snapshot or an old temp path', () => {
+        const doc = {source_type: 'document', source_identifier: 'uploads/credit.pdf'};
+        citationsByCid.set(
+            new Map([
+                [1, citation({id: 1, ...doc, locator: {page: 3}})],
+                [2, citation({id: 2})],
+                [3, citation({id: 3, ...doc, has_snapshot: true})],
+                [4, citation({id: 4, source_type: 'document', source_identifier: '/tmp/tmpab12.pdf'})],
+            ]),
+        );
+        const panel = make();
+        const rows = panel.rows();
+        expect(rows.map((r) => r.workspacePath)).toEqual(['uploads/credit.pdf', null, null, null]);
+
+        panel.openSource(rows[0]);
+        expect(files.open).toHaveBeenCalledWith('thread-1', 'uploads/credit.pdf', {page: 3});
     });
 
     it('maps citation states to badge tones + labels; pending never looks verified', () => {

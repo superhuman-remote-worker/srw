@@ -5064,3 +5064,131 @@ async def test_hold_with_route_reason_escalates_blocking_routes(db):
     assert transition["to"] == "escalated_to_user"
     assert transition["note"] == "officer_hold"
     assert transition["actor_id"] == "drain:officer_hold"
+
+
+@pytest.mark.asyncio
+async def test_job_transition_repeat_is_skipped_while_the_first_is_in_flight(db):
+    """One completion, two reporters, one officer turn (k3d 2026-11-05).
+
+    The completion hook enqueues ``<job8>:<status>`` and the drain claims it at
+    once; the jobs-outbox backstop then enqueues the same key. The pending-only
+    unique index cannot see a claimed row, so the backstop used to insert a
+    second row and the officer paid for two identical SITREP turns. A guarded
+    insert skips while the equal row is in flight or recently delivered, and
+    still admits a genuinely new event once the window has passed.
+    """
+    seed = await _seed_post(db)
+    thread_id = seed["thread_id"]
+    key = "718c764d:pending_review"
+
+    assert await db.enqueue_session_wake_event(
+        thread_id,
+        source="job_transition",
+        dedup_key=key,
+        payload={"job_id": "j", "status": "pending_review"},
+        project_id=seed["project_id"],
+        suppress_if_delivered_within_seconds=60,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE session_wake_events SET state='sending', claimed_at=now() "
+            "WHERE thread_id=$1 AND dedup_key=$2",
+            UUID(thread_id),
+            key,
+        )
+
+    # In flight: the backstop's equal event is the same transition.
+    assert not await db.enqueue_session_wake_event(
+        thread_id,
+        source="job_transition",
+        dedup_key=key,
+        payload={"job_id": "j", "status": "pending_review"},
+        project_id=seed["project_id"],
+        suppress_if_delivered_within_seconds=900,
+    )
+    # The unguarded path keeps its historical pending-only behaviour.
+    assert await db.enqueue_session_wake_event(
+        thread_id,
+        source="job_transition",
+        dedup_key="other:completed",
+        payload={},
+        project_id=seed["project_id"],
+    )
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            # Seed a delivered row directly; the admission trigger guards the
+            # production settle path, which is not under test here.
+            await conn.execute("SET LOCAL session_replication_role = replica")
+            await conn.execute(
+                "UPDATE session_wake_events SET state='sent', sent_at=now() "
+                "WHERE thread_id=$1 AND dedup_key=$2",
+                UUID(thread_id),
+                key,
+            )
+    # Delivered moments ago: still the same transition.
+    assert not await db.enqueue_session_wake_event(
+        thread_id,
+        source="job_transition",
+        dedup_key=key,
+        payload={},
+        project_id=seed["project_id"],
+        suppress_if_delivered_within_seconds=900,
+    )
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE session_wake_events SET sent_at=now() - interval '2 minutes' "
+            "WHERE thread_id=$1 AND dedup_key=$2",
+            UUID(thread_id),
+            key,
+        )
+    # Outside the hook's short window: a genuine re-entry into the status.
+    assert await db.enqueue_session_wake_event(
+        thread_id,
+        source="job_transition",
+        dedup_key=key,
+        payload={},
+        project_id=seed["project_id"],
+        suppress_if_delivered_within_seconds=60,
+    )
+    async with db.acquire() as conn:
+        states = await conn.fetch(
+            "SELECT state FROM session_wake_events "
+            "WHERE thread_id=$1 AND dedup_key=$2 ORDER BY id",
+            UUID(thread_id),
+            key,
+        )
+    assert [row["state"] for row in states] == ["sent", "pending"]
+
+
+@pytest.mark.asyncio
+async def test_hook_route_skips_a_repeat_of_an_in_flight_transition(db):
+    """maybe_wake_session runs from several completion paths for one transition."""
+    seed = await _seed_post(db)
+
+    first = await db.route_project_officer_job_transition(
+        seed["project_id"],
+        job_id="job-a",
+        status="pending_review",
+        description="d",
+        dedup_key="job-a:pending_review",
+    )
+    assert first["enqueued"] is True
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE session_wake_events SET state='sending', claimed_at=now() "
+            "WHERE thread_id=$1 AND dedup_key='job-a:pending_review'",
+            UUID(seed["thread_id"]),
+        )
+
+    repeat = await db.route_project_officer_job_transition(
+        seed["project_id"],
+        job_id="job-a",
+        status="pending_review",
+        description="d",
+        dedup_key="job-a:pending_review",
+    )
+
+    assert repeat["destination"] == "wake"
+    assert repeat["enqueued"] is False

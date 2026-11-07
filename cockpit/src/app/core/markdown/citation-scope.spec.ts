@@ -22,6 +22,10 @@ describe('citationIdsIn', () => {
         expect(citationIdsIn('a [^c7] b [12] c [^c7] d [c3]')).toEqual([7, 12, 3]);
     });
 
+    it('counts every handle in a stacked run', () => {
+        expect(citationIdsIn('a.[^c33][^c34] b.[^c35][36][c37]')).toEqual([33, 34, 35, 36, 37]);
+    });
+
     it('skips links, definitions and code', () => {
         expect(citationIdsIn('[1](http://x) [2][ref] [^c3]: def `[^c4]`\n```\n[^c5]\n```\n')).toEqual([]);
     });

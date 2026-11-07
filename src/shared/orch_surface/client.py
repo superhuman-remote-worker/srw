@@ -1212,6 +1212,18 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def accept_job_diff(self, job_id: str) -> dict[str, Any]:
+        """Apply a pending_review job's project-folder diff and complete it."""
+        resp = await self._mutation_request("POST", f"/api/jobs/{job_id}/accept")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def reject_job_diff(self, job_id: str) -> dict[str, Any]:
+        """Discard a pending_review job's project-folder diff and complete it."""
+        resp = await self._mutation_request("POST", f"/api/jobs/{job_id}/reject")
+        resp.raise_for_status()
+        return resp.json()
+
     async def resume_job(
         self,
         job_id: str,
@@ -3269,6 +3281,51 @@ class AsyncCockpitClient:
             "POST",
             f"/api/projects/{project_id}/officer/note",
             json={"message": message},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def commission_officer(
+        self, project_id: str, kit: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Raise an officer onto the project's post with an optional kit."""
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/projects/{project_id}/officer/commission",
+            json=kit or {},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def decommission_officer(
+        self, project_id: str, *, force: bool = False, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Stand the officer down; without force, jobs in flight return a warning."""
+        body: dict[str, Any] = {"force": bool(force)}
+        if reason:
+            body["reason"] = reason
+        resp = await self._mutation_request(
+            "POST", f"/api/projects/{project_id}/officer/decommission", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def hold_officer(
+        self, project_id: str, note: str | None = None
+    ) -> dict[str, Any]:
+        """Put the commissioned officer on a maintenance hold."""
+        resp = await self._mutation_request(
+            "POST",
+            f"/api/projects/{project_id}/officer/hold",
+            json={"note": note} if note else {},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def release_officer(self, project_id: str) -> dict[str, Any]:
+        """Release the officer's maintenance hold."""
+        resp = await self._mutation_request(
+            "POST", f"/api/projects/{project_id}/officer/release"
         )
         resp.raise_for_status()
         return resp.json()

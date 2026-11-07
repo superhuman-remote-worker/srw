@@ -49,8 +49,9 @@ export class CitationScope {
 }
 
 // Mirrors citationExtension's tokenizer: a handle `[^c12]` / `[c12]`, or a
-// legacy `[12]` not followed by `(`, `[` or `:`.
-const MARKER_RE = /\[(?:\^?c)?(\d+)\](?![([:])/g;
+// legacy `[12]` not followed by `(`, `:` or a `[` that opens anything but
+// another marker (stacked handles `[^c1][^c2]` all count).
+const MARKER_RE = /\[(?:\^?c)?(\d+)\](?![(:]|\[(?!(?:\^?c)?\d+\]))/g;
 const FENCED_CODE_RE = /^(```|~~~)[^\n]*\n[\s\S]*?^\1[^\n]*$/gm;
 const INLINE_CODE_RE = /`[^`\n]*`/g;
 

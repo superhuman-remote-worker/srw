@@ -136,22 +136,40 @@ def unpublished_creation_retirement_authority(value: Any) -> dict[str, Any]:
     """Parse one creation the cluster refused before any Pod existed.
 
     It names only the aborted reservation: there is no runtime UID, so no
-    shell, resident or process ever needs a stop proof.
+    shell, resident or process ever needs a stop proof. A Resumed Session's
+    refused create also names, under ``retained``, the earlier creation whose
+    PVC soft End kept and the binding that still points at it.
     """
 
     fields = {"generation", "reservation_id", "reservation_generation", "namespace"}
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or set(value) - {"retained"} != fields:
         raise RuntimeError("unpublished creation retirement authority is malformed")
     result = dict(value)
-    for field in ("generation", "reservation_id"):
-        raw = result[field]
-        try:
-            if not isinstance(raw, str) or str(UUID(raw)) != raw:
-                raise ValueError()
-        except (ValueError, TypeError, AttributeError) as exc:
+    identities = [(result, ("generation", "reservation_id"))]
+    if "retained" in result:
+        retained = result["retained"]
+        retained_fields = (
+            "predecessor_reservation_id",
+            "predecessor_cleanup_id",
+            "pvc_uid",
+            "binding_generation",
+        )
+        if not isinstance(retained, dict) or set(retained) != set(retained_fields):
             raise RuntimeError(
-                "unpublished creation retirement identity is malformed"
-            ) from exc
+                "unpublished creation retained storage authority is malformed"
+            )
+        result["retained"] = dict(retained)
+        identities.append((result["retained"], retained_fields))
+    for source, names in identities:
+        for field in names:
+            raw = source[field]
+            try:
+                if not isinstance(raw, str) or str(UUID(raw)) != raw:
+                    raise ValueError()
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise RuntimeError(
+                    "unpublished creation retirement identity is malformed"
+                ) from exc
     if (
         _exact_nonnegative_int(
             result["reservation_generation"], label="reservation_generation"
@@ -368,8 +386,12 @@ def stateless_retirement_authority(
                 "retained startup attention disagrees with terminal authority"
             )
     if "unpublished_creation" in marker:
-        unpublished_creation_retirement_authority(marker["unpublished_creation"])
+        unpublished = unpublished_creation_retirement_authority(
+            marker["unpublished_creation"]
+        )
+        retained = unpublished.get("retained")
         # No Pod was ever accepted, so there is no shell or resident to retire.
+        # A Resumed Session keeps the binding of the storage it resumed from.
         if (
             "initial_creation" in marker
             or "retained_startup_attention" in marker
@@ -378,12 +400,16 @@ def stateless_retirement_authority(
             or not marker["claimant_quiesced"]
             or marker["shell_retirement_required"]
             or marker["resident_cleanup_required"]
-            or any(
-                marker[field] is not None
-                for field in (
-                    "workspace_generation",
-                    "endpoint_generation",
-                    "host_key_fingerprint",
+            or (
+                marker["workspace_generation"] is not None
+                if retained is None
+                else marker["workspace_generation"] != retained["binding_generation"]
+            )
+            or (
+                retained is None
+                and any(
+                    marker[field] is not None
+                    for field in ("endpoint_generation", "host_key_fingerprint")
                 )
             )
         ):
@@ -557,14 +583,22 @@ def stateless_settled_retirement_authority(
         ):
             raise RuntimeError("settled retained startup attention disagrees")
     if "unpublished_creation" in settled:
-        unpublished_creation_retirement_authority(settled["unpublished_creation"])
+        unpublished = unpublished_creation_retirement_authority(
+            settled["unpublished_creation"]
+        )
+        retained = unpublished.get("retained")
         if (
             "initial_creation" in settled
             or "retained_startup_attention" in settled
             or settled["runtime_incarnation"] is not None
             or settled["terminal_token"] <= 0
             or settled["snapshot_restore_required"] is not False
-            or backing_id is not None
+            or backing_id
+            != (
+                None
+                if retained is None
+                else f"k8s-pvc:{unpublished['namespace']}:{retained['pvc_uid']}"
+            )
         ):
             raise RuntimeError("settled unpublished creation authority disagrees")
     return settled

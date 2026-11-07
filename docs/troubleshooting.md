@@ -209,6 +209,33 @@ kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
 helm upgrade srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 ```
 
+## A project answers 409 "This project is being deleted."
+
+**Symptom.** Opening a project, or starting a job or session in it, fails
+with `409` and `This project is being deleted.` The project is missing from
+the project list. Deleting it again answers `202` with `"status": "deleting"`,
+or `"deleting": true` through the manifest API.
+
+**Cause.** A delete that passes its checks marks the project first. From then
+on SRW refuses every request to the project except the delete. The delete
+then removes the project's Git repositories, folder grants, database row,
+search index, Keycloak group and cloud folder. If a step fails, for example
+because Gitea, Keycloak or the cloud is unreachable, the orchestrator records
+the error and retries in the background: after 30 seconds at first, with the
+wait doubling up to an hour. A decided delete cannot be cancelled.
+
+**Fix.** Find the step that fails, in the orchestrator log or in the deletion
+record (the app database pod is `srw-postgres-0` in the default install):
+
+```bash
+kubectl -n srw logs deploy/srw-orchestrator | grep "deletion is not finished"
+kubectl -n srw exec srw-postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "${POSTGRES_DB:-srw}" -c "SELECT project_id, attempts, pending_steps, last_error, next_attempt_at FROM project_deletions WHERE completed_at IS NULL"'
+```
+
+Fix what `last_error` names, such as a service that is down or a credential
+that changed. The next background pass then finishes the delete; nothing else
+is needed.
+
 ## Still stuck
 
 The [Helm chart guide](../helm/README.md) covers each value and the failure

@@ -573,7 +573,7 @@ class TestUpsertKbNoteSeedsTtl:
         # (swapped with a neighbour) or the identifier only appeared in a
         # comment. The $21/$22 tests above constrain renumbering below this
         # point; this is the tripwire for $23 itself.
-        assert "priority, ready_at, remaining_cycles)" in query
+        assert "priority, ready_at, remaining_cycles, description)" in query
         assert params[22] == 2
 
     @pytest.mark.asyncio
@@ -632,6 +632,42 @@ class TestUpsertKbNoteSeedsTtl:
 # reindex has no opinion of its own -- without this, a value set through the
 # inline materialize call would be wiped back to empty by the very next sweep.
 # =============================================================================
+
+
+class TestUpsertKbNoteDescription:
+    """The file's description lands on the row, and a file without one clears
+    it: unlike priority or job_id there is no other writer to protect."""
+
+    async def _upsert(self, **kw):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha=None,
+            embedding_version=None,
+            **kw,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        return query, params
+
+    @pytest.mark.asyncio
+    async def test_binds_the_description_as_the_last_parameter(self):
+        query, params = await self._upsert(description="Why JWT.")
+        assert "remaining_cycles, description)" in query
+        assert "$23, $24)" in query
+        assert params[23] == "Why JWT."
+
+    @pytest.mark.asyncio
+    async def test_overwrites_on_conflict_without_a_sentinel(self):
+        query, params = await self._upsert()
+        assert "description = $24" in query
+        assert "COALESCE($24" not in query
+        assert params[23] is None
 
 
 class TestUpsertKbNoteRetrievalMessagesCoalesceSentinel:

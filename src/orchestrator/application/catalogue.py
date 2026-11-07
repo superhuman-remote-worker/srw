@@ -164,6 +164,23 @@ def manifest_dependencies(
             ),
         )
 
+    async def delete_project(project_id, *, user, expected_resource):
+        # The REST project delete, so a manifest delete removes the same
+        # external state and refuses in the same cases.
+        from orchestrator.application.projects import project_dependencies
+        from orchestrator.services import projects as projects_operations
+
+        project = await resources.postgres_db.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Resource does not exist.")
+        return await projects_operations.delete_project(
+            project_id,
+            project=project,
+            dependencies=project_dependencies(resources),
+            requested_by=str(user["id"]),
+            expected_resource=expected_resource,
+        )
+
     return manifest_routes.ManifestDependencies(
         service=ManifestService(),
         require_approved_user=approved_user,
@@ -171,6 +188,7 @@ def manifest_dependencies(
             resources.postgres_db,
             admit_job=admit_manifest,
             project_activation=activate_project,
+            delete_project=delete_project,
         ),
         execution=functools.partial(manifest_execution_service, resources),
         trigger_dispatch=bound(

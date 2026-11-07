@@ -52,7 +52,9 @@ data:
       "displayNameHtml": "<div class=\"kc-logo-text\"><span>Superhuman Remote Worker</span></div>",
       "registrationAllowed": true,
       "registrationEmailAsUsername": false,
-      "verifyEmail": true,
+      {{- /* Only with mail: otherwise "Register" ends at a verification
+           message that is never sent. The postStart hook re-asserts it. */}}
+      "verifyEmail": {{ include "srw.keycloak.mailConfigured" . }},
       "loginWithEmailAllowed": true,
       "duplicateEmailsAllowed": false,
       "resetPasswordAllowed": true,
@@ -988,6 +990,15 @@ spec:
                       $KC create "realms/{{ .Values.keycloak.realm }}/clear-realm-cache" 2>&1 || \
                         echo "WARN: kcadm clear-realm-cache failed"
                     fi
+                    # --- Email verification follows SMTP ---
+                    # The realm import sets verifyEmail only on first boot; this
+                    # keeps an existing realm in step when email.* changes, so an
+                    # install without mail never asks a new user to verify an
+                    # address it cannot write to. Self-registration stays on;
+                    # SRW's own admin approval still gates new accounts.
+                    $KC update "realms/{{ .Values.keycloak.realm }}" \
+                      -s "verifyEmail={{ include "srw.keycloak.mailConfigured" . }}" 2>/dev/null || \
+                      echo "WARN: kcadm verifyEmail update failed"
                     # --- Sync session/token lifespans ---
                     # Same self-heal pattern as SMTP: realm-import only seeds
                     # these on first boot, so existing deployments would keep

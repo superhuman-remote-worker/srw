@@ -13,6 +13,9 @@ needs a real Keycloak.
 
 from __future__ import annotations
 
+import html
+import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
@@ -37,12 +40,36 @@ class FakeStore:
         self.session_row: dict | None = None
         self.deleted_sessions: list[str] = []
         self.deleted_by_sid: list[str] = []
+        # Rows still in srw_pre_auth_states, by state, as the callback's
+        # return-path lookup sees them. A row outlives its cookie until the
+        # hourly cleanup, so a lost cookie usually still has one.
+        self.parked_return_to: dict[str, str] = {}
+        self.lookup_fails = False
 
-    async def create_srw_pre_auth(self, *, state, pkce_verifier, return_to):
+    async def create_srw_pre_auth(
+        self, *, state, pkce_verifier, return_to, ttl_seconds=300
+    ):
         self.created_pre_auth.append(
-            {"state": state, "pkce_verifier": pkce_verifier, "return_to": return_to}
+            {
+                "state": state,
+                "pkce_verifier": pkce_verifier,
+                "return_to": return_to,
+                "ttl_seconds": ttl_seconds,
+            }
         )
         return "pre-auth-id-1"
+
+    @asynccontextmanager
+    async def acquire(self):
+        store = self
+
+        class _Conn:
+            async def fetchval(self, _query, state):
+                if store.lookup_fails:
+                    raise ConnectionError("database unavailable")
+                return store.parked_return_to.get(state)
+
+        yield _Conn()
 
     async def consume_srw_pre_auth(self, pre_auth_id):
         return self.pre_auth_row
@@ -186,18 +213,6 @@ class TestCallbackRefusals:
         assert r.status_code == 400
         assert r.json()["detail"] == "Missing code or state"
 
-    def test_missing_pre_auth_cookie_is_refused(self, client):
-        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
-        assert r.status_code == 400
-        assert r.json()["detail"] == "Missing pre-auth state"
-
-    def test_unknown_or_replayed_pre_auth_is_refused(self, client, store):
-        store.pre_auth_row = None
-        client.cookies.set(PRE_AUTH_COOKIE, "pre-auth-id-1")
-        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
-        assert r.status_code == 400
-        assert r.json()["detail"] == "Pre-auth state expired or used"
-
     def test_state_mismatch_is_refused(self, client, store):
         store.pre_auth_row = {
             "state": "the-real-state",
@@ -210,6 +225,141 @@ class TestCallbackRefusals:
         )
         assert r.status_code == 400
         assert r.json()["detail"] == "State mismatch"
+
+
+def _restart_target(r):
+    """The ``/auth/login`` restart a callback answered with, parsed."""
+    assert r.status_code == 302, r.text
+    loc = urlparse(r.headers["location"])
+    # Relative, so it lands on the origin that served the callback, which is
+    # the origin /auth/login lives on in both single- and split-origin setups.
+    assert (loc.scheme, loc.netloc, loc.path) == ("", "", "/auth/login")
+    return parse_qs(loc.query)
+
+
+def _marked_state_from_restarted_login(client, restart_url):
+    """Follow a restart to /auth/login and return the state it sent to KC."""
+    r = client.get(restart_url)
+    assert r.status_code == 302
+    return parse_qs(urlparse(r.headers["location"]).query)["state"][0]
+
+
+class TestCallbackLostPreAuth:
+    """A callback whose pre-auth state is gone restarts login once.
+
+    The cookie goes missing when the Keycloak form took longer than its
+    lifetime, when another tab already finished with it, or when the
+    browser blocks cookies. None of these is an attack, and the Keycloak
+    session is usually valid, so one trip back through /auth/login signs
+    the user in. A second miss in a row stops on a readable page.
+    """
+
+    def test_missing_cookie_restarts_login_instead_of_raw_json(self, client):
+        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        q = _restart_target(r)
+        assert q["return_to"] == ["/"]
+
+    def test_spent_or_expired_pre_auth_restarts_login(self, client, store):
+        store.pre_auth_row = None  # consume found it used or past its TTL
+        client.cookies.set(PRE_AUTH_COOKIE, "pre-auth-id-1")
+        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        _restart_target(r)
+        # The spent cookie is dropped so it cannot shadow the next flow.
+        set_cookie = r.headers.get("set-cookie", "")
+        assert f"{PRE_AUTH_COOKIE}=" in set_cookie and "Max-Age=0" in set_cookie
+
+    def test_restart_keeps_the_return_path_the_login_parked(self, client, store):
+        store.parked_return_to = {"s": "/sessions/abc?tab=files"}
+        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        assert _restart_target(r)["return_to"] == ["/sessions/abc?tab=files"]
+
+    def test_a_parked_return_path_is_sanitized_again(self, client, store):
+        store.parked_return_to = {"s": "https://evil.example/steal"}
+        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        assert _restart_target(r)["return_to"] == ["/"]
+
+    def test_a_failed_return_path_lookup_still_restarts_to_root(self, client, store):
+        store.parked_return_to = {"s": "/sessions/abc"}
+        store.lookup_fails = True
+        r = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        assert _restart_target(r)["return_to"] == ["/"]
+
+    def test_second_miss_in_a_row_shows_a_page_instead_of_redirecting(
+        self, client, store
+    ):
+        store.parked_return_to = {"s": "/sessions/abc"}
+        first = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        _restart_target(first)
+
+        # The restarted login keeps the return path ...
+        marked = _marked_state_from_restarted_login(client, first.headers["location"])
+        assert store.created_pre_auth[-1]["return_to"] == "/sessions/abc"
+        store.parked_return_to[marked] = "/sessions/abc"
+
+        # ... and the browser comes back without the cookie again
+        # (cookies blocked for this site).
+        client.cookies.clear()
+        second = client.get("/auth/callback", params={"code": "c2", "state": marked})
+
+        assert second.status_code == 400
+        assert "location" not in second.headers
+        assert second.headers["content-type"].startswith("text/html")
+        # A link lets the user start over by hand; it is a fresh login, so a
+        # deliberate retry gets the one automatic restart again.
+        hrefs = [html.unescape(h) for h in re.findall(r'href="([^"]+)"', second.text)]
+        assert len(hrefs) == 1
+        link = urlparse(hrefs[0])
+        assert link.path == "/auth/login"
+        assert parse_qs(link.query) == {"return_to": ["/sessions/abc"]}
+
+    def test_a_restarted_login_that_keeps_its_cookie_proceeds(
+        self, client, store, monkeypatch
+    ):
+        first = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        marked = _marked_state_from_restarted_login(client, first.headers["location"])
+        store.pre_auth_row = {"state": marked, "pkce_verifier": "v", "return_to": "/"}
+        client.cookies.set(PRE_AUTH_COOKIE, "pre-auth-id-1")
+        exchange = AsyncMock(side_effect=bff.KeycloakClientError("stop here"))
+        monkeypatch.setattr(bff.kc_bff_client, "exchange_code", exchange, raising=False)
+
+        r = client.get("/auth/callback", params={"code": "c2", "state": marked})
+
+        # Past the state check and on to the code exchange with its verifier.
+        exchange.assert_awaited_once_with("c2", "v")
+        assert r.status_code == 502
+
+    def test_a_restarted_login_with_a_mismatched_state_is_still_refused(
+        self, client, store
+    ):
+        """The restart marker never short-circuits the CSRF check."""
+        first = client.get("/auth/callback", params={"code": "c", "state": "s"})
+        marked = _marked_state_from_restarted_login(client, first.headers["location"])
+        store.pre_auth_row = {
+            "state": "the-real-state",
+            "pkce_verifier": "v",
+            "return_to": "/",
+        }
+        client.cookies.set(PRE_AUTH_COOKIE, "pre-auth-id-1")
+        r = client.get("/auth/callback", params={"code": "c2", "state": marked})
+        assert r.status_code == 400
+        assert r.json()["detail"] == "State mismatch"
+
+
+class TestPreAuthLifetime:
+    def test_cookie_and_row_share_a_lifetime_that_outlasts_a_slow_login(
+        self, client, store
+    ):
+        """The cookie and its row expire together, after at least 10 minutes.
+
+        If the row expired first, the cookie would arrive pointing at a dead
+        row; if the cookie expired first, a live row would be unreachable.
+        Ten minutes covers looking up a password or a first login with
+        registration and email verification.
+        """
+        r = client.get("/auth/login")
+        max_age = int(re.search(r"Max-Age=(\d+)", r.headers["set-cookie"]).group(1))
+        assert max_age == store.created_pre_auth[-1]["ttl_seconds"]
+        assert max_age >= 600
 
 
 class TestCallbackSubjectCheck:

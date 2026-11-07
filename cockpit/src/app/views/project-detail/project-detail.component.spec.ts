@@ -110,6 +110,7 @@ function createComponent(
     getDatasources: vi.fn().mockReturnValue(of([])),
     linkProjectDatasource: vi.fn().mockReturnValue(of({status: 'linked'})),
     getProjectRepositories: vi.fn().mockReturnValue(of([])),
+    ensureProjectRepoAccess: vi.fn().mockReturnValue(of(null)),
     attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
     getProject: vi.fn().mockReturnValue(
@@ -349,6 +350,44 @@ describe('ProjectDetailPageComponent job outcomes', () => {
 });
 
 
+describe('ProjectDetailPageComponent knowledge note controls', () => {
+  // Mirrors the server gates (routers/knowledge.py, D9): a viewer reads, an
+  // editor changes or deletes, the owner alone touches the charter.
+  function asMember(role: 'viewer' | 'editor' | 'owner' | null) {
+    const created = createComponent();
+    created.component.members.set(
+      role ? [{project_id: 'project-a', user_id: 'user-1', role, joined_at: ''}] : [],
+    );
+    return created;
+  }
+
+  it('hides note status and delete from a viewer', () => {
+    const {component} = asMember('viewer');
+
+    expect(component.canEditKnowledgeNote({note_type: 'issue'})).toBe(false);
+  });
+
+  it('shows them to an editor, except on the charter', () => {
+    const {component} = asMember('editor');
+
+    expect(component.canEditKnowledgeNote({note_type: 'issue'})).toBe(true);
+    expect(component.canEditKnowledgeNote({note_type: 'charter'})).toBe(false);
+  });
+
+  it('lets the owner change the charter', () => {
+    const {component} = asMember('owner');
+
+    expect(component.canEditKnowledgeNote({note_type: 'charter'})).toBe(true);
+  });
+
+  it('lets an admin through without a membership', () => {
+    const {component, currentUser} = asMember(null);
+    currentUser.set({id: 'user-1', is_admin: true});
+
+    expect(component.canEditKnowledgeNote({note_type: 'charter'})).toBe(true);
+  });
+});
+
 function kbConnector(id: string, overrides: Partial<Datasource> = {}): Datasource {
   return datasource(id, {
     type: 'kb',
@@ -428,6 +467,19 @@ describe('ProjectDetailPageComponent external knowledge base', () => {
 
     expect(component.kbAttachError()).toBe('Set its note root to knowledge first');
     expect(component.isAttachingKb()).toBe(false);
+  });
+});
+
+describe('ProjectDetailPageComponent repository access', () => {
+  it('re-grants the managed repositories to the viewer when the project opens', () => {
+    // A vault shared with its creator only once 404s for them in Gitea; the
+    // server re-grants on this call, as it does for a job's workspace.
+    const {api, component} = createComponent();
+
+    component.loadAll();
+
+    expect(api.ensureProjectRepoAccess).toHaveBeenCalledTimes(1);
+    expect(api.ensureProjectRepoAccess).toHaveBeenCalledWith('project-a');
   });
 });
 

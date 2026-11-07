@@ -1,5 +1,7 @@
 """Knowledge search, mutation and projection request contracts."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -44,6 +46,16 @@ class KnowledgeMaterializeRequest(BaseModel):
             "Synthetic retrieval queries for this note. Omitted/None leaves "
             "any already-indexed value alone — OKF frontmatter carries no "
             "such field, so only an explicit caller has an opinion."
+        ),
+    )
+    mode: Literal["create", "update"] | None = Field(
+        None,
+        description=(
+            "'create' refuses (failed/already-exists) when the note already "
+            "exists anywhere in the vault, so a create never overwrites; "
+            "'update' refuses (failed/precondition-failed) when it is gone. "
+            "Omitted: the historical upsert. Either way an existing note is "
+            "written where it lives, which may be a subfolder."
         ),
     )
 
