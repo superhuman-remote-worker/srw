@@ -105,7 +105,12 @@ refused when it conflicts.
 
 - The create forms preselect the work's own connectors, each removable: the
   project's knowledge base, its folder (Sessions) or folder copy (Jobs), your
-  outbox, and for a Session of your personal project My cloud.
+  outbox, and for a Session of your personal project My cloud. They also
+  preselect the project's connector defaults (set by a project owner through
+  the API or a manifest) and your own connectors marked "Attach by default to
+  my new work" whose scope covers the project. The home composer attaches the
+  same set. `agent.datasourceScopeAutoAttachV1Enabled: "false"` turns this
+  second part, and the connector form's scope and auto-attach controls, off.
 - Over the REST API, omitting `datasource_ids` attaches the same; with
   `agent.datasourceDefaultsOnOmission` on, every default. The MCP tools
   that omit the list ask for every default.

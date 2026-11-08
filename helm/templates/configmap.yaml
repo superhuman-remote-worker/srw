@@ -498,7 +498,8 @@ data:
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
   # Compatibility gate for omitted datasource_ids on root REST/session work.
   DATASOURCE_DEFAULTS_ON_OMISSION: {{ .Values.agent.datasourceDefaultsOnOmission | default "false" | quote }}
-  # Capability-advertisement gate for datasource project scope + auto-attach.
+  # Capability-advertisement gate for datasource project scope + auto-attach
+  # (on by default since 0.2.0; "false" keeps the old Cockpit forms).
   DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED: {{ .Values.agent.datasourceScopeAutoAttachV1Enabled | default "false" | quote }}
   # Protected cloud mode: RO-reader provisioning + capture overlay. Read by the
   # orchestrator's RO engage gate + reader reconciler. Default-off (prod-safe).

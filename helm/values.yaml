@@ -1020,9 +1020,15 @@ agent:
   # submits an explicit reviewed array; enable this after legacy clients no
   # longer encode "none" by omission.
   datasourceDefaultsOnOmission: "false"
-  # -- Coordinated rollout gate for the connector project-scope/auto-attach UI.
-  # Keep false until all orchestrator replicas understand the v1 API contract.
-  datasourceScopeAutoAttachV1Enabled: "false"
+  # -- Connector availability and auto-attach in the Cockpit. On (since 0.2.0),
+  # New Session and New Job preselect the project's connector defaults and
+  # your own auto-attach connectors, the home composer attaches them, and the
+  # connector form shows scope and auto-attach (a new connector needs a scope).
+  # The server marks and attaches these defaults either way (automations,
+  # loops, MCP); "false" keeps the old forms: only the work's own connectors
+  # preselected and the connector policy controls hidden. Every 0.1.x replica
+  # understands the v1 contract this once guarded during a mixed rollout.
+  datasourceScopeAutoAttachV1Enabled: "true"
   # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
   # See knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1.

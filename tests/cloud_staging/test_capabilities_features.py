@@ -161,8 +161,13 @@ class TestCapabilitiesFeatures:
         assert result["features"]["datasource_scope_auto_attach_v1"] is True
 
 
-def test_datasource_scope_feature_gate_defaults_off(monkeypatch):
+def test_datasource_scope_feature_gate_defaults_on(monkeypatch):
     monkeypatch.delenv("DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", raising=False)
+    assert deployment_gates_module.datasource_scope_auto_attach_v1_enabled() is True
+
+
+def test_datasource_scope_feature_gate_opts_out(monkeypatch):
+    monkeypatch.setenv("DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "false")
     assert deployment_gates_module.datasource_scope_auto_attach_v1_enabled() is False
 
 
