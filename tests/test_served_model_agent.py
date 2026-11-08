@@ -307,11 +307,25 @@ class TestCatalogStamp:
         assert catalog_model_of(client) == CATALOG_ID
 
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
-    def test_no_stamp_without_a_served_string(self, chat):
+    def test_a_row_without_a_served_string_is_stamped_too(self, chat):
         client = MagicMock(spec=[])
         chat.return_value = client
         create_llm(LLMConfig(model="gpt-4o", provider="openai", api_key="k"))
-        assert catalog_model_of(client) is None
+        assert catalog_model_of(client) == "gpt-4o"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_an_openrouter_client_is_stamped_with_the_prefixed_id(self, chat):
+        client = MagicMock(spec=[])
+        chat.return_value = client
+        create_llm(
+            LLMConfig(
+                model="openrouter/anthropic/claude-sonnet-5.5",
+                provider="openrouter",
+                api_key="sk-or-v1-x",
+            )
+        )
+        assert chat.call_args.kwargs["model"] == "anthropic/claude-sonnet-5.5"
+        assert catalog_model_of(client) == "openrouter/anthropic/claude-sonnet-5.5"
 
     def test_auxiliary_archive_names_the_catalog_id(self):
         from langchain_openai import ChatOpenAI
@@ -322,6 +336,57 @@ class TestCatalogStamp:
         assert _get_model_name(client) == SERVED
         stamp_catalog_model(client, CATALOG_ID)
         assert _get_model_name(client) == CATALOG_ID
+
+    def test_an_openrouter_auxiliary_archive_records_the_catalog_id(self):
+        """The orchestrator injects ``openrouter/…`` as the auxiliary model.
+        The client sends ``anthropic/…``; the ``llm_requests`` rows (call and
+        error) name the catalog id, which is what ``usage_rates`` is keyed on."""
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        from shared.runtime.services.auxiliary import AuxiliaryLLM, GenerateTitleTask
+
+        catalog_id = "openrouter/anthropic/claude-sonnet-5.5"
+        client = create_llm(
+            LLMConfig(model=catalog_id, provider="openrouter", api_key="sk-or-v1-x")
+        )
+        assert client.model_name == "anthropic/claude-sonnet-5.5", "the wire name"
+        archiver = MagicMock()
+        aux = AuxiliaryLLM(
+            llm=client,
+            max_context_tokens=50_000,
+            archiver=archiver,
+            job_id="job-1",
+            agent_type="worker",
+        )
+        task = GenerateTitleTask("hello")
+        messages = [HumanMessage(content="hello")]
+
+        aux._archive_call(task, messages, AIMessage(content="A title"), 12)
+        aux._archive_error(task, messages, RuntimeError("upstream 503"), 12)
+
+        assert archiver.archive.call_args.kwargs["model"] == catalog_id
+        assert archiver.archive_error.call_args.kwargs["model"] == catalog_id
+
+    def test_native_compaction_records_the_catalog_id(self):
+        """Native compaction names the client it forked through: the stamped
+        catalog id, also when the client is wrapped in a tool binding."""
+        from agent.core.context import _client_model_name
+
+        catalog_id = "openrouter/z-ai/glm-5.3-flash"
+        client = create_llm(
+            LLMConfig(model=catalog_id, provider="openrouter", api_key="sk-or-v1-x")
+        )
+        assert client.model_name == "z-ai/glm-5.3-flash"
+        assert _client_model_name(client) == catalog_id
+        bound = client.bind(stop=["\n\n"])
+        assert _client_model_name(bound) == catalog_id
+
+    def test_native_compaction_keeps_the_wire_name_of_an_unstamped_client(self):
+        from agent.core.context import _client_model_name
+
+        client = MagicMock(spec=["model_name"])
+        client.model_name = "gpt-6-sol"
+        assert _client_model_name(client) == "gpt-6-sol"
 
 
 # ---------------------------------------------------------------------------

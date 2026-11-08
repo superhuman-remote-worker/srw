@@ -4490,7 +4490,12 @@ def create_llm(
         llm = _create_codex_llm(config, limits)
     else:
         llm = _create_openai_llm(config, limits)
-    if served_model_of(config):
+    if config.model:
+        # Every client, not only a served row's: a factory sends a different
+        # string than the catalog id whenever it strips a routing prefix
+        # (``openrouter/x/y`` sends ``x/y``), and a recorder that holds only
+        # the client (the auxiliary archive, native compaction) must record
+        # the catalog id, which is what rates are keyed on.
         from shared.runtime.core.transport_resolution import stamp_catalog_model
 
         stamp_catalog_model(llm, config.model)

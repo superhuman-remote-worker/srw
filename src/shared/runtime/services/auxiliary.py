@@ -809,8 +809,9 @@ _TASK_CALL_TYPES = {
 def _get_model_name(llm: BaseChatModel) -> str:
     """Extract model name from a LangChain chat model.
 
-    A client built for a catalog row with a served model names the catalog
-    id, not the string it sends (``loader.recorded_model_name``).
+    A client ``create_llm`` built names its catalog id, not the string it
+    sends (a served model id, or the id minus a routing prefix such as
+    ``openrouter/``), so usage lands on the row whose rate prices it.
     """
     from shared.runtime.core.transport_resolution import catalog_model_of
 
