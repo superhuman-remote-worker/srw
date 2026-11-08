@@ -722,11 +722,19 @@ def test_named_validation_reasons(
 
 def test_capability_checks_are_opt_in() -> None:
     # Disable chart-generated random Secret values so byte comparison is stable.
-    normal = render_chart(MAIN, "secrets.create=false", "searxng.enabled=false")
-    with_versions = render_chart(
-        MAIN,
+    # The bundled databases' superuser Secret generates its passwords in every
+    # secrets mode, so pin them too.
+    stable = (
         "secrets.create=false",
         "searxng.enabled=false",
+        "secrets.values.POSTGRES_SUPERUSER_PASSWORD=fixed",
+        "secrets.values.VECTOR_POSTGRES_SUPERUSER_PASSWORD=fixed",
+        "secrets.values.AUDIT_POSTGRES_SUPERUSER_PASSWORD=fixed",
+    )
+    normal = render_chart(MAIN, *stable)
+    with_versions = render_chart(
+        MAIN,
+        *stable,
         api_versions=("kubevirt.io/v1", "cdi.kubevirt.io/v1beta1"),
     )
     assert normal == with_versions
