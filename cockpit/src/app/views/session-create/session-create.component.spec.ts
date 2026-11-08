@@ -872,6 +872,71 @@ describe('SessionCreateComponent tool preview', () => {
     expect(component.toolPreview()).toBeNull();
     expect(prefill).not.toHaveBeenCalled();
   });
+
+  // create_job_first_click_swallowed_after_typing_description.md §5 Part 2:
+  // Create Session used to be disabled while a settings check ran, and had no
+  // re-entry guard of its own. A click now waits for the latest answer and
+  // one render; a second click is refused.
+  describe('a click while the settings check is in flight', () => {
+    const isCreate = (r: {url: string; method: string}) => r.url.endsWith('/persistent/threads') && r.method === 'POST';
+
+    function withPendingPreview() {
+      const ctx = setup(ANSWER);
+      // Mount first, so the render the click waits for does not run the view
+      // query for the first time and replace the settings stub below.
+      ctx.fixture.detectChanges();
+      for (const load of ctx.http.match(() => true)) load.flush([]);
+      const preview = new Subject<unknown>();
+      ctx.api.previewToolGroups.mockReturnValue(preview);
+      let anchored = false;
+      ctx.fixture.componentInstance.agentSettings = {
+        vmSizingValid: () => true,
+        delegationCapValid: () => true,
+        hasToolEdits: () => false,
+        hasDatasourceSelection: () => false,
+        prefillFromResolvedToolset: () => { anchored = true; },
+        getOverrides: () => ({tools: {shell: !anchored}}),
+        getTaskOverrides: () => ({}),
+        getSelectedDatasourceIds: () => [],
+        getSelectedDatasourceAccess: () => ({}),
+      } as unknown as SessionCreateComponent['agentSettings'];
+      ctx.fixture.componentInstance.onSettingsChange();
+      return {...ctx, component: ctx.fixture.componentInstance, preview};
+    }
+
+    it('waits for the preview and creates exactly one session, built from its answer', async () => {
+      const {component, http, preview} = withPendingPreview();
+      expect(component.loadingWorkspacePreview()).toBe(true);
+
+      const first = component.createSession();
+      // Set before any await: the second click is refused.
+      expect(component.creating()).toBe(true);
+      const second = component.createSession();
+      http.expectNone(isCreate);
+
+      preview.next(ANSWER);
+      let request!: ReturnType<typeof http.expectOne>;
+      await vi.waitFor(() => { request = http.expectOne(isCreate); });
+      expect(request.request.body.config_override).toEqual({tools: {shell: false}});
+      request.flush({thread_id: 'thread-1'});
+      await Promise.all([first, second]);
+
+      http.expectNone(isCreate);
+      expect(component.creating()).toBe(false);
+    });
+
+    it('sends nothing when the form is left while it waits', async () => {
+      const {fixture, component, http, preview} = withPendingPreview();
+
+      const pending = component.createSession();
+      fixture.destroy();
+      preview.next(ANSWER);
+      await pending;
+
+      http.expectNone(isCreate);
+      expect(component.creating()).toBe(false);
+    });
+  });
 });
 
 // Task 14, item B (session_config_drift_resume.md §8.3): "Start a new

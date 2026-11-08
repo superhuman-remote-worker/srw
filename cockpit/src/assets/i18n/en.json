@@ -659,7 +659,8 @@
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
       "expertSelectedPrefix": "Selected:",
-      "createSession": "Create Session"
+      "createSession": "Create Session",
+      "settingsStillLoading": "The settings are still loading. Try again in a moment."
     },
     "configDrift": {
       "title": "Some of this session's setup is gone",
@@ -993,7 +994,8 @@
       "submit": "Create Job",
       "creating": "Creating...",
       "uploading": "Uploading...",
-      "removeFile": "Remove file"
+      "removeFile": "Remove file",
+      "settingsStillLoading": "The settings are still loading. Try again in a moment."
     },
     "detail": {
       "auditSteps": "Audit steps",

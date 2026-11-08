@@ -178,6 +178,18 @@ describe('Create Job: a native change from a projected field starts no settings 
 
     expect(enterOn(description).defaultPrevented).toBe(false);
   });
+
+  it('Create stays enabled while the settings check loads: the click waits instead', () => {
+    const {fixture, component} = mount();
+    component.formData.description = 'Summarise the logs';
+    component.loadingWorkspacePreview.set(true);
+    component.isLoadingExpertDetail.set(true);
+    component.isLoadingDatasources.set(true);
+    fixture.detectChanges();
+
+    const create = fixture.nativeElement.querySelector('app-button[type="submit"]') as HTMLElement & {disabled: boolean};
+    expect(create.disabled).toBe(false);
+  });
 });
 
 describe('Create Session: a native change from the projected title starts no settings preview', () => {
@@ -195,8 +207,20 @@ describe('Create Session: a native change from the projected title starts no set
     const settings = fixture.debugElement.query(By.directive(AgentSettingsStub)).componentInstance as AgentSettingsStub;
     const onSettingsChange = vi.spyOn(component, 'onSettingsChange');
     stubApi.previewToolGroups.mockClear();
-    return {component, host, settings, onSettingsChange, api: stubApi};
+    return {fixture, component, host, settings, onSettingsChange, api: stubApi};
   }
+
+  it('Create Session stays enabled while the settings check loads: the click waits instead', () => {
+    const {fixture, component} = mount();
+    component.loadingWorkspacePreview.set(true);
+    component.loadingExpert.set(true);
+    component.loadingDatasources.set(true);
+    fixture.detectChanges();
+
+    const buttons = fixture.nativeElement.querySelectorAll('.form-actions app-button');
+    const create = buttons[buttons.length - 1] as HTMLElement & {disabled: boolean};
+    expect(create.disabled).toBe(false);
+  });
 
   it('a bubbling change from the title reaches no handler', () => {
     const {host, onSettingsChange, api: stub} = mount();

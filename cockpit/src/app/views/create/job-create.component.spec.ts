@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { ActivatedRoute, Router, convertToParamMap } from '@angular/router';
-import { of, throwError } from 'rxjs';
+import { of, Subject, throwError } from 'rxjs';
 import { Expert, JobCreateRequest, Project } from '../../core/models/api.model';
-import { SessionToolGroupsResponse } from '../../core/services/api.service';
+import { SESSION_TOOL_GROUPS_TIMEOUT_MS, SessionToolGroupsResponse } from '../../core/services/api.service';
 import { WorkspaceChoice } from '../../core/models/workspace-template.model';
 import { ApiService } from '../../core/services/api.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
@@ -257,6 +257,7 @@ describe('JobCreateComponent project picker', () => {
       getExpertDefaults: vi.fn().mockReturnValue(of(null)),
       getExperts: vi.fn().mockReturnValue(of([])),
       getExpertDetail: vi.fn().mockReturnValue(of(null)),
+      getExpertTemplate: vi.fn().mockReturnValue(of(null)),
       previewToolGroups: vi.fn().mockReturnValue(of(null)),
       listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
       getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
@@ -624,16 +625,25 @@ describe('JobCreateComponent project picker', () => {
       expect(noteFor({kind: 'none'}, preview('off'))).toBeNull();
     });
 
-    it('is hidden while the preview for a new choice or Expert is loading', () => {
+    // The note sits above Create. Hiding it while a preview loads moved the
+    // button between mousedown and mouseup, and the click was lost.
+    it('keeps its last value while the preview for a new choice or Expert is loading', () => {
       const {component} = setup(null);
       component.workspaceChoice.set(REF);
       component.toolPreview.set(preview('off'));
       expect(component.noShellNoteKey()).toBe(GRANTED);
+
       component.loadingWorkspacePreview.set(true);
-      expect(component.noShellNoteKey()).toBeNull();
+      component.toolPreview.set(preview('on'));
+      expect(component.noShellNoteKey()).toBe(GRANTED);
       component.loadingWorkspacePreview.set(false);
-      component.isLoadingExpertDetail.set(true);
       expect(component.noShellNoteKey()).toBeNull();
+
+      component.isLoadingExpertDetail.set(true);
+      component.toolPreview.set(preview('off'));
+      expect(component.noShellNoteKey()).toBeNull();
+      component.isLoadingExpertDetail.set(false);
+      expect(component.noShellNoteKey()).toBe(GRANTED);
     });
 
     it('is hidden when the user switched Shell off themselves', () => {
@@ -650,6 +660,134 @@ describe('JobCreateComponent project picker', () => {
     it('names the administrator when the user lacks the shell_tools grant', () => {
       expect(noteFor(REF, preview('off'), {shell_tools: false})).toBe(NOT_GRANTED);
       expect(noteFor(REF, preview('off'), {shell_tools: true})).toBe(GRANTED);
+    });
+  });
+
+  // create_job_first_click_swallowed_after_typing_description.md §5 Part 2:
+  // Create used to be disabled while a settings check ran, so a click during
+  // one was lost. It now waits for the latest answer and one render, and
+  // builds the request from that answer.
+  describe('a click while the settings check is in flight', () => {
+    const SHELL_OFF = {
+      thread_id: '', source: 'resolved', tool_groups: null,
+      categories: {shell: {state: 'off', reason: null, settable: true, decided_by: 'config', tools: []}},
+    } as unknown as SessionToolGroupsResponse;
+
+    /** A form whose next tool preview is held open, and whose tools fragment
+     *  says whether the preview's answer re-anchored it. */
+    function withPendingPreview() {
+      const ctx = setup(null);
+      const preview = new Subject<SessionToolGroupsResponse | null>();
+      ctx.api.previewToolGroups.mockReturnValue(preview);
+      let anchored = false;
+      ctx.component.agentSettings = {
+        vmSizingValid: () => true,
+        hasToolEdits: () => false,
+        prefillFromResolvedToolset: () => { anchored = true; },
+        prefillFromConfig: vi.fn(),
+        getOverrides: () => ({tools: {shell: anchored ? false : true}}),
+        getInstructions: () => null,
+        getSelectedDatasourceIds: () => [],
+        resetAll: vi.fn(),
+      } as unknown as JobCreateComponent['agentSettings'];
+      ctx.component.formData.description = 'Summarise the logs';
+      ctx.component.onSettingsChange();
+      return {...ctx, preview};
+    }
+
+    afterEach(() => vi.useRealTimers());
+
+    it('waits for the preview and sends exactly one job, built from its answer', async () => {
+      const {component, api, preview} = withPendingPreview();
+      expect(component.loadingWorkspacePreview()).toBe(true);
+
+      const first = component.onSubmit();
+      // The loading state is set before any await: the second click is refused.
+      expect(component.isSubmitting()).toBe(true);
+      const second = component.onSubmit();
+      expect(api.createJob).not.toHaveBeenCalled();
+
+      preview.next(SHELL_OFF);
+      await Promise.all([first, second]);
+
+      expect(api.createJob).toHaveBeenCalledOnce();
+      expect(api.createJob.mock.calls[0][0].config_override).toEqual({tools: {shell: false}});
+      expect(component.isSubmitting()).toBe(false);
+    });
+
+    it('waits for the LATEST preview: a superseded answer does not release it', async () => {
+      const {component, api, preview: superseded} = withPendingPreview();
+      const latest = new Subject<SessionToolGroupsResponse | null>();
+      api.previewToolGroups.mockReturnValue(latest);
+      component.onSettingsChange();
+
+      const pending = component.onSubmit();
+      superseded.next(SHELL_OFF);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(component.loadingWorkspacePreview()).toBe(true);
+      expect(api.createJob).not.toHaveBeenCalled();
+
+      latest.next(SHELL_OFF);
+      await pending;
+      expect(api.createJob).toHaveBeenCalledOnce();
+    });
+
+    it('waits for an Expert detail, and the preview it starts, before building', async () => {
+      const {component, api, preview} = withPendingPreview();
+      preview.next(null);
+      const detail = new Subject<unknown>();
+      api.getExpertDetail.mockReturnValue(detail);
+      const next = new Subject<SessionToolGroupsResponse | null>();
+      api.previewToolGroups.mockReturnValue(next);
+      component.toggleExpert({id: 'developer', storage_kind: 'bundled'} as Expert);
+      expect(component.isLoadingExpertDetail()).toBe(true);
+
+      const pending = component.onSubmit();
+      detail.next({id: 'developer', config: {}, instructions: null});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // The detail started a preview of its own; the click still waits.
+      expect(component.loadingWorkspacePreview()).toBe(true);
+      expect(api.createJob).not.toHaveBeenCalled();
+
+      next.next(SHELL_OFF);
+      await pending;
+      expect(api.createJob).toHaveBeenCalledOnce();
+      expect(api.createJob.mock.calls[0][0]).toMatchObject({config_name: 'developer', config_override: {tools: {shell: false}}});
+    });
+
+    it('sends nothing when the form is left while it waits', async () => {
+      const {fixture, component, api, preview} = withPendingPreview();
+
+      const pending = component.onSubmit();
+      fixture.destroy();
+      preview.next(SHELL_OFF);
+      await pending;
+
+      expect(api.createJob).not.toHaveBeenCalled();
+      expect(component.isSubmitting()).toBe(false);
+    });
+
+    it('gives up at the preview deadline with a visible reason, not a silent no-op', async () => {
+      const {component, api} = withPendingPreview();
+      vi.useFakeTimers();
+
+      const pending = component.onSubmit();
+      await vi.advanceTimersByTimeAsync(SESSION_TOOL_GROUPS_TIMEOUT_MS);
+      await pending;
+
+      expect(api.createJob).not.toHaveBeenCalled();
+      expect(component.settingsStillLoading()).toBe(true);
+      expect(component.isSubmitting()).toBe(false);
+      expect(component.formData.description).toBe('Summarise the logs');
+    });
+
+    it('a click with nothing in flight still sends at once', () => {
+      const {component, api} = setup(null);
+      component.formData.description = 'Do it now';
+
+      void component.onSubmit();
+
+      expect(api.createJob).toHaveBeenCalledOnce();
     });
   });
 

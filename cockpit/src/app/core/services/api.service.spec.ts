@@ -719,8 +719,9 @@ describe('ApiService.getSessionToolGroups', () => {
   });
 
   it('previewToolGroups is deadline-bounded and fails silently to null', async () => {
-    // The creation form blocks nothing on this, but a hung request that never
-    // settles would leave the tool switches anchored to the config forever.
+    // A Create click during a preview waits for it (create forms, onSubmit /
+    // createSession), and a hung request that never settled would also leave
+    // the tool switches anchored to the config forever.
     const pending = firstValueFrom(api.previewToolGroups({config_name: 'session_base'}));
     const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/tool-groups/preview'));
     await vi.advanceTimersByTimeAsync(SESSION_TOOL_GROUPS_TIMEOUT_MS + 1);

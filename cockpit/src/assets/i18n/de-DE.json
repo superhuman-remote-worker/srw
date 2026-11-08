@@ -659,7 +659,8 @@
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
       "expertSelectedPrefix": "Ausgewählt:",
-      "createSession": "Sitzung erstellen"
+      "createSession": "Sitzung erstellen",
+      "settingsStillLoading": "Die Einstellungen werden noch geladen. Versuche es gleich noch einmal."
     },
     "configDrift": {
       "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
@@ -993,7 +994,8 @@
       "submit": "Auftrag erstellen",
       "creating": "Wird erstellt...",
       "uploading": "Wird hochgeladen...",
-      "removeFile": "Datei entfernen"
+      "removeFile": "Datei entfernen",
+      "settingsStillLoading": "Die Einstellungen werden noch geladen. Versuchen Sie es gleich noch einmal."
     },
     "detail": {
       "auditSteps": "Audit-Schritte",
