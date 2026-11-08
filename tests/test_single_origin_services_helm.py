@@ -320,6 +320,37 @@ def test_nextcloud_also_answers_under_cloud_for_in_cluster_webdav_clients(manife
         assert mounted is (container["name"] == "nextcloud"), container["name"]
 
 
+SAMESITE_MARKERS_MOUNT = {
+    "name": "server-config",
+    "mountPath": "/etc/apache2/conf-enabled/zz-srw-samesite-markers.conf",
+    "subPath": "apache-samesite-markers.conf",
+    "readOnly": True,
+}
+
+
+def test_nextcloud_hands_out_its_same_site_markers_on_a_first_visit(manifests):
+    """The Cockpit's session cookie rides on every /cloud request, so Nextcloud
+    never sends its markers; its login hop then redirects to a URL that
+    getRequestUri() mangles under OVERWRITEWEBROOT
+    (open_project_folder_link_mangled_on_single_origin)."""
+    conf = manifests["ConfigMap", "srw-nextcloud-server-config"]["data"][
+        "apache-samesite-markers.conf"
+    ]
+    for policy in ("lax", "strict"):
+        cookie = f"nc_sameSiteCookie{policy}=true; path=/cloud; httponly; secure;"
+        line = next(line for line in conf.splitlines() if cookie in line)
+        # Appended (PHP's own Set-Cookie headers stay), on every status
+        # (the 303 to the login page included), only when the request lacks it.
+        assert line.startswith("Header always add Set-Cookie ")
+        assert f"SameSite={policy}" in line
+        assert f"!~ /nc_sameSiteCookie{policy}=true/" in line
+
+    pod = manifests["Deployment", "srw-nextcloud"]["spec"]["template"]["spec"]
+    for container in pod["containers"] + pod.get("initContainers", []):
+        mounted = SAMESITE_MARKERS_MOUNT in container.get("volumeMounts", [])
+        assert mounted is (container["name"] == "nextcloud"), container["name"]
+
+
 def test_in_cluster_routing_keeps_the_unprefixed_service_url(manifests):
     """The prefix is discovered by the adapter for WebDAV only. NEXTCLOUD_URL
     is part of the sealed main-cloud routing: prefixing it would mint a new

@@ -169,6 +169,21 @@ apache-cloud-alias.conf: |
       ErrorDocument 403 /index.php/error/403
       ErrorDocument 404 /index.php/error/404
   </Location>
+apache-samesite-markers.conf: |
+  # Single-origin: Nextcloud sends its same-site marker cookies only to a
+  # request that carries no cookie at all (base.php). Here the Cockpit's own
+  # session cookie (Path=/) rides on every /cloud request, so a browser's first
+  # visit gets a Nextcloud session but no markers. Its login request then fails
+  # Nextcloud's lax-cookie check and is redirected to getRequestUri(), which
+  # under OVERWRITEWEBROOT cuts strlen('/index.php') characters from the pretty
+  # URL: /cloud/index.phpirect_url=... ("Page not found"). Hand out the same
+  # two cookies Nextcloud would (name, value, path, flags as in base.php's
+  # sendSameSiteCookies) whenever the request lacks them; `add` keeps PHP's own
+  # Set-Cookie headers. This grants nothing Nextcloud's own lax-check redirect
+  # does not: browsers ignore SameSite cookies set by a cross-site subrequest,
+  # and the request itself is still checked without them.
+  Header always add Set-Cookie "nc_sameSiteCookielax=true; path=/cloud; httponly; secure; expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=lax" "expr=%{HTTP_COOKIE} !~ /nc_sameSiteCookielax=true/"
+  Header always add Set-Cookie "nc_sameSiteCookiestrict=true; path=/cloud; httponly; secure; expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=strict" "expr=%{HTTP_COOKIE} !~ /nc_sameSiteCookiestrict=true/"
 {{- end }}
 {{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
@@ -731,6 +746,12 @@ spec:
             - name: server-config
               mountPath: /etc/apache2/conf-enabled/zz-srw-cloud-alias.conf
               subPath: apache-cloud-alias.conf
+              readOnly: true
+            # Hands a browser Nextcloud's same-site marker cookies on its first
+            # visit (see apache-samesite-markers.conf).
+            - name: server-config
+              mountPath: /etc/apache2/conf-enabled/zz-srw-samesite-markers.conf
+              subPath: apache-samesite-markers.conf
               readOnly: true
             {{- end }}
           startupProbe:
