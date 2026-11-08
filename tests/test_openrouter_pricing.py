@@ -7,8 +7,10 @@ upsert into usage_rates (via a fake asyncpg pool/conn).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -20,6 +22,7 @@ from orchestrator.services.openrouter_pricing import (
     _price,
     _pricing_id_for,
     fetch_openrouter_prices,
+    llm_pricing_sync_loop,
     sync_catalog_llm_rates,
     sync_llm_rates,
 )
@@ -497,3 +500,264 @@ class TestSyncCatalogLlmRates:
             raise RuntimeError("db down")
 
         assert await sync_catalog_llm_rates(FakePool(FakeConn()), list_models) == 0
+
+
+# --- llm_pricing_sync_loop --------------------------------------------------
+
+SIX_HOURS = 21600.0
+_GPT = {"model_id": "gpt-5.5", "params_json": {"pricing_id": "openai/gpt-5.5"}}
+_TERRA = {"model_id": "gpt-5.6-terra", "params_json": None}
+_SELF_HOSTED = {"model_id": "gemma-4-local", "params_json": None}
+_PRICED = {
+    "openai/gpt-5.5": LlmTokenPrices(Decimal("0.0000025"), Decimal("0.00001")),
+    "openai/gpt-5.6-terra": LlmTokenPrices(Decimal("0.000003"), Decimal("0.00002")),
+}
+
+
+class _Timeline:
+    """A fake clock, catalog and price fetch for one loop run.
+
+    ``sleep`` advances the clock by the requested wait; ``stop_when`` ends the
+    run (sets shutdown) once it holds after a wait.
+    """
+
+    def __init__(self, catalog, prices=None):
+        self.now = 0.0
+        self.catalog = list(catalog)
+        self.prices = _PRICED if prices is None else prices
+        self.fetched_at: list[float] = []
+        self.waits: list[float] = []
+        self.shutdown = asyncio.Event()
+        self.stop_when = lambda: len(self.waits) >= 10
+        self.on_wait = lambda: None
+        self.conn = FakeConn()
+
+    def clock(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.waits.append(seconds)
+        self.now += seconds
+        self.on_wait()
+        if self.stop_when():
+            self.shutdown.set()
+
+    async def list_models(self):
+        return list(self.catalog)
+
+    async def fetch(self):
+        self.fetched_at.append(self.now)
+        return dict(self.prices)
+
+    async def run(self, **kwargs):
+        await asyncio.wait_for(
+            llm_pricing_sync_loop(
+                self.shutdown,
+                FakePool(self.conn),
+                self.list_models,
+                fetch_prices=self.fetch,
+                clock=self.clock,
+                sleep=self.sleep,
+                **kwargs,
+            ),
+            timeout=5,
+        )
+
+
+class TestPricingSyncLoop:
+    @pytest.mark.asyncio
+    async def test_syncs_on_entry_then_an_unchanged_catalog_does_not_fetch(self):
+        timeline = _Timeline([_GPT])
+        timeline.stop_when = lambda: timeline.now >= 3600  # an hour of checks
+        await timeline.run()
+
+        assert timeline.fetched_at == [0.0]
+        assert set(timeline.waits) == {60.0}, "the catalog is checked every minute"
+        assert len(timeline.conn.inserts) == 3
+
+    @pytest.mark.asyncio
+    async def test_prices_are_refreshed_every_six_hours(self):
+        timeline = _Timeline([_GPT])
+        timeline.stop_when = lambda: len(timeline.fetched_at) >= 3
+        await timeline.run()
+
+        assert timeline.fetched_at == [0.0, SIX_HOURS, 2 * SIX_HOURS]
+
+    @pytest.mark.asyncio
+    async def test_a_new_catalog_pair_syncs_at_the_next_check(self):
+        timeline = _Timeline([_GPT])
+
+        def _admin_adds_a_model():
+            if timeline.now == 300:
+                timeline.catalog.append(_TERRA)
+
+        timeline.on_wait = _admin_adds_a_model
+        await timeline.run()
+
+        assert timeline.fetched_at == [0.0, 300.0]
+        assert ("gpt-5.6-terra", "prompt-token", Decimal("0.000003")) in (
+            timeline.conn.inserts
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pricing_id_edit_is_a_catalog_change(self):
+        timeline = _Timeline([_SELF_HOSTED])
+        timeline.prices = {
+            **_PRICED,
+            "google/gemma-4-31b-it": LlmTokenPrices(Decimal("1e-7"), Decimal("2e-7")),
+        }
+
+        def _admin_sets_a_pricing_id():
+            if timeline.now == 120:
+                timeline.catalog = [
+                    {
+                        "model_id": "gemma-4-local",
+                        "params_json": {"pricing_id": "google/gemma-4-31b-it"},
+                    }
+                ]
+
+        timeline.on_wait = _admin_sets_a_pricing_id
+        await timeline.run()
+
+        assert timeline.fetched_at == [0.0, 120.0]
+        assert ("gemma-4-local", "prompt-token", Decimal("1e-7")) in (
+            timeline.conn.inserts
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pair_openrouter_cannot_price_does_not_refetch(self):
+        timeline = _Timeline([_GPT, _SELF_HOSTED])
+        timeline.stop_when = lambda: timeline.now >= 3600
+        await timeline.run()
+
+        assert timeline.fetched_at == [0.0]
+        assert not any(r == "gemma-4-local" for r, *_ in timeline.conn.inserts)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_catalog_fetches_nothing_until_the_seed_writes_it(self):
+        timeline = _Timeline([])
+
+        def _seed_job_runs():
+            if timeline.now == 240:
+                timeline.catalog = [_GPT]
+
+        timeline.on_wait = _seed_job_runs
+        await timeline.run()
+
+        assert timeline.fetched_at == [240.0]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_fetch_retries_on_a_doubling_backoff_capped_at_six_hours(
+        self,
+    ):
+        timeline = _Timeline([_GPT], prices={})
+        timeline.stop_when = lambda: len(timeline.fetched_at) >= 12
+        await timeline.run()
+
+        gaps = [b - a for a, b in zip(timeline.fetched_at, timeline.fetched_at[1:])]
+        assert gaps == [60, 120, 240, 480, 960, 1920, 3840, 7680, 15360, 21600, 21600]
+        assert max(timeline.waits) <= 60, "the catalog is still checked every minute"
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_after_the_network_recovers_resets_the_backoff(self):
+        timeline = _Timeline([_GPT], prices={})
+
+        def _network_recovers():
+            if timeline.now == 180:
+                timeline.prices = _PRICED
+
+        timeline.on_wait = _network_recovers
+        timeline.stop_when = lambda: timeline.now > SIX_HOURS + 180
+        await timeline.run()
+
+        # 0 fails, 60 fails, 180 succeeds; then the 6 h refresh.
+        assert timeline.fetched_at == [0.0, 60.0, 180.0, SIX_HOURS + 180]
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_change_during_the_backoff_is_tried_at_once(self):
+        timeline = _Timeline([_GPT], prices={})
+
+        def _admin_adds_a_model():
+            if timeline.now == 120:
+                timeline.catalog.append(_TERRA)
+
+        timeline.on_wait = _admin_adds_a_model
+        timeline.stop_when = lambda: timeline.now >= 600
+        await timeline.run()
+
+        # 0 fails (retry at 60); 60 fails (retry at 180); the change at 120 is
+        # tried at once and fails (retry 240 s later, at 360).
+        assert timeline.fetched_at == [0.0, 60.0, 120.0, 360.0]
+
+    @pytest.mark.asyncio
+    async def test_a_database_error_counts_as_a_failed_sync(self):
+        timeline = _Timeline([_GPT])
+
+        class _BrokenConn(FakeConn):
+            async def fetchval(self, *_args):
+                raise RuntimeError("db down")
+
+        timeline.conn = _BrokenConn()
+        timeline.stop_when = lambda: len(timeline.fetched_at) >= 3
+        await timeline.run()
+
+        assert timeline.fetched_at == [0.0, 60.0, 180.0]
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_list_failure_waits_for_the_next_check(self):
+        timeline = _Timeline([_GPT])
+        calls = []
+
+        async def _flaky_list():
+            calls.append(timeline.now)
+            if len(calls) == 1:
+                raise RuntimeError("db down")
+            return [_GPT]
+
+        timeline.list_models = _flaky_list
+        timeline.stop_when = lambda: len(timeline.waits) >= 2
+        await timeline.run()
+
+        assert calls == [0.0, 60.0]
+        assert timeline.fetched_at == [60.0]
+
+    @pytest.mark.asyncio
+    async def test_inserted_rates_clear_this_processes_rate_cache(self):
+        rates = MagicMock()
+        timeline = _Timeline([_GPT])
+        timeline.stop_when = lambda: len(timeline.fetched_at) >= 2
+        await timeline.run(usage_rates=rates)
+
+        # The first sync inserted rows, the 6 h refresh found no change.
+        assert rates.invalidate.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_during_the_wait_returns(self):
+        shutdown = asyncio.Event()
+        listed = asyncio.Event()
+
+        async def list_models():
+            listed.set()
+            return []
+
+        task = asyncio.create_task(
+            llm_pricing_sync_loop(shutdown, FakePool(FakeConn()), list_models)
+        )
+        await asyncio.wait_for(listed.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert not task.done(), "the loop is waiting for its next check"
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_without_the_app_pool_the_loop_waits_for_shutdown(self):
+        shutdown = asyncio.Event()
+
+        async def list_models():
+            raise AssertionError("no catalog read without the app pool")
+
+        task = asyncio.create_task(llm_pricing_sync_loop(shutdown, None, list_models))
+        await asyncio.sleep(0.05)
+        assert not task.done(), "a leader-gated loop that returns is restarted"
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=5)

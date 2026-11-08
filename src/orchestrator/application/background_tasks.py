@@ -955,13 +955,21 @@ async def start_background_tasks(
 
     # LLM $/token pricing sync: seed usage_rates from OpenRouter × the model
     # catalog (params_json.pricing_id) so record_events can cost the audit-
-    # sourced token rows. Slow (6h) + change-only; no-op without the app pool.
-    tasks.start(
+    # sourced token rows. Leader-gated (one writer per install): it follows
+    # catalog changes within a minute, retries a failed fetch on a backoff,
+    # refreshes prices every 6 h, and clears this replica's rate cache after
+    # inserting rates. Waits for shutdown without the app pool.
+    tasks.start_leader_gated(
         "pricing_sync",
-        openrouter_pricing.llm_pricing_sync_loop(
-            resources.shutdown_event,
+        lambda stop: openrouter_pricing.llm_pricing_sync_loop(
+            stop,
             resources.postgres_db.pool,
             resources.postgres_db.list_models,
+            usage_rates=(
+                resources.usage_ledger.rates
+                if resources.usage_ledger is not None
+                else None
+            ),
         ),
     )
 

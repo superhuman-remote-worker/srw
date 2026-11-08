@@ -24,8 +24,14 @@ rate → ``cost_usd`` stays NULL.
 Effective-dated + change-only: a sync inserts a NEW ``usage_rates`` row only when
 the upstream price differs from the current newest rate for that (resource, unit),
 so re-running every N minutes never bloats the effective-dated table and never
-rewrites already-snapshotted history. Non-fatal throughout (network/DB errors log
-and no-op) — same graceful-degradation posture as the rest of the metering tier.
+rewrites already-snapshotted history. A network error or an empty answer prices
+nothing and raises nothing; a database error propagates to the caller, and the
+loop logs it and retries — the same graceful-degradation posture as the rest of
+the metering tier.
+
+Schedule (:func:`llm_pricing_sync_loop`, one leader per install): rates follow
+the catalog within a minute of any write (seed Job, Admin, imports, manual SQL),
+a failed fetch is retried with backoff, and prices are refreshed every 6 h.
 """
 
 from __future__ import annotations
@@ -33,14 +39,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Optional,
+)
 
 import asyncpg
 import httpx
+
+if TYPE_CHECKING:
+    from orchestrator.services.usage_ledger import UsageRates
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +222,15 @@ async def fetch_openrouter_prices(
             resp = await client.get(OPENROUTER_MODELS_URL)
             resp.raise_for_status()
             data = resp.json().get("data") or []
-        except Exception:
-            logger.warning("openrouter pricing fetch failed (non-fatal)", exc_info=True)
+        except Exception as exc:
+            # One line: an air-gapped install retries this on a backoff, and a
+            # traceback per attempt says nothing the exception text does not.
+            logger.warning(
+                "openrouter pricing fetch failed (non-fatal): %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug("openrouter pricing fetch failure", exc_info=True)
             return {}
     finally:
         if owns:
@@ -353,33 +377,160 @@ async def sync_catalog_llm_rates(
     )
 
 
+# How often the loop compares the catalog's pricing pairs with the last sync.
+CATALOG_CHECK_INTERVAL_S = 60.0
+# First retry after a failed or empty price fetch; it doubles up to the loop's
+# refresh interval.
+FIRST_RETRY_S = 60.0
+
+
+@dataclass
+class _SyncSchedule:
+    """When the pricing loop syncs next (times on the loop's monotonic clock).
+
+    A sync is due when the catalog's pricing pairs differ from the set the
+    last attempt saw, or once ``next_due`` has passed: ``interval`` after a
+    sync that got prices (price drift), or a backoff after a failed or empty
+    fetch — ``first_retry``, doubling up to ``interval``.
+
+    Comparing with the last *attempt* keeps a failed fetch on its backoff
+    rather than retrying at every check, while a catalog change no attempt
+    has seen yet still syncs at the next check. After a sync that got prices
+    the attempted set is the set of that sync, so a pair OpenRouter cannot
+    price (a self-hosted model) never causes a fetch by itself.
+    """
+
+    interval: float
+    first_retry: float
+    attempted: Optional[frozenset] = None
+    next_due: float = float("-inf")
+    retry: Optional[float] = None
+
+    def due(self, now: float, pairs: frozenset) -> bool:
+        return pairs != self.attempted or now >= self.next_due
+
+    def succeeded(self, now: float, pairs: frozenset) -> None:
+        self.attempted = pairs
+        self.retry = None
+        self.next_due = now + self.interval
+
+    def failed(self, now: float, pairs: frozenset) -> float:
+        """Record a failed attempt; returns the delay until the next one."""
+        self.attempted = pairs
+        if self.retry is None:
+            self.retry = min(self.first_retry, self.interval)
+        else:
+            self.retry = min(self.retry * 2, self.interval)
+        self.next_due = now + self.retry
+        return self.retry
+
+
+async def _sync_pairs(
+    app_pool: asyncpg.Pool,
+    pairs: list[tuple[str, Optional[str]]],
+    fetch_prices: Callable[[], Awaitable[dict[str, LlmTokenPrices]]],
+) -> Optional[int]:
+    """One sync of the catalog's ``pairs``.
+
+    Returns the rate rows inserted (0 when the prices are unchanged), or
+    ``None`` when the fetch failed or returned no prices, which the loop
+    retries on its backoff. A catalog with no pair to price (empty, or every
+    row unpriced on purpose) needs no fetch and counts as synced.
+    """
+    if not any(_pricing_id_for(resource, pid) for resource, pid in pairs):
+        return 0
+    prices = await fetch_prices()
+    if not prices:
+        return None
+    return await sync_llm_rates(app_pool, pairs, prices=prices)
+
+
+async def _wait_for_shutdown(shutdown_event: asyncio.Event, timeout: float) -> None:
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def llm_pricing_sync_loop(
     shutdown_event: asyncio.Event,
     app_pool: Optional[asyncpg.Pool],
     list_models: Callable[[], Awaitable[list[dict]]],
     *,
+    usage_rates: Optional[UsageRates] = None,
     interval: float = 21600.0,
+    catalog_check_interval: float = CATALOG_CHECK_INTERVAL_S,
+    first_retry: float = FIRST_RETRY_S,
+    fetch_prices: Optional[Callable[[], Awaitable[dict[str, LlmTokenPrices]]]] = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Optional[Callable[[float], Awaitable[None]]] = None,
 ) -> None:
-    """Background loop: refresh ``usage_rates`` from OpenRouter × catalog.
+    """Background loop: keep ``usage_rates`` in step with the catalog × OpenRouter.
 
-    Syncs once on entry then every ``interval`` s (default 6 h — public prices
-    move slowly, and the sync is change-only so an unchanged run is nearly free).
-    Non-fatal per tick; no-op when the app pool is absent.
+    Leader-gated, so one writer per install. Every ``catalog_check_interval``
+    s it lists the catalog's pricing pairs (a DB read only) and syncs when
+    they changed, so rates follow every catalog writer — the Helm seed Job,
+    Admin create/update/delete, a ``pricing_id`` edit, the subscription
+    import, the startup seeders, manual SQL — within about a minute. It
+    also syncs on entry and ``interval`` s (6 h) after each sync that got
+    prices, for price drift. A failed or empty fetch is retried after
+    ``first_retry`` s, doubling up to ``interval``: an air-gapped install
+    makes a few attempts, then one per ``interval`` (see
+    :class:`_SyncSchedule`).
+
+    After a sync that inserted rates, ``usage_rates`` (the ledger's resolver
+    in this process) drops its cache; other replicas reload on a miss.
+
+    Non-fatal per tick. Without the app pool the loop waits for shutdown
+    rather than returning, because a leader-gated loop that returns is
+    started again every second. ``fetch_prices``, ``clock`` and ``sleep``
+    are for tests.
     """
     if app_pool is None:
         logger.info("LLM pricing sync loop disabled (app pool unavailable)")
+        await shutdown_event.wait()
         return
-    logger.info("LLM pricing sync loop starting (interval=%ss)", interval)
+    fetch = fetch_prices or fetch_openrouter_prices
+    wait = sleep or (lambda seconds: _wait_for_shutdown(shutdown_event, seconds))
+    schedule = _SyncSchedule(interval=interval, first_retry=first_retry)
+    logger.info(
+        "LLM pricing sync loop starting (catalog check every %ss, refresh every %ss)",
+        catalog_check_interval,
+        interval,
+    )
     try:
         while not shutdown_event.is_set():
             try:
-                await sync_catalog_llm_rates(app_pool, list_models)
-            except Exception:
-                logger.exception("LLM pricing sync tick failed (non-fatal)")
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
+                models = await list_models()
+            except Exception as exc:
+                logger.warning(
+                    "LLM pricing: catalog list failed (non-fatal): %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                pairs = _catalog_pricing_pairs(models)
+                current = frozenset(pairs)
+                if schedule.due(clock(), current):
+                    try:
+                        inserted = await _sync_pairs(app_pool, pairs, fetch)
+                    except Exception:
+                        logger.exception("LLM pricing sync failed (non-fatal)")
+                        inserted = None
+                    if inserted is None:
+                        retry = schedule.failed(clock(), current)
+                        logger.info(
+                            "LLM pricing: no prices fetched; next attempt in %.0fs",
+                            retry,
+                        )
+                    else:
+                        schedule.succeeded(clock(), current)
+                        if inserted and usage_rates is not None:
+                            usage_rates.invalidate()
+            until_due = schedule.next_due - clock()
+            if until_due <= 0:
+                until_due = catalog_check_interval
+            await wait(min(catalog_check_interval, until_due))
     finally:
         logger.info("LLM pricing sync loop stopped")
 

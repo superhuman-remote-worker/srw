@@ -360,6 +360,14 @@ class UsageRates:
         self._rows: List[Dict[str, Any]] = []
         self._loaded_at: float = -1.0
 
+    def invalidate(self) -> None:
+        """Drop the cached rates; the next lookup reads the table again.
+
+        The pricing sync calls this after it inserted rates, so this process
+        prices the next event with them instead of a cache up to ``ttl_s`` old.
+        """
+        self._loaded_at = -1.0
+
     async def _ensure_loaded(self) -> None:
         if self._pool is None:
             return
@@ -722,6 +730,11 @@ class UsageLedger:
     @property
     def is_available(self) -> bool:
         return self._pool is not None
+
+    @property
+    def rates(self) -> UsageRates:
+        """The rate resolver this ledger prices events with."""
+        return self._rates
 
     async def verify_frozen_events(
         self, events: Sequence[StrictUsageEvent]
