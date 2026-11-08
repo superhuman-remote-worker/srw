@@ -557,3 +557,65 @@ async def test_a_real_busy_answer_is_retried(tmp_path, monkeypatch, status):
     )
     assert commit.manifest["a.txt"]["remote_etag"] == '"e1"'
     assert [method for method, _p, _c in adapter.seen] == ["PUT", "PUT"]
+
+
+# --- Single-origin webroot: the orchestrator hands out /cloud-prefixed URLs.
+# Issue: single_origin_cloud_folder_listings_come_back_empty (WP4). With the
+# prefix in the URL the sync driver's own parsers strip it like any other
+# base; before the fix (unprefixed URL, prefixed hrefs) they fell back to
+# ``href.strip("/")`` and produced ``cloud/remote.php/...`` junk paths.
+
+_WEBROOT_URL = (
+    "http://srw-nextcloud/cloud/remote.php/dav/files/agent-service/sessions/s1/"
+)
+_WEBROOT_HREF = "/cloud/remote.php/dav/files/agent-service/sessions/s1/"
+
+
+def _webroot_multistatus() -> str:
+    def resp(href: str, *, collection: bool, etag: str, size: str = "") -> str:
+        rtype = "<d:collection/>" if collection else ""
+        length = f"<d:getcontentlength>{size}</d:getcontentlength>" if size else ""
+        return (
+            f"<d:response><d:href>{href}</d:href><d:propstat><d:prop>"
+            f"<d:resourcetype>{rtype}</d:resourcetype>"
+            f"<d:getetag>&quot;{etag}&quot;</d:getetag>{length}"
+            "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        )
+
+    return (
+        '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+        + resp(_WEBROOT_HREF, collection=True, etag="root")
+        + resp(f"{_WEBROOT_HREF}out", collection=True, etag="d1")
+        + resp(
+            f"{_WEBROOT_HREF}out/chart%20one.svg", collection=False, etag="f1", size="7"
+        )
+        + "</d:multistatus>"
+    )
+
+
+def test_a_webroot_url_strips_webroot_hrefs_in_the_multistatus_parser(tmp_path):
+    sync = NextcloudWorkspaceSync(
+        tmp_path, webdav_url=_WEBROOT_URL, webdav_user="u", webdav_password="p"
+    )
+    paths = {item["path"] for item in sync._parse_multistatus(_webroot_multistatus())}
+    assert not any(p.startswith("cloud/") for p in paths)
+    assert {"out", "out/chart one.svg"} <= {p.strip("/") for p in paths}
+
+
+def test_a_webroot_url_strips_webroot_paths_in_the_webdav3_listing(tmp_path):
+    from agent.services.cloud_sync.base import _normalize_dav_listing
+
+    sync = NextcloudWorkspaceSync(
+        tmp_path, webdav_url=_WEBROOT_URL, webdav_user="u", webdav_password="p"
+    )
+    raw = [
+        {"path": f"{_WEBROOT_HREF}out/", "etag": "d1", "isdir": True},
+        {
+            "path": f"{_WEBROOT_HREF}out/a.txt",
+            "etag": "f1",
+            "isdir": False,
+            "size": "3",
+        },
+    ]
+    listed = _normalize_dav_listing(raw, sync._webdav_base_path)
+    assert [item["path"] for item in listed] == ["out/", "out/a.txt"]
