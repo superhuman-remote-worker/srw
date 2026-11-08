@@ -24,6 +24,15 @@ prompt rows sum to the provider's total prompt count. Reasoning tokens are a
 ``details`` for observability, never as a separate priced row (that would
 double-count cost).
 
+Resource: the recorded ``llm_requests.model``, which agents write as the catalog
+``model_id`` — what ``usage_rates`` is keyed on. Older agent images (still
+running during a rollout) record auxiliary calls and native compaction under the
+client's wire name instead (``openrouter/x/y`` sends ``x/y``). Such a string is
+mapped to the catalog id only when it is not a catalog id itself and exactly
+one catalog row sends it; otherwise it is recorded unchanged and stays unpriced
+(fail closed).
+``details.model`` always keeps the recorded string.
+
 Attribution: ``llm_requests.job_id`` is a job id for worker rows and a thread id
 for session rows. Resolved against the app-DB ``jobs`` / ``threads`` tables to
 ``user_id`` / ``project_id`` (soft — a deleted job's tokens still meter, just
@@ -133,6 +142,77 @@ def _first_int(*vals: Any) -> int:
     return 0
 
 
+# The routing prefixes the agent's chat factories strip from a catalog id
+# before sending it: ``loader._create_openrouter_llm`` drops ``openrouter/``,
+# and the groq, mistral and codex factories drop their own. Each factory strips
+# only its own prefix, so a row's prefix must name the row's own provider.
+_FACTORY_STRIPPED_PREFIXES = frozenset({"openrouter", "groq", "mistral", "codex"})
+
+_CATALOG_SQL = (
+    "SELECT model_id, served_model_id, provider_kind, provider_ref FROM models"
+)
+
+# details.resource_from on an event whose resource was mapped from a wire name.
+RESOURCE_FROM_WIRE_NAME = "unique_wire_name"
+
+
+def catalog_wire_name(row: Any) -> str:
+    """The model name an agent's chat client sends for catalog ``row``.
+
+    The served model id when the row names one, else the catalog id, minus the
+    routing prefix the row's provider factory strips (a provider-key row
+    ``openrouter/anthropic/claude-sonnet-5.5`` sends
+    ``anthropic/claude-sonnet-5.5``). An endpoint row sends its id unchanged.
+    """
+    name = row["served_model_id"] or row["model_id"]
+    prefix, sep, rest = str(name).partition("/")
+    provider = (row["provider_ref"] or "").lower()
+    if (
+        sep
+        and rest
+        and row["provider_kind"] == "system"
+        and prefix.lower() == provider
+        and provider in _FACTORY_STRIPPED_PREFIXES
+    ):
+        return rest
+    return str(name)
+
+
+def unique_wire_names(rows: Iterable[Any]) -> dict[str, str]:
+    """``{wire name: catalog id}`` for the wire names a recorded string may map.
+
+    A wire name is kept only when exactly one catalog row sends it and it is
+    not itself a catalog ``model_id``: two rows that strip to the same name
+    (``openrouter/x/y`` and another gateway's ``…/x/y``) are ambiguous, and a
+    string that is a catalog id already names its own row. Fail closed.
+    """
+    rows = [r for r in rows if r["model_id"]]
+    catalog_ids = {str(r["model_id"]) for r in rows}
+    senders: dict[str, list[str]] = {}
+    for r in rows:
+        senders.setdefault(catalog_wire_name(r), []).append(str(r["model_id"]))
+    return {
+        wire: ids[0]
+        for wire, ids in senders.items()
+        if len(ids) == 1 and wire not in catalog_ids
+    }
+
+
+async def _load_unique_wire_names(app_pool: asyncpg.Pool) -> dict[str, str]:
+    """:func:`unique_wire_names` over the catalog. Non-fatal: ``{}`` on error,
+    so every recorded string stays as it is."""
+    try:
+        async with app_pool.acquire() as conn:
+            rows = await conn.fetch(_CATALOG_SQL)
+    except Exception:
+        logger.warning(
+            "catalog read for usage resource mapping failed (non-fatal)",
+            exc_info=True,
+        )
+        return {}
+    return unique_wire_names(rows)
+
+
 async def _resolve_owners(
     app_pool: asyncpg.Pool,
     job_ids: Iterable[Any],
@@ -222,6 +302,7 @@ async def materialize_llm_usage_from_audit(
         r["job_id"] for r in aged if (r["agent_type"] or "") == _SESSION_AGENT_TYPE
     }
     owners = await _resolve_owners(app_pool, job_ids, thread_ids)
+    wire_names = await _load_unique_wire_names(app_pool)
 
     events: list[UsageEvent] = []
     new_cursor = since_ts
@@ -240,19 +321,23 @@ async def materialize_llm_usage_from_audit(
         is_session = (r["agent_type"] or "") == _SESSION_AGENT_TYPE
         user_id, project_id = owners.get(r["job_id"], (None, None))
         reasoning = _first_int(r["m_reasoning"], r["um_reasoning"])
+        recorded_model = str(r["model"])
+        resource = wire_names.get(recorded_model, recorded_model)
         details: dict[str, Any] = {
-            "model": str(r["model"]),
+            "model": recorded_model,
             "llm_request_id": r["id"],
             "agent_type": r["agent_type"],
             "call_type": r["call_type"],
         }
+        if resource != recorded_model:
+            details["resource_from"] = RESOURCE_FROM_WIRE_NAME
         if reasoning:
             details["reasoning_tokens"] = reasoning
         if cached:
             details["cached_prompt_tokens"] = cached
         common = dict(
             category="llm",
-            resource=str(r["model"]),
+            resource=resource,
             source="audit",
             source_id=str(r["id"]),
             ts=r["timestamp"],
