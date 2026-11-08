@@ -36,7 +36,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import asyncpg
 
@@ -352,11 +352,25 @@ class UsageRates:
     OpenRouter (``openrouter_pricing``); compute rates are not yet seeded, so an
     unpriced (category, resource, unit) resolves to ``None`` and the event's
     quantity is metered with cost NULL.
+
+    A miss reloads the table once when the cache is older than
+    ``miss_reload_s``: an event is priced once, when it is written, so a rate
+    the pricing sync just inserted (on the leader replica) must not stay
+    invisible here for the whole ``ttl_s``. A hit never reloads.
     """
 
-    def __init__(self, app_pool: Optional[asyncpg.Pool], *, ttl_s: float = 300.0):
+    def __init__(
+        self,
+        app_pool: Optional[asyncpg.Pool],
+        *,
+        ttl_s: float = 300.0,
+        miss_reload_s: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._pool = app_pool
         self._ttl = ttl_s
+        self._miss_reload_s = miss_reload_s
+        self._clock = clock
         self._rows: List[Dict[str, Any]] = []
         self._loaded_at: float = -1.0
 
@@ -368,11 +382,12 @@ class UsageRates:
         """
         self._loaded_at = -1.0
 
-    async def _ensure_loaded(self) -> None:
+    async def _ensure_loaded(self, max_age_s: Optional[float] = None) -> None:
         if self._pool is None:
             return
-        now = time.monotonic()
-        if self._loaded_at >= 0 and (now - self._loaded_at) < self._ttl:
+        now = self._clock()
+        max_age = self._ttl if max_age_s is None else max_age_s
+        if self._loaded_at >= 0 and (now - self._loaded_at) < max_age:
             return
         try:
             rows = await self._pool.fetch(
@@ -391,6 +406,17 @@ class UsageRates:
         self, category: str, resource: str, unit: str, ts: datetime
     ) -> Optional[Decimal]:
         await self._ensure_loaded()
+        rate = self._lookup(category, resource, unit, ts)
+        if rate is None:
+            loaded_at = self._loaded_at
+            await self._ensure_loaded(self._miss_reload_s)
+            if self._loaded_at != loaded_at:
+                rate = self._lookup(category, resource, unit, ts)
+        return rate
+
+    def _lookup(
+        self, category: str, resource: str, unit: str, ts: datetime
+    ) -> Optional[Decimal]:
         if not self._rows:
             return None
         for want in (resource, "*"):
