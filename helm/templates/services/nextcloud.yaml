@@ -136,7 +136,7 @@ container in the Pod shares.
 {{- /*
 Server settings mounted as files into the image's include directories. They
 are read once at process start (subPath mounts never update in place), so the
-Pod carries their checksum and restarts when they change. Neither file is a
+Pod carries their checksum and restarts when they change. None of them is a
 protected-effect lane file: the lane digest does not cover them.
 */ -}}
 {{- define "srw.nextcloudServerConfigData" -}}
@@ -151,6 +151,25 @@ apache-mpm-prefork.conf: |
   <IfModule mpm_prefork_module>
       MaxRequestWorkers {{ int .Values.nextcloud.apache.maxRequestWorkers }}
   </IfModule>
+{{- if include "srw.singleOrigin" . }}
+apache-cloud-alias.conf: |
+  # Single-origin: Nextcloud runs with OVERWRITEWEBROOT=/cloud, so it writes
+  # /cloud into every WebDAV href and into sabre's base URI, also for the
+  # in-cluster clients that reach the Service without the gateway's prefix.
+  # rclone drops every entry whose href does not start with the path it asked
+  # for, and sabre refuses a MOVE/COPY Destination outside its base URI, so
+  # those clients must ask under /cloud too: serve Nextcloud there as well.
+  # The gateway still strips /cloud for browsers, which keep using /.
+  Alias /cloud /var/www/html
+  # Nextcloud's generated .htaccess points ErrorDocument at
+  # /cloud/index.php/error/40x (from overwrite.cli.url). Under the alias that
+  # reaches index.php with a root REQUEST_URI, which it cannot route: every
+  # denied or missing path at / would answer 500. Root-relative pages instead.
+  <Location "/">
+      ErrorDocument 403 /index.php/error/403
+      ErrorDocument 404 /index.php/error/404
+  </Location>
+{{- end }}
 {{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
 {{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson }}
@@ -706,6 +725,14 @@ spec:
               mountPath: /etc/apache2/conf-enabled/zz-srw-mpm-prefork.conf
               subPath: apache-mpm-prefork.conf
               readOnly: true
+            {{- if include "srw.singleOrigin" . }}
+            # Serves Nextcloud under /cloud for in-cluster WebDAV clients too
+            # (see apache-cloud-alias.conf).
+            - name: server-config
+              mountPath: /etc/apache2/conf-enabled/zz-srw-cloud-alias.conf
+              subPath: apache-cloud-alias.conf
+              readOnly: true
+            {{- end }}
           startupProbe:
             httpGet:
               path: /status.php

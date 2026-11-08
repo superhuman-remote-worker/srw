@@ -272,6 +272,18 @@ def test_php_ini_reaches_every_php_container_and_mpm_only_apache() -> None:
     assert volume["configMap"]["name"].endswith("-nextcloud-server-config")
 
 
+def test_multi_host_serves_nextcloud_only_at_its_root() -> None:
+    """The /cloud alias exists for single-origin's webroot only."""
+    documents = _documents(*BUNDLED, *PROTECTED)
+    data = _named(documents, "ConfigMap", "-nextcloud-server-config")["data"]
+    assert "apache-cloud-alias.conf" not in data
+    for container in _containers(documents).values():
+        assert not any(
+            mount.get("subPath") == "apache-cloud-alias.conf"
+            for mount in container.get("volumeMounts") or []
+        )
+
+
 def test_a_server_config_change_restarts_nextcloud() -> None:
     """subPath mounts never update in place; the Pod must roll instead."""
 

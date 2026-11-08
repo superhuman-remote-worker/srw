@@ -290,3 +290,44 @@ def test_legacy_keycloak_keeps_rolling_update_strategy():
         keycloak["spec"].get("strategy", {}).get("type", "RollingUpdate")
         == "RollingUpdate"
     )
+
+
+CLOUD_ALIAS_MOUNT = {
+    "name": "server-config",
+    "mountPath": "/etc/apache2/conf-enabled/zz-srw-cloud-alias.conf",
+    "subPath": "apache-cloud-alias.conf",
+    "readOnly": True,
+}
+
+
+def test_nextcloud_also_answers_under_cloud_for_in_cluster_webdav_clients(manifests):
+    """Nextcloud writes /cloud into every href and into sabre's base URI, also
+    for callers that skip the gateway; rclone and MOVE/COPY need a request
+    path under /cloud to match (single_origin_cloud_folder_listings_come_back_empty)."""
+    conf = manifests["ConfigMap", "srw-nextcloud-server-config"]["data"][
+        "apache-cloud-alias.conf"
+    ]
+    assert "Alias /cloud /var/www/html" in conf
+    # Without the root-relative error documents every denied or missing path
+    # at / would answer 500 (the generated .htaccess points at /cloud/...).
+    assert '<Location "/">' in conf
+    assert "ErrorDocument 403 /index.php/error/403" in conf
+    assert "ErrorDocument 404 /index.php/error/404" in conf
+
+    pod = manifests["Deployment", "srw-nextcloud"]["spec"]["template"]["spec"]
+    for container in pod["containers"] + pod.get("initContainers", []):
+        mounted = CLOUD_ALIAS_MOUNT in container.get("volumeMounts", [])
+        assert mounted is (container["name"] == "nextcloud"), container["name"]
+
+
+def test_in_cluster_routing_keeps_the_unprefixed_service_url(manifests):
+    """The prefix is discovered by the adapter for WebDAV only. NEXTCLOUD_URL
+    is part of the sealed main-cloud routing: prefixing it would mint a new
+    cloud instance and send the lane's attestation into nginx's 404."""
+    env = next(
+        document["data"]
+        for (kind, _name), document in manifests.items()
+        if kind == "ConfigMap" and "NEXTCLOUD_URL" in (document.get("data") or {})
+    )
+    assert env["NEXTCLOUD_URL"] == "http://srw-nextcloud"
+    assert env["NEXTCLOUD_PROTECTED_EFFECT_URL"] == "http://srw-protected-effect"
