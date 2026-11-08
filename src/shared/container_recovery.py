@@ -165,3 +165,34 @@ def container_retained_projection_sql(context: str, owner_id: str = "jobs.id") -
             'deleted'
         )
     )"""
+
+
+#: Job workspace projections whose creation has not published Ready.
+CONTAINER_CREATING_STATUSES = ("created", "creating", "pending")
+
+
+def container_creation_in_flight_sql(context: str, owner_id: str = "jobs.id") -> str:
+    """Whether the Job's workspace projection names an unsettled creation.
+
+    A resume that arrives while the replacement Pod of an earlier resume is
+    still starting must keep that projection: moving it to
+    ``last_workspace_container`` drops the live runtime incarnation, which the
+    authority trigger refuses (23514). The VM tier's ``_vm_creation_pending``
+    guard is the precedent.
+    """
+
+    workspace = f"{context}->'workspace_container'"
+    statuses = ",".join(f"'{status}'" for status in CONTAINER_CREATING_STATUSES)
+    return f"""(
+        {workspace}->>'provisioner' = 'k8s'
+        AND {workspace}->>'status' IN ({statuses})
+        AND EXISTS (
+            SELECT 1 FROM managed_repository_workspace_creation_reservations creation
+             WHERE creation.owner_kind = 'job'
+               AND creation.owner_id = {owner_id}
+               AND creation.scope = 'workspace_container'
+               AND creation.operation_kind = 'create'
+               AND creation.id::text = {workspace}->>'_creation_reservation_id'
+               AND creation.settled_at IS NULL
+        )
+    )"""

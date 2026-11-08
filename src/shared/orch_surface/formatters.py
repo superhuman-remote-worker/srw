@@ -1190,6 +1190,14 @@ def format_action_error(
             error_msg = detail
         except Exception:
             error_msg = f"HTTP {error.response.status_code}: {error_msg}"  # type: ignore[union-attr]
+    if isinstance(error_msg, dict) and isinstance(error_msg.get("message"), str):
+        # A typed refusal ({code, message}) reads as its message, not a repr.
+        code = error_msg.get("code")
+        error_msg = (
+            f"{error_msg['message']} ({code})"
+            if isinstance(code, str) and code
+            else error_msg["message"]
+        )
 
     return f"Action '{action}' failed for {target_kind} {job_id}:\n{error_msg}"
 

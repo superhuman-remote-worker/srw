@@ -4533,6 +4533,10 @@
       "permission.denied": "Dafür fehlt dir die Berechtigung.",
       "nothing_staged": "Es sind keine bereitgestellten Änderungen mehr vorhanden — sie wurden anderswo übernommen oder verworfen.",
       "no_protected_mount": "Diese Session hat keinen geschützten Cloud-Mount mehr, ihre bereitgestellten Änderungen können also nicht übernommen werden.",
+      "job_state_conflict": "Der Arbeitsbereich des Jobs hat sich während dieser Anfrage geändert. Lade den Job neu und versuche es noch einmal.",
+      "workspace_start_failed": "Der Arbeitsbereich des Jobs konnte nicht starten, und ein erneutes Fortsetzen würde genauso scheitern. Bitte eine Administratorin oder einen Administrator, Image und Einstellungen des Arbeitsbereichs zu prüfen.",
+      "workspace_retirement_refused": "Der Arbeitsbereich, der nicht gestartet ist, konnte noch nicht ersetzt werden. Versuche „Fortsetzen“ in einer Minute noch einmal.",
+      "workspace_retirement_unavailable": "Diese Installation kann den Arbeitsbereich des Jobs nicht ersetzen.",
       "staging_missing": "Der bereitgestellte Inhalt ist im Speicher nicht mehr vorhanden und kann daher nicht übernommen werden. Stelle die Änderungen erneut bereit und prüfe sie noch einmal.",
       "invalid_epoch": "Diese Prüfung ist veraltet. Lade sie neu und entscheide erneut."
     },

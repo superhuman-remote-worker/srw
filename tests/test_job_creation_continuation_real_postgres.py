@@ -447,7 +447,13 @@ def _make_job_pod_ready(monkeypatch, provisioner, pod, receipt, *, ready_at):
     pod.status.pod_ip = "10.42.0.51"
     for container in pod.status.container_statuses:
         container.ready = True
-        container.state = SimpleNamespace(waiting=None, running=SimpleNamespace())
+        container.started = True
+        container.container_id = f"containerd://{pod.metadata.uid}"
+        container.state = SimpleNamespace(
+            waiting=None,
+            running=SimpleNamespace(started_at=ready_at),
+            terminated=None,
+        )
     provisioner._trusted_pod_ssh_identity = AsyncMock(
         return_value=(
             f"k8s-pvc:agent-workspaces:{receipt['pvc_uid']}",

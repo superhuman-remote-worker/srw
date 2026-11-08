@@ -4533,6 +4533,10 @@
       "permission.denied": "You don't have permission to do that.",
       "nothing_staged": "There are no staged changes left to act on — they were applied or rejected somewhere else.",
       "no_protected_mount": "This session no longer has a protected cloud mount, so its staged changes cannot be applied.",
+      "job_state_conflict": "The job's workspace changed while this request ran. Reload the job and try again.",
+      "workspace_start_failed": "The job's workspace could not start, and resuming again would fail the same way. Ask an administrator to check the workspace image and settings.",
+      "workspace_retirement_refused": "The workspace that did not start could not be replaced yet. Try Resume again in a minute.",
+      "workspace_retirement_unavailable": "This deployment cannot replace the job's workspace.",
       "staging_missing": "The staged content is no longer available in storage, so it cannot be applied. Re-stage the changes and review them again.",
       "invalid_epoch": "This review is out of date. Reload it and decide again."
     },

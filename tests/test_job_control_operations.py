@@ -1074,3 +1074,113 @@ async def test_vm_delete_router_preserves_owner_or_project_owner_gate(
 
     assert exc.value.status_code == 403
     operations.delete_vm.assert_not_awaited()
+
+
+def _authority_violation(constraint: str):
+    import asyncpg
+
+    exc = asyncpg.CheckViolationError(
+        "Kubernetes runtime authority fields require exact durable authority"
+    )
+    exc.constraint_name = constraint
+    return exc
+
+
+@pytest.mark.asyncio
+async def test_resume_maps_a_workspace_authority_race_to_409_without_db_text(
+    tmp_path: Path,
+) -> None:
+    """Dev 11-08: a second resume of cca716a8 answered 500 with trigger text."""
+
+    store = MagicMock()
+    store.prepare_stateless_job_for_workspace_resume = AsyncMock(
+        side_effect=_authority_violation(
+            "managed_repository_workspace_authority_envelope_immutable"
+        )
+    )
+    operations = _operations(tmp_path, store=store)
+    operations.dependencies.resume_missing_workspace.return_value = "container"
+
+    with pytest.raises(HTTPException) as refused:
+        await operations.resume_job_internal(
+            JOB_ID,
+            user={"id": "user-a"},
+            job=_frozen_job(execution_lane="stateless"),
+        )
+
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "job_state_conflict"
+    assert "durable authority" not in json.dumps(refused.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_resume_leaves_other_check_violations_to_the_app_handlers(
+    tmp_path: Path,
+) -> None:
+    """The project deletion fence keeps its own 409 handler (not a 500)."""
+
+    import asyncpg
+
+    store = MagicMock()
+    store.prepare_stateless_job_for_workspace_resume = AsyncMock(
+        side_effect=_authority_violation("project_deletion_in_progress")
+    )
+    operations = _operations(tmp_path, store=store)
+    operations.dependencies.resume_missing_workspace.return_value = "container"
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await operations.resume_job_internal(
+            JOB_ID,
+            user={"id": "user-a"},
+            job=_frozen_job(execution_lane="stateless"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_of_a_paused_job_with_a_starting_workspace_joins_the_creation(
+    tmp_path: Path,
+) -> None:
+    join = AsyncMock(
+        return_value={
+            "outcome": "queued",
+            "reservation_id": "b8d74c39",
+            "feedback_appended": True,
+        }
+    )
+
+    class _Store(MagicMock):
+        # Optional store capabilities are looked up on the class.
+        join_resume_to_job_workspace_creation = join
+
+    store = _Store()
+    store.prepare_stateless_job_for_workspace_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store, completion_commands_enabled=True)
+    workspace = {
+        "provisioner": "k8s",
+        "status": "creating",
+        "_creation_reservation_id": "b8d74c39",
+    }
+    operations.dependencies.get_container_context.return_value = workspace
+    operations.dependencies.resume_missing_workspace.return_value = "container"
+    job = {
+        **_frozen_job(execution_lane="stateless"),
+        "status": "paused",
+        "freeze_data": None,
+        "context": {"workspace_container": workspace},
+    }
+
+    result = await operations.resume_job_internal(
+        JOB_ID,
+        user={"id": "user-a"},
+        job=job,
+        request=job_controls_module.JobResumeRequest(feedback="Also ignore *.pyc."),
+    )
+
+    assert result["status"] == "queued"
+    assert "added" in result["message"]
+    kwargs = join.await_args.kwargs
+    assert kwargs["feedback"] == "Also ignore *.pyc."
+    assert kwargs["completion_commands_enabled"] is True
+    assert "ssh_deadline" in kwargs["retirable_attention_reasons"]
+    store.prepare_stateless_job_for_workspace_resume.assert_not_awaited()
+    operations.dependencies.trigger_dispatch.assert_called_once_with()
