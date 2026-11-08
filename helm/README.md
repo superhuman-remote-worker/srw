@@ -1945,6 +1945,28 @@ exception is that chart's Canvas gateway role Job, which creates its login as
 srw SUPERUSER` as `postgres` (this rollback path is reasoned from the
 templates, not tested).
 
+### Neo4j is off by default (0.2.0)
+
+Since 0.2.0 `databases.neo4j.enabled` defaults to `false`: the knowledge base
+runs on the Postgres store, and Neo4j adds only the typed graph edges, note
+relationships and the knowledge export.
+
+An install that ran the bundled Neo4j only because of the old default loses
+its StatefulSet, Service and NetworkPolicy on the upgrade. The data volume
+(`<release>-neo4j-data`) carries `helm.sh/resource-policy: keep`, so the
+graph stays on disk. To keep Neo4j running, set it in your values before
+upgrading:
+
+```yaml
+databases:
+  neo4j:
+    enabled: true
+```
+
+Its credentials stay where they are (`NEO4J_USERNAME`, `NEO4J_PASSWORD` in
+the Secret). Installs written by the installer generator set
+`databases.neo4j.enabled` explicitly and are not affected.
+
 ### What an upgrade leaves alone in the bundled Keycloak realm
 
 Keycloak imports the `srw` realm once, on the first install. Some realm
