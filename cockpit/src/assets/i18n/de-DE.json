@@ -3635,6 +3635,7 @@
     "hints": {
       "idleDisabled": "0 = deaktiviert",
       "autoPlaceholder": "auto",
+      "auxModelFromDeployment": "Von der Installation festgelegt",
       "vmSizeWholeGiB": "Geben Sie eine ganze Zahl in GiB ein (mindestens 1).",
       "parallelToolCalls": "Die Modellunterstützung variiert — manche Modelle führen unabhängig von dieser Einstellung möglicherweise parallele Tool-Aufrufe aus, während andere sie gar nicht unterstützen.",
       "virtualBackend": "Virtuelle Workspaces laufen ohne Container — Shell-, Browser- und Git-Tools sind deaktiviert. Datei-, Web-, Datenbank- und Wissens-Tools bleiben verfügbar.",
