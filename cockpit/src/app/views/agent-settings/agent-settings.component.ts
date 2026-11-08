@@ -533,7 +533,8 @@ export class AgentSettingsComponent {
    *  Angular then also listens for that native event on the host, and the
    *  `change` a projected task field fires on blur bubbles through it. That
    *  started a tool preview between mousedown and click and lost the first
-   *  click on Create. */
+   *  click on Create. `src/app/output-names-are-not-dom-events.spec.ts`
+   *  fails on such a name. */
   settingsChange = output<void>();
   retryDatasources = output<void>();
   /** Live mode: a workspace tier the user picked. The host confirms it and
