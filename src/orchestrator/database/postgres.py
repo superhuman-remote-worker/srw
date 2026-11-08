@@ -96,6 +96,8 @@ from orchestrator.database.session_subagent_recovery import (
     write_recovered_result,
 )
 from orchestrator.database.container_startup_stage import (
+    JOB_STARTUP_OBSERVABLE_OWNER_STATUS_SQL,
+    JOB_STARTUP_OBSERVABLE_OWNER_STATUSES,
     BoundPodObserved,
     ReadyObservedAt,
     ScheduledAt,
@@ -24683,7 +24685,10 @@ class PostgresDB:
                     "WHERE id=$1 FOR UPDATE",
                     job_uuid,
                 )
-                if owner is None or owner["status"] not in {"created", "processing"}:
+                if (
+                    owner is None
+                    or owner["status"] not in JOB_STARTUP_OBSERVABLE_OWNER_STATUSES
+                ):
                     return None
                 try:
                     context = _strict_json_object(owner["context"], label="context")
@@ -24760,6 +24765,9 @@ class PostgresDB:
                         "_runtime_incarnation": str(runtime_uuid),
                         "_creation_reservation_id": str(receipt_uuid),
                         "_creation_claim_token": str(creation_claim_token),
+                        # A new runtime starts its reaper count afresh; the merge
+                        # would otherwise carry the retired runtime's attempts.
+                        "snapshot_attempts": 0,
                     }
                 )
                 if host is None:
@@ -40629,7 +40637,7 @@ class PostgresDB:
             "AND r.cancel_requested_at IS NULL "
             "AND r.startup_state IN ('observing','waiting_capacity','starting') "
             "AND r.runtime_incarnation=r.pod_uid AND r.pod_uid IS NOT NULL "
-            "AND j.status IN ('created','processing') "
+            f"AND j.status IN {JOB_STARTUP_OBSERVABLE_OWNER_STATUS_SQL} "
             "AND NOT (j.context ? '_worker_execution_hold') "
             "AND j.context->'workspace_container'->>'provisioner'='k8s' "
             "AND j.context->'workspace_container'->>'status' "

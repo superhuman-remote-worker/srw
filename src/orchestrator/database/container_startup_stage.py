@@ -191,6 +191,17 @@ class StageBudgets:
         )
 
 
+# Job statuses whose v1 workspace creation may be observed and published Ready.
+# A Job is ``paused`` while an explicit or review Resume waits for its new Pod
+# (the worker queue row stays closed until Ready), so the observer, the
+# continuation and the Ready writer must all accept it. Dispatcher admission,
+# not this set, decides whether a Ready ``paused`` Job may run.
+JOB_STARTUP_OBSERVABLE_OWNER_STATUSES: frozenset[str] = frozenset(
+    {"created", "processing", "paused"}
+)
+JOB_STARTUP_OBSERVABLE_OWNER_STATUS_SQL = "('created','processing','paused')"
+
+
 @dataclass(frozen=True, slots=True)
 class StageDeadlines:
     """Frozen boundaries from the attested scheduled transition."""

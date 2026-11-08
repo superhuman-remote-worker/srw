@@ -431,3 +431,270 @@ async def test_exited_job_pod_reaches_container_exited_attention_in_one_pass(
     assert not await provisioner.continue_job_workspace_creation(*gate)
     assert (await stage._reservation(db, receipt))["startup_exit_code"] == exit_code
     assert set(cluster.objects) == {"pvc", "service", "pod"}
+
+
+def _make_job_pod_ready(monkeypatch, provisioner, pod, receipt, *, ready_at):
+    """Turn the fake Pod Ready and stub the SSH attestation around it."""
+
+    pod.spec.node_name = "node-1"
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=ready_at
+        ),
+        SimpleNamespace(type="Ready", status="True", last_transition_time=ready_at),
+    ]
+    pod.status.phase = "Running"
+    pod.status.pod_ip = "10.42.0.51"
+    for container in pod.status.container_statuses:
+        container.ready = True
+        container.state = SimpleNamespace(waiting=None, running=SimpleNamespace())
+    provisioner._trusted_pod_ssh_identity = AsyncMock(
+        return_value=(
+            f"k8s-pvc:agent-workspaces:{receipt['pvc_uid']}",
+            "SHA256:" + "B" * 43,
+            pod.metadata.uid,
+        )
+    )
+    monkeypatch.setattr(
+        provider_module, "wait_for_agent_ssh", AsyncMock(return_value=(True, 1, ""))
+    )
+    monkeypatch.setattr(
+        provider_module, "resolve_ssh_key_path", lambda: "/run/test-key"
+    )
+    monkeypatch.setattr(
+        provider_module, "workspace_private_key_fingerprint", lambda _: "SHA256:test"
+    )
+
+
+async def _resumed_paused_stateless_job(db):
+    """A stateless review Job resumed through the real queue-holding writer.
+
+    ``prepare_stateless_job_for_workspace_resume`` closes the worker queue row
+    until the replacement workspace is Ready, so no worker claim moves the Job
+    to ``processing``: it stays ``paused`` for the whole creation.
+    """
+
+    job_id = await fixtures._job(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET execution_lane='stateless', status='pending_review' "
+            "WHERE id=$1",
+            job_id,
+        )
+    assert await db.prepare_stateless_job_for_workspace_resume(
+        str(job_id),
+        "workspace_container",
+        {"queued_feedback": "Remove the two tracked .pyc files."},
+        expected_status="pending_review",
+    )
+    job = await db.get_job(str(job_id))
+    assert str(job["status"]) == "paused"
+    return job_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_expired", [False, True], ids=["live", "expired"])
+async def test_paused_resume_creation_publishes_ready_and_is_admitted(
+    db, monkeypatch, lease_expired
+):
+    """Kai's cca716a8: every gate on the observe-and-publish path accepts paused.
+
+    Discovery, the continuation and the Ready writer each refused ``paused``,
+    so a review Resume's new Pod was never published Ready and the Job never
+    ran. This checks the whole path, not only the listing.
+    """
+
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    job_id = await _resumed_paused_stateless_job(db)
+    cluster = fixtures.NeverPullingCluster()
+    provisioner = fixtures._provisioner(monkeypatch, db, cluster)
+    owner = WorkspaceOwner.job(str(job_id))
+    assert (
+        await ensure_workspace(
+            owner,
+            provisioner=provisioner,
+            suspension=SimpleNamespace(),
+            current_status=None,
+        )
+    ).outcome is EnsureOutcome.PENDING
+    pod = cluster.objects["pod"]
+    receipt = await provisioner.get_current_workspace_creation_result(
+        owner, operation_kind="create"
+    )
+    async with db.acquire() as conn:
+        # The reaper's counter from the retired runtime (5 on dev).
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context, "
+            "'{workspace_container,snapshot_attempts}', '5'::jsonb) WHERE id=$1",
+            job_id,
+        )
+        if lease_expired:
+            await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET created_at=clock_timestamp()-interval '1800 seconds', "
+                "expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+                receipt["id"],
+            )
+    assert not (
+        await db.admit_stateless_worker_job(str(job_id), fair_key=None, priority=0)
+    )[0]
+    _make_job_pod_ready(
+        monkeypatch, provisioner, pod, receipt, ready_at=datetime.now(timezone.utc)
+    )
+
+    page = await db.list_current_job_creation_candidates(limit=32)
+    assert [c["job_id"] for c in page["candidates"]].count(job_id) == 1
+    assert await provisioner.continue_job_workspace_creation(
+        str(job_id), str(receipt["id"]), int(receipt["claim_token"]), pod.metadata.uid
+    )
+
+    closed = await stage._reservation(db, receipt)
+    assert closed["settled_at"] is not None
+    assert closed["startup_first_ready_at"] is not None
+    assert closed["pod_uid"] == receipt["pod_uid"]
+    if lease_expired:
+        assert closed["claim_token"] != receipt["claim_token"]
+    workspace = await fixtures._workspace(db, job_id)
+    assert workspace["status"] == "ready"
+    assert workspace["_runtime_incarnation"] == pod.metadata.uid
+    assert workspace["snapshot_attempts"] == 0
+    job = await db.get_job(str(job_id))
+    assert str(job["status"]) == "paused"
+    context = job["context"]
+    if isinstance(context, str):
+        context = json.loads(context)
+    assert context["queued_feedback"] == "Remove the two tracked .pyc files."
+    assert set(cluster.objects) == {"pvc", "service", "pod"}
+    assert (
+        await db.admit_stateless_worker_job(str(job_id), fair_key=None, priority=0)
+    )[0]
+
+
+@pytest.mark.asyncio
+async def test_operator_held_paused_job_publishes_ready_but_is_not_admitted(
+    db, monkeypatch
+):
+    """An operator hold placed mid-creation: Ready may settle, admission refuses."""
+
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    job_id = await _resumed_paused_stateless_job(db)
+    cluster = fixtures.NeverPullingCluster()
+    provisioner = fixtures._provisioner(monkeypatch, db, cluster)
+    owner = WorkspaceOwner.job(str(job_id))
+    assert (
+        await ensure_workspace(
+            owner,
+            provisioner=provisioner,
+            suspension=SimpleNamespace(),
+            current_status=None,
+        )
+    ).outcome is EnsureOutcome.PENDING
+    pod = cluster.objects["pod"]
+    receipt = await provisioner.get_current_workspace_creation_result(
+        owner, operation_kind="create"
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=context || "
+            "jsonb_build_object('_operator_pause_hold', "
+            "jsonb_build_object('token', $2::text)) WHERE id=$1",
+            job_id,
+            uuid4().hex,
+        )
+    _make_job_pod_ready(
+        monkeypatch, provisioner, pod, receipt, ready_at=datetime.now(timezone.utc)
+    )
+
+    assert await provisioner.continue_job_workspace_creation(
+        str(job_id), str(receipt["id"]), int(receipt["claim_token"]), pod.metadata.uid
+    )
+    assert (await stage._reservation(db, receipt))["settled_at"] is not None
+    assert (await fixtures._workspace(db, job_id))["status"] == "ready"
+    assert not (
+        await db.admit_stateless_worker_job(str(job_id), fair_key=None, priority=0)
+    )[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["cancelled", "failed", "completed"])
+async def test_terminal_owner_creation_is_neither_listed_nor_published(
+    db, monkeypatch, terminal
+):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    job_id = await fixtures._job(db)
+    cluster = fixtures.NeverPullingCluster()
+    provisioner = fixtures._provisioner(monkeypatch, db, cluster)
+    owner = WorkspaceOwner.job(str(job_id))
+    assert (
+        await ensure_workspace(
+            owner,
+            provisioner=provisioner,
+            suspension=SimpleNamespace(),
+            current_status=None,
+        )
+    ).outcome is EnsureOutcome.PENDING
+    pod = cluster.objects["pod"]
+    receipt = await provisioner.get_current_workspace_creation_result(
+        owner, operation_kind="create"
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status=$2::text WHERE id=$1", job_id, terminal
+        )
+    _make_job_pod_ready(
+        monkeypatch, provisioner, pod, receipt, ready_at=datetime.now(timezone.utc)
+    )
+
+    page = await db.list_current_job_creation_candidates(limit=32)
+    assert all(c["job_id"] != job_id for c in page["candidates"])
+    assert not await provisioner.continue_job_workspace_creation(
+        str(job_id), str(receipt["id"]), int(receipt["claim_token"]), pod.metadata.uid
+    )
+    assert (await stage._reservation(db, receipt))["settled_at"] is None
+    # A terminal transition may start the runtime's retirement; never Ready.
+    assert (await fixtures._workspace(db, job_id))["status"] != "ready"
+
+
+@pytest.mark.asyncio
+async def test_pinned_paused_resume_creation_publishes_ready(db, monkeypatch):
+    """The pinned lane stalls the same way: its dispatcher claims only after Ready."""
+
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    job_id = await fixtures._job(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET execution_lane='pinned', status='pending_review' "
+            "WHERE id=$1",
+            job_id,
+        )
+    assert await db.queue_job_for_resume(
+        str(job_id),
+        {"queued_feedback": "Remove the two tracked .pyc files."},
+        expected_status="pending_review",
+    )
+    assert str((await db.get_job(str(job_id)))["status"]) == "paused"
+    cluster = fixtures.NeverPullingCluster()
+    provisioner = fixtures._provisioner(monkeypatch, db, cluster)
+    owner = WorkspaceOwner.job(str(job_id))
+    assert (
+        await ensure_workspace(
+            owner,
+            provisioner=provisioner,
+            suspension=SimpleNamespace(),
+            current_status=None,
+        )
+    ).outcome is EnsureOutcome.PENDING
+    pod = cluster.objects["pod"]
+    receipt = await provisioner.get_current_workspace_creation_result(
+        owner, operation_kind="create"
+    )
+    _make_job_pod_ready(
+        monkeypatch, provisioner, pod, receipt, ready_at=datetime.now(timezone.utc)
+    )
+
+    assert await provisioner.continue_job_workspace_creation(
+        str(job_id), str(receipt["id"]), int(receipt["claim_token"]), pod.metadata.uid
+    )
+    assert (await stage._reservation(db, receipt))["settled_at"] is not None
+    assert (await fixtures._workspace(db, job_id))["status"] == "ready"
+    assert str((await db.get_job(str(job_id)))["status"]) == "paused"

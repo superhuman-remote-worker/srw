@@ -43,6 +43,7 @@ from shared.workspace_recovery import WorkspaceRecoveryCode
 from shared.tls_trust import TrustCaSource
 
 from orchestrator.database.container_startup_stage import (
+    JOB_STARTUP_OBSERVABLE_OWNER_STATUSES,
     BoundPodObserved,
     ReadyObservedAt,
     ScheduledAt,
@@ -3102,10 +3103,11 @@ class ContainerProvisioner:
             ):
                 return False
             job = await self._db.get_job(owner.id)
-            if not job or str(job.get("status") or "") not in {
-                "created",
-                "processing",
-            }:
+            if (
+                not job
+                or str(job.get("status") or "")
+                not in JOB_STARTUP_OBSERVABLE_OWNER_STATUSES
+            ):
                 return False
             now_db = await self._db.fetchval("SELECT clock_timestamp()")
             if receipt["expires_at"] <= now_db:
