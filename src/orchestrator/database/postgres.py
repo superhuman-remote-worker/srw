@@ -40662,6 +40662,32 @@ class PostgresDB:
             "exhausted": len(rows) < bounded_limit,
         }
 
+    async def list_unobserved_job_creation_receipts(self, *, limit=16):
+        """Open v1 Job receipts whose lease ran out: nothing has observed them.
+
+        The continuation rotates an expired lease whenever it observes a
+        receipt, so one that stays expired is outside discovery (or held).
+        Sticky startup attention is excluded; it has its own exit. A hint
+        for logging only, never an authority.
+        """
+
+        rows = await self.fetch(
+            "SELECT r.id AS reservation_id, r.owner_id AS job_id, "
+            "j.status::text AS job_status, r.startup_state, r.expires_at, "
+            "r.startup_first_ready_at "
+            "FROM managed_repository_workspace_creation_reservations r "
+            "JOIN jobs j ON j.id=r.owner_id "
+            "WHERE r.owner_kind='job' AND r.scope='workspace_container' "
+            "AND r.operation_kind='create' AND r.phase='runtime_bound' "
+            "AND r.startup_protocol_version=1 AND r.settled_at IS NULL "
+            "AND r.cancel_requested_at IS NULL "
+            "AND r.startup_state IS DISTINCT FROM 'attention' "
+            "AND r.expires_at < clock_timestamp() - interval '60 seconds' "
+            "ORDER BY r.expires_at, r.id LIMIT $1",
+            max(1, min(int(limit), 64)),
+        )
+        return tuple(dict(row) for row in rows)
+
     async def current_session_creation_candidate_is_exact(self, candidate) -> bool:
         """Recheck the immutable source and current owner under a caller's guard."""
         from orchestrator.database.session_creation_candidates import (

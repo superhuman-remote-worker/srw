@@ -4280,7 +4280,7 @@ class ContainerProvisioner:
                             complete_job = getattr(
                                 type(self._db), "complete_job_workspace_creation", None
                             )
-                            return bool(
+                            published = bool(
                                 callable(complete_job)
                                 and await complete_job(
                                     self._db,
@@ -4301,6 +4301,18 @@ class ContainerProvisioner:
                                     else None,
                                 )
                             )
+                            if not published:
+                                # The Ready writer refuses silently (owner status,
+                                # hold, receipt, SSH window, execution deadline).
+                                logger.warning(
+                                    "Workspace %s of job %s is Ready and attested, "
+                                    "but publishing Ready was refused "
+                                    "(creation reservation %s)",
+                                    pod_name,
+                                    owner.id,
+                                    _creation_reservation["id"],
+                                )
+                            return published
                     if not await self._workspace_creation_reservation_is_current(
                         owner,
                         _creation_reservation,

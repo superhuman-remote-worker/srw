@@ -170,6 +170,10 @@ class ReapableInstanceManager(StatefulInstanceManager, Protocol):
         """Persist one more failed snapshot attempt."""
         ...
 
-    async def give_up(self, inst: Instance, grace_s: int) -> None:
-        """Terminal action when a dirty instance can never be snapshotted."""
+    async def give_up(self, inst: Instance, grace_s: int) -> bool | None:
+        """Terminal action when a dirty instance can never be snapshotted.
+
+        False means nothing was deleted; True or None (a manager that does
+        not report) lets the caller record a forced delete.
+        """
         ...

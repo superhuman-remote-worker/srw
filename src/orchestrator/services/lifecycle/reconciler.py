@@ -310,8 +310,18 @@ class InstanceLifecycleReconciler:
                         stats["reap_attempts"] += 1
                 return
             if await manager.attempts_exhausted(inst):
-                await manager.give_up(inst, grace_s=0)
+                deleted = await manager.give_up(inst, grace_s=0)
                 if not permit.local:
+                    return
+                if deleted is False:
+                    logger.warning(
+                        "Lifecycle reaper gave up on dirty unreachable instance "
+                        "kind=%s id=%s bound=%s but deleted nothing; it stays "
+                        "(snapshot attempts exhausted)",
+                        manager.kind,
+                        inst.id,
+                        inst.bound_to,
+                    )
                     return
                 stats["reap_forced"] += 1
                 # Data-loss signal: a dirty instance we could never snapshot.

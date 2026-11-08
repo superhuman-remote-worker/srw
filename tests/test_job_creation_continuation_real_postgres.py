@@ -698,3 +698,30 @@ async def test_pinned_paused_resume_creation_publishes_ready(db, monkeypatch):
     assert (await stage._reservation(db, receipt))["settled_at"] is not None
     assert (await fixtures._workspace(db, job_id))["status"] == "ready"
     assert str((await db.get_job(str(job_id)))["status"]) == "paused"
+
+
+@pytest.mark.asyncio
+async def test_unobserved_receipt_listing_names_expired_open_creations(db, monkeypatch):
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    job_id = await fixtures._job(db)
+    cluster = fixtures.NeverPullingCluster()
+    provisioner = fixtures._provisioner(monkeypatch, db, cluster)
+    owner = WorkspaceOwner.job(str(job_id))
+    assert await provisioner.create_workspace(owner)
+    receipt = await provisioner.get_current_workspace_creation_result(
+        owner, operation_kind="create"
+    )
+    listed = await db.list_unobserved_job_creation_receipts(limit=64)
+    assert all(r["reservation_id"] != receipt["id"] for r in listed)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at=clock_timestamp()-interval '3600 seconds', "
+            "expires_at=clock_timestamp()-interval '1800 seconds' WHERE id=$1",
+            receipt["id"],
+        )
+    listed = await db.list_unobserved_job_creation_receipts(limit=64)
+    [row] = [r for r in listed if r["reservation_id"] == receipt["id"]]
+    assert row["job_id"] == job_id
+    assert row["job_status"] == "created"
+    assert row["startup_first_ready_at"] is None
