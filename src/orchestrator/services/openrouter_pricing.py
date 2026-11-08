@@ -24,7 +24,12 @@ rate → ``cost_usd`` stays NULL.
 Effective-dated + change-only: a sync inserts a NEW ``usage_rates`` row only when
 the upstream price differs from the current newest rate for that (resource, unit),
 so re-running every N minutes never bloats the effective-dated table and never
-rewrites already-snapshotted history. A network error or an empty answer prices
+rewrites already-snapshotted history. A price change is effective from the sync.
+A resource's FIRST rate for a unit is effective from its catalog row's
+``created_at`` instead (owner decision D-C2, 2026-11-08): calls made between the
+catalog write and the first sync, which the audit poll records afterwards, are
+priced too. Events already recorded are never touched (``usage_events`` is
+append-only). A network error or an empty answer prices
 nothing and raises nothing; a database error propagates to the caller, and the
 loop logs it and retries — the same graceful-degradation posture as the rest of
 the metering tier.
@@ -50,6 +55,7 @@ from typing import (
     Awaitable,
     Callable,
     Iterable,
+    Mapping,
     Optional,
 )
 
@@ -248,10 +254,10 @@ async def fetch_openrouter_prices(
     return out
 
 
-async def _rate_changed(
-    conn: asyncpg.Connection, resource: str, unit: str, rate: Decimal
-) -> bool:
-    """True if ``rate`` differs from the newest ``llm`` rate for (resource, unit)."""
+async def _newest_rate(
+    conn: asyncpg.Connection, resource: str, unit: str
+) -> Optional[Decimal]:
+    """The newest ``llm`` rate for (resource, unit), or ``None`` when it has none."""
     cur = await conn.fetchval(
         "SELECT rate_usd FROM usage_rates "
         "WHERE category = 'llm' AND resource = $1 AND unit = $2 "
@@ -259,7 +265,24 @@ async def _rate_changed(
         resource,
         unit,
     )
-    return cur is None or Decimal(cur) != rate
+    return None if cur is None else Decimal(cur)
+
+
+def _first_rate_effective_from(
+    created_at: Optional[datetime], sync_time: datetime
+) -> datetime:
+    """When a resource's first rate takes effect: its catalog row's creation.
+
+    Falls back to the sync time when the creation time is unknown, has no
+    zone, or lies after the sync (clock skew).
+    """
+    if (
+        isinstance(created_at, datetime)
+        and created_at.tzinfo is not None
+        and created_at < sync_time
+    ):
+        return created_at
+    return sync_time
 
 
 async def sync_llm_rates(
@@ -268,6 +291,7 @@ async def sync_llm_rates(
     *,
     prices: Optional[dict[str, LlmTokenPrices]] = None,
     now: Optional[datetime] = None,
+    created_at: Optional[Mapping[str, datetime]] = None,
 ) -> int:
     """Seed ``usage_rates`` LLM $/token rows for ``models`` from OpenRouter pricing.
 
@@ -277,6 +301,11 @@ async def sync_llm_rates(
     ``None`` → heuristic). Inserts a new effective-dated row only when the price
     changed (see module docstring). Returns the count of rate rows inserted.
     Non-fatal: returns 0 when the app pool is unavailable.
+
+    A changed price is effective from ``now``. A (resource, unit) with no rate
+    yet gets its first one effective from ``created_at[resource]`` (the catalog
+    row's creation time), so calls made before this sync are priced when they
+    are recorded after it.
     """
     if app_pool is None:
         return 0
@@ -298,19 +327,26 @@ async def sync_llm_rates(
                 continue  # unmatched / self-hosted → leave unpriced (cost = NULL)
             priced += 1
             for unit, rate in price.rates().items():
-                if await _rate_changed(conn, resource, unit, rate):
-                    await conn.execute(
-                        "INSERT INTO usage_rates "
-                        "(category, resource, unit, rate_usd, effective_from) "
-                        "VALUES ('llm', $1, $2, $3, $4) "
-                        "ON CONFLICT (category, resource, unit, effective_from) "
-                        "DO NOTHING",
-                        resource,
-                        unit,
-                        rate,
-                        ts,
-                    )
-                    inserted += 1
+                current = await _newest_rate(conn, resource, unit)
+                if current == rate:
+                    continue
+                effective_from = (
+                    _first_rate_effective_from((created_at or {}).get(resource), ts)
+                    if current is None
+                    else ts
+                )
+                await conn.execute(
+                    "INSERT INTO usage_rates "
+                    "(category, resource, unit, rate_usd, effective_from) "
+                    "VALUES ('llm', $1, $2, $3, $4) "
+                    "ON CONFLICT (category, resource, unit, effective_from) "
+                    "DO NOTHING",
+                    resource,
+                    unit,
+                    rate,
+                    effective_from,
+                )
+                inserted += 1
     # Surface how many catalog resources matched a price vs. were left unpriced, so
     # a regression (e.g. a future suffix collision silently dropping a model to
     # unpriced) is visible in logs rather than invisible.
@@ -351,6 +387,15 @@ def _catalog_pricing_pairs(
     return pairs
 
 
+def _catalog_created_at(models: Iterable[dict]) -> dict[str, datetime]:
+    """``{model_id: created_at}`` for the catalog rows that carry a creation time."""
+    return {
+        str(m["model_id"]): m["created_at"]
+        for m in models
+        if m.get("model_id") and isinstance(m.get("created_at"), datetime)
+    }
+
+
 async def sync_catalog_llm_rates(
     app_pool: Optional[asyncpg.Pool],
     list_models: Callable[[], Awaitable[list[dict]]],
@@ -373,7 +418,11 @@ async def sync_catalog_llm_rates(
         logger.warning("catalog list for pricing failed (non-fatal)", exc_info=True)
         return 0
     return await sync_llm_rates(
-        app_pool, _catalog_pricing_pairs(models), prices=prices, now=now
+        app_pool,
+        _catalog_pricing_pairs(models),
+        prices=prices,
+        now=now,
+        created_at=_catalog_created_at(models),
     )
 
 
@@ -429,6 +478,8 @@ async def _sync_pairs(
     app_pool: asyncpg.Pool,
     pairs: list[tuple[str, Optional[str]]],
     fetch_prices: Callable[[], Awaitable[dict[str, LlmTokenPrices]]],
+    *,
+    created_at: Optional[Mapping[str, datetime]] = None,
 ) -> Optional[int]:
     """One sync of the catalog's ``pairs``.
 
@@ -442,7 +493,7 @@ async def _sync_pairs(
     prices = await fetch_prices()
     if not prices:
         return None
-    return await sync_llm_rates(app_pool, pairs, prices=prices)
+    return await sync_llm_rates(app_pool, pairs, prices=prices, created_at=created_at)
 
 
 async def _wait_for_shutdown(shutdown_event: asyncio.Event, timeout: float) -> None:
@@ -513,7 +564,12 @@ async def llm_pricing_sync_loop(
                 current = frozenset(pairs)
                 if schedule.due(clock(), current):
                     try:
-                        inserted = await _sync_pairs(app_pool, pairs, fetch)
+                        inserted = await _sync_pairs(
+                            app_pool,
+                            pairs,
+                            fetch,
+                            created_at=_catalog_created_at(models),
+                        )
                     except Exception:
                         logger.exception("LLM pricing sync failed (non-fatal)")
                         inserted = None

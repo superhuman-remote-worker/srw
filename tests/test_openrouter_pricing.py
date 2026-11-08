@@ -32,19 +32,22 @@ from orchestrator.services.openrouter_pricing import (
 
 
 class FakeConn:
-    """Records inserts; answers _rate_changed's fetchval from in-memory state."""
+    """Records inserts; answers _newest_rate's fetchval from in-memory state."""
 
     def __init__(self, existing=None):
         # {(resource, unit): Decimal}
         self.existing = dict(existing or {})
         self.inserts: list[tuple[str, str, Decimal]] = []
+        # {(resource, unit): [effective_from, ...]} in insert order
+        self.effective_from: dict[tuple[str, str], list[datetime]] = {}
 
     async def fetchval(self, _sql, resource, unit):
         return self.existing.get((resource, unit))
 
-    async def execute(self, _sql, resource, unit, rate, _ts):
+    async def execute(self, _sql, resource, unit, rate, effective_from):
         self.inserts.append((resource, unit, rate))
         self.existing[(resource, unit)] = rate  # reflect the insert for change-only
+        self.effective_from.setdefault((resource, unit), []).append(effective_from)
 
 
 class _AcquireCtx:
@@ -500,6 +503,127 @@ class TestSyncCatalogLlmRates:
             raise RuntimeError("db down")
 
         assert await sync_catalog_llm_rates(FakePool(FakeConn()), list_models) == 0
+
+
+# --- a resource's first rate is back-dated (owner decision D-C2) ------------
+
+
+class TestFirstRateBackdating:
+    CREATED = datetime(2026, 11, 7, 21, 26, tzinfo=timezone.utc)
+    SYNC = datetime(2026, 11, 7, 21, 40, tzinfo=timezone.utc)
+    LATER = datetime(2026, 11, 8, 3, 40, tzinfo=timezone.utc)
+    _PRICES = TestSyncLlmRates._PRICES
+    _MODELS = [("gpt-5.5", "openai/gpt-5.5")]
+
+    @pytest.mark.asyncio
+    async def test_the_first_rate_is_effective_from_the_catalog_rows_creation(self):
+        conn = FakeConn()
+        n = await sync_llm_rates(
+            FakePool(conn),
+            self._MODELS,
+            prices=self._PRICES,
+            now=self.SYNC,
+            created_at={"gpt-5.5": self.CREATED},
+        )
+        assert n == 3
+        assert conn.effective_from == {
+            ("gpt-5.5", "prompt-token"): [self.CREATED],
+            ("gpt-5.5", "completion-token"): [self.CREATED],
+            ("gpt-5.5", "cached-prompt-token"): [self.CREATED],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_later_price_change_is_effective_from_the_sync(self):
+        conn = FakeConn()
+        created = {"gpt-5.5": self.CREATED}
+        await sync_llm_rates(
+            FakePool(conn),
+            self._MODELS,
+            prices=self._PRICES,
+            now=self.SYNC,
+            created_at=created,
+        )
+        bumped = {
+            "openai/gpt-5.5": LlmTokenPrices(
+                Decimal("0.0000030"), Decimal("0.00001"), Decimal("0.00000025")
+            )
+        }
+        n = await sync_llm_rates(
+            FakePool(conn),
+            self._MODELS,
+            prices=bumped,
+            now=self.LATER,
+            created_at=created,
+        )
+        assert n == 1
+        assert conn.effective_from[("gpt-5.5", "prompt-token")] == [
+            self.CREATED,
+            self.LATER,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_unit_with_rates_already_is_not_back_dated(self):
+        # A rate a manual backfill or an earlier sync left keeps the history:
+        # only a (resource, unit) with no rate at all is back-dated.
+        conn = FakeConn(existing={("gpt-5.5", "prompt-token"): Decimal("0.000002")})
+        await sync_llm_rates(
+            FakePool(conn),
+            self._MODELS,
+            prices=self._PRICES,
+            now=self.SYNC,
+            created_at={"gpt-5.5": self.CREATED},
+        )
+        assert conn.effective_from[("gpt-5.5", "prompt-token")] == [self.SYNC]
+        assert conn.effective_from[("gpt-5.5", "completion-token")] == [self.CREATED]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "created",
+        [
+            None,
+            datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc),  # after the sync
+            datetime(2026, 11, 7, 21, 26),  # no zone
+        ],
+    )
+    async def test_an_unusable_creation_time_falls_back_to_the_sync(self, created):
+        conn = FakeConn()
+        await sync_llm_rates(
+            FakePool(conn),
+            self._MODELS,
+            prices=self._PRICES,
+            now=self.SYNC,
+            created_at={"gpt-5.5": created} if created else None,
+        )
+        assert conn.effective_from[("gpt-5.5", "prompt-token")] == [self.SYNC]
+
+    @pytest.mark.asyncio
+    async def test_the_catalog_sync_reads_created_at_from_the_rows(self):
+        conn = FakeConn()
+
+        async def list_models():
+            return [
+                {
+                    "model_id": "gpt-5.5",
+                    "params_json": {"pricing_id": "openai/gpt-5.5"},
+                    "created_at": self.CREATED,
+                }
+            ]
+
+        await sync_catalog_llm_rates(
+            FakePool(conn), list_models, prices=self._PRICES, now=self.SYNC
+        )
+        assert conn.effective_from[("gpt-5.5", "prompt-token")] == [self.CREATED]
+
+    @pytest.mark.asyncio
+    async def test_the_loop_back_dates_a_seeded_rows_first_rate(self):
+        timeline = _Timeline([{**_GPT, "created_at": self.CREATED}])
+        timeline.stop_when = lambda: len(timeline.waits) >= 1
+        await timeline.run()
+        assert conn_dates(timeline.conn) == {self.CREATED}
+
+
+def conn_dates(conn: FakeConn) -> set[datetime]:
+    return {d for dates in conn.effective_from.values() for d in dates}
 
 
 # --- llm_pricing_sync_loop --------------------------------------------------
