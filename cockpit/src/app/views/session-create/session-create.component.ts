@@ -160,14 +160,15 @@ interface ExpertDetail extends Expert {
           [gatedCapabilities]="capabilities.grants() ?? null"
           [expertName]="selectedExpert()?.display_name ?? ''"
           [expertSource]="selectedExpertSource()"
-          (change)="onSettingsChange()"
+          (settingsChange)="onSettingsChange()"
           (retryDatasources)="loadDatasourcesList()"
         >
           <div settingsTop class="session-fields">
             <!-- Title -->
             <app-form-field [label]="'sessions.create.titleLabel' | transloco">
               <app-input
-                [(value)]="title"
+                [value]="title"
+                (valueChange)="onTitleEdit($event)"
                 [placeholder]="'sessions.create.titlePlaceholder' | transloco"
                 [disabled]="creating()"
               />
@@ -428,6 +429,14 @@ export class SessionCreateComponent implements OnInit {
   onWorkspaceChoice(choice: WorkspaceChoice): void {
     this.workspaceChoice.set(choice);
     this.loadToolPreview();
+    this.refreshManifest();
+  }
+
+  /** The title feeds the request, not the tool preview: it refreshes an open
+   *  manifest view and starts no preview. */
+  onTitleEdit(value: string): void {
+    this.title = value;
+    this.refreshManifest();
   }
   readonly selectedProjects = computed(() =>
     this.projects().filter(p => this.selectedProjectIds().has(p.id)),
@@ -853,6 +862,7 @@ export class SessionCreateComponent implements OnInit {
     this.loadEffectiveDefault();
     // The project layer can override the expert's tools and workspace, so the prediction moves with the selection.
     this.loadToolPreview();
+    this.refreshManifest();
   }
 
   toggleExpert(expert: Expert): void {

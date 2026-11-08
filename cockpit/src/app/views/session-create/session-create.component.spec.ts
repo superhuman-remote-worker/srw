@@ -331,6 +331,35 @@ describe('SessionCreateComponent submit flow', () => {
     await pending;
   });
 
+  // The native `change` that bubbled out of the settings host used to be what
+  // refreshed an open manifest; the handlers refresh it themselves now.
+  it('an open manifest view follows the workspace choice and the project', () => {
+    const {fixture} = setup();
+    const component = fixture.componentInstance;
+    component.toggleManifest();
+    expect(component.manifestText()).not.toContain('workspace:');
+
+    component.onWorkspaceChoice({kind: 'none'});
+    expect(component.manifestText()).toContain('workspace:');
+
+    const refresh = vi.spyOn(component, 'refreshManifest');
+    component.selectProject(null);
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('a title edit refreshes the manifest and starts no preview', () => {
+    const {fixture} = setup();
+    const component = fixture.componentInstance;
+    const api = TestBed.inject(ApiService) as unknown as ReturnType<typeof stubApi>;
+    const refresh = vi.spyOn(component, 'refreshManifest');
+
+    component.onTitleEdit('Quarterly report');
+
+    expect(component.title).toBe('Quarterly report');
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(api.previewToolGroups).not.toHaveBeenCalled();
+  });
+
   it('omits workspace for the default choice', async () => {
     const {fixture, http} = setup();
     const pending = fixture.componentInstance.createSession();

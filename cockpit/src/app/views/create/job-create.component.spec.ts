@@ -496,6 +496,66 @@ describe('JobCreateComponent project picker', () => {
     expect(yaml).toContain('text: Fix the flaky test');
   });
 
+  // The task fields used to refresh an open manifest only through the native
+  // `change` bubbling out of the settings host — the same event that lost the
+  // first click on Create. They refresh it themselves now, and start no preview.
+  describe('an open manifest view follows the task fields', () => {
+    function openManifest() {
+      const ctx = setup(null);
+      ctx.component.toggleManifest();
+      ctx.api.previewToolGroups.mockClear();
+      return ctx;
+    }
+
+    it('a description edit refreshes it and starts no preview', () => {
+      const {component, api} = openManifest();
+
+      component.onDescriptionEdit('Write the quarterly report');
+
+      expect(component.manifestText()).toContain('text: Write the quarterly report');
+      expect(api.previewToolGroups).not.toHaveBeenCalled();
+    });
+
+    it('an emptied description reads as empty, so Create cannot send the old text', () => {
+      const {component} = openManifest();
+      component.onDescriptionEdit('Draft');
+
+      component.onDescriptionEdit('');
+
+      expect(component.formData.description).toBe('');
+      expect(component.manifestText()).not.toContain('Draft');
+    });
+
+    it('kickoff and priority edits refresh it and start no preview', () => {
+      const {component, api} = openManifest();
+
+      component.onKickoffEdit('Start with the summary');
+      component.onPriorityChange('10');
+
+      expect(component.manifestText()).toContain('kickoff_message: Start with the summary');
+      expect(component.manifestText()).toContain('priority: 10');
+      expect(api.previewToolGroups).not.toHaveBeenCalled();
+    });
+
+    it('a project change refreshes it', () => {
+      const {component} = openManifest();
+      expect(component.manifestText()).toContain('name: live-project');
+
+      component.onProjectIdChange('');
+
+      expect(component.manifestText()).not.toContain('live-project');
+    });
+
+    it('a workspace choice refreshes it', () => {
+      const {component} = openManifest();
+      expect(component.manifestText()).not.toContain('workspace:');
+
+      component.onWorkspaceChoice({kind: 'none'});
+
+      expect(component.manifestText()).toContain('workspace:');
+    });
+  });
+
   it('sends the picked template in the preview and the create, never config_override.workspace', async () => {
     const {component, api} = setup(null);
     const choice = {kind: 'ref' as const, ref: {name: 'container-minimal', scope: {kind: 'Catalog' as const, name: 'shared'}}, backend: 'sandbox' as const, label: 'container-minimal'};

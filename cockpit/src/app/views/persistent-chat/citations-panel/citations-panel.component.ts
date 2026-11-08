@@ -70,7 +70,7 @@ type DriftState = CitationDrift | 'loading' | undefined;
     <div class="citations-panel">
       <div class="cp-header">
         <span class="cp-title">{{ 'chat.citations.title' | transloco }} ({{ rows().length }})</span>
-        <button class="cp-close" type="button" (click)="close.emit()"
+        <button class="cp-close" type="button" (click)="closed.emit()"
                 [title]="'chat.citations.close' | transloco">
           <app-icon size="sm">close</app-icon>
         </button>
@@ -235,7 +235,7 @@ export class CitationsPanelComponent {
     }
 
     /** Emitted when the user closes the panel. */
-    readonly close = output<void>();
+    readonly closed = output<void>();
 
     private readonly driftByCid = signal<Map<number, DriftState>>(new Map());
 

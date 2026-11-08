@@ -1323,7 +1323,7 @@ export function clearDraft(threadId: string | null): void {
       <!-- Citations panel (Half-B v2): session citations + view-original/drift -->
       @if (showCitations()) {
         <div class="settings-panel citations-panel-wrap">
-          <app-citations-panel (close)="showCitations.set(false); chat.citationFocus.set(null)" />
+          <app-citations-panel (closed)="showCitations.set(false); chat.citationFocus.set(null)" />
         </div>
       }
 

@@ -81,7 +81,11 @@ import {AppFormFieldComponent} from '../../ui/form-field';
              More renders every field, and a template value of 0 under a
              min="1" input blocked Create with an unfocusable error). -->
         <form novalidate (submit)="$event.preventDefault(); onSubmit()">
+          <!-- (keydown.enter): Enter in a one-line settings field (connector
+               search, number fields) must not create the job. The task fields
+               are textareas, where Enter is a newline. -->
           <app-agent-settings
+            (keydown.enter)="blockImplicitSubmit($event)"
             mode="job"
             [workspacePicker]="true"
             [pickerBackend]="pickerBackend()"
@@ -102,7 +106,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
             [loadingExpert]="isLoadingExpertDetail()"
             [expertName]="selectedExpert()?.display_name ?? ''"
             [expertSource]="selectedExpertSource()"
-            (change)="onSettingsChange()"
+            (settingsChange)="onSettingsChange()"
             (retryDatasources)="loadDatasources()"
             (instructionsChange)="onInstructionsChange($event)"
           >
@@ -145,7 +149,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
               <app-form-field [label]="'jobs.create.kickoffLabel' | transloco" [hint]="'jobs.create.kickoffHint' | transloco">
                 <app-textarea
                   [value]="kickoffMessage"
-                  (valueChange)="kickoffMessage = $event"
+                  (valueChange)="onKickoffEdit($event)"
                   [rows]="2"
                   [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
                   [disabled]="isSubmitting()"
@@ -1153,6 +1157,7 @@ export class JobCreateComponent implements OnInit {
     if (!Number.isNaN(num)) {
       this.selectedPriority.set(num);
     }
+    this.refreshManifest();
   }
 
   onProjectIdChange(value: string | null): void {
@@ -1162,6 +1167,7 @@ export class JobCreateComponent implements OnInit {
     this.loadEffectiveDefault();
     // The project is a grant scope, so it can change what the answer says.
     this.loadToolPreview();
+    this.refreshManifest();
   }
 
   readonly projects = signal<Project[]>([]);
@@ -1331,6 +1337,7 @@ export class JobCreateComponent implements OnInit {
   onWorkspaceChoice(choice: WorkspaceChoice): void {
     this.workspaceChoice.set(choice);
     this.loadToolPreview();
+    this.refreshManifest();
   }
 
   private toolPreviewSerial = 0;
@@ -1410,12 +1417,33 @@ export class JobCreateComponent implements OnInit {
     });
   }
 
+  // The task fields feed the request but not the tool preview, so their edits
+  // refresh an open manifest view and start no preview. (They used to reach
+  // onSettingsChange() through the native `change` event bubbling out of the
+  // settings host, which also lost the first click on Create.)
   onDescriptionEdit(value: string): void {
+    // Written here too, not only through the artifact effect: the manifest is
+    // rebuilt right away, and an emptied field must read as empty.
+    this.formData.description = value;
     this.artifacts.description.set(value || null);
+    this.refreshManifest();
+  }
+
+  onKickoffEdit(value: string): void {
+    this.kickoffMessage = value;
+    this.refreshManifest();
   }
 
   onInstructionsChange(value: string | null): void {
     this.artifacts.instructions.set(value);
+    this.refreshManifest();
+  }
+
+  /** Enter in a one-line field submits its form (HTML implicit submission).
+   *  None of the settings fields is the job's last step, so Enter there does
+   *  nothing; textareas are not INPUTs and keep their newline. */
+  blockImplicitSubmit(event: Event): void {
+    if ((event.target as HTMLElement | null)?.tagName === 'INPUT') event.preventDefault();
   }
 
   loadDatasources(): void {

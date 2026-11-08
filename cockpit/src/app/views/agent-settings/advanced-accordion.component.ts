@@ -848,7 +848,7 @@ export class AdvancedAccordionComponent {
    *  templates carry their sizes, so the legacy VM sizing neither shows nor emits. */
   vmSizing = input(true);
 
-  change = output<void>();
+  settingsChange = output<void>();
 
   // Accordion state
   readonly expanded = signal<Set<string>>(new Set());
@@ -1028,7 +1028,7 @@ export class AdvancedAccordionComponent {
     this.expanded.set(next);
   }
 
-  emitChange(): void { this.change.emit(); }
+  emitChange(): void { this.settingsChange.emit(); }
 
   /** Commit a displayed-but-inherited value on deliberate interaction.
    *  See PinOnInteractDirective — a <select> emits no change event when the

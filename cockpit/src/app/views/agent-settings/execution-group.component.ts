@@ -428,7 +428,7 @@ export class ExecutionGroupComponent {
       if (this.canUseVm()) return;
       if (this.effectiveBackend() === 'vm') {
         this.workspaceBackend.set('sandbox');
-        this.change.emit();
+        this.settingsChange.emit();
       }
     });
   }
@@ -473,7 +473,7 @@ export class ExecutionGroupComponent {
    *  'agentSettings.execution.workspaceRecommended', because an Expert only recommends. */
   workspaceBackendLabel = input('agentSettings.execution.workspaceBackend');
 
-  change = output<void>();
+  settingsChange = output<void>();
   /** A live tier the user picked. Intent only — the host confirms and
    *  dispatches the upgrade verb; this component never mutates tier state. */
   tierChangeRequested = output<string>();
@@ -686,55 +686,55 @@ export class ExecutionGroupComponent {
    *  option already showing is re-picked, so without this the resolved default
    *  is the one value the form cannot express. */
   pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
-    if (pinResolvedValue(target, resolved)) this.change.emit();
+    if (pinResolvedValue(target, resolved)) this.settingsChange.emit();
   }
 
   onAutonomyChange(value: string): void {
     this.autonomy.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onPermissionModeChange(value: string): void {
     this.permissionMode.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onNarrationModeChange(value: string): void {
     this.narrationMode.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onScholarChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
     this.scholar.set(checked);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onCriticChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
     this.critic.set(checked);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onCriticRoundsChange(value: number): void {
     this.criticRounds.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onProjectMemoryChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
     this.projectMemory.set(checked);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onImageQualityChange(value: string): void {
     this.imageQuality.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onWorkspaceBackendChange(value: string): void {
     this.workspaceBackend.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Reset emits, unlike the other rows here: the backend also drives the
@@ -742,7 +742,7 @@ export class ExecutionGroupComponent {
    *  hosts have to hear about it. */
   resetWorkspaceBackend(): void {
     this.workspaceBackend.set(null);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Live mode: a pick is a request, not a value.
@@ -760,7 +760,7 @@ export class ExecutionGroupComponent {
   resetCritic(): void {
     this.critic.set(null);
     this.criticRounds.set(null);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Build the execution-related config_override fragment. */

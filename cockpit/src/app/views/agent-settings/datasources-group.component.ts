@@ -847,7 +847,7 @@ export class DatasourcesGroupComponent {
   readonly query = signal('');
   readonly onlyAttached = signal(false);
 
-  change = output<void>();
+  settingsChange = output<void>();
   retry = output<void>();
 
   // The user's explicit selections are kept per execution context. Untouched
@@ -1019,7 +1019,7 @@ export class DatasourcesGroupComponent {
       ids: next,
       touched,
     });
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Check every selectable datasource, or clear them all if already all on.
@@ -1040,7 +1040,7 @@ export class DatasourcesGroupComponent {
       this.selectableDatasources().map(d => d.id),
     );
     this.setCurrentSelection({key: datasourceSetKey(this.datasources()), ids, touched});
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   getTypeIcon(type: DatasourceType | string): string {
@@ -1144,7 +1144,7 @@ export class DatasourcesGroupComponent {
       ...all,
       [contextKey]: {...(all[contextKey] ?? {}), [id]: level},
     }));
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** The levels to send, by connector id: the ones the user chose for a
@@ -1212,7 +1212,7 @@ export class DatasourcesGroupComponent {
     // an earlier touched selection.
     this.selections.set({});
     this.accessChoices.set({});
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   private setCurrentSelection(selection: NonNullable<DatasourceSelection>): void {

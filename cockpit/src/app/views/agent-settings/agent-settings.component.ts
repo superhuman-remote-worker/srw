@@ -68,7 +68,7 @@ import type {BadgeTone} from '../../ui/badge';
               [mode]="mode()"
               [disabled]="disabled()"
               [gatedCapabilities]="gatedCapabilities()"
-              (change)="onChange()"
+              (settingsChange)="onChange()"
             />
           </div>
           <ng-content select="[settingsTopAside]" />
@@ -97,7 +97,7 @@ import type {BadgeTone} from '../../ui/badge';
                 [disabled]="disabled()"
                 [showProjectMemory]="showProjectMemory()"
                 [gatedCapabilities]="gatedCapabilities()"
-                (change)="onChange()"
+                (settingsChange)="onChange()"
               />
             </div>
           </div>
@@ -143,7 +143,7 @@ import type {BadgeTone} from '../../ui/badge';
             [effectiveModels]="effectiveModels()"
             [showSubagent]="delegationEnabled()"
             [rememberLastModel]="false"
-            (change)="onChange()"
+            (settingsChange)="onChange()"
           />
 
           @if (mode() === 'job') {
@@ -164,7 +164,7 @@ import type {BadgeTone} from '../../ui/badge';
             [readsResolvedToolset]="readsResolvedToolset()"
             [enumerateOnly]="enumerateOnly()"
             [gatedCapabilities]="gatedCapabilities()"
-            (change)="onChange()"
+            (settingsChange)="onChange()"
           />
 
           @if (mode() === 'live') {
@@ -196,7 +196,7 @@ import type {BadgeTone} from '../../ui/badge';
                   [config]="mode() === 'live' ? (lockedConfig() ?? config()) : config()"
                   [mode]="mode()"
                   [disabled]="disabled()"
-                  (change)="onChange()"
+                  (settingsChange)="onChange()"
                 />
                 <app-advanced-accordion
                   [flat]="true"
@@ -207,7 +207,7 @@ import type {BadgeTone} from '../../ui/badge';
                   [modelOverride]="modelGroup?.model() ?? null"
                   [backendOverride]="workspacePicker() ? pickerBackend() : (liveTier() ?? null)"
                   [vmSizing]="false"
-                  (change)="onChange()"
+                  (settingsChange)="onChange()"
                 />
               }
             </div>
@@ -237,7 +237,7 @@ import type {BadgeTone} from '../../ui/badge';
               [liveTier]="liveTier()"
               [tierReachability]="tierReachability()"
               [upgradeInProgress]="upgradeInProgress()"
-              (change)="onChange()"
+              (settingsChange)="onChange()"
               (tierChangeRequested)="tierChangeRequested.emit($event)"
             />
             <div class="locked-field">
@@ -281,7 +281,7 @@ import type {BadgeTone} from '../../ui/badge';
             [accessMode]="datasourceAccessMode()"
             [initialAccess]="mode() === 'live' ? initialDatasourceAccess() : null"
             [lockedIds]="lockedDatasourceIds()"
-            (change)="onChange()"
+            (settingsChange)="onChange()"
             (retry)="retryDatasources.emit()"
           />
           @if (mode() === 'live') {
@@ -527,8 +527,14 @@ export class AgentSettingsComponent {
     return backend === 'virtual' || backend === 'none';
   }
 
-  /** Emitted whenever any setting changes. */
-  change = output<void>();
+  /** Emitted whenever any setting changes.
+   *
+   *  Never name it (or any group's output) after a DOM event such as `change`:
+   *  Angular then also listens for that native event on the host, and the
+   *  `change` a projected task field fires on blur bubbles through it. That
+   *  started a tool preview between mousedown and click and lost the first
+   *  click on Create. */
+  settingsChange = output<void>();
   retryDatasources = output<void>();
   /** Live mode: a workspace tier the user picked. The host confirms it and
    *  dispatches the upgrade verb — this surface only reports the intent. */
@@ -709,7 +715,7 @@ export class AgentSettingsComponent {
   // ===== Host API (unchanged from the tabbed layout) =====
 
   onChange(): void {
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onInstructionsChange(value: string | null): void {
@@ -733,7 +739,7 @@ export class AgentSettingsComponent {
     this.executionExpertGroup?.resetAll();
     this.instructionsTab?.resetToExpert();
     this.executionGroup?.workspaceBackend.set(workspace);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /**

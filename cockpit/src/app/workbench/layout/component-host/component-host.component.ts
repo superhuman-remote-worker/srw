@@ -32,7 +32,7 @@ import { PanelHeaderComponent } from '../panel-header/panel-header.component';
         (componentChange)="onComponentChange($event)"
         (splitHorizontal)="onSplitHorizontal()"
         (splitVertical)="onSplitVertical()"
-        (close)="onClose()"
+        (closed)="onClose()"
       />
       <div class="component-content">
         <ng-container #outlet />

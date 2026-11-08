@@ -466,10 +466,10 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
         getToolAdditions: () => toolsGroup.getToolAdditions(),
       }),
     });
-    // The control emits `change`; in the app the host binds it to
+    // The control emits `settingsChange`; in the app the host binds it to
     // onSettingsChange(). Wire the same edge here rather than calling the pane
     // by hand, so the click really is the only input to this test.
-    toolsGroup.change.subscribe(() => component.onSettingsChange());
+    toolsGroup.settingsChange.subscribe(() => component.onSettingsChange());
     TestBed.tick(); // fire the pane's load effect
     fixture.detectChanges();
     return {component, chat, fixture};
