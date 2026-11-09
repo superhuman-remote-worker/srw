@@ -164,9 +164,11 @@ SRW keeps several kinds of durable state outside the model context window:
 - **Audit records** make model requests, tool activity, and lifecycle events
   inspectable when the audit path is enabled.
 
-Recovery combines these layers. A replacement runtime can reattach or recreate
-the workspace, restore durable artifacts, and resume a shared checkpoint,
-subject to the configured storage and retention policy.
+Recovery combines these layers. On a supported, enabled and qualified
+[recovery path](vm-workspace-recovery.md), a replacement runtime can reattach or
+recreate the workspace, restore durable artifacts, and resume a shared
+checkpoint, subject to the configured storage and retention policy. Uncertain
+stop or command outcomes remain held for recovery rather than being replayed.
 
 ## Deployment model
 
