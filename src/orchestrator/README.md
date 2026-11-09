@@ -77,8 +77,9 @@ DATABASE_URL=postgresql://user:pass@localhost:5432/srw
 # Audit store (optional - Postgres audit trail; AUDIT_POSTGRES_* or AUDIT_DB_URL)
 AUDIT_DB_URL=postgresql://user:pass@localhost:5432/srw_audit
 
-# Neo4j (optional - for graph visualization)
-NEO4J_URI=bolt://localhost:7687
+# Neo4j (optional knowledge graph; unset = the KB runs on Postgres alone).
+# The chart sets these only when databases.neo4j.enabled.
+NEO4J_URL=bolt://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=password
 ```

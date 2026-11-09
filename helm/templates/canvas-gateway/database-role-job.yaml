@@ -102,6 +102,15 @@ spec:
               drop:
                 - ALL
         {{- if ne $postgresEngine "cnpg" }}
+        {{- /*
+        Only the bundled StatefulSet gets here (an external database is refused
+        above). CREATE ROLE and ALTER ROLE ... IN DATABASE need superuser or
+        CREATEROLE, and SRW's role has neither there (see _postgres-roles.tpl),
+        so this one step logs in as the bootstrap superuser; every other step
+        stays the database owner. CREATEROLE for SRW's role instead would let it
+        grant itself predefined roles such as pg_execute_server_program on
+        PostgreSQL 15.
+        */}}
         - name: reconcile-legacy-identity
           image: {{ .Values.databases.postgres.image }}
           command:
@@ -123,15 +132,12 @@ spec:
             - name: PGDATABASE
               value: {{ include "srw.postgresDb" . | quote }}
             - name: PGUSER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: POSTGRES_USER
+              value: {{ include "srw.postgresSuperuser" . | quote }}
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: POSTGRES_PASSWORD
+                  name: {{ include "srw.postgresSuperuserSecretName" . }}
+                  key: POSTGRES_SUPERUSER_PASSWORD
             - name: CANVAS_VIEWER_POSTGRES_USER
               value: {{ $database.username | quote }}
             - name: CANVAS_VIEWER_POSTGRES_PASSWORD

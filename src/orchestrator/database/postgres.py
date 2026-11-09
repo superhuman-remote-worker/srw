@@ -96,6 +96,8 @@ from orchestrator.database.session_subagent_recovery import (
     write_recovered_result,
 )
 from orchestrator.database.container_startup_stage import (
+    JOB_STARTUP_OBSERVABLE_OWNER_STATUS_SQL,
+    JOB_STARTUP_OBSERVABLE_OWNER_STATUSES,
     BoundPodObserved,
     ReadyObservedAt,
     ScheduledAt,
@@ -192,8 +194,10 @@ from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
 from shared.container_recovery import (
+    CONTAINER_CREATING_STATUSES,
     ContainerRecoveryCleanup,
     container_recovery_resume_allowed_sql,
+    container_creation_in_flight_sql,
     container_retained_projection_sql,
 )
 from shared.worker_execution_hold import (
@@ -13768,6 +13772,7 @@ class PostgresDB:
             "WHERE a.job_id=jobs.id AND a.policy_version=4 AND NOT "
             "public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))"
             f" AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql('context')})"
+            f" AND ($2::text <> 'workspace_container' OR NOT {container_creation_in_flight_sql('context')})"
             f" AND NOT {worker_execution_held_sql('context')}"
         )
         async with self.acquire() as conn:
@@ -24683,7 +24688,10 @@ class PostgresDB:
                     "WHERE id=$1 FOR UPDATE",
                     job_uuid,
                 )
-                if owner is None or owner["status"] not in {"created", "processing"}:
+                if (
+                    owner is None
+                    or owner["status"] not in JOB_STARTUP_OBSERVABLE_OWNER_STATUSES
+                ):
                     return None
                 try:
                     context = _strict_json_object(owner["context"], label="context")
@@ -24760,6 +24768,9 @@ class PostgresDB:
                         "_runtime_incarnation": str(runtime_uuid),
                         "_creation_reservation_id": str(receipt_uuid),
                         "_creation_claim_token": str(creation_claim_token),
+                        # A new runtime starts its reaper count afresh; the merge
+                        # would otherwise carry the retired runtime's attempts.
+                        "snapshot_attempts": 0,
                     }
                 )
                 if host is None:
@@ -36935,6 +36946,7 @@ class PostgresDB:
                            ) <> 'true')
                            AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
                           AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
+                          AND ($2::text <> 'workspace_container' OR NOT {container_creation_in_flight_sql("context")})
                           AND NOT {worker_execution_held_sql("context")}
                         RETURNING id
                         """,
@@ -36959,6 +36971,151 @@ class PostgresDB:
             return True
         except _ResumeCASLostError:
             return False
+
+    async def join_resume_to_job_workspace_creation(
+        self,
+        job_id: str,
+        *,
+        feedback: str | None,
+        feedback_reason: str | None,
+        lift_operator_pause_hold: str | None = None,
+        retirable_attention_reasons: frozenset[str] = frozenset(),
+        completion_commands_enabled: bool = False,
+    ) -> dict[str, Any] | None:
+        """Join a Resume to the paused Job's workspace creation still in flight.
+
+        An explicit Resume that finds the replacement Pod of an earlier Resume
+        still starting keeps that creation: shedding its projection would drop
+        the live runtime (the authority trigger refuses it). New feedback is
+        appended to the feedback already queued, oldest first; a repeat that
+        adds nothing writes nothing. A matching operator pause hold is lifted.
+
+        Returns ``None`` when the Job has no in-flight creation, so the caller
+        takes the ordinary path. Otherwise ``outcome`` is:
+
+        - ``queued``: the creation keeps running (or is already being retired);
+        - ``retire``: the creation is in startup attention for a reason in
+          ``retirable_attention_reasons``; the feedback is queued and the
+          caller retires the exact runtime so the dispatcher recreates it;
+        - ``start_failed``: attention for any other reason; nothing written;
+        - ``conflict``: a newer hold, a worker hold or a completion control
+          claim owns the Job; nothing written.
+        """
+
+        try:
+            job_uuid = UUID(str(job_id))
+        except (TypeError, ValueError):
+            return None
+        control_sql = (
+            _completion_control_active_sql("context")
+            if completion_commands_enabled
+            else "false"
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                owner = await conn.fetchrow(
+                    "SELECT status::text AS status, context, "
+                    f"({worker_execution_held_sql('context')}) AS worker_held, "
+                    f"({control_sql}) AS control_active "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                if owner is None or owner["status"] != "paused":
+                    return None
+                try:
+                    context = _strict_json_object(owner["context"], label="context")
+                except RuntimeError:
+                    return None
+                workspace = context.get("workspace_container")
+                if (
+                    not isinstance(workspace, dict)
+                    or workspace.get("provisioner") != "k8s"
+                    or workspace.get("status") not in CONTAINER_CREATING_STATUSES
+                    or not isinstance(workspace.get("_creation_reservation_id"), str)
+                ):
+                    return None
+                try:
+                    receipt_uuid = UUID(workspace["_creation_reservation_id"])
+                except ValueError:
+                    return None
+                receipt = await conn.fetchrow(
+                    "SELECT id, settled_at, cancel_requested_at, startup_state, "
+                    "startup_reason_code, runtime_incarnation "
+                    "FROM managed_repository_workspace_creation_reservations "
+                    "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                    "AND scope='workspace_container' AND operation_kind='create' "
+                    "FOR SHARE",
+                    receipt_uuid,
+                    job_uuid,
+                )
+                if receipt is None or receipt["settled_at"] is not None:
+                    return None
+                result: dict[str, Any] = {
+                    "reservation_id": str(receipt["id"]),
+                    "runtime_incarnation": (
+                        str(receipt["runtime_incarnation"])
+                        if receipt["runtime_incarnation"] is not None
+                        else None
+                    ),
+                    "startup_state": receipt["startup_state"],
+                    "reason_code": receipt["startup_reason_code"],
+                    "feedback_appended": False,
+                }
+                hold = context.get(OPERATOR_PAUSE_HOLD_CONTEXT_KEY)
+                held_id = (
+                    hold.get("hold_id")
+                    if isinstance(hold, dict) and isinstance(hold.get("hold_id"), str)
+                    else ""
+                )
+                if (
+                    owner["worker_held"]
+                    or owner["control_active"]
+                    or (
+                        hold is not None and held_id != (lift_operator_pause_hold or "")
+                    )
+                    or (hold is not None and not held_id)
+                ):
+                    return {**result, "outcome": "conflict"}
+                outcome = "queued"
+                if (
+                    receipt["startup_state"] == "attention"
+                    and receipt["cancel_requested_at"] is None
+                ):
+                    if (
+                        receipt["startup_reason_code"]
+                        not in retirable_attention_reasons
+                    ):
+                        return {**result, "outcome": "start_failed"}
+                    if receipt["runtime_incarnation"] is None:
+                        return {**result, "outcome": "start_failed"}
+                    outcome = "retire"
+                merge: dict[str, Any] = {}
+                queued = context.get("queued_feedback")
+                if feedback:
+                    if isinstance(queued, str) and queued:
+                        if feedback not in queued:
+                            merge["queued_feedback"] = f"{queued}\n\n---\n\n{feedback}"
+                    else:
+                        merge["queued_feedback"] = feedback
+                        merge["queued_feedback_reason"] = feedback_reason
+                        merge["queued_feedback_delivery_id"] = str(uuid4())
+                if merge or hold is not None:
+                    base = (
+                        operator_pause_hold_lift_sql("context")
+                        if hold is not None
+                        else "COALESCE(context, '{}'::jsonb)"
+                    )
+                    updated = await conn.fetchval(
+                        f"UPDATE jobs SET context = {base} || $2::jsonb, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id=$1 AND status='paused' RETURNING id",
+                        job_uuid,
+                        json.dumps(merge),
+                    )
+                    if updated is None:
+                        return {**result, "outcome": "conflict"}
+                result["feedback_appended"] = "queued_feedback" in merge
+                return {**result, "outcome": outcome}
 
     async def prepare_pinned_job_for_workspace_resume(
         self,
@@ -37026,6 +37183,7 @@ class PostgresDB:
                               public.vm_job_cancel_retention_discharged(a.cleanup_admission_id))
                           AND ({_completion_control_owned_active_sql("context", "$4")})
                           AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
+                          AND ($2::text <> 'workspace_container' OR NOT {container_creation_in_flight_sql("context")})
                           AND NOT {worker_execution_held_sql("context")}
                         RETURNING id
                         """,
@@ -40629,7 +40787,7 @@ class PostgresDB:
             "AND r.cancel_requested_at IS NULL "
             "AND r.startup_state IN ('observing','waiting_capacity','starting') "
             "AND r.runtime_incarnation=r.pod_uid AND r.pod_uid IS NOT NULL "
-            "AND j.status IN ('created','processing') "
+            f"AND j.status IN {JOB_STARTUP_OBSERVABLE_OWNER_STATUS_SQL} "
             "AND NOT (j.context ? '_worker_execution_hold') "
             "AND j.context->'workspace_container'->>'provisioner'='k8s' "
             "AND j.context->'workspace_container'->>'status' "
@@ -40653,6 +40811,32 @@ class PostgresDB:
             else after,
             "exhausted": len(rows) < bounded_limit,
         }
+
+    async def list_unobserved_job_creation_receipts(self, *, limit=16):
+        """Open v1 Job receipts whose lease ran out: nothing has observed them.
+
+        The continuation rotates an expired lease whenever it observes a
+        receipt, so one that stays expired is outside discovery (or held).
+        Sticky startup attention is excluded; it has its own exit. A hint
+        for logging only, never an authority.
+        """
+
+        rows = await self.fetch(
+            "SELECT r.id AS reservation_id, r.owner_id AS job_id, "
+            "j.status::text AS job_status, r.startup_state, r.expires_at, "
+            "r.startup_first_ready_at "
+            "FROM managed_repository_workspace_creation_reservations r "
+            "JOIN jobs j ON j.id=r.owner_id "
+            "WHERE r.owner_kind='job' AND r.scope='workspace_container' "
+            "AND r.operation_kind='create' AND r.phase='runtime_bound' "
+            "AND r.startup_protocol_version=1 AND r.settled_at IS NULL "
+            "AND r.cancel_requested_at IS NULL "
+            "AND r.startup_state IS DISTINCT FROM 'attention' "
+            "AND r.expires_at < clock_timestamp() - interval '60 seconds' "
+            "ORDER BY r.expires_at, r.id LIMIT $1",
+            max(1, min(int(limit), 64)),
+        )
+        return tuple(dict(row) for row in rows)
 
     async def current_session_creation_candidate_is_exact(self, candidate) -> bool:
         """Recheck the immutable source and current owner under a caller's guard."""

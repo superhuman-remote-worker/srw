@@ -17,6 +17,7 @@ import os
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+import asyncpg
 import httpx
 from fastapi import HTTPException, Request
 from shared.vm_resource_admission import ResourceAdmissionError
@@ -48,6 +49,7 @@ from shared.worker_execution_hold import (
     worker_execution_held_sql,
 )
 from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
+from shared.container_recovery import CONTAINER_CREATING_STATUSES
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -83,6 +85,60 @@ def resume_reject_should_requeue(status_code: int) -> bool:
 
 async def _no_mint_gate(_job: Any) -> tuple[str, str | None]:
     return "dispatch", None
+
+
+#: Startup attention reasons a Resume may retire and recreate (owner decision
+#: D-B, 2026-11-08): the frozen window ran out, which a new Pod can fix. The
+#: deterministic reasons (invalid image or configuration, an exited process)
+#: would fail the same way again.
+RETIRABLE_STARTUP_ATTENTION_REASONS = frozenset(
+    {"ssh_deadline", "readiness_deadline", "pull_deadline"}
+)
+
+#: Check violations the workspace authority trigger raises when a write races
+#: a runtime change. A request that loses that race gets a 409, never the
+#: trigger text. Any other constraint keeps the application's handlers.
+WORKSPACE_AUTHORITY_CONSTRAINTS = frozenset(
+    {
+        f"managed_repository_{name}"
+        for scope in ("workspace", "ide")
+        for name in (
+            f"{scope}_authority_envelope_immutable",
+            f"{scope}_cleanup_in_progress",
+            f"retired_{scope}_runtime_reactivation",
+            f"retired_{scope}_runtime_rebind",
+            f"{scope}_creation_reservation_required",
+            f"uidless_{scope}_runtime_transition_forbidden",
+        )
+    }
+    | {"stateless_workspace_runtime_generation_mismatch"}
+)
+
+JOB_STATE_CONFLICT_DETAIL = {
+    "code": "job_state_conflict",
+    "message": (
+        "The Job's workspace changed while this request ran. Reload the Job "
+        "and try again."
+    ),
+}
+
+
+def workspace_authority_conflict(
+    exc: BaseException, *, logger: logging.Logger, job_id: str
+) -> HTTPException | None:
+    """409 for a listed workspace authority refusal, else ``None``."""
+
+    if not isinstance(exc, asyncpg.CheckViolationError):
+        return None
+    constraint = getattr(exc, "constraint_name", None)
+    if constraint not in WORKSPACE_AUTHORITY_CONSTRAINTS:
+        return None
+    logger.warning(
+        "Job %s control lost a workspace authority race (constraint %s)",
+        job_id,
+        constraint,
+    )
+    return HTTPException(status_code=409, detail=dict(JOB_STATE_CONFLICT_DETAIL))
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +182,8 @@ class JobControlDependencies:
     get_vm_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     recovery_store: Any
     validate_workspace_recovery_storage: Callable[[str], Awaitable[bool]] | None = None
+    #: Retires a Job workspace whose startup ran out of time (Resume, D-B).
+    container_provisioner: Any | None = None
     #: A job's provider-minted credentials before its claim (connector
     #: drivers C5, ``connector_minted_credentials.job_mint_gate``).
     job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = _no_mint_gate
@@ -898,6 +956,144 @@ class JobControlOperations:
         """
         return resume_reject_should_requeue(status_code)
 
+    async def _resume_during_workspace_creation(
+        self,
+        job_id: str,
+        *,
+        job: Mapping[str, Any],
+        feedback: str | None,
+        feedback_reason: str | None,
+        lift_operator_pause_hold: str,
+    ) -> dict[str, str] | None:
+        """A Resume of a paused Job whose replacement Pod is still starting.
+
+        Owner decision D-A (2026-11-08): keep the creation and append the new
+        feedback. D-B: a creation whose startup window ran out is retired
+        (exact Pod, PVC kept) so the dispatcher starts a new one.
+        ``None`` means no creation is in flight; take the ordinary path.
+        """
+
+        if str(job.get("status") or "") != "paused":
+            return None
+        workspace = self.dependencies.get_container_context(job)
+        if (
+            not isinstance(workspace, Mapping)
+            or workspace.get("provisioner") != "k8s"
+            or workspace.get("status") not in CONTAINER_CREATING_STATUSES
+            or not workspace.get("_creation_reservation_id")
+        ):
+            return None
+        join = getattr(
+            type(self.dependencies.store),
+            "join_resume_to_job_workspace_creation",
+            None,
+        )
+        if not callable(join):
+            return None
+        joined = await join(
+            self.dependencies.store,
+            job_id,
+            feedback=feedback,
+            feedback_reason=feedback_reason,
+            lift_operator_pause_hold=lift_operator_pause_hold or None,
+            retirable_attention_reasons=RETIRABLE_STARTUP_ATTENTION_REASONS,
+            completion_commands_enabled=self.dependencies.completion_commands_enabled(),
+        )
+        if joined is None:
+            return None
+        outcome = joined.get("outcome")
+        if outcome == "conflict":
+            raise HTTPException(status_code=409, detail=dict(JOB_STATE_CONFLICT_DETAIL))
+        if outcome == "start_failed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_start_failed",
+                    "message": (
+                        "The Job's workspace could not start "
+                        f"({joined.get('reason_code') or 'unknown reason'}). "
+                        "Resuming again would fail the same way; ask an "
+                        "administrator to check the workspace image and settings."
+                    ),
+                },
+            )
+        if outcome == "retire":
+            await self._retire_unstarted_workspace(
+                job_id, str(joined["runtime_incarnation"])
+            )
+            message = (
+                "The workspace did not start in time; it is being replaced and "
+                "the Job will continue on the same storage"
+            )
+        else:
+            message = "The workspace for an earlier resume is still starting; " + (
+                "your feedback was added to the queued feedback"
+                if joined.get("feedback_appended")
+                else "the Job will continue once it is ready"
+            )
+        self.dependencies.logger.info(
+            "Resume of job %s joined its workspace creation %s (%s)",
+            job_id,
+            joined.get("reservation_id"),
+            outcome,
+        )
+        self.dependencies.trigger_dispatch()
+        return {"status": "queued", "message": message, "job_id": job_id}
+
+    async def _retire_unstarted_workspace(self, job_id: str, runtime: str) -> None:
+        """Retire exactly the runtime whose startup ran out; keep its PVC."""
+
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+
+        provisioner = self.dependencies.container_provisioner
+        if provisioner is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_retirement_unavailable",
+                    "message": "This deployment cannot replace the workspace.",
+                },
+            )
+        owner = WorkspaceOwner.job(job_id)
+        intent = await provisioner.prepare_workspace_cleanup_intent(
+            owner,
+            expected_runtime_incarnation=runtime,
+            target_disposition="deleted",
+            reclaim_shared_resources=False,
+            admission_source="explicit",
+        )
+        if not isinstance(intent, dict):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_retirement_refused",
+                    "message": (
+                        "The workspace that did not start could not be retired "
+                        "yet. Try Resume again in a minute."
+                    ),
+                },
+            )
+        try:
+            async with asyncio.timeout(20):
+                await provisioner.reconcile_workspace_cleanup_intent(
+                    owner,
+                    expected_runtime_incarnation=runtime,
+                    intent_generation=int(intent["intent_generation"]),
+                )
+        except TimeoutError:
+            # The committed intent is finished by the cleanup sweep.
+            self.dependencies.logger.info(
+                "Retirement of job %s runtime %s continues in the background",
+                job_id,
+                runtime,
+            )
+        except Exception:
+            self.dependencies.logger.exception(
+                "Retirement of job %s runtime %s will be retried by the sweep",
+                job_id,
+                runtime,
+            )
+
     async def _resume_job_internal(
         self,
         job_id: str,
@@ -1266,6 +1462,16 @@ class JobControlOperations:
                 if creation is not None:
                     self.dependencies.trigger_dispatch()
                     return creation
+
+            joined = await self._resume_during_workspace_creation(
+                job_id,
+                job=job,
+                feedback=request.feedback if request else None,
+                feedback_reason=feedback_reason,
+                lift_operator_pause_hold=operator_pause_lift,
+            )
+            if joined is not None:
+                return joined
 
             async def _queue_for_dispatch(
                 message: str,
@@ -1740,6 +1946,16 @@ class JobControlOperations:
                 status_code=502,
                 detail=f"Failed to connect to agent: {str(e)}. Agent may be offline.",
             ) from e
+        except asyncpg.CheckViolationError as e:
+            conflict = workspace_authority_conflict(
+                e, logger=self.dependencies.logger, job_id=job_id
+            )
+            if conflict is not None:
+                raise conflict from e
+            # Other check violations (the project deletion fence) keep the
+            # application's own handlers; none of them echo the DB text.
+            self.dependencies.logger.exception(f"Failed to resume job {job_id}: {e}")
+            raise
         except Exception as e:
             self.dependencies.logger.exception(f"Failed to resume job {job_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e)) from e

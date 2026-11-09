@@ -667,7 +667,7 @@ export class ToolsGroupComponent {
     return !!grantKey && g[grantKey] !== true;
   }
 
-  change = output<void>();
+  settingsChange = output<void>();
 
   /**
    * The user's own switch positions, or null while they have set none.
@@ -933,7 +933,7 @@ export class ToolsGroupComponent {
     if (!this.additionsByKey()[key]?.length) return;
     if (this.requestedAdditions().has(key)) return;
     this.requestedAdditions.update((set) => new Set(set).add(key));
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /**
@@ -1042,7 +1042,7 @@ export class ToolsGroupComponent {
     if (next.has(key)) next.delete(key);
     else next.add(key);
     this.userDisabled.set(next);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Enable every selectable category, or disable them all if already all on.
@@ -1056,7 +1056,7 @@ export class ToolsGroupComponent {
       else next.add(key);
     }
     this.userDisabled.set(next);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   resetCategory(key: string, event: Event): void {
@@ -1069,7 +1069,7 @@ export class ToolsGroupComponent {
     if (key === 'delegation') {
       this.delegationCap.set(null);
     }
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** The cap field changed. An emptied field is "no edit" (null), which in a
@@ -1077,12 +1077,12 @@ export class ToolsGroupComponent {
    *  field to show beside its error, and is never written. */
   onDelegationCapChange(v: number | null): void {
     this.delegationCap.set(typeof v === 'number' ? v : null);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   resetDelegationCap(): void {
     this.delegationCap.set(null);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** False while the session cap field holds a value that would be refused. */

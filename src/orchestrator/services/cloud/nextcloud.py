@@ -40,7 +40,11 @@ from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import httpx
 
-from orchestrator.services.cloud._propfind import parse_propfind_entries
+from orchestrator.services.cloud._propfind import (
+    first_href_path as _first_href_path,
+    hrefs_outside_prefix,
+    parse_propfind_entries,
+)
 from orchestrator.services.cloud.base import (
     CanaryFixture,
     CloudMountSubject,
@@ -335,6 +339,13 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             else None
         )
         self._initialized = False
+        # Where Nextcloud's WebDAV lives, learned in ``ensure_initialized``
+        # (``_discover_dav_roots``): the path its hrefs carry before
+        # ``/remote.php/dav/`` and the path under ``base_url`` that answers
+        # with them. Both are empty unless Nextcloud runs under a webroot it
+        # writes into its hrefs (single-origin ``/cloud``).
+        self._dav_href_root = ""
+        self._dav_request_root = ""
         # The admin's, with client-level auth: never agent-service's.
         self._client: Optional[httpx.AsyncClient] = None
         self._agent_client: Optional[httpx.AsyncClient] = None
@@ -400,6 +411,106 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         }:
             raise RuntimeError("Nextcloud attestation instance changed")
         self._attestation_backend_instance_id = backend_instance_id
+
+    # ------------------------------------------------------------ WebDAV roots
+
+    @property
+    def dav_href_root(self) -> str:
+        """The path Nextcloud's hrefs carry before ``/remote.php/dav/``."""
+        return self._dav_href_root
+
+    @property
+    def dav_request_root(self) -> str:
+        """The path under ``base_url`` that serves WebDAV with those hrefs."""
+        return self._dav_request_root
+
+    def _dav_path(self, rest: str) -> str:
+        """A WebDAV request path relative to ``base_url``; ``rest`` starts
+        with ``/remote.php/``."""
+        return f"{self._dav_request_root}{rest}"
+
+    def _dav_url(self, rest: str) -> str:
+        """An absolute WebDAV URL, as handed to rclone, agents and probes.
+        Its path must equal the hrefs Nextcloud answers with: rclone drops
+        every entry otherwise, and sabre refuses a MOVE/COPY whose
+        ``Destination`` lies outside its base URI."""
+        return f"{self._base_url}{self._dav_request_root}{rest}"
+
+    def _dav_href_prefix(self, rest: str) -> str:
+        """The prefix this backend's PROPFIND hrefs carry for ``rest``."""
+        return f"{self._dav_href_root}{rest}"
+
+    async def _discover_dav_roots(self) -> None:
+        """Learn where Nextcloud's WebDAV lives from Nextcloud itself.
+
+        With ``overwritewebroot`` (single-origin: ``/cloud``) Nextcloud
+        writes that webroot into every href and into sabre's base URI, for
+        every caller, also one that reached it without the prefix. A
+        ``Depth: 0`` PROPFIND of the DAV root names the href root; the
+        request root is the same path under ``base_url``, used only when it
+        verifiably serves WebDAV with those hrefs (the chart's Apache alias).
+        A transport error or 5xx fails initialization, as ``status.php``
+        does; any other answer keeps today's unprefixed behaviour.
+        """
+        assert self._client is not None
+        dav = "/remote.php/dav/"
+        resp = await self._client.request("PROPFIND", dav, headers={"Depth": "0"})
+        if resp.status_code >= 500:
+            resp.raise_for_status()
+        href = _first_href_path(resp.text) if resp.status_code == 207 else None
+        if href is None or not href.endswith(dav):
+            logger.warning(
+                "Nextcloud WebDAV root not discoverable (PROPFIND %s answered "
+                "%s); using unprefixed WebDAV paths",
+                dav,
+                resp.status_code,
+            )
+            self._dav_href_root = self._dav_request_root = ""
+            return
+        href_root = href[: -len(dav)].rstrip("/")
+        base_path = urlsplit(self._base_url).path.rstrip("/")
+        request_root = ""
+        if href_root and href_root != base_path:
+            if base_path and not href_root.startswith(f"{base_path}/"):
+                logger.warning(
+                    "Nextcloud names its WebDAV root %s%s, outside the base URL "
+                    "path %s; using unprefixed WebDAV requests",
+                    href_root,
+                    dav,
+                    base_path,
+                )
+            else:
+                candidate = href_root[len(base_path) :]
+                check = await self._client.request(
+                    "PROPFIND", f"{candidate}{dav}", headers={"Depth": "0"}
+                )
+                if check.status_code >= 500:
+                    check.raise_for_status()
+                served = (
+                    _first_href_path(check.text) if check.status_code == 207 else None
+                )
+                if served == f"{href_root}{dav}":
+                    request_root = candidate
+                else:
+                    logger.warning(
+                        "Nextcloud names its WebDAV root %s%s but %s%s%s does "
+                        "not serve it (%s); rclone mounts will list nothing",
+                        href_root,
+                        dav,
+                        self._base_url,
+                        candidate,
+                        dav,
+                        check.status_code,
+                    )
+        self._dav_href_root = href_root
+        self._dav_request_root = request_root
+        logger.info(
+            "Nextcloud WebDAV: hrefs under '%s%s', requests via '%s%s'",
+            href_root,
+            dav,
+            self._base_url,
+            request_root,
+        )
 
     def _protected_effect_origin_path(self, path: str) -> str:
         """Prefix a signed target with the installation path exactly once."""
@@ -675,7 +786,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
                 # URL.
                 username = str(handle.vendor_meta.get("username") or "")
                 webdav_url = (
-                    f"{self._base_url}/remote.php/dav/files/{quote(username, safe='')}/"
+                    self._dav_url(f"/remote.php/dav/files/{quote(username, safe='')}/")
                     if username
                     else None
                 )
@@ -694,13 +805,18 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         # to the public edge (no-op unless the URL is internal-prefixed). Mirror
         # of the OpenCloud path — see
         # knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
+        # The public edge reaches the WebDAV root through its own path (the
+        # single-origin gateway strips ``/cloud``), so the swap replaces the
+        # whole internal WebDAV root, request root included, never just
+        # ``base_url`` (that would double ``/cloud``).
+        dav_base = f"{self._base_url}{self._dav_request_root}"
         if (
             prefer_public_url
             and webdav_url
             and self._public_url
-            and webdav_url.startswith(self._base_url)
+            and webdav_url.startswith(dav_base)
         ):
-            webdav_url = self._public_url + webdav_url[len(self._base_url) :]
+            webdav_url = self._public_url + webdav_url[len(dav_base) :]
 
         if not webdav_url:
             raise CloudBackendError(
@@ -850,6 +966,8 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
                 )
                 await self._close_clients()
                 return False
+
+            await self._discover_dav_roots()
 
             installation_proof = legacy_installation_proof
             if self._protected_effect_url is not None:
@@ -1105,7 +1223,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         if not self._initialized:
             return None
         username = str(user_id)
-        webdav_url = f"{self._base_url}/remote.php/dav/files/{username}/"
+        webdav_url = self._dav_url(f"/remote.php/dav/files/{username}/")
         browser_url = f"{self._public_url}/apps/files/"
         handle = ProjectFolderHandle(
             backend=self.backend_id,
@@ -1400,13 +1518,23 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         mountpoint = handle.vendor_meta.get("mountpoint")
         if not mountpoint:
             return None
-        return (
-            f"{self._base_url}/remote.php/dav/groupfolders/"
-            f"{self._agent_user}/{mountpoint}/"
+        return self._dav_url(
+            f"/remote.php/dav/groupfolders/{self._agent_user}/{mountpoint}/"
         )
 
     def _groupfolder_dav_base(self, handle: ProjectFolderHandle) -> str:
-        """WebDAV base path (no trailing slash) for a Group Folder's bytes.
+        """WebDAV request path (no trailing slash) for a Group Folder's
+        bytes, under the discovered request root (``_dav_path``)."""
+        return self._dav_path(self._groupfolder_dav_rest(handle))
+
+    def _groupfolder_href_prefix(self, handle: ProjectFolderHandle) -> str:
+        """The prefix (with trailing slash) every href of a walk of this
+        Group Folder carries: under the discovered href root, which is not
+        the request path when Nextcloud writes a webroot into its hrefs."""
+        return f"{self._dav_href_prefix(self._groupfolder_dav_rest(handle))}/"
+
+    def _groupfolder_dav_rest(self, handle: ProjectFolderHandle) -> str:
+        """``/remote.php/dav/groupfolders/...`` path of a Group Folder.
 
         ``agent-service`` is a member of ``srw-agents``, which has access to
         every project Group Folder, so it reaches the folder's contents via
@@ -1446,8 +1574,9 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         self._ensure_ready()
         base_path = self._groupfolder_dav_base(handle)
         # Strip this prefix off every href so callers get paths relative to
-        # the folder root.
-        href_prefix = f"{base_path}/"
+        # the folder root. It is the href root's, not the request path's: a
+        # webroot Nextcloud writes into its hrefs is in it.
+        href_prefix = self._groupfolder_href_prefix(handle)
 
         all_entries: list[ProjectFolderEntry] = []
         # Breadth-first queue of subpaths to expand. Empty string = root.
@@ -1505,9 +1634,30 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
                 status_code=resp.status_code,
                 raw={"body": resp.text[:500]},
             )
+        self._raise_on_foreign_hrefs(resp.text, href_prefix, url_path)
         return parse_propfind_entries(
             resp.text, href_prefix=href_prefix, self_path=self_path
         )
+
+    def _raise_on_foreign_hrefs(
+        self, xml: str, href_prefix: str, url_path: str
+    ) -> None:
+        """Refuse a listing whose hrefs all lie outside the expected root.
+
+        Dropping them would read as an empty folder: a job then copies
+        nothing and the outside-edit check compares nothing, so write-back
+        overwrites unseen files. A correct server always returns the walked
+        collection's own entry under the prefix.
+        """
+        if hrefs_outside_prefix(xml, href_prefix=href_prefix):
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"PROPFIND hrefs for {url_path} do not start with the expected "
+                f"WebDAV root {href_prefix!r}; Nextcloud's webroot does not "
+                "match the one discovered at initialization",
+                backend=self.backend_id,
+                retryable=False,
+            )
 
     async def _propfind_at_depth(
         self, url_path: str, href_prefix: str, *, depth: str, self_path: str = ""
@@ -1528,6 +1678,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             raise PropfindError(
                 f"PROPFIND Depth:{depth} returned {resp.status_code} for {url_path}"
             )
+        self._raise_on_foreign_hrefs(resp.text, href_prefix, url_path)
         return parse_propfind_entries(
             resp.text, href_prefix=href_prefix, self_path=self_path
         )
@@ -1540,7 +1691,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         Depth:1 BFS (design §3.4, §11.5)."""
         self._ensure_ready()
         base_path = self._groupfolder_dav_base(handle)
-        href_prefix = f"{base_path}/"
+        href_prefix = self._groupfolder_href_prefix(handle)
 
         async def list_tree() -> list[ProjectFolderEntry]:
             return await self._propfind_at_depth(
@@ -1684,7 +1835,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         that the folder is its own."""
         self._ensure_ready()
         folder_path = f"sessions/{session_id}"
-        dav_prefix = f"/remote.php/dav/files/{self._agent_user}"
+        dav_prefix = self._dav_path(f"/remote.php/dav/files/{self._agent_user}")
         parts = folder_path.strip("/").split("/")
         try:
             # The leaf first: ``sessions/`` is there for every session but
@@ -1732,7 +1883,9 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         self._ensure_ready()
         folder_path = handle.native_id
         try:
-            url = f"/remote.php/dav/files/{self._agent_user}/{folder_path}"
+            url = self._dav_path(
+                f"/remote.php/dav/files/{self._agent_user}/{folder_path}"
+            )
             resp = await self._agent_client.delete(url)
             if resp.status_code == 204:
                 logger.info(f"Deleted session folder: {folder_path}")
@@ -1849,9 +2002,8 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         self, handle: SessionFolderHandle
     ) -> Optional[str]:
         """Internal WebDAV URL for agent access to a session folder."""
-        return (
-            f"{self._base_url}/remote.php/dav/files/"
-            f"{self._agent_user}/{handle.native_id}/"
+        return self._dav_url(
+            f"/remote.php/dav/files/{self._agent_user}/{handle.native_id}/"
         )
 
     @instrument_backend_op("put_session_file")
@@ -1876,7 +2028,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         folder_path = handle.native_id.strip("/")
         try:
             await self._put_creating_parents(
-                f"/remote.php/dav/files/{self._agent_user}",
+                self._dav_path(f"/remote.php/dav/files/{self._agent_user}"),
                 folder_path.split("/") + rel.split("/"),
                 content=content,
                 content_type=content_type,
@@ -2272,8 +2424,8 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         return RoReaderGrant(
             reader_id=plan.reader_id,
             grant_handle=plan.grant_handle,
-            webdav_url=(
-                f"{self._base_url}/remote.php/dav/files/{plan.reader_id}/"
+            webdav_url=self._dav_url(
+                f"/remote.php/dav/files/{plan.reader_id}/"
                 f"{quote(plan.mountpoint, safe='')}/"
             ),
             credentials=credentials,
@@ -2361,8 +2513,8 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         mountpoint = handle.vendor_meta.get("mountpoint")
         if not mountpoint or not principal_id:
             return None
-        return (
-            f"{self._base_url}/remote.php/dav/groupfolders/"
+        return self._dav_url(
+            "/remote.php/dav/groupfolders/"
             f"{quote(str(principal_id), safe='')}/{quote(str(mountpoint), safe='')}/"
         )
 
@@ -2589,7 +2741,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         if fixture.trash_ref:
             user = self.webdav_credentials.get("username")
             if user:
-                purge_url = (
+                purge_url = self._dav_path(
                     f"/remote.php/dav/trashbin/{user}/trash/"
                     f"{quote(fixture.trash_ref, safe='')}"
                 )
@@ -2657,7 +2809,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         user = self.webdav_credentials.get("username")
         if not user:
             return None
-        url = f"/remote.php/dav/versions/{user}/versions/{fileid}"
+        url = self._dav_path(f"/remote.php/dav/versions/{user}/versions/{fileid}")
         try:
             resp = await self._agent_client.request(
                 "PROPFIND",
@@ -2704,7 +2856,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             )
         except CloudBackendError:
             return None
-        url = f"/remote.php/dav/trashbin/{user}/trash"
+        url = self._dav_path(f"/remote.php/dav/trashbin/{user}/trash")
         try:
             resp = await self._agent_client.request(
                 "PROPFIND",

@@ -659,7 +659,8 @@
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
       "expertSelectedPrefix": "Ausgewählt:",
-      "createSession": "Sitzung erstellen"
+      "createSession": "Sitzung erstellen",
+      "settingsStillLoading": "Die Einstellungen werden noch geladen. Versuche es gleich noch einmal."
     },
     "configDrift": {
       "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
@@ -771,6 +772,7 @@
       "user": "Von einer Person erstellt",
       "session": "Aus einer Sitzung gestartet",
       "automation": "Automatisierung",
+      "telephony": "Telefonanruf",
       "loop": "Schleife",
       "officer": "Officer",
       "subjob": "Teilauftrag",
@@ -992,7 +994,8 @@
       "submit": "Auftrag erstellen",
       "creating": "Wird erstellt...",
       "uploading": "Wird hochgeladen...",
-      "removeFile": "Datei entfernen"
+      "removeFile": "Datei entfernen",
+      "settingsStillLoading": "Die Einstellungen werden noch geladen. Versuchen Sie es gleich noch einmal."
     },
     "detail": {
       "auditSteps": "Audit-Schritte",
@@ -3632,6 +3635,7 @@
     "hints": {
       "idleDisabled": "0 = deaktiviert",
       "autoPlaceholder": "auto",
+      "auxModelFromDeployment": "Von der Installation festgelegt",
       "vmSizeWholeGiB": "Geben Sie eine ganze Zahl in GiB ein (mindestens 1).",
       "parallelToolCalls": "Die Modellunterstützung variiert — manche Modelle führen unabhängig von dieser Einstellung möglicherweise parallele Tool-Aufrufe aus, während andere sie gar nicht unterstützen.",
       "virtualBackend": "Virtuelle Workspaces laufen ohne Container — Shell-, Browser- und Git-Tools sind deaktiviert. Datei-, Web-, Datenbank- und Wissens-Tools bleiben verfügbar.",
@@ -4532,6 +4536,10 @@
       "permission.denied": "Dafür fehlt dir die Berechtigung.",
       "nothing_staged": "Es sind keine bereitgestellten Änderungen mehr vorhanden — sie wurden anderswo übernommen oder verworfen.",
       "no_protected_mount": "Diese Session hat keinen geschützten Cloud-Mount mehr, ihre bereitgestellten Änderungen können also nicht übernommen werden.",
+      "job_state_conflict": "Der Arbeitsbereich des Jobs hat sich während dieser Anfrage geändert. Lade den Job neu und versuche es noch einmal.",
+      "workspace_start_failed": "Der Arbeitsbereich des Jobs konnte nicht starten, und ein erneutes Fortsetzen würde genauso scheitern. Bitte eine Administratorin oder einen Administrator, Image und Einstellungen des Arbeitsbereichs zu prüfen.",
+      "workspace_retirement_refused": "Der Arbeitsbereich, der nicht gestartet ist, konnte noch nicht ersetzt werden. Versuche „Fortsetzen“ in einer Minute noch einmal.",
+      "workspace_retirement_unavailable": "Diese Installation kann den Arbeitsbereich des Jobs nicht ersetzen.",
       "staging_missing": "Der bereitgestellte Inhalt ist im Speicher nicht mehr vorhanden und kann daher nicht übernommen werden. Stelle die Änderungen erneut bereit und prüfe sie noch einmal.",
       "invalid_epoch": "Diese Prüfung ist veraltet. Lade sie neu und entscheide erneut."
     },

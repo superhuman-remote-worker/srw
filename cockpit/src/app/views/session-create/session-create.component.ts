@@ -2,7 +2,7 @@ import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings
 import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
 import {WorkspaceChoice} from '../../core/models/workspace-template.model';
 import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
-import {Component, computed, effect, inject, OnInit, signal, untracked, ViewChild} from '@angular/core';
+import {Component, computed, effect, inject, Injector, OnInit, signal, untracked, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {HttpClient, HttpContext, HttpParams} from '@angular/common/http';
 import {VIEW_AS_OVERRIDE} from '../../core/interceptors/view-as.interceptor';
@@ -13,6 +13,7 @@ import {UserService} from '../../core/services/user.service';
 import {AgentSettingsComponent} from '../../views/agent-settings/agent-settings.component';
 import {ExpertPickerComponent} from '../../views/agent-settings/expert-picker.component';
 import {executionManifest, inlineExpertSelection, toYaml} from '../../views/agent-settings/execution-request';
+import {LatestLoad, PendingLoad, settleBeforeCreate} from '../../views/agent-settings/settle-before-create';
 import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {resolveEffectiveModels} from '../../views/agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
@@ -160,14 +161,15 @@ interface ExpertDetail extends Expert {
           [gatedCapabilities]="capabilities.grants() ?? null"
           [expertName]="selectedExpert()?.display_name ?? ''"
           [expertSource]="selectedExpertSource()"
-          (change)="onSettingsChange()"
+          (settingsChange)="onSettingsChange()"
           (retryDatasources)="loadDatasourcesList()"
         >
           <div settingsTop class="session-fields">
             <!-- Title -->
             <app-form-field [label]="'sessions.create.titleLabel' | transloco">
               <app-input
-                [(value)]="title"
+                [value]="title"
+                (valueChange)="onTitleEdit($event)"
                 [placeholder]="'sessions.create.titlePlaceholder' | transloco"
                 [disabled]="creating()"
               />
@@ -231,10 +233,10 @@ interface ExpertDetail extends Expert {
         <!-- A rejected config is correctable, so the error lands here and the
              form keeps every selection instead of unmounting into the chat
              view and bouncing back to the sessions list. -->
-        @if (createError()) {
+        @if (createError() || settingsStillLoading()) {
           <div class="create-error" role="alert">
             <app-icon size="md">error</app-icon>
-            <span>{{ createError() }}</span>
+            <span>{{ createError() ?? ('sessions.create.settingsStillLoading' | transloco) }}</span>
           </div>
         }
 
@@ -253,10 +255,14 @@ interface ExpertDetail extends Expert {
           <app-button variant="secondary" (clicked)="cancel()" [disabled]="creating()">
             {{ 'sessions.create.cancel' | transloco }}
           </app-button>
+          <!-- Not disabled while the settings check (tool preview, Expert
+               detail, connector list) loads: a click then waits for it in
+               createSession. Disabling here lost the click (zoneless change
+               detection disables the button before mouseup). -->
           <app-button
             variant="primary"
             [loading]="creating()"
-            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview() || !vmSizingValid() || !delegationCapValid()"
+            [disabled]="datasourceLoadError() || !vmSizingValid() || !delegationCapValid()"
             (clicked)="createSession()"
           >
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
@@ -406,6 +412,7 @@ export class SessionCreateComponent implements OnInit {
   private readonly errorMessages = inject(ErrorMessageService);
   private readonly api = inject(ApiService);
   readonly capabilities = inject(CapabilitiesService);
+  private readonly injector = inject(Injector);
 
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
 
@@ -414,6 +421,8 @@ export class SessionCreateComponent implements OnInit {
   /** Server rejection of the submitted config, rendered in-form so the user
    *  can correct it without losing the rest of their selections. */
   readonly createError = signal<string | null>(null);
+  /** Create gave up waiting for the settings check (see createSession). */
+  readonly settingsStillLoading = signal(false);
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectIds = signal<Set<string>>(new Set());
   readonly selectedProjectId = computed(() => [...this.selectedProjectIds()][0] ?? null);
@@ -428,6 +437,14 @@ export class SessionCreateComponent implements OnInit {
   onWorkspaceChoice(choice: WorkspaceChoice): void {
     this.workspaceChoice.set(choice);
     this.loadToolPreview();
+    this.refreshManifest();
+  }
+
+  /** The title feeds the request, not the tool preview: it refreshes an open
+   *  manifest view and starts no preview. */
+  onTitleEdit(value: string): void {
+    this.title = value;
+    this.refreshManifest();
   }
   readonly selectedProjects = computed(() =>
     this.projects().filter(p => this.selectedProjectIds().has(p.id)),
@@ -489,6 +506,10 @@ export class SessionCreateComponent implements OnInit {
   private toolPreviewSerial = 0;
   private expertDetailSerial = 0;
   readonly loadingWorkspacePreview = signal(false);
+  // The latest of each load the request depends on, for a Create that waits.
+  private readonly previewLoad = new LatestLoad();
+  private readonly expertDetailLoad = new LatestLoad();
+  private readonly datasourceLoad = new LatestLoad();
   readonly loadingExperts = signal(false);
   readonly loadingExpert = signal(false);
   readonly datasources = signal<EligibleDatasource[]>([]);
@@ -817,6 +838,7 @@ export class SessionCreateComponent implements OnInit {
 
   loadDatasourcesList(): void {
     const serial = ++this.datasourceRequestSerial;
+    const done = this.datasourceLoad.start();
     this.loadingDatasources.set(true);
     this.datasourceLoadError.set(false);
     // The server applies all-project scope matching and computes owner-specific
@@ -835,6 +857,7 @@ export class SessionCreateComponent implements OnInit {
         if (serial !== this.datasourceRequestSerial) return;
         this.datasources.set(ds);
         this.loadingDatasources.set(false);
+        done();
       },
       error: () => {
         if (serial !== this.datasourceRequestSerial) return;
@@ -842,6 +865,7 @@ export class SessionCreateComponent implements OnInit {
         // read-only context; the error state blocks create until retry wins.
         this.datasourceLoadError.set(true);
         this.loadingDatasources.set(false);
+        done();
       },
     });
   }
@@ -853,6 +877,7 @@ export class SessionCreateComponent implements OnInit {
     this.loadEffectiveDefault();
     // The project layer can override the expert's tools and workspace, so the prediction moves with the selection.
     this.loadToolPreview();
+    this.refreshManifest();
   }
 
   toggleExpert(expert: Expert): void {
@@ -871,6 +896,7 @@ export class SessionCreateComponent implements OnInit {
     this.api.getExpertTemplate(selected?.id === expertId ? selected : {id: expertId}).subscribe((template) => {
       if (serial === this.expertDetailSerial) this.expertTemplate.set(template);
     });
+    const done = this.expertDetailLoad.start();
     this.loadingExpert.set(true);
     this.http.get<ExpertDetail>(
       `${environment.apiUrl}/experts/${expertId}?account_defaults=true&role=session`,
@@ -885,8 +911,13 @@ export class SessionCreateComponent implements OnInit {
         this.applyModelPrefillOnce();
         this.loadingExpert.set(false);
         this.loadToolPreview();
+        done();
       },
-      error: () => { if (serial === this.expertDetailSerial) this.loadingExpert.set(false); },
+      error: () => {
+        if (serial !== this.expertDetailSerial) return;
+        this.loadingExpert.set(false);
+        done();
+      },
     });
     this.loadToolPreview();
   }
@@ -928,6 +959,7 @@ export class SessionCreateComponent implements OnInit {
    */
   loadToolPreview(): void {
     const serial = ++this.toolPreviewSerial;
+    const done = this.previewLoad.start();
     this.loadingWorkspacePreview.set(true);
     const expert = this.selectedExpert();
     // Routed EXACTLY as createSession routes it. A preview that resolved a
@@ -954,6 +986,7 @@ export class SessionCreateComponent implements OnInit {
       if (categories && !this.agentSettings?.hasToolEdits()) {
         this.agentSettings?.prefillFromResolvedToolset(categories);
       }
+      done();
     });
   }
 
@@ -985,33 +1018,61 @@ export class SessionCreateComponent implements OnInit {
     return this.agentSettings?.delegationCapValid() ?? true;
   }
 
+  /** The loads the request is built from: the tool preview (the tools
+   *  baseline it re-anchors, the lite-tier holdback), the Expert detail (its
+   *  config prefill) and the eligible connectors (the selection). */
+  private settingsLoads(): PendingLoad[] {
+    return [
+      {busy: () => this.loadingWorkspacePreview(), load: this.previewLoad},
+      {busy: () => this.loadingExpert(), load: this.expertDetailLoad},
+      {busy: () => this.loadingDatasources(), load: this.datasourceLoad},
+    ];
+  }
+
   async createSession(): Promise<void> {
-    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview() || !this.vmSizingValid() || !this.delegationCapValid()) return;
+    if (this.creating() || this.datasourceLoadError() || !this.vmSizingValid() || !this.delegationCapValid()) return;
+    // Before any await: the button shows its loading state at once, and a
+    // second click is refused instead of creating a second session.
     this.creating.set(true);
-
-    const body = this.buildBody();
-
-    // Create BEFORE navigating. The form used to hand the body to the chat
-    // route and unmount, so a rejected config destroyed every selection and
-    // dumped the user back on /sessions with nothing to correct. The POST is
-    // fast (tens of ms — it returns as soon as the thread row exists; the slow
-    // part is provisioning, which happens after); paying that here buys a
-    // recoverable failure. On success we route to the real thread id and the
-    // chat view runs its normal connect, showing the setup progress.
     this.createError.set(null);
+    this.settingsStillLoading.set(false);
+    let navigated = false;
     try {
-      const resp = await firstValueFrom(
-        this.http.post<{thread_id: string}>(
-          `${environment.apiUrl}/persistent/threads`,
-          body,
-        ),
-      );
-      await this.router.navigate(['/sessions', resp.thread_id]);
-    } catch (err) {
-      this.createError.set(
-        this.errorMessages.translate(err, 'sessions.create.failed'),
-      );
-      this.creating.set(false);
+      const loads = this.settingsLoads();
+      if (loads.some((l) => l.busy())) {
+        // A click during a settings check waits for the latest answer and one
+        // render, then builds the request from it. It used to be refused.
+        const outcome = await settleBeforeCreate(loads, this.injector);
+        if (outcome === 'timeout') this.settingsStillLoading.set(true);
+        if (outcome !== 'settled' || this.datasourceLoadError() || !this.vmSizingValid() || !this.delegationCapValid()) return;
+      }
+
+      const body = this.buildBody();
+
+      // Create BEFORE navigating. The form used to hand the body to the chat
+      // route and unmount, so a rejected config destroyed every selection and
+      // dumped the user back on /sessions with nothing to correct. The POST is
+      // fast (tens of ms — it returns as soon as the thread row exists; the slow
+      // part is provisioning, which happens after); paying that here buys a
+      // recoverable failure. On success we route to the real thread id and the
+      // chat view runs its normal connect, showing the setup progress.
+      try {
+        const resp = await firstValueFrom(
+          this.http.post<{thread_id: string}>(
+            `${environment.apiUrl}/persistent/threads`,
+            body,
+          ),
+        );
+        navigated = !!(await this.router.navigate(['/sessions', resp.thread_id]));
+      } catch (err) {
+        this.createError.set(
+          this.errorMessages.translate(err, 'sessions.create.failed'),
+        );
+      }
+    } finally {
+      // After a navigation the form is gone; until then `creating` stays set,
+      // so a second click cannot create a second session.
+      if (!navigated) this.creating.set(false);
     }
   }
 

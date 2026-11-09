@@ -1,4 +1,8 @@
-"""Keycloak asks a new user to verify their email only when it can send mail."""
+"""A new realm asks for email verification and offers password reset only with mail.
+
+Both flags are seeded once by the realm import. A restart never rewrites them,
+so an existing realm keeps what its admin chose: new realms only.
+"""
 
 from __future__ import annotations
 
@@ -114,17 +118,21 @@ def _post_start_calls(tmp_path: Path, deployment: dict, env: dict) -> list[list[
 
 
 @pytest.mark.parametrize("overrides,expected", CASES)
-def test_first_import_verifies_email_only_with_mail(tmp_path, overrides, expected):
+def test_first_import_verifies_email_and_offers_reset_only_with_mail(
+    tmp_path, overrides, expected
+):
     realm = json.loads(
         _keycloak(tmp_path, overrides)["ConfigMap"]["data"]["srw-realm.json"]
     )
     assert realm["verifyEmail"] is expected
+    # "Forgot password?" sends a mail too; without SMTP it would never arrive.
+    assert realm["resetPasswordAllowed"] is expected
     # Self-registration stays; SRW's admin approval gates the new account.
     assert realm["registrationAllowed"] is True
 
 
 @pytest.mark.parametrize("overrides,expected", CASES)
-def test_every_start_reasserts_verify_email_for_existing_realms(
+def test_restarts_leave_verify_email_and_password_reset_to_the_realm_admin(
     tmp_path, overrides, expected
 ):
     deployment = _keycloak(tmp_path, overrides)["Deployment"]
@@ -136,19 +144,15 @@ def test_every_start_reasserts_verify_email_for_existing_realms(
         else {}
     )
     calls = _post_start_calls(tmp_path, deployment, smtp)
-    realm_updates = [call for call in calls if call[:2] == ["update", "realms/srw"]]
-    verify = [call for call in realm_updates if any("verifyEmail" in a for a in call)]
-    assert verify == [
-        ["update", "realms/srw", "-s", f"verifyEmail={str(expected).lower()}"]
-    ]
+    # The realm import seeds both flags once; an existing realm keeps what its
+    # admin set, whatever email.* says now.
+    for flag in ("verifyEmail", "resetPasswordAllowed"):
+        assert not [call for call in calls if any(flag in arg for arg in call)]
     smtp_updates = [
-        index
-        for index, call in enumerate(calls)
+        call
+        for call in calls
         if call[:2] == ["update", "realms/srw"]
         and any(a.startswith("smtpServer.host=") for a in call)
     ]
-    if expected:
-        # Mail is configured before the realm starts asking for verification.
-        assert smtp_updates and smtp_updates[0] < calls.index(verify[0])
-    else:
-        assert smtp_updates == []
+    # The SMTP server itself is still synced from values on every start.
+    assert bool(smtp_updates) is expected

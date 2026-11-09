@@ -52,6 +52,7 @@ from typing import Any
 from orchestrator.services.model_availability import (
     ModelUnavailable,
     UnavailableModel,
+    endpoint_key_unreadable,
     keeps_explicit_transport,
     model_slots,
     stale_account_model_reason,
@@ -264,7 +265,11 @@ async def inject_model_credentials(
     For endpoint-backed models (``origin`` in {``custom``, ``system``}):
     looks up the endpoint row and inlines its ``base_url`` + ``api_key``.
     Custom endpoints are user-scoped; system endpoints are helm-seeded or
-    managed via Admin → Providers. Both live in llm_endpoints.
+    managed via Admin → Providers. Both live in llm_endpoints. A row whose
+    stored key did not decrypt is refused with
+    ``model_availability.EndpointKeyUnreadable`` (and an ERROR) rather than
+    sent keyless; a row registered without a key (``api_key_stored`` false)
+    gets its ``base_url`` alone, as before.
 
     For system-anchored catalog rows: injects the row's provider key from
     ``resolved_keys`` (the user > project > env resolution chain).
@@ -361,6 +366,21 @@ async def inject_model_credentials(
         and meta.endpoint_id
     ):
         endpoint_row = await dependencies.store.get_user_llm_endpoint(meta.endpoint_id)
+        unreadable = endpoint_key_unreadable(endpoint_row, meta.endpoint_id)
+        if unreadable is not None:
+            # A key is stored but did not decrypt. Sent without it, the base
+            # URL earns a 401 that names nothing; refuse instead, naming the
+            # endpoint. An endpoint registered without a key (no ciphertext)
+            # is not this case and runs keyless below.
+            dependencies.logger.error(
+                "Dispatch: %s model %r refused: endpoint %r (%s) has a stored "
+                "API key that did not decrypt; re-add the key in Admin → Models.",
+                capability,
+                model_id,
+                unreadable.endpoint,
+                meta.endpoint_id,
+            )
+            return unreadable
         if endpoint_row:
             if endpoint_row.get("base_url"):
                 section["base_url"] = endpoint_row["base_url"]

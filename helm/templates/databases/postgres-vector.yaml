@@ -41,11 +41,18 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 8 }}
+      annotations:
+        {{- include "srw.postgresRolesChecksum" . | nindent 8 }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # `postgres` is the bootstrap superuser and SRW's role an ordinary
+      # owner. This converts a volume initialised before that split and
+      # re-applies it on every start; see _postgres-roles.tpl.
+      initContainers:
+        {{- include "srw.postgresRolesInitContainer" (dict "context" . "key" "vector" "db" .Values.databases.vector) | nindent 8 }}
       containers:
         - name: pgvector
           image: {{ .Values.databases.vector.image }}
@@ -60,24 +67,11 @@ spec:
           ports:
             - containerPort: 5432
           env:
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: VECTOR_POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: VECTOR_POSTGRES_PASSWORD
-            - name: POSTGRES_DB
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: VECTOR_POSTGRES_DB
+            {{- include "srw.postgresRolesEnv" (dict "context" . "key" "vector") | nindent 12 }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            {{- include "srw.postgresRolesInitdbMount" . | nindent 12 }}
           livenessProbe:
             exec:
               # -d postgres: probe the always-present maintenance DB. Without
@@ -100,6 +94,7 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "srw.fullname" . }}-pgvector-data
+        {{- include "srw.postgresRolesVolume" . | nindent 8 }}
 ---
 apiVersion: v1
 kind: Service

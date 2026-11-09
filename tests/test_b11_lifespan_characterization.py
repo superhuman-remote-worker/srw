@@ -555,7 +555,7 @@ DEFAULT_CREATION = [
     ("kb_reindex_sweeper_loop", True, None),
     ("orphaned_graph_knowledge_sweep_loop", True, None),
     ("project_deletion_sweep_loop", True, None),
-    ("llm_pricing_sync_loop", False, None),
+    ("llm_pricing_sync_loop", True, None),
     ("cloud_pricing_sync_loop", False, None),
     ("workspace_metering_loop", True, None),
     ("llm_usage_poll_loop", False, None),
@@ -1083,6 +1083,10 @@ async def test_moved_loops_receive_the_application_collaborators(monkeypatch):
     assert ro_reader["router"]() is live.main_cloud_router
     sudo = _keywords(created["sudo_expiration_sweeper"])
     assert sudo["gate"] is live.sudo_gate
+    # The pricing sync clears the rate cache the ledger prices events with.
+    pricing = _keywords(created["llm_pricing_sync_loop"])
+    assert pricing["app_pool"] is world.store.pool
+    assert pricing["usage_rates"] is resources.usage_ledger.rates
 
 
 @pytest.mark.asyncio

@@ -95,7 +95,7 @@ _GATES = [
         gates.datasource_scope_auto_attach_v1_enabled,
         deployment_gates_module.datasource_scope_auto_attach_v1_enabled,
         "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED",
-        False,
+        True,
     ),
     (
         gates.is_protected_cloud_mode_enabled,

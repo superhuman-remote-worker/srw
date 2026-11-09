@@ -187,6 +187,124 @@ kubectl -n srw logs deploy/srw-orchestrator | grep -i provision
 kubectl -n srw get secret srw-session-jwt
 ```
 
+## Self-registered users are stuck at "Failed to send email"
+
+**Symptom.** A user registers on the Keycloak sign-in page and lands on
+**Failed to send email, please try again later.** Every later sign-in stops at
+the same page, and the user never reaches SRW. **Forgot password?** fails the
+same way.
+
+**Cause.** The realm asks new users to verify their address, but the
+installation has no mail server. Chart 0.1.0 and earlier created every realm
+with **Verify email** and **Forgot password** switched on. Newer charts switch
+both on only when `email.enabled` is true and `email.smtp.host` is set.
+Keycloak imports the realm on the first install only, so an existing realm
+keeps its settings through upgrades and restarts, and the chart does not
+change them. Fix an existing realm by hand. The same applies the other way
+round: if you configure SMTP later, switch both on yourself.
+
+SRW itself does not need a verified address. A user gets in once an
+administrator approves them in SRW or gives them the `user` realm role.
+
+**Fix.** Open the Keycloak admin console (`https://auth.<domain>/admin/`, or
+`https://<origin>/identity/admin/` in single-origin mode), sign in as the
+Keycloak server administrator (`KEYCLOAK_ADMIN_USER`), and select the realm
+`srw`:
+
+1. **Stop new cases.** Under **Realm settings → Login**, switch
+   **Verify email** off. Switch **Forgot password** off as well: its mail
+   cannot be sent either.
+2. **Unblock each stuck user.** Under **Users**, open the user, switch
+   **Email verified** on, remove **Verify Email** from
+   **Required user actions**, and select **Save**.
+3. **Start a new sign-in.** Ask the user to open the SRW address again rather
+   than retry on the old error page.
+4. **Check admission.** If SRW still refuses the user, approve them in SRW, or
+   give them the `user` realm role. A group called `user` is not the role.
+
+Without verification, nobody proves they own the address they register with.
+SRW, Git and the cloud link accounts by email address, so someone could
+register with another person's address first. Check the address before you
+approve a user.
+
+For many users, run step 2 from a workstation with `kubectl` and `jq`. The
+script lists every user who holds the **Verify Email** action, then marks
+their address verified and removes only that action; other required actions,
+such as **Update Password**, stay. Review the list before you run the loop.
+**This script has not been run against a live Keycloak yet;** try it on a
+single user first.
+
+```bash
+NS=srw                      # namespace
+KC_POD=deploy/srw-keycloak  # <release>-keycloak
+REALM=srw                   # keycloak.realm
+kc() {
+  kubectl -n "$NS" exec "$KC_POD" -c keycloak -- \
+    /opt/keycloak/bin/kcadm.sh "$@" </dev/null
+}
+
+# Sign kcadm in as the Keycloak server administrator. The session is stored
+# inside the pod and reused by the calls below.
+kubectl -n "$NS" exec "$KC_POD" -c keycloak -- sh -c \
+  '/opt/keycloak/bin/kcadm.sh config credentials \
+     --server "http://localhost:8080${KC_HTTP_RELATIVE_PATH:-}" \
+     --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD"'
+
+# 1. Who is stuck?
+kc get users -r "$REALM" --limit 100000 \
+  --fields id,username,requiredActions > users.json
+jq -r '.[] | select((.requiredActions // []) | index("VERIFY_EMAIL"))
+       | .username' users.json
+
+# 2. Unblock them.
+jq -r '.[] | select((.requiredActions // []) | index("VERIFY_EMAIL"))
+       | [.id, .username, ((.requiredActions - ["VERIFY_EMAIL"]) | tojson)]
+       | @tsv' users.json |
+while IFS=$'\t' read -r id username actions; do
+  echo "unblocking $username"
+  kc update "users/$id" -r "$REALM" \
+    -s emailVerified=true -s "requiredActions=$actions"
+done
+```
+
+## The first administrator has no Git account
+
+**Symptom.** The initial administrator signs in to SRW, but opening Git fails
+with an error page, and repositories are never shared with them, including
+their projects' knowledge repositories. The Gitea log shows
+`CreateUser: name is reserved`, and the orchestrator logs
+`Gitea refused to create user '<name>' (status 422)`. Helm's install or
+upgrade notes print **WARNING: the initial administrator's name is reserved in
+Gitea**.
+
+**Cause.** Gitea names each account after the Keycloak username, and it
+refuses a set of reserved names, among them `admin`, `api`, `user`, `explore`
+and `ghost`, plus names ending in `.keys`, `.gpg`, `.rss`, `.atom` or `.png`,
+in any letter case. The initial administrator is
+`keycloak.bootstrapAdmin.username`. With the bundled Gitea, a fresh install now
+refuses a reserved name. An existing realm keeps the name it was created with,
+because the chart cannot rename a Keycloak user.
+
+**Fix.** Rename the user in Keycloak. In the Keycloak admin console, realm
+`srw`:
+
+1. Under **Realm settings → Login**, switch **Edit username** on. Keycloak
+   refuses a rename while it is off.
+2. Under **Users**, open the user, change **Username** to a name Gitea allows,
+   such as `srwadmin`, and select **Save**.
+3. Switch **Edit username** off again.
+4. Have the user sign in again, with the new name or their email address, and
+   open Git once, so Gitea creates their account.
+5. Open each of their projects in Cockpit. Opening a project shares its
+   repositories with its members again.
+
+SRW keeps working through the rename: it identifies users by their Keycloak
+ID and finds Git accounts by email address. Leave
+`keycloak.bootstrapAdmin.username` in your values as it is. The chart keeps
+the name it first installed with and refuses a change on upgrade, and it
+prints the warning on each upgrade, which you can ignore once the user is
+renamed.
+
 ## Local k3d: cloud or Keycloak sign-in fails after recreating the cluster
 
 **Symptom.** On a local k3d cluster, signing in to the cloud or Git through

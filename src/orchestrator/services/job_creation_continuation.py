@@ -27,6 +27,7 @@ class JobCreationContinuationRunner:
         quantum_s: float = 2.0,
         page_size: int = 32,
         round_delay_s: float = 5.0,
+        unobserved_check_s: float = 300.0,
     ):
         self.db = db
         self.provisioner = provisioner
@@ -34,6 +35,8 @@ class JobCreationContinuationRunner:
         self.quantum_s = quantum_s
         self.page_size = page_size
         self.round_delay_s = round_delay_s
+        self.unobserved_check_s = unobserved_check_s
+        self._warned_unobserved: dict[str, None] = {}
         self._stopping = asyncio.Event()
         self._workers: dict[asyncio.Task, dict] = {}
 
@@ -62,6 +65,38 @@ class JobCreationContinuationRunner:
             )
             return False
 
+    async def _warn_unobserved(self) -> None:
+        """Name, once each, open creations this observer is not reaching."""
+
+        listing = getattr(self.db, "list_unobserved_job_creation_receipts", None)
+        if not callable(listing):
+            return
+        try:
+            receipts = await listing(limit=16)
+        except Exception:
+            logger.debug("Unobserved Job creation check failed", exc_info=True)
+            return
+        for receipt in receipts or ():
+            try:
+                reservation_id = str(receipt["reservation_id"])
+            except (KeyError, TypeError):
+                continue
+            if reservation_id in self._warned_unobserved:
+                continue
+            self._warned_unobserved[reservation_id] = None
+            while len(self._warned_unobserved) > 1024:
+                self._warned_unobserved.pop(next(iter(self._warned_unobserved)))
+            logger.warning(
+                "Job %s (status %s) has an open workspace creation %s that is not "
+                "being observed: state %s, lease expired at %s, first Ready %s",
+                receipt.get("job_id"),
+                receipt.get("job_status"),
+                reservation_id,
+                receipt.get("startup_state"),
+                receipt.get("expires_at"),
+                receipt.get("startup_first_ready_at") or "never recorded",
+            )
+
     def _reap(self) -> None:
         for task in tuple(self._workers):
             if task.done():
@@ -84,6 +119,7 @@ class JobCreationContinuationRunner:
         exhausted = False
         next_scan_at = 0.0
         loop = asyncio.get_running_loop()
+        next_unobserved_check_at = loop.time() + self.unobserved_check_s
         shutdown_wait = asyncio.create_task(self.shutdown_event.wait())
         stop_wait = asyncio.create_task(self._stopping.wait())
         try:
@@ -108,6 +144,11 @@ class JobCreationContinuationRunner:
                         pending.extend(page["candidates"])
                         if exhausted:
                             next_scan_at = loop.time() + self.round_delay_s
+                            if loop.time() >= next_unobserved_check_at:
+                                next_unobserved_check_at = (
+                                    loop.time() + self.unobserved_check_s
+                                )
+                                await self._warn_unobserved()
                 active_owners = {str(c["job_id"]) for c in self._workers.values()}
                 while pending and len(self._workers) < 2:
                     candidate = pending.popleft()

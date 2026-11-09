@@ -43,6 +43,7 @@ from shared.workspace_recovery import WorkspaceRecoveryCode
 from shared.tls_trust import TrustCaSource
 
 from orchestrator.database.container_startup_stage import (
+    JOB_STARTUP_OBSERVABLE_OWNER_STATUSES,
     BoundPodObserved,
     ReadyObservedAt,
     ScheduledAt,
@@ -3102,10 +3103,11 @@ class ContainerProvisioner:
             ):
                 return False
             job = await self._db.get_job(owner.id)
-            if not job or str(job.get("status") or "") not in {
-                "created",
-                "processing",
-            }:
+            if (
+                not job
+                or str(job.get("status") or "")
+                not in JOB_STARTUP_OBSERVABLE_OWNER_STATUSES
+            ):
                 return False
             now_db = await self._db.fetchval("SELECT clock_timestamp()")
             if receipt["expires_at"] <= now_db:
@@ -4278,7 +4280,7 @@ class ContainerProvisioner:
                             complete_job = getattr(
                                 type(self._db), "complete_job_workspace_creation", None
                             )
-                            return bool(
+                            published = bool(
                                 callable(complete_job)
                                 and await complete_job(
                                     self._db,
@@ -4299,6 +4301,18 @@ class ContainerProvisioner:
                                     else None,
                                 )
                             )
+                            if not published:
+                                # The Ready writer refuses silently (owner status,
+                                # hold, receipt, SSH window, execution deadline).
+                                logger.warning(
+                                    "Workspace %s of job %s is Ready and attested, "
+                                    "but publishing Ready was refused "
+                                    "(creation reservation %s)",
+                                    pod_name,
+                                    owner.id,
+                                    _creation_reservation["id"],
+                                )
+                            return published
                     if not await self._workspace_creation_reservation_is_current(
                         owner,
                         _creation_reservation,

@@ -212,7 +212,7 @@ export class PanelHeaderComponent {
   readonly componentChange = output<ComponentType>();
   readonly splitHorizontal = output<void>();
   readonly splitVertical = output<void>();
-  readonly close = output<void>();
+  readonly closed = output<void>();
 
   isDropdownOpen = false;
 
@@ -246,6 +246,6 @@ export class PanelHeaderComponent {
 
   onClose(event: MouseEvent): void {
     event.stopPropagation();
-    this.close.emit();
+    this.closed.emit();
   }
 }

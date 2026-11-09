@@ -422,10 +422,11 @@ databases:
   gitea:
     storageSize: "2Gi"
   neo4j:
-    # Disabled for a lighter dev stack (JVM + ~1Gi working memory + 5Gi PVC).
-    # The configmap drops the Neo4j URL and the orchestrator degrades to
-    # kg=None — knowledge-graph/OKF-KB features are OFF locally. Re-enable
-    # when working on KG features.
+    # Off, as in the chart default (JVM + ~1Gi working memory + 5Gi PVC). The
+    # knowledge base runs on the Postgres store; only the graph-only features
+    # (typed edges, note relationships, the knowledge export) are off. Set
+    # true when working on those: the agents and the orchestrator then get
+    # NEO4J_URL and the NEO4J_USERNAME/NEO4J_PASSWORD from secrets.values above.
     enabled: false
     storageSize: "5Gi"
   keycloak:

@@ -5005,6 +5005,16 @@ class UniversalAgent:
         if not project_id:
             return
 
+        # An unset NEO4J_URL means Neo4j is not configured (the chart's default
+        # since it went optional): skip the Graph tier instead of letting
+        # KnowledgeGraphDB dial its localhost:7687 default and log an ERROR.
+        # Same test as the orchestrator's KnowledgeGraphHandle.
+        if not os.getenv("NEO4J_URL", "").strip():
+            logger.info(
+                "Knowledge Graph tier off: NEO4J_URL is not set (Neo4j not configured)"
+            )
+            return
+
         try:
             from shared.runtime.services.knowledge_graph import KnowledgeGraphDB
 

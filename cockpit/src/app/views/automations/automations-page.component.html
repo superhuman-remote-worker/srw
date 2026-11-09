@@ -120,7 +120,7 @@
                 [initialSelectedIds]="ed.connectorIds" [contextKey]="connectorContext()"
                 [loading]="connectorsLoading()" [error]="connectorsError()"
                 [showHeader]="false" [searchable]="true"
-                (change)="onConnectorChange()" (retry)="retryConnectors()" />
+                (settingsChange)="onConnectorChange()" (retry)="retryConnectors()" />
               @if (!connectorsLoading() && !connectorsError() && !liveConnectors().length) {
                 <p>{{ (ed.mode === 'create' && !ed.projectId && projectChoices().length
                   ? 'automations.editor.noLiveConnectorsChooseProject'
@@ -141,7 +141,7 @@
                 [initialSelectedIds]="ed.connectorIds" [contextKey]="connectorContext()"
                 [showHeader]="false" [searchable]="true"
                 [loading]="connectorsLoading()" [error]="connectorsError()"
-                (change)="onConnectorChange()" (retry)="retryConnectors()" />
+                (settingsChange)="onConnectorChange()" (retry)="retryConnectors()" />
               <app-workspace-picker role="job" [projectId]="ed.projectId"
                 [choice]="ed.workspaceChoice" (choiceChange)="updateEditor('workspaceChoice', $event)" />
             </div>

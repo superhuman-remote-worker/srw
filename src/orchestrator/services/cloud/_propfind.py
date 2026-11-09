@@ -16,7 +16,7 @@ body→entries parsing lives here.
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from orchestrator.services.cloud.handles import ProjectFolderEntry
 
@@ -33,6 +33,39 @@ _PROPFIND_ETAG_RE = re.compile(r"<d:getetag[^>]*>([^<]+)</d:getetag>", re.IGNORE
 _PROPFIND_CONTENTTYPE_RE = re.compile(
     r"<d:getcontenttype[^>]*>([^<]+)</d:getcontenttype>", re.IGNORECASE
 )
+
+
+def _href_path(raw: str) -> str:
+    """An href's percent-decoded path; RFC 4918 allows a full URI too."""
+    href = raw.strip()
+    if "://" in href:
+        href = urlsplit(href).path
+    return unquote(href)
+
+
+def first_href_path(xml: str) -> str | None:
+    """The decoded path of the first ``<d:href>`` in a multistatus body (a
+    ``Depth: 0`` PROPFIND's self entry), or ``None`` when there is none."""
+    match = _PROPFIND_HREF_RE.search(xml or "")
+    return _href_path(match.group(1)) if match else None
+
+
+def hrefs_outside_prefix(xml: str, *, href_prefix: str) -> bool:
+    """True when the body holds responses but none of their hrefs starts
+    with ``href_prefix``. A correct server always answers with the walked
+    collection's own entry, so this means the server writes another root
+    into its hrefs than the caller expects: every entry would be dropped
+    and the folder would read as empty."""
+    prefix = unquote(href_prefix)
+    seen = False
+    for resp in _PROPFIND_RESPONSE_RE.finditer(xml or ""):
+        href_match = _PROPFIND_HREF_RE.search(resp.group(1))
+        if not href_match:
+            continue
+        seen = True
+        if _href_path(href_match.group(1)).startswith(prefix):
+            return False
+    return seen
 
 
 def parse_propfind_entries(
@@ -58,7 +91,7 @@ def parse_propfind_entries(
         href_match = _PROPFIND_HREF_RE.search(block)
         if not href_match:
             continue
-        href = unquote(href_match.group(1).strip())
+        href = _href_path(href_match.group(1))
         if not href.startswith(decoded_prefix):
             continue
         rel_path = href[len(decoded_prefix) :].rstrip("/")

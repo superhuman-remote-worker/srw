@@ -291,7 +291,7 @@ export class ModelGroupComponent {
    *  default instead of a pick carried over from an earlier job. */
   rememberLastModel = input(true);
 
-  change = output<void>();
+  settingsChange = output<void>();
 
   readonly availableModels = this.modelService.models;
   /** Option text: the catalog label; the value stays the model id. */
@@ -419,7 +419,7 @@ export class ModelGroupComponent {
    *  option already showing is re-picked, so without this the resolved default
    *  is the one value the form cannot express. */
   pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
-    if (pinResolvedValue(target, resolved)) this.change.emit();
+    if (pinResolvedValue(target, resolved)) this.settingsChange.emit();
   }
 
   onModelChange(value: string | null): void {
@@ -430,13 +430,13 @@ export class ModelGroupComponent {
     if (this.sessionReasoning() !== null) this.reasoningResetNotice.set(true);
     this.sessionReasoning.set(null);
     this.persistModel(this.modelStorageKey(), value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onSubagentModelChange(value: string | null): void {
     this.subagentModel.set(value);
     this.persistModel('subagent', value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   onSessionReasoningChange(value: string | null): void {
@@ -444,7 +444,7 @@ export class ModelGroupComponent {
     // concrete level that happens to be the default pins it.
     this.reasoningResetNotice.set(false);
     this.sessionReasoning.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Reasoning select's PinOnInteract handler: re-confirming the shown
@@ -457,7 +457,7 @@ export class ModelGroupComponent {
 
   onTemperatureChange(value: number): void {
     this.temperature.set(value);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** Build the model-related config_override fragment:

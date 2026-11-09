@@ -25,6 +25,16 @@ async def create_empty_container_recovery_ledger(conn):
             settled_at timestamptz
         );
         TRUNCATE managed_repository_workspace_cleanup_intents;
+        -- The resume shed's in-flight creation guard reads the receipts.
+        CREATE TABLE IF NOT EXISTS managed_repository_workspace_creation_reservations (
+            id uuid PRIMARY KEY,
+            owner_kind text,
+            owner_id uuid,
+            scope text,
+            operation_kind text,
+            settled_at timestamptz
+        );
+        TRUNCATE managed_repository_workspace_creation_reservations;
         CREATE OR REPLACE FUNCTION
             public.managed_repository_workspace_cleanup_projection_is_settled(
                 text, uuid, text, text, text, text

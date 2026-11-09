@@ -770,14 +770,22 @@ orchestrator:
   # orchestrator/deployment.yaml — the ConfigMap's POSTGRES_*_CONNECTIONS carry
   # the small AGENT-pod sizing (agent.dbPool) and must not reach the
   # orchestrator. These match the code defaults; override only to tune.
-  # Budget per server: sum(maxes across replicas + agents) <= max_connections
-  # - 3 reserved - ~10 headroom. At the defaults (replicas=2,
-  # agent.pool.maxAgents=10, agent.dbPool.app.max=3), per server:
-  #   app    : 2*10 (orch) + 10*3 (agents) = 50   (fits default max_connections=100)
-  #   vector : 2*5  + 10*3 = 40
-  #   audit  : 2*4  + (agents keep the code default) = 8
-  # Scaling to ~30 agents pushes app to 2*10 + 30*3 = 110 -> raise Postgres
-  # max_connections, trim agent.dbPool.app.max, or front the app DB with
+  # Budget per server: every pool max across orchestrator replicas (R), agent
+  # pods (W = agent.pool.maxAgents) and stateless executors (E =
+  # agent.stateless.replicas) must fit max_connections - 3 reserved - ~10
+  # headroom. What each one opens at most:
+  #   orchestrator  app 10 + 20 dedicated advisory-lock sessions (5 lock
+  #                 domains x POSTGRES_DEDICATED_ADVISORY_LOCK_SLOTS 4),
+  #                 vector 5, audit 4 + a 5-connection read pool
+  #   agent pod     app 3 (agent.dbPool.app.max) + 1 checkpointer, vector 3,
+  #                 audit 2 (agents write the audit trail directly)
+  #   executor      app 3 + 4 fenced checkpoint pool, vector 3, audit 2
+  # So app = 30R + 4W + 7E + 13, vector = 5R + 3W + 3E + 13 and
+  # audit = 9R + 2W + 2E + 13. At the defaults (R=1, W=10, E=2): app 97,
+  # vector 54, audit 46, which fits the bundled max_connections of 100.
+  # More agents or a second orchestrator replica push app past it -> raise
+  # databases.postgres.maxConnections (the srw-cloud generator derives it from
+  # the worker count), trim agent.dbPool.app.max, or front the app DB with
   # pgbouncer (transaction mode; the advisory-lock migration runner + LISTEN
   # users stay on direct connections).
   dbPool:
@@ -1012,9 +1020,15 @@ agent:
   # submits an explicit reviewed array; enable this after legacy clients no
   # longer encode "none" by omission.
   datasourceDefaultsOnOmission: "false"
-  # -- Coordinated rollout gate for the connector project-scope/auto-attach UI.
-  # Keep false until all orchestrator replicas understand the v1 API contract.
-  datasourceScopeAutoAttachV1Enabled: "false"
+  # -- Connector availability and auto-attach in the Cockpit. On (since 0.2.0),
+  # New Session and New Job preselect the project's connector defaults and
+  # your own auto-attach connectors, the home composer attaches them, and the
+  # connector form shows scope and auto-attach (a new connector needs a scope).
+  # The server marks and attaches these defaults either way (automations,
+  # loops, MCP); "false" keeps the old forms: only the work's own connectors
+  # preselected and the connector policy controls hidden. Every 0.1.x replica
+  # understands the v1 contract this once guarded during a mixed rollout.
+  datasourceScopeAutoAttachV1Enabled: "true"
   # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
   # See knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1.
@@ -1855,6 +1869,11 @@ secrets:
   # -- Mode 3: Reference a pre-existing K8s Secret by name
   existingSecret: ""
   # -- Mode 2: Chart creates a Secret from the values below (dev/testing only)
+  #    POSTGRES_SUPERUSER_PASSWORD, VECTOR_POSTGRES_SUPERUSER_PASSWORD and
+  #    AUDIT_POSTGRES_SUPERUSER_PASSWORD are the exception, in every mode: the
+  #    bundled databases' superuser passwords go to <release>-db-superuser,
+  #    never into this Secret (agents read it whole). Empty = generated once
+  #    and kept. See helm/README.md "Bundled Postgres roles".
   create: false
   values: {}
   # -- Separate existing secret for VM SSH key (optional)
@@ -2813,9 +2832,24 @@ databases:
         memory: "512Mi"
         cpu: "500m"
   neo4j:
-    enabled: true
+    # -- Optional knowledge graph, OFF by default. The Postgres store (pgvector
+    #    instance) carries the whole knowledge base without it: agents' kb_write,
+    #    kb_read, kb_list, kb_search and kb_related, and the orchestrator's note
+    #    list, get, update and delete all run there. Postgres also needs no
+    #    extra license: Neo4j Community is GPLv3 and Enterprise is commercial.
+    #    Turn it on only for what has no Postgres equivalent: the typed graph
+    #    edges behind kb_contradictions, kb_provenance and kb_unanswered, the
+    #    relationship list on the orchestrator's note read, and the project
+    #    knowledge export (which answers 503 without Neo4j).
+    #    When on, NEO4J_URL plus NEO4J_USERNAME/NEO4J_PASSWORD from the Secret
+    #    reach both the agents and the orchestrator. The "Default Neo4j"
+    #    datasource is seeded from them only by `python -m orchestrator.init`,
+    #    which the chart does not run.
+    enabled: false
+    # -- true runs the bundled StatefulSet; false uses externalUrl below.
     internal: true
-    # -- Full Neo4j Bolt URL for external mode. Example: "bolt://my-neo4j.db.svc:7687"
+    # -- Full Neo4j Bolt URL for external mode (internal: false); required then.
+    #    Example: "bolt://my-neo4j.db.svc:7687"
     externalUrl: ""
     # -- Auth credentials for the bundled Neo4j: both NEO4J_USERNAME and
     # NEO4J_PASSWORD live in the Secret (Vault), mirroring how the
@@ -2985,12 +3019,16 @@ keycloak:
   # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
   internal: true
   image: quay.io/keycloak/keycloak:26.2
-  # -- Initial SRW login for the bundled Keycloak realm. Password comes from
-  # KC_REALM_ADMIN_PASSWORD. This does not configure the Keycloak master admin.
+  # -- Initial SRW login for the bundled Keycloak realm. Its password comes from
+  # KC_REALM_ADMIN_PASSWORD, set once when Keycloak creates the user; rotating
+  # the Secret later does not change it. This does not configure the Keycloak
+  # master admin.
   bootstrapAdmin:
     # Empty preserves the existing realm ConfigMap's initial username during
     # connected Helm upgrades; a fresh install defaults to the historical test.
-    # Set before first install: 1-64 ASCII letters/digits/._-, starting alnum.
+    # Set before first install: 1-64 ASCII letters/digits/._-, starting alnum,
+    # and not a name Gitea reserves (admin, api, user, ...; see helm/README.md).
+    # With the bundled Gitea a fresh install with one fails to render.
     # Keep the same explicit value for offline/GitOps renders (no lookup).
     username: ""
   # -- Replica count for the bundled Keycloak. The pod runs in production mode

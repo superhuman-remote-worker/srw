@@ -448,7 +448,7 @@ export class SubagentsEditorComponent {
   modelAllowed = input<(model: string) => boolean>(() => true);
   disabled = input(false);
 
-  change = output<void>();
+  settingsChange = output<void>();
 
   readonly entries = signal<RosterEntryDraft[]>([]);
   /** `subagents.default`; '' = none. */
@@ -566,17 +566,17 @@ export class SubagentsEditorComponent {
         extraText: '',
       },
     ]);
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   remove(key: number): void {
     this.entries.update((list) => list.filter((d) => d.key !== key));
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   patch(key: number, changes: Partial<RosterEntryDraft>): void {
     this.entries.update((list) => list.map((d) => (d.key === key ? {...d, ...changes} : d)));
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   setKind(key: number, kind: string | null): void {
@@ -597,7 +597,7 @@ export class SubagentsEditorComponent {
 
   setDefault(value: string | null): void {
     this.defaultEntry.set(value ?? '');
-    this.change.emit();
+    this.settingsChange.emit();
   }
 
   /** "Show all experts": any expert may be referenced — the server accepts a

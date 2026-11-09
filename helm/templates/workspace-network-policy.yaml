@@ -223,7 +223,8 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
-    # Neo4j (for datasource shell tools)
+    {{- if and $.Values.databases.neo4j.enabled $.Values.databases.neo4j.internal }}
+    # Bundled Neo4j (for datasource shell tools)
     - to:
         - podSelector:
             matchLabels:
@@ -231,6 +232,7 @@ spec:
       ports:
         - protocol: TCP
           port: 7688
+    {{- end }}
     {{- if $.Values.connectors.servicePods.enabled }}
     # Connector driver service pods (connector drivers D5): only their one
     # named port, srw-driver, in the driver namespace. Each driver pod's own

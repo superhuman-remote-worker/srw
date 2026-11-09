@@ -138,7 +138,7 @@ const LIVE_ATTACH_REFUSED_TYPES: ReadonlySet<string> = new Set([
             [expertName]="expertLabel()"
             [projectName]="projectLabel()"
             [lockedConfig]="lockedConfig()"
-            (change)="onSettingsChange()"
+            (settingsChange)="onSettingsChange()"
             (retryDatasources)="retryDatasourceLoad()"
             (tierChangeRequested)="onTierPicked($event)"
           />

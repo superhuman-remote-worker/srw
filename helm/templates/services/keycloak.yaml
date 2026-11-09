@@ -53,11 +53,14 @@ data:
       "registrationAllowed": true,
       "registrationEmailAsUsername": false,
       {{- /* Only with mail: otherwise "Register" ends at a verification
-           message that is never sent. The postStart hook re-asserts it. */}}
+           message that is never sent, and "Forgot password?" at a reset
+           mail that is never sent. Seeded once, like the whole realm: no
+           restart rewrites them, so an admin's choice in Realm settings ->
+           Login stands. Existing realms: docs/troubleshooting.md. */}}
       "verifyEmail": {{ include "srw.keycloak.mailConfigured" . }},
       "loginWithEmailAllowed": true,
       "duplicateEmailsAllowed": false,
-      "resetPasswordAllowed": true,
+      "resetPasswordAllowed": {{ include "srw.keycloak.mailConfigured" . }},
       "editUsernameAllowed": false,
       {{- /* TLS terminates at the ingress, so "all" would reject in-cluster
            plaintext traffic. "external" is Keycloak's own default: HTTPS
@@ -846,12 +849,18 @@ spec:
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080{{ if include "srw.singleOrigin" . }}/identity{{ end }} \
                       --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
-                    # --- Set realm admin password ---
-                    # Realm import does resolve ${KC_REALM_ADMIN_PASSWORD} on
-                    # first boot (verified on Keycloak 26.2), but we still
-                    # force-set on every start so Vault-rotated admin
-                    # passwords propagate without requiring a DB wipe.
-                    $KC set-password -r {{ .Values.keycloak.realm }} --username "$KC_REALM_ADMIN_USERNAME" --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
+                    # --- Realm admin password: never set here ---
+                    # The first-boot realm import creates the initial SRW
+                    # administrator (keycloak.bootstrapAdmin.username) and
+                    # resolves ${KC_REALM_ADMIN_PASSWORD} as its password
+                    # (verified on a fresh Keycloak 26.2.5, 2026-11-06). This
+                    # hook used to force-set that password on every start so a
+                    # rotated Secret would propagate, but that also undid any
+                    # password the admin chose and kept the install's initial
+                    # password valid for good. It is no longer touched after
+                    # the import: rotation is a manual step (helm/README.md).
+                    # Imported users carry no creation time, so "set it on the
+                    # start that created the user" cannot be detected here.
                     # --- Sync client secrets ---
                     # cockpit-bff is included so secret rotations in Vault
                     # propagate to KC on the next pod restart. The other
@@ -990,15 +999,11 @@ spec:
                       $KC create "realms/{{ .Values.keycloak.realm }}/clear-realm-cache" 2>&1 || \
                         echo "WARN: kcadm clear-realm-cache failed"
                     fi
-                    # --- Email verification follows SMTP ---
-                    # The realm import sets verifyEmail only on first boot; this
-                    # keeps an existing realm in step when email.* changes, so an
-                    # install without mail never asks a new user to verify an
-                    # address it cannot write to. Self-registration stays on;
-                    # SRW's own admin approval still gates new accounts.
-                    $KC update "realms/{{ .Values.keycloak.realm }}" \
-                      -s "verifyEmail={{ include "srw.keycloak.mailConfigured" . }}" 2>/dev/null || \
-                      echo "WARN: kcadm verifyEmail update failed"
+                    # verifyEmail and resetPasswordAllowed are deliberately NOT
+                    # synced here. The realm import seeds them from email.* on
+                    # first boot only; an existing realm keeps whatever its
+                    # admin chose, including SMTP set up by hand in the
+                    # Keycloak UI, which a per-start rewrite would override.
                     # --- Sync session/token lifespans ---
                     # Same self-heal pattern as SMTP: realm-import only seeds
                     # these on first boot, so existing deployments would keep

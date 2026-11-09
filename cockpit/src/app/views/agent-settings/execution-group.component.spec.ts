@@ -224,7 +224,7 @@ describe('ExecutionGroupComponent workspace backend', () => {
   it('counts toward modifiedCount, and reset clears it and notifies the host', () => {
     const c = createComponent();
     let changes = 0;
-    c.change.subscribe(() => changes++);
+    c.settingsChange.subscribe(() => changes++);
 
     c.onWorkspaceBackendChange('none');
     expect(c.modifiedCount()).toBe(1);

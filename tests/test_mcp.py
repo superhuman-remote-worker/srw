@@ -30,6 +30,29 @@ def test_ambiguous_mutation_is_not_labeled_as_confirmed_failure():
     assert "failed" not in rendered.lower()
 
 
+def test_typed_refusal_reads_as_its_message_not_a_dict_repr():
+    """A 409 {code, message} used to reach MCP callers as a Python dict."""
+
+    request = httpx.Request("POST", "http://orch/api/jobs/x/resume")
+    response = httpx.Response(
+        409,
+        request=request,
+        json={
+            "detail": {
+                "code": "job_state_conflict",
+                "message": "The Job's workspace changed while this request ran.",
+            }
+        },
+    )
+    error = httpx.HTTPStatusError("conflict", request=request, response=response)
+
+    rendered = _mcp_server_mod._format_action_error("resume", "job-1", error)
+
+    assert "The Job's workspace changed while this request ran." in rendered
+    assert "(job_state_conflict)" in rendered
+    assert "{'code'" not in rendered
+
+
 # ============================================================================
 # Helpers
 # ============================================================================

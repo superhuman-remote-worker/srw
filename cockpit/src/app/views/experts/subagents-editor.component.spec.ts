@@ -239,7 +239,7 @@ describe('SubagentsEditorComponent', () => {
   it('add / patch / remove emit the roster the drafts describe', () => {
     const {editor} = createEditor();
     const changes = vi.fn();
-    editor.change.subscribe(changes);
+    editor.settingsChange.subscribe(changes);
 
     editor.add();
     const key = editor.entries()[0].key;

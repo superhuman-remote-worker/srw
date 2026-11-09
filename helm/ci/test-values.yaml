@@ -49,6 +49,9 @@ agent:
 
 databases:
   neo4j:
+    # Off by default; on here so CI renders and validates the Neo4j
+    # StatefulSet, its Bolt TLS Certificate and the Bolt LoadBalancer.
+    enabled: true
     boltTls:
       enabled: true
       issuerName: test-issuer

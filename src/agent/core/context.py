@@ -68,6 +68,7 @@ from shared.runtime.core.message_markers import (
     mark_compaction_view,
     protected_identity,
 )
+from shared.runtime.core.transport_resolution import catalog_model_of
 
 logger = logging.getLogger(__name__)
 
@@ -1190,11 +1191,19 @@ def get_token_counter(
 
 
 def _client_model_name(llm: Any) -> str:
-    """The model name of a chat client, through any binding layers."""
+    """The model name usage records for a chat client, through any bindings.
+
+    The catalog id ``create_llm`` stamped on the client wins over the name the
+    client sends (``openrouter/x/y`` sends ``x/y``), because rates are keyed
+    on the catalog id.
+    """
     target = llm
     for _ in range(5):
         if target is None:
             break
+        catalog_model = catalog_model_of(target)
+        if catalog_model:
+            return catalog_model
         for attr in ("model_name", "model"):
             value = getattr(target, attr, None)
             if isinstance(value, str) and value:

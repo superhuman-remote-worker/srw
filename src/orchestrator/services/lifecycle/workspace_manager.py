@@ -89,6 +89,19 @@ _TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _TERMINAL_THREAD_STATUSES = frozenset({"ended"})
 _REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
 _REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
+# Job workspace projections whose Pod has not been published Ready yet.
+_CREATING_WORKSPACE_STATUSES = frozenset({"created", "creating", "pending"})
+
+
+def _creation_owns_runtime(inst: Instance) -> bool:
+    """A live Job's runtime is still owned by its creation, not the reaper."""
+
+    return (
+        bool(inst.metadata.get("creation_unsettled"))
+        and inst.metadata.get("job_status") not in _TERMINAL_JOB_STATUSES
+        and not inst.metadata.get("bound_row_missing")
+    )
+
 
 # Job statuses whose workspace Pod may be released while its PVC keeps the
 # work. 'reviewing' stays out: its critic rides the parent's Pod (see above).
@@ -423,6 +436,9 @@ class WorkspaceInstanceManager:
                     metadata["job_assigned_agent"] = (
                         row.get("assigned_agent_id") is not None
                     )
+                    metadata["creation_unsettled"] = await self._job_creation_unsettled(
+                        job_id, row, ws_ctx
+                    )
                     ide_ctx = ctx.get("ide_session")
                     metadata["ide_status"] = (
                         ide_ctx.get("status") if isinstance(ide_ctx, dict) else None
@@ -486,6 +502,10 @@ class WorkspaceInstanceManager:
         ):
             # Startup and explicit cancellation own this runtime. A failed
             # pre-Ready Pod must not acquire a competing lifecycle delete claim.
+            return True
+        if _creation_owns_runtime(inst):
+            # The same holds for a Job resumed while paused (either lane): its
+            # replacement Pod is still owned by the startup continuation.
             return True
         if inst.metadata.get("completion_lifecycle_deferred"):
             # Live commands stand down; expired/parked commands have already
@@ -553,6 +573,13 @@ class WorkspaceInstanceManager:
         if inst.metadata.get("bound_row_missing"):
             age = inst.metadata.get("pod_age_s")
             return age is not None and age >= self._orphan_grace_s()
+        if _creation_owns_runtime(inst):
+            # A non-terminal Job's runtime without a settled creation
+            # reservation belongs to its startup continuation (or, for a
+            # pre-0195 runtime, to an explicit owner). Automatic cleanup refuses
+            # exactly these owners, so claiming one only fences resume and
+            # Cancel for the claim's lease and ends in a refused give_up.
+            return False
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         reapable = False
@@ -573,6 +600,43 @@ class WorkspaceInstanceManager:
         if inst.metadata.get("pod_ip") and await self.is_dirty(inst):
             return False
         return True
+
+    async def _job_creation_unsettled(
+        self, job_id: str, row: dict[str, Any], workspace: dict[str, Any]
+    ) -> bool:
+        """Whether a non-terminal Job's starting runtime lacks a settled receipt.
+
+        Reads the same per-owner fact as automatic cleanup admission
+        (``managed_repository_workspace_runtime_is_unannotated``), so the
+        reaper never claims a runtime that cleanup would refuse. Only
+        projections still being created are checked; a failed lookup counts
+        as unsettled, which keeps the runtime out of the reaper.
+        """
+
+        if row.get("status") in _TERMINAL_JOB_STATUSES:
+            return False
+        if not isinstance(workspace, dict) or workspace.get("provisioner") != "k8s":
+            return False
+        if workspace.get("status") not in _CREATING_WORKSPACE_STATUSES:
+            return False
+        unannotated = getattr(
+            self._db, "managed_repository_workspace_runtime_is_unannotated", None
+        )
+        if not callable(unannotated):
+            return False
+        try:
+            return (
+                await unannotated(job_id, owner_kind="job", scope="workspace_container")
+                is not False
+            )
+        except Exception:
+            logger.warning(
+                "Could not read the creation receipt of job %s; leaving its "
+                "workspace to the startup continuation",
+                job_id,
+                exc_info=True,
+            )
+            return True
 
     def _idle_pod_release_applies(self, inst: Instance) -> bool:
         """Whether an idle job's Pod may go while its PVC keeps the work.
@@ -996,8 +1060,12 @@ class WorkspaceInstanceManager:
         if isinstance(permit, LifecycleActionPermit):
             permit.complete()
 
-    async def give_up(self, inst: Instance, grace_s: int) -> None:
+    async def give_up(self, inst: Instance, grace_s: int) -> bool | None:
         """Escape hatch: dirty + unreachable + attempts exhausted.
+
+        Returns False when nothing was deleted (no claim, refused admission, an
+        unsettled cleanup), True once the exact runtime was deleted, and None
+        on the flag-off legacy path, which does not report.
 
         Ephemeral storage → delete the pod (state already unrecoverable).
         PVC-backed + non-terminal → recreate the pod against the same PVC so the
@@ -1014,10 +1082,10 @@ class WorkspaceInstanceManager:
         """
         if self._completion_lifecycle is None:
             if _is_stateless_thread_instance(inst):
-                return
+                return None
             bound = inst.bound_to
             if not bound:
-                return
+                return None
             labels = inst.metadata.get("labels") or {}
             owner = (
                 WorkspaceOwner.session(bound)
@@ -1034,17 +1102,17 @@ class WorkspaceInstanceManager:
                     else:
                         await self._provisioner.create_workspace(owner)
                 except SessionWorkspaceObservationYielded:
-                    return
+                    return None
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
-            return
+            return None
 
         async with self._action_scope(inst, source="give_up") as (permit, _owns):
             if not permit.local or _is_stateless_thread_instance(inst):
-                return
+                return False
             bound = inst.bound_to
             if not bound:
-                return
+                return False
             labels = inst.metadata.get("labels") or {}
             owner = (
                 WorkspaceOwner.session(bound)
@@ -1052,14 +1120,14 @@ class WorkspaceInstanceManager:
                 else WorkspaceOwner.job(bound)
             )
             if not await self._permit_external(permit):
-                return
+                return False
             if not await self._delete_owned(inst, grace_s):
-                return
+                return False
             if not self._is_terminal(inst) and not inst.metadata.get(
                 "volume_ephemeral", True
             ):
                 if not await self._permit_external(permit):
-                    return
+                    return True
                 try:
                     async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
                         if owner.kind == "session":
@@ -1069,13 +1137,14 @@ class WorkspaceInstanceManager:
                         else:
                             await self._provisioner.create_workspace(owner)
                     if not await self._permit_external(permit):
-                        return
+                        return True
                 except SessionWorkspaceObservationYielded:
-                    return
+                    return True
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
-                    return
+                    return True
             permit.complete()
+            return True
 
     async def snapshot(self, inst: Instance) -> str | None:
         """Capture the workspace contents to S3.
@@ -1299,6 +1368,14 @@ class WorkspaceInstanceManager:
                 admission_source="automatic",
             )
             if not isinstance(intent, dict):
+                logger.info(
+                    "Workspace lifecycle cleanup of %s (%s %s, runtime %s) was not "
+                    "admitted; the runtime stays",
+                    inst.id,
+                    "job" if owner.kind == "job" else "session",
+                    owner.id,
+                    runtime_incarnation,
+                )
                 return False
             if isinstance(
                 permit, LifecycleActionPermit

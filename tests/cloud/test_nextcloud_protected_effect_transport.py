@@ -146,6 +146,19 @@ async def test_initialization_builds_a_distinct_json_effect_client(
                 json=payload,
             )
 
+        async def request(self, method: str, path: str, **_kwargs) -> httpx.Response:
+            # WebDAV-root discovery: an install without a webroot.
+            assert (method, path) == ("PROPFIND", "/remote.php/dav/")
+            return httpx.Response(
+                207,
+                request=httpx.Request(method, f"https://cloud.invalid{path}"),
+                text=(
+                    '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+                    "<d:response><d:href>/remote.php/dav/</d:href></d:response>"
+                    "</d:multistatus>"
+                ),
+            )
+
         async def aclose(self) -> None:
             self.closed = True
 

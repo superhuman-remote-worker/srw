@@ -1,8 +1,10 @@
-import {describe, expect, it} from 'vitest';
-import {signal} from '@angular/core';
+import {beforeAll, describe, expect, it} from 'vitest';
+import {signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {TranslocoService} from '@jsverse/transloco';
+import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
 import {of} from 'rxjs';
+import en from '../../../assets/i18n/en.json';
+import {ModelService} from '../../core/services/model.service';
 import {AdvancedAccordionComponent} from './advanced-accordion.component';
 
 /**
@@ -182,5 +184,70 @@ describe('AdvancedAccordionComponent — VM sizing', () => {
     component.vmCpuCores.set(4);
     expect(component.getOverrides()['workspace']).toBeUndefined();
     expect(component.vmSizingValid()).toBe(true);
+  });
+});
+
+/**
+ * The auxiliary Model field used to fall back to a hardcoded
+ * `RedHatAI/gemma-4-31B-it-FP8-Dynamic`, as its value and its placeholder, on
+ * every install whose config named no auxiliary model, including installs
+ * that never run that model
+ * (auxiliary_model_field_shows_stale_gemma_default.md). Mounted for real, with
+ * every section open (`flat`), so the assertion is on what is on screen.
+ */
+describe('AdvancedAccordionComponent — auxiliary model field', () => {
+  beforeAll(async () => {
+    // The icon component in its imports has a styleUrl; resolve it the way
+    // the other mounted specs in this folder do.
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  async function mount(config: Record<string, unknown>) {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      imports: [
+        AdvancedAccordionComponent,
+        TranslocoTestingModule.forRoot({
+          langs: {en},
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+      providers: [{provide: ModelService, useValue: {reasoningByModel: signal({})}}],
+    });
+    const fixture = TestBed.createComponent(AdvancedAccordionComponent);
+    // Signal inputs cannot be set through setInput() in this pipeline.
+    Object.defineProperty(fixture.componentInstance, 'flat', {value: () => true});
+    Object.defineProperty(fixture.componentInstance, 'config', {value: () => config});
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+    const root = fixture.nativeElement as HTMLElement;
+    const field = root.querySelector<HTMLInputElement>('input[type="text"]');
+    if (!field) throw new Error('no auxiliary model field');
+    return {fixture, root, field};
+  }
+
+  /** Everything on screen, including what inputs show as values and placeholders. */
+  function onScreen(root: HTMLElement): string {
+    const inputs = Array.from(root.querySelectorAll('input'))
+      .map((input) => `${input.value} ${input.placeholder}`);
+    return [root.textContent ?? '', ...inputs].join(' ');
+  }
+
+  it('never renders the literal Gemma id when the config names no auxiliary model', async () => {
+    const {root, field, fixture} = await mount({});
+
+    expect(onScreen(root)).not.toMatch(/gemma/i);
+    expect(field.value).toBe('');
+    expect(field.placeholder).toBe(en.advanced.hints.auxModelFromDeployment);
+    expect(fixture.componentInstance.resolvedAuxModel()).toBeNull();
+    // An untouched field sends nothing: the deployment's pin applies at dispatch.
+    expect(fixture.componentInstance.getOverrides()['auxiliary']).toBeUndefined();
+  });
+
+  it('shows the auxiliary model the config carries', async () => {
+    const {field} = await mount({auxiliary: {model: 'openrouter/anthropic/claude-sonnet-5.5'}});
+
+    expect(field.value).toBe('openrouter/anthropic/claude-sonnet-5.5');
   });
 });

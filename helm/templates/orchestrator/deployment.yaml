@@ -963,7 +963,37 @@ spec:
             # models_yaml_removal — both resolved from the catalog at
             # request time (system_settings['llm.default_builder_model']
             # + the joined transport's provider_kind/provider_ref).
-            # Default Neo4j datasource (local instance — optional)
+            {{- if .Values.databases.neo4j.enabled }}
+            # Neo4j knowledge graph (optional, databases.neo4j.enabled). This
+            # Deployment does not envFrom the shared ConfigMap, so without these
+            # the agents' NEO4J_URL never reached the orchestrator and its graph
+            # leg (note relationships, the update and delete projection, the
+            # knowledge export) never ran. KnowledgeGraphHandle and
+            # init.get_neo4j_config read exactly these three names. The URL is
+            # the agents' one (srw.neo4jUrl: the bundled Service, or
+            # databases.neo4j.externalUrl when internal=false); the credentials
+            # are the Secret keys the bundled server and the agents use, optional
+            # like the agents' envFrom so a Secret without them still starts.
+            - name: NEO4J_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEO4J_URL
+            - name: NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_USERNAME
+                  optional: true
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_PASSWORD
+                  optional: true
+            # Default Neo4j datasource: the same connection, seeded as a
+            # connector only by `python -m orchestrator.init`
+            # (_seed_default_datasources), which the chart does not run.
             - name: DEFAULT_DS_NEO4J_URL
               valueFrom:
                 configMapKeyRef:
@@ -994,29 +1024,7 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: DEFAULT_DS_NEO4J_READ_ONLY
                   optional: true
-            # The orchestrator's own knowledge-graph client (a note's
-            # relationships, graph updates and deletes from the REST API, the
-            # KB export) reads these; the DEFAULT_DS_* copies above only seed
-            # the default connector. The ConfigMap key exists only while Neo4j
-            # is enabled, so without Neo4j the client stays off.
-            - name: NEO4J_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: NEO4J_URL
-                  optional: true
-            - name: NEO4J_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEO4J_USERNAME
-                  optional: true
-            - name: NEO4J_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: NEO4J_PASSWORD
-                  optional: true
+            {{- end }}
             {{- if or .Values.nextcloud.enabled (eq (default "" .Values.cloud.externalBackend) "nextcloud") }}
             # Nextcloud — bundled (nextcloud.enabled=true) or external
             # (cloud.externalBackend=nextcloud). Skipped entirely otherwise so

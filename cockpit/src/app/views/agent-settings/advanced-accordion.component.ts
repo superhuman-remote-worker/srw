@@ -552,7 +552,7 @@ function validVmSizeGiB(value: number | null): value is number {
                     [ngModel]="auxModel() ?? resolvedAuxModel()"
                     (ngModelChange)="auxModel.set($event); emitChange()"
                     [disabled]="disabled()"
-                    placeholder="RedHatAI/gemma-4-31B-it-FP8-Dynamic">
+                    [placeholder]="'advanced.hints.auxModelFromDeployment' | transloco">
                   @if (auxModel() !== null) {
                     <button type="button" class="reset-btn" (click)="auxModel.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
@@ -848,7 +848,7 @@ export class AdvancedAccordionComponent {
    *  templates carry their sizes, so the legacy VM sizing neither shows nor emits. */
   vmSizing = input(true);
 
-  change = output<void>();
+  settingsChange = output<void>();
 
   // Accordion state
   readonly expanded = signal<Set<string>>(new Set());
@@ -989,7 +989,11 @@ export class AdvancedAccordionComponent {
   readonly resolvedProxyEnabled = computed(() => (this.r('research.proxy.enabled') ?? false) as boolean);
 
   readonly resolvedAuxEnabled = computed(() => (this.r('auxiliary.enabled') ?? true) as boolean);
-  readonly resolvedAuxModel = computed(() => (this.r('auxiliary.model') ?? 'RedHatAI/gemma-4-31B-it-FP8-Dynamic') as string);
+  // No literal fallback: the deployment's auxiliary pin is injected at
+  // dispatch, and a model id guessed here was wrong on every install that
+  // does not run it. With no value in the config the field stays empty and
+  // its placeholder says the deployment decides.
+  readonly resolvedAuxModel = computed(() => (this.r('auxiliary.model') as string | null | undefined) ?? null);
   readonly resolvedAuxTemperature = computed(() => (this.r('auxiliary.temperature') ?? 0) as number);
 
   readonly resolvedIdleTimeout = computed(() => (this.r('interactive.idle_timeout_minutes') ?? 30) as number);
@@ -1028,7 +1032,7 @@ export class AdvancedAccordionComponent {
     this.expanded.set(next);
   }
 
-  emitChange(): void { this.change.emit(); }
+  emitChange(): void { this.settingsChange.emit(); }
 
   /** Commit a displayed-but-inherited value on deliberate interaction.
    *  See PinOnInteractDirective — a <select> emits no change event when the

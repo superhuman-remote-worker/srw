@@ -9,10 +9,10 @@ live environment rather than a value frozen at import.
 
 Two properties are load-bearing and moved unchanged:
 
-* **Each gate keeps its own default.** ``EXPERTS_DB_ENABLED`` and
-  ``REQUIRE_PINNED_STATUS_IDENTITY`` default to ``"true"``;
-  ``DATASOURCE_DEFAULTS_ON_OMISSION`` and
-  ``DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED`` default to ``"false"``; the rest
+* **Each gate keeps its own default.** ``EXPERTS_DB_ENABLED``,
+  ``REQUIRE_PINNED_STATUS_IDENTITY`` and
+  ``DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED`` default to ``"true"``;
+  ``DATASOURCE_DEFAULTS_ON_OMISSION`` defaults to ``"false"``; the rest
   default to the empty string, which is off. A uniform default would silently
   flip four deployments' behaviour.
 * **The truthy vocabulary is exactly ``("true", "1", "yes")``** after
@@ -77,14 +77,16 @@ def datasource_defaults_on_omission() -> bool:
 
 
 def datasource_scope_auto_attach_v1_enabled() -> bool:
-    """Coordinated rollout gate for the project-scope/auto-attach UI.
+    """Whether the Cockpit shows connector scope/auto-attach and preselects
+    server defaults (the ``datasource_scope_auto_attach_v1`` capability bit).
 
-    Keep this default-off until every API replica understands the additive
-    datasource contract; the Cockpit reads the corresponding capability bit
-    and leaves the new management workflow hidden while a rollout is mixed.
+    On by default since 0.2.0: every 0.1.x replica speaks the additive
+    datasource contract this gate once hid during a mixed rollout. It switches
+    no server path (``default_selected`` and unattended attach ignore it);
+    ``false`` keeps the old Cockpit forms.
     """
     return os.getenv(
-        "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "false"
+        "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "true"
     ).lower().strip() in ("true", "1", "yes")
 
 

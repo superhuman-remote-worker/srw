@@ -396,9 +396,10 @@ def clear_served_model_env(prefixes: Optional[Iterable[str]] = None) -> None:
             os.environ.pop(CITATION_PROVIDER_ENV_KEY, None)
 
 
-# Set on a chat client built for a catalog row with a served model, so a
-# recorder that holds only the client (the auxiliary archive) records the
-# catalog id rather than the string the client sends.
+# Set by ``create_llm`` on every chat client it builds, so a recorder that
+# holds only the client (the auxiliary archive, native compaction) records the
+# catalog id rather than the string the client sends: a served model id, or the
+# catalog id minus a routing prefix such as ``openrouter/``.
 _CATALOG_MODEL_ATTR = "_srw_catalog_model"
 
 

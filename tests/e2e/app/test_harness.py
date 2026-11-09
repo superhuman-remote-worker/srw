@@ -2544,11 +2544,23 @@ def test_generated_app_secret_covers_every_required_rendered_key(
     ).stdout
     documents = [document for document in yaml.safe_load_all(rendered) if document]
     refs = _rendered_secret_key_refs(documents)
-    minted = harness.generated_secret_data(
-        harness.SecretBundle.generate("20260824-123456-ab12cd34"),
-        vm_private_key="unused",
-        vm_public_key="unused",
-    )
+    minted = {
+        name: set(keys)
+        for name, keys in harness.generated_secret_data(
+            harness.SecretBundle.generate("20260824-123456-ab12cd34"),
+            vm_private_key="unused",
+            vm_public_key="unused",
+        ).items()
+    }
+    # A Secret the chart renders itself (the bundled databases' superuser
+    # Secret, in every secrets mode) is minted by the install, not the harness.
+    for document in documents:
+        if document.get("kind") != "Secret":
+            continue
+        name = (document.get("metadata") or {}).get("name")
+        minted.setdefault(name, set()).update(
+            {**(document.get("data") or {}), **(document.get("stringData") or {})}
+        )
     required_app_keys = {
         ref["key"]
         for ref in refs

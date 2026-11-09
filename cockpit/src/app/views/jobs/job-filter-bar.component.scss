@@ -1,35 +1,118 @@
 @use '../../../styles/variables' as v;
 @use '../../../styles/shape-recipes' as shape;
 
+// Two rows: the status strip, then search + Filters + applied tokens. Every
+// control in both rows shares the toolbar's 28px rhythm (`size="sm"` input
+// and button), so nothing in the strip outweighs the controls next to it.
 .job-filters {
   display: flex;
   flex-direction: column;
   gap: v.$space-sm;
 }
 
-.job-filters__row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: v.$space-md;
-  flex-wrap: wrap;
-}
+// --- Status strip -------------------------------------------------------------
 
 .job-filters__chips {
   display: flex;
-  gap: v.$space-xs;
   flex-wrap: wrap;
+  align-items: center;
+  gap: v.$space-xs;
 }
 
-.job-filters__tools {
-  display: flex;
+.job-chip {
+  @include shape.pill;
+
+  display: inline-flex;
   align-items: center;
-  gap: v.$space-sm;
-  margin-left: auto;
+  gap: 0.375rem;
+  height: 28px;
+  padding: 0 v.$space-sm 0 0.625rem;
+  font-family: inherit;
+  font-size: v.$font-size-control;
+  font-weight: v.$font-weight-medium;
+  line-height: v.$line-height-tight;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+
+  &:hover:not(:disabled, [aria-pressed='true']) {
+    color: var(--text-primary);
+    background: var(--hover);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  // Selected: the same accent tint as ui/chip, not a solid fill — the strip
+  // is a filter, not the page's primary action.
+  &[aria-pressed='true'] {
+    color: var(--accent-color);
+    background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+    border-color: color-mix(in srgb, var(--accent-color) 45%, transparent);
+  }
+
+  // A status with no jobs is a dead end, so it is disabled — but it stays in
+  // the strip so the vocabulary is visible and the row does not reflow when
+  // a count crosses zero. Borderless muted text instead of a faded pill: on a
+  // fresh install most statuses are empty, and nine ghost buttons read as
+  // broken UI where nine quiet labels read as a legend.
+  // Borderless, so it needs less side padding to look evenly spaced.
+  &:disabled {
+    padding: 0 0.375rem;
+    color: var(--text-muted);
+    border-color: transparent;
+    cursor: default;
+  }
+}
+
+.job-chip__count {
+  @include shape.pill;
+
+  min-width: 1.25rem;
+  padding: 0.0625rem 0.375rem;
+  font-size: v.$font-size-xs;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--text-secondary);
+  background: var(--surface-1);
+
+  .job-chip[aria-pressed='true'] & {
+    color: var(--accent-color);
+    background: color-mix(in srgb, var(--accent-color) 16%, transparent);
+  }
+
+  .job-chip:disabled & {
+    min-width: 0;
+    padding: 0;
+    color: inherit;
+    background: transparent;
+  }
+}
+
+// --- Search, Filters, applied tokens ------------------------------------------
+
+.job-filters__bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: v.$space-sm v.$space-12;
 }
 
 .job-filters__search {
-  min-width: 14rem;
+  flex: 0 1 20rem;
+  min-width: 12rem;
+}
+
+.job-filters__trigger {
+  flex: none;
 }
 
 .job-filters__badge {
@@ -43,59 +126,18 @@
   font-weight: v.$font-weight-medium;
 }
 
-// --- Status chips ------------------------------------------------------------
-
-.job-chip {
-  @include shape.pill;
-
-  display: inline-flex;
-  align-items: center;
-  gap: v.$space-xs;
-  padding: 0.2rem v.$space-sm;
-  font-family: inherit;
-  font-size: v.$font-size-sm;
-  line-height: v.$line-height-tight;
-  color: var(--text-secondary);
-  background: var(--surface-0);
-  border: 1px solid var(--border-color);
-  cursor: pointer;
-  transition:
-    color 0.12s ease,
-    border-color 0.12s ease,
-    background-color 0.12s ease;
-
-  &:hover:not(:disabled) {
-    color: var(--text-primary);
-    background: var(--hover);
-  }
-
-  &[aria-pressed='true'] {
-    color: var(--on-accent);
-    background: var(--accent-color);
-    border-color: var(--accent-color);
-  }
-
-  // A status with no jobs is not a filter, it is a dead end. Dimmed and
-  // disabled rather than hidden, so the vocabulary stays visible and the row
-  // does not reflow every time a count crosses zero.
-  &:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-}
-
-.job-chip__count {
-  font-variant-numeric: tabular-nums;
-  opacity: 0.75;
-}
-
-// --- Applied-filter tokens ---------------------------------------------------
-
+// A fixed basis, not `auto`: the group stays beside the button whenever
+// 24rem is left and wraps *inside* that column as tokens are added. With
+// `auto` the whole group would jump to the next line the moment typing a
+// search adds one token too many. Under 24rem it takes its own line instead
+// of stacking one token per line in a sliver.
 .job-filters__tokens {
   display: flex;
+  flex: 1 1 24rem;
+  flex-wrap: wrap;
   align-items: center;
   gap: v.$space-xs;
-  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .job-token {
@@ -104,10 +146,12 @@
   display: inline-flex;
   align-items: center;
   gap: v.$space-xs;
-  padding: 0.15rem v.$space-sm;
+  height: 24px;
+  padding: 0 v.$space-sm;
   font-family: inherit;
   font-size: v.$font-size-xs;
   line-height: v.$line-height-tight;
+  white-space: nowrap;
   color: var(--text-secondary);
   background: var(--surface-1);
   border: 1px solid var(--border-color);
@@ -121,9 +165,21 @@
     border-color: var(--accent-color);
   }
 
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
   &--clear {
+    color: var(--text-muted);
     background: transparent;
-    border-style: dashed;
+    border-color: transparent;
+
+    &:hover {
+      color: var(--accent-color);
+      border-color: transparent;
+      text-decoration: underline;
+    }
   }
 }
 
@@ -133,17 +189,39 @@
   opacity: 0.7;
 }
 
-// --- Phones ------------------------------------------------------------------
-// The tools cluster wraps under the chips; margin-left:auto then parked it
-// ~50px in from the left edge. Give it the full row and let the search grow.
+// --- Phones -------------------------------------------------------------------
 @media (max-width: v.$breakpoint-md) {
-  .job-filters__tools {
-    margin-left: 0;
-    width: 100%;
+  // One horizontally scrolling line instead of four wrapped rows (~120px of
+  // chips before the first job). The right edge is feathered so a clipped
+  // chip reads as "swipe for more", and the trailing padding lets the last
+  // chip scroll clear of the fade.
+  // A scroll container clips its children, focus rings included, so the
+  // strip is inset by the ring's reach and pulled back out by a negative
+  // margin.
+  .job-filters__chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    margin: -0.25rem;
+    padding: 0.25rem 1.75rem 0.25rem 0.25rem;
+    scrollbar-width: none;
+    mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+
+    &::-webkit-scrollbar {
+      display: none;
+    }
+  }
+
+  .job-chip {
+    flex-shrink: 0;
+    height: 32px;
   }
 
   .job-filters__search {
-    flex: 1;
+    flex: 1 1 0;
     min-width: 0;
+  }
+
+  .job-token {
+    height: 28px;
   }
 }

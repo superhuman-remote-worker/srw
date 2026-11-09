@@ -376,3 +376,31 @@ async def test_reap_orphans_failure_does_not_break_tick():
     report = await rec.tick()
     assert report["workspace"]["orphans_reaped"] == 0
     assert report["workspace"]["reaped"] == 1  # clean reapable still torn down
+
+
+@pytest.mark.asyncio
+async def test_give_up_that_deleted_nothing_is_not_reported_as_force_deleted(caplog):
+    """Dev logged "force-deleted … state not captured" every 2 h for a Pod it
+    never deleted (automatic cleanup admission refused it)."""
+
+    mgr = _stateful_mgr(_inst(), dirty=True, reachable=False, exhausted=True)
+    mgr.give_up = AsyncMock(return_value=False)
+    rec = InstanceLifecycleReconciler([mgr])
+    with caplog.at_level("WARNING"):
+        report = await rec.tick()
+    mgr.give_up.assert_awaited_once()
+    assert report["workspace"].get("reap_forced", 0) == 0
+    assert "force-deleted" not in caplog.text
+    assert "deleted nothing" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [True, None], ids=["deleted", "legacy"])
+async def test_give_up_that_deleted_is_still_reported(caplog, result):
+    mgr = _stateful_mgr(_inst(), dirty=True, reachable=False, exhausted=True)
+    mgr.give_up = AsyncMock(return_value=result)
+    rec = InstanceLifecycleReconciler([mgr])
+    with caplog.at_level("WARNING"):
+        report = await rec.tick()
+    assert report["workspace"]["reap_forced"] == 1
+    assert "force-deleted" in caplog.text

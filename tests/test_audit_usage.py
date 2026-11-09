@@ -19,8 +19,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from orchestrator.services.audit_usage import (
+    RESOURCE_FROM_WIRE_NAME,
     _first_int,
+    catalog_wire_name,
     materialize_llm_usage_from_audit,
+    unique_wire_names,
 )
 
 USER = uuid.uuid4()
@@ -95,13 +98,17 @@ class AuditConn:
 
 
 class AppConn:
-    """Answers the jobs / threads owner lookups from in-memory maps."""
+    """Answers the jobs / threads owner lookups and the catalog read."""
 
-    def __init__(self, jobs=None, threads=None):
+    def __init__(self, jobs=None, threads=None, models=None):
         self.jobs = jobs or {}
         self.threads = threads or {}
+        self.models = list(models or [])
 
-    async def fetch(self, sql, ids):
+    async def fetch(self, sql, *args):
+        if "FROM models" in sql:
+            return list(self.models)
+        (ids,) = args
         table = self.jobs if "FROM jobs" in sql else self.threads
         return [
             {"id": i, "user_id": table[i][0], "project_id": table[i][1]}
@@ -454,3 +461,118 @@ class TestMaterialize:
             )
             == noop
         )
+
+
+# --- recorded wire name → catalog id (agents on an older image) -------------
+
+
+def _model(model_id, *, served=None, kind="system", ref="openrouter"):
+    return {
+        "model_id": model_id,
+        "served_model_id": served,
+        "provider_kind": kind,
+        "provider_ref": ref,
+    }
+
+
+SONNET = "openrouter/anthropic/claude-sonnet-5.5"
+SONNET_WIRE = "anthropic/claude-sonnet-5.5"
+
+
+class TestCatalogWireName:
+    def test_an_openrouter_row_sends_its_id_without_the_prefix(self):
+        assert catalog_wire_name(_model(SONNET)) == SONNET_WIRE
+
+    def test_a_served_row_sends_its_served_id(self):
+        row = _model("claude-opus-5-5-api", served="claude-opus-5-5", ref="anthropic")
+        assert catalog_wire_name(row) == "claude-opus-5-5"
+
+    def test_only_the_rows_own_provider_prefix_is_stripped(self):
+        # An endpoint row is routed by its base URL and sends its id unchanged;
+        # a provider row strips only its own provider's prefix.
+        assert catalog_wire_name(_model("groq/llama-x", kind="endpoint")) == (
+            "groq/llama-x"
+        )
+        assert catalog_wire_name(_model("openrouter/x/y", ref="groq")) == (
+            "openrouter/x/y"
+        )
+        assert catalog_wire_name(_model("groq/llama-x", ref="groq")) == "llama-x"
+
+    def test_a_provider_that_strips_nothing_sends_its_id(self):
+        assert catalog_wire_name(_model("openai/gpt-5.5", ref="openai")) == (
+            "openai/gpt-5.5"
+        )
+
+
+class TestUniqueWireNames:
+    def test_maps_a_wire_name_exactly_one_row_sends(self):
+        assert unique_wire_names([_model(SONNET)]) == {SONNET_WIRE: SONNET}
+
+    def test_two_rows_stripping_to_one_name_map_nothing(self):
+        rows = [_model(SONNET), _model("groq/" + SONNET_WIRE, ref="groq")]
+        assert SONNET_WIRE not in unique_wire_names(rows)
+
+    def test_a_wire_name_that_is_a_catalog_id_maps_nothing(self):
+        # A self-hosted endpoint row named like the stripped id records under
+        # its own id; it must never become the OpenRouter row.
+        rows = [_model(SONNET), _model(SONNET_WIRE, kind="endpoint", ref="ep-1")]
+        assert SONNET_WIRE not in unique_wire_names(rows)
+
+    def test_an_id_that_sends_itself_is_not_a_mapping(self):
+        assert unique_wire_names([_model("minimax-m3", kind="endpoint")]) == {}
+
+
+class TestMaterializeMapsTheWireName:
+    async def _materialize(self, model, models):
+        row = _row(1, model=model, call_type="auxiliary", m_prompt="10", m_output="4")
+        audit = FakePool(AuditConn([row]))
+        app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}, models=models))
+        ledger = FakeLedger()
+        await materialize_llm_usage_from_audit(audit, app, ledger, min_age_s=0, now=NOW)
+        return ledger.events
+
+    @pytest.mark.asyncio
+    async def test_the_stripped_id_maps_when_one_row_sends_it(self):
+        events = await self._materialize(SONNET_WIRE, [_model(SONNET)])
+        assert {e.resource for e in events} == {SONNET}
+        details = events[0].details
+        assert details["model"] == SONNET_WIRE, "the recorded string is kept"
+        assert details["resource_from"] == RESOURCE_FROM_WIRE_NAME
+
+    @pytest.mark.asyncio
+    async def test_two_rows_stripping_to_it_keep_the_recorded_string(self):
+        models = [_model(SONNET), _model("groq/" + SONNET_WIRE, ref="groq")]
+        events = await self._materialize(SONNET_WIRE, models)
+        assert {e.resource for e in events} == {SONNET_WIRE}
+        assert "resource_from" not in events[0].details
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_id_is_recorded_as_it_is(self):
+        models = [_model(SONNET), _model(SONNET_WIRE, kind="endpoint", ref="ep-1")]
+        events = await self._materialize(SONNET_WIRE, models)
+        assert {e.resource for e in events} == {SONNET_WIRE}
+        events = await self._materialize(SONNET, models)
+        assert {e.resource for e in events} == {SONNET}
+        assert "resource_from" not in events[0].details
+
+    @pytest.mark.asyncio
+    async def test_a_string_no_row_sends_is_recorded_as_it_is(self):
+        events = await self._materialize("RedHatAI/gemma-4-31B-it", [_model(SONNET)])
+        assert {e.resource for e in events} == {"RedHatAI/gemma-4-31B-it"}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_catalog_read_records_the_string_unchanged(self):
+        class _NoCatalog(AppConn):
+            async def fetch(self, sql, *args):
+                if "FROM models" in sql:
+                    raise RuntimeError("db down")
+                return await super().fetch(sql, *args)
+
+        audit = FakePool(AuditConn([_row(1, model=SONNET_WIRE, m_prompt="3")]))
+        app = FakePool(_NoCatalog(jobs={JOB: (USER, PROJ)}, models=[_model(SONNET)]))
+        ledger = FakeLedger()
+        res = await materialize_llm_usage_from_audit(
+            audit, app, ledger, min_age_s=0, now=NOW
+        )
+        assert res["materialized"] == 1
+        assert ledger.events[0].resource == SONNET_WIRE

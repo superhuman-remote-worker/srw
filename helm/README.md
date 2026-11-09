@@ -29,7 +29,7 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 | `databases.vector` | pgvector for embeddings, citations, memories | internal or external |
 | `databases.keycloak` | Dedicated Postgres for the bundled Keycloak (only relevant when `keycloak.internal: true`) | internal or external |
 | `databases.audit` | Audit trail — LLM/agent/chat traces (optional but recommended) | internal or external |
-| `databases.neo4j` | Project knowledge graph (optional). `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
+| `databases.neo4j` | Project knowledge graph, **off by default** (`databases.neo4j.enabled`). The knowledge base runs on the Postgres store without it; Neo4j adds only the typed graph edges, note relationships and the knowledge export. `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
 | `keycloak` | OIDC provider | internal or external |
 | `gitea` | Git server for agent code workspaces | internal or external |
 | `opencloud` / `nextcloud` | Cloud storage backend | one or external |
@@ -57,7 +57,7 @@ first, especially on shared Fedora hosts or when volumes must use a separate dis
 Optional but recommended:
 - **External Secrets Operator** + a backing store (Vault, AWS Secrets Manager, etc.) — see `externalSecrets.*`
 - **An OIDC IdP** if you don't want the bundled Keycloak (Azure AD, Google Workspace, Okta, etc.)
-- **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit, Neo4j 5+)
+- **Managed databases** for production (any standard Postgres 14+ for app + pgvector + audit; Neo4j 5+ only if you enable the optional knowledge graph)
 - **CloudNativePG 1.30+ on Kubernetes 1.29+**, only if a bundled database uses
   `databases.<name>.engine: cnpg|migrating`; add the **Barman Cloud plugin**
   only for object-store backups — see
@@ -103,6 +103,68 @@ databases:
 This keeps each enabled internal PostgreSQL database on one chart-owned
 StatefulSet. It is appropriate for evaluation, local development, and
 non-HA/self-hosted installations that accept single-node database availability.
+
+### Bundled Postgres roles
+
+On the `statefulset` engine, SRW's three database servers (`postgres`,
+`vector`, `audit`) each have two roles:
+
+| role | what it is | password |
+|---|---|---|
+| `postgres` | the bootstrap superuser, for maintenance only | `<release>-db-superuser` Secret, keys `POSTGRES_SUPERUSER_PASSWORD`, `VECTOR_POSTGRES_SUPERUSER_PASSWORD`, `AUDIT_POSTGRES_SUPERUSER_PASSWORD` |
+| `srw` (`*_POSTGRES_USER`) | SRW's own role: `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, owner of its database and of every schema object in it | the application Secret, `*_POSTGRES_PASSWORD` |
+
+This is how CloudNativePG already runs these databases. The orchestrator,
+agents, executors, migrations and pgAdmin connect as `srw` only. The
+superuser Secret is read by the three database pods and, when it provisions
+the Dynamic Canvas login on the app database, by one init container of the
+Canvas gateway's role Job (`CREATE ROLE` needs a superuser). Agent pods take
+the application Secret whole through `envFrom`, which is why the superuser
+passwords are not in it.
+
+The superuser creates the extensions the migrations need, before they run:
+`uuid-ossp` and `btree_gist` in `srw`; `uuid-ossp`, `vector` and `pg_trgm` in
+`srw_vector`; none in `srw_audit`. Extensions are owned by `postgres`. `vector`
+is not a trusted extension, so `srw` could not create it itself. A future
+migration that needs another untrusted extension must add it to
+`srw.postgresRolesDatabases` in `templates/databases/_postgres-roles.tpl`
+(a chart test fails until it does).
+
+**How the passwords are set.** The chart generates each superuser password
+once and keeps it, like its other generated credentials. A value in
+`secrets.values` (for example `secrets.values.POSTGRES_SUPERUSER_PASSWORD`)
+wins, in every Secret mode; the chart routes it to the superuser Secret, never
+to the application Secret. Do not put these keys in an ESO bundle or a
+pre-existing application Secret: agents would receive them.
+
+Every start of a database pod runs the `postgres-roles` init container, which
+sets both `postgres`'s and `srw`'s passwords from their Secrets. To rotate
+either one, change the Secret and restart that database pod, then restart the
+pods that connect as `srw`.
+
+**Maintenance as the superuser.** Inside the database pod the Unix socket
+needs no password:
+
+```bash
+kubectl -n srw exec -it srw-postgres-0 -c postgres -- psql -U postgres -d srw
+kubectl -n srw exec -it srw-pgvector-0 -c pgvector -- psql -U postgres -d srw_vector
+kubectl -n srw exec -it srw-auditdb-0 -c auditdb -- psql -U postgres -d srw_audit
+```
+
+Over the network (a port-forward, a backup tool), use the password:
+
+```bash
+kubectl -n srw get secret srw-db-superuser \
+  -o jsonpath='{.data.POSTGRES_SUPERUSER_PASSWORD}' | base64 -d
+```
+
+An object you create as `postgres` in an SRW database belongs to `postgres`,
+and a later migration that alters it fails. Create objects for SRW as `srw`
+(`SET ROLE srw;` after connecting as `postgres`), or hand them over with
+`ALTER ... OWNER TO srw`.
+
+Gitea's, Keycloak's and Nextcloud's bundled databases are unchanged: their
+application role is still the image's superuser.
 
 ### HA installation: install CNPG first
 
@@ -248,7 +310,7 @@ aimed at this release's own object store.
 ## Quick start (evaluation, single command)
 
 For a self-contained evaluation install with everything in-cluster (Postgres,
-Neo4j, Keycloak, Gitea, OpenCloud all bundled):
+Keycloak, Gitea, OpenCloud all bundled):
 
 ```bash
 helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \
@@ -264,6 +326,11 @@ helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 `MCP_INTERNAL_KEY`, and `IDE_CREDENTIAL_KEY`, and create internal credentials.
 **This mode is for evaluation only** — see
 [Secrets](#secrets) for production options.
+
+Neo4j is not bundled unless you ask for it. To add the optional knowledge
+graph, set `databases.neo4j.enabled=true` and supply its credentials, which the
+chart does not generate: `secrets.values.NEO4J_USERNAME=neo4j` and
+`secrets.values.NEO4J_PASSWORD` (no `/` in it; see [Secret schema](#secret-schema)).
 
 The first login is the initial administrator, `keycloak.bootstrapAdmin.username`
 (`test` when empty), with the password you supply as `KC_REALM_ADMIN_PASSWORD`;
@@ -544,13 +611,14 @@ key — both layouts coexist (the app falls back to the URL if user+password
 aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`
 - `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD` — pgvector has its
-  own superuser password (separate from the main Postgres) so a credential
-  leak on one instance doesn't compromise the other. Citations, embeddings,
+  own password (separate from the main Postgres) so a credential leak on one
+  instance doesn't compromise the other. Citations, embeddings,
   and memories all live in this instance (`srw_vector`); the citation engine
   is a native SRW subsystem on the vector pool, **not** a separate role or
   database. The former `srw_citations` / `citation_engine` database is retired.
-- `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
-  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
+- `NEO4J_USERNAME`, `NEO4J_PASSWORD` — only when `databases.neo4j.enabled`.
+  The bundled server, the agents and the orchestrator all read them. Both
+  live in Vault (mirroring the `POSTGRES_USER` / `VECTOR_POSTGRES_USER`
   pattern, so all DB credentials sit in one place). Community edition
   expects `NEO4J_USERNAME=neo4j`; enterprise can use a different value.
   The Neo4j server image's `NEO4J_AUTH` is composed at pod-start from
@@ -563,6 +631,11 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 For external-mode databases (`internal: false`), the host/port/db come
 from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
+
+`POSTGRES_SUPERUSER_PASSWORD`, `VECTOR_POSTGRES_SUPERUSER_PASSWORD` and
+`AUDIT_POSTGRES_SUPERUSER_PASSWORD` are **not** application Secret keys. The
+chart keeps them in `<release>-db-superuser`; see
+[Bundled Postgres roles](#bundled-postgres-roles).
 
 An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
 receives the application `POSTGRES_*` credential. For a chart-owned
@@ -593,15 +666,20 @@ only while `viewer.enabled=true`.
 
 External PostgreSQL remains operator-provisioned because the Helm release does
 not own its control plane. The legacy bundled StatefulSet keeps its existing
-development-only identity branch until that engine is retired. Keep the
+development-only identity branch until that engine is retired; that one step
+logs in as the bundled database's superuser, because SRW's role there cannot
+create roles. Keep the
 gateway's database lifecycle, Secret rotation, and backup policy aligned with
 the operator that owns the external database.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
 - `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.
-- `KC_REALM_ADMIN_PASSWORD` — password for the initial SRW administrator
-  selected by `keycloak.bootstrapAdmin.username` (bundled Keycloak).
+- `KC_REALM_ADMIN_PASSWORD` — initial password of the first SRW administrator
+  selected by `keycloak.bootstrapAdmin.username` (bundled Keycloak). Keycloak
+  sets it once, when it creates that user on the first install. Changing it in
+  the Secret later does not change the password; see
+  [Changing the initial administrator's password](#changing-the-initial-administrators-password).
 - `MCP_OIDC_CLIENT_SECRET` (if `mcp.enabled`)
 - `GITEA_OIDC_CLIENT_SECRET`, `NEXTCLOUD_OIDC_CLIENT_SECRET`, `OPENCLOUD_KEYCLOAK_CLIENT_SECRET`, `PGADMIN_OIDC_CLIENT_SECRET` (per enabled component)
 
@@ -611,12 +689,23 @@ your values file:
 ```yaml
 keycloak:
   bootstrapAdmin:
-    username: admin
+    username: srwadmin
 ```
 
 Use 1–64 ASCII letters, digits, dots, underscores, or hyphens, starting with a
 letter or digit. The name must differ from enabled `keycloak.devUsers` accounts,
-including case variants. Supply its password through `KC_REALM_ADMIN_PASSWORD`
+including case variants. It must also not be a name Gitea reserves, in any
+letter case: Gitea names each account after the Keycloak username and refuses
+`admin`, `api`, `user`, `explore`, `ghost` and the rest of its list, plus
+names ending in `.keys`, `.gpg`, `.rss`, `.atom` or `.png`. With the bundled
+Gitea, a fresh install with such a name fails to render, naming the reserved
+word. An upgrade does not fail, because the realm already exists; the install
+notes print a warning instead, and
+[The first administrator has no Git account](../docs/troubleshooting.md#the-first-administrator-has-no-git-account)
+has the recovery steps. With an external Git server, the chart cannot know its
+reserved names, so it only warns. A render without cluster access, such as
+`helm template` or Argo CD, counts as a fresh install and fails too: rename the
+user in Keycloak first, then render with the new name. Supply its password through `KC_REALM_ADMIN_PASSWORD`
 in your chosen Secret source. Keycloak requires at least 16 characters and a
 password different from the username. For bundled Keycloak 26.2 realm import,
 exclude double quotes, backslashes, control characters, and `${` sequences from
@@ -631,8 +720,43 @@ ConfigMap, preserves its initial username when the value is empty, and rejects
 an explicit change. This setting seeds a new realm; it does not rename a user
 in an existing Keycloak database. Keep the same explicit value in offline or
 GitOps rendering, where Helm cannot read the existing ConfigMap. Create further
-administrators through SRW user management. Password reconciliation on pod
-restart continues to target the selected initial user.
+administrators through SRW user management.
+
+#### Changing the initial administrator's password
+
+`KC_REALM_ADMIN_PASSWORD` is the password the initial administrator starts
+with. Keycloak sets it when it creates the user on the first install, and the
+chart never sets it again: a restart or an upgrade keeps whatever password the
+administrator chose since. Rotating the value in the Secret therefore changes
+nothing on its own. (Chart 0.1.0 and earlier reset the password to the Secret
+value on every Keycloak restart.)
+
+Treat this account as the way in for the first login, not as a daily
+administrator: create the administrators who work on the install through SRW
+user management, and change this account's password after the first login.
+
+To change the password, the administrator signs in to the Keycloak Account
+Console (`https://auth.<domain>/realms/srw/account/`, or
+`https://<origin>/identity/realms/srw/account/` in single-origin mode) and
+updates it under **Account security → Signing in**. An operator can also reset
+it in the Keycloak admin console (realm `srw`, **Users →** the user →
+**Credentials → Reset password**, with **Temporary** off), or apply the value
+now in the Secret with kcadm. Keycloak reads the Secret at pod start, so
+restart Keycloak after changing it, then run the following. Replace
+`<username>` with the name Keycloak lists under **Users**; Keycloak stores
+usernames in lower case.
+
+```bash
+kubectl -n srw exec deploy/srw-keycloak -c keycloak -- sh -c '
+  KC=/opt/keycloak/bin/kcadm.sh
+  $KC config credentials --server "http://localhost:8080${KC_HTTP_RELATIVE_PATH:-}" \
+    --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" &&
+  $KC set-password -r srw --username "$1" --new-password "$KC_REALM_ADMIN_PASSWORD"' \
+  _ <username>
+```
+
+The Keycloak server administrator (`KEYCLOAK_ADMIN_USER` in the master realm)
+is a separate account and is not affected.
 
 The chart creates no test accounts. `keycloak.devUsers` seeds six accounts
 whose passwords are published in this repository; it exists for local k3d
@@ -1766,6 +1890,106 @@ helm upgrade srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 
 The chart preserves `APP_ENCRYPTION_KEY` across upgrades when `secrets.create=true`
 via `lookup`. ESO mode reads from Vault on each refresh interval.
+
+### Bundled Postgres: SRW's role stops being a superuser
+
+Chart 0.1.0 and earlier ran SRW's role on the `statefulset` engine as the
+image's bootstrap superuser. The first upgrade to a newer chart converts each
+of the three SRW databases in place; see
+[Bundled Postgres roles](#bundled-postgres-roles) for the result. Nothing to
+do by hand, and it works the same under Fleet or another GitOps tool.
+
+What happens:
+
+- The `postgres`, `pgvector` and `auditdb` pods restart once. The new
+  `postgres-roles` init container starts a temporary server that listens on
+  the pod's Unix socket only, so no client is connected while roles change.
+- It renames the bootstrap superuser `srw` to `postgres` and gives it the
+  password from `<release>-db-superuser`. It creates a new ordinary role,
+  hands it the database and every schema, table, sequence, view, function and
+  type the old role owned (extensions stay with `postgres`), and names it
+  `srw` with the unchanged application password. Renaming is necessary:
+  PostgreSQL 16 refuses to remove superuser from the bootstrap role, and on 15
+  that role would still own the system catalogs.
+- The init container logs each step (`kubectl -n srw logs srw-postgres-0 -c
+  postgres-roles`). It takes seconds; it locks every relation of the database
+  in one transaction, so it does not run beside live traffic.
+
+Every step is idempotent and reads its state from the catalog, so a pod killed
+during the conversion finishes it on the next start, and later starts change
+nothing. At every point the bootstrap role is a superuser with a known
+password: the old application password until the rename, the superuser
+Secret's after it, and always the trusted Unix socket inside the pod.
+
+Check the result:
+
+```bash
+kubectl -n srw exec srw-postgres-0 -c postgres -- psql -U postgres -Atc \
+  "SELECT rolname, rolsuper FROM pg_roles WHERE rolname IN ('postgres', 'srw')"
+# postgres|t
+# srw|f
+```
+
+If the init container fails, the database pod stays in `Init:` and SRW is
+down; its log names the problem. The one known cause is a role already named
+`postgres` that is not the bootstrap superuser: rename or drop it (`kubectl
+exec` into the pod, `psql -U srw`) and delete the pod. Objects of other kinds
+(operators, collations, event triggers, ...) are never created by SRW; if you
+made one by hand as `srw`, the log warns that it stays with `postgres`.
+
+A rollback to chart 0.1.0 keeps the split. That chart's database pods read
+`POSTGRES_USER`/`POSTGRES_PASSWORD` only at initdb, so they start unchanged,
+and SRW keeps connecting as `srw`, which owns everything SRW uses. The one
+exception is that chart's Canvas gateway role Job, which creates its login as
+`srw` and fails without superuser. To restore the old state, run `ALTER ROLE
+srw SUPERUSER` as `postgres` (this rollback path is reasoned from the
+templates, not tested).
+
+### Neo4j is off by default (0.2.0)
+
+Since 0.2.0 `databases.neo4j.enabled` defaults to `false`: the knowledge base
+runs on the Postgres store, and Neo4j adds only the typed graph edges, note
+relationships and the knowledge export.
+
+An install that ran the bundled Neo4j only because of the old default loses
+its StatefulSet, Service and NetworkPolicy on the upgrade. The data volume
+(`<release>-neo4j-data`) carries `helm.sh/resource-policy: keep`, so the
+graph stays on disk. To keep Neo4j running, set it in your values before
+upgrading:
+
+```yaml
+databases:
+  neo4j:
+    enabled: true
+```
+
+Its credentials stay where they are (`NEO4J_USERNAME`, `NEO4J_PASSWORD` in
+the Secret). Installs written by the installer generator set
+`databases.neo4j.enabled` explicitly and are not affected.
+
+### What an upgrade leaves alone in the bundled Keycloak realm
+
+Keycloak imports the `srw` realm once, on the first install. Some realm
+settings come only from that import, so an upgrade or a restart leaves them as
+they are, and changing values later has no effect on them:
+
+- **Email verification and password reset.** A new realm asks new users to
+  verify their address, and offers **Forgot password?**, only when
+  `email.enabled` is true and `email.smtp.host` is set. Chart 0.1.0 and earlier
+  switched both on regardless, which strands self-registered users on installs
+  without a mail server. Change them in the Keycloak admin console under
+  **Realm settings → Login**; see
+  [Self-registered users are stuck at "Failed to send email"](../docs/troubleshooting.md#self-registered-users-are-stuck-at-failed-to-send-email).
+- **The initial administrator's password.** `KC_REALM_ADMIN_PASSWORD` applies
+  only when Keycloak creates the initial administrator. Chart 0.1.0 and
+  earlier reset that password to the Secret value on every Keycloak restart;
+  newer charts keep the password the administrator chose. Rotating the Secret
+  no longer changes it; see
+  [Changing the initial administrator's password](#changing-the-initial-administrators-password).
+- **The initial administrator's name.** An upgrade keeps the name the realm was
+  created with, even one Gitea reserves (such as `admin`), and prints a warning
+  in the install notes. Rename that user in Keycloak; see
+  [The first administrator has no Git account](../docs/troubleshooting.md#the-first-administrator-has-no-git-account).
 
 ### Migration 0185 pinned-runtime cutover
 

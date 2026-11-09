@@ -290,3 +290,75 @@ def test_legacy_keycloak_keeps_rolling_update_strategy():
         keycloak["spec"].get("strategy", {}).get("type", "RollingUpdate")
         == "RollingUpdate"
     )
+
+
+CLOUD_ALIAS_MOUNT = {
+    "name": "server-config",
+    "mountPath": "/etc/apache2/conf-enabled/zz-srw-cloud-alias.conf",
+    "subPath": "apache-cloud-alias.conf",
+    "readOnly": True,
+}
+
+
+def test_nextcloud_also_answers_under_cloud_for_in_cluster_webdav_clients(manifests):
+    """Nextcloud writes /cloud into every href and into sabre's base URI, also
+    for callers that skip the gateway; rclone and MOVE/COPY need a request
+    path under /cloud to match (single_origin_cloud_folder_listings_come_back_empty)."""
+    conf = manifests["ConfigMap", "srw-nextcloud-server-config"]["data"][
+        "apache-cloud-alias.conf"
+    ]
+    assert "Alias /cloud /var/www/html" in conf
+    # Without the root-relative error documents every denied or missing path
+    # at / would answer 500 (the generated .htaccess points at /cloud/...).
+    assert '<Location "/">' in conf
+    assert "ErrorDocument 403 /index.php/error/403" in conf
+    assert "ErrorDocument 404 /index.php/error/404" in conf
+
+    pod = manifests["Deployment", "srw-nextcloud"]["spec"]["template"]["spec"]
+    for container in pod["containers"] + pod.get("initContainers", []):
+        mounted = CLOUD_ALIAS_MOUNT in container.get("volumeMounts", [])
+        assert mounted is (container["name"] == "nextcloud"), container["name"]
+
+
+SAMESITE_MARKERS_MOUNT = {
+    "name": "server-config",
+    "mountPath": "/etc/apache2/conf-enabled/zz-srw-samesite-markers.conf",
+    "subPath": "apache-samesite-markers.conf",
+    "readOnly": True,
+}
+
+
+def test_nextcloud_hands_out_its_same_site_markers_on_a_first_visit(manifests):
+    """The Cockpit's session cookie rides on every /cloud request, so Nextcloud
+    never sends its markers; its login hop then redirects to a URL that
+    getRequestUri() mangles under OVERWRITEWEBROOT
+    (open_project_folder_link_mangled_on_single_origin)."""
+    conf = manifests["ConfigMap", "srw-nextcloud-server-config"]["data"][
+        "apache-samesite-markers.conf"
+    ]
+    for policy in ("lax", "strict"):
+        cookie = f"nc_sameSiteCookie{policy}=true; path=/cloud; httponly; secure;"
+        line = next(line for line in conf.splitlines() if cookie in line)
+        # Appended (PHP's own Set-Cookie headers stay), on every status
+        # (the 303 to the login page included), only when the request lacks it.
+        assert line.startswith("Header always add Set-Cookie ")
+        assert f"SameSite={policy}" in line
+        assert f"!~ /nc_sameSiteCookie{policy}=true/" in line
+
+    pod = manifests["Deployment", "srw-nextcloud"]["spec"]["template"]["spec"]
+    for container in pod["containers"] + pod.get("initContainers", []):
+        mounted = SAMESITE_MARKERS_MOUNT in container.get("volumeMounts", [])
+        assert mounted is (container["name"] == "nextcloud"), container["name"]
+
+
+def test_in_cluster_routing_keeps_the_unprefixed_service_url(manifests):
+    """The prefix is discovered by the adapter for WebDAV only. NEXTCLOUD_URL
+    is part of the sealed main-cloud routing: prefixing it would mint a new
+    cloud instance and send the lane's attestation into nginx's 404."""
+    env = next(
+        document["data"]
+        for (kind, _name), document in manifests.items()
+        if kind == "ConfigMap" and "NEXTCLOUD_URL" in (document.get("data") or {})
+    )
+    assert env["NEXTCLOUD_URL"] == "http://srw-nextcloud"
+    assert env["NEXTCLOUD_PROTECTED_EFFECT_URL"] == "http://srw-protected-effect"

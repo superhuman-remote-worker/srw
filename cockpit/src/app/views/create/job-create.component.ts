@@ -3,7 +3,7 @@ import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.compo
 import {WorkspaceChoice} from '../../core/models/workspace-template.model';
 import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
-import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {Component, computed, effect, ElementRef, inject, Injector, linkedSignal, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {pickOwnDefaultProject} from '../../core/util/own-default-project';
@@ -19,6 +19,7 @@ import {hasGrant} from '../agent-settings/capability-gates';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
 import {ExpertPickerComponent} from '../agent-settings/expert-picker.component';
 import {executionManifest, inlineExpertSelection, toYaml} from '../agent-settings/execution-request';
+import {LatestLoad, PendingLoad, settleBeforeCreate} from '../agent-settings/settle-before-create';
 import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {TranslocoPipe} from '@jsverse/transloco';
@@ -67,9 +68,9 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         }
 
         <!-- Error Message -->
-        @if (errorMessage()) {
+        @if (errorMessage() || settingsStillLoading()) {
           <div class="error-message">
-            <span>{{ errorMessage() }}</span>
+            <span>{{ errorMessage() ?? ('jobs.create.settingsStillLoading' | transloco) }}</span>
             <app-button variant="ghost" size="sm" (clicked)="clearError()">
               {{ 'jobs.create.dismiss' | transloco }}
             </app-button>
@@ -81,7 +82,11 @@ import {AppFormFieldComponent} from '../../ui/form-field';
              More renders every field, and a template value of 0 under a
              min="1" input blocked Create with an unfocusable error). -->
         <form novalidate (submit)="$event.preventDefault(); onSubmit()">
+          <!-- (keydown.enter): Enter in a one-line settings field (connector
+               search, number fields) must not create the job. The task fields
+               are textareas, where Enter is a newline. -->
           <app-agent-settings
+            (keydown.enter)="blockImplicitSubmit($event)"
             mode="job"
             [workspacePicker]="true"
             [pickerBackend]="pickerBackend()"
@@ -102,7 +107,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
             [loadingExpert]="isLoadingExpertDetail()"
             [expertName]="selectedExpert()?.display_name ?? ''"
             [expertSource]="selectedExpertSource()"
-            (change)="onSettingsChange()"
+            (settingsChange)="onSettingsChange()"
             (retryDatasources)="loadDatasources()"
             (instructionsChange)="onInstructionsChange($event)"
           >
@@ -145,7 +150,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
               <app-form-field [label]="'jobs.create.kickoffLabel' | transloco" [hint]="'jobs.create.kickoffHint' | transloco">
                 <app-textarea
                   [value]="kickoffMessage"
-                  (valueChange)="kickoffMessage = $event"
+                  (valueChange)="onKickoffEdit($event)"
                   [rows]="2"
                   [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
                   [disabled]="isSubmitting()"
@@ -310,16 +315,20 @@ import {AppFormFieldComponent} from '../../ui/form-field';
             >
               {{ 'jobs.create.reset' | transloco }}
             </app-button>
+            <!-- Not disabled while the settings check (tool preview, Expert
+                 detail, connector list) loads: a click then waits for it in
+                 onSubmit. Disabling here lost the click (zoneless change
+                 detection disables the button before mouseup). -->
             <app-button
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError() || isLoadingExpertDetail() || loadingWorkspacePreview() || !vmSizingValid()"
+              [disabled]="!formData.description || datasourceLoadError() || !vmSizingValid()"
             >
-              @if (isSubmitting()) {
-                {{ 'jobs.create.creating' | transloco }}
-              } @else if (isUploading()) {
+              @if (isUploading()) {
                 {{ 'jobs.create.uploading' | transloco }}
+              } @else if (isSubmitting()) {
+                {{ 'jobs.create.creating' | transloco }}
               } @else {
                 {{ 'jobs.create.submit' | transloco }}
               }
@@ -1074,6 +1083,7 @@ export class JobCreateComponent implements OnInit {
   private readonly modelService = inject(ModelService);
   readonly fileService = inject(FileHandlingService);
   readonly artifacts = inject(JobArtifactService);
+  private readonly injector = inject(Injector);
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
@@ -1114,6 +1124,8 @@ export class JobCreateComponent implements OnInit {
   readonly isDragOver = signal(false);
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
+  /** Create gave up waiting for the settings check (see onSubmit). */
+  readonly settingsStillLoading = signal(false);
   readonly filePreviews = signal<FilePreview[]>([]);
 
   readonly experts = signal<Expert[]>([]);
@@ -1153,6 +1165,7 @@ export class JobCreateComponent implements OnInit {
     if (!Number.isNaN(num)) {
       this.selectedPriority.set(num);
     }
+    this.refreshManifest();
   }
 
   onProjectIdChange(value: string | null): void {
@@ -1162,6 +1175,7 @@ export class JobCreateComponent implements OnInit {
     this.loadEffectiveDefault();
     // The project is a grant scope, so it can change what the answer says.
     this.loadToolPreview();
+    this.refreshManifest();
   }
 
   readonly projects = signal<Project[]>([]);
@@ -1311,11 +1325,21 @@ export class JobCreateComponent implements OnInit {
 
   /** Why a hand-picked container/VM workspace can't run commands for this Expert, or null.
    *  A note only: it never blocks submit. Default is skipped on purpose (Helm makes most
-   *  installations' default Job workspace a container, so it would show on every Job). */
-  readonly noShellNoteKey = computed<string | null>(() => {
-    // While a preview (or the Expert detail that triggers one) is loading, the signal still
-    // holds the previous Expert's answer; saying "no shell" about that would be false.
-    if (this.loadingWorkspacePreview() || this.isLoadingExpertDetail()) return null;
+   *  installations' default Job workspace a container, so it would show on every Job).
+   *
+   *  While a preview (or the Expert detail that triggers one) is loading, the preview still
+   *  holds the previous answer, so the note keeps the value it had until the new answer
+   *  lands. Hiding it instead moved Create, which sits below it, between mousedown and
+   *  mouseup, and the click was lost. */
+  readonly noShellNoteKey = linkedSignal<{loading: boolean; key: string | null}, string | null>({
+    source: () => ({
+      loading: this.loadingWorkspacePreview() || this.isLoadingExpertDetail(),
+      key: this.currentNoShellNoteKey(),
+    }),
+    computation: ({loading, key}, previous) => (loading ? previous?.value ?? null : key),
+  });
+
+  private readonly currentNoShellNoteKey = computed<string | null>(() => {
     const kind = this.workspaceChoice().kind;
     if (kind !== 'ref' && kind !== 'inline') return null;
     const backend = this.pickerBackend();
@@ -1331,11 +1355,16 @@ export class JobCreateComponent implements OnInit {
   onWorkspaceChoice(choice: WorkspaceChoice): void {
     this.workspaceChoice.set(choice);
     this.loadToolPreview();
+    this.refreshManifest();
   }
 
   private toolPreviewSerial = 0;
   private expertDetailSerial = 0;
   readonly loadingWorkspacePreview = signal(false);
+  // The latest of each load the request depends on, for a Create that waits.
+  private readonly previewLoad = new LatestLoad();
+  private readonly expertDetailLoad = new LatestLoad();
+  private readonly datasourceLoad = new LatestLoad();
 
   /** Ask the server what this job's toolset would be.
    *
@@ -1353,6 +1382,7 @@ export class JobCreateComponent implements OnInit {
    */
   loadToolPreview(): void {
     const serial = ++this.toolPreviewSerial;
+    const done = this.previewLoad.start();
     this.loadingWorkspacePreview.set(true);
     const expert = this.selectedExpert();
     const isDbExpert =
@@ -1380,6 +1410,7 @@ export class JobCreateComponent implements OnInit {
         if (categories && !this.agentSettings?.hasToolEdits()) {
           this.agentSettings?.prefillFromResolvedToolset(categories);
         }
+        done();
       });
   }
 
@@ -1391,6 +1422,7 @@ export class JobCreateComponent implements OnInit {
     this.api.getExpertTemplate(selected?.id === expertId ? selected : {id: expertId}).subscribe((template) => {
       if (serial === this.expertDetailSerial) this.expertTemplate.set(template);
     });
+    const done = this.expertDetailLoad.start();
     this.isLoadingExpertDetail.set(true);
     this.api.getExpertDetail(expertId, {accountDefaults: true, role: "worker"}).subscribe({
       next: (detail) => {
@@ -1405,21 +1437,48 @@ export class JobCreateComponent implements OnInit {
         }
         this.isLoadingExpertDetail.set(false);
         this.loadToolPreview();
+        done();
       },
-      error: () => { if (serial === this.expertDetailSerial) this.isLoadingExpertDetail.set(false); },
+      error: () => {
+        if (serial !== this.expertDetailSerial) return;
+        this.isLoadingExpertDetail.set(false);
+        done();
+      },
     });
   }
 
+  // The task fields feed the request but not the tool preview, so their edits
+  // refresh an open manifest view and start no preview. (They used to reach
+  // onSettingsChange() through the native `change` event bubbling out of the
+  // settings host, which also lost the first click on Create.)
   onDescriptionEdit(value: string): void {
+    // Written here too, not only through the artifact effect: the manifest is
+    // rebuilt right away, and an emptied field must read as empty.
+    this.formData.description = value;
     this.artifacts.description.set(value || null);
+    this.refreshManifest();
+  }
+
+  onKickoffEdit(value: string): void {
+    this.kickoffMessage = value;
+    this.refreshManifest();
   }
 
   onInstructionsChange(value: string | null): void {
     this.artifacts.instructions.set(value);
+    this.refreshManifest();
+  }
+
+  /** Enter in a one-line field submits its form (HTML implicit submission).
+   *  None of the settings fields is the job's last step, so Enter there does
+   *  nothing; textareas are not INPUTs and keep their newline. */
+  blockImplicitSubmit(event: Event): void {
+    if ((event.target as HTMLElement | null)?.tagName === 'INPUT') event.preventDefault();
   }
 
   loadDatasources(): void {
     const serial = ++this.datasourceRequestSerial;
+    const done = this.datasourceLoad.start();
     this.isLoadingDatasources.set(true);
     this.datasourceLoadError.set(false);
     // The server applies execution authorization and scope for this exact
@@ -1432,6 +1491,7 @@ export class JobCreateComponent implements OnInit {
         if (serial !== this.datasourceRequestSerial) return;
         this.availableDatasources.set(datasources);
         this.isLoadingDatasources.set(false);
+        done();
       },
       error: () => {
         if (serial !== this.datasourceRequestSerial) return;
@@ -1439,6 +1499,7 @@ export class JobCreateComponent implements OnInit {
         // picker disables edits while errored and submission remains blocked.
         this.datasourceLoadError.set(true);
         this.isLoadingDatasources.set(false);
+        done();
       },
     });
   }
@@ -1586,21 +1647,51 @@ export class JobCreateComponent implements OnInit {
     return this.agentSettings?.vmSizingValid() ?? true;
   }
 
+  /** The loads the request is built from: the tool preview (the tools
+   *  baseline it re-anchors, the lite-tier holdback), the Expert detail (its
+   *  config prefill) and the eligible connectors (the selection). */
+  private settingsLoads(): PendingLoad[] {
+    return [
+      {busy: () => this.loadingWorkspacePreview(), load: this.previewLoad},
+      {busy: () => this.isLoadingExpertDetail(), load: this.expertDetailLoad},
+      {busy: () => this.isLoadingDatasources(), load: this.datasourceLoad},
+    ];
+  }
+
   async onSubmit(): Promise<void> {
     if (
       !this.formData.description || this.isSubmitting() || this.isUploading() ||
-      this.isLoadingDatasources() || this.datasourceLoadError() || this.isLoadingExpertDetail() || this.loadingWorkspacePreview() || !this.vmSizingValid()
+      this.datasourceLoadError() || !this.vmSizingValid()
     ) return;
-    this.clearMessages();
-
-    const files = this.filePreviews();
-    if (files.length > 0 && !this.uploadId) {
-      if (!(await this.uploadFiles())) return;
-    }
-
+    // Before any await: the button shows its loading state at once, and a
+    // second click (or Enter) is refused instead of creating a second job.
     this.isSubmitting.set(true);
-    const request = this.buildRequest();
+    this.clearMessages();
+    let sent = false;
+    try {
+      const loads = this.settingsLoads();
+      if (loads.some((l) => l.busy())) {
+        // A click during a settings check waits for the latest answer and one
+        // render, then builds the request from it. It used to be refused.
+        const outcome = await settleBeforeCreate(loads, this.injector);
+        if (outcome === 'timeout') this.settingsStillLoading.set(true);
+        if (outcome !== 'settled' || this.datasourceLoadError() || !this.vmSizingValid()) return;
+      }
 
+      const files = this.filePreviews();
+      if (files.length > 0 && !this.uploadId) {
+        if (!(await this.uploadFiles())) return;
+      }
+
+      const request = this.buildRequest();
+      sent = true;
+      this.sendCreate(request);
+    } finally {
+      if (!sent) this.isSubmitting.set(false);
+    }
+  }
+
+  private sendCreate(request: JobCreateRequest): void {
     this.api.createJob(request).subscribe({
       next: (job) => {
         this.isSubmitting.set(false);
@@ -1769,8 +1860,8 @@ export class JobCreateComponent implements OnInit {
   }
 
   clearSuccess(): void { this.successMessage.set(null); }
-  clearError(): void { this.errorMessage.set(null); }
-  private clearMessages(): void { this.successMessage.set(null); this.errorMessage.set(null); }
+  clearError(): void { this.errorMessage.set(null); this.settingsStillLoading.set(false); }
+  private clearMessages(): void { this.successMessage.set(null); this.clearError(); }
 
   /** Leave the create form and return to the job list. */
   cancel(): void {

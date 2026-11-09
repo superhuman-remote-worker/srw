@@ -659,7 +659,8 @@
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
       "expertSelectedPrefix": "Selected:",
-      "createSession": "Create Session"
+      "createSession": "Create Session",
+      "settingsStillLoading": "The settings are still loading. Try again in a moment."
     },
     "configDrift": {
       "title": "Some of this session's setup is gone",
@@ -771,6 +772,7 @@
       "user": "Submitted by a person",
       "session": "Started from a session",
       "automation": "Automation",
+      "telephony": "Phone call",
       "loop": "Loop",
       "officer": "Officer",
       "subjob": "Sub-job",
@@ -992,7 +994,8 @@
       "submit": "Create Job",
       "creating": "Creating...",
       "uploading": "Uploading...",
-      "removeFile": "Remove file"
+      "removeFile": "Remove file",
+      "settingsStillLoading": "The settings are still loading. Try again in a moment."
     },
     "detail": {
       "auditSteps": "Audit steps",
@@ -3632,6 +3635,7 @@
     "hints": {
       "idleDisabled": "0 = disabled",
       "autoPlaceholder": "auto",
+      "auxModelFromDeployment": "Set by the deployment",
       "vmSizeWholeGiB": "Enter a whole number of GiB (at least 1).",
       "parallelToolCalls": "Model support varies — some models may still make parallel tool calls regardless of this setting, while others may not support them at all.",
       "virtualBackend": "Virtual workspaces run with no container — shell, browser, and git tools are disabled. File, web, database, and knowledge tools remain available.",
@@ -4532,6 +4536,10 @@
       "permission.denied": "You don't have permission to do that.",
       "nothing_staged": "There are no staged changes left to act on — they were applied or rejected somewhere else.",
       "no_protected_mount": "This session no longer has a protected cloud mount, so its staged changes cannot be applied.",
+      "job_state_conflict": "The job's workspace changed while this request ran. Reload the job and try again.",
+      "workspace_start_failed": "The job's workspace could not start, and resuming again would fail the same way. Ask an administrator to check the workspace image and settings.",
+      "workspace_retirement_refused": "The workspace that did not start could not be replaced yet. Try Resume again in a minute.",
+      "workspace_retirement_unavailable": "This deployment cannot replace the job's workspace.",
       "staging_missing": "The staged content is no longer available in storage, so it cannot be applied. Re-stage the changes and review them again.",
       "invalid_epoch": "This review is out of date. Reload it and decide again."
     },
