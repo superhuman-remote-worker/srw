@@ -2139,8 +2139,9 @@ class LLMConfig:
     # the provider-side prefix cache survives pod rotation on the stateless
     # lane — stateless_agents.md OQ5; worker jobs pass a per-job key). Never
     # set from YAML. Transmitted as the `prompt_cache_key` body field to
-    # first-party OpenAI and the subscription proxy's Codex lane, and as the
-    # proxy's `X-Session-ID` session-affinity header. Other compatible
+    # first-party OpenAI and the subscription proxy's Codex lane, as the
+    # proxy's `X-Session-ID` session-affinity header, and as OpenRouter's
+    # `session_id` sticky-routing key for Claude there. Other compatible
     # endpoints (vLLM et al.) may reject unknown body fields and run their own
     # keyless prefix caches, so they get neither.
     prompt_cache_key: Optional[str] = None
@@ -5426,6 +5427,20 @@ def _create_openrouter_llm(
     if config.extra_body:
         extra_body = deep_merge(extra_body, config.extra_body)
 
+    # OpenRouter caches Claude only when the request asks; its other models
+    # (OpenAI, DeepSeek, Kimi, Gemini, ...) are cached without a field. The
+    # top-level field is OpenRouter's automatic form: one breakpoint on the
+    # last cacheable block, moved forward each turn, so an append-only request
+    # reads the previous turn's entry. The conversation key (the main client's
+    # only) becomes OpenRouter's sticky-routing session, which keeps the turns
+    # on the upstream provider that holds the cache from the first call on.
+    # Without both, every call re-sent its whole prefix at the full input
+    # price. setdefault: a declared value keeps winning.
+    if _is_openrouter_claude(config, model):
+        extra_body.setdefault("cache_control", {"type": "ephemeral"})
+        if config.prompt_cache_key:
+            extra_body.setdefault("session_id", config.prompt_cache_key)
+
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {
         "model": model,
@@ -5506,10 +5521,23 @@ def _create_openrouter_llm(
         f"served={served_model_of(config) or 'none'}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
-        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
+        f"prompt_cache={'requested' if 'cache_control' in extra_body else 'provider'}"
     )
 
     return llm
+
+
+def _is_openrouter_claude(config: LLMConfig, wire_model: str) -> bool:
+    """True for a Claude model on OpenRouter.
+
+    By catalog family (``openrouter/anthropic/claude-*``) or by OpenRouter's
+    own namespace (``anthropic/…``, ``~anthropic/…-latest``), so a bare
+    OpenRouter id with ``provider: openrouter`` is caught too.
+    """
+    if wire_model.lower().lstrip("~").startswith("anthropic/"):
+        return True
+    return family_of(config.model or "").startswith("claude")
 
 
 def _create_mistral_llm(
