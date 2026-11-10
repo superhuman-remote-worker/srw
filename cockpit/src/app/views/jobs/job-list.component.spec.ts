@@ -1085,8 +1085,60 @@ describe('JobListComponent — server-resolved tree', () => {
       'VM workspace unavailable · Waiting for VM creation cancellation to be reconciled.',
     );
     expect(component.workspaceContractSummary(disposed)).toBe(
+      'Workspace: requested vm · assigned vm',
+    );
+    expect(component.workspaceContractWarns(disposed)).toBe(false);
+    // A creation record still pending keeps the full line and the warning.
+    expect(component.workspaceContractSummary(cleanupHeld)).toBe(
       'Workspace: requested vm · assigned vm · effective unavailable',
     );
+    expect(component.workspaceContractWarns(cleanupHeld)).toBe(true);
+  });
+
+  it('leaves the effective backend out once a stopped job released its sandbox', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    const released = {
+      requested_backend: null,
+      assigned_backend: 'sandbox' as const,
+      effective_backend: null,
+      state: 'waiting',
+      failure: 'sandbox_runtime_not_ready',
+    };
+
+    for (const status of ['completed', 'pending_review', 'failed', 'cancelled']) {
+      const stopped = job(status, {status, workspace_contract: released}) as JobSummary;
+      expect(component.workspaceContractSummary(stopped)).toBe(
+        'Workspace: requested default · assigned sandbox',
+      );
+      expect(component.workspaceContractWarns(stopped)).toBe(false);
+    }
+    for (const status of ['processing', 'paused', 'created']) {
+      const live = job(status, {status, workspace_contract: released}) as JobSummary;
+      expect(component.workspaceContractSummary(live)).toBe(
+        'Workspace: requested default · assigned sandbox · effective unavailable',
+      );
+      expect(component.workspaceContractWarns(live)).toBe(true);
+    }
+    const recovering = job('recovering', {
+      status: 'cancelled', workspace_contract: released,
+      workspace_recovery: {
+        operation_id: '22222222-bbbb-4222-8222-222222222222',
+        state: 'recovering', reason_code: 'prior_runtime_unfenced',
+        message: 'Workspace recovery is running.',
+        started_at: '2026-09-16T08:00:00Z',
+        deadline_at: '2026-09-16T08:15:00Z',
+        next_check_at: null, retryable: false, cleanup_pending: true,
+      },
+    }) as JobSummary;
+    expect(component.workspaceContractSummary(recovering)).toContain('effective unavailable');
+    expect(component.workspaceContractWarns(recovering)).toBe(true);
+    const failedProvisioning = job('failed-provisioning', {
+      status: 'failed',
+      workspace_contract: {...released, state: 'failed', failure: 'sandbox_provisioning_failed'},
+    }) as JobSummary;
+    expect(component.workspaceContractSummary(failedProvisioning)).toContain('effective unavailable');
+    expect(component.workspaceContractWarns(failedProvisioning)).toBe(true);
   });
 
   it('keeps active waits and terminal retained runtimes in their existing workspace states', () => {

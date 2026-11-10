@@ -250,6 +250,121 @@ async def test_delete_refuses_non_owner_before_any_retirement_effect():
     cleanup.assert_not_awaited()
 
 
+_JOB_ID = "6f1c2d3e-4a5b-4c6d-8e7f-0123456789ab"
+
+
+def _delete_store(*job_rows):
+    """A store whose get_job answers ``job_rows`` in turn (the last repeats)."""
+    rows = list(job_rows)
+
+    async def get_job(_job_id):
+        return rows.pop(0) if len(rows) > 1 else rows[0]
+
+    return SimpleNamespace(
+        has_child_jobs=AsyncMock(return_value=False),
+        get_job=AsyncMock(side_effect=get_job),
+        delete_checkpoint_thread=AsyncMock(),
+        delete_job=AsyncMock(return_value={"deleted": True}),
+    )
+
+
+def _job_row(status, workspace_status):
+    return {
+        "id": _JOB_ID,
+        "status": status,
+        "context": {
+            "workspace_container": {
+                "provisioner": "kubernetes",
+                "status": workspace_status,
+            }
+        },
+    }
+
+
+_OWNER = {"id": "owner", "is_admin": False}
+_DELETE_JOB = {
+    "id": _JOB_ID,
+    "runtime_kind": "srw",
+    "user_id": "owner",
+    "execution_lane": "pinned",
+}
+
+
+def _fast_wait(operations):
+    operations.delete_teardown_poll_seconds = 0
+    return operations
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_the_completion_teardown_it_raced():
+    # The completion teardown is deleting the Pod: the strict release refuses
+    # once, then the row reads deleted and retirement skips the container.
+    store = _delete_store(
+        _job_row("completed", "ready"),
+        _job_row("completed", "ready"),
+        _job_row("completed", "deleted"),
+    )
+    cleanup = AsyncMock(
+        side_effect=[
+            RuntimeError("Kubernetes workspace exact teardown is incomplete"),
+            None,
+        ]
+    )
+    operations = _fast_wait(_controls(store, archive_and_cleanup_workspace=cleanup))
+
+    await operations.delete(_JOB_ID, caller=_OWNER, job=_DELETE_JOB)
+
+    assert cleanup.await_count == 2
+    store.delete_job.assert_awaited_once()
+    assert store.delete_checkpoint_thread.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_of_a_job_in_review_does_not_wait():
+    # No completion teardown runs for a job waiting for review; its Pod stays.
+    store = _delete_store(_job_row("pending_review", "ready"))
+    cleanup = AsyncMock(side_effect=RuntimeError("teardown is incomplete"))
+    operations = _controls(store, archive_and_cleanup_workspace=cleanup)
+    operations.delete_teardown_poll_seconds = 30  # would hang if it waited
+
+    with pytest.raises(HTTPException) as raised:
+        await operations.delete(_JOB_ID, caller=_OWNER, job=_DELETE_JOB)
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == "Workspace authority retirement is incomplete"
+    assert cleanup.await_count == 1
+    store.delete_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_still_answers_503_when_the_teardown_never_settles():
+    store = _delete_store(_job_row("completed", "ready"))
+    cleanup = AsyncMock(side_effect=RuntimeError("teardown is incomplete"))
+    operations = _fast_wait(_controls(store, archive_and_cleanup_workspace=cleanup))
+    operations.delete_teardown_wait_seconds = 0.05
+
+    with pytest.raises(HTTPException) as raised:
+        await operations.delete(_JOB_ID, caller=_OWNER, job=_DELETE_JOB)
+
+    assert raised.value.status_code == 503
+    assert cleanup.await_count == 1
+    store.delete_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_answers_503_when_the_retry_fails_too():
+    store = _delete_store(_job_row("completed", "deleted"))
+    cleanup = AsyncMock(side_effect=RuntimeError("checkpoint rows remain"))
+    operations = _fast_wait(_controls(store, archive_and_cleanup_workspace=cleanup))
+
+    with pytest.raises(HTTPException) as raised:
+        await operations.delete(_JOB_ID, caller=_OWNER, job=_DELETE_JOB)
+
+    assert raised.value.status_code == 503
+    assert cleanup.await_count == 2
+    store.delete_job.assert_not_awaited()
+
+
 def _delivery(**overrides) -> JobDeliveryDependencies:
     values = {
         field: MagicMock() for field in JobDeliveryDependencies.__dataclass_fields__

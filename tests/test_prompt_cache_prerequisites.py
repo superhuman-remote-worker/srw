@@ -12,6 +12,9 @@ Design: knowledge-base/knowledge/features/compaction_refactor_fidelity_and_fork_
   ``X-Session-ID`` session-affinity header, and the Codex lane also forwards it
   as ``prompt_cache_key``.
 - The chart turns on CLIProxyAPI session affinity.
+- Claude on OpenRouter asks for OpenRouter's automatic caching (top-level
+  ``cache_control``) and sends the conversation key as its sticky-routing
+  ``session_id``; OpenRouter's other models are cached without either.
 """
 
 import dataclasses
@@ -324,6 +327,83 @@ class TestSubscriptionProxyWire:
             llm.http_client.close()
 
         assert "x-session-id" not in captured[0]["headers"]
+
+
+class TestOpenRouterWire:
+    """OpenRouter caches Claude only on request: the top-level automatic field,
+    plus the conversation key as its sticky-routing session. Its other models
+    are cached by OpenRouter itself and get neither."""
+
+    @staticmethod
+    def _invoke(monkeypatch, model: str, **overrides) -> dict:
+        captured = _capture(monkeypatch)
+        config = dataclasses.replace(
+            loader.LLMConfig(),
+            model=model,
+            provider="openrouter",
+            api_key="fixture-key",
+            max_retries=0,
+            **overrides,
+        )
+        llm = loader.create_llm(config)
+        try:
+            # The proxy's message-level shape is not OpenRouter's.
+            assert llm.anthropic_cache_breakpoints is False
+            llm.invoke(_worker_request())
+        finally:
+            llm.http_client.close()
+        (request,) = captured
+        return request
+
+    def test_claude_asks_for_automatic_caching_on_one_provider(self, monkeypatch):
+        request = self._invoke(
+            monkeypatch,
+            "openrouter/anthropic/claude-sonnet-5.5",
+            prompt_cache_key="srw-job-j1",
+        )
+        body = request["body"]
+        assert body["model"] == "anthropic/claude-sonnet-5.5"
+        assert body["cache_control"] == CC
+        assert body["session_id"] == "srw-job-j1"
+        assert not any("cache_control" in m for m in body["messages"])
+        assert "prompt_cache_key" not in body
+        assert "x-session-id" not in request["headers"]
+
+    def test_auxiliary_client_without_a_key_gets_no_session(self, monkeypatch):
+        body = self._invoke(monkeypatch, "openrouter/anthropic/claude-sonnet-5.5")[
+            "body"
+        ]
+        assert body["cache_control"] == CC
+        assert "session_id" not in body
+
+    def test_models_cached_by_openrouter_get_nothing(self, monkeypatch):
+        body = self._invoke(
+            monkeypatch,
+            "openrouter/deepseek/deepseek-v4-pro",
+            prompt_cache_key="srw-job-j1",
+        )["body"]
+        assert "cache_control" not in body
+        assert "session_id" not in body
+
+    def test_provider_decides_not_the_url(self, monkeypatch):
+        # A bare OpenRouter id (no catalog family) on a custom base URL.
+        body = self._invoke(
+            monkeypatch,
+            "anthropic/claude-sonnet-5.5",
+            base_url="https://openrouter-fixture.invalid/api/v1",
+            prompt_cache_key="srw-thread-t1",
+        )["body"]
+        assert body["cache_control"] == CC
+        assert body["session_id"] == "srw-thread-t1"
+
+    def test_declared_cache_control_wins(self, monkeypatch):
+        one_hour = {"type": "ephemeral", "ttl": "1h"}
+        body = self._invoke(
+            monkeypatch,
+            "openrouter/anthropic/claude-sonnet-5.5",
+            extra_body={"cache_control": one_hour},
+        )["body"]
+        assert body["cache_control"] == one_hour
 
 
 class TestCodexLaneSessionKey:

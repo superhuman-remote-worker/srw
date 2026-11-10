@@ -804,6 +804,7 @@
     "failureReason": "Grund",
     "workspace": {
       "summary": "Arbeitsbereich: angefordert {{requested}} · zugewiesen {{assigned}} · wirksam {{effective}}",
+      "summaryStopped": "Arbeitsbereich: angefordert {{requested}} · zugewiesen {{assigned}}",
       "state": "Arbeitsbereichsstatus: {{state}} · Detail: {{failure}}",
       "terminalUnavailable": "VM-Arbeitsbereich nicht verfügbar",
       "terminalUnavailableWithPending": "VM-Arbeitsbereich nicht verfügbar · {{message}}",
