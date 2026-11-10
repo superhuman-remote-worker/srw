@@ -17,7 +17,11 @@ import {
   jobStatusLabelKey,
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
-import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
+import {
+  workspaceContractSummary as formatWorkspaceContractSummary,
+  workspaceContractTitle as formatWorkspaceContractTitle,
+  workspaceContractWarns as warnsForWorkspaceContract,
+} from '../../core/util/workspace-contract-presentation';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
 import {
   checkoutCaptureState,
@@ -241,7 +245,7 @@ export function selectDeliveryRepository(
               @if (job()!.workspace_contract) {
                 <span
                   class="meta-item workspace-contract"
-                  [class.warning]="job()!.workspace_contract!.state !== 'ready'"
+                  [class.warning]="workspaceContractWarns()"
                   [title]="workspaceContractTitle()"
                 >{{ workspaceContractSummary() }}</span>
               }
@@ -864,16 +868,11 @@ export class JobReviewComponent {
   );
 
   workspaceContractSummary(): string {
-    const workspace = this.job()?.workspace_contract;
-    if (!workspace) return '';
-    return this.transloco.translate('jobs.workspace.summary', {
-      requested:
-        workspace.requested_backend ?? this.transloco.translate('jobs.workspace.default'),
-      assigned:
-        workspace.assigned_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
-      effective:
-        workspace.effective_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
-    });
+    return formatWorkspaceContractSummary(this.job(), this.transloco);
+  }
+
+  workspaceContractWarns(): boolean {
+    return warnsForWorkspaceContract(this.job());
   }
 
   workspaceContractTitle(): string {

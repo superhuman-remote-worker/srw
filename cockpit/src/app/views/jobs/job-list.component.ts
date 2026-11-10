@@ -20,7 +20,11 @@ import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
 import {JobSummary} from '../../core/models/audit.model';
-import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
+import {
+  workspaceContractSummary as formatWorkspaceContractSummary,
+  workspaceContractTitle as formatWorkspaceContractTitle,
+  workspaceContractWarns as warnsForWorkspaceContract,
+} from '../../core/util/workspace-contract-presentation';
 import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {
   JobDetailPanelComponent,
@@ -322,7 +326,7 @@ export type {JobCloudAction};
                     @if (row.job.workspace_contract) {
                       <div
                         class="workspace-contract"
-                        [class.warning]="row.job.workspace_contract.state !== 'ready'"
+                        [class.warning]="workspaceContractWarns(row.job)"
                         [style.padding-left.px]="row.isChild ? 16 : 0"
                         [title]="workspaceContractTitle(row.job)"
                       >
@@ -1630,16 +1634,11 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   workspaceContractSummary(job: JobSummary): string {
-    const workspace = job.workspace_contract;
-    if (!workspace) return '';
-    return this.transloco.translate('jobs.workspace.summary', {
-      requested:
-        workspace.requested_backend ?? this.transloco.translate('jobs.workspace.default'),
-      assigned:
-        workspace.assigned_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
-      effective:
-        workspace.effective_backend ?? this.transloco.translate('jobs.workspace.unavailable'),
-    });
+    return formatWorkspaceContractSummary(job, this.transloco);
+  }
+
+  workspaceContractWarns(job: JobSummary): boolean {
+    return warnsForWorkspaceContract(job);
   }
 
   workspaceContractTitle(job: JobSummary): string {

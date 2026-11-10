@@ -804,6 +804,7 @@
     "failureReason": "Reason",
     "workspace": {
       "summary": "Workspace: requested {{requested}} · assigned {{assigned}} · effective {{effective}}",
+      "summaryStopped": "Workspace: requested {{requested}} · assigned {{assigned}}",
       "state": "Workspace state: {{state}} · detail: {{failure}}",
       "terminalUnavailable": "VM workspace unavailable",
       "terminalUnavailableWithPending": "VM workspace unavailable · {{message}}",
