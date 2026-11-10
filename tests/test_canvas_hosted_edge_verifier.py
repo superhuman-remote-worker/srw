@@ -143,7 +143,7 @@ def test_pwa_hash_fails_when_worker_manifest_references_an_old_shell() -> None:
 def test_api_and_ide_require_distinct_framing_policies() -> None:
     origin = "https://api.example.test"
     responses = {
-        f"{origin}/openapi.json": _strict(b"{}"),
+        f"{origin}/api/openapi.json": _strict(b"{}"),
         f"{origin}/api/ide/probe/": _response(
             status=404,
             csp="frame-ancestors 'self'",

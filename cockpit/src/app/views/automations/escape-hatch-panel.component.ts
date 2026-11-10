@@ -4,6 +4,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {environment} from '../../core/environment';
 
+export const API_GUIDE_URL = 'https://docs.superhuman-remote-worker.com/api/';
+
 /**
  * The "Need more than schedules?" panel at the bottom of the Automations
  * page.
@@ -33,7 +35,7 @@ import {environment} from '../../core/environment';
           <app-icon size="inherit">menu_book</app-icon>
           {{ 'automations.escapeHatch.apiDocs' | transloco }}
         </a>
-        <a class="link" href="https://github.com/superhuman-remote-worker/srw/blob/main/docs/features/automations_api.md" target="_blank" rel="noopener">
+        <a class="link" [href]="guideUrl" target="_blank" rel="noopener">
           <app-icon size="inherit">description</app-icon>
           {{ 'automations.escapeHatch.guide' | transloco }}
         </a>
@@ -94,7 +96,10 @@ import {environment} from '../../core/environment';
   ],
 })
 export class EscapeHatchPanelComponent {
-  // The Swagger UI lives at /api/docs (FastAPI default). environment.apiUrl
-  // includes the /api suffix; strip it to derive the doc URL.
+  // The orchestrator serves its Swagger UI at /api/docs (create_app sets
+  // docs_url). environment.apiUrl includes the /api suffix; strip it to
+  // derive the doc URL.
   readonly apiDocsUrl = `${environment.apiUrl.replace(/\/api$/, '')}/api/docs`;
+  /** docs/api.md on the public documentation site. */
+  readonly guideUrl = API_GUIDE_URL;
 }

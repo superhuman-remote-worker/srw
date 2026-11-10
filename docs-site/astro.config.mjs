@@ -90,6 +90,7 @@ export default defineConfig({
 						'vm-capacity',
 						'vm-workspace-recovery',
 						'project-loops',
+						'api',
 					],
 				},
 				{

@@ -50,6 +50,8 @@ the site; edit it on GitHub and the site follows.
   an immutable image, enable bounded recovery, interpret retained holds.
 - [Project loops](project-loops.md) — bounded, repeated job sequences against
   one project goal.
+- [Automate SRW with the API](api.md) — personal access tokens, jobs and
+  automations from n8n, Zapier, scripts or curl.
 
 ## Operations
 

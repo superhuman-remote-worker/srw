@@ -298,7 +298,7 @@ def test_orchestrator_registers_anti_framing_inside_request_correlation() -> Non
     assert middleware_classes[0].__name__ == "CorrelationIdMiddleware"
     assert middleware_classes[1] is TrustedParentAntiFramingMiddleware
 
-    response = TestClient(orchestrator.main.app).get("/openapi.json")
+    response = TestClient(orchestrator.main.app).get("/api/openapi.json")
     assert response.status_code == 200
     _assert_denies_framing(response)
 
