@@ -53,6 +53,22 @@ def _harness_lacks_pause(capabilities: Mapping[str, Any]) -> bool:
     return "jobs" in capabilities
 
 
+_TEARDOWN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+def _container_workspace_context(job: Mapping[str, Any]) -> dict[str, Any]:
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    workspace = (
+        context.get("workspace_container") if isinstance(context, dict) else None
+    )
+    return workspace if isinstance(workspace, dict) else {}
+
+
 class JobCancelResponse(TypedDict):
     status: str
     cleanup_pending: NotRequired[bool]
@@ -149,6 +165,11 @@ class JobControlDependencies:
 
 class JobControlOperations:
     """Own cancel, pause, release, and permanent job deletion policy."""
+
+    # How long a Delete waits for an in-flight completion teardown to settle
+    # the workspace: the teardown's own Pod-absence wait (45 s) plus margin.
+    delete_teardown_wait_seconds: float = 60.0
+    delete_teardown_poll_seconds: float = 2.0
 
     def __init__(self, dependencies: JobControlDependencies) -> None:
         self.dependencies = dependencies
@@ -339,6 +360,32 @@ class JobControlOperations:
                 ),
             )
 
+    async def _wait_for_completion_teardown(self, job_id: str) -> bool:
+        """True once a terminal job's container workspace reads deleted.
+
+        Only a terminal job (completed, failed, cancelled) has a completion
+        teardown that can still be running; a job waiting for review keeps its
+        Pod, so this answers False at once. Polls the job row, never the
+        cluster: the teardown owns the Pod, this caller only waits for it.
+        """
+        get_job = getattr(self.dependencies.store, "get_job", None)
+        if get_job is None or self.delete_teardown_wait_seconds <= 0:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.delete_teardown_wait_seconds
+        while True:
+            fresh = await get_job(job_id)
+            if not fresh or fresh.get("status") not in _TEARDOWN_TERMINAL_STATUSES:
+                return False
+            workspace = _container_workspace_context(fresh)
+            if not workspace or workspace.get("provisioner") == "docker":
+                return False
+            if workspace.get("status") in ("deleted", "released"):
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(self.delete_teardown_poll_seconds)
+
     async def delete(
         self,
         job_id: str,
@@ -384,7 +431,7 @@ class JobControlOperations:
                             detail="Pinned Ready retained stop or Delete authority is incomplete",
                         )
 
-            try:
+            async def retire_workspace_authority() -> None:
                 await d.archive_and_cleanup_workspace(job_id)
                 select_vm = getattr(
                     store, "quiesce_cancelled_stateless_vm_parent", None
@@ -401,14 +448,43 @@ class JobControlOperations:
                     # the retry anchor until its terminal checkpoint thread
                     # is proven empty after workspace retirement.
                     await store.delete_checkpoint_thread(job_id, strict=True)
+
+            try:
+                await retire_workspace_authority()
             except Exception as exc:
-                d.logger.warning(
-                    "Workspace cleanup is incomplete for job %s: %s", job_id, exc
+                # A Delete that lands while the job's own completion teardown
+                # is deleting the workspace Pod finds it Terminating, without
+                # exact process-zero evidence, and the strict release refuses.
+                # That teardown settles within its absence timeout and marks
+                # the workspace deleted, after which retirement skips the
+                # container. Wait for it once instead of answering 503 to a
+                # Delete that succeeds when repeated a few seconds later.
+                if not await self._wait_for_completion_teardown(job_id):
+                    d.logger.warning(
+                        "Workspace cleanup is incomplete for job %s: %s", job_id, exc
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Workspace authority retirement is incomplete",
+                    ) from exc
+                d.logger.info(
+                    "Job %s completion teardown settled its workspace while "
+                    "Delete waited (%s); retrying retirement",
+                    job_id,
+                    exc,
                 )
-                raise HTTPException(
-                    status_code=503,
-                    detail="Workspace authority retirement is incomplete",
-                ) from exc
+                try:
+                    await retire_workspace_authority()
+                except Exception as retry_exc:
+                    d.logger.warning(
+                        "Workspace cleanup is incomplete for job %s: %s",
+                        job_id,
+                        retry_exc,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Workspace authority retirement is incomplete",
+                    ) from retry_exc
 
             if d.snapshot_service.is_available:
                 try:
