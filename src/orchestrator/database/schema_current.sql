@@ -29473,6 +29473,7 @@ CREATE TABLE public.jobs (
     workspace_idle_revision bigint DEFAULT 0 NOT NULL,
     workspace_idle_episode jsonb,
     harness_image text,
+    title text,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),
@@ -29584,6 +29585,13 @@ COMMENT ON COLUMN public.jobs.wake_delivery_id IS 'Server-owned identity linking
 --
 
 COMMENT ON COLUMN public.jobs.wake_delivery_claim_attempt IS '0174 rolling-upgrade fence. Must equal wake_attempts on each sending claim so an old replica fails before performing a non-idempotent HTTP send.';
+
+
+--
+-- Name: COLUMN jobs.title; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.title IS 'Display name a person gave the job after creating it (PATCH /api/jobs/{id}, at most 200 characters, enforced by the API). NULL means the job was never named: readers show jobs.description instead. The agent never sees it; the task text stays in description.';
 
 
 --
