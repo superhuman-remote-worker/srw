@@ -1,0 +1,114 @@
+/* House style for HTML slide decks, printed to PDF one slide per page.
+   16:9 at 13.333 x 7.5 in (1280 x 720 CSS px). Same tokens as report.css. */
+
+:root {
+  --ink: #1b2230;
+  --muted: #5d6677;
+  --rule: #dfe3ea;
+  --tint: #f4f6f9;
+  --accent: #2456c9;
+  --accent-tint: #eaf0fc;
+  --highlight: #d9822b;
+  --good: #2f8f5b;
+  --bad: #c43d3d;
+  --font: "Noto Sans", "DejaVu Sans", sans-serif;
+}
+
+@page { size: 13.333in 7.5in; margin: 0; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--font);
+  color: var(--ink);
+  counter-reset: slide;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+.slide {
+  position: relative;
+  width: 1280px;
+  height: 720px;
+  padding: 64px 80px 72px;
+  overflow: hidden;
+  break-after: page;
+  counter-increment: slide;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+}
+.slide:last-child { break-after: auto; }
+
+/* Slide number and source line */
+.slide::after {
+  content: counter(slide);
+  position: absolute;
+  right: 80px;
+  bottom: 30px;
+  font-size: 14px;
+  color: var(--muted);
+}
+.source { position: absolute; left: 80px; bottom: 30px; font-size: 14px; color: var(--muted); }
+
+/* The action title: the slide's takeaway as a sentence */
+h2 {
+  font-size: 40px;
+  line-height: 1.15;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0 0 36px;
+  max-width: 1050px;
+}
+p, li { font-size: 24px; line-height: 1.4; }
+ul { margin: 0; padding-left: 28px; }
+li { margin-bottom: 16px; }
+li::marker { color: var(--accent); }
+.body { flex: 1; min-height: 0; }
+.muted { color: var(--muted); }
+
+/* Title slide */
+.title-slide { justify-content: center; background: var(--ink); color: #fff; }
+.title-slide h1 { font-size: 60px; line-height: 1.1; font-weight: 650; margin: 0 0 24px; max-width: 1000px; }
+.title-slide p { font-size: 24px; color: #c6ccd8; margin: 0; }
+.title-slide::before { content: ""; width: 120px; height: 8px; background: var(--accent); margin-bottom: 36px; }
+.title-slide::after { content: none; }
+
+/* One sentence, nothing else */
+.statement { justify-content: center; }
+.statement h2 { font-size: 56px; max-width: 1000px; margin: 0; }
+.statement p { font-size: 26px; color: var(--muted); margin-top: 28px; max-width: 900px; }
+
+/* Chart or image with the takeaway beside or below it */
+.figure { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.figure img, .figure svg { max-width: 100%; max-height: 100%; object-fit: contain; }
+.split { display: grid; grid-template-columns: 1.5fr 1fr; gap: 56px; flex: 1; min-height: 0; align-items: center; }
+.split .figure { height: 100%; }
+
+/* Big numbers */
+.numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; align-content: center; flex: 1; }
+.number { border-top: 4px solid var(--ink); padding-top: 16px; }
+.number.highlight { border-top-color: var(--highlight); }
+.number .value { font-size: 56px; font-weight: 650; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.number .label { font-size: 20px; color: var(--muted); margin-top: 8px; }
+.number .delta { font-size: 18px; margin-top: 4px; }
+.up { color: var(--good); }
+.down { color: var(--bad); }
+
+/* Tables on slides: few rows, large type */
+table { border-collapse: collapse; font-size: 22px; font-variant-numeric: tabular-nums; width: 100%; }
+th { text-align: left; border-bottom: 3px solid var(--ink); padding: 10px 14px; }
+td { border-bottom: 1px solid var(--rule); padding: 10px 14px; }
+.num { text-align: right; }
+tr.highlight td { background: #fdf1e5; }
+
+/* Closing / next steps */
+.steps { counter-reset: step; list-style: none; padding: 0; }
+.steps li { counter-increment: step; padding-left: 64px; position: relative; }
+.steps li::before {
+  content: counter(step);
+  position: absolute; left: 0; top: -2px;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--accent); color: #fff;
+  font-size: 20px; font-weight: 650;
+  display: flex; align-items: center; justify-content: center;
+}

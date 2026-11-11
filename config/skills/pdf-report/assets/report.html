@@ -1,0 +1,108 @@
+<!doctype html>
+<!-- Report template. Copy this file and report.css into a work folder, replace
+     the example content, delete blocks you do not need, then print with
+     scripts/render_pdf.py. Keep lang= and the number format in step with the reader:
+     German readers get 1.234,5 € and 11.11.2026. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Restaurant performance, September 2025 – August 2026</title>
+  <link rel="stylesheet" href="report.css">
+  <style>
+    /* Footer text on every page; page numbers come from report.css. */
+    @page { @bottom-left { content: "Restaurant performance 2025/26"; font: 8pt "Noto Sans"; color: #8a92a3; } }
+  </style>
+</head>
+<body>
+
+  <header class="title-block">
+    <p class="kicker">Example Hotel · Prepared 11 November 2026</p>
+    <h1>Lunch is down, dinner carries the year</h1>
+    <p class="subtitle">Covers, revenue and spend per cover, September 2025 – August 2026</p>
+  </header>
+
+  <!-- The answer first: two or three sentences a reader can act on. -->
+  <section class="summary">
+    <h2>Summary</h2>
+    <p>Weekday lunch fell from about 41 to 28 covers a day from June on, a drop of
+      31%, while dinner held steady. Revenue for the year is 2% above the year
+      before because spend per cover at dinner rose by €4.10.</p>
+  </section>
+
+  <!-- Three to five numbers, each with its comparison. Leave a tile out
+       rather than invent a value. -->
+  <div class="kpis">
+    <div class="kpi">
+      <div class="label">Revenue</div>
+      <div class="value">€1,284,300</div>
+      <div class="delta up">+2.1% on prior year</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Covers</div>
+      <div class="value">31,920</div>
+      <div class="delta down">−4.8% on prior year</div>
+    </div>
+    <div class="kpi highlight">
+      <div class="label">Weekday lunch, Jun–Aug</div>
+      <div class="value">28 / day</div>
+      <div class="delta down">−31% on Sep–May</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Spend per cover, dinner</div>
+      <div class="value">€52.40</div>
+      <div class="delta up">+€4.10</div>
+    </div>
+  </div>
+
+  <h2>Covers by month</h2>
+  <p>Lunch covers are stable until May and fall in June. July and August stay low.</p>
+  <figure>
+    <!-- Prefer a chart file from the charts skill: <img src="covers.svg" alt="…">.
+         This inline SVG only shows the intended look. -->
+    <svg viewBox="0 40 600 125" role="img" aria-label="Lunch covers per day by month">
+      <g font-family="Noto Sans" font-size="10" fill="#5d6677">
+        <line x1="40" y1="140" x2="590" y2="140" stroke="#dfe3ea"/>
+        <g fill="#c9d3e6">
+          <rect x="50" y="58" width="30" height="82"/><rect x="95" y="56" width="30" height="84"/>
+          <rect x="140" y="60" width="30" height="80"/><rect x="185" y="62" width="30" height="78"/>
+          <rect x="230" y="59" width="30" height="81"/><rect x="275" y="57" width="30" height="83"/>
+          <rect x="320" y="58" width="30" height="82"/><rect x="365" y="60" width="30" height="80"/>
+          <rect x="410" y="57" width="30" height="83"/>
+        </g>
+        <g fill="#d9822b">
+          <rect x="455" y="84" width="30" height="56"/><rect x="500" y="86" width="30" height="54"/>
+          <rect x="545" y="85" width="30" height="55"/>
+        </g>
+        <text x="455" y="76" fill="#1b2230" font-weight="600">−31% from June</text>
+        <text x="50" y="156">Sep</text><text x="545" y="156">Aug</text>
+        <text x="0" y="62">41</text><text x="0" y="88">28</text>
+      </g>
+    </svg>
+    <figcaption>Figure 1 — Weekday lunch covers per day, monthly average. Source: POS export.</figcaption>
+  </figure>
+
+  <h2>Month by month</h2>
+  <table class="data">
+    <thead>
+      <tr><th>Month</th><th class="num">Lunch covers</th><th class="num">Dinner covers</th><th class="num">Revenue</th><th class="num">Spend / cover</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>May 2026</td><td class="num">902</td><td class="num">1,811</td><td class="num">€108,950</td><td class="num">€40.16</td></tr>
+      <tr class="highlight"><td>June 2026</td><td class="num">616</td><td class="num">1,794</td><td class="num">€101,120</td><td class="num">€41.96</td></tr>
+      <tr class="highlight"><td>July 2026</td><td class="num">594</td><td class="num">1,840</td><td class="num">€103,480</td><td class="num">€42.51</td></tr>
+    </tbody>
+    <tfoot>
+      <tr><td>Year</td><td class="num">9,874</td><td class="num">22,046</td><td class="num">€1,284,300</td><td class="num">€40.23</td></tr>
+    </tfoot>
+  </table>
+
+  <h2>Method and sources</h2>
+  <div class="sources">
+    <ol>
+      <li>POS export <em>sales_2025-09_2026-08.csv</em>, 48,212 receipts; lunch = receipts opened 11:30–15:00 Monday to Friday.</li>
+      <li>Prior-year figures from <em>sales_2024-09_2025-08.csv</em>, same definitions.</li>
+    </ol>
+  </div>
+
+</body>
+</html>
