@@ -38,7 +38,7 @@ async def get_job_progress(
     *,
     dependencies: JobInspectionDependencies = Depends(get_job_inspection_dependencies),
 ) -> dict[str, Any]:
-    """Get honest job liveness (E1/E3, officer_supervision_surface §4–§5).
+    """Get honest job liveness.
 
     Composes the control-row basis with the one shared liveness computation
     (audit movement → agent heartbeat, ``updated_at`` never consulted).
@@ -46,6 +46,8 @@ async def get_job_progress(
     compatibility but are honest ``null`` — no percentage telemetry exists
     and none is fabricated.
     """
+    # Design: knowledge-base/knowledge/features/officer_supervision_surface.md
+    # §4–§5 (E1/E3).
     _, job = await dependencies.require_job_access(request, dependencies.store, job_id)
     return await job_inspection.get_job_progress(
         job_id=job_id, authorized_job=job, dependencies=dependencies.inspections
@@ -153,9 +155,9 @@ async def get_job_brief(
 
     ``JobResumeRequest`` carries no description/deliverables/kickoff, so a
     resumed job would serve an empty brief for the rest of its life; the agent
-    backfills from here on resume
-    (knowledge-base/knowledge/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+    backfills from here on resume.
     """
+    # Design: knowledge-history/done/fresh_job_dispatched_as_resume_skips_seeding.md.
     await dependencies.require_internal(request)
     return await job_inspection.get_job_brief(
         job_id=job_id, dependencies=dependencies.inspections

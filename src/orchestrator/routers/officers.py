@@ -70,15 +70,15 @@ async def get_project_officer_summary(
 ) -> dict[str, Any]:
     """The project's post at a glance — the cockpit's officer card.
 
-    officer_post.md §4/§8: always returns the post. ``commissioned`` /
-    ``held`` / ``kit`` / ``incarnations`` / ``communication_policy`` /
-    ``while_vacant`` come from the durable ``project_officers`` row; the
-    ``officer`` block is ALWAYS present so the card's editor seeds from one
-    place — live thread metadata when commissioned, the row's config when
-    vacant (live-only fields null there). Kit utilization is lineage-aware:
-    in-flight counts follow every incarnation on the post, not just the
-    current thread.
+    Always returns the post. ``commissioned`` / ``held`` / ``kit`` /
+    ``incarnations`` / ``communication_policy`` / ``while_vacant`` come from
+    the durable ``project_officers`` row; the ``officer`` block is ALWAYS
+    present so the card's editor seeds from one place — live thread metadata
+    when commissioned, the row's config when vacant (live-only fields null
+    there). Kit utilization is lineage-aware: in-flight counts follow every
+    incarnation on the post, not just the current thread.
     """
+    # Design: knowledge-base/knowledge/features/officer_post.md §4/§8.
     dependencies = get_officer_post_view_dependencies(request)
     user, _project = await require_project_member(
         request, dependencies.store, project_id, min_role="viewer"
@@ -110,29 +110,31 @@ async def commission_project_officer(
     project_id: str,
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Raise an officer onto the project's post (officer_post.md §5).
+    """Raise an officer onto the project's post.
 
     Auth: project admin (owner or platform admin) — the kit belongs to the
-    century, not to whoever clicked provision (§11 Q1, decided). Optional
-    body: the same partial kit as PATCH; validated and merged into the row
-    FIRST, so the thread is created from the durable record. A stale
-    ended/disabled link completes the authoritative handoff before provisioning;
-    the new thread then goes through the one create funnel, whose registration
-    claim links it and 409s rivals. The continuity brief is his first wake:
-    vacant-since/until, a pointer at his restored state + charter, and the
-    while-vacant ledger.
+    century, not to whoever clicked provision. Optional body: the same partial
+    kit as PATCH; validated and merged into the row FIRST, so the thread is
+    created from the durable record. A stale ended/disabled link completes the
+    authoritative handoff before provisioning; the new thread then goes through
+    the one create funnel, whose registration claim links it and 409s rivals.
+    The continuity brief is his first wake: vacant-since/until, a pointer at
+    his restored state + charter, and the while-vacant ledger.
 
-    Project-binding invariant (officer_knowledge_plane.md §3.1, K1): a
-    commissioned background officer has exactly one project — the sole native
-    writable KB — and no override may replace that write target. This
-    endpoint satisfies most of it by construction: the project comes from the
-    URL, ``ThreadCreateRequest`` carries a single ``project_id``, and the kit
-    patch vocabulary (``_SESSION_OFFICER_OVERRIDE_KEYS`` + workspace/tools/
-    llm/interactive passthrough) has no project or datasource channel. The
-    guard below rejects an unparseable project id (fail-closed 422 instead of
-    a DB-layer 500); the agent-side attach re-checks the resolved bindings
-    and refuses to boot a mis-bound officer.
+    Project-binding invariant: a commissioned background officer has exactly
+    one project — the sole native writable KB — and no override may replace
+    that write target. This endpoint satisfies most of it by construction: the
+    project comes from the URL, ``ThreadCreateRequest`` carries a single
+    ``project_id``, and the kit patch vocabulary
+    (``_SESSION_OFFICER_OVERRIDE_KEYS`` + workspace/tools/llm/interactive
+    passthrough) has no project or datasource channel. The guard below rejects
+    an unparseable project id (fail-closed 422 instead of a DB-layer 500); the
+    agent-side attach re-checks the resolved bindings and refuses to boot a
+    mis-bound officer.
     """
+    # Design: knowledge-base/knowledge/features/officer_post.md §5 (auth:
+    # §11 Q1, decided); project-binding invariant:
+    # knowledge-base/knowledge/features/officer_knowledge_plane.md §3.1, K1.
     dependencies = get_officer_post_lifecycle_dependencies(request)
     # The project-id shape guard runs BEFORE the membership read, exactly as it
     # did in the moved handler: an unparseable id is a 422 here, not a 500 from
@@ -157,7 +159,7 @@ async def decommission_project_officer(
     project_id: str,
     body: OfficerDecommissionRequest | None = None,
 ) -> dict[str, Any]:
-    """Stand the officer down and keep everything he had (officer_post.md §5).
+    """Stand the officer down and keep everything he had.
 
     Auth: project admin. Returns a 200 warning result listing in-flight jobs unless
     ``force`` — and force only acknowledges the warning: jobs are LEFT
@@ -166,6 +168,7 @@ async def decommission_project_officer(
     inside the shared ``end_thread`` stand-down, so this endpoint and a
     direct thread DELETE are one funnel.
     """
+    # Design: knowledge-base/knowledge/features/officer_post.md §5.
     dependencies = get_officer_post_lifecycle_dependencies(request)
     await require_project_owner(request, dependencies.store, project_id)
     return await officer_post_lifecycle.decommission_project_officer(
@@ -179,7 +182,7 @@ async def hold_project_officer(
     project_id: str,
     body: OfficerHoldRequest | None = None,
 ) -> dict[str, Any]:
-    """Maintenance hold — pause ≠ retire (officer_post.md §5, decided 08-01).
+    """Maintenance hold — pause ≠ retire.
 
     Auth: project admin. Stamps ``officer.hold = {kind, since, note}`` on the
     THREAD (hold is runtime state; a vacant post 400s) with — critically —
@@ -188,6 +191,7 @@ async def hold_project_officer(
     effects, all pre-wired by the conference machinery: drain skips him,
     dispatches 409, watchdog stands down, nothing self-heals.
     """
+    # Design: knowledge-base/knowledge/features/officer_post.md §5 (decided 08-01).
     dependencies = get_officer_post_lifecycle_dependencies(request)
     await require_project_owner(request, dependencies.store, project_id)
     return await officer_post_lifecycle.hold_project_officer(
@@ -197,13 +201,14 @@ async def hold_project_officer(
 
 @router.post("/api/projects/{project_id}/officer/release")
 async def release_project_officer(request: Request, project_id: str) -> dict[str, Any]:
-    """Release the officer's hold (officer_post.md §5). Auth: project admin.
+    """Release the officer's hold. Auth: project admin.
 
     Clears via the established lever — deep-merge ``{"officer": {"hold":
     None}}`` → JSON null, which every reader (watchdog, wake claim, dispatch
     fence) treats as unheld. Queued events drain within one ~20s tick; the
     kick below just makes it immediate.
     """
+    # Design: knowledge-base/knowledge/features/officer_post.md §5.
     dependencies = get_officer_post_lifecycle_dependencies(request)
     await require_project_owner(
         request, dependencies.store, project_id, allow_archived=False
@@ -219,7 +224,7 @@ async def send_project_officer_note(
     project_id: str,
     body: OfficerNoteRequest,
 ) -> dict[str, Any]:
-    """Send the project's officer a one-way note (officer_legate_channel.md).
+    """Send the project's officer a one-way note.
 
     Auth: project owner — a note carries command authority, the same bar as
     hold/release. The reply, if he has one, arrives in his log or as a page;
@@ -230,6 +235,7 @@ async def send_project_officer_note(
     exact current runtime, and ``held`` is fenced behind a hold that must lift
     first. Durable acceptance is never reported as provider admission.
     """
+    # Design: knowledge-base/knowledge/features/officer_legate_channel.md.
     dependencies = get_officer_post_lifecycle_dependencies(request)
     user, _project = await require_project_owner(
         request, dependencies.store, project_id, allow_archived=False
@@ -243,8 +249,8 @@ async def send_project_officer_note(
 async def patch_project_officer(
     request: Request, project_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
-    """Edit the post — the missing form (officer_post.md §7). Auth: project
-    owner or system admin (the kit belongs to the century, §11 decision 1).
+    """Edit the post — the missing form. Auth: project owner or system admin
+    (the kit belongs to the century).
 
     Writes the durable row always; when commissioned, merges the fragment into
     thread metadata (with an explicitly supplied ``slots`` map replacing the
@@ -254,6 +260,8 @@ async def patch_project_officer(
     lives at the next dispatch, running jobs are untouched.
     ``communication_policy`` is row-only and never touches the thread.
     """
+    # Design: knowledge-base/knowledge/features/officer_post.md §7
+    # (auth: §11 decision 1).
     dependencies = get_officer_post_lifecycle_dependencies(request)
     await require_project_owner(
         request, dependencies.store, project_id, allow_archived=False

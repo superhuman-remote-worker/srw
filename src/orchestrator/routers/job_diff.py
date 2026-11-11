@@ -57,9 +57,8 @@ async def get_job_diff(
     Returns 404 when the job has no baseline (loose job, or a pre-Mode-A
     project job). Empty ``files`` list means no changes under
     ``projects/<slug>/`` — the agent didn't touch the mounted folder.
-
-    See knowledge-history/done/job_cloud_export.md §5.
     """
+    # Design: knowledge-history/done/job_cloud_export.md §5.
     _, job = await dependencies.require_job_access(request, dependencies.store, job_id)
     return await job_diff_review.get_job_diff(
         job_id=job_id, authorized_job=job, dependencies=dependencies.diff_review
@@ -119,9 +118,8 @@ async def accept_job_diff(
     On success, writes/deletes each diff path back via the cloud
     backend, then transitions ``diff_status='accepted'`` and
     ``status='completed'``.
-
-    See knowledge-history/done/job_cloud_export.md §3.5.
     """
+    # Design: knowledge-history/done/job_cloud_export.md §3.5.
     user, job = await dependencies.require_job_access(
         request, dependencies.store, job_id
     )
@@ -142,13 +140,12 @@ async def reject_job_diff(
 ) -> dict[str, Any]:
     """Mode A reject: discard the job's diff, no cloud write.
 
-    Stamps ``diff_status='rejected'`` and ``status='completed'``. The
-    Gitea commits stay around as the audit trail of what the agent
-    tried to do (cheap; see §3.6). The caller must be an administrator or a
-    current owner or editor of the job's project, as for an accept.
-
-    See knowledge-history/done/job_cloud_export.md §3.6.
+    Stamps ``diff_status='rejected'`` and ``status='completed'``. The Gitea
+    commits stay around as the audit trail of what the agent tried to do
+    (cheap). The caller must be an administrator or a current owner or editor
+    of the job's project, as for an accept.
     """
+    # Design: knowledge-history/done/job_cloud_export.md §3.6.
     user, job = await dependencies.require_job_access(
         request, dependencies.store, job_id
     )

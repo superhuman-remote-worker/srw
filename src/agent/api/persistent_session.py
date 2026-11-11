@@ -1331,7 +1331,7 @@ class PersistentSession:
                 )
             logger.info(
                 "Background officer session: refusing project cloud mount "
-                "(object plane; officer_knowledge_plane.md §4)"
+                "(an officer never mounts the project's cloud folder)"
             )
             return
         if not self.workspace_manager:
@@ -2321,6 +2321,8 @@ class PersistentSession:
         bindings intact and must stay survivable (degraded), never an attach
         failure.
         """
+        # Design: knowledge-base/knowledge/features/officer_knowledge_plane.md
+        # §3.1 (K1).
         from agent.tools.registry import officer_ceiling_active
 
         if not officer_ceiling_active(getattr(self.config, "officer", None)):
@@ -2332,7 +2334,7 @@ class PersistentSession:
                 "Background officer attach refused: expected exactly one "
                 f"project binding, got {len(project_ids)} "
                 f"({project_ids or 'none'}). Commission an officer onto one "
-                "project post (officer_knowledge_plane.md §3.1)."
+                "project post."
             )
 
         from agent.services.knowledge.bindings import KnowledgeBinding
@@ -2357,14 +2359,14 @@ class PersistentSession:
                 "native writable knowledge binding, got "
                 f"[{', '.join(shape)}]. External knowledge bases must be "
                 "read-only and no override may replace the project write "
-                "target (officer_knowledge_plane.md §3.1)."
+                "target."
             )
         if str(writable[0].kb_id) != project_ids[0]:
             raise OfficerKnowledgeBindingError(
                 "Background officer attach refused: the writable knowledge "
                 f"binding targets KB {writable[0].kb_id}, not the officer's "
                 f"project {project_ids[0]} — the write target cannot be "
-                "replaced (officer_knowledge_plane.md §3.1)."
+                "replaced."
             )
 
     def _setup_knowledge(self, vector_conn: Optional[Any]) -> None:

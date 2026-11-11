@@ -283,20 +283,22 @@ async def provision_job_workspace(
     ``none``) worker job, upgrading it to the ``sandbox`` tier IN PLACE.
     **Internal** (P4b) — requires ``X-Internal-Key``.
 
-    The worker-side counterpart to the session ``upgrade-to-workspace`` endpoint
-    (workspace_tier_upgrade.md §4.3 W2). Unlike the operator-gated
-    ``/api/jobs/{id}/upgrade-to-vm`` (which freezes → re-dispatches), this never
-    pauses or re-dispatches: the job stays ``processing`` and the SAME running
-    agent provisions, polls ``/workspace-status`` for readiness, seeds the
-    virtual files into the new pod, and hot-swaps its ``WorkspaceManager``
-    backend — re-``ainvoke``-ing from the local checkpoint. That sidesteps the
-    non-portable pod-local LangGraph checkpoint entirely (§2.3). Idempotent: a
-    second call while a container is already provisioning/ready is a no-op.
+    The worker-side counterpart to the session ``upgrade-to-workspace``
+    endpoint. Unlike the operator-gated ``/api/jobs/{id}/upgrade-to-vm`` (which
+    freezes → re-dispatches), this never pauses or re-dispatches: the job stays
+    ``processing`` and the SAME running agent provisions, polls
+    ``/workspace-status`` for readiness, seeds the virtual files into the new
+    pod, and hot-swaps its ``WorkspaceManager`` backend — re-``ainvoke``-ing
+    from the local checkpoint. That sidesteps the non-portable pod-local
+    LangGraph checkpoint entirely. Idempotent: a second call while a container
+    is already provisioning/ready is a no-op.
 
     ``vm`` is intentionally NOT accepted here: VM is operator-gated and must
     pause for approval (it can't stay in-process), so it keeps the existing
-    ``/upgrade-to-vm`` freeze→approve→re-dispatch path (§4.3 W3).
+    ``/upgrade-to-vm`` freeze→approve→re-dispatch path.
     """
+    # Design: knowledge-base/knowledge/features/workspace_tier_upgrade.md §4.3 W2
+    # (checkpoint: §2.3; the vm path: §4.3 W3).
     await dependencies.require_internal(request)
     return await workspace_access.provision_job_workspace(
         job_id=job_id,
@@ -317,12 +319,13 @@ async def get_job_workspace_status(
     """Return a running job's workspace-container connection details for the
     agent's in-process upgrade poller. **Internal** — requires ``X-Internal-Key``.
 
-    The job-side analogue of ``GET /api/agents/threads/{id}/workspace``: surfaces
-    ``context.workspace_container`` (status + pod IP/port) so the agent's
-    ``_poll_job_workspace_ready`` can build the upgraded ``RemoteBackend``
-    (workspace_tier_upgrade.md §4.3 W1). The provisioner writes ``pod_ip``/
-    ``port``; map ``port`` → ``pod_port`` to match the session poller's shape.
+    The job-side analogue of ``GET /api/agents/threads/{id}/workspace``:
+    surfaces ``context.workspace_container`` (status + pod IP/port) so the
+    agent's ``_poll_job_workspace_ready`` can build the upgraded
+    ``RemoteBackend``. The provisioner writes ``pod_ip``/``port``; map ``port``
+    → ``pod_port`` to match the session poller's shape.
     """
+    # Design: knowledge-base/knowledge/features/workspace_tier_upgrade.md §4.3 W1.
     await dependencies.require_internal(request)
     return await workspace_access.get_job_workspace_status(
         job_id=job_id,

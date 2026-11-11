@@ -43,8 +43,8 @@ async def get_job_logs(
     """Read the tail of a job's log file with optional filtering.
 
     Serves the live per-job file when it exists (compose/dev shared volume),
-    else falls back to the S3 log archive written at agent-pod deletion
-    (knowledge-base/knowledge/features/job_log_archive.md) — logs stay readable after the reap.
+    else falls back to the S3 log archive written at agent-pod deletion — logs
+    stay readable after the reap.
 
     Args:
         job_id: Job UUID
@@ -55,6 +55,7 @@ async def get_job_logs(
             for reading in an IDE or handing to an agent. For archived
             logs this is the full pod log (may span multiple jobs).
     """
+    # Design: knowledge-history/done/2026-07-15-job-log-archive.md.
     # Validate job_id format
     try:
         UUID(job_id)
@@ -89,11 +90,12 @@ async def get_thread_logs(
 ) -> Any:
     """Read the archived agent-pod log for a session (auth: owner only).
 
-    Post-mortem debugging for sessions whose agent pod is gone: serves the
-    S3 archive written at pod deletion (knowledge-base/knowledge/features/job_log_archive.md).
-    404s until the pod has been deleted at least once — while it is alive,
-    the log lives on the pod (``kubectl logs``).
+    Post-mortem debugging for sessions whose agent pod is gone: serves the S3
+    archive written at pod deletion. 404s until the pod has been deleted at
+    least once — while it is alive, the log lives on the pod
+    (``kubectl logs``).
     """
+    # Design: knowledge-history/done/2026-07-15-job-log-archive.md.
     try:
         UUID(thread_id)
     except ValueError:

@@ -49,13 +49,13 @@ async def internal_unit_claim_bundle(
     ``_assemble_session_attach_payload`` the pinned-lane sender uses, under
     the same fail-closed rules.
 
-    Auth is two-layer (stateless_agents.md §5.6): the ``X-Internal-Key``
-    transport guard every agent→orchestrator call carries, PLUS proof of a
-    LIVE lease — (unit_id, lease_token) must match ``state='leased'`` with
-    the exact current token, checked server-side in one SELECT that also
-    reads the watermarks. Credentials therefore flow only to the executor
-    that currently holds the unit; a zombie with a stale token gets the same
-    generic 403 as a guess (no enumeration oracle).
+    Auth is two-layer: the ``X-Internal-Key`` transport guard every
+    agent→orchestrator call carries, PLUS proof of a LIVE lease — (unit_id,
+    lease_token) must match ``state='leased'`` with the exact current token,
+    checked server-side in one SELECT that also reads the watermarks.
+    Credentials therefore flow only to the executor that currently holds the
+    unit; a zombie with a stale token gets the same generic 403 as a guess (no
+    enumeration oracle).
 
     Errors: 401 bad internal key; 403 token mismatch / not leased (single
     generic detail); 404 unit row absent; 409 not a session unit, thread not
@@ -65,6 +65,7 @@ async def internal_unit_claim_bundle(
     Session that still owes its workspace-upgrade copy answers 425 to a
     claimant without ``workspace_upgrade_seed.v1``.
     """
+    # Auth design: knowledge-base/knowledge/features/stateless_agents.md §5.6.
     dependencies = get_unit_claim_bundle_dependencies(request)
     await dependencies.require_internal(request)
     try:

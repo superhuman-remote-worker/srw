@@ -150,11 +150,11 @@ async def materialize_knowledge_note(
     """Commit one rendered note to ``knowledge/<slug>.md`` in the project's KB
     repo. **Internal** (P4b) — requires ``X-Internal-Key``.
 
-    Step 3 of knowledge-base/knowledge/features/knowledge_base_repo_separation.md: the agent used
-    to write this file into its workspace checkout, which welded the vault to
-    the jobs repo and skipped entirely wherever there was no git (persistent
-    sessions, lite tiers, repo-less projects). The write is server-side now —
-    one note, one commit, into whichever repo ``resolve_kb_repo`` picks.
+    The agent used to write this file into its workspace checkout, which welded
+    the vault to the jobs repo and skipped entirely wherever there was no git
+    (persistent sessions, lite tiers, repo-less projects). The write is
+    server-side now — one note, one commit, into whichever repo
+    ``resolve_kb_repo`` picks.
 
     Always answers 200 with the service's ``{status, reason, repo, branch,
     path, operation, indexed, index_reason}``; the failure vocabulary lives in
@@ -162,6 +162,7 @@ async def materialize_knowledge_note(
     searchable already — ``false`` with an ``index_reason`` means the commit
     landed and the sweep will finish the job.
     """
+    # Step 3 of knowledge-base/knowledge/features/knowledge_base_repo_separation.md.
     await dependencies.require_internal_service(request)
     return await knowledge_operations.materialize_knowledge_note(
         project_id, body, dependencies=dependencies.operations

@@ -418,7 +418,7 @@ async def convert_project_loop_scheduling(
     *,
     dependencies: ProjectLoopsDependencies = Depends(get_project_loops_dependencies),
 ) -> dict[str, Any]:
-    """Convert the live loop to officer scheduling (centurion.md §7/S8).
+    """Convert the live loop to officer scheduling.
 
     ``scheduling`` is start-time-only everywhere else; this is the one
     sanctioned mutation, and v1 converts in ONE direction (→ officer) — going
@@ -429,6 +429,7 @@ async def convert_project_loop_scheduling(
     officer; plus an enabled centurion on the project. An in-flight TURN is
     fine — its completion hits the officer branch and wakes him.
     """
+    # Design: knowledge-base/knowledge/features/centurion.md §7/S8.
     from orchestrator.services.session_wake import kick_event_drain, notify_officer
 
     caller = await require_approved_user(request, dependencies.store)

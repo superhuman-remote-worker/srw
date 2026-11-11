@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Operator runbook: move a bundled Nextcloud from SQLite to Postgres.
 
-Design: knowledge-base/knowledge/features/bundled_nextcloud_performance.md,
-WP6 (with WP4, which gives the Nextcloud container an empty Postgres and its
+The chart gives the Nextcloud container an empty Postgres and its
 ``POSTGRES_HOST``/``POSTGRES_DB``/``POSTGRES_USER``/``POSTGRES_PASSWORD``
-environment). The conversion is ``occ db:convert-type``; this script wraps it
+environment. The conversion is ``occ db:convert-type``; this script wraps it
 in the checks the migration needs. One phase per run, in this order:
 
   precheck  read-only. ``occ status``; ``dbtype`` must be ``sqlite3``; the
@@ -99,6 +98,10 @@ config.php (secrets): it is created 0700 and refused inside a git work tree.
       --context k3d-srw --namespace srw --backup-dir ~/nc-wp6 \\
       --run --confirm MIGRATE-NEXTCLOUD-srw
 """
+
+# Design: knowledge-base/knowledge/features/bundled_nextcloud_performance.md,
+# WP6 (with WP4, which adds the empty Postgres and its environment). The
+# docstring above is the --help text, so it carries no design-vault pointer.
 
 from __future__ import annotations
 

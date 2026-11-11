@@ -255,12 +255,12 @@ async def thread_queue_state(
         get_thread_transport_dependencies
     ),
 ) -> dict[str, Any]:
-    """Owner read of the unit's queue lifecycle
-    (stateless_turn_resilience.md step 2) — the same ``queue`` block that
-    ``/input`` and ``/connection`` carry, for polling while a turn is awaited.
-    A thread that never enqueued (pinned lane, or no turn yet) reports
-    ``state='none'``.
+    """Owner read of the unit's queue lifecycle — the same ``queue`` block
+    that ``/input`` and ``/connection`` carry, for polling while a turn is
+    awaited. A thread that never enqueued (pinned lane, or no turn yet)
+    reports ``state='none'``.
     """
+    # Design: knowledge-base/knowledge/features/stateless_turn_resilience.md step 2.
     from orchestrator.services.chat_pool_stall import read_chat_pool_stalled
     from orchestrator.services.stateless_queue_state import queue_block_for_thread
 
@@ -291,8 +291,7 @@ async def thread_queue_retry(
         get_thread_transport_dependencies
     ),
 ) -> dict[str, Any]:
-    """Owner verb: revive a parked, retryable unit
-    (stateless_turn_resilience.md step 2). ``parked`` + retryable →
+    """Owner verb: revive a parked, retryable unit. ``parked`` + retryable →
     ``unpark_unit`` (attempts reset, park_reason cleared) → 200
     ``{state:'queued'}``; 409 ``{code}`` under stop markers / a claim-loss
     hold / a non-retryable reason; 404 when not parked. Audited. The admin
@@ -300,15 +299,18 @@ async def thread_queue_retry(
     operator path for the non-retryable reasons.
 
     A pinned session has no queue unit; its input parks at the recovery
-    bound instead (parallel_subagents.md §14.2, P3). The same verb re-arms
-    every parked input of the thread (``retry_parked_pinned_inputs``) and
-    answers ``{state:'rearmed', inputs:[...]}``. It wakes nothing: the
+    bound instead. The same verb re-arms every parked input of the thread
+    (``retry_parked_pinned_inputs``) and answers
+    ``{state:'rearmed', inputs:[...]}``. It wakes nothing: the
     pinned runtime takes a re-armed input at its next inbox read, which is
     its loop's input wait (a poll of at most a second), its next accepted
     input, or the next attach. A runtime whose loop has not started (its
     attach found no other work) reads it when a socket connects or input
     arrives.
     """
+    # Design: knowledge-base/knowledge/features/stateless_turn_resilience.md
+    # step 2; pinned recovery bound:
+    # knowledge-base/knowledge/features/parallel_subagents.md §14.2, P3.
     from orchestrator.services.stateless_queue_state import park_retry_refusal
     from shared.persistent_input_delivery import (
         PINNED_RECOVERY_ADMISSION_LIMIT,

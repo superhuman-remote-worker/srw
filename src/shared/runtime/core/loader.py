@@ -334,9 +334,11 @@ def _log_legacy_tiers_once(source: str, blocks: Dict[str, Any], summary: str) ->
     if len(_TIER_LOG_SEEN) >= _TIER_LOG_SEEN_MAX:
         _TIER_LOG_SEEN.clear()
     _TIER_LOG_SEEN.add(key)
+    # Deprecated in U1: knowledge-base/knowledge/features/
+    # universal_experts_and_subagents.md §1.1.
     logger.warning(
-        "config: legacy llm tier(s) %s in %s → %s (deprecated since U1; see "
-        "universal_experts_and_subagents.md §1.1)",
+        "config: legacy llm tier(s) %s in %s → %s (deprecated: an expert sets "
+        "one llm.model)",
         sorted(blocks),
         source,
         summary,
@@ -460,11 +462,12 @@ def _log_legacy_delegation_once(source: str, dropped: Dict[str, Any]) -> None:
     if len(_DELEGATION_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
         _DELEGATION_LOG_SEEN.clear()
     _DELEGATION_LOG_SEEN.add(key)
+    # Changed in U3: knowledge-base/knowledge/features/
+    # universal_experts_and_subagents.md §0 D2/D7.
     logger.warning(
         "config: legacy delegation key(s) %s in %s dropped — the delegation "
-        "block is {enabled, max_concurrent, run_in_background_default} since "
-        "U3 (delegate_work / spawn_subagent were deleted; see "
-        "universal_experts_and_subagents.md §0 D2/D7)",
+        "block is {enabled, max_concurrent, run_in_background_default} now "
+        "(delegate_work / spawn_subagent were deleted)",
         sorted(dropped),
         source,
     )
@@ -527,9 +530,10 @@ def normalize_interactive_permission_mode(fragment: Any, *, source: str) -> Any:
         if len(_PERMISSION_MODE_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
             _PERMISSION_MODE_LOG_SEEN.clear()
         _PERMISSION_MODE_LOG_SEEN.add(source)
+        # Rename: knowledge-base/knowledge/features/tool_permission_tiers.md D2.
         logger.warning(
             "config: interactive.permission_mode %r in %s read as %r (renamed; "
-            "see tool_permission_tiers.md)",
+            "write the new value in this config)",
             mode,
             source,
             canonical,

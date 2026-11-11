@@ -105,10 +105,11 @@ async def agent_abort_thread_vm_upgrade(
     Called by the persistent agent when ``_poll_vm_ready`` gives up: a cold CDI
     registry import can outrun the poll budget, leaving a half-provisioned VM +
     DataVolume + importer pod with nobody attached. This deletes the VM and
-    marks ``metadata.vm.status='aborted'`` so the provisioning-in-progress guard
-    (``status in provisioning/created/ready``) doesn't wedge a later retry
-    (workspace_tier_upgrade.md Q7). Idempotent — safe to call when no VM exists.
+    marks ``metadata.vm.status='aborted'`` so the provisioning-in-progress
+    guard (``status in provisioning/created/ready``) doesn't wedge a later
+    retry. Idempotent — safe to call when no VM exists.
     """
+    # Design: knowledge-base/knowledge/features/workspace_tier_upgrade.md Q7.
     # The gate runs here, in the declaration's own body:
     # `scripts/check_endpoint_auth.py` reads the audited gate from the route
     # it is declared on and does not follow a call into a service module, so a
@@ -132,19 +133,20 @@ async def agent_upgrade_thread_to_workspace(
     thread, upgrading it to the ``sandbox`` tier. **Internal** (P4b) — requires
     ``X-Internal-Key``. Ingress strips this path.
 
-    The session-side counterpart to the live ``swap_backend()`` hot-swap
-    (workspace_tier_upgrade.md §4.2 S2): the agent calls this when a ``virtual``
-    session needs a real environment (the user starts coding / the agent
-    requests an upgrade), then polls ``/workspace`` for readiness via
-    ``_poll_workspace_ready`` and swaps its backend in place — the conversation
-    never drops. Idempotent: a second call while a container is already
-    provisioning/ready is a no-op.
+    The session-side counterpart to the live ``swap_backend()`` hot-swap: the
+    agent calls this when a ``virtual`` session needs a real environment (the
+    user starts coding / the agent requests an upgrade), then polls
+    ``/workspace`` for readiness via ``_poll_workspace_ready`` and swaps its
+    backend in place — the conversation never drops. Idempotent: a second call
+    while a container is already provisioning/ready is a no-op.
 
-    ``vm`` targets (workspace_tier_upgrade.md Phase 2) are delegated to the
-    operator-gated VM path (``/upgrade-to-vm``): same grant gate, but provisions
-    a KubeVirt VM and records ``metadata.vm``. The agent polls vm readiness and
-    hot-swaps in place just like the container tier.
+    ``vm`` targets are delegated to the operator-gated VM path
+    (``/upgrade-to-vm``): same grant gate, but provisions a KubeVirt VM and
+    records ``metadata.vm``. The agent polls vm readiness and hot-swaps in
+    place just like the container tier.
     """
+    # Design: knowledge-base/knowledge/features/workspace_tier_upgrade.md §4.2 S2
+    # (container) and Phase 2 (``vm`` targets).
     # The gate runs here, in the declaration's own body:
     # `scripts/check_endpoint_auth.py` reads the audited gate from the route
     # it is declared on and does not follow a call into a service module, so a
@@ -268,13 +270,12 @@ async def update_thread_config(
 ) -> dict[str, Any]:
     """Edit a DISCONNECTED session's config (auth: owner only).
 
-    Slice C of live_session_settings.md. Runs the exact validate → datasource-
-    authorize → grant-check → merge core the live (internal) PATCH uses —
-    authorization stays keyed to the THREAD OWNER, so an API caller can't
-    exceed what the live settings pane allows. Changes take effect at the next
-    attach: every attach path re-resolves ``metadata.config_override`` +
-    ``datasource_ids`` and injects credentials in-flight, so no enrichment
-    round-trip to an agent is needed.
+    Runs the exact validate → datasource-authorize → grant-check → merge core
+    the live (internal) PATCH uses — authorization stays keyed to the THREAD
+    OWNER, so an API caller can't exceed what the live settings pane allows.
+    Changes take effect at the next attach: every attach path re-resolves
+    ``metadata.config_override`` + ``datasource_ids`` and injects credentials
+    in-flight, so no enrichment round-trip to an agent is needed.
 
     Refuses PINNED threads currently bound to an agent (409) — there is no
     orchestrator→agent config-push channel, so an edit here would silently go
@@ -295,6 +296,7 @@ async def update_thread_config(
     internal endpoint intentionally returns plaintext transport secrets to the
     agent; that shape must never reach a browser-facing route.
     """
+    # Slice C of knowledge-history/done/2026-07-16-live-session-settings.md.
     # The gate runs here, in the declaration's own body:
     # `scripts/check_endpoint_auth.py` reads the audited gate from the route
     # it is declared on and does not follow a call into a service module, so a

@@ -256,12 +256,13 @@ class EmbeddingService:
             f"{len(vector)}-dim vectors; schema expects "
             f"vector({self.expected_dimensions})"
         )
+        # Design: knowledge-base/knowledge/issues/memory_bugs.md B4.
         logger.error(
             "EMBEDDING DIMENSION MISMATCH: %s — every memory/KB write and "
             "dense query would fail at INSERT, so the dense path is disabled "
             "loudly instead. Fix EMBEDDING_MODEL/EMBEDDING_BASE_URL (or set "
             "EMBEDDING_DIMENSIONS alongside a schema re-dimension) and "
-            "restart. See knowledge-base/knowledge/issues/memory_bugs.md B4.",
+            "restart. See https://docs.superhuman-remote-worker.com/models/.",
             self.degraded_reason,
         )
         raise EmbeddingDimensionError(self.degraded_reason)

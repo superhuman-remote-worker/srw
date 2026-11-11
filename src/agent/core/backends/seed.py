@@ -60,7 +60,8 @@ _LEGACY_SEEDED_SENTINEL = "task_brief.md"
 # and churn the workspace repo.
 _SEEDED_MARKER_BODY = (
     "Superhuman Remote Worker seeded this workspace.\n"
-    "Framework marker — do not edit. See knowledge-base/knowledge/features/virtual_directories.md.\n"
+    "Framework marker — do not edit or delete: it tells a resumed job that\n"
+    "this workspace already holds its seeded content.\n"
 )
 
 

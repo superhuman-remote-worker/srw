@@ -92,11 +92,12 @@ def project_folder_slug(job: dict[str, Any], project: dict[str, Any]) -> str:
     return slugify_project_name(str(project.get("name") or "project"))
 
 
+# Design: knowledge-history/done/job_cloud_export.md.
 _BASELINE_COMMIT_MESSAGE = (
     "Mode A baseline: seed project folder for job {job_short}\n\n"
     "Seeded by orchestrator from project '{project_name}' cloud folder. "
     "This is the diff baseline; agent edits on top become the diff at "
-    "job completion. See knowledge-history/done/job_cloud_export.md."
+    "job completion."
 )
 
 

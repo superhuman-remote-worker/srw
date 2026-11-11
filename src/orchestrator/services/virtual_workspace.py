@@ -89,12 +89,12 @@ def object_store_startup_warning(
     if not bullets:
         return None
 
+    # Design: knowledge-history/done/s3_object_store_bundled_fallback.md.
     return (
         "Object store not fully configured — "
         + "; ".join(bullets)
         + ". Fix: point at an external S3 (S3_ENDPOINT / VIRTUAL_WORKSPACE_S3_*) "
-        "or enable the chart-bundled store (garage.enabled=true). "
-        "See knowledge-history/done/s3_object_store_bundled_fallback.md."
+        "or enable the chart-bundled store (garage.enabled=true)."
     )
 
 

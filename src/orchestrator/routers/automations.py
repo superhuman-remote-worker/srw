@@ -118,12 +118,13 @@ class AutomationJobShape(BaseModel):
         return shape
 
 
+# Live trigger design: knowledge-base/knowledge/features/live_session_jobs.md §4.4.
 class AutomationCreate(BaseModel):
     """Request body for ``POST /api/automations``.
 
     ``trigger_type`` is ``cron`` (a schedule; ``cron_expr`` required) or
     ``live`` (an incoming live session on the ``primary_connector``, an
-    alias in ``job_shape.execution.connectors``; live_session_jobs §4.4).
+    alias in ``job_shape.execution.connectors``).
     """
 
     name: str = Field(..., min_length=1, max_length=200)

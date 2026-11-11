@@ -109,10 +109,11 @@ class ConnectorSelection(BaseModel):
         return self
 
 
+# Design: knowledge-base/knowledge/features/live_session_jobs.md §4.2.
 class LiveSessionSelection(BaseModel):
-    """The live session a live-session job starts in (live_session_jobs §4.2):
-    the alias of one of the job's connectors (a live connector, e.g. a
-    phone line) and the provider's session id."""
+    """The live session a live-session job starts in: the alias of one of the
+    job's connectors (a live connector, e.g. a phone line) and the provider's
+    session id."""
 
     model_config = ConfigDict(extra="forbid")
 

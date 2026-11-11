@@ -260,6 +260,8 @@ def require_officer_commission_project_id(project_id: str) -> None:
     gate moving into the router; the operation calls it again so the fence
     holds for any other caller. Parsing a UUID twice costs nothing.
     """
+    # Binding invariant: knowledge-base/knowledge/features/
+    # officer_knowledge_plane.md §3.1.
     try:
         UUID(str(project_id))
     except (TypeError, ValueError):
@@ -268,7 +270,7 @@ def require_officer_commission_project_id(project_id: str) -> None:
             detail=(
                 "officer commission requires one valid project id — got "
                 f"'{project_id}'. The officer's post binds exactly one "
-                "project knowledge base (officer_knowledge_plane.md §3.1)."
+                "project knowledge base."
             ),
         )
 

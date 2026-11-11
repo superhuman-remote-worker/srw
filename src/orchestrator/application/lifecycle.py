@@ -855,6 +855,7 @@ async def lifespan(app: FastAPI):
     # with no consumer is an active misconfiguration that won't self-heal —
     # the legacy code path silently fell through to api.openai.com with
     # `not-needed` (the bug captured in knowledge-base/knowledge/llm_routing_issues.md).
+    # Design: knowledge-base/knowledge/features/models_yaml_removal.md.
     if os.getenv("LLM_BASE_URL"):
         logger.error(
             "LLM_BASE_URL is set but no longer honoured. Self-hosted models "
@@ -862,7 +863,7 @@ async def lifespan(app: FastAPI):
             "+ Admin → Models (catalog row) or via "
             "helm.llm.seed.systemEndpoints[]. Unset LLM_BASE_URL and seed "
             "the endpoint in helm to migrate. See "
-            "knowledge-base/knowledge/features/models_yaml_removal.md."
+            "https://docs.superhuman-remote-worker.com/models/."
         )
         sys.exit(1)
 

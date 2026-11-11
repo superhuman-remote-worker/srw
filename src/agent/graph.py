@@ -723,13 +723,13 @@ def create_init_strategic_todos_node(
         # A lever whose "off" position reintroduces a high-severity defect is
         # not a rollback. Failing closed here covers every cause instead of one,
         # and cannot corrupt a shared workspace to do it.
+        # Design: knowledge-base/knowledge/features/virtual_directories.md.
         if not task_brief.strip() and not instructions.strip():
             raise RuntimeError(
                 f"[{job_id}] Refusing to start: no task description available. "
                 "Both task_brief.md and instructions.md resolved empty — the "
                 "virtual instruction providers did not serve content. Starting "
-                "anyway would run the job against an empty brief. See "
-                "knowledge-base/knowledge/features/virtual_directories.md."
+                "anyway would run the job against an empty brief."
             )
 
         # Load the first phase's predefined todos from config template

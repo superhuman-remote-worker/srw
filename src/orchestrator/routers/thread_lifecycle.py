@@ -86,9 +86,9 @@ async def end_thread(
         force: Required to end a session whose agent is mid-turn. Without it
                a live turn returns 409 — a sessions-list cleanup sweep tore
                down an active session mid-turn, destroying its in-memory
-               input queue (knowledge-base/knowledge/issues/session_silent_failure_audit.md #11).
+               input queue.
     """
-
+    # Incident: knowledge-history/done/session_silent_failure_audit.md #11.
     _user, thread = await dependencies.require_thread_owner(
         request, dependencies.store, thread_id
     )
@@ -118,10 +118,9 @@ async def resume_thread(
 
     Drifted config (deleted/revoked connectors or projects, withdrawn grants)
     is reported as 428 rather than silently denied; the caller re-POSTs with
-    ``acknowledge`` naming the drift ids it accepts losing. See
-    knowledge-history/done/session_config_drift_resume.md.
+    ``acknowledge`` naming the drift ids it accepts losing.
     """
-
+    # Design: knowledge-history/done/session_config_drift_resume.md.
     user, thread = await dependencies.require_thread_owner(
         request, dependencies.store, thread_id
     )
@@ -140,13 +139,12 @@ async def rewind_thread_detached(
 ) -> dict[str, Any]:
     """Rewind a DETACHED session's transcript (auth: owner only).
 
-    knowledge-base/knowledge/features/session_rewind.md §Flow — detached. Conversation mode
-    only: file restore needs the agent that holds the workspace, so live
-    sessions rewind through the session WebSocket instead, and code modes
-    here answer 400 ("resume first"). A bound agent means the in-memory
-    authority is live and a DB-only sweep would diverge it → 409.
+    Conversation mode only: file restore needs the agent that holds the
+    workspace, so live sessions rewind through the session WebSocket instead,
+    and code modes here answer 400 ("resume first"). A bound agent means the
+    in-memory authority is live and a DB-only sweep would diverge it → 409.
     """
-
+    # Design: knowledge-history/done/session_rewind.md §Flow — detached.
     user, thread = await dependencies.require_thread_owner(
         request, dependencies.store, thread_id
     )

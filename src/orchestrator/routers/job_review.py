@@ -58,10 +58,9 @@ async def export_job_to_shared_folder(
     re-creates a share the owner removed. Workspace-relative paths are kept
     **except** for the leading directories every deliverable shares, which
     are collapsed (``_common_dir_prefix``).
-
-    See knowledge-history/done/job_cloud_export.md §3.2 and
-    main_cloud_as_connectors.md, slice 6.2.
     """
+    # Design: knowledge-history/done/job_cloud_export.md §3.2 and
+    # knowledge-base/knowledge/features/main_cloud_as_connectors.md, slice 6.2.
     user, job = await dependencies.require_job_access(
         request, dependencies.store, job_id
     )
