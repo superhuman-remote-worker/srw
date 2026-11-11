@@ -33,14 +33,20 @@ Templates and helpers are in `skills/slides/`.
      Office: python-pptx with `scripts/pptx_kit.py`.
 3. **Build it.**
 
-   PDF: copy `assets/deck.html` and `assets/deck.css` to a work folder. The
-   template has a title slide, big numbers, chart with bullets, a one-sentence
-   statement and next steps; duplicate and fill the types you need. Then
+   PDF: start from the template,
+
+       python skills/slides/scripts/new_deck.py work/deck.html
+
+   which puts `deck.html` and `deck.css` into `work/` (never inside
+   `skills/`). It has a title slide, big numbers, chart with bullets, a
+   one-sentence statement and next steps; duplicate and fill the slide types
+   you need, one `<section class="slide">` per slide. Then
 
        python skills/slides/scripts/render_deck.py work/deck.html output/deck.pdf
 
-   which reports per slide: content running off the slide, more than 60
-   words, broken images, placeholders.
+   which reports per slide (content running off the slide, more than 60
+   words, broken images, placeholders), checks the PDF has one 16:9 page per
+   slide, and renders the slides to PNG under `.render/`.
 
    PowerPoint:
 
@@ -60,11 +66,10 @@ Templates and helpers are in `skills/slides/`.
 
    Charts for slides: `ck.use(scale=1.6)` and `figsize=(11, 5.5)` in the
    `charts` helpers, saved as PNG.
-4. **Look at every slide:**
-
-       python skills/pdf-report/scripts/render_pages.py output/deck.pdf     # or output/review.pptx
-
-   `read_file` the sheet for the rhythm of the deck, then each slide. Check:
+4. **Look at every slide.** `render_deck.py` ends with a `LOOK NOW:
+   read_file …` line; do exactly that. For a .pptx:
+   `python skills/pdf-report/scripts/render_pages.py output/review.pptx`.
+   Read the sheet for the rhythm of the deck, then each slide. Check:
    readable from the back of a room, nothing touching the edges, the title
    says the takeaway, the highlighted number or bar is the one the title
    talks about, consistent positions from slide to slide.

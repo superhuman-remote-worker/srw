@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Print an HTML file to PDF with the workspace's headless Chromium.
 
-usage: python render_pdf.py INPUT.html OUTPUT.pdf [--landscape] [--letter]
+usage: python render_pdf.py INPUT.html OUTPUT.pdf [--landscape] [--letter] [--no-pages]
 
 Page size, margins, footer and page numbers come from the page's CSS
-(@page). The script waits for fonts and images, then warns about defects a
-reader would see: content wider than the page, images that did not load and
-leftover placeholders. Exit code 0 means a PDF was written; warnings do not
-change it, so read them.
+(@page). A page with no stylesheet at all gets the house report.css. The
+script waits for fonts and images, warns about defects a reader would see
+(content wider than the page, images that did not load, leftover
+placeholders), then renders the pages to PNG under .render/ and prints the
+read_file command to look at them. Exit code 0 means a PDF was written;
+warnings do not change it, so read them.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+HOUSE_CSS = Path(__file__).resolve().parent.parent / "assets" / "report.css"
 
 PLACEHOLDERS = re.compile(
     r"lorem ipsum|\{\{|\}\}|\bTODO\b|\bTBD\b|PLACEHOLDER|\bNaN\b|undefined"
@@ -73,6 +77,16 @@ def render_with_playwright(
         width = 994 if landscape else 688 if letter else 665
         page = browser.new_page(viewport={"width": width, "height": 1100})
         page.goto(src.resolve().as_uri(), wait_until="networkidle")
+        styled = page.evaluate(
+            "() => document.styleSheets.length > 0 || "
+            "!!document.querySelector('[style]')"
+        )
+        if not styled and HOUSE_CSS.is_file():
+            page.add_style_tag(path=str(HOUSE_CSS))
+            warnings.append(
+                "the page had no stylesheet, so the house report.css was applied; "
+                "link it yourself (<link rel=stylesheet href=report.css>) to keep it"
+            )
         page.evaluate("document.fonts.ready")
         page.emulate_media(media="print")
         lint = page.evaluate(LINT_JS)
@@ -135,6 +149,7 @@ def main() -> int:
     ap.add_argument(
         "--letter", action="store_true", help="US Letter when the CSS sets no size"
     )
+    ap.add_argument("--no-pages", action="store_true", help="skip the page images")
     args = ap.parse_args()
     src, dst = Path(args.input), Path(args.output)
     if not src.is_file():
@@ -149,7 +164,12 @@ def main() -> int:
     for w in warnings:
         print(f"WARNING {w}")
     if not warnings:
-        print("no layout warnings; now render the pages and look at them")
+        print("no layout warnings")
+    if not args.no_pages:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from render_pages import look_hint, render
+
+        print(look_hint(render(dst)))
     return 0
 
 

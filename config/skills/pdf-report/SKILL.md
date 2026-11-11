@@ -30,11 +30,15 @@ Everything below runs in the workspace shell. The bundled files are in
    answer, the three to five numbers that carry it (each compared with
    something: last year, the plan, the average), then the sections, then
    method and sources. Write in the language the user writes in.
-2. **Start from the template.** Copy `assets/report.html` and `assets/report.css`
-   next to each other in a work folder (not `output/`), and replace the
-   example content. The template has a title block, a summary box, KPI tiles,
-   a figure, a data table and a sources block. Delete the parts you do not
-   need rather than leaving them empty.
+2. **Start from the template:**
+
+       python skills/pdf-report/scripts/new_report.py work/report.html
+
+   It puts `report.html` and `report.css` into `work/` (never inside
+   `skills/` or `output/`). Replace the example content and keep the
+   `<link>` to report.css. The template has a title block, a summary box, KPI
+   tiles, a figure, a data table and a sources block. Delete the parts you do
+   not need rather than leaving them empty.
 3. **Add charts as SVG** (`charts` skill: `fig.savefig("chart.svg")`) and
    reference them with `<img src="chart.svg">` or paste the SVG inline. SVG
    stays sharp at any zoom and keeps the PDF small.
@@ -43,17 +47,15 @@ Everything below runs in the workspace shell. The bundled files are in
        python skills/pdf-report/scripts/render_pdf.py work/report.html output/report.pdf
 
    The script waits for fonts and images, prints with the page size and
-   margins from the CSS, prints the page count, and warns about content wider
-   than the page, broken images and leftover placeholders. Treat every
-   warning as a defect.
-5. **Look at every page.** `read_file` on a PDF skips pages that hold only
-   text and vector graphics, so render them yourself:
-
-       python skills/pdf-report/scripts/render_pages.py output/report.pdf
-
-   It writes one PNG per page plus `sheet.png` (all pages side by side) and
-   prints the paths. `read_file` the sheet for the overall rhythm, then each
-   page you need to check closely. Go through the check list below.
+   margins from the CSS, warns about content wider than the page, broken
+   images and leftover placeholders (treat every warning as a defect), and
+   renders the pages to PNG under `.render/`.
+5. **Look at every page.** The script ends with a `LOOK NOW: read_file …`
+   line: do exactly that. (`read_file` on the PDF itself skips pages that
+   hold only text and vector graphics, so it is no substitute.) Read the
+   sheet for the overall rhythm, then each page you need to check closely,
+   and go through the check list below. For any other PDF or Office file:
+   `python skills/pdf-report/scripts/render_pages.py FILE`.
 6. **Fix and print again** until a page you would send to a customer comes
    out. Two or three rounds is normal. Deliver the PDF in `output/`; keep the
    HTML source in the work folder.
