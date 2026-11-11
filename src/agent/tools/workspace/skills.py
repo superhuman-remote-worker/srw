@@ -73,12 +73,16 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
 
     @tool
     def use_skill(skill_name: str) -> str:
-        """Load a skill's guidance (its SKILL.md body) into your context.
+        """Load a skill: the procedure, templates and scripts for one kind of work.
 
-        Skills are reusable "how to do X well" procedures listed in your system
-        prompt under available_skills. Call this when a listed skill matches the
-        task at hand; the body will appear in your context and walk you through
-        the procedure. Skills bound as mandatory instruction gates (for example
+        Skills are listed in your system prompt under available_skills. When a
+        listed skill matches the task or the deliverable you are about to build
+        (a PDF report, a chart, a spreadsheet, a slide deck, ...), call this
+        first, before you write the code or the file: the skill holds the
+        procedure and the bundled templates and scripts you would otherwise
+        reinvent. The body appears in your context; the skill's files are in
+        the workspace under skills/<name>/. Skills bound as mandatory
+        instruction gates (for example
         verify-before-done) are intentionally absent from that optional menu —
         they ride the frozen instructions channel to skills/<name>/SKILL.md and
         are equally loadable here or with read_file at that path. If the skill
