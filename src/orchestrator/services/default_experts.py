@@ -48,7 +48,11 @@ MANAGED_SEEDS: tuple[dict[str, Any], ...] = (
         # 2: the assistant gained its roster. 3 repairs only that exact
         # managed v2 roster's shell-enabled implementer; an operator's own
         # roster remains authoritative. Other upgrades remain additive.
-        "seed_version": 3,
+        # 4 (2026-11-11, shell_tools granted by default): the assistant gains
+        # the shell tools (a row without a `tools` key gets the bundle's), the
+        # exact managed v3 roster gets its implementer's shell back, and the
+        # unedited v3 description, which listed no shell, is replaced.
+        "seed_version": 4,
     },
 )
 
@@ -74,6 +78,19 @@ _ASSISTANT_V3_SUBAGENTS = {
         },
     },
 }
+# Seed 4 lifts seed 3's pin: the roster is the v2 one again. A v2 row already
+# carries it, so it gets no roster repair on its way to 4.
+_ASSISTANT_V4_SUBAGENTS = _ASSISTANT_V2_SUBAGENTS
+# The managed assistant's description through seed 3, exactly as seeded
+# (stripped). Seed 4 replaces only this text; an operator's own stays.
+_ASSISTANT_V3_DESCRIPTION = (
+    "General-purpose interactive assistant and the default for new sessions.\n"
+    "Collaborates with the user turn by turn on research, writing, analysis,\n"
+    "planning, and light coding — rather than running an autonomous batch job.\n"
+    "Inherits the safe persistent toolset (files, research, browser, citations,\n"
+    "git, knowledge) from session_base; its only specialization is\n"
+    "a conversational, generalist persona (persona.txt)."
+)
 
 
 # The managed General Worker's v1 description, exactly as seeded (stripped).
@@ -169,11 +186,12 @@ async def upgrade_managed_seed(
     row is current. This is how a seeded row gains a block the bundle grew
     later (the assistant's ``subagents`` roster: every deployment seeded before
     2026-09-07 bound ``delegate_agent`` with nothing to delegate to; the
-    General Worker's ``tools`` shell group, 2026-11-11). Two exact-content
-    repairs replace a value the bundle changed: the managed v2 assistant
-    roster, and the General Worker's v1 description. The SQL compares each
-    again under the row lock, so a concurrent operator edit cannot be
-    overwritten using this earlier read.
+    ``tools`` shell group of the General Worker and the assistant, 2026-11-11).
+    Exact-content repairs replace a value the bundle changed: the managed v2
+    and v3 assistant rosters, and the shipped descriptions that promised no
+    shell (General Worker v1, assistant v3). The SQL compares each again under
+    the row lock, so a concurrent operator edit cannot be overwritten using
+    this earlier read.
     """
     current = int(row.get("seed_version") or 0)
     target = int(spec["seed_version"])
@@ -186,10 +204,11 @@ async def upgrade_managed_seed(
         if key not in existing
     }
     repair = {}
+    session_seed = spec["managed_key"] == "application-default-session-seed"
     if (
-        spec["managed_key"] == "application-default-session-seed"
+        session_seed
         and current == 2
-        and target >= 3
+        and target == 3
         and existing.get("subagents") == _ASSISTANT_V2_SUBAGENTS
     ):
         repair = {
@@ -199,6 +218,23 @@ async def upgrade_managed_seed(
             # still gets this historical repair, never those newer values.
             "replacement_subagents": _ASSISTANT_V3_SUBAGENTS,
         }
+    if (
+        session_seed
+        and current == 3
+        and target >= 4
+        and existing.get("subagents") == _ASSISTANT_V3_SUBAGENTS
+    ):
+        # Seed 4 undoes seed 3's pin on exactly the roster seed 3 wrote. (A v2
+        # row skips both repairs: its roster already is the v4 one.)
+        repair = {
+            "expected_seed_version": 3,
+            "expected_subagents": _ASSISTANT_V3_SUBAGENTS,
+            "replacement_subagents": _ASSISTANT_V4_SUBAGENTS,
+        }
+    if session_seed and current < 4 <= target:
+        # Compared again under the row lock: an edited description stays.
+        repair["expected_description"] = _ASSISTANT_V3_DESCRIPTION
+        repair["replacement_description"] = bundle["description"]
     if (
         spec["managed_key"] == "application-default-worker-seed"
         and current < 2 <= target
@@ -230,9 +266,9 @@ async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
     current application pointer are preserved across restarts and upgrades.
     The one exception is :func:`upgrade_managed_seed`: a row behind the
     bundle's ``seed_version`` gains the top-level config keys it lacks. Only
-    the exact managed v2 assistant roster and the exact v1 General Worker
-    description receive a conditional repair; operator variants and
-    unrelated content remain unchanged.
+    the exact managed v2/v3 assistant rosters and the exact shipped
+    descriptions (General Worker v1, assistant v3) receive a conditional
+    repair; operator variants and unrelated content remain unchanged.
     """
     seeded: dict[str, str] = {}
     for spec in MANAGED_SEEDS:

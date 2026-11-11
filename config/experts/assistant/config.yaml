@@ -14,11 +14,13 @@ metadata:
 
       planning, and light coding — rather than running an autonomous batch job.
 
-      Inherits the safe persistent toolset (files, research, browser, citations,
+      It runs commands once its workspace has a shell; on the lite workspace a
 
-      git, knowledge) from session_base; its only specialization is
+      session starts with, it asks you to upgrade first. Everything else (files,
 
-      a conversational, generalist persona (persona.txt).'
+      research, browser, citations, knowledge) comes from session_base, and its
+
+      persona is a conversational generalist (persona.txt).'
     srw.io/icon: smart_toy
     srw.io/color: '#89b4fa'
     srw.io/expert-type: session
@@ -45,9 +47,10 @@ spec:
           General-purpose interactive assistant and the default for new sessions.
           Collaborates with the user turn by turn on research, writing, analysis,
           planning, and light coding — rather than running an autonomous batch job.
-          Inherits the safe persistent toolset (files, research, browser, citations,
-          git, knowledge) from session_base; its only specialization is
-          a conversational, generalist persona (persona.txt).
+          It runs commands once its workspace has a shell; on the lite workspace a
+          session starts with, it asks you to upgrade first. Everything else (files,
+          research, browser, citations, knowledge) comes from session_base, and its
+          persona is a conversational generalist (persona.txt).
         icon: smart_toy
         color: "#89b4fa"
         tags:
@@ -61,6 +64,20 @@ spec:
         # inherited from session_base via $extends (deep-merge), so nothing is
         # duplicated. The persona lives here (not in session_base) so the base
         # stays role-neutral for the other session experts that extend it.
+        #
+        # The one tool addition: the shell group (2026-11-11, with `shell_tools`
+        # granted by default). A session still starts on the workspace its
+        # installation defaults to, usually the lite `virtual` tier, where the
+        # backend filter strips the shell and the session is offered
+        # `request_workspace_upgrade` instead; after the user approves the
+        # upgrade the tool list is rebuilt and these tools bind. With a shell
+        # present ToolsConfig suppresses the git_* group: the shell runs git
+        # against any repository in the workspace.
+        tools:
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read
 
         # Bind the citation skill to the citation tools inherited from session_base,
         # so the assistant references sources inline by handle instead of citing-and-forgetting.
@@ -81,15 +98,14 @@ spec:
         # Delegation itself stays OFF until a session ticks it (tools.delegation +
         # delegation.enabled) — the roster only decides what that tick can reach. A
         # child's tools are capped by the parent's; declared child tools must also
-        # pass capability admission before delegation is enabled. The safe default's
-        # implementer uses file tools without shell verification. An explicitly
-        # shell-enabled roster requires the shell_tools grant like any other expert.
-        # The Delegation row shows the roster either way.
+        # pass capability admission before delegation is enabled. The implementer
+        # keeps its library shell tools (it was pinned to `tools: {shell: []}` while
+        # `shell_tools` was deny-by-default, so the roster did not refuse a session
+        # for users without it; seed 4 lifts the pin). The Delegation row shows the
+        # roster either way.
         subagents:
           default: explorer
           roster:
             explorer: {$ref: subagents/explorer}
             reader: {$ref: subagents/reader}
-            implementer:
-              $ref: subagents/implementer
-              tools: {shell: []}
+            implementer: {$ref: subagents/implementer}

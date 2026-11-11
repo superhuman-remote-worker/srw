@@ -34,6 +34,10 @@ OLD_ROSTER = {
         for name in ("explorer", "reader", "implementer")
     },
 }
+#: Seed 3's roster: the implementer pinned to no shell. Seed 4 lifts the pin,
+#: so the shipped roster is OLD_ROSTER again and only a v3 row is repaired.
+V3_ROSTER = deepcopy(OLD_ROSTER)
+V3_ROSTER["roster"]["implementer"]["tools"] = {"shell": []}
 
 
 @pytest.fixture(scope="module")
@@ -236,7 +240,9 @@ async def test_setup_guidance_rechecks_concurrent_persona_edit(legacy_db):
 
 
 @pytest.mark.asyncio
-async def test_exact_v2_roster_repairs_once_preserving_other_content_and_pointer(db):
+async def test_v2_roster_is_kept_as_seed_4_ships_it_preserving_content_and_pointer(db):
+    """Seed 3 pinned a v2 roster's implementer; seed 4 ships the v2 roster
+    again, so a v2 row upgrades straight to 4 with its roster untouched."""
     before = await _legacy(db)
     alternative = _bundle()
     alternative["name"] = "operator-choice"
@@ -252,8 +258,9 @@ async def test_exact_v2_roster_repairs_once_preserving_other_content_and_pointer
     after = await db.get_expert_by_managed_key(KEY)
     expected_config = _config(before)
     expected_config["subagents"] = _bundle()["config"]["subagents"]
+    assert expected_config["subagents"] == OLD_ROSTER
     assert _config(after) == expected_config
-    assert after["seed_version"] == 3
+    assert after["seed_version"] == 4
     assert after["version"] == before["version"] + 1
     for key in before.keys() - {
         "config",
@@ -290,7 +297,7 @@ async def test_operator_roster_variants_survive_seed_upgrade(db, edit):
     after = await db.get_expert_by_managed_key(KEY)
     assert _config(after) == _config(before)
     assert after["prompts"] == before["prompts"]
-    assert after["seed_version"] == 3
+    assert after["seed_version"] == 4
 
 
 @pytest.mark.asyncio
@@ -314,7 +321,8 @@ async def test_repair_requires_exact_seed_version(db, seed_version):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("edit_roster", [True, False])
 async def test_waiting_upgrade_rechecks_operator_edit_after_row_lock(db, edit_roster):
-    stale_row = await _legacy(db)
+    # A v3 row: the one whose roster seed 4 repairs, so a repair is waiting.
+    stale_row = await _legacy(db, roster=V3_ROSTER, seed_version=3)
     task = None
     async with db.acquire() as editor:
         blocker = await editor.fetchval("SELECT pg_backend_pid()")
@@ -370,7 +378,7 @@ async def test_waiting_upgrade_rechecks_operator_edit_after_row_lock(db, edit_ro
         expected["subagents"] = _bundle()["config"]["subagents"]
         assert _config(after) == expected
         assert after["prompts"] == operator_row["prompts"]
-        assert after["seed_version"] == 3
+        assert after["seed_version"] == 4
         assert after["version"] == operator_row["version"] + 1
 
 
@@ -507,3 +515,61 @@ async def test_v1_general_worker_keeps_operator_description_and_tools(db):
     assert after["seed_version"] == 2
     assert _config(after) == _config(before)
     assert after["description"] == "Our house worker."
+
+
+async def _v3_assistant(db, *, description=None, tools=None):
+    """What a pre-2026-11-11 install holds: seed 3, the pinned roster, no
+    `tools` key and the description that listed no shell."""
+    from orchestrator.services.default_experts import _ASSISTANT_V3_DESCRIPTION
+
+    bundle = _bundle()
+    text = _ASSISTANT_V3_DESCRIPTION if description is None else description
+    bundle["description"] = text
+    bundle["config"]["description"] = text + "\n"
+    bundle["config"]["subagents"] = deepcopy(V3_ROSTER)
+    bundle["config"].pop("tools")
+    if tools is not None:
+        bundle["config"]["tools"] = tools
+    row, created = await db.upsert_managed_expert(
+        managed_key=KEY, seed_version=3, **bundle
+    )
+    assert created
+    return row
+
+
+@pytest.mark.asyncio
+async def test_v3_assistant_gains_shell_unpinned_roster_and_description_once(db):
+    before = await _v3_assistant(db)
+    assert "tools" not in _config(before)
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    after = await db.get_expert_by_managed_key(KEY)
+    shipped = _bundle()
+    assert after["seed_version"] == 4
+    assert _config(after)["tools"] == {
+        "shell": ["run_command", "cancel_command", "shell_read"]
+    }
+    assert _config(after)["subagents"] == OLD_ROSTER
+    assert after["description"] == shipped["description"]
+    assert _config(after)["description"] == shipped["description"]
+    assert after["version"] == before["version"] + 1
+
+    await seed_managed_default_experts(db, ROOT / "config")
+    assert await db.get_expert_by_managed_key(KEY) == after
+
+
+@pytest.mark.asyncio
+async def test_v3_assistant_keeps_operator_description_and_tools(db):
+    before = await _v3_assistant(
+        db, description="Our house assistant.", tools={"shell": []}
+    )
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    after = await db.get_expert_by_managed_key(KEY)
+    expected = _config(before)
+    expected["subagents"] = OLD_ROSTER
+    assert after["seed_version"] == 4
+    assert _config(after) == expected
+    assert after["description"] == "Our house assistant."

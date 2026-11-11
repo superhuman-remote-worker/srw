@@ -205,7 +205,7 @@ async def test_seed_upgrade_adds_only_the_keys_the_row_lacks():
     await seed_managed_default_experts(db, ROOT / "config")
 
     upgraded = db.rows["application-default-session-seed"]
-    assert upgraded["seed_version"] == 3
+    assert upgraded["seed_version"] == 4
     assert upgraded["config"]["subagents"]["default"] == "explorer"
     assert set(upgraded["config"]["subagents"]["roster"]) == {
         "explorer",
@@ -227,7 +227,7 @@ async def test_seed_upgrade_never_replaces_an_operators_roster():
 
     await seed_managed_default_experts(db, ROOT / "config")
 
-    assert row["seed_version"] == 3
+    assert row["seed_version"] == 4
     assert row["config"]["subagents"] == theirs
 
 
@@ -249,8 +249,12 @@ async def test_seed_upgrade_is_a_no_op_at_the_current_version():
 
 
 @pytest.mark.asyncio
-async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster():
+async def test_v2_roster_skips_the_seed_3_pin_on_its_way_to_4():
+    """Seed 3 pinned the implementer to `shell: []`; seed 4 lifts that pin, so
+    a v2 row (unpinned) needs no roster repair at all, and a future bundle's
+    unrelated roster change still never reaches it."""
     from orchestrator.services.default_experts import (
+        _ASSISTANT_V2_SUBAGENTS,
         MANAGED_SEEDS,
         upgrade_managed_seed,
     )
@@ -259,9 +263,8 @@ async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster()
     await seed_managed_default_experts(db, ROOT / "config")
     spec = next(s for s in MANAGED_SEEDS if s["expert_type"] == "session")
     row = db.rows[spec["managed_key"]]
-    safe_v3_roster = deepcopy(row["config"]["subagents"])
     row["seed_version"] = 2
-    row["config"]["subagents"]["roster"]["implementer"].pop("tools")
+    row["config"]["subagents"] = deepcopy(_ASSISTANT_V2_SUBAGENTS)
     future_bundle = load_seed_bundle(
         ROOT / "config", directory="assistant", expert_type="session"
     )
@@ -269,12 +272,72 @@ async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster()
     future_bundle["config"]["subagents"]["default"] = "reader"
 
     await upgrade_managed_seed(
-        db, spec={**spec, "seed_version": 4}, bundle=future_bundle, row=row
+        db, spec={**spec, "seed_version": 5}, bundle=future_bundle, row=row
     )
 
-    assert row["seed_version"] == 4
-    assert row["config"]["subagents"] == safe_v3_roster
+    assert row["seed_version"] == 5
+    assert row["config"]["subagents"] == _ASSISTANT_V2_SUBAGENTS
     assert row["config"]["future_top_level_key"] is True
+
+
+def _v3_assistant(db):
+    """Rewind the managed assistant to what a pre-2026-11-11 install holds:
+    seed 3, the pinned roster, no `tools` key, the description without a shell."""
+    from orchestrator.services.default_experts import (
+        _ASSISTANT_V3_DESCRIPTION,
+        _ASSISTANT_V3_SUBAGENTS,
+    )
+
+    row = db.rows["application-default-session-seed"]
+    row["seed_version"] = 3
+    row["config"] = {k: v for k, v in row["config"].items() if k != "tools"}
+    row["config"]["subagents"] = deepcopy(_ASSISTANT_V3_SUBAGENTS)
+    row["description"] = _ASSISTANT_V3_DESCRIPTION
+    row["config"]["description"] = _ASSISTANT_V3_DESCRIPTION + "\n"
+    return row
+
+
+@pytest.mark.asyncio
+async def test_v3_assistant_gains_the_shell_an_unpinned_roster_and_the_description():
+    from orchestrator.services.default_experts import _ASSISTANT_V4_SUBAGENTS
+
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="assistant", expert_type="session"
+    )
+    row = _v3_assistant(db)
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 4
+    assert row["config"]["tools"] == {
+        "shell": ["run_command", "cancel_command", "shell_read"]
+    }
+    assert row["config"]["subagents"] == _ASSISTANT_V4_SUBAGENTS
+    assert "tools" not in row["config"]["subagents"]["roster"]["implementer"]
+    assert row["description"] == bundle["description"]
+    assert row["config"]["description"] == bundle["description"]
+
+
+@pytest.mark.asyncio
+async def test_v3_assistant_keeps_an_operators_tools_roster_and_description():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    row = _v3_assistant(db)
+    row["config"]["tools"] = {"shell": []}
+    row["config"]["subagents"]["roster"]["critic"] = {"$ref": "critic"}
+    theirs = deepcopy(row["config"]["subagents"])
+    row["description"] = "Our house assistant."
+    row["config"]["description"] = "Our house assistant."
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 4
+    assert row["config"]["tools"] == {"shell": []}
+    assert row["config"]["subagents"] == theirs
+    assert row["description"] == "Our house assistant."
+    assert row["config"]["description"] == "Our house assistant."
 
 
 def _v1_general_worker(db):
