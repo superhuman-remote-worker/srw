@@ -2260,7 +2260,6 @@ class TestSetupTools:
         monkeypatch.setenv(PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV, "true")
         monkeypatch.setenv("APP_GUIDE_BREAK_GLASS_DISABLED", "true")
         monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
-        monkeypatch.setenv("SKILLS_DB_ENABLED", "false")
         cfg = _make_config(
             extra={
                 "_fleet_management_disabled": True,

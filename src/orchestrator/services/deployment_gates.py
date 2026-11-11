@@ -44,12 +44,6 @@ def is_experts_db_enabled() -> bool:
     )
 
 
-def is_skills_db_enabled() -> bool:
-    """True when DB-backed Agent Skills are on (env). Dev on / prod off (helm
-    ``skillsDbEnabled``). Mirrors ``EXPERTS_DB_ENABLED``."""
-    return os.getenv("SKILLS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
-
-
 def mcp_datasources_enabled() -> bool:
     """Whether user-added MCP server datasources are enabled."""
     return os.getenv("MCP_DATASOURCES_ENABLED", "").lower().strip() in (
@@ -125,7 +119,6 @@ __all__ = [
     "datasource_scope_auto_attach_v1_enabled",
     "is_experts_db_enabled",
     "is_protected_cloud_mode_enabled",
-    "is_skills_db_enabled",
     "mcp_datasources_enabled",
     "require_pinned_status_identity",
     "stateless_idle_conversation_rewind_enabled",

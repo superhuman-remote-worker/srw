@@ -74,12 +74,6 @@ _GATES = [
         True,
     ),
     (
-        gates.is_skills_db_enabled,
-        deployment_gates_module.is_skills_db_enabled,
-        "SKILLS_DB_ENABLED",
-        False,
-    ),
-    (
         gates.mcp_datasources_enabled,
         deployment_gates_module.mcp_datasources_enabled,
         "MCP_DATASOURCES_ENABLED",

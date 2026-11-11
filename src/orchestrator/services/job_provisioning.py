@@ -57,7 +57,7 @@ class JobProvisioningError(RuntimeError):
 # restore from the LangGraph checkpoint (not disk), plan.md/workspace.md are read
 # only for non-blocking curation (FileNotFoundError-tolerant), and archive/ is
 # recovered from phase snapshots — not git. `skills/` (capability bundles
-# materialized into the workspace when SKILLS_DB_ENABLED) and `notes/` are
+# materialized into the workspace) and `notes/` are
 # framework/job-scoped, not deliverables — a k3d E2E caught `skills/` leaking
 # into its durable cloud diff. The agent's actual project files live below
 # `projects/<slug>/` and are NOT floored. See project_jobs_repo_retirement.md.

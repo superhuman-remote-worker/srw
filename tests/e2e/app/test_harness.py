@@ -1529,14 +1529,13 @@ def test_e2e_values_keep_only_required_stack_and_exact_provider_egress() -> None
     assert models[2]["capabilities"] == ["rerank"]
 
 
-def test_stateless_sandbox_values_enable_session_executor_and_skill_catalogue() -> None:
+def test_stateless_sandbox_values_enable_session_executor() -> None:
     values = yaml.safe_load(
         harness.STATELESS_SANDBOX_VALUES_FILE.read_text(encoding="utf-8")
     )
 
     assert values == {
         "agent": {
-            "skillsDbEnabled": "true",
             "stateless": {
                 "enabled": True,
                 "replicas": 2,

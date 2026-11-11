@@ -1,8 +1,6 @@
 # Profile overlay for SES-11. The shared values-e2e.yaml remains the cheap
 # pinned/virtual baseline; this overlay enables the sandbox acceptance features.
 agent:
-  # Exercise DB skill catalogue reads and authoring during local acceptance.
-  skillsDbEnabled: "true"
   stateless:
     enabled: true
     replicas: 2

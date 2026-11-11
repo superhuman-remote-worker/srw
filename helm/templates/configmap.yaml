@@ -476,9 +476,6 @@ data:
   # ConfigMap for compatibility. Enabled because root creation resolves DB pointers;
   # false is retained only as an emergency compatibility switch.
   EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "true" | quote }}
-  # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
-  # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
-  SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
   # Emergency operator-only withdrawal of the immutable App Guide + reader.
   # Negative/default-off by design; provisioned agent pods inherit this value
   # via envFrom and expose operator_break_glass in persistent-agent health.

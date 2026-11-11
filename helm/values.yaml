@@ -993,10 +993,6 @@ agent:
   # DB-backed experts are the source of truth for the application and personal
   # root-creation defaults. Set false only as an emergency compatibility switch.
   expertsDbEnabled: "true"
-  # -- Enable DB-backed Agent Skills (skills + skill_files tables). Default OFF
-  # (prod-safe); the dev/experimental values file turns it on. Mirrors
-  # expertsDbEnabled.
-  skillsDbEnabled: "false"
   # -- Emergency operator-only withdrawal of the managed in-product App Guide.
   # Default OFF. This is not a user preference or normal feature gate; enable
   # only to contain a broken guide/reader, then disable it after rollback or

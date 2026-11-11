@@ -1170,13 +1170,6 @@ class ExpertCatalogService:
                     ),
                 )
 
-    def require_skills_db(self) -> None:
-        """The DB-skills feature is fully behind SKILLS_DB_ENABLED."""
-        if not self.deps.skills_enabled():
-            raise HTTPException(
-                status_code=404, detail="DB-backed skills are not enabled"
-            )
-
     def scan_skills(self) -> list[SkillInfo]:
         """Scan config/skills/<name>/SKILL.md for bundled skills.
 
@@ -1273,13 +1266,13 @@ class ExpertCatalogService:
     ) -> dict[str, Any]:
         """Build the resolved-blob skills payload: the precedence-deduped menu plus
         the file tree for each winning skill. Bundled (disk) + DB (owned + global).
-        Returns {} when skills are disabled or there is no user. Slice 2."""
+        Returns {} when there is no user. Slice 2."""
         from shared.runtime.core.skill_resolution import (
             is_reserved_system_skill_name,
             resolve_skill_menu,
         )
 
-        if not self.deps.skills_enabled() or not user_id:
+        if not user_id:
             return {}
 
         if self.state.skills is None:
@@ -1415,15 +1408,14 @@ class ExpertCatalogService:
         if self.state.skills is None:
             self.state.skills = self.scan_skills()
         result = [{**s.model_dump(), "source": "bundled"} for s in self.state.skills]
-        if self.deps.skills_enabled():
-            rows = await self.store.list_skills_visible(user_id=str(user["id"]))
-            result += [
-                {
-                    **skill_row_to_meta(r),
-                    "source": "global" if r["is_global"] else "user",
-                }
-                for r in rows
-            ]
+        rows = await self.store.list_skills_visible(user_id=str(user["id"]))
+        result += [
+            {
+                **skill_row_to_meta(r),
+                "source": "global" if r["is_global"] else "user",
+            }
+            for r in rows
+        ]
         return result
 
     async def reload_skills(self) -> dict[str, Any]:
@@ -1443,7 +1435,7 @@ class ExpertCatalogService:
 
     async def get_skill(self, skill_id: str, *, user: dict[str, Any]) -> dict[str, Any]:
         """Full skill detail (metadata + file tree). DB skill by UUID, else bundled."""
-        if self.deps.skills_enabled() and self.deps.looks_like_uuid(skill_id):
+        if self.deps.looks_like_uuid(skill_id):
             row = await self.get_visible_skill_row(skill_id, user=user)
             if not row:
                 raise HTTPException(

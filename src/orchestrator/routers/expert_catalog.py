@@ -346,7 +346,6 @@ async def create_skill(
     request: Request, body: SkillCreate, *, deps: CatalogDeps
 ) -> dict[str, Any]:
     """Create an owned DB skill from its file tree (Slice 1: deny-scan validated)."""
-    deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
     return await deps.authoring.create_skill(body=body, user=user)
 
@@ -385,7 +384,6 @@ async def update_skill(
     """Update an owned DB skill (owner or admin). Bundled skills are read-only.
     ``name`` is immutable — an edited SKILL.md whose frontmatter name differs is
     rejected (rename = create a new skill)."""
-    deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
     return await deps.authoring.update_skill(skill_id=skill_id, body=body, user=user)
 
@@ -395,7 +393,6 @@ async def delete_skill(
     request: Request, skill_id: str, *, deps: CatalogDeps
 ) -> dict[str, Any]:
     """Delete an owned DB skill (owner or admin). Files cascade away."""
-    deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
     return await deps.authoring.delete_skill(skill_id=skill_id, user=user)
 
@@ -405,7 +402,6 @@ async def duplicate_skill(
     request: Request, skill_id: str, *, deps: CatalogDeps
 ) -> dict[str, Any]:
     """Fork any visible skill (bundled or DB) into an owned copy."""
-    deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
     return await deps.authoring.duplicate_skill(skill_id=skill_id, user=user)
 
@@ -415,7 +411,6 @@ async def export_skill(
     request: Request, skill_id: str, *, deps: CatalogDeps
 ) -> Response:
     """Serialize a skill to a native zipped directory (drops into .claude/skills)."""
-    deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
     archive = await deps.authoring.export_skill(skill_id=skill_id, user=user)
     return Response(
@@ -430,7 +425,6 @@ async def import_skill(
     request: Request, file: UploadFile = File(...), *, deps: CatalogDeps
 ) -> dict[str, Any]:
     """Create an owned skill from an uploaded skill zip (fork-on-name-collision)."""
-    deps.catalog.require_skills_db()
     user = await deps.require_approved_user(request)
     # One byte past the cap is enough for the service to refuse the upload,
     # without reading an oversized one whole into memory (N61).

@@ -233,7 +233,6 @@ class ExpertCatalogDependencies:
     get_config_dir: Callable[[], Path]
     load_settings_matrix: Callable[[Path], dict[str, Any]]
     experts_enabled: Callable[[], bool]
-    skills_enabled: Callable[[], bool]
     account_defaults_layer: Callable[[str | None, str], Awaitable[dict[str, Any]]]
     visible_project_ids: VisibleProjectIds
     with_validated_tool_overrides: Callable[
