@@ -19,9 +19,11 @@ export const GENERATED_DIR = path.join(SITE_DIR, 'src/generated');
 
 /**
  * Files under docs/ that are not site pages: the GitHub index (the site has
- * its own landing page) and the asset sources.
+ * its own landing page), the asset sources, and the release highlights, which
+ * scripts/release/release_notes.py folds into the GitHub release (the sidebar's
+ * "Release notes" link) and which only some releases have.
  */
-export const DOCS_EXCLUDE = ['README.md', 'assets/**'];
+export const DOCS_EXCLUDE = ['README.md', 'assets/**', 'release-notes/**'];
 
 function isExcludedDocsPath(relativePath) {
 	return DOCS_EXCLUDE.some((pattern) =>

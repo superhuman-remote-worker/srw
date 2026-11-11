@@ -427,6 +427,15 @@ const body = [
 	'',
 ].join('\n');
 
+// The design vault (knowledge-base/, knowledge-history/) is private: a reader
+// of this page cannot follow a pointer into it. Markdown escaping turns `_`
+// into `\_`, so the check runs on the unescaped text.
+const vaultPointer = /knowledge-(?:base|history)\//.exec(body.replaceAll('\\_', '_'));
+if (vaultPointer) {
+	const at = body.replaceAll('\\_', '_').slice(Math.max(0, vaultPointer.index - 80), vaultPointer.index + 80);
+	throw new Error(`helm values reference points into the private design vault: …${at}…`);
+}
+
 mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
 writeFileSync(OUTPUT_PATH, body);
 console.log(
