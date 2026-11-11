@@ -26,6 +26,19 @@ class SudoRuleCreateRequest(BaseModel):
     description: str = Field("", description="Human-readable description")
 
 
+class JobUpdateRequest(BaseModel):
+    """Request body for changing a job's mutable metadata."""
+
+    title: str | None = Field(
+        ...,
+        description=(
+            "Display name for the job, at most 200 characters. Null or blank "
+            "clears it, and the job is shown by its description again. The "
+            "task text (description) does not change."
+        ),
+    )
+
+
 class JobResumeRequest(BaseModel):
     """Request body for resuming a failed or paused job."""
 

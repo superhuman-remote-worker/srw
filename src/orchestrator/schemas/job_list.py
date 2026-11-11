@@ -66,6 +66,12 @@ class PublicJobListItem(BaseModel):
 
     id: UUID
     description: str
+    title: str | None = Field(
+        description=(
+            "Display name a person gave the job (PATCH /api/jobs/{id}); null "
+            "when it was never named. Show the description then."
+        )
+    )
     status: str
     completion_outcome_kind: str | None
     origin: str

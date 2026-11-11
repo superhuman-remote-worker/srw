@@ -25,7 +25,7 @@ OTHER_JOB = "30000000-0000-4000-8000-000000000003"
 PROJECT_SQL = (
     "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
     "jcr.delivery_sha, jcr.record_type AS change_record_type, "
-    "j.diff_status, j.cloud_diff_baseline_commit, "
+    "j.diff_status, j.cloud_diff_baseline_commit, j.title, "
     "j.context->'cloud_checkout' AS cloud_checkout "
     "FROM job_summary js "
     "JOIN jobs j ON j.id = js.id "

@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from orchestrator.schemas.job_controls import JobUpdateRequest
 from orchestrator.schemas.job_create import PublicJobCreateBody
 from orchestrator.services.config_overrides import (
     refuse_caller_transport_keys,
@@ -18,6 +19,7 @@ from orchestrator.services.job_mutation_controls import (
     JobCancelResponse,
     JobControlOperations,
 )
+from orchestrator.services.job_rename import rename_job
 
 router = APIRouter()
 
@@ -128,6 +130,27 @@ async def admit_job_request(
         origin="internal_rest" if internal_call else "user_rest",
         dependencies=dependencies.job_admission_dependencies(request),
     )
+
+
+@router.patch("/api/jobs/{job_id}")
+async def update_job(
+    request: Request,
+    job_id: str,
+    body: JobUpdateRequest,
+    *,
+    dependencies: JobControlRouteDependencies = Depends(
+        get_job_control_route_dependencies
+    ),
+) -> dict[str, Any]:
+    """Rename a job. Caller must be able to see it (``require_job_access``).
+
+    Sets the job's display title, the name shown in lists. The task text
+    (``description``) is what the agent was asked to do and never changes
+    here. A null or blank title clears the name, and the job is shown by its
+    description again.
+    """
+    await dependencies.require_job_access(request, dependencies.store, job_id)
+    return await rename_job(dependencies.store, job_id, body.title)
 
 
 @router.delete("/api/jobs/{job_id}")

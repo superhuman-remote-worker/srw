@@ -43,6 +43,7 @@ def row(**fields):
     return {
         "id": UUID(JOB),
         "description": "Job-list contract fixture",
+        "title": None,
         "status": "completed",
         "completion_outcome_kind": None,
         "origin": "user",

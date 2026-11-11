@@ -55,7 +55,7 @@ The old token keeps working for 24 hours so you can switch your tool over.
 | Scope | Allows |
 |---|---|
 | `jobs:read` | Listing and reading jobs and automations; reading projects, experts, skills, connectors, models and manifests. |
-| `jobs:write` | Creating, pausing, resuming, cancelling, approving and deleting jobs; creating and changing automations. |
+| `jobs:write` | Creating, renaming, pausing, resuming, cancelling, approving and deleting jobs; creating and changing automations. |
 | `chat:read` | Reading sessions and their message history. |
 | `chat:write` | Starting sessions and sending messages. |
 | `knowledge:read` | Searching knowledge, reading sources and citations. |
@@ -97,7 +97,7 @@ The fields most integrations use:
 
 | Field | Meaning |
 |---|---|
-| `description` | Required. What the agent should do. |
+| `description` | Required. What the agent should do. It is also how the job is listed until someone names it. |
 | `expert` | The expert that runs the job: a bundled expert name such as `scholar` or `developer`, or the ID of an expert from the Cockpit. `GET /api/experts` lists what you can use. Leave it out to use the installation's default worker expert. |
 | `project_id` | Run the job in a project. You need at least the editor role on it. |
 | `priority` | 0 to 10, default 5. |
@@ -114,9 +114,10 @@ then moves to `processing` and ends as `completed`, `failed`, `cancelled`, or
 
 | Request | Does |
 |---|---|
-| `GET /api/jobs` | Lists the jobs you can see. Filter with `status`, `origin` or `project_id` (each can repeat). |
+| `GET /api/jobs` | Lists the jobs you can see. Filter with `status`, `origin` or `project_id` (each can repeat); `search` matches the task text, the name and the start of the ID. |
 | `GET /api/jobs/{id}` | Returns one job, including its `status`. |
 | `GET /api/jobs/{id}/progress` | Returns the job's progress. |
+| `PATCH /api/jobs/{id}` | Renames the job. Body: `{"title": "…"}`, at most 200 characters; `{"title": null}` removes the name. The task text (`description`) does not change. |
 | `PUT /api/jobs/{id}/pause` | Pauses the job. It stays paused until you resume it. |
 | `POST /api/jobs/{id}/resume` | Resumes a paused or failed job. Optional body: `{"feedback": "…"}`. |
 | `POST /api/jobs/{id}/approve` | Approves a job in `pending_review`. Optional body: `{"notes": "…"}`. |

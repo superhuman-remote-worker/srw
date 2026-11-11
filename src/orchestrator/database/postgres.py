@@ -4103,6 +4103,7 @@ class PostgresDB:
             id_param = f"${len(values)}"
             conditions.append(
                 f"(j.description ILIKE {description_param} "
+                f"OR j.title ILIKE {description_param} "
                 f"OR j.id::text LIKE {id_param})"
             )
 
@@ -4283,7 +4284,7 @@ class PostgresDB:
                       FROM subtree
                      GROUP BY root_id
                 )
-                SELECT j.id, j.description, j.status,
+                SELECT j.id, j.description, j.title, j.status,
                        j.completion_outcome_kind, j.origin,
                        j.config_name,
                        -- A DB expert's job stores config_name='worker_base'
@@ -4487,7 +4488,8 @@ class PostgresDB:
                        j.error_message, j.error_details, j.runner_kind,
                        j.execution_lane,
                        j.created_by_thread_id, j.wake_on_complete,
-                       j.created_at, j.updated_at, j.description, j.context,
+                       j.created_at, j.updated_at, j.description, j.title,
+                       j.context,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        wr.workspace_recovery AS _workspace_recovery,
                        (SELECT jsonb_build_object(
@@ -12165,7 +12167,8 @@ class PostgresDB:
                       FROM descendants
                      ORDER BY id, depth
                 )
-                SELECT j.id, j.parent_job_id, u.depth, j.description, j.status,
+                SELECT j.id, j.parent_job_id, u.depth, j.description, j.title,
+                       j.status,
                        j.config_name, j.origin, j.error_message,
                        j.created_at, j.completed_at, j.updated_at
                   FROM unique_descendants u
@@ -12177,6 +12180,27 @@ class PostgresDB:
             )
 
         return [dict(row) for row in rows]
+
+    async def update_job_title(self, job_id: str, title: str | None) -> bool:
+        """Set or clear a job's display title (a person renaming the job).
+
+        ``None`` clears it, and readers show the description again. Writes
+        only the title; ``updated_at`` still moves, because its trigger fires
+        on every write to the row.
+
+        Returns True if the job exists.
+        """
+        try:
+            uuid_val = UUID(str(job_id))
+        except (ValueError, AttributeError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE jobs SET title = $2 WHERE id = $1",
+                uuid_val,
+                title,
+            )
+        return result == "UPDATE 1"
 
     async def store_resolved_config(
         self, job_id: str, resolved_config: Dict[str, Any]

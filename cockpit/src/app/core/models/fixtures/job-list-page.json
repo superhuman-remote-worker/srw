@@ -3,6 +3,7 @@
     {
       "id": "33333333-3333-4333-8333-333333333333",
       "description": "Job-list contract fixture",
+      "title": null,
       "status": "completed",
       "completion_outcome_kind": null,
       "origin": "user",
@@ -46,6 +47,7 @@
     {
       "id": "33333333-3333-4333-8333-333333333334",
       "description": "Matching child",
+      "title": null,
       "status": "completed",
       "completion_outcome_kind": null,
       "origin": "subjob",
