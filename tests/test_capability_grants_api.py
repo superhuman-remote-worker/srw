@@ -66,6 +66,7 @@ _SHELL_OFF = [{"key": "shell_tools", "value_json": False}]
 _DELEGATION_OFF = [{"key": "delegation", "value_json": False}]
 _VM_OFF = [{"key": "vm_workspace", "value_json": False}]
 _PERMISSION_AUTO_ACCEPT = [{"key": "permission_mode", "value_json": "auto_accept"}]
+_AUTONOMY_REVIEW = [{"key": "autonomy_ceiling", "value_json": "review"}]
 
 
 def _patch_grants_db(monkeypatch, *, user_rows=None, is_admin=False, global_rows=None):
@@ -186,7 +187,9 @@ async def test_lifecycle_runner_allows_full_autonomy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_user_runner_still_denies_full_autonomy(monkeypatch):
-    _patch_grants_db(monkeypatch)
+    # Under an administrator's review ceiling (the default is full since
+    # 2026-11-11), a user runner is held to it; the lifecycle runner below is not.
+    _patch_grants_db(monkeypatch, global_rows=_AUTONOMY_REVIEW)
     with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
         await grant_enforcement_module.enforce_dispatch_grants(
             {"autonomy": "full"},

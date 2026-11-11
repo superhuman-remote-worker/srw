@@ -77,7 +77,8 @@ services, ownership checks, or other operation-specific authorization.
 Grants that only let the user's own agent get work done in its own workspace
 are on by default: `personal_default_experts`, `vm_workspace`, `shell_tools`,
 `delegation`, `catalog_authoring`, `datasource_tools` and `browser`, with the
-`permission_mode` ceiling at Autonomous and every model selectable. The others
+`permission_mode` ceiling at Autonomous, the `autonomy_ceiling` at Full and
+every model selectable. The others
 are off by default. An administrator turns a default off with a global, project
 or user grant set to off. The current grant catalog covers:
 
@@ -112,7 +113,8 @@ or user grant set to off. The current grant catalog covers:
   would complete itself is routed to review instead. Merging the pull request is
   the normal way past this, not the grant;
 - `model_selection` — restrict the selectable model set;
-- `autonomy_ceiling` — cap worker-job autonomy (Review by default); and
+- `autonomy_ceiling` — cap worker-job autonomy. A Job still starts at Review
+  unless the user or the expert picks more; and
 - `permission_mode` — cap persistent-session permission mode.
 
 An unavailable choice may be greyed out with **Requires a capability grant**.

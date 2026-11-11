@@ -611,8 +611,13 @@ async def test_real_merged_capability_denial_is_refused_before_datasources_or_in
         grant_enforcement_module, "enforce_job_create_grants", wire.enforce_grants
     )
     wire.db.get_project.return_value["default_config_override"] = {"autonomy": "full"}
+    # An administrator's review ceiling (the default is full since 2026-11-11).
     wire.db.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={
+            "user": [],
+            "project": [],
+            "global": [{"key": "autonomy_ceiling", "value_json": "review"}],
+        }
     )
     response = await submit(
         wire,

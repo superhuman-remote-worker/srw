@@ -30,6 +30,7 @@ RESTRICTED = {
     "vm_workspace": False,
     "catalog_authoring": False,
     "permission_mode": "auto_accept",
+    "autonomy_ceiling": "review",
 }
 
 
@@ -77,7 +78,7 @@ def test_catalog_keys_and_defaults():
     assert CATALOG["browser"]["default"] is True  # spec-deferred allow
     assert CATALOG["datasource_tools"]["default"] is True
     assert CATALOG["model_selection"]["default"] is None
-    assert CATALOG["autonomy_ceiling"]["default"] == "review"
+    assert CATALOG["autonomy_ceiling"]["default"] == "full"
     # Deny-by-default and NOT backfilled: the gate can only fire on a job that
     # carries a recorded context.pull_request, and no such job existed when the
     # key was introduced, so there is nothing to grandfather.
@@ -106,7 +107,7 @@ def test_lone_user_grant_widens_past_default():
     )
     assert g["unattended_operations"] is True
     assert g["custom_harness_images"] is False and g["model_selection"] is None
-    assert g["autonomy_ceiling"] == "review" and g["permission_mode"] == "autonomous"
+    assert g["autonomy_ceiling"] == "full" and g["permission_mode"] == "autonomous"
 
 
 def test_project_cap_clamps_user_grant():
@@ -339,8 +340,10 @@ def test_user_grant_cannot_exceed_project_ceiling():
 
 
 def test_null_deletion_of_guardrail_caught_in_merged():
-    d = {k: v["default"] for k, v in CATALOG.items()}
-    assert evaluate({"autonomy": "full"}, d)  # ceiling review -> flagged
+    # The default ceiling is full since 2026-11-11; under a review ceiling a
+    # merged `autonomy: full` is still flagged.
+    assert evaluate({"autonomy": "full"}, DEFAULTS) == []
+    assert evaluate({"autonomy": "full"}, RESTRICTED)  # ceiling review -> flagged
 
 
 def test_cross_layer_credential_assembly_denied():

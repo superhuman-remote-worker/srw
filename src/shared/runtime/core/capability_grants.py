@@ -30,7 +30,8 @@ _DATASOURCE_TOOL_CATEGORIES = tool_categories()
 #:
 #: Defaults (2026-11-11, owner decision): a key that only lets the user's own
 #: agent get work done in its own workspace is granted by default: shell,
-#: delegation, VM workspaces, catalog authoring and autonomous Sessions.
+#: delegation, VM workspaces, catalog authoring, autonomous Sessions and
+#: full-autonomy Jobs.
 #: Keys whose effect reaches other users (public_datasources), leaves the
 #: platform unasked (email_autonomous_send), skips a review check
 #: (complete_unmerged_pr) or starts Jobs with nobody watching
@@ -219,9 +220,15 @@ CATALOG: dict[str, dict[str, Any]] = {
             "Limit which models the user may pick. Empty means every enabled model."
         ),
     },
+    # Default ceiling is full since 2026-11-11 (review before that). The
+    # ceiling is only what a user MAY pick: a Job still defaults to `review`
+    # (config/overlays/worker.yaml) unless the user or the expert chooses
+    # otherwise. Known gap, owner's call: under `full` a Job the agent itself
+    # scored confidence 0 still ends `completed`
+    # (knowledge-base/knowledge/issues/full_autonomy_completes_a_zero_confidence_job.md).
     "autonomy_ceiling": {
         "type": "enum",
-        "default": "review",
+        "default": "full",
         "restrict_only": True,
         "order": _AUTONOMY_ORDER,
         "description": (
