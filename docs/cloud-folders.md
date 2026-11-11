@@ -24,7 +24,7 @@ WebDAV connector, and nothing on this page applies to it.
 | **Session outbox** | `cloud_outbox` | A folder SRW creates for the execution and shares with you. A Session mounts it at `cloud/outbox`; a Job's deliverables are copied into it when the Job finishes. Every approved user has one. | Sessions and Jobs |
 | **Project folder copy (jobs)** | `cloud_folder_checkout` | The project's folder copied into the Job's repository under `projects/<slug>/` before it starts (see [Jobs](#jobs)). | Jobs |
 
-These are platform-owned. **Settings → Connectors** shows them as managed
+These are platform-owned. **Customize → Connectors** shows them as managed
 ("Managed by its project", "Managed by SRW for you"), and nobody can create,
 edit, re-point, link, unlink or delete one; a project owner only sets its
 default level. A project's go with the project, a user's with their
@@ -172,7 +172,7 @@ for where each credential sits.
 
 ## Connect your cloud
 
-My cloud needs your consent once (Nextcloud only). **Settings → Connectors**
+My cloud needs your consent once (Nextcloud only). **Customize → Connectors**
 shows **My cloud** above the connector list:
 
 1. Click **Connect**. A tab opens on your cloud's sign-in page (Nextcloud's
@@ -235,7 +235,7 @@ same.
 | not mounted beside a protected folder | `beside_protected` | A protected Session mounts only its protected folder; use an unprotected Session for the others. |
 | its account for this folder is not ready yet; its read-only account for this folder is not ready yet | `grant_unavailable`, `reader_unavailable` | SRW could not create or verify the folder's own account in the cloud. Start a new Session; if it persists, your operator checks the cloud's admin API. |
 | no cloud account yet: connect your cloud | `cloud_not_connected` | [Connect your cloud](#connect-your-cloud); it mounts at the next start. |
-| the cloud no longer accepts your connection | `cloud_grant_revoked` | Reconnect it under **Settings → Connectors**. |
+| the cloud no longer accepts your connection | `cloud_grant_revoked` | Reconnect it under **Customize → Connectors**. |
 | the session has more cloud folders than a workspace mounts | `too_many_mounts` | Detach some; the limit is `connectors.inPodPlane.maxMounts`. |
 | this deployment syncs files instead of mounting them; cloud folders aren't delivered here | `delivery_unsupported` | The deployment syncs instead of mounting; see [below](#known-limitation-sync-instead-of-mount). |
 | this workspace can't mount cloud folders; they aren't delivered here | `mount_unsupported` | The workspace refuses mounts (`cloud.rcloneMount.allowContainer: false`, or FUSE denied); see [below](#known-limitation-sync-instead-of-mount). On a Virtual Session (`virtual_workspace`): upgrade it to a Container, or start a new Session with a Container workspace. |

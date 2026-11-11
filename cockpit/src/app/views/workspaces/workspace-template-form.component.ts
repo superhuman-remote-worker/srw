@@ -15,6 +15,9 @@ export interface ScopeOption {
 
 let nextFormId = 0;
 
+/** The public guide to building a workspace image FROM an SRW base. */
+export const WORKSPACE_IMAGE_GUIDE_URL = 'https://docs.superhuman-remote-worker.com/workspace-images/';
+
 /** One WorkspaceTemplate as a form (spec §3). Used by the editor page and the picker's Customize dialog. */
 @Component({
   selector: 'app-workspace-template-form',
@@ -71,10 +74,12 @@ let nextFormId = 0;
           <div class="notice custom" role="note">
             <strong>{{ 'workspaces.customImage.title' | transloco }}</strong>
             <ul>
+              <li>{{ 'workspaces.customImage.base' | transloco }}</li>
               <li>{{ 'workspaces.customImage.unprivileged' | transloco }}</li>
               <li>{{ 'workspaces.customImage.digest' | transloco }}</li>
               <li>{{ 'workspaces.customImage.jobFirst' | transloco }}</li>
             </ul>
+            <a [href]="imageGuideUrl" target="_blank" rel="noopener">{{ 'workspaces.customImage.guide' | transloco }}</a>
           </div>
         }
         <div class="row three">
@@ -149,6 +154,7 @@ export class WorkspaceTemplateFormComponent {
   }
 
   protected readonly listId = `srw-workspace-images-${nextFormId++}`;
+  readonly imageGuideUrl = WORKSPACE_IMAGE_GUIDE_URL;
   readonly errors = computed(() => validateTemplateForm(this.value()));
   readonly valid = computed(() => Object.keys(this.errors()).length === 0);
   readonly suggestedImages = computed(() => this.srwImages()[this.value().backend] ?? []);

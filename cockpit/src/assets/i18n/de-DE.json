@@ -592,7 +592,7 @@
     },
     "escapeHatch": {
       "title": "Mehr als nur Zeitpläne?",
-      "body": "Nutze die Orchestrator-API direkt — aus n8n, Zapier, eigenen Skripten oder jedem HTTP-Client. Webhooks, verzweigte Workflows und E-Mail-Auslöser liegen dort.",
+      "body": "Rufe die SRW-API aus n8n, Zapier, eigenen Skripten oder jedem HTTP-Client auf. Webhooks, verzweigte Workflows und E-Mail-Auslöser baust du in diesen Werkzeugen und lässt sie SRW-Aufträge starten.",
       "apiDocs": "API-Dokumentation",
       "guide": "Externer API-Leitfaden",
       "createKey": "API-Schlüssel anlegen"
@@ -2120,8 +2120,8 @@
         "beside_protected": "neben einem geschützten Ordner nicht eingebunden: eine geschützte Sitzung bindet nur diesen ein",
         "grant_unavailable": "sein Konto für diesen Ordner ist noch nicht bereit",
         "reader_unavailable": "sein Nur-Lese-Konto für diesen Ordner ist noch nicht bereit",
-        "cloud_not_connected": "noch kein Cloud-Konto: verbinde deine Cloud unter Einstellungen → Konnektoren",
-        "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Einstellungen → Konnektoren",
+        "cloud_not_connected": "noch kein Cloud-Konto: verbinde deine Cloud unter Anpassen → Konnektoren",
+        "cloud_grant_revoked": "die Cloud akzeptiert deine Verbindung nicht mehr: verbinde sie neu unter Anpassen → Konnektoren",
         "delivery_unsupported": "diese Installation synchronisiert Dateien, statt sie einzubinden; Cloud-Ordner werden hier nicht bereitgestellt",
         "mount_unsupported": "dieser Arbeitsbereich kann keine Cloud-Ordner einbinden; sie werden hier nicht bereitgestellt",
         "virtual_workspace": "ein virtueller Arbeitsbereich kann ihn auf der gewünschten Zugriffsstufe nicht bereitstellen; ein Container bekommt ihn: Upgrade dieser Session oder eine neue Session mit Container",
@@ -2873,7 +2873,7 @@
       "description": "Beschreibung",
       "tier": "Stufe",
       "image": "Image",
-      "imageHint": "SRW-Images werden vorgeschlagen; jedes Registry-Image funktioniert.",
+      "imageHint": "Verwenden Sie ein SRW-Image oder ein eigenes Image, das FROM einem SRW-Basis-Image gebaut ist.",
       "cpu": "CPU",
       "memory": "Arbeitsspeicher",
       "storage": "Speicherplatz",
@@ -2890,9 +2890,11 @@
     },
     "customImage": {
       "title": "Das ist keines der SRW-Images.",
+      "base": "Es muss FROM einem SRW-Basis-Image gebaut sein und dessen ENTRYPOINT und USER beibehalten, sonst startet sein Arbeitsbereich nicht.",
       "unprivileged": "Es läuft ohne erhöhte Rechte, sofern Ihr Betreiber es nicht erlaubt; daher gibt es keinen eingebundenen Cloud-Ordner und keine geschützte Cloud.",
       "digest": "Legen Sie einen Digest fest (image@sha256:…) statt eines Tags, damit jeder Lauf dasselbe Image verwendet.",
-      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job. Ein Job zeigt mehr darüber, warum sein Arbeitsbereich nicht gestartet ist; eine Sitzung unter Umständen nicht."
+      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job. Ein Job zeigt mehr darüber, warum sein Arbeitsbereich nicht gestartet ist; eine Sitzung unter Umständen nicht.",
+      "guide": "So bauen Sie ein Workspace-Image"
     },
     "errors": {
       "name": "1-63 Kleinbuchstaben, Ziffern oder Bindestriche; Anfang und Ende ein Buchstabe oder eine Ziffer.",

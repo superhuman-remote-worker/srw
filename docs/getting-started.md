@@ -133,9 +133,9 @@ and Qwen3 Reranker 8B and pins the four defaults.
 
 Otherwise you add models in Cockpit after the first login (below). The form's
 **Use AI subscriptions** option instead installs a proxy that lets you connect a
-supported subscription account under **Settings → AI Subscriptions**; a
-subscription may not supply every capability, so you may still need a
-provider for the rest.
+supported subscription account under **Settings → Administration →
+Subscriptions**; a subscription may not supply every capability, so you may
+still need a provider for the rest.
 
 ## Run SRW locally with k3d
 

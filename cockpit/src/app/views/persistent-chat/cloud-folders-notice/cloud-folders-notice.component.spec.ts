@@ -318,7 +318,7 @@ describe('CloudFoldersNoticeComponent', () => {
     expect(text(rows[0])).toBe('cloud/acme · Project folder Read-only · mounted');
     expect(text(rows[1])).toBe('cloud/outbox · Session outbox Read-write · confirmed when the agent starts');
     expect(text(rows[2])).toBe(
-      'My cloud was not attached · no cloud account yet: connect your cloud under Settings → Connectors Connect your cloud',
+      'My cloud was not attached · no cloud account yet: connect your cloud under Customize → Connectors Connect your cloud',
     );
     expect(rows[2].classList).toContain('cfn__folder--down');
     expect(text(root)).toContain('Some cloud folders of this session are not available');

@@ -52,7 +52,7 @@ export function cloudRootDetail(status: CloudRootStatus): {key: string; params?:
 }
 
 /**
- * "My cloud" in Settings → Connectors: the user's own cloud root, a
+ * "My cloud" in Customize → Connectors: the user's own cloud root, a
  * connector SRW keeps for them (main cloud slice 4). It shows where the
  * connection stands and the one action that moves it: Connect (the cloud's
  * own sign-in, in a new tab), Cancel while it waits, Disconnect, or

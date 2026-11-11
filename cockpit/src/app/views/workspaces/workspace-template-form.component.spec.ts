@@ -40,6 +40,10 @@ describe('WorkspaceTemplateFormComponent', () => {
     expect(loaded.customImage()).toBe(true);
   });
 
+  it('links the public guide to building a workspace image', () => {
+    expect(create().imageGuideUrl).toBe('https://docs.superhuman-remote-worker.com/workspace-images/');
+  });
+
   it('never shows the custom-image notice for a virtual template', () => {
     const c = create();
     c.patch({backend: 'virtual'});
