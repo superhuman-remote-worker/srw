@@ -28,6 +28,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
+import {jobDisplayName} from '../../core/util/job-name';
 import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {LiveSession} from '../../core/models/live-session.model';
 import {JobLiveSessionPanelComponent} from './job-live-session-panel.component';
@@ -533,7 +534,7 @@ export function failureReason(
                   </td>
                   <td class="sub-desc">
                     <span class="sub-desc-text" [title]="sub.description">
-                      {{ sub.description }}
+                      {{ jobName(sub) }}
                     </span>
                     @if (sub.error_message) {
                       <span class="sub-error" [title]="sub.error_message">
@@ -961,6 +962,7 @@ export function failureReason(
 })
 export class JobDetailPanelComponent {
   readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
+  readonly jobName = jobDisplayName;
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
   readonly job = input.required<JobSummary>();

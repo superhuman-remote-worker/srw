@@ -1438,3 +1438,76 @@ describe('jobCloudAction', () => {
     ).toBe('exported');
   });
 });
+
+describe('a job is listed by its name and renamed from its row', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  function mountWith(jobs: Partial<JobSummary>[], renameJob = vi.fn()) {
+    const ctx = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page(jobs))), renameJob} as Partial<ApiService>,
+    });
+    ctx.fixture.detectChanges();
+    return {...ctx, renameJob};
+  }
+
+  it('shows the task text until someone names the job, then the name', () => {
+    const {component} = mountWith([
+      job('j1', {description: 'Summarise the attached contract', title: null}),
+      job('j2', {description: 'Summarise the attached contract', title: 'Lease review'}),
+    ]);
+
+    expect(component.jobs().map((j) => component.jobName(j))).toEqual([
+      'Summarise the attached contract',
+      'Lease review',
+    ]);
+  });
+
+  it('starts the rename editor from a short first line, not the whole task', () => {
+    const {component} = mountWith([
+      job('j1', {description: 'Summarise the attached contract\n\nThen list every risk you find.', title: null}),
+    ]);
+
+    expect(component.jobNameSuggestion(component.jobs()[0])).toBe('Summarise the attached contract');
+  });
+
+  it('a rename shows at once and keeps the title the server stored', () => {
+    const answer = new Subject<{job_id: string; title: string | null} | null>();
+    const {component, renameJob} = mountWith(
+      [job('j1', {description: 'Summarise the attached contract', title: null})],
+      vi.fn().mockReturnValue(answer),
+    );
+
+    component.onRenameJob(component.jobs()[0], 'Lease  review');
+
+    expect(renameJob).toHaveBeenCalledExactlyOnceWith('j1', 'Lease  review');
+    expect(component.jobs()[0].title).toBe('Lease  review');
+
+    // The server collapses whitespace; its answer is what the row keeps.
+    answer.next({job_id: 'j1', title: 'Lease review'});
+    expect(component.jobs()[0].title).toBe('Lease review');
+    expect(component.jobs()[0].description).toBe('Summarise the attached contract');
+  });
+
+  it('a refused rename puts the previous name back', () => {
+    const {component} = mountWith(
+      [job('j1', {description: 'Summarise the attached contract', title: 'Lease review'})],
+      vi.fn().mockReturnValue(of(null)),
+    );
+
+    component.onRenameJob(component.jobs()[0], 'Something else');
+
+    expect(component.jobs()[0].title).toBe('Lease review');
+  });
+
+  it('a refused first rename leaves the job unnamed', () => {
+    const {component} = mountWith(
+      [job('j1', {description: 'Summarise the attached contract'})],
+      vi.fn().mockReturnValue(of(null)),
+    );
+
+    component.onRenameJob(component.jobs()[0], 'Lease review');
+
+    expect(component.jobs()[0].title).toBeNull();
+    expect(component.jobName(component.jobs()[0])).toBe('Summarise the attached contract');
+  });
+});

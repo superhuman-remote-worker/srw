@@ -71,6 +71,8 @@ import {
 import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 import {newRequestId} from '../../core/util/request-id';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
+import {JOB_TITLE_MAX_LENGTH, jobDisplayName, jobNameSuggestion} from '../../core/util/job-name';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 
 /**
  * Angular's ParamMap keeps repeated keys, which is how multi-value filters
@@ -129,6 +131,7 @@ export type {JobCloudAction};
     JobListFooterComponent,
     JobDetailPanelComponent,
     VMCreationWaitComponent,
+    AppInlineEditableTextComponent,
   ],
   template: `
     <div class="job-list-container">
@@ -313,8 +316,17 @@ export type {JobCloudAction};
                           [title]="getUserName(row.job.user_id)"
                         ></span>
                       }
-                      <span class="prompt-text" [title]="row.job.description">
-                        {{ row.job.description }}
+                      <!-- The job's name: its title once someone named it, else
+                           the task text. The pencil renames; the task text is
+                           untouched and stays in the panel below. -->
+                      <span class="prompt-text" data-testid="job-name">
+                        <app-inline-editable-text
+                          [value]="jobName(row.job)"
+                          [editValue]="jobNameSuggestion(row.job)"
+                          [maxLength]="jobTitleMaxLength"
+                          [ariaLabel]="'common.rename' | transloco"
+                          (save)="onRenameJob(row.job, $event)"
+                        />
                       </span>
                     </div>
                     <div class="job-id" [style.padding-left.px]="row.isChild ? 16 : 0">
@@ -595,7 +607,7 @@ export type {JobCloudAction};
         size="sm"
         (closed)="confirmDeleteOpen.set(false)"
       >
-        {{ pendingJob()?.description }}
+        {{ jobName(pendingJob()) }}
         <div appDialogActions>
           <app-button variant="secondary" (clicked)="confirmDeleteOpen.set(false)">
             {{ 'common.cancel' | transloco }}
@@ -1541,6 +1553,23 @@ export class JobListComponent implements OnInit, OnDestroy {
         });
       }
     });
+  }
+
+  readonly jobName = jobDisplayName;
+  readonly jobNameSuggestion = jobNameSuggestion;
+  readonly jobTitleMaxLength = JOB_TITLE_MAX_LENGTH;
+
+  /** Rename from the row's pencil: shown at once, put back if the server refuses. */
+  onRenameJob(job: JobSummary, title: string): void {
+    const previous = job.title ?? null;
+    this.setJobTitle(job.id, title);
+    this.api.renameJob(job.id, title).subscribe((renamed) => {
+      this.setJobTitle(job.id, renamed ? renamed.title : previous);
+    });
+  }
+
+  private setJobTitle(jobId: string, title: string | null): void {
+    this.jobs.update((current) => current.map((job) => (job.id === jobId ? {...job, title} : job)));
   }
 
   showNewJobs(): void {

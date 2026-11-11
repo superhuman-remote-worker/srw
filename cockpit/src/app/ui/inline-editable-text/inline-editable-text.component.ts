@@ -44,6 +44,7 @@ import {AppIconComponent} from '../icon';
         [value]="draft()"
         [size]="draft().length || 1"
         [attr.aria-label]="ariaLabel() || null"
+        [attr.maxlength]="maxLength()"
         [placeholder]="placeholder()"
         (input)="onInput($event)"
         (keydown)="onKeydown($event)"
@@ -54,7 +55,7 @@ import {AppIconComponent} from '../icon';
       <span
         class="inline-edit__text inline-edit__text--clickable"
         [title]="value()"
-        (click)="startEdit(value(), $event)"
+        (click)="startEdit(editValue() ?? value(), $event)"
         >{{ value() }}</span
       >
     } @else {
@@ -66,7 +67,7 @@ import {AppIconComponent} from '../icon';
           size="sm"
           [ariaLabel]="ariaLabel()"
           [tooltip]="ariaLabel()"
-          (clicked)="startEdit(value(), $event)"
+          (clicked)="startEdit(editValue() ?? value(), $event)"
         >
           <app-icon size="sm">edit</app-icon>
         </app-icon-button>
@@ -151,6 +152,13 @@ export class AppInlineEditableTextComponent {
   readonly ariaLabel = input('');
   /** Already-translated placeholder for the edit input. */
   readonly placeholder = input('');
+  /**
+   * What the editor starts from, when that differs from the text shown — a
+   * long text shown cut off, edited from a short suggestion. Null: `value`.
+   */
+  readonly editValue = input<string | null>(null);
+  /** Longest value the editor accepts; null for no limit. */
+  readonly maxLength = input<number | null>(null);
 
   /** Emitted with the trimmed new value — only when it changed and is non-empty. */
   readonly save = output<string>();

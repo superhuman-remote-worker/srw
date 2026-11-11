@@ -6,6 +6,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
 import {stripMarkdown} from '../../core/util/strip-markdown';
 import {effectiveJobStatus} from '../../core/util/job-status';
+import {jobDisplayName} from '../../core/util/job-name';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
@@ -300,7 +301,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             {{ 'jobs.status.' + effectiveJobStatus(job) | transloco }}
                           </span>
                         </td>
-                        <td class="desc-cell">{{ truncate(job.description, 60) }}</td>
+                        <td class="desc-cell">{{ truncate(jobName(job), 60) }}</td>
                         <td class="mono">{{ job.config_name }}</td>
                         <td class="mono">
                           @if (job.repo_name) {
@@ -2204,6 +2205,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
   `],
 })
 export class ProjectDetailPageComponent implements OnInit, OnDestroy {
+  readonly jobName = jobDisplayName;
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly api = inject(ApiService);

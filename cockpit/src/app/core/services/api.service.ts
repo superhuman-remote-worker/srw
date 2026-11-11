@@ -2007,6 +2007,23 @@ export class ApiService {
   }
 
   /**
+   * Rename a job: sets the name it is listed by. The task text (description)
+   * is not changed. Emits the stored title — the server collapses whitespace —
+   * or null when the rename failed (already reported).
+   */
+  renameJob(jobId: string, title: string | null): Observable<{ job_id: string; title: string | null } | null> {
+    return this.http
+      .patch<{ job_id: string; title: string | null }>(`${this.baseUrl}/jobs/${jobId}`, { title })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to rename job ${jobId}:`, error);
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.renameFailed'));
+          return of(null);
+        }),
+      );
+  }
+
+  /**
    * Pause a running job. The agent will cooperatively pause at the next safe point.
    */
   pauseJob(jobId: string): Observable<{ status: string } | null> {

@@ -105,7 +105,10 @@ export interface AuditResponse {
  */
 export interface JobSummary {
   id: string;
+  /** The task text the job was created from. */
   description: string;
+  /** The name a person gave the job afterwards; null when it was never named. */
+  title?: string | null;
   status: string;
   completion_outcome_kind?: 'blocked_undelivered' | null;
   config_name?: string | null;

@@ -2531,7 +2531,10 @@ export interface WorkspaceLifecycleView {
 
 export interface Job {
   id: string;
+  /** The task text the job was created from. */
   description: string;
+  /** The name a person gave the job afterwards; null when it was never named. */
+  title?: string | null;
   document_path?: string | null;
   config_name: string | null;
   /** JSONB can arrive as JSON text; normalize before reading its fields. */
@@ -2975,6 +2978,8 @@ export interface JobSubjob {
   /** 0 = a direct child of the job asked about. */
   depth: number;
   description: string;
+  /** The name a person gave the subjob; null when it was never named. */
+  title?: string | null;
   status: string;
   /** The role: `scholar`, `critic`, `curator`. What makes a row readable. */
   config_name: string | null;

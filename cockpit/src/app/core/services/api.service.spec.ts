@@ -1733,3 +1733,48 @@ describe('ApiService job outbox re-sync', () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 });
+
+describe('ApiService job rename', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+  let toast: {danger: ReturnType<typeof vi.fn>};
+  let errors: {translate: ReturnType<typeof vi.fn>};
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    toast = {danger: vi.fn()};
+    errors = {translate: vi.fn((_error: unknown, key: string) => key)};
+    TestBed.configureTestingModule({providers: [
+      ApiService, provideHttpClient(), provideHttpClientTesting(),
+      {provide: AppToastService, useValue: toast},
+      {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+      {provide: ErrorMessageService, useValue: errors},
+    ]});
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('PATCHes the title only and hands back what the server stored', async () => {
+    const pending = firstValueFrom(api.renameJob('job-1', 'Lease  review'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1'));
+    expect(req.request.method).toBe('PATCH');
+    // The task text is never part of a rename.
+    expect(req.request.body).toEqual({title: 'Lease  review'});
+    req.flush({job_id: 'job-1', title: 'Lease review'});
+
+    expect(await pending).toEqual({job_id: 'job-1', title: 'Lease review'});
+    expect(toast.danger).not.toHaveBeenCalled();
+  });
+
+  it('reports a refused rename and emits null so the caller can undo it', async () => {
+    const pending = firstValueFrom(api.renameJob('job-1', 'x'.repeat(201)));
+    httpMock
+      .expectOne((r) => r.url.endsWith('/jobs/job-1'))
+      .flush({detail: 'Title too long (max 200)'}, {status: 400, statusText: 'Bad Request'});
+
+    expect(await pending).toBeNull();
+    expect(toast.danger).toHaveBeenCalledExactlyOnceWith('errors.jobs.renameFailed');
+  });
+});

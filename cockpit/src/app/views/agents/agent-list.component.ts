@@ -3,6 +3,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {Agent, AgentStatus} from '../../core/models/api.model';
 import {JobSummary} from '../../core/models/audit.model';
+import {jobDisplayName} from '../../core/util/job-name';
 import {AppButtonComponent} from '../../ui/button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppDialogComponent} from '../../ui/dialog';
@@ -54,7 +55,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
                 [class.selected]="selectedJobId() === job.id"
                 (click)="selectJob(job.id)"
               >
-                <span class="job-prompt">{{ truncatePrompt(job.description) }}</span>
+                <span class="job-prompt">{{ truncatePrompt(jobName(job)) }}</span>
                 <span class="job-meta">{{ job.id.slice(0, 8) }}... | {{ formatDate(job.created_at) }}</span>
               </div>
             }
@@ -400,6 +401,7 @@ export class AgentListComponent implements OnInit, OnDestroy {
 
   readonly agents = signal<Agent[]>([]);
   readonly availableJobs = signal<JobSummary[]>([]);
+  readonly jobName = jobDisplayName;
   readonly isLoading = signal(false);
   /** The last refresh could not load the list (not the same as "no agents"). */
   readonly loadFailed = signal(false);

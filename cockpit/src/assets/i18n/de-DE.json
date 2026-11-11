@@ -4560,6 +4560,7 @@
       "deleteFailed": "Job konnte nicht gelöscht werden.",
       "cancelFailed": "Job konnte nicht abgebrochen werden.",
       "pauseFailed": "Job konnte nicht pausiert werden.",
+      "renameFailed": "Job konnte nicht umbenannt werden.",
       "resumeFailed": "Job konnte nicht fortgesetzt werden.",
       "recoveryRetryFailed": "Wiederherstellung des Arbeitsbereichs konnte nicht erneut gestartet werden.",
       "approveFailed": "Job konnte nicht freigegeben werden.",

@@ -4560,6 +4560,7 @@
       "deleteFailed": "Couldn't delete the job.",
       "cancelFailed": "Couldn't cancel the job.",
       "pauseFailed": "Couldn't pause the job.",
+      "renameFailed": "Couldn't rename the job.",
       "resumeFailed": "Couldn't resume the job.",
       "recoveryRetryFailed": "Couldn't retry workspace recovery.",
       "approveFailed": "Couldn't approve the job.",

@@ -1,6 +1,7 @@
 import { Component, inject, OnInit, OnDestroy } from '@angular/core';
 import { DataService } from '../../../core/services/data.service';
 import { JobContextService } from '../../../core/services/job-context.service';
+import { jobDisplayName } from '../../../core/util/job-name';
 
 /**
  * Timeline scrubber component for playback control.
@@ -22,7 +23,7 @@ import { JobContextService } from '../../../core/services/job-context.service';
         <option value="">Select a job...</option>
         @for (job of jobContext.jobs(); track job.id) {
           <option [value]="job.id">
-            {{ job.description ? truncate(job.description, 28) : job.id.slice(0, 8) }} · {{ job.status }}
+            {{ jobName(job) ? truncate(jobName(job), 28) : job.id.slice(0, 8) }} · {{ job.status }}
             @if (job.audit_count !== null) {
               ({{ job.audit_count }} steps)
             }
@@ -292,6 +293,7 @@ import { JobContextService } from '../../../core/services/job-context.service';
   ],
 })
 export class TimelineComponent implements OnInit, OnDestroy {
+  readonly jobName = jobDisplayName;
   readonly data = inject(DataService);
   readonly jobContext = inject(JobContextService);
 
