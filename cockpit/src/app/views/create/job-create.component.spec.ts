@@ -11,6 +11,8 @@ import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { ErrorMessageService } from '../../core/services/error-message.service';
 import { ModelService } from '../../core/services/model.service';
 import { UserService } from '../../core/services/user.service';
+import { JobArtifactService } from '../../core/services/job-artifact.service';
+import { ViewportService } from '../../core/services/viewport.service';
 import { JobCreateComponent } from './job-create.component';
 
 /**
@@ -263,6 +265,7 @@ describe('JobCreateComponent project picker', () => {
       getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
       createJob: vi.fn().mockReturnValue(of({id: 'job-1'})),
     };
+    const router = {navigate: vi.fn().mockResolvedValue(true)};
     TestBed.resetTestingModule();
     TestBed.configureTestingModule({
       providers: [
@@ -273,10 +276,11 @@ describe('JobCreateComponent project picker', () => {
             snapshot: {queryParamMap: convertToParamMap(queryProject ? {project: queryProject} : {})},
           },
         },
-        {provide: Router, useValue: {navigate: vi.fn()}},
+        {provide: Router, useValue: router},
         {provide: UserService, useValue: {currentUserId: signal('user-1'), currentUser: signal(null)}},
         {provide: ErrorMessageService, useValue: errors},
         {provide: ModelService, useValue: {load: vi.fn()}},
+        {provide: ViewportService, useValue: {isMobile: signal(false)}},
         {
           provide: CapabilitiesService,
           useValue: {
@@ -289,7 +293,7 @@ describe('JobCreateComponent project picker', () => {
     TestBed.overrideComponent(JobCreateComponent, {set: {imports: [], template: ''}});
     const fixture = TestBed.createComponent(JobCreateComponent);
     fixture.detectChanges();
-    return {fixture, component: fixture.componentInstance, api, errors};
+    return {fixture, component: fixture.componentInstance, api, errors, router};
   }
 
   const ACTIVE_PROJECT = {
@@ -384,7 +388,6 @@ describe('JobCreateComponent project picker', () => {
     const {component, api} = setup(null);
     component.formData.description = 'Keep my settings';
     component.selectedPriority.set(7);
-    component.kickoffMessage = '  Start here  ';
     component.agentSettings = {
       vmSizingValid: () => true,
       getOverrides: () => ({llm: {model: 'selected-model'}}),
@@ -397,8 +400,66 @@ describe('JobCreateComponent project picker', () => {
 
     expect(api.createJob).toHaveBeenCalledExactlyOnceWith({
       description: 'Keep my settings', config_override: {llm: {model: 'selected-model'}},
-      instructions: 'Instructions', kickoff_message: 'Start here', datasource_ids: ['connector-1'],
+      instructions: 'Instructions', datasource_ids: ['connector-1'],
       priority: 7, project_id: 'proj-1', user_id: 'user-1',
+    });
+  });
+
+  // One box: the task text is the whole brief. The form has no second
+  // "opening message" field, so it never sends one.
+  it('sends the task text as the description and no kickoff message', async () => {
+    const {component, api} = setup(null);
+    component.onDescriptionEdit('Summarise the attached contract and list the risks');
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls[0][0] as JobCreateRequest;
+    expect(request.description).toBe('Summarise the attached contract and list the risks');
+    expect('kickoff_message' in request).toBe(false);
+  });
+
+  it('a task of only whitespace creates nothing', async () => {
+    const {component, api} = setup(null);
+    component.onDescriptionEdit('   \n  ');
+
+    await component.onSubmit();
+
+    expect(api.createJob).not.toHaveBeenCalled();
+  });
+
+  describe('after the job is created', () => {
+    it('returns to the job list', async () => {
+      const {component, router} = setup(null);
+      component.formData.description = 'Write the quarterly report';
+
+      await component.onSubmit();
+
+      expect(router.navigate).toHaveBeenCalledExactlyOnceWith(['/jobs']);
+      expect(component.isSubmitting()).toBe(false);
+    });
+
+    it('clears the shared draft, so the next New Job form starts empty', async () => {
+      // JobArtifactService is a root service: it outlives this page, and its
+      // description is written back into every freshly opened form.
+      const {component} = setup(null);
+      const artifacts = TestBed.inject(JobArtifactService);
+      component.onDescriptionEdit('Write the quarterly report');
+      expect(artifacts.description()).toBe('Write the quarterly report');
+
+      await component.onSubmit();
+
+      expect(artifacts.description()).toBeNull();
+    });
+
+    it('stays on the form when the server refuses the job', async () => {
+      const {component, api, router} = setup(null);
+      api.createJob.mockReturnValue(throwError(() => ({status: 400})));
+      component.formData.description = 'Write the quarterly report';
+
+      await component.onSubmit();
+
+      expect(router.navigate).not.toHaveBeenCalled();
+      expect(component.formData.description).toBe('Write the quarterly report');
     });
   });
 
@@ -527,13 +588,11 @@ describe('JobCreateComponent project picker', () => {
       expect(component.manifestText()).not.toContain('Draft');
     });
 
-    it('kickoff and priority edits refresh it and start no preview', () => {
+    it('a priority edit refreshes it and starts no preview', () => {
       const {component, api} = openManifest();
 
-      component.onKickoffEdit('Start with the summary');
       component.onPriorityChange('10');
 
-      expect(component.manifestText()).toContain('kickoff_message: Start with the summary');
       expect(component.manifestText()).toContain('priority: 10');
       expect(api.previewToolGroups).not.toHaveBeenCalled();
     });

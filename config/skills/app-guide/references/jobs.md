@@ -24,19 +24,25 @@ Open **Jobs → New Job**. A session can create one for you only when its actual
 tool list includes Fleet Management; loading this App Guide does not grant
 those tools. The form includes:
 
+- **The task box** — one box at the top for what the agent should do. State
+  the desired outcome, constraints, and what evidence would count as done.
+  **Attach** (or dropping files on the box) adds input files. **Create Job**
+  is in the box; Ctrl+Enter creates the job too. After creating, the app
+  returns to the job list.
 - **Project** — use a project when the work should share its goal, eligible
   connectors, repositories, knowledge, and (when enabled) project memory.
-- **Description** — the main task brief. State the desired outcome,
-  constraints, and what evidence would count as done.
-- **Kick-off message** — an optional first instruction sent when work starts.
-- **Expert** — a worker expert; session experts are not eligible for jobs.
-- **Documents** — optional input files.
+- **Autonomy** — when the job stops for a person's review.
 - **Priority** — **Low (backfill)**, **Normal (default)**, or **High (preempts
   lower)**.
+- **Expert** — a worker expert; session experts are not eligible for jobs.
 - Project cloud access, when the selected project has cloud storage.
 - **Agent Settings** — autonomy, models, tool categories, selected connectors,
   custom instructions, memory, quality helpers, and limits.
 - **Workspace** — see below.
+
+A new job is listed by its task text. To give it a shorter name, hover its row
+in **Jobs** and use the pencil. The task text does not change, and search
+finds the job by either.
 
 ### Choosing a workspace
 

@@ -3,7 +3,7 @@ import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.compo
 import {WorkspaceChoice} from '../../core/models/workspace-template.model';
 import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
-import {Component, computed, effect, ElementRef, inject, Injector, linkedSignal, OnInit, signal, ViewChild} from '@angular/core';
+import {AfterViewInit, Component, computed, effect, ElementRef, inject, Injector, linkedSignal, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {pickOwnDefaultProject} from '../../core/util/own-default-project';
@@ -25,10 +25,8 @@ import {ModelService} from '../../core/services/model.service';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
-import {AppSelectComponent} from '../../ui/select';
-import {AppTextareaComponent} from '../../ui/textarea';
 import {AppIconComponent} from '../../ui/icon';
-import {AppFormFieldComponent} from '../../ui/form-field';
+import {ViewportService} from '../../core/services/viewport.service';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -41,10 +39,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
     TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
-    AppSelectComponent,
-    AppTextareaComponent,
     AppIconComponent,
-    AppFormFieldComponent,
   ],
   template: `
     <div class="job-create-container">
@@ -57,16 +52,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       </div>
 
       <div class="form-container">
-        <!-- Success Message -->
-        @if (successMessage()) {
-          <div class="success-message">
-            <span>{{ successMessage() }}</span>
-            <app-button variant="ghost" size="sm" (clicked)="clearSuccess()">
-              {{ 'jobs.create.dismiss' | transloco }}
-            </app-button>
-          </div>
-        }
-
         <!-- Error Message -->
         @if (errorMessage() || settingsStillLoading()) {
           <div class="error-message">
@@ -112,125 +97,120 @@ import {AppFormFieldComponent} from '../../ui/form-field';
             (instructionsChange)="onInstructionsChange($event)"
           >
             <div settingsTop class="task-fields">
-              <!-- Description Field (Required) -->
-              <app-form-field [label]="'jobs.create.descriptionLabel' | transloco" [required]="true" [hint]="'jobs.create.descriptionHint' | transloco">
-                <app-textarea
+              <!-- One box for the job: the task text, its files and Create.
+                   The text is the job's description; nothing else is asked. -->
+              <div
+                class="composer"
+                data-testid="job-composer"
+                [class.dragover]="isDragOver()"
+                [class.disabled]="isSubmitting()"
+                (dragover)="onDragOver($event)"
+                (dragleave)="onDragLeave($event)"
+                (drop)="onDrop($event)"
+              >
+                <textarea
+                  #taskInput
+                  class="composer-input"
+                  data-testid="job-task"
+                  rows="4"
                   [value]="formData.description"
-                  (valueChange)="onDescriptionEdit($event)"
-                  [required]="true"
-                  [rows]="5"
-                  [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
+                  (input)="onTaskInput($event)"
+                  (keydown.control.enter)="submitFromKeyboard($event)"
+                  (keydown.meta.enter)="submitFromKeyboard($event)"
+                  [placeholder]="'jobs.create.taskPlaceholder' | transloco"
+                  [attr.aria-label]="'jobs.create.taskLabel' | transloco"
+                  aria-required="true"
                   [disabled]="isSubmitting()"
-                />
-              </app-form-field>
+                ></textarea>
 
-              <!-- Project Selector -->
-              @if (projects().length > 0) {
-                <app-form-field
-                  [label]="'jobs.create.projectLabel' | transloco"
-                  [hint]="'jobs.create.projectHint' | transloco"
-                  [error]="selectedProjectIsArchived() ? ('jobs.create.projectArchivedWarning' | transloco) : ''"
-                >
-                  <app-select
-                    [value]="selectedProjectId() ?? ''"
-                    (changed)="onProjectIdChange($event)"
-                    [disabled]="isSubmitting()"
-                  >
-                    <option value="">{{ 'jobs.create.projectNone' | transloco }}</option>
-                    @for (proj of projects(); track proj.id) {
-                      <option [value]="proj.id">
-                        {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}@if (proj.status === 'archived') { {{ 'jobs.create.projectArchived' | transloco }}}
-                      </option>
-                    }
-                  </app-select>
-                </app-form-field>
-              }
-
-              <!-- Kickoff Message (optional opening prompt) -->
-              <app-form-field [label]="'jobs.create.kickoffLabel' | transloco" [hint]="'jobs.create.kickoffHint' | transloco">
-                <app-textarea
-                  [value]="kickoffMessage"
-                  (valueChange)="onKickoffEdit($event)"
-                  [rows]="2"
-                  [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
-                  [disabled]="isSubmitting()"
-                />
-              </app-form-field>
-
-              <!-- File Upload Dropzone -->
-              <app-form-field [label]="'jobs.create.documentsLabel' | transloco" [hint]="'jobs.create.documentsOptional' | transloco">
-                <div
-                  class="dropzone"
-                  [class.dragover]="isDragOver()"
-                  [class.has-files]="filePreviews().length > 0"
-                  [class.disabled]="isSubmitting()"
-                  (dragover)="onDragOver($event)"
-                  (dragleave)="onDragLeave($event)"
-                  (drop)="onDrop($event)"
-                  (click)="triggerFileInput()"
-                >
-                  @if (filePreviews().length === 0) {
-                    <div class="dropzone-content">
-                      <app-icon size="inherit" class="dropzone-icon">upload_file</app-icon>
-                      <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
-                      <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getJobUploadMaxFiles(), maxSizeMb: fileService.getJobUploadMaxFileSizeMB() } }}</span>
-                    </div>
-                  } @else {
-                    <div class="file-list">
-                      @for (file of filePreviews(); track file.id) {
-                        <div class="file-item" [class.uploading]="file.uploadStatus === 'uploading'" [class.failed]="file.uploadStatus === 'failed'">
-                          @if (file.type === 'image' && file.preview) {
-                            <img [src]="file.preview" class="file-thumb" alt="">
+                @if (filePreviews().length > 0) {
+                  <div class="file-list" data-testid="job-files">
+                    @for (file of filePreviews(); track file.id) {
+                      <div class="file-item" [class.uploading]="file.uploadStatus === 'uploading'" [class.failed]="file.uploadStatus === 'failed'">
+                        @if (file.type === 'image' && file.preview) {
+                          <img [src]="file.preview" class="file-thumb" alt="">
+                        } @else {
+                          <app-icon size="md" class="file-icon">{{ fileService.getFileIcon(file.type) }}</app-icon>
+                        }
+                        <div class="file-info">
+                          <span class="file-name" [title]="file.name">{{ file.name }}</span>
+                          @if (file.error) {
+                            <span class="file-error">{{ file.error }}</span>
                           } @else {
-                            <app-icon size="lg" class="file-icon">{{ fileService.getFileIcon(file.type) }}</app-icon>
-                          }
-                          <div class="file-info">
-                            <span class="file-name">{{ file.name }}</span>
                             <span class="file-size">{{ file.sizeFormatted }}</span>
-                            @if (file.error) {
-                              <span class="file-error">{{ file.error }}</span>
-                            }
-                          </div>
-                          @if (file.uploadStatus === 'uploading') {
-                            <div class="upload-progress">
-                              <div class="progress-bar" [style.width.%]="file.uploadProgress || 0"></div>
-                            </div>
                           }
-                          @if (file.uploadStatus === 'completed') {
-                            <app-icon size="md" class="status-icon success">check_circle</app-icon>
-                          }
-                          @if (file.uploadStatus === 'failed') {
-                            <app-icon size="md" class="status-icon error">error</app-icon>
-                          }
-                          @if (file.uploadStatus === 'pending') {
-                            <app-icon size="md" class="status-icon pending">schedule</app-icon>
-                          }
-                          <app-icon-button
-                            variant="danger"
-                            size="sm"
-                            type="button"
-                            [ariaLabel]="'jobs.create.removeFile' | transloco"
-                            [disabled]="isSubmitting()"
-                            (clicked)="removeFile(file.id, $event)"
-                          >
-                            <app-icon size="sm">close</app-icon>
-                          </app-icon-button>
                         </div>
-                      }
-                    </div>
-                    @if (!isSubmitting()) {
-                      <app-button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        [fullWidth]="true"
-                        class="add-more-btn"
-                        (clicked)="triggerFileInput()"
-                      >
-                        {{ 'jobs.create.addMore' | transloco }}
-                      </app-button>
+                        @if (file.uploadStatus === 'uploading') {
+                          <div class="upload-progress">
+                            <div class="progress-bar" [style.width.%]="file.uploadProgress || 0"></div>
+                          </div>
+                        }
+                        @if (file.uploadStatus === 'completed') {
+                          <app-icon size="sm" class="status-icon success">check_circle</app-icon>
+                        }
+                        @if (file.uploadStatus === 'failed') {
+                          <app-icon size="sm" class="status-icon error">error</app-icon>
+                        }
+                        <app-icon-button
+                          variant="danger"
+                          size="sm"
+                          type="button"
+                          [ariaLabel]="'jobs.create.removeFile' | transloco"
+                          [disabled]="isSubmitting()"
+                          (clicked)="removeFile(file.id, $event)"
+                        >
+                          <app-icon size="sm">close</app-icon>
+                        </app-icon-button>
+                      </div>
                     }
-                  }
+                  </div>
+                }
+
+                <div class="composer-bar">
+                  <button
+                    type="button"
+                    class="ctrl"
+                    data-testid="job-attach"
+                    [disabled]="isSubmitting()"
+                    [title]="'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getJobUploadMaxFiles(), maxSizeMb: fileService.getJobUploadMaxFileSizeMB() }"
+                    [attr.aria-label]="'jobs.create.attach' | transloco"
+                    (click)="triggerFileInput()"
+                  >
+                    <app-icon size="sm" class="ctrl-icon">attach_file</app-icon>
+                    <span class="ctrl-label">{{ 'jobs.create.attach' | transloco }}</span>
+                  </button>
+                  <span class="composer-hint">{{ 'jobs.create.attachHint' | transloco }}</span>
+                  <span class="spacer"></span>
+                  <app-button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    class="composer-reset"
+                    [disabled]="isSubmitting()"
+                    (clicked)="resetForm()"
+                  >
+                    {{ 'jobs.create.reset' | transloco }}
+                  </app-button>
+                  <!-- Not disabled while the settings check (tool preview, Expert
+                       detail, connector list) loads: a click then waits for it in
+                       onSubmit. Disabling here lost the click (zoneless change
+                       detection disables the button before mouseup). -->
+                  <app-button
+                    type="submit"
+                    variant="primary"
+                    size="sm"
+                    data-testid="job-create-submit"
+                    [loading]="isSubmitting() || isUploading()"
+                    [disabled]="!formData.description.trim() || datasourceLoadError() || !vmSizingValid()"
+                  >
+                    @if (isUploading()) {
+                      {{ 'jobs.create.uploading' | transloco }}
+                    } @else if (isSubmitting()) {
+                      {{ 'jobs.create.creating' | transloco }}
+                    } @else {
+                      {{ 'jobs.create.submit' | transloco }}
+                    }
+                  </app-button>
                 </div>
                 <input
                   #fileInput
@@ -240,21 +220,52 @@ import {AppFormFieldComponent} from '../../ui/form-field';
                   (change)="onFilesSelected($event)"
                   style="display: none"
                 >
-              </app-form-field>
+              </div>
             </div>
 
-            <!-- Priority sits beside autonomy -->
-            <app-form-field settingsTopAside [label]="'jobs.create.priorityLabel' | transloco" [hint]="'jobs.create.priorityHint' | transloco">
-              <app-select
-                [value]="selectedPriority()"
-                (changed)="onPriorityChange($event)"
+            <!-- Project and priority sit beside autonomy, in the settings
+                 groups' own field look so the three line up. [selected] on
+                 each option, not [value] on the select: the project list
+                 arrives after the selection is known. -->
+            @if (projects().length > 0) {
+              <div settingsTopAside class="aside-field project-field">
+                <label class="aside-label" for="job-project">{{ 'jobs.create.projectLabel' | transloco }}</label>
+                <select
+                  id="job-project"
+                  class="aside-select"
+                  data-testid="job-project"
+                  [disabled]="isSubmitting()"
+                  (change)="onProjectIdChange($any($event.target).value)"
+                >
+                  <option value="" [selected]="!selectedProjectId()">{{ 'jobs.create.projectNone' | transloco }}</option>
+                  @for (proj of projects(); track proj.id) {
+                    <option [value]="proj.id" [selected]="proj.id === selectedProjectId()">
+                      {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}@if (proj.status === 'archived') { {{ 'jobs.create.projectArchived' | transloco }}}
+                    </option>
+                  }
+                </select>
+                @if (selectedProjectIsArchived()) {
+                  <span class="aside-hint error" role="alert">{{ 'jobs.create.projectArchivedWarning' | transloco }}</span>
+                } @else {
+                  <span class="aside-hint">{{ 'jobs.create.projectHint' | transloco }}</span>
+                }
+              </div>
+            }
+            <div settingsTopAside class="aside-field">
+              <label class="aside-label" for="job-priority">{{ 'jobs.create.priorityLabel' | transloco }}</label>
+              <select
+                id="job-priority"
+                class="aside-select"
+                data-testid="job-priority"
                 [disabled]="isSubmitting()"
+                (change)="onPriorityChange($any($event.target).value)"
               >
                 @for (level of priorityLevels; track level.value) {
-                  <option [value]="level.value">{{ getPriorityKey(level.value) | transloco }}</option>
+                  <option [value]="level.value" [selected]="level.value === selectedPriority()">{{ getPriorityKey(level.value) | transloco }}</option>
                 }
-              </app-select>
-            </app-form-field>
+              </select>
+              <span class="aside-hint">{{ 'jobs.create.priorityHint' | transloco }}</span>
+            </div>
 
             <!-- Expert templates: worker experts by default (expert_type || tags);
                  "Show all experts" lists every role — the server accepts a
@@ -297,7 +308,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
             </section>
           }
 
-          <!-- Submit Button -->
+          <!-- Create and Reset live in the task box at the top; only the
+               manifest toggle stays below the settings it describes. -->
           <div class="form-actions">
             <app-button
               type="button"
@@ -306,32 +318,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
               (clicked)="toggleManifest()"
             >
               {{ (manifestOpen() ? 'agentSettings.manifest.hide' : 'agentSettings.manifest.show') | transloco }}
-            </app-button>
-            <app-button
-              type="button"
-              variant="secondary"
-              [disabled]="isSubmitting()"
-              (clicked)="resetForm()"
-            >
-              {{ 'jobs.create.reset' | transloco }}
-            </app-button>
-            <!-- Not disabled while the settings check (tool preview, Expert
-                 detail, connector list) loads: a click then waits for it in
-                 onSubmit. Disabling here lost the click (zoneless change
-                 detection disables the button before mouseup). -->
-            <app-button
-              type="submit"
-              variant="primary"
-              [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || datasourceLoadError() || !vmSizingValid()"
-            >
-              @if (isUploading()) {
-                {{ 'jobs.create.uploading' | transloco }}
-              } @else if (isSubmitting()) {
-                {{ 'jobs.create.creating' | transloco }}
-              } @else {
-                {{ 'jobs.create.submit' | transloco }}
-              }
             </app-button>
           </div>
         </form>
@@ -420,7 +406,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .form-container > form,
-      .form-container > .success-message,
       .form-container > .error-message {
         max-width: 52rem;
         margin-left: auto;
@@ -428,7 +413,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       /* Messages */
-      .success-message,
       .error-message {
         display: flex;
         align-items: center;
@@ -439,12 +423,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         font-size: 13px;
       }
 
-      .success-message {
-        background: var(--success-tint);
-        border: 1px solid var(--success-tint);
-        color: var(--success);
-      }
-
       .error-message {
         background: var(--danger-tint);
         border: 1px solid var(--danger-tint);
@@ -453,13 +431,6 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       /* Form Groups */
       .form-group {
-        margin-bottom: 16px;
-      }
-
-      /* The shared field primitive carries no outer margin; without this the
-         project hint ran straight into the Description label. */
-      app-form-field {
-        display: block;
         margin-bottom: 16px;
       }
 
@@ -770,74 +741,135 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         color: var(--ctp-yellow, var(--warning));
       }
 
-      /* Dropzone */
-      .dropzone {
-        border: 2px dashed var(--border-color, var(--surface-1));
+      /* The task box: text, attached files, and the bar that creates the
+         job. Its look follows the session composer. */
+      .composer {
+        background: var(--surface-0);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-surface);
-        padding: 20px;
-        text-align: center;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        background: var(--surface-0, var(--surface-0));
+        overflow: hidden;
+        transition: outline-color 0.15s ease, border-color 0.15s ease;
       }
 
-      .dropzone:hover:not(.disabled) {
-        border-color: var(--accent-color, var(--accent-color));
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      .composer:focus-within {
+        outline: 2px solid var(--accent-color);
+        outline-offset: 1px;
+        border-color: var(--accent-color);
       }
 
-      .dropzone.dragover {
-        border-color: var(--accent-color, var(--accent-color));
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      .composer.dragover {
+        border-color: var(--accent-color);
+        background: color-mix(in srgb, var(--accent-color) 12%, var(--surface-0));
       }
 
-      .dropzone.has-files {
-        text-align: left;
-        padding: 12px;
-      }
-
-      .dropzone.disabled {
+      .composer.disabled {
         opacity: 0.6;
+      }
+
+      .composer-input {
+        display: block;
+        width: 100%;
+        min-height: 112px;
+        max-height: min(50vh, 420px);
+        padding: 14px 16px;
+        background: transparent;
+        border: 0;
+        outline: 0;
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 14px;
+        line-height: 1.55;
+        resize: none;
+        overflow-y: auto;
+      }
+
+      .composer-input:focus,
+      .composer-input:focus-visible {
+        outline: none;
+        box-shadow: none;
+      }
+
+      .composer-input:disabled {
         cursor: not-allowed;
       }
 
-      .dropzone-content {
+      .composer-input::placeholder {
+        color: var(--text-muted);
+      }
+
+      .composer-bar {
         display: flex;
-        flex-direction: column;
+        flex-wrap: wrap;
         align-items: center;
         gap: 8px;
+        padding: 8px 10px;
+        border-top: 1px solid var(--border-color, var(--surface-1));
+        background: var(--panel-bg);
       }
 
-      .dropzone-icon {
-        font-size: 48px;
+      .composer-bar .spacer {
+        flex: 1;
+      }
+
+      .composer-hint {
+        font-size: 11px;
         color: var(--text-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
       }
 
-      .dropzone-text {
-        font-size: 14px;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .dropzone-hint {
+      .ctrl {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 28px;
+        padding: 0 10px;
+        flex-shrink: 0;
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        font-family: inherit;
         font-size: 12px;
-        color: var(--text-muted);
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
       }
 
-      /* File List */
+      .ctrl:hover:not(:disabled) {
+        background: var(--hover, color-mix(in srgb, var(--text-primary) 6%, transparent));
+        color: var(--text-primary);
+      }
+
+      .ctrl:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--ring);
+      }
+
+      .ctrl:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      /* Attached files, as chips between the text and the bar */
       .file-list {
         display: flex;
-        flex-direction: column;
+        flex-wrap: wrap;
         gap: 8px;
+        padding: 0 12px 12px;
       }
 
       .file-item {
-        display: flex;
+        display: inline-flex;
         align-items: center;
-        gap: 10px;
-        padding: 8px 10px;
-        background: var(--panel-bg, var(--panel-bg));
+        gap: 8px;
+        max-width: 280px;
+        padding: 4px 4px 4px 8px;
+        background: var(--panel-bg);
         border-radius: var(--radius-control);
-        border: 1px solid var(--border-color, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-1));
       }
 
       .file-item.uploading {
@@ -849,17 +881,15 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .file-thumb {
-        width: 36px;
-        height: 36px;
+        width: 28px;
+        height: 28px;
         object-fit: cover;
         border-radius: var(--radius-tag);
       }
 
       .file-icon {
-        font-size: 28px;
         color: var(--text-muted);
-        width: 36px;
-        text-align: center;
+        flex-shrink: 0;
       }
 
       .file-info {
@@ -867,30 +897,30 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         min-width: 0;
         display: flex;
         flex-direction: column;
-        gap: 2px;
       }
 
       .file-name {
-        font-size: 13px;
-        color: var(--text-primary, var(--text-primary));
+        font-size: 12px;
+        color: var(--text-primary);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
       }
 
       .file-size {
-        font-size: 11px;
+        font-size: 10px;
         color: var(--text-muted);
       }
 
       .file-error {
-        font-size: 11px;
+        font-size: 10px;
         color: var(--danger);
       }
 
       .upload-progress {
-        width: 60px;
+        width: 40px;
         height: 4px;
+        flex-shrink: 0;
         background: var(--border-color, var(--surface-0));
         border-radius: var(--radius-pill);
         overflow: hidden;
@@ -903,7 +933,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .status-icon {
-        font-size: 20px;
+        flex-shrink: 0;
       }
 
       .status-icon.success {
@@ -914,13 +944,63 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         color: var(--danger);
       }
 
-      .status-icon.pending {
+      /* Project and priority, beside autonomy. These mirror the settings
+         groups' .field-row (execution-group.component.ts) so the three fields
+         of the row share one label, control and hint size; the transparent
+         left border is that row's "changed" marker, kept for the alignment. */
+      .aside-field {
+        /* The row's own sizing rule (.es-row > *) is scoped to the settings
+           component and never matches content projected from this page. */
+        flex: 1 1 14rem;
+        min-width: 0;
+        margin-bottom: 12px;
+        padding-left: 8px;
+        border-left: 2px solid transparent;
+      }
+
+      .aside-field.project-field {
+        order: -1;
+      }
+
+      .aside-label {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-primary);
+      }
+
+      .aside-select {
+        display: block;
+        width: 100%;
+        padding: 7px 10px;
+        border: 1px solid var(--border-color, var(--surface-1));
+        border-radius: var(--radius-control);
+        background: var(--surface-0);
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 13px;
+      }
+
+      .aside-select:focus {
+        outline: none;
+        border-color: var(--accent-color);
+      }
+
+      .aside-select:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .aside-hint {
+        display: block;
+        margin-top: 2px;
+        font-size: 11px;
         color: var(--text-muted);
       }
 
-      app-button.add-more-btn {
-        display: block;
-        margin-top: 8px;
+      .aside-hint.error {
+        color: var(--danger);
       }
 
       /* Advanced Section */
@@ -1034,14 +1114,21 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         color: var(--info);
       }
 
-      /* Form Actions */
+      /* Below the settings: only the manifest toggle */
       .form-actions {
         display: flex;
-        justify-content: flex-end;
-        gap: 10px;
-        margin-top: 20px;
-        padding-top: 16px;
-        border-top: 1px solid var(--border-color, var(--surface-0));
+        justify-content: flex-start;
+        margin-top: 12px;
+      }
+
+      /* A phone-wide form keeps the bar to Attach and Create: the labels are
+         long in German, and a clipped Create button is worse than no Reset. */
+      @container (max-width: 480px) {
+        .composer-hint,
+        .ctrl-label,
+        app-button.composer-reset {
+          display: none;
+        }
       }
 
       /* Narrow panel responsive overrides */
@@ -1062,18 +1149,11 @@ import {AppFormFieldComponent} from '../../ui/form-field';
           gap: 6px;
         }
 
-        .form-actions {
-          flex-direction: column;
-        }
-
-        .form-actions app-button {
-          width: 100%;
-        }
       }
     `,
   ],
 })
-export class JobCreateComponent implements OnInit {
+export class JobCreateComponent implements OnInit, AfterViewInit {
   private readonly api = inject(ApiService);
   readonly capabilities = inject(CapabilitiesService);
   private readonly route = inject(ActivatedRoute);
@@ -1084,8 +1164,10 @@ export class JobCreateComponent implements OnInit {
   readonly fileService = inject(FileHandlingService);
   readonly artifacts = inject(JobArtifactService);
   private readonly injector = inject(Injector);
+  private readonly viewport = inject(ViewportService);
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
+  @ViewChild('taskInput') taskInput?: ElementRef<HTMLTextAreaElement>;
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
   @ViewChild(WorkspacePickerComponent) picker?: WorkspacePickerComponent;
 
@@ -1122,7 +1204,6 @@ export class JobCreateComponent implements OnInit {
   readonly isSubmitting = signal(false);
   readonly isUploading = signal(false);
   readonly isDragOver = signal(false);
-  readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
   /** Create gave up waiting for the settings check (see onSubmit). */
   readonly settingsStillLoading = signal(false);
@@ -1225,8 +1306,13 @@ export class JobCreateComponent implements OnInit {
   });
 
   private uploadId: string | null = null;
-  kickoffMessage = '';
   formData: JobCreateRequest = { description: '' };
+
+  ngAfterViewInit(): void {
+    // The page has one thing to type into. On a phone, focusing it would open
+    // the keyboard over the form before the user has seen it.
+    if (!this.viewport.isMobile()) this.taskInput?.nativeElement.focus();
+  }
 
   ngOnInit(): void {
     this.modelService.load();
@@ -1459,9 +1545,22 @@ export class JobCreateComponent implements OnInit {
     this.refreshManifest();
   }
 
-  onKickoffEdit(value: string): void {
-    this.kickoffMessage = value;
-    this.refreshManifest();
+  onTaskInput(event: Event): void {
+    const el = event.target as HTMLTextAreaElement;
+    this.onDescriptionEdit(el.value);
+    this.growTaskInput(el);
+  }
+
+  /** The box grows with the text up to its CSS max-height, then scrolls. */
+  private growTaskInput(el: HTMLTextAreaElement): void {
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }
+
+  /** Ctrl/Cmd+Enter in the task box creates the job; plain Enter stays a newline. */
+  submitFromKeyboard(event: Event): void {
+    event.preventDefault();
+    void this.onSubmit();
   }
 
   onInstructionsChange(value: string | null): void {
@@ -1660,13 +1759,13 @@ export class JobCreateComponent implements OnInit {
 
   async onSubmit(): Promise<void> {
     if (
-      !this.formData.description || this.isSubmitting() || this.isUploading() ||
+      !this.formData.description.trim() || this.isSubmitting() || this.isUploading() ||
       this.datasourceLoadError() || !this.vmSizingValid()
     ) return;
     // Before any await: the button shows its loading state at once, and a
     // second click (or Enter) is refused instead of creating a second job.
     this.isSubmitting.set(true);
-    this.clearMessages();
+    this.clearError();
     let sent = false;
     try {
       const loads = this.settingsLoads();
@@ -1693,10 +1792,15 @@ export class JobCreateComponent implements OnInit {
 
   private sendCreate(request: JobCreateRequest): void {
     this.api.createJob(request).subscribe({
-      next: (job) => {
+      // Back to the list, where the new job is the first row (ApiService
+      // has already said "Job created"). The sent text is cleared first:
+      // JobArtifactService outlives this page and would put it back into the
+      // next New Job form.
+      next: () => {
         this.isSubmitting.set(false);
-        this.successMessage.set(`Job created successfully! ID: ${job.id.slice(0, 8)}...`);
-        this.resetForm();
+        this.formData = { description: '' };
+        this.artifacts.reset();
+        void this.router.navigate(['/jobs']);
       },
       // The form stays mounted with every selection intact, and shows what the
       // server actually objected to — `err.message` would be Angular's
@@ -1758,8 +1862,6 @@ export class JobCreateComponent implements OnInit {
       request.config_override = configOverride;
     }
 
-    if (this.kickoffMessage.trim()) request.kickoff_message = this.kickoffMessage.trim();
-
     // Empty is an explicit opt-out; omission means "apply server defaults".
     request.datasource_ids = settings?.getSelectedDatasourceIds() ?? [];
 
@@ -1792,7 +1894,6 @@ export class JobCreateComponent implements OnInit {
     const selected = new Set(request.datasource_ids ?? []);
     const settings: Record<string, unknown> = {...(request.config_override ?? {})};
     if (request.priority !== undefined) settings['priority'] = request.priority;
-    if (request.kickoff_message) settings['kickoff_message'] = request.kickoff_message;
     const doc = executionManifest({
       kind: 'job',
       name: this.formData.description.split(/\s+/).slice(0, 6).join(' '),
@@ -1843,7 +1944,7 @@ export class JobCreateComponent implements OnInit {
 
   resetForm(): void {
     this.formData = { description: '' };
-    this.kickoffMessage = '';
+    if (this.taskInput) this.taskInput.nativeElement.style.height = '';
     this.filePreviews.set([]);
     this.uploadId = null;
     this.selectedExpert.set(null);
@@ -1859,9 +1960,7 @@ export class JobCreateComponent implements OnInit {
     this.artifacts.reset();
   }
 
-  clearSuccess(): void { this.successMessage.set(null); }
   clearError(): void { this.errorMessage.set(null); this.settingsStillLoading.set(false); }
-  private clearMessages(): void { this.successMessage.set(null); this.clearError(); }
 
   /** Leave the create form and return to the job list. */
   cancel(): void {
