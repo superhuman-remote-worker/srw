@@ -10,11 +10,13 @@ metadata:
     srw.io/description: 'General-purpose worker for research, writing, analysis, planning,
       and file
 
-      deliverables. It starts with a safe, non-orchestrating tool profile: no shell,
+      deliverables. It runs commands in its workspace, so it can convert documents
 
-      delegation, scholar pre-job, critic verification, automations, or loops unless
+      (for example to PDF), run scripts and process data. Delegation, scholar pre-job,
 
-      an administrator or copied expert explicitly enables them.'
+      critic verification, automations and loops stay off unless an administrator
+
+      or copied expert explicitly enables them.'
     srw.io/icon: engineering
     srw.io/color: '#a6e3a1'
     srw.io/expert-type: worker
@@ -24,6 +26,7 @@ metadata:
   - worker
   - safe-default
 spec:
+  workspacePreference: {backend: sandbox}
   runtime:
     adapter: srw/v1
     config:
@@ -37,9 +40,10 @@ spec:
         display_name: General Worker
         description: |
           General-purpose worker for research, writing, analysis, planning, and file
-          deliverables. It starts with a safe, non-orchestrating tool profile: no shell,
-          delegation, scholar pre-job, critic verification, automations, or loops unless
-          an administrator or copied expert explicitly enables them.
+          deliverables. It runs commands in its workspace, so it can convert documents
+          (for example to PDF), run scripts and process data. Delegation, scholar pre-job,
+          critic verification, automations and loops stay off unless an administrator
+          or copied expert explicitly enables them.
         icon: engineering
         color: "#a6e3a1"
         tags:
@@ -55,3 +59,12 @@ spec:
           enabled: false
         delegation:
           enabled: false
+
+        # The shell group (the shell_tools grant is on by default). A Job's
+        # workspace is a container unless the request picks another tier; on a
+        # Virtual workspace the backend filter drops these tools again.
+        tools:
+          shell:
+            - run_command
+            - cancel_command
+            - shell_read

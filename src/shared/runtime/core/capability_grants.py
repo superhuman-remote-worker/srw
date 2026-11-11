@@ -5,8 +5,9 @@ glue is in orchestrator/services/grants_service.py.
 
 Spec: knowledge-history/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 Restrict-only (decision 22): a more-specific scope may only narrow an inherited
-value. Deny-by-default for security keys; existing users grandfathered by the
-0030 migration backfill (shell_tools, delegation)."""
+value. Defaults: see the note above ``CATALOG`` (what the user's own agent needs
+is granted; what reaches other users, acts unasked outside the platform or runs
+unattended is not)."""
 
 from __future__ import annotations
 
@@ -23,6 +24,20 @@ _PERMISSION_ORDER = list(PERMISSION_MODES)
 #: The connector drivers' specs say which categories they bind.
 _DATASOURCE_TOOL_CATEGORIES = tool_categories()
 
+#: Every key's ``description`` is shown under it on Admin → Capability Grants
+#: (the grants API returns this dict as JSON), so it is written for an
+#: administrator deciding whether to allow it, not for a developer.
+#:
+#: Defaults (2026-11-11, owner decision): a key that only lets the user's own
+#: agent get work done in its own workspace is granted by default: shell,
+#: delegation, VM workspaces, catalog authoring and autonomous Sessions.
+#: Keys whose effect reaches other users (public_datasources), leaves the
+#: platform unasked (email_autonomous_send), skips a review check
+#: (complete_unmerged_pr) or starts Jobs with nobody watching
+#: (unattended_operations) stay deny-by-default, as does running a custom
+#: harness image (custom_harness_images), which only builders of one need.
+#: An administrator restores a stricter posture with a global grant: every
+#: key is restrict-only, so a global cap binds every project and user.
 CATALOG: dict[str, dict[str, Any]] = {
     # Lets a user fork/set a personal worker/session default.  Clearing an
     # existing pointer remains allowed even when this grant is later revoked;
@@ -31,29 +46,94 @@ CATALOG: dict[str, dict[str, Any]] = {
         "type": "bool",
         "default": True,
         "restrict_only": True,
+        "description": "Choose their own default Expert for new Jobs and Sessions.",
     },
-    "vm_workspace": {"type": "bool", "default": False, "restrict_only": True},
-    "shell_tools": {"type": "bool", "default": False, "restrict_only": True},
-    "delegation": {"type": "bool", "default": False, "restrict_only": True},
+    # Granted by default (2026-11-11). A VM is the agent's own machine; its
+    # cost is capacity, which the operator controls separately: the global
+    # `vm_workspaces` system setting blocks everyone, admins included
+    # (vm_workspace_policy.check_vm_permission), and an install without a VM
+    # provisioner fails a VM Job at dispatch with a message saying so, as it
+    # already did for admins.
+    "vm_workspace": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+        "description": (
+            "Run Jobs and Sessions in a full virtual machine. Needs VM support "
+            "on this installation."
+        ),
+    },
+    # Granted by default (2026-11-11). Agents run in an isolated workspace,
+    # and a worker that cannot run a command cannot even render a PDF; the
+    # default General Worker carries the shell tools on that basis. An
+    # administrator who wants the old posture sets a global `shell_tools:
+    # false` grant (restrict-only, so it caps every project and user below it).
+    "shell_tools": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+        "description": (
+            "Use Experts that run commands in their workspace, for example to "
+            "convert a document to PDF, run a script or install a package."
+        ),
+    },
+    # Granted by default (2026-11-11). A delegated child runs in-process on
+    # the parent's own workspace with tools capped by the parent's, so the
+    # only thing it adds is token spend. Until then every shipped expert that
+    # delegates (Engineer, Scholar, Developer, Critic, …) was refused for a
+    # non-admin and replaced by the General Worker.
+    "delegation": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+        "description": (
+            "Use Experts that hand parts of a task to subagents. Subagents work "
+            "in the same workspace and add to the token cost."
+        ),
+    },
     # Publish datasources org-wide (is_global). Deny-by-default: publishing
     # hands the publisher's stored credentials to every user's agents.
     # Spec: knowledge-base/knowledge/features/public_datasources.md
-    "public_datasources": {"type": "bool", "default": False, "restrict_only": True},
+    "public_datasources": {
+        "type": "bool",
+        "default": False,
+        "restrict_only": True,
+        "description": (
+            "Publish a datasource to every user. Their agents then connect with "
+            "the publisher's stored credentials."
+        ),
+    },
     # Unattended email send: allows setting unattended_send=true on an email
     # datasource, which skips the human send-approval freeze on email_send.
     # Deny-by-default and re-checked fail-closed at dispatch (a revoked grant
     # forces the flag back off). Spec: knowledge-base/knowledge/features/email_datasource.md
-    "email_autonomous_send": {"type": "bool", "default": False, "restrict_only": True},
+    "email_autonomous_send": {
+        "type": "bool",
+        "default": False,
+        "restrict_only": True,
+        "description": (
+            "Let an email datasource send mail without a person approving each "
+            "message first."
+        ),
+    },
     # Agent-authored catalogue entries: lets a session's agent create or update
     # experts, skills and automations on the user's behalf (tools.catalog_authoring).
-    # Deny-by-default and NOT backfilled, unlike shell_tools/delegation in 0030 —
-    # this is a new capability nobody held before, so there is nothing to
-    # grandfather and a backfill would hand it to every existing user silently.
-    # Deny-by-default is also what makes it a tier control: the writes themselves
-    # are owner-scoped by the endpoints they call, but an enabled automation
-    # creates jobs on a schedule, so this grant bounds token spend as much as
-    # permissions. Spec: knowledge-base/knowledge/features/agent_authored_catalog_entries.md
-    "catalog_authoring": {"type": "bool", "default": False, "restrict_only": True},
+    # Granted by default since 2026-11-11. Each write calls the endpoint the
+    # Cockpit calls, as the session's owner, so the agent can do only what the
+    # user could do by hand: their own entries, never a bundled or global
+    # expert. The tools are still not injected by default; an expert must name
+    # them. An automation the agent writes starts disabled unless it asks for
+    # allow_enabled, and a user may already create an enabled one in the UI.
+    # Spec: knowledge-base/knowledge/features/agent_authored_catalog_entries.md
+    "catalog_authoring": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+        "description": (
+            "Let the agent create and edit the user's own Experts, Skills and "
+            "Automations. Bundled and global entries stay read-only."
+        ),
+    },
     # Sealing a job whose delivered pull request is not merged. A job whose
     # deliverable is a PR is done when that PR lands, not when the branch is
     # pushed; without this gate a reviewer marks work complete on the strength
@@ -64,7 +144,15 @@ CATALOG: dict[str, dict[str, Any]] = {
     # NOT backfilled — the gate can only fire on a job carrying a recorded
     # context.pull_request, and none existed when the key was introduced.
     # Spec: knowledge-base/knowledge/features/merged_pr_completion_grant.md
-    "complete_unmerged_pr": {"type": "bool", "default": False, "restrict_only": True},
+    "complete_unmerged_pr": {
+        "type": "bool",
+        "default": False,
+        "restrict_only": True,
+        "description": (
+            "Mark a Job done while its pull request is still open. Without it, "
+            "such a Job is done only once the pull request is merged."
+        ),
+    },
     # The project self-improvement loop and the commissioned officer: the two
     # surfaces that spawn jobs with no human in the loop. Deny-by-default and
     # NOT backfilled — nobody held it before, and an unattended loop or officer
@@ -85,36 +173,81 @@ CATALOG: dict[str, dict[str, Any]] = {
     #     `user_can_run_unattended_operations` (the same shape as
     #     `complete_unmerged_pr` above).
     # Spec: knowledge-history/done/unattended_operations_grant.md.
-    "unattended_operations": {"type": "bool", "default": False, "restrict_only": True},
+    "unattended_operations": {
+        "type": "bool",
+        "default": False,
+        "restrict_only": True,
+        "description": (
+            "Run project loops and commission officers. Both start Jobs on their "
+            "own with nobody watching, so their cost has no upper limit."
+        ),
+    },
     # Run an admin-approved custom harness image (manifestHosting.approvedImages)
     # as a generic manifest Job. Deny-by-default and NOT backfilled: nobody held
     # it before. Checked at generic Job admission via
     # `user_can_run_custom_harness_images`.
     # Spec: knowledge-base/knowledge/superpowers/specs/2026-10-26-custom-harness-claude-code-design.md
-    "custom_harness_images": {"type": "bool", "default": False, "restrict_only": True},
-    "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
-    "browser": {"type": "bool", "default": True, "restrict_only": True},
-    "model_selection": {"type": "list", "default": None, "restrict_only": True},
+    "custom_harness_images": {
+        "type": "bool",
+        "default": False,
+        "restrict_only": True,
+        "description": (
+            "Run an administrator-approved custom harness image as a Job, "
+            "instead of the built-in agent."
+        ),
+    },
+    "datasource_tools": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+        "description": (
+            "Use the tools of attached connectors, such as databases, email and "
+            "cloud storage."
+        ),
+    },
+    "browser": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+        "description": "Use Experts that drive a real web browser.",
+    },
+    "model_selection": {
+        "type": "list",
+        "default": None,
+        "restrict_only": True,
+        "description": (
+            "Limit which models the user may pick. Empty means every enabled model."
+        ),
+    },
     "autonomy_ceiling": {
         "type": "enum",
         "default": "review",
         "restrict_only": True,
         "order": _AUTONOMY_ORDER,
+        "description": (
+            "The most autonomy a user may give a Job. 'review' stops for a person "
+            "before the Job counts as done; 'full' never stops."
+        ),
     },
     "permission_mode": {
         "type": "enum",
-        # Default ceiling is auto_accept (raised from supervised — now read_only —
-        # 2026-06-26 policy):
-        # every approved user may pick up to auto_accept without a grant — safe
-        # because agents run in isolated sandbox workspaces and shell execution is
-        # separately gated by `shell_tools`. autonomous (fully unattended) still
-        # requires an explicit permission_mode grant. A global-scope grant can
-        # restrict back to read_only if ever needed. Stored rows may still say
+        # Default ceiling is autonomous since 2026-11-11 (auto_accept from
+        # 2026-06-26, supervised — now read_only — before that). The ceiling
+        # is only what a user MAY pick: a Session still starts in read_only
+        # (DEFAULT_PERMISSION_MODE) unless the user or the expert chooses
+        # otherwise. autonomous runs shell and external effects without
+        # asking, inside the agent's own workspace; sending mail unattended
+        # stays behind `email_autonomous_send`. A global-scope grant can
+        # restrict back to auto_accept or read_only. Stored rows may still say
         # `supervised`; _VALUE_NORMALIZERS maps them before any comparison.
         # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md (Phase 5).
-        "default": "auto_accept",
+        "default": "autonomous",
         "restrict_only": True,
         "order": _PERMISSION_ORDER,
+        "description": (
+            "The most a user may let a Session do without asking. 'autonomous' "
+            "runs commands and outward actions such as a git push without asking."
+        ),
     },
 }
 
@@ -236,6 +369,14 @@ def _fragment_models(fragment: dict) -> list[str]:
     return out
 
 
+def _granted(grants: dict, key: str) -> Any:
+    """The resolved value of ``key``, or its catalog default when ``grants``
+    lacks it. ``resolve_grants`` always fills every key, so the default only
+    applies to a partial dict (tests, hand-built callers); reading it from
+    ``CATALOG`` keeps the PDP and the catalog from drifting apart."""
+    return grants.get(key, CATALOG[key]["default"])
+
+
 def _enum_exceeds(value: Any, ceiling: str, order: list[str]) -> bool:
     return (
         isinstance(value, str)
@@ -257,21 +398,21 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
     inter = fragment.get("interactive") or {}
     officer = fragment.get("officer") or {}
 
-    if not grants.get("vm_workspace", False) and ws.get("backend") == "vm":
+    if not _granted(grants, "vm_workspace") and ws.get("backend") == "vm":
         v.append("vm_workspace: workspace.backend='vm' requires the vm_workspace grant")
-    if not grants.get("shell_tools", False) and _truthy(tools.get("shell")):
+    if not _granted(grants, "shell_tools") and _truthy(tools.get("shell")):
         v.append("shell_tools: tools.shell requires the shell_tools grant")
     # delegation gates on the .enabled flag (a settings dict) OR a non-empty tool list,
     # NOT mere presence of the settings dict.
-    if not grants.get("delegation", False) and (
+    if not _granted(grants, "delegation") and (
         deleg.get("enabled") is True or _truthy(tools.get("delegation"))
     ):
         v.append("delegation: delegation requires the delegation grant")
-    if not grants.get("datasource_tools", True) and any(
+    if not _granted(grants, "datasource_tools") and any(
         _truthy(tools.get(k)) for k in _DATASOURCE_TOOL_CATEGORIES
     ):
         v.append("datasource_tools: connector tools are not permitted")
-    if not grants.get("browser", True) and _truthy(tools.get("browser_direct")):
+    if not _granted(grants, "browser") and _truthy(tools.get("browser_direct")):
         v.append("browser: tools.browser_direct is not permitted")
     # Gates on `officer.enabled` only — the flag that makes a thread a live
     # officer. Every other officer key (slots, sleep bounds, pools, conference)
@@ -279,7 +420,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
     # may still read and edit the durable kit; he just cannot raise anyone onto
     # it. Mirrors main._officer_meta_enabled's truthy set rather than `_truthy`,
     # which would read the string "false" as enabled.
-    if not grants.get("unattended_operations", False) and officer.get("enabled") in (
+    if not _granted(grants, "unattended_operations") and officer.get("enabled") in (
         True,
         "true",
         "True",
@@ -289,7 +430,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
             "unattended_operations: a commissioned officer requires the "
             "unattended_operations grant"
         )
-    if not grants.get("catalog_authoring", False) and _truthy(
+    if not _granted(grants, "catalog_authoring") and _truthy(
         tools.get("catalog_authoring")
     ):
         v.append(
@@ -311,15 +452,15 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
         if not isinstance(etools, dict):
             continue
         at = f"subagents.roster.{name}"
-        if not grants.get("shell_tools", False) and _truthy(etools.get("shell")):
+        if not _granted(grants, "shell_tools") and _truthy(etools.get("shell")):
             v.append(f"shell_tools: {at}.tools.shell requires the shell_tools grant")
-        if not grants.get("datasource_tools", True) and any(
+        if not _granted(grants, "datasource_tools") and any(
             _truthy(etools.get(k)) for k in _DATASOURCE_TOOL_CATEGORIES
         ):
             v.append(f"datasource_tools: {at} connector tools are not permitted")
-        if not grants.get("browser", True) and _truthy(etools.get("browser_direct")):
+        if not _granted(grants, "browser") and _truthy(etools.get("browser_direct")):
             v.append(f"browser: {at}.tools.browser_direct is not permitted")
-        if not grants.get("catalog_authoring", False) and _truthy(
+        if not _granted(grants, "catalog_authoring") and _truthy(
             etools.get("catalog_authoring")
         ):
             v.append(
@@ -335,7 +476,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
 
     if _enum_exceeds(
         fragment.get("autonomy"),
-        grants.get("autonomy_ceiling", "review"),
+        _granted(grants, "autonomy_ceiling"),
         _AUTONOMY_ORDER,
     ):
         v.append(
@@ -343,7 +484,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
         )
     if _enum_exceeds(
         normalize_permission_mode(inter.get("permission_mode")),
-        normalize_permission_mode(grants.get("permission_mode", "auto_accept")),
+        normalize_permission_mode(_granted(grants, "permission_mode")),
         _PERMISSION_ORDER,
     ):
         v.append(

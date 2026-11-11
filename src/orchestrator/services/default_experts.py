@@ -36,7 +36,10 @@ MANAGED_SEEDS: tuple[dict[str, Any], ...] = (
         "managed_key": "application-default-worker-seed",
         "directory": "general-worker",
         "expert_type": "worker",
-        "seed_version": 1,
+        # 2: the General Worker gained the shell tools (a v1 row has no
+        # `tools` key, so the additive upgrade hands it the bundle's) and
+        # the unedited v1 description, which promised "no shell", is replaced.
+        "seed_version": 2,
     },
     {
         "managed_key": "application-default-session-seed",
@@ -71,6 +74,16 @@ _ASSISTANT_V3_SUBAGENTS = {
         },
     },
 }
+
+
+# The managed General Worker's v1 description, exactly as seeded (stripped).
+# Seed 2 replaces only this text; an operator's own description stays.
+_GENERAL_WORKER_V1_DESCRIPTION = (
+    "General-purpose worker for research, writing, analysis, planning, and file\n"
+    "deliverables. It starts with a safe, non-orchestrating tool profile: no shell,\n"
+    "delegation, scholar pre-job, critic verification, automations, or loops unless\n"
+    "an administrator or copied expert explicitly enables them."
+)
 
 
 class DefaultExpertUnavailable(RuntimeError):
@@ -155,10 +168,12 @@ async def upgrade_managed_seed(
     the operator's and stays. Returns the updated row, or ``None`` when the
     row is current. This is how a seeded row gains a block the bundle grew
     later (the assistant's ``subagents`` roster: every deployment seeded before
-    2026-09-07 bound ``delegate_agent`` with nothing to delegate to). The exact
-    managed v2 assistant roster is the one repair exception: the SQL compares
-    its version and whole subtree again before replacing it, so a concurrent
-    operator edit cannot be overwritten using this earlier read.
+    2026-09-07 bound ``delegate_agent`` with nothing to delegate to; the
+    General Worker's ``tools`` shell group, 2026-11-11). Two exact-content
+    repairs replace a value the bundle changed: the managed v2 assistant
+    roster, and the General Worker's v1 description. The SQL compares each
+    again under the row lock, so a concurrent operator edit cannot be
+    overwritten using this earlier read.
     """
     current = int(row.get("seed_version") or 0)
     target = int(spec["seed_version"])
@@ -184,6 +199,13 @@ async def upgrade_managed_seed(
             # still gets this historical repair, never those newer values.
             "replacement_subagents": _ASSISTANT_V3_SUBAGENTS,
         }
+    if (
+        spec["managed_key"] == "application-default-worker-seed"
+        and current < 2 <= target
+    ):
+        # Compared again under the row lock: an edited description stays.
+        repair["expected_description"] = _GENERAL_WORKER_V1_DESCRIPTION
+        repair["replacement_description"] = bundle["description"]
     updated = await db.upgrade_managed_expert_seed(
         managed_key=spec["managed_key"],
         seed_version=target,
@@ -208,8 +230,9 @@ async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
     current application pointer are preserved across restarts and upgrades.
     The one exception is :func:`upgrade_managed_seed`: a row behind the
     bundle's ``seed_version`` gains the top-level config keys it lacks. Only
-    the exact managed v2 assistant roster receives a conditional repair;
-    operator variants and unrelated content remain unchanged.
+    the exact managed v2 assistant roster and the exact v1 General Worker
+    description receive a conditional repair; operator variants and
+    unrelated content remain unchanged.
     """
     seeded: dict[str, str] = {}
     for spec in MANAGED_SEEDS:

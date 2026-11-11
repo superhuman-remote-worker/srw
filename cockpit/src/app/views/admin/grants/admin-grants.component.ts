@@ -13,8 +13,8 @@ const INHERIT = '__inherit__';
 
 /**
  * Admin → Grants panel: set/revoke capability grants per user/project/global.
- * Deny-by-default; restrict-only. Reads the catalog dynamically from the API
- * (never hardcodes the keys). Server-side admin-gated.
+ * Restrict-only; each key's default and description come from the catalog the
+ * API returns (the keys are never hardcoded). Server-side admin-gated.
  */
 @Component({
   selector: 'app-admin-grants',
@@ -56,9 +56,11 @@ const INHERIT = '__inherit__';
 
         <section class="admin-section">
           <p class="desc">
-            Set or revoke per-user, per-project, or global capability grants.
-            Deny-by-default: a capability that isn't granted is blocked at expert
-            save-time and at job/session dispatch.
+            Allow or deny each capability for one user, one project or everyone.
+            The Default column applies wherever nothing is set. A setting can only
+            narrow what a wider scope allows: a Global deny holds for every
+            project and user. A denied capability is refused when an Expert is
+            saved and when a Job or Session starts.
           </p>
 
           <div class="scope-bar">
@@ -107,7 +109,12 @@ const INHERIT = '__inherit__';
               <tbody>
                 @for (k of catalogKeys(); track k) {
                   <tr>
-                    <td><code>{{ k }}</code></td>
+                    <td class="capability">
+                      <code>{{ k }}</code>
+                      @if (svc.catalog()[k].description; as description) {
+                        <span class="capability-desc">{{ description }}</span>
+                      }
+                    </td>
                     <td class="muted">{{ fmt(svc.catalog()[k].default) }}</td>
                     <td>
                       @if (svc.catalog()[k].type === 'bool') {
@@ -168,6 +175,10 @@ const INHERIT = '__inherit__';
       border: 1px solid var(--border-color); border-radius: var(--radius-surface);
     }
     .grid .muted, .muted { color: var(--text-muted); }
+    .capability-desc {
+      display: block; margin-top: 0.2rem; max-width: 46ch;
+      color: var(--text-muted); font-size: 0.8rem; line-height: 1.35;
+    }
     .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-control); }
     .banner.err { background: var(--danger-tint); color: var(--danger); }
     .banner.info {

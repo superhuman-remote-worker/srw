@@ -140,6 +140,8 @@ class SeedDB:
         expected_seed_version=None,
         expected_subagents=None,
         replacement_subagents=None,
+        expected_description=None,
+        replacement_description=None,
     ):
         # Models PostgresDB.upgrade_managed_expert_seed: `$additions || config`
         # (the row wins every key it has) under a `seed_version < $3` guard.
@@ -154,6 +156,15 @@ class SeedDB:
                 return None
             row["config"] = {**row["config"], "subagents": replacement_subagents}
         row["config"] = {**config_additions, **row["config"]}
+        if expected_description is not None:
+            expected = expected_description.strip()
+            if str(row.get("description") or "").strip() == expected:
+                row["description"] = replacement_description
+            if str(row["config"].get("description") or "").strip() == expected:
+                row["config"] = {
+                    **row["config"],
+                    "description": replacement_description,
+                }
         row["seed_version"] = seed_version
         return row
 
@@ -264,6 +275,55 @@ async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster()
     assert row["seed_version"] == 4
     assert row["config"]["subagents"] == safe_v3_roster
     assert row["config"]["future_top_level_key"] is True
+
+
+def _v1_general_worker(db):
+    """Rewind the managed General Worker to what a pre-2026-11-11 install holds."""
+    from orchestrator.services.default_experts import _GENERAL_WORKER_V1_DESCRIPTION
+
+    row = db.rows["application-default-worker-seed"]
+    row["seed_version"] = 1
+    row["config"] = {k: v for k, v in row["config"].items() if k != "tools"}
+    row["description"] = _GENERAL_WORKER_V1_DESCRIPTION
+    row["config"]["description"] = _GENERAL_WORKER_V1_DESCRIPTION + "\n"
+    return row
+
+
+@pytest.mark.asyncio
+async def test_v1_general_worker_gains_the_shell_and_the_new_description():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    row = _v1_general_worker(db)
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 2
+    assert row["config"]["tools"] == {
+        "shell": ["run_command", "cancel_command", "shell_read"]
+    }
+    assert row["description"] == bundle["description"]
+    assert "no shell" not in row["description"]
+    assert row["config"]["description"] == bundle["description"]
+
+
+@pytest.mark.asyncio
+async def test_v1_general_worker_keeps_an_operators_tools_and_description():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    row = _v1_general_worker(db)
+    row["config"]["tools"] = {"shell": []}
+    row["description"] = "Our house worker."
+    row["config"]["description"] = "Our house worker."
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 2
+    assert row["config"]["tools"] == {"shell": []}
+    assert row["description"] == "Our house worker."
+    assert row["config"]["description"] == "Our house worker."
 
 
 def test_default_expert_migration_shape():

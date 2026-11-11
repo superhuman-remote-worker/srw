@@ -56852,6 +56852,8 @@ class PostgresDB:
         expected_seed_version: int | None = None,
         expected_subagents: Dict[str, Any] | None = None,
         replacement_subagents: Dict[str, Any] | None = None,
+        expected_description: str | None = None,
+        replacement_description: str | None = None,
     ) -> Dict[str, Any] | None:
         """Additive seed upgrade (services.default_experts.upgrade_managed_seed).
 
@@ -56862,12 +56864,17 @@ class PostgresDB:
         The optional repair triplet replaces only a matching roster subtree
         at the exact expected seed version. PostgreSQL rechecks both after
         waiting for a concurrent update; operator edits therefore win.
+        The optional description pair replaces the description (column and
+        ``config.description``) only where it still equals the expected text,
+        compared after stripping; any other description is the operator's.
         """
         repair = (expected_seed_version, expected_subagents, replacement_subagents)
         if any(value is not None for value in repair) and any(
             value is None for value in repair
         ):
             raise ValueError("Managed seed repair requires version and both rosters")
+        if (expected_description is None) != (replacement_description is None):
+            raise ValueError("Managed seed description repair requires both texts")
         async with self.transaction_scope():
             await self._lock_expert_catalog()
             raw = await self.fetchrow(
@@ -56888,10 +56895,18 @@ class PostgresDB:
             config = {**(config_additions or {}), **config}
             if replacement_subagents is not None:
                 config["subagents"] = replacement_subagents
+            description = None  # NULL keeps the column (COALESCE below)
+            if expected_description is not None:
+                expected = expected_description.strip()
+                if str(current.get("description") or "").strip() == expected:
+                    description = replacement_description
+                if str(config.get("description") or "").strip() == expected:
+                    config["description"] = replacement_description
             row = await self.fetchrow(
-                "UPDATE experts SET seed_version=$2,version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
+                "UPDATE experts SET seed_version=$2,description=COALESCE($3,description),version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
                 current["id"],
                 seed_version,
+                description,
             )
             return await self._persist_expert_resource(
                 {
@@ -65546,7 +65561,13 @@ class PostgresDB:
 
     async def user_can_use_vm(self, user: dict) -> bool:
         """Effective vm_workspace grant; fall back to the legacy can_use_vm column
-        during rollout / on grant-read failure (per-capability fail-mode).
+        only on grant-read failure (per-capability fail-mode).
+
+        The resolved grant decides even when no scope sets the key: it is then
+        the catalog default, granted since 2026-11-11. Before that a user with
+        no row fell through to ``can_use_vm`` (default FALSE), which would keep
+        every new user off VMs whatever the catalog said; a FALSE column cannot
+        tell "denied" from "never set", so it no longer denies.
 
         Admins short-circuit to True — grants restrict non-admins only (the PDP
         takes ``is_admin`` the same way). Without this, a direct caller that
@@ -65565,11 +65586,7 @@ class PostgresDB:
                 project_rows=scoped["project"],
                 global_rows=scoped["global"],
             )
-            if any(
-                r["key"] == "vm_workspace"
-                for r in scoped["user"] + scoped["project"] + scoped["global"]
-            ):
-                return bool(g["vm_workspace"])
+            return bool(g["vm_workspace"])
         except Exception:
             logger.exception("vm grant read failed; fall back to can_use_vm column")
         return bool(user.get("can_use_vm"))

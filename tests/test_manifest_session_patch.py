@@ -150,10 +150,15 @@ async def test_partial_patch_rechecks_full_frozen_policy_under_current_grants():
     runtime = current["resolved"]["spec"]["execution"]["expert"]["inline"]["runtime"]
     runtime["config"]["resolved"]["agent"]["tools"]["shell"] = ["run_command"]
     runtime["config"]["policy"]["tools"]["shell"] = ["run_command"]
+    # An administrator restricted the (default-on) shell grant after freeze.
     db = SimpleNamespace(
         get_system_setting=AsyncMock(return_value=None),
         list_grants_for_scopes=AsyncMock(
-            return_value={"user": [], "project": [], "global": []}
+            return_value={
+                "user": [],
+                "project": [],
+                "global": [{"key": "shell_tools", "value_json": False}],
+            }
         ),
     )
     with pytest.raises(HTTPException, match="shell_tools"):

@@ -446,3 +446,64 @@ async def test_native_expert_binding_preserves_scope_visibility(db, scope_kind):
             str(project_id), str(linked["linked_id"])
         )
         assert linked_project["manifest"] == document
+
+
+# The managed General Worker's seed 2 (2026-11-11): the shell tools and the
+# exact v1 description, through the same SQL and manifest write-back.
+WORKER_KEY = "application-default-worker-seed"
+
+
+async def _v1_worker(db, *, description=None, tools=None):
+    from orchestrator.services.default_experts import _GENERAL_WORKER_V1_DESCRIPTION
+
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    text = _GENERAL_WORKER_V1_DESCRIPTION if description is None else description
+    bundle["description"] = text
+    bundle["config"]["description"] = text + "\n"
+    bundle["config"].pop("tools")
+    if tools is not None:
+        bundle["config"]["tools"] = tools
+    row, created = await db.upsert_managed_expert(
+        managed_key=WORKER_KEY, seed_version=1, **bundle
+    )
+    assert created
+    return row
+
+
+@pytest.mark.asyncio
+async def test_v1_general_worker_gains_shell_and_description_once(db):
+    before = await _v1_worker(db)
+    assert "tools" not in _config(before)
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    after = await db.get_expert_by_managed_key(WORKER_KEY)
+    shipped = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    assert after["seed_version"] == 2
+    assert _config(after)["tools"] == {
+        "shell": ["run_command", "cancel_command", "shell_read"]
+    }
+    assert after["description"] == shipped["description"]
+    assert _config(after)["description"] == shipped["description"]
+    annotations = after["manifest"]["metadata"]["annotations"]
+    assert annotations["srw.io/description"] == shipped["description"]
+    assert after["version"] == before["version"] + 1
+
+    await seed_managed_default_experts(db, ROOT / "config")
+    assert await db.get_expert_by_managed_key(WORKER_KEY) == after
+
+
+@pytest.mark.asyncio
+async def test_v1_general_worker_keeps_operator_description_and_tools(db):
+    before = await _v1_worker(db, description="Our house worker.", tools={"shell": []})
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    after = await db.get_expert_by_managed_key(WORKER_KEY)
+    assert after["seed_version"] == 2
+    assert _config(after) == _config(before)
+    assert after["description"] == "Our house worker."

@@ -367,7 +367,7 @@ def test_fleet_guide_keeps_current_scope_and_fallback_boundaries():
     assert "does not delete jobs" in body
     assert "does not" in body and "continuously monitor a job" in body
     assert "delegation" in body and "different ways srw can split work" in body
-    assert "non-admin users need the delegation grant" in body
+    assert "the delegation grant allows it by default" in body
 
 
 def test_fleet_guide_covers_published_evidence():
@@ -448,8 +448,8 @@ def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
     assert "not the same as a connector's read-only access level" in body
     assert "autonomous" in body and "without per-call approval" in body
     assert "permission mode does not add tools" in body
-    assert "built-in non-admin ceiling allows auto-accept" in body
-    assert "autonomous needs an explicit grant" in body
+    assert "built-in ceiling allows autonomous" in body
+    assert "can narrow it to auto-accept or read-only" in body
     assert "global, project, and user scope" in body
     assert "most restrictive result wins" in body
     assert "installation default is container for jobs and virtual for sessions" in body
@@ -628,7 +628,7 @@ def test_protected_cloud_guide_matches_the_current_mount_selection_rule():
 def test_permissions_guide_covers_the_current_grant_catalog():
     _, body = _focused_topic("permissions-and-availability")
 
-    assert CATALOG["permission_mode"]["default"] == "auto_accept"
+    assert CATALOG["permission_mode"]["default"] == "autonomous"
     for key in CATALOG:
         assert f"`{key}`" in body, key
 

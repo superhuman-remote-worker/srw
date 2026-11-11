@@ -588,6 +588,43 @@ class TestUserCanUseVmAdminGuard:
             is False
         )
 
+    @pytest.mark.asyncio
+    async def test_no_grant_row_reads_the_catalog_default_not_the_column(self):
+        """vm_workspace is granted by default since 2026-11-11. A user no
+        scope sets it for gets a VM even with the legacy column FALSE (its
+        default, which cannot tell "denied" from "never set")."""
+        from orchestrator.database.postgres import PostgresDB
+
+        db = PostgresDB.__new__(PostgresDB)
+        db.list_grants_for_scopes = AsyncMock(
+            return_value={"user": [], "project": [], "global": []}
+        )
+        assert (
+            await db.user_can_use_vm(
+                {"id": JOB_ID, "is_admin": False, "can_use_vm": False}
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_global_restriction_denies_whatever_the_column_says(self):
+        from orchestrator.database.postgres import PostgresDB
+
+        db = PostgresDB.__new__(PostgresDB)
+        db.list_grants_for_scopes = AsyncMock(
+            return_value={
+                "user": [],
+                "project": [],
+                "global": [{"key": "vm_workspace", "value_json": False}],
+            }
+        )
+        assert (
+            await db.user_can_use_vm(
+                {"id": JOB_ID, "is_admin": False, "can_use_vm": True}
+            )
+            is False
+        )
+
 
 # =============================================================================
 # _fail_expired_vm_upgrade_jobs

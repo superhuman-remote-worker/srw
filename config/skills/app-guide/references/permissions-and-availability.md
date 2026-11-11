@@ -62,9 +62,8 @@ or bypass authorization. Autonomous means “do not ask for each tool,” not
 “ignore access controls.” Every real operation still enforces its own user,
 project, connector, deployment, and safety checks. A user's
 `permission_mode` grant is a ceiling; modes above it are unavailable even if
-an expert requests them. The built-in non-admin ceiling allows Auto-accept;
-Autonomous needs an explicit grant unless an administrator narrows or widens
-the applicable policy.
+an expert requests them. The built-in ceiling allows Autonomous; an
+administrator can narrow it to Auto-accept or Read-only.
 
 ## Capability grants are restrict-only ceilings
 
@@ -75,10 +74,17 @@ project or none.
 Admins bypass this grant policy, but not deployment kill switches, missing
 services, ownership checks, or other operation-specific authorization.
 
-The current grant catalog covers:
+Grants that only let the user's own agent get work done in its own workspace
+are on by default: `personal_default_experts`, `vm_workspace`, `shell_tools`,
+`delegation`, `catalog_authoring`, `datasource_tools` and `browser`, with the
+`permission_mode` ceiling at Autonomous and every model selectable. The others
+are off by default. An administrator turns a default off with a global, project
+or user grant set to off. The current grant catalog covers:
 
 - `personal_default_experts` — set or fork personal default experts;
-- `vm_workspace` — select or upgrade to a VM workspace (VM templates need it);
+- `vm_workspace` — select or upgrade to a VM workspace (VM templates need it).
+  The installation must also support VMs, and an administrator can switch VM
+  workspaces off for everyone;
 - `shell_tools` — load shell tools;
 - `delegation` — enable subagent delegation;
 - `public_datasources` — publish a connector to all users;
@@ -87,8 +93,8 @@ The current grant catalog covers:
 - `browser` — load the agent's direct browser tools;
 - `catalog_authoring` — let the agent create and update the user's own experts,
   skills, and automations. The writes are owner-scoped by the same endpoints the
-  UI uses, and a new automation is created switched off; the grant exists because
-  an enabled automation goes on to spawn jobs;
+  UI uses, so bundled and global entries stay read-only, and a new automation is
+  created switched off;
 - `unattended_operations` — start a project self-improvement loop and commission
   a project officer (centurion). These are the two surfaces that spawn jobs with
   no human clicking anything, so the grant bounds unattended token spend as much
@@ -98,15 +104,15 @@ The current grant catalog covers:
   rejected. Reading a loop's state, pausing it, and stopping it stay available —
   nobody is locked out of halting work that is already running;
 - `custom_harness_images` — run an admin-approved custom harness image
-  (`manifestHosting.approvedImages`) as a generic manifest Job. Denied by
-  default; admins bypass it;
+  (`manifestHosting.approvedImages`) as a generic manifest Job. Admins bypass
+  it;
 - `complete_unmerged_pr` — approve or auto-complete a job whose delivered pull
   request has not been merged. Without it, a job that opened a pull request stays
   in review until that pull request lands: approval is refused, and a job that
   would complete itself is routed to review instead. Merging the pull request is
   the normal way past this, not the grant;
 - `model_selection` — restrict the selectable model set;
-- `autonomy_ceiling` — cap worker-job autonomy; and
+- `autonomy_ceiling` — cap worker-job autonomy (Review by default); and
 - `permission_mode` — cap persistent-session permission mode.
 
 An unavailable choice may be greyed out with **Requires a capability grant**.

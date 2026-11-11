@@ -110,8 +110,8 @@ one research job, one implementation job, and one review job.
 **Delegation** is useful when one parent agent can divide a single outcome into
 independent investigations or workstreams and then synthesize the results. It
 must be enabled in the selected expert (`delegation.enabled` plus the
-`delegate_agent` tool) or in **Agent Settings → Tools → Delegation**, and
-non-admin users need the delegation grant.
+`delegate_agent` tool) or in **Agent Settings → Tools → Delegation**. The
+delegation grant allows it by default; an administrator can turn it off.
 
 A delegated subagent is a short-lived, fresh-context helper of a type the
 expert's roster defines (for example an explorer that reads and reports). It

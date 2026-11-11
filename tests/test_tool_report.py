@@ -194,10 +194,17 @@ class TestGrantGate:
         assert "shell_tools" in blocked["shell"]
 
     def test_absent_key_falls_back_to_the_catalog_default(self):
-        """`{}` is deny-by-default for shell_tools and permissive for browser."""
+        """`{}` reads the catalog defaults: shell, delegation, catalog
+        authoring (granted by default since 2026-11-11) and browser are not
+        blocked; each is once its key is set to false."""
         blocked = grant_blocked_categories({})
-        assert "shell" in blocked
-        assert "browser_direct" not in blocked
+        for category in ("shell", "delegation", "catalog_authoring", "browser_direct"):
+            assert category not in blocked
+        assert "shell" in grant_blocked_categories({"shell_tools": False})
+        assert "delegation" in grant_blocked_categories({"delegation": False})
+        assert "catalog_authoring" in grant_blocked_categories(
+            {"catalog_authoring": False}
+        )
 
     def test_datasource_tools_blocks_every_connector_category(self):
         blocked = grant_blocked_categories({"datasource_tools": False})

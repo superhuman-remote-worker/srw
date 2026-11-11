@@ -3217,6 +3217,8 @@ export interface GrantCatalogEntry {
   default: unknown;
   restrict_only: boolean;
   order?: string[];
+  /** One line for the administrator: what allowing the key lets a user do. */
+  description?: string;
 }
 
 export type GrantCatalog = Record<string, GrantCatalogEntry>;
