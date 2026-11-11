@@ -54,18 +54,24 @@ The old token keeps working for 24 hours so you can switch your tool over.
 
 | Scope | Allows |
 |---|---|
-| `jobs:read` | Listing and reading jobs and automations; reading projects and experts. |
+| `jobs:read` | Listing and reading jobs and automations; reading projects, experts, skills, connectors, models and manifests. |
 | `jobs:write` | Creating, pausing, resuming, cancelling, approving and deleting jobs; creating and changing automations. |
 | `chat:read` | Reading sessions and their message history. |
 | `chat:write` | Starting sessions and sending messages. |
 | `knowledge:read` | Searching knowledge, reading sources and citations. |
 | `knowledge:write` | Creating, changing and deleting knowledge notes and citations. |
-| `admin` | Everything above, plus administration. Only an admin can create a token with it. |
+| `admin` | Everything above, plus creating, changing and deleting projects, experts, skills, connectors, models and manifests, and administration. Only an admin can create a token with it. |
 
 `write` does not include `read`: a tool that creates jobs and then checks on
 them needs `jobs:read` and `jobs:write`. A request whose token lacks the
 scope gets `403` with `Insufficient token scope: requires …` naming the
 missing scope.
+
+A token without `admin` can use projects, experts, skills and connectors in
+the jobs it creates, but cannot create or change them. That includes
+`POST /api/manifests/…`, so the `srw` command line can validate, preview and
+apply manifests with a token only if the token has `admin`. Users who are not
+admins make those changes in the Cockpit.
 
 Tokens cannot create or change other tokens, SSH keys or MCP tokens, and they
 cannot open WebSocket connections.

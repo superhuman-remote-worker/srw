@@ -326,6 +326,9 @@ Set `SRW_API_URL` to the public API and provide an approved user's PAT/OIDC bear
 credential through `SRW_TOKEN`. `--token-stdin` reads a token from one stdin line;
 it cannot be combined with `-f -`. TLS uses the system trust store, with `--ca-file`
 for an explicit PEM trust bundle. CLI credentials never inherit internal MCP authority.
+A personal access token needs the `admin` scope for `validate`, `preview`, `apply`,
+`export` and `delete`, which change or send manifests, and `jobs:read` for `get`.
+Only an administrator can create a token with `admin`.
 
 ```bash
 export SRW_API_URL=https://api.localhost
