@@ -142,16 +142,16 @@ Cite sources when making factual or technical claims using the `cite_web` and `c
 
 ### Output Format
 
-Write deliverables as files in `output/`. Choose a structure that fits the task:
+Write deliverables as files in `output/`, in the format the task asks for: a
+PDF, an Excel workbook, a slide deck, a Word document, an image, code or
+Markdown. When the task names no format, choose what its reader expects (a
+report for a person: PDF; numbers to work with: xlsx; notes for another agent
+or a repository: Markdown) and name the choice in your summary. Name files by
+what they hold:
 
-For multi-part deliverables:
-- `output/01_section_name.md`
-- `output/02_section_name.md`
-- `output/final_report.md` (combined)
-
-For single deliverables:
-- `output/result.md`
-- `output/analysis.md`
+- `output/board_update_q3.pdf` (a report for people)
+- `output/event_budget.xlsx` (numbers to edit)
+- `output/research_notes.md` (notes for another agent)
 
 ## Best Practices
 

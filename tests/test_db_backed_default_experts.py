@@ -142,6 +142,8 @@ class SeedDB:
         replacement_subagents=None,
         expected_description=None,
         replacement_description=None,
+        expected_persona=None,
+        replacement_persona=None,
     ):
         # Models PostgresDB.upgrade_managed_expert_seed: `$additions || config`
         # (the row wins every key it has) under a `seed_version < $3` guard.
@@ -165,6 +167,10 @@ class SeedDB:
                     **row["config"],
                     "description": replacement_description,
                 }
+        if expected_persona is not None:
+            prompts = dict(row.get("prompts") or {})
+            if str(prompts.get("persona") or "").strip() == expected_persona.strip():
+                row["prompts"] = {**prompts, "persona": replacement_persona}
         row["seed_version"] = seed_version
         return row
 
@@ -342,13 +348,17 @@ async def test_v3_assistant_keeps_an_operators_tools_roster_and_description():
 
 def _v1_general_worker(db):
     """Rewind the managed General Worker to what a pre-2026-11-11 install holds."""
-    from orchestrator.services.default_experts import _GENERAL_WORKER_V1_DESCRIPTION
+    from orchestrator.services.default_experts import (
+        _GENERAL_WORKER_V1_DESCRIPTION,
+        _GENERAL_WORKER_V1_PERSONA,
+    )
 
     row = db.rows["application-default-worker-seed"]
     row["seed_version"] = 1
     row["config"] = {k: v for k, v in row["config"].items() if k != "tools"}
     row["description"] = _GENERAL_WORKER_V1_DESCRIPTION
     row["config"]["description"] = _GENERAL_WORKER_V1_DESCRIPTION + "\n"
+    row["prompts"] = {**row["prompts"], "persona": _GENERAL_WORKER_V1_PERSONA + "\n"}
     return row
 
 
@@ -363,13 +373,14 @@ async def test_v1_general_worker_gains_the_shell_and_the_new_description():
 
     await seed_managed_default_experts(db, ROOT / "config")
 
-    assert row["seed_version"] == 2
+    assert row["seed_version"] == 3
     assert row["config"]["tools"] == {
         "shell": ["run_command", "cancel_command", "shell_read"]
     }
     assert row["description"] == bundle["description"]
     assert "no shell" not in row["description"]
     assert row["config"]["description"] == bundle["description"]
+    assert row["prompts"]["persona"] == bundle["prompts"]["persona"]
 
 
 @pytest.mark.asyncio
@@ -380,13 +391,41 @@ async def test_v1_general_worker_keeps_an_operators_tools_and_description():
     row["config"]["tools"] = {"shell": []}
     row["description"] = "Our house worker."
     row["config"]["description"] = "Our house worker."
+    row["prompts"] = {**row["prompts"], "persona": "Our house persona."}
 
     await seed_managed_default_experts(db, ROOT / "config")
 
-    assert row["seed_version"] == 2
+    assert row["seed_version"] == 3
+    assert row["prompts"]["persona"] == "Our house persona."
     assert row["config"]["tools"] == {"shell": []}
     assert row["description"] == "Our house worker."
     assert row["config"]["description"] == "Our house worker."
+
+
+@pytest.mark.asyncio
+async def test_v2_general_worker_gets_the_outcome_first_persona_only():
+    """A seed-2 row (shell already granted) still holds the v1 persona; seed 3
+    replaces exactly that persona and touches nothing else."""
+    from orchestrator.services.default_experts import _GENERAL_WORKER_V1_PERSONA
+
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    row = db.rows["application-default-worker-seed"]
+    row["seed_version"] = 2
+    row["description"] = "Our house worker."
+    row["prompts"] = {**row["prompts"], "persona": _GENERAL_WORKER_V1_PERSONA}
+    config_before = deepcopy(row["config"])
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 3
+    assert row["prompts"]["persona"] == bundle["prompts"]["persona"]
+    assert "pdf-report" in row["prompts"]["persona"]
+    assert row["description"] == "Our house worker."
+    assert row["config"] == config_before
 
 
 def test_default_expert_migration_shape():

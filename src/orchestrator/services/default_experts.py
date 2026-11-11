@@ -39,7 +39,10 @@ MANAGED_SEEDS: tuple[dict[str, Any], ...] = (
         # 2: the General Worker gained the shell tools (a v1 row has no
         # `tools` key, so the additive upgrade hands it the bundle's) and
         # the unedited v1 description, which promised "no shell", is replaced.
-        "seed_version": 2,
+        # 3 (2026-11-11, office skills): the unedited v1 persona, written for
+        # a worker without a shell, is replaced by the outcome-first one that
+        # names the workspace's tools and the office skills.
+        "seed_version": 3,
     },
     {
         "managed_key": "application-default-session-seed",
@@ -100,6 +103,34 @@ _GENERAL_WORKER_V1_DESCRIPTION = (
     "deliverables. It starts with a safe, non-orchestrating tool profile: no shell,\n"
     "delegation, scholar pre-job, critic verification, automations, or loops unless\n"
     "an administrator or copied expert explicitly enables them."
+)
+
+# The managed General Worker's persona through seed 2, exactly as seeded
+# (compared stripped). Seed 3 replaces only this text; an operator's own stays.
+_GENERAL_WORKER_V1_PERSONA = (
+    "<role>\n"
+    "General-purpose worker that completes a bounded assignment and leaves a clear,\n"
+    "verified deliverable in the workspace.\n"
+    "</role>\n"
+    "\n"
+    "<goal>\n"
+    "Understand the requested outcome, gather the evidence needed, produce the work,\n"
+    "and verify it before reporting completion.\n"
+    "</goal>\n"
+    "\n"
+    "<operating_rules>\n"
+    "1. Start from the requested outcome and keep the work scoped to it.\n"
+    "2. Use available workspace and research tools when evidence is needed.\n"
+    "3. Record useful intermediate work in the workspace rather than relying on memory.\n"
+    "4. Verify factual claims and inspect the final deliverable before completion.\n"
+    "5. State uncertainty and blockers plainly; never invent sources or tool results.\n"
+    "6. Avoid destructive or irreversible actions unless the assignment authorizes them.\n"
+    "</operating_rules>\n"
+    "\n"
+    "<identity_anchors>\n"
+    "Remain a careful general worker. You finish the assigned\n"
+    "job, verify the result, and do not silently expand its scope.\n"
+    "</identity_anchors>"
 )
 
 
@@ -242,6 +273,14 @@ async def upgrade_managed_seed(
         # Compared again under the row lock: an edited description stays.
         repair["expected_description"] = _GENERAL_WORKER_V1_DESCRIPTION
         repair["replacement_description"] = bundle["description"]
+    if (
+        spec["managed_key"] == "application-default-worker-seed"
+        and current < 3 <= target
+        and bundle.get("prompts", {}).get("persona")
+    ):
+        # Compared again under the row lock: an edited persona stays.
+        repair["expected_persona"] = _GENERAL_WORKER_V1_PERSONA
+        repair["replacement_persona"] = bundle["prompts"]["persona"]
     updated = await db.upgrade_managed_expert_seed(
         managed_key=spec["managed_key"],
         seed_version=target,
@@ -266,9 +305,10 @@ async def seed_managed_default_experts(db, config_dir: Path) -> dict[str, str]:
     current application pointer are preserved across restarts and upgrades.
     The one exception is :func:`upgrade_managed_seed`: a row behind the
     bundle's ``seed_version`` gains the top-level config keys it lacks. Only
-    the exact managed v2/v3 assistant rosters and the exact shipped
-    descriptions (General Worker v1, assistant v3) receive a conditional
-    repair; operator variants and unrelated content remain unchanged.
+    the exact managed v2/v3 assistant rosters, the exact shipped
+    descriptions (General Worker v1, assistant v3) and the exact shipped
+    General Worker v1 persona receive a conditional repair; operator
+    variants and unrelated content remain unchanged.
     """
     seeded: dict[str, str] = {}
     for spec in MANAGED_SEEDS:

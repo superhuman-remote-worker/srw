@@ -461,8 +461,11 @@ async def test_native_expert_binding_preserves_scope_visibility(db, scope_kind):
 WORKER_KEY = "application-default-worker-seed"
 
 
-async def _v1_worker(db, *, description=None, tools=None):
-    from orchestrator.services.default_experts import _GENERAL_WORKER_V1_DESCRIPTION
+async def _v1_worker(db, *, description=None, tools=None, persona=None):
+    from orchestrator.services.default_experts import (
+        _GENERAL_WORKER_V1_DESCRIPTION,
+        _GENERAL_WORKER_V1_PERSONA,
+    )
 
     bundle = load_seed_bundle(
         ROOT / "config", directory="general-worker", expert_type="worker"
@@ -471,6 +474,9 @@ async def _v1_worker(db, *, description=None, tools=None):
     bundle["description"] = text
     bundle["config"]["description"] = text + "\n"
     bundle["config"].pop("tools")
+    bundle["prompts"]["persona"] = (
+        _GENERAL_WORKER_V1_PERSONA + "\n" if persona is None else persona
+    )
     if tools is not None:
         bundle["config"]["tools"] = tools
     row, created = await db.upsert_managed_expert(
@@ -491,10 +497,11 @@ async def test_v1_general_worker_gains_shell_and_description_once(db):
     shipped = load_seed_bundle(
         ROOT / "config", directory="general-worker", expert_type="worker"
     )
-    assert after["seed_version"] == 2
+    assert after["seed_version"] == 3
     assert _config(after)["tools"] == {
         "shell": ["run_command", "cancel_command", "shell_read"]
     }
+    assert after["prompts"]["persona"] == shipped["prompts"]["persona"]
     assert after["description"] == shipped["description"]
     assert _config(after)["description"] == shipped["description"]
     annotations = after["manifest"]["metadata"]["annotations"]
@@ -507,12 +514,18 @@ async def test_v1_general_worker_gains_shell_and_description_once(db):
 
 @pytest.mark.asyncio
 async def test_v1_general_worker_keeps_operator_description_and_tools(db):
-    before = await _v1_worker(db, description="Our house worker.", tools={"shell": []})
+    before = await _v1_worker(
+        db,
+        description="Our house worker.",
+        tools={"shell": []},
+        persona="Our house persona.",
+    )
 
     await seed_managed_default_experts(db, ROOT / "config")
 
     after = await db.get_expert_by_managed_key(WORKER_KEY)
-    assert after["seed_version"] == 2
+    assert after["seed_version"] == 3
+    assert after["prompts"]["persona"] == "Our house persona."
     assert _config(after) == _config(before)
     assert after["description"] == "Our house worker."
 

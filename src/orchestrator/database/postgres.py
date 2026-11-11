@@ -56854,6 +56854,8 @@ class PostgresDB:
         replacement_subagents: Dict[str, Any] | None = None,
         expected_description: str | None = None,
         replacement_description: str | None = None,
+        expected_persona: str | None = None,
+        replacement_persona: str | None = None,
     ) -> Dict[str, Any] | None:
         """Additive seed upgrade (services.default_experts.upgrade_managed_seed).
 
@@ -56867,6 +56869,7 @@ class PostgresDB:
         The optional description pair replaces the description (column and
         ``config.description``) only where it still equals the expected text,
         compared after stripping; any other description is the operator's.
+        The persona pair does the same for ``prompts.persona``.
         """
         repair = (expected_seed_version, expected_subagents, replacement_subagents)
         if any(value is not None for value in repair) and any(
@@ -56875,6 +56878,8 @@ class PostgresDB:
             raise ValueError("Managed seed repair requires version and both rosters")
         if (expected_description is None) != (replacement_description is None):
             raise ValueError("Managed seed description repair requires both texts")
+        if (expected_persona is None) != (replacement_persona is None):
+            raise ValueError("Managed seed persona repair requires both texts")
         async with self.transaction_scope():
             await self._lock_expert_catalog()
             raw = await self.fetchrow(
@@ -56902,6 +56907,11 @@ class PostgresDB:
                     description = replacement_description
                 if str(config.get("description") or "").strip() == expected:
                     config["description"] = replacement_description
+            prompts = dict(current.get("prompts") or {})
+            if expected_persona is not None and (
+                str(prompts.get("persona") or "").strip() == expected_persona.strip()
+            ):
+                prompts["persona"] = replacement_persona
             row = await self.fetchrow(
                 "UPDATE experts SET seed_version=$2,description=COALESCE($3,description),version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
                 current["id"],
@@ -56912,7 +56922,7 @@ class PostgresDB:
                 {
                     **dict(row),
                     "config": config,
-                    "prompts": current.get("prompts") or {},
+                    "prompts": prompts,
                 }
             )
 
