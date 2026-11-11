@@ -2587,7 +2587,9 @@ class TestSetupTools:
         assert "create_job" not in loaded_names
         assert "list_project_repositories" not in loaded_names
         assert "list_skills" in loaded_names
-        assert "request_workspace_upgrade" not in loaded_names
+        # Not an app-control tool any more (2026-11-11): a lite session keeps
+        # its way to ask for a shell even with every fleet group disabled.
+        assert "request_workspace_upgrade" in loaded_names
 
     def test_agent_catalog_can_be_disabled(self):
         """Experts & Skills opt-out removes expert/skill catalog tools."""

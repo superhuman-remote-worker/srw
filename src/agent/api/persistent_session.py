@@ -124,7 +124,6 @@ _JOB_INSPECTION_DISABLED_KEY = "_job_inspection_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 _CANVAS_DISABLED_KEY = "_canvas_disabled"
-_FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
 _CANVAS_SKILL_NAME = "present-with-canvas"
 _CANVAS_SKILL_MANIFEST = f"skills/{_CANVAS_SKILL_NAME}/.srw-managed.json"
 _CANVAS_SKILL_MANIFEST_OWNER = "srw-present-with-canvas-v1"
@@ -3189,7 +3188,6 @@ class PersistentSession:
         agent_catalog_enabled = _agent_catalog_enabled(self.config)
         workflows_enabled = _workflows_enabled(self.config)
         fleet_management_tools = set(get_tools_by_category("orchestrator"))
-        fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
         job_control_tools = set(get_tools_by_category("job_control"))
         job_inspection_tools = set(get_tools_by_category("job_inspection"))
         agent_catalog_tools = set(get_tools_by_category("agent_catalog"))
@@ -3287,6 +3285,17 @@ class PersistentSession:
         # real sandbox. Gated on the backend lacking a shell — after a virtual →
         # sandbox swap this re-derives against the now-shell-capable backend and
         # the tool drops out (nothing left to upgrade to).
+        #
+        # Not gated on Fleet Management (2026-11-11). It used to be, as the
+        # opt-out for sessions that must not receive SRW app-control tools; but
+        # the orchestrator derives that opt-out marker from the fully merged
+        # config (session_config_resolution: "empty session-control groups are
+        # meaningful at every layer") and expert_base declares
+        # `tools.orchestrator: []`, so every default session read as opted out
+        # and none on a lite tier could ask for a shell. The tool only records a
+        # request a person approves, and the upgrade re-runs the owner's grants,
+        # so it stays with every lite session. A commissioned background officer
+        # still loses it to the ceiling applied below.
         _backend = getattr(self.workspace_manager, "backend", None)
         if (
             fleet_management_enabled
@@ -3295,11 +3304,7 @@ class PersistentSession:
         ):
             if "checkout_project_repository" not in tool_names:
                 tool_names.append("checkout_project_repository")
-        if (
-            fleet_management_enabled
-            and _backend is not None
-            and not getattr(_backend, "supports_shell", False)
-        ):
+        if _backend is not None and not getattr(_backend, "supports_shell", False):
             if "request_workspace_upgrade" not in tool_names:
                 tool_names.append("request_workspace_upgrade")
 
