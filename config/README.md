@@ -139,7 +139,8 @@ config/
 │   ├── session.yaml             #   public name `session_base` (interactive / persistent experts)
 │   └── subagent.yaml            #   public name `subagent_base` (roster entries; declares `$ignore_keys`)
 ├── schema.json                  # JSON Schema for config validation
-├── model_config_matrix.yaml     # Per model family: prompt/instruction filenames, inference params, context limits
+├── model_config_matrix.yaml     # Per model family: prompt/instruction filenames, inference params, context limits, reasoning, guardrails
+├── guardrails/                  # Per-family tool examples and nudges (named by the matrix's `guardrails.file`)
 ├── README.md                    # This file
 ├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
@@ -156,7 +157,9 @@ config/
 │   ├── strategic-phase/SKILL.md
 │   └── tactical-phase/SKILL.md
 ├── prompts/                     # System, persona, and auxiliary prompt templates
-│   ├── systemprompt.txt         # Main system prompt
+│   ├── systemprompt.txt         # Worker (job) system prompt scaffold
+│   ├── systemprompt_interactive.txt # Session system prompt scaffold
+│   ├── systemprompt_subagent.txt    # Subagent (roster child) system prompt scaffold
 │   ├── persona.txt              # Agent persona/identity prompt
 │   ├── summarization_prompt.txt # Context compaction prompt
 │   ├── systemprompt_minimax.txt # MiniMax M2.7-optimized system prompt
@@ -187,8 +190,9 @@ config/
     ├── strategic_todos_initial.yaml     # Initial todos for job start
     ├── strategic_todos_transition.yaml  # Todos for phase transitions
     ├── strategic_todos_resume.yaml      # Todos for job resume with feedback
+    ├── live_tactical_todos.yaml         # First (tactical) phase of a live-session job
+    ├── live_post_session_todos.yaml     # Strategic phase after a live session ended
     ├── workspace_template.md            # (deprecated; workspace.md removed — unused)
-    ├── todo_guide.md                    # Todo crafting guide
     └── phase_retrospective_template.md  # Template for phase retrospectives
 ```
 
@@ -295,8 +299,8 @@ merge, again after the job/thread override layers, and after a roster
 override, so no later layer can re-introduce them. A key that does not apply
 to a role is dropped silently — never an error. Today only the subagent
 overlay declares any (`workspace.backend/remote/mounts/structure/instructions_template/initial_files/git_versioning`,
-`autonomy`, `verification`, `scholar`, `curator`, `phase_settings`,
-`delegation`, `communication`, `officer`, `headless`); the worker and session
+`autonomy`, `verification`, `scholar`, `curator`, `phase_settings`, `tools.core`,
+`delegation`, `tools.delegation`, `communication`, `officer`, `headless`); the worker and session
 overlays declare none, so a re-rooted expert keeps everything it authored.
 
 Never read a base file directly — an overlay alone is only the role's residue.
@@ -349,7 +353,7 @@ For configs that need custom prompts or instructions, create a directory:
 ```
 config/
 └── my_agent/
-    ├── config.yaml              # Expert overlay (extends a mode base)
+    ├── config.yaml              # Expert overlay (extends a role base)
     ├── model_config_matrix.yaml # Expert-level matrix overrides (optional)
     ├── instructions.md          # Custom instructions (optional)
     └── skills/
@@ -357,26 +361,96 @@ config/
         └── tactical-phase/SKILL.md  # Custom execution guidance (optional)
 ```
 
-### Two Matrix Systems
+### Model Config Matrix
 
-The agent uses two parallel matrix systems with the same 4-level fallback chain:
+Everything that depends on the model family lives in one file,
+`config/model_config_matrix.yaml`. Its top-level keys are model families, and
+`default` is the fall-through. The loader derives the family from the model ID
+(`family_of()` in `src/shared/runtime/core/model_registry.py`); an
+`openrouter/`, `groq/`, `codex/` or `openai/` prefix is ignored. A model ID it
+does not recognize uses `default`.
 
-**Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts:
-- Entries include `systemprompt`, `persona`, and `summarization`
-- File search: expert directory → `config/prompts/`
+Each family block can have these sections:
 
-**Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates:
-- Entries: `instructions`, `strategic_todos_initial`, `strategic_todos_transition`, `strategic_todos_resume`, `workspace_template`, `todo_guide`
-- File search: expert directory → `config/templates/`
+| Section | Holds |
+|---------|-------|
+| `prompts` | Prompt type → file in `config/prompts/`: `systemprompt`, `systemprompt_interactive`, `persona`, `summarization`, `memory_extraction`, `curation`, `knowledge_assembler`, `citation_verification` |
+| `instructions` | Template type → file in `config/templates/`: `instructions`, `strategic_todos_initial`, `strategic_todos_transition`, `strategic_todos_resume`, `live_tactical_todos`, `live_post_session_todos`, `workspace_template` |
+| `settings` | Inference parameters and model limits, e.g. `temperature`, `top_p`, `top_k`, `multimodal`, `parallel_tool_calls`, `model_max_context_tokens`, `max_output_tokens`, `image_tokens`, `structured_output_method`, `shell_mode`, `session_max_concurrent` |
+| `reasoning` | How the family's reasoning is controlled: `method`, `default`, `options` |
+| `guardrails` | `file:` a file in `config/guardrails/` with tool-call examples and nudges |
 
-Both use the same resolution chain (4 levels):
+An excerpt:
 
-1. Expert matrix → model-specific key → type
-2. Expert matrix → `"default"` key → type
-3. Base matrix → model-specific key → type
-4. Base matrix → `"default"` key → type
+```yaml
+default:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh] }
+  prompts:
+    systemprompt: systemprompt.txt
+    persona: persona.txt
+    summarization: summarization_prompt.txt
+  instructions:
+    instructions: instructions.md
+  guardrails:
+    file: default.yaml
+  settings:
+    temperature: 0.0
+    multimodal: false
+    parallel_tool_calls: false
+    model_max_context_tokens: 128000
+    image_tokens: { mode: flat, flat: 1600 }
 
-Once the filename is resolved, the loader checks the expert directory first for the file, falling back to the framework directory (`config/prompts/` or `config/templates/`).
+minimax-m3:           # a family names only what differs from `default`
+  prompts:
+    systemprompt: systemprompt_minimax_m3.txt
+    persona: persona_minimax_m3.txt
+  instructions:
+    instructions: instructions_minimax_m3.md
+  guardrails:
+    file: minimax_m3.yaml
+  settings:
+    temperature: 1.0
+    top_p: 0.95
+    multimodal: true
+    model_max_context_tokens: 1000000
+```
+
+An expert directory may hold its own `model_config_matrix.yaml` with only the
+entries that differ from the base file (see `config/experts/developer/`).
+
+How each section resolves:
+
+- **`prompts` and `instructions`** pick a filename from the first match of:
+  1. expert matrix → model family
+  2. expert matrix → `default`
+  3. base matrix → model family
+  4. base matrix → `default`
+
+  The loader then looks for the file in the expert directory before the
+  framework directory (`config/prompts/` or `config/templates/`). In each
+  directory it tries the family's filename first, then the plain one
+  (for example `persona_minimax_m3.txt`, then `persona.txt`).
+- **`settings`**: the expert matrix is deep-merged over the base matrix, then
+  the family block over `default`. Most keys are written to `llm`, but an `llm`
+  key that the expert or a layer above it (project, user or job/thread
+  override) sets itself wins over the family value. A few keys go elsewhere:
+  `image_tokens` and `pdf_render_dpi` to `limits`, `shell_mode` to
+  `shell.mode` (only when no config sets it), and `session_max_concurrent` to
+  the `delegation` block.
+- **`guardrails`**: the `default` file, with the family's file merged on top.
+  An expert matrix can name its own file per family; it is read from the
+  expert's `guardrails/` directory and merged over the base file.
+- **`reasoning`** comes from the base matrix only: the family's block, else
+  `default`'s.
+
+Context limits are derived from the model's window; see
+[Context Management](#context-management).
+
+When a deployment enables database overrides (`agent.configDbOverridesEnabled`
+in the Helm values, `CONFIG_DB_OVERRIDES_ENABLED` for the agent), entries an
+administrator stores through `/api/admin/config/overrides` win over these files
+for prompts, instructions, settings and guardrails: the family's entry first,
+then a global one.
 
 ### Resolved Config JSONB
 
@@ -404,8 +478,11 @@ today's defaults.
 Controls when the agent pauses for human review at phase boundaries and after job completion.
 
 ```yaml
-autonomy: partial  # full | review | partial | guided | dependent
+autonomy: review  # full | review | partial | guided | dependent
 ```
+
+The worker overlay sets `review`, so a job that does not choose a level runs
+under `review`. Autonomy applies to jobs only; sessions and subagents ignore it.
 
 | Level | After 1st Strategic | After Nth Strategic | After Tactical | After job_complete |
 |-------|:---:|:---:|:---:|:---:|
@@ -415,9 +492,9 @@ autonomy: partial  # full | review | partial | guided | dependent
 | `guided` | freeze | freeze | - | freeze |
 | `dependent` | freeze | freeze | freeze | freeze |
 
-- **`full`** — Fully autonomous. Never freezes. On `job_complete`, writes `job_completion.json` directly and sets DB status to `completed`.
-- **`review`** — Runs freely through all phases but freezes after `job_complete` for human review before marking as completed.
-- **`partial`** (default) — Freezes after the first strategic phase boundary for early feedback, then runs freely. Freezes again at `job_complete`.
+- **`full`** — Fully autonomous. Never freezes. On `job_complete`, the agent writes `job_completion.json` directly and the orchestrator marks the job `completed` (or starts the critic when `verification.enabled`).
+- **`review`** (default) — Runs freely through all phases but freezes after `job_complete` for human review before marking as completed.
+- **`partial`** — Freezes after the first strategic phase boundary for early feedback, then runs freely. Freezes again at `job_complete`.
 - **`guided`** — Freezes at every strategic phase boundary for review. Tactical phases run freely. Freezes at `job_complete`.
 - **`dependent`** — Freezes at every phase boundary (strategic and tactical). Maximum human oversight.
 
@@ -427,13 +504,24 @@ When frozen at a phase boundary (`freeze_type: "phase_boundary"`), approving the
 
 ```yaml
 llm:
-  model: openai/gpt-oss-120b
-  temperature: 0.0
-  reasoning_level: high  # low, medium, high
-  base_url: null         # Custom API endpoint
-  timeout: 600           # Seconds
-  max_retries: 3
+  model: openai/gpt-oss-120b  # The one model every phase and session turn runs on
+  temperature: 0.0            # Optional: omit to use the model family's value
+  reasoning_level: high       # Levels depend on the model family
+  base_url: null              # Custom API endpoint
+  timeout: 600                # Seconds
+  max_retries: 3              # Provider-SDK retries (the worker overlay sets 0)
+  summarization:              # Optional: another model for context compaction
+    model: your-summary-model
 ```
+
+An expert has one `llm.model`. The legacy per-phase tiers `llm.strategic`,
+`llm.tactical` and `llm.subagent` still load, with a deprecation warning:
+`strategic` (else `tactical`) becomes `llm.model` when the layer sets no model
+of its own, and `subagent` moves to `subagents.llm`.
+
+Inference parameters you leave out come from the model family (see
+[Model Config Matrix](#model-config-matrix)). A `reasoning_level` the family
+does not offer is clamped to the nearest level it does, preferring lower ones.
 
 ### Workspace Configuration
 
@@ -442,125 +530,116 @@ workspace:
   structure:
     - archive/
     - output/
-    - tools/
+    - reference/
   max_read_words: 25000
 ```
 
 ### Tool Categories
 
-Tools are organized into categories. Each category maps to a module under `src/agent/tools/`:
+`tools` has one key per tool category. Its value is a **policy** for that
+category, not a list of members: the tool catalog (`src/shared/tool_catalog/`,
+re-exported as `TOOL_REGISTRY` by `src/agent/tools/registry.py`) decides which
+tools a category holds.
+
+| Value | Meaning |
+|-------|---------|
+| `true` | Every tool in the category that config may grant (see "Grants" below). Follows the catalog, so a tool added later is included. |
+| `false` | No tools. |
+| `{only: [a, b]}` | Exactly these tools. |
+| `{except: [a]}` | `true` minus these tools. Follows the catalog. |
+| `[a, b]` | Legacy spelling of `{only: [a, b]}`. |
+| `[]` | Legacy spelling of `false`. |
 
 ```yaml
 tools:
-  # File operations (src/agent/tools/workspace/)
-  workspace:
-    - read_file
-    - write_file
-    - edit_file
-    - list_files
-    - delete_file
-    - search_files
-    - file_exists
-    - move_file
-    - rename_file
-    - copy_file
-    - get_workspace_summary
-    - get_document_info
-    - create_directory
-    - delete_directory
-
-  # Skill loader (src/agent/tools/workspace/skills.py). Its own group, so a
-  # workspace list written above never drops it. See "Skills" below.
-  skills:
-    - use_skill
-
-  # Task management + completion (src/agent/tools/core/)
-  core:
-    - next_phase_todos      # Stage todos for next tactical phase
-    - todo_complete          # Mark current todo done
-    - todo_list              # List current todos
-    - request_replan         # End the phase early and re-plan, keeping all work
-    - mark_complete          # Signal phase/task completion
-    - job_complete           # Signal final completion (strategic only)
-
-  # Research: web, papers, browser, workflows (src/agent/tools/research/)
-  research:
-    - web_search             # Tavily web search
-    - extract_webpage        # Extract content from a URL
-    - crawl_website          # Crawl a website following links
-    - map_website            # Map a website's link structure
-    - search_papers          # Search arXiv or Semantic Scholar
-    - download_paper         # Download PDF (arXiv → Unpaywall → browser fallback)
-    - get_paper_info         # Paper metadata via Semantic Scholar
-    - research_topic         # Multi-database literature search + download
-    # NOTE: browse_website / download_from_website were removed from the
-    # registry — the agent drives the browser itself via the browser_direct
-    # group below. Names listed here must exist in TOOL_REGISTRY; an unknown
-    # name fails the whole batch load (tests/test_config_tool_names_are_registered.py).
-
-  # Citation management (src/agent/tools/citation/)
-  citation:
-    - cite_document
-    - cite_web
-    - list_sources
-    - get_citation
-    - list_citations
-    - edit_citation
-    - withdraw_citation
-    - annotate_source
-    - get_annotations
-    - tag_source
-    - search_library
-    - generate_bibliography
-
-  # Database tool categories (src/agent/tools/graph/, sql/, mongodb/)
-  # These are injected/stripped automatically by the orchestrator based on
-  # which datasources are attached to the job. Usually left empty in config.
-  graph: []      # Neo4j: execute_cypher_query, get_database_schema
-  sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
-  mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
-
-  # Shell command execution (src/agent/tools/shell/)
-  # Mode controlled by shell.mode: "stateless" (default) or "persistent"
-  shell:
-    - run_command     # Execute commands, get output (stateless mode, default)
-    - shell_read      # Read more output from scrollback
-    # Alternative (persistent mode): shell_execute + shell_read
-
-  # Evaluation tools for critic agents (src/agent/tools/evaluation/)
-  # Enable in critic config for approve/return capabilities.
-  evaluation: []
-
-  # Version control (src/agent/tools/git/) — reads the job's own repo by default and
-  # an attached repository datasource with repo="<clone-dir>".
-  #
-  # ONLY BOUND WHEN THE AGENT HAS NO SHELL TOOLS. If `shell` above is
-  # non-empty, ToolsConfig.__post_init__ (src/shared/runtime/core/loader.py) drops this whole
-  # group: a shell can run git against any repository in the workspace, and
-  # granting both gives the agent two ways to ask one question — the weaker of
-  # which silently answers about a different repo. Shell-having agents should
-  # be told to run `git ...` (and `git -C repos/<name> ...`) instead.
-  git:
-    - git_log
-    - git_show
-    - git_diff
-    - git_status
-    - git_tags
+  workspace: true                             # every file tool
+  research: {except: [crawl_website, map_website]}
+  citation: {only: [cite_web, list_sources]}
+  shell: [run_command, shell_read]            # shell must list its tools
+  browser_direct: false
 ```
 
-Select which tools your agent needs. For example, a research-focused agent:
+- A layer's value replaces the inherited one; lists are not merged. A child
+  `{except: [...]}` starts again from the whole category, even when its parent
+  used `only`.
+- `shell` and `delegation` must list their tools: only a list,
+  `{only: [...]}` or `false` is accepted. `true` and `except` would pick up a
+  tool added to the category later without review.
+- `shell.mode` selects the shell flavour: `stateless` (the fallback) binds
+  `run_command`, `persistent` binds `shell_execute`; each name is mapped to the
+  other to match the mode. The model family can set the default mode
+  (`settings.shell_mode` in the matrix); an explicit `shell.mode` wins.
+- `git` is dropped when `shell` is not empty: the shell can run `git` against
+  any repository in the workspace (`ToolsConfig.__post_init__` in
+  `src/shared/runtime/core/loader.py`).
+- A workspace without a shell drops `shell`, `browser_direct` and `git`; one
+  without file tools drops `workspace`, `skills` and `canvas`.
+- `orchestrator: true` also grants the `job_control` and `job_inspection`
+  tools that `true` would grant there; it predates the split into three groups.
+- Every name must exist in the catalog. `tests/test_config_tool_names_are_registered.py`
+  checks the bundled configs.
 
-```yaml
-tools:
-  research:
-    - web_search
-    - search_papers
-    - download_paper
-    - research_topic
-  citation:
-    - cite_web
-    - cite_document
-```
+| Category | Purpose | Tools |
+|----------|---------|-------|
+| `workspace` | Workspace file operations | `read_file`, `write_file`, `edit_file`, `list_files`, `delete_file`, `search_files`, `file_exists`, `move_file`, `rename_file`, `copy_file`, `get_document_info`, `create_directory`, `delete_directory` |
+| `skills` | Load a skill (see [Skills](#skills)) | `use_skill` |
+| `core` | Worker todos and job completion (the phase loop) | `next_phase_todos`, `todo_complete`, `todo_list`, `request_replan`, `mark_complete`, `job_complete`, `request_workspace_upgrade`, `sleep`, `notify_user` |
+| `session_task` | A session's lightweight todo list | `task_add`, `task_complete`, `task_list` |
+| `research` | Web search, page extraction, papers | `web_search`, `extract_webpage`, `crawl_website`, `map_website`, `search_papers`, `download_paper`, `get_paper_info`, `research_topic` |
+| `browser_direct` | Step-by-step control of a browser on the workspace | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_scroll`, `browser_screenshot`, `browser_back`, `browser_close` |
+| `citation` | Citations and the source library | `cite_document`, `cite_web`, `list_sources`, `get_citation`, `list_citations`, `edit_citation`, `withdraw_citation`, `annotate_source`, `get_annotations`, `tag_source`, `search_library`, `generate_bibliography` |
+| `knowledge` | Project knowledge base: notes and search | `kb_write`, `kb_update`, `kb_delete`, `kb_read`, `kb_list`, `kb_search`, `kb_grep`, `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`, `kb_export`, `kb_lint`, `kb_index` |
+| `memory` | Search project memory (bound only while `memory.enabled`, `memory.manager.enabled` and its pipeline extension are on) | `memory_search` |
+| `git` | Read git history of the job's repository and attached repositories | `git_log`, `git_show`, `git_diff`, `git_status`, `git_tags` |
+| `shell` | Run commands on the workspace | `run_command`, `cancel_command`, `shell_execute`, `shell_read`, `srw_cloud_status` |
+| `evaluation` | Critic verdicts: approve a job or return it with feedback | `approve_job_verdict`, `return_job_with_feedback` |
+| `communication` | Message people by email | `send_message` |
+| `delegation` | Built-in subagents (see [Delegation](#delegation)) | `delegate_agent`, `wait_agent`, `message_agent`, `stop_agent`, `list_agents` |
+| `canvas` | Dynamic Canvas presentation (sessions) | `get_canvas`, `set_canvas`, `clear_canvas` |
+| `orchestrator` | Projects, repositories and session context | `get_session_context`, `get_current_project`, `list_project_jobs`, `list_project_repositories`, `get_default_project_repository`, `checkout_project_repository` |
+| `job_control` | Create, steer and review jobs | `accept_job_diff`, `acknowledge_job_message`, `approve_job`, `assign_job`, `cancel_job`, `create_job`, `delete_job`, `escalate_job_message`, `pause_job`, `promote_job`, `reject_job_diff`, `reply_to_job_message`, `resume_job_with_feedback`, `send_message_to_job`, `steer_job` |
+| `job_inspection` | Read jobs, their files, logs and audit trail | `get_audit_bulk`, `get_audit_timerange`, `get_audit_trail`, `get_chat_bulk`, `get_chat_history`, `get_current_todos`, `get_frozen_job`, `get_job`, `get_job_completion_report`, `get_job_diff`, `get_job_file`, `get_job_log`, `get_job_progress`, `get_job_summary`, `get_llm_request`, `get_message_thread`, `get_shell_state`, `get_stuck_jobs`, `get_todo_archive`, `get_todos`, `get_workspace_overview`, `list_job_commits`, `list_job_evidence`, `list_job_files`, `list_jobs`, `list_llm_requests`, `list_message_threads`, `list_todo_archives`, `read_job_evidence`, `search_audit` |
+| `agent_catalog` | Read experts and skills | `list_experts`, `get_expert`, `list_skills`, `search_skills`, `get_skill` |
+| `catalog_authoring` | Create or update experts, skills and automations from bundles (needs the `catalog_authoring` capability grant) | `get_expert_bundle`, `set_expert_bundle`, `get_skill_bundle`, `set_skill_bundle`, `get_automation_bundle`, `set_automation_bundle` |
+| `workflows` | Inspect automations and project loops; draft disabled automations | `list_automations`, `get_automation`, `list_automation_runs`, `propose_automation`, `get_project_loop`, `list_project_loop_jobs`, `explain_project_loop` |
+| `loop` | Loop-campaign planning; set per job by a planner loop, not in bundled configs | `loop_plan` |
+| `product_help` | Product guide and capability readers for sessions | `read_product_guide`, `get_product_capabilities` |
+| `graph` | Neo4j datasource | `cypher_query`, `cypher_execute`, `get_database_schema` |
+| `sql` | PostgreSQL datasource | `sql_query`, `sql_schema`, `sql_execute` |
+| `mongodb` | MongoDB datasource | `mongo_query`, `mongo_aggregate`, `mongo_schema`, `mongo_insert`, `mongo_update` |
+| `webdav` | WebDAV / cloud-storage datasource | `webdav_list`, `webdav_read`, `webdav_info`, `webdav_write`, `webdav_delete` |
+| `repo` | Write to an attached repository datasource | `repo_checkout`, `repo_commit`, `repo_push`, `repo_pull`, `repo_open_pr`, `repo_pr_status` |
+| `email` | IMAP/SMTP mailbox datasource | `email_list_folders`, `email_list`, `email_search`, `email_read`, `email_move`, `email_flag`, `email_draft`, `email_send` |
+| `mcp` | Tools of attached MCP datasources, discovered at runtime. `true` takes all of them; `except` is not accepted. | — |
+
+**Phases.** In a worker's phase loop some tools work in one phase only, and a
+call in the other phase is refused. Sessions and subagents have no phases.
+
+- Strategic only: `next_phase_todos`, `job_complete`, `approve_job_verdict`,
+  `return_job_with_feedback`.
+- Tactical only: `request_replan`; every `research`, `browser_direct`,
+  `graph`, `sql` and `mongodb` tool; `webdav_write`, `webdav_delete`,
+  `email_move`, `email_flag`, `email_draft`, `email_send`.
+
+`phase_settings.strategic_tools` lets an expert call named tactical-only tools
+in its strategic phase as well.
+
+**Grants.** Two kinds of tools are not reached by `true` or `except`:
+
+- *Explicit grant*: config grants these only by naming them. That is every
+  `delegation` tool (which also needs `delegation.enabled`); in `job_control`
+  every tool except `approve_job`, `cancel_job`, `create_job`, `pause_job` and
+  `resume_job_with_feedback`; and in `job_inspection` every tool except
+  `get_job`, `get_job_completion_report`, `get_job_file`, `list_job_evidence`,
+  `list_job_files`, `list_jobs` and `read_job_evidence`.
+- *Granted by the runtime*: code binds these, not config, so leave the key
+  out. `graph`, `sql`, `mongodb`, `webdav`, `repo` and `email` are bound when
+  a datasource of that type is attached (see
+  [Multi-Stage Config Pipeline](#multi-stage-config-pipeline-database-tools)).
+  `session_task` and `product_help` are bound in sessions. The single tools
+  `request_workspace_upgrade`, `sleep`, `notify_user`,
+  `checkout_project_repository` and `srw_cloud_status` each have their own
+  runtime switch.
 
 See `expert_base.yaml` (the shared groups) and `overlays/worker.yaml` /
 `overlays/session.yaml` (the role-owned groups) for the conservative inherited
@@ -605,7 +684,7 @@ managed through the datasource connector system and resolved at dispatch.
 
 ### Multi-Stage Config Pipeline (Database Tools)
 
-Database tool categories (`graph`, `sql`, `mongodb`) are **not** controlled by the agent config YAML. Instead, they go through a multi-stage pipeline:
+Datasource tool categories (`graph`, `sql`, `mongodb`, `webdav`, `repo`, `email`) are **not** controlled by the agent config YAML. Instead, they go through a multi-stage pipeline:
 
 ```
 1. Agent config (config/*.yaml)        → User defines base tools (workspace, research, etc.)
@@ -641,58 +720,28 @@ existed) is converted when the config is loaded.
 
 ### Context Management
 
-Context limits are model-dependent and set via `settings_matrix.yaml` (see below). The values below are defaults that get overridden per model family:
-
 ```yaml
 limits:
   message_count_threshold: 300
-  # Model-dependent (set in settings_matrix.yaml, NOT here):
-  # context_threshold_tokens, model_max_context_tokens,
+  # Derived from the model's context window, never set here:
+  # model_max_context_tokens, context_threshold_tokens,
   # message_count_min_tokens
   # (summarization budgets are not config leaves — they are computed at call
   # time from the auxiliary model's window, see src/agent/core/summarizer.py)
 
 context_management:
-  compact_on_archive: true
+  compact_on_archive: true   # Set by the worker overlay
   keep_recent_messages: 10
 ```
 
-### Settings Matrix
-
-`settings_matrix.yaml` is the single source of truth for model-family-specific inference parameters and context limits. Keys match `detect_model_family()` output in `src/shared/runtime/core/loader.py`.
-
-```yaml
-# Resolution: default → family-specific (deep_merge)
-
-default:
-  model_max_context_tokens: 128000
-  limits:
-    model_max_context_tokens: 100000
-    context_threshold_tokens: 80000
-
-minimax:              # MiniMax M2.7 — 204K context, text-only
-  temperature: 1.0
-  top_p: 0.95
-  limits:
-    model_max_context_tokens: 150000
-    context_threshold_tokens: 100000
-
-minimax-m3:           # MiniMax M3 — 1M context (MSA), native multimodal; distinct family from minimax
-  temperature: 1.0
-  top_p: 0.95
-  multimodal: true
-  model_max_context_tokens: 1000000
-  limits:
-    model_max_context_tokens: 200000
-    context_threshold_tokens: 150000
-
-deepseek:
-  model_max_context_tokens: 64000
-  limits:
-    context_threshold_tokens: 40000
-```
-
-Experts can place their own `settings_matrix.yaml` in their directory.
+The context limits follow one number, the model's context window: the model's
+`context_window` in **Settings → Models → Catalog** when it has one, otherwise
+the family's `settings.model_max_context_tokens` from the
+[Model Config Matrix](#model-config-matrix). `limits.model_max_context_tokens`
+is that window, and `context_threshold_tokens` and `message_count_min_tokens`
+are 80% of it (`_apply_settings_matrix` in `src/shared/runtime/core/loader.py`).
+To run a model below its full window, give it a smaller `context_window` in
+the catalog.
 
 ### Verification
 
@@ -705,11 +754,98 @@ verification:
   max_rounds: 3          # Max feedback round-trips before auto-accepting
 ```
 
+### Delegation
+
+`delegation` lets an expert hand work to the children in its
+[`subagents`](#subagents) roster. One tool starts a child: `delegate_agent`.
+Four more manage children that run in the background: `wait_agent`,
+`message_agent`, `stop_agent` and `list_agents`. Each tool is bound only when
+the expert sets `delegation.enabled: true` **and** names that tool in
+`tools.delegation`. A child never receives these tools, so delegation is one
+level deep.
+
+```yaml
+delegation:
+  enabled: true
+  max_concurrent: 4                 # Worker parent: children running at once; more calls queue
+  run_in_background_default: false  # Used when a delegate_agent call omits run_in_background
+
+tools:
+  delegation: [delegate_agent, wait_agent, message_agent, stop_agent, list_agents]
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `false` | Opt-in. Without it no delegation tool is bound. |
+| `max_concurrent` | `4` | A worker parent's cap on children running at once. Further calls queue. |
+| `run_in_background_default` | `false` | `false`: the parent waits and gets the child's report as the tool result. `true`: the parent gets a receipt, and the child's completion is pushed to it later. |
+| `session_max_concurrent` | family value, else `6` | A session parent's cap on children running at once (1–20). The family value is `settings.session_max_concurrent` in the matrix. |
+| `session_max_calls_per_turn` | `20` | `delegate_agent` calls one session turn may make. Further calls get an error result. |
+
+Whether a session may run children in parallel at all is a deployment setting
+(`orchestrator.sessionSubagentFanoutLanes` in the Helm values), not expert
+configuration. Stored layers that still use the old tool names
+(`spawn_subagent`, `delegate_work`) or the old keys (`max_depth`,
+`default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) keep
+loading: the names map to `delegate_agent`, the keys are dropped, and the
+loader logs a deprecation warning.
+
+### Subagents
+
+`subagents` is the expert's roster: the children `delegate_agent` can start.
+
+```yaml
+subagents:
+  default: explorer                      # Used when a delegate_agent call names no subagent_type
+  llm: {model: inherit}                  # Roster-wide model; inherit = the parent's model
+  roster:
+    explorer: {$ref: subagents/explorer} # Library entry from config/subagents/
+    reviewer:                            # A full expert as a child, with one key changed
+      $ref: critic
+      llm: {model: claude-haiku-4-5}
+    summarizer:                          # Inline entry: any expert key
+      description: Reads the files named in the brief and returns a short summary.
+      tools: {workspace: {only: [read_file, list_files, search_files]}}
+      write_policy: none
+      return: summary
+```
+
+- `roster` maps a name to an entry. The name is the `subagent_type` the
+  parent passes to `delegate_agent`; `description` is what the parent sees for
+  it.
+- An entry is inline, or a `$ref` whose sibling keys are merged over the
+  referenced expert. `$ref` takes a bundled expert (`critic` or
+  `experts/critic`), a library entry (`explorer` or `subagents/explorer`) or a
+  DB expert ID, never a path. A bare name tries `config/experts/` first, then
+  `config/subagents/`.
+- Every entry resolves on the subagent role:
+  `expert_base` ← `overlays/subagent` ← the entry. An inline entry without
+  `tools` gets that overlay's read-only tool floor; a `$ref` keeps the
+  referenced expert's tools, minus `delegation`. Keys a child does not use
+  (`autonomy`, `phase_settings`, `tools.core`, `delegation`, ...) are dropped.
+- Model: the entry's own `llm` wins over the roster-wide `subagents.llm`,
+  which wins over the `$ref` target's. `model: inherit` (the subagent
+  overlay's default) means the parent's model and transport. Each entry gets
+  the matrix settings of its own model family.
+- Depth is 1: a referenced expert's own `subagents` block is dropped.
+- A job or thread override can change one entry, for example
+  `{subagents: {roster: {explorer: {llm: {model: ...}}}}}`.
+- Runtime keys per entry: `isolation` (`shared` | `worktree`), `write_policy`
+  (`none` | `scratch_only` | `owned_paths` | `full`; omitted means `full`, so
+  set it), `return` (`summary` | `structured` | `evidence` | `diff`), and child
+  budgets under `limits` (`max_turns`, `max_tokens`, `return_budget_tokens`,
+  `stale_idle_s`, `stale_in_tool_s`).
+
+The roster does nothing until [delegation](#delegation) is on. The resolution
+chain, failure policy and how to add a library entry are in
+[config/subagents/README.md](subagents/README.md).
+
 ### Memory Light
 
-Opt-in recall system backed by PostgreSQL and pgvector hybrid search. It stores
+Recall system backed by PostgreSQL and pgvector hybrid search. It stores
 and retrieves project-scoped insights across context compactions; see
 [state, knowledge, and recovery](../docs/architecture.md#state-knowledge-and-recovery).
+`expert_base.yaml` turns it on; set `memory.enabled: false` to turn it off.
 
 ```yaml
 memory:
@@ -717,7 +853,8 @@ memory:
   budget_tokens: 10000
   max_memories_per_injection: 25
   observer_interval: 5
-  embedding_model: qwen3-embedding-8b
+  # No embedding model key: the orchestrator passes the Embedding default from
+  # Settings → Models to the agent as EMBEDDING_* variables.
 ```
 
 ## Inheritance
@@ -932,16 +1069,25 @@ This works with VS Code + Red Hat YAML extension.
 
 ## Running Agents
 
+`python -m agent` always starts the agent's API server (port 8001 by default).
+It takes jobs and sessions from the orchestrator; it has no flags to run a job
+itself.
+
 ```bash
 # Use the worker framework base directly (normally a named expert is selected)
 python -m agent
 
-# Use custom config
+# Use custom config: config/<name>/config.yaml, config/experts/<name>/,
+# config/subagents/<name>/, then config/<name>.yaml
 python -m agent --config my_agent
 
 # Use explicit path
 python -m agent --config /path/to/config.yaml
 
-# As API server
-python -m agent --config my_agent --port 8001
+# Keep the process alive after each job or session (needed when you start it by hand)
+python -m agent --config my_agent --port 8001 --loop
+
+# Accept only jobs, or only interactive sessions (default: both)
+python -m agent --mode worker --port 8001 --loop
+python -m agent --mode persistent --port 8002 --loop
 ```

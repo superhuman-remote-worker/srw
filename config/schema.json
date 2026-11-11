@@ -2405,7 +2405,7 @@
     "autonomy": {
       "type": "string",
       "enum": ["full", "review", "partial", "guided", "dependent"],
-      "default": "partial",
+      "default": "review",
       "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
     },
     "image_quality": {
