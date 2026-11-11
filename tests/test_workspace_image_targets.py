@@ -282,3 +282,91 @@ def test_the_agent_images_run_the_agent_contract_gate():
         assert f'"{binary}"' in script, binary
     tiltfile = (REPO / "Tiltfile").read_text()
     assert "'docker/assert-agent-contract.sh'," in tiltfile
+
+
+# ---------------------------------------------------------------------------
+# The office stack: one pinned list, both images, one shared gate.
+# ---------------------------------------------------------------------------
+
+OFFICE_REQUIREMENTS = REPO / "docker/workspace-office-requirements.txt"
+OFFICE_GATE = (REPO / "docker/assert-office-stack.sh").read_text()
+OFFICE_APT = {
+    "libreoffice-writer-nogui",
+    "libreoffice-calc-nogui",
+    "libreoffice-impress-nogui",
+    "fonts-crosextra-carlito",
+    "fonts-crosextra-caladea",
+    "librsvg2-bin",
+}
+IMPORT_NAME = {"python-pptx": "pptx"}
+
+
+def office_pins() -> list[str]:
+    return [
+        line.strip()
+        for line in OFFICE_REQUIREMENTS.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def vm_office_section() -> str:
+    vm = (REPO / "docker/agent-vm-base/scripts/provision-stage1.sh").read_text()
+    section = vm[vm.index("# 6b. Office and data stack") :]
+    return section[: section.index("\n# 7. ")]
+
+
+def test_office_pins_are_exact():
+    pins = office_pins()
+    assert pins
+    for pin in pins:
+        assert re.fullmatch(r"[a-z0-9-]+==[0-9]+(\.[0-9]+)*", pin), pin
+
+
+def test_full_installs_the_office_stack_and_minimal_does_not():
+    minimal, full = stages()["minimal"], stages()["full"]
+    assert OFFICE_APT <= tokens(full), OFFICE_APT - tokens(full)
+    assert not OFFICE_APT & tokens(minimal)
+    assert "-r /tmp/workspace-office-requirements.txt" in full
+    assert "workspace-office-requirements" not in minimal
+    gate = full.rfind("RUN /usr/local/bin/assert-office-stack")
+    assert gate > last_install(full)
+    assert gate > full.rfind("pip install")
+
+
+def test_the_vm_base_installs_the_same_office_stack():
+    section = vm_office_section()
+    assert re.findall(r'"([a-z0-9-]+==[^"]+)"', section) == office_pins()
+    assert OFFICE_APT <= tokens(section), OFFICE_APT - tokens(section)
+
+
+def test_the_vm_runs_the_shared_office_gate():
+    stage2 = (REPO / "docker/agent-vm-base/stage2.pkr.hcl").read_text()
+    assert '"../assert-office-stack.sh",' in stage2
+    provision = (REPO / "docker/agent-vm-base/scripts/provision-stage2.sh").read_text()
+    assert "sudo -u agent-host /usr/local/bin/assert-office-stack" in provision
+    # Stage1 satisfies the gate, so a stricter gate must rebuild stage1.
+    inputs = (REPO / "scripts/vm_stage1_image.py").read_text()
+    assert '"docker/assert-office-stack.sh",' in inputs
+
+
+def test_the_office_gate_imports_every_pinned_library():
+    imported = set(re.search(r"for module in ([^;]+);", OFFICE_GATE).group(1).split())
+    imported.discard("\\")
+    for pin in office_pins():
+        name = pin.split("==")[0]
+        assert IMPORT_NAME.get(name, name) in imported, name
+    # browser-use pins these; the gate still requires them.
+    assert {"docx", "reportlab", "pypdf", "PIL"} <= imported
+
+
+def test_tilt_and_ci_send_the_office_files_to_the_workspace_build():
+    tiltfile = (REPO / "Tiltfile").read_text()
+    develop = (REPO / ".github/workflows/develop.yml").read_text()
+    workspace_paths = develop[develop.index("WORKSPACE_PATHS=(") :]
+    workspace_paths = workspace_paths[: workspace_paths.index(")")]
+    for path in (
+        "docker/assert-office-stack.sh",
+        "docker/workspace-office-requirements.txt",
+    ):
+        assert f"'{path}'," in tiltfile, path
+        assert path in workspace_paths, path

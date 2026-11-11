@@ -289,6 +289,8 @@ docker_build(
         'docker/check-browser-stream.py',
         'docker/assert-browser-stack.sh',
         'docker/assert-workspace-contract.sh',
+        'docker/assert-office-stack.sh',
+        'docker/workspace-office-requirements.txt',
         'docker/link-playwright-browsers',
         'docker/write-agent-environment',
     ],

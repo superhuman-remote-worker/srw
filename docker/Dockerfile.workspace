@@ -435,6 +435,33 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3-dev
 
 # ---------------------------------------------------------------------------
+# F1b. Office and data stack for the bundled office skills (pdf-report,
+#      charts, data-analysis, spreadsheet, document, slides).
+#      LibreOffice (headless, no GUI) converts docx/xlsx/pptx to PDF,
+#      recalculates spreadsheet formulas and lets the agent render its own
+#      slides to look at them. Carlito/Caladea are the metric twins of
+#      Calibri/Cambria, so Office documents keep their line breaks.
+#      The Python list is shared with the VM image; see the file's header.
+#      Mirrors agent-vm-base/scripts/provision-stage1.sh section 1c.
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -y \
+    && eatmydata apt-get install -y \
+    libreoffice-writer-nogui \
+    libreoffice-calc-nogui \
+    libreoffice-impress-nogui \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    librsvg2-bin
+COPY docker/workspace-office-requirements.txt /tmp/workspace-office-requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    eatmydata pip install --break-system-packages \
+        -r /tmp/workspace-office-requirements.txt \
+    && rm /tmp/workspace-office-requirements.txt
+COPY --chmod=0755 docker/assert-office-stack.sh /usr/local/bin/assert-office-stack
+
+# ---------------------------------------------------------------------------
 # F2. Datasource CLI clients (psql, mongosh, cypher-shell)
 #     Needed for read-write datasource mode — agent runs queries via shell.
 #     Mirrors agent-vm-base/scripts/provision-stage1.sh section 1b.
@@ -500,3 +527,4 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # ---------------------------------------------------------------------------
 RUN /usr/local/bin/assert-workspace-contract
 RUN /usr/local/bin/assert-browser-stack
+RUN /usr/local/bin/assert-office-stack

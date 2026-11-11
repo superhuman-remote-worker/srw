@@ -381,6 +381,18 @@ sudo install -o root -g root -m 0755 /tmp/assert-browser-stack.sh /usr/local/bin
 sudo -u agent-host /usr/local/bin/assert-browser-stack
 
 # -----------------------------------------------------------------------------
+# 8b. Office stack conformance gate
+# -----------------------------------------------------------------------------
+#
+# Shared with docker/Dockerfile.workspace, same reasoning as the browser gate:
+# the office skills promise these tools, so an image without them fails here.
+# Stage1 installs them (section 6b); runs as agent-host for the agent's PATH.
+
+_section "Asserting office stack"
+sudo install -o root -g root -m 0755 /tmp/assert-office-stack.sh /usr/local/bin/assert-office-stack
+sudo -u agent-host /usr/local/bin/assert-office-stack
+
+# -----------------------------------------------------------------------------
 # 9. Container stack conformance gate (VM-only)
 # -----------------------------------------------------------------------------
 #

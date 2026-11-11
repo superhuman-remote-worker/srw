@@ -931,6 +931,7 @@ jobs:
             docker/browser-exec docker/check-browser-stream.py
             docker/assert-browser-stack.sh
             docker/assert-workspace-contract.sh
+            docker/assert-office-stack.sh docker/workspace-office-requirements.txt
             docker/link-playwright-browsers docker/write-agent-environment
             .playwright-version .dockerignore)
 
@@ -1037,6 +1038,7 @@ jobs:
             docker/agent-vm-base/Dockerfile.containerDisk-stage1
             docker/agent-vm-base/cloud-init/
             docker/assert-browser-stack.sh
+            docker/assert-office-stack.sh
             .playwright-version)
           VM_BASE_STAGE1_SHA=$(last_input_sha "${VM_BASE_STAGE1_PATHS[@]}")
           VM_BASE_STAGE1=$(image_missing agent-vm-base-stage1 "$VM_BASE_STAGE1_SHA")

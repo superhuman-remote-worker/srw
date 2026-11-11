@@ -19,6 +19,7 @@ INPUTS = (
     "docker/agent-vm-base/Dockerfile.containerDisk-stage1",
     "docker/agent-vm-base/cloud-init",
     "docker/assert-browser-stack.sh",
+    "docker/assert-office-stack.sh",
     ".playwright-version",
     "scripts/vm_stage1_image.py",
     # Build invocations can change inputs too. Conservatively invalidate for

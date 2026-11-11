@@ -415,6 +415,45 @@ python3 -c "import browser_use" \
     || { echo "ERROR: agent-chromium is present but will not run"; exit 1; }
 
 # -----------------------------------------------------------------------------
+# 6b. Office and data stack for the bundled office skills
+#     Mirrors docker/Dockerfile.workspace section F1b; the Python pins are the
+#     lines of docker/workspace-office-requirements.txt (a test keeps them
+#     equal). Asserted by docker/assert-office-stack.sh at the end of stage2.
+# -----------------------------------------------------------------------------
+sudo eatmydata apt-get install -y --no-install-recommends \
+    libreoffice-writer-nogui \
+    libreoffice-calc-nogui \
+    libreoffice-impress-nogui \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-dejavu-core \
+    librsvg2-bin
+# --ignore-installed for the reason section 6 gives (cloud-init's apt Python
+# packages, Jinja2 among them, have no RECORD file). The constraints file
+# holds everything pip already put in /usr/local (browser-use's exact pins),
+# so the reinstall cannot move them; a real conflict fails here, loudly.
+python3 -m pip freeze --path /usr/local/lib/python3.12/dist-packages \
+    > /tmp/office-constraints.txt
+sudo python3 -m pip install --break-system-packages --ignore-installed \
+    -c /tmp/office-constraints.txt \
+    "pandas==2.3.3" \
+    "numpy==2.3.5" \
+    "scipy==1.16.3" \
+    "matplotlib==3.10.7" \
+    "openpyxl==3.1.5" \
+    "xlsxwriter==3.2.9" \
+    "python-pptx==1.0.2" \
+    "pdfplumber==0.11.7" \
+    "jinja2==3.1.6" \
+    "markdown==3.9" \
+    "tabulate==0.9.0"
+rm -f /tmp/office-constraints.txt
+python3 -c "import pandas, matplotlib, openpyxl, pptx, docx, pdfplumber" \
+    || { echo "ERROR: office stack installed but not importable"; exit 1; }
+soffice --version \
+    || { echo "ERROR: LibreOffice installed but soffice will not run"; exit 1; }
+
+# -----------------------------------------------------------------------------
 # 7. Node.js 22 + minimal global npm packages
 #    Trimmed from the prior list (typescript, ts-node, @angular/cli, eslint,
 #    prettier, yarn). Only typescript + prettier are commonly invoked by

@@ -120,6 +120,7 @@ build {
       "../browser-exec",
       "../check-browser-stream.py",
       "../assert-browser-stack.sh",
+      "../assert-office-stack.sh",
       "../link-playwright-browsers",
       "../write-agent-environment",
       # VM-only, unlike its browser sibling: the sandbox tier cannot run
