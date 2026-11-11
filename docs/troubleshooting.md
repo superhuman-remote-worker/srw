@@ -354,6 +354,54 @@ Fix what `last_error` names, such as a service that is down or a credential
 that changed. The next background pass then finishes the delete; nothing else
 is needed.
 
+## The orchestrator restarts with "dirty migration"
+
+**Symptom.** The orchestrator Pod restarts in a loop. Its log ends with
+`dirty migration '<file>.sql' in the <name> database: ...; manual repair
+required`.
+
+**Cause.** The orchestrator applies database migrations when it starts and
+records each one in the `schema_migrations` table of its database: `app`,
+`vector` or `audit`. A migration that failed stays recorded as failed, with its
+error. The orchestrator does not start on top of a failed migration, because
+it cannot tell how much of it was applied. SRW retries some known failures on
+its own; this message means the failure is not one of them.
+
+**Fix.**
+
+1. Read the error after the file name. Common causes are a lock timeout
+   because a long query held the table, a full disk, or a database role that
+   lacks a privilege. Fix that cause first.
+2. Check how much was applied. A file ending in `.sql` runs in one
+   transaction, so a failure leaves nothing behind. A file ending in
+   `.notx.sql` runs statement by statement and can stop halfway. Its statements
+   are usually `CREATE INDEX CONCURRENTLY`, and a failed one leaves an invalid
+   index of that name, which you drop. The file is in
+   [`src/orchestrator/database/migrations/<name>/`](../src/orchestrator/database/migrations/)
+   for your release.
+3. Remove the failed record, so the next start applies the migration again.
+   Open the database named in the message:
+
+   ```bash
+   kubectl -n srw exec -it srw-postgres-0 -c postgres -- psql -U postgres -d srw              # app
+   kubectl -n srw exec -it srw-pgvector-0 -c pgvector -- psql -U postgres -d srw_vector      # vector
+   kubectl -n srw exec -it srw-auditdb-0 -c auditdb -- psql -U postgres -d srw_audit         # audit
+   ```
+
+   ```sql
+   SELECT filename, error FROM schema_migrations WHERE success = false;
+   DELETE FROM schema_migrations WHERE filename = '<file>.sql' AND success = false;
+   ```
+
+4. Restart the orchestrator:
+   `kubectl -n srw rollout restart deploy/srw-orchestrator`.
+
+These commands are for the bundled `statefulset` databases. On the `cnpg`
+engine, open the cluster's primary Pod instead
+(`kubectl -n srw get pods -l cnpg.io/instanceRole=primary`). If the error does
+not say what went wrong, open an issue with the log before you delete the
+record.
+
 ## Still stuck
 
 The [Helm chart guide](../helm/README.md) covers each value and the failure
