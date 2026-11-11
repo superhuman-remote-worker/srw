@@ -1,7 +1,7 @@
 # Charter — <project name>
 
 <!--
-The project's pinned standing orders (knowledge-base/knowledge/features/centurion.md §5).
+The project's pinned standing orders.
 Written as a KB note with note_type=charter — ONE active charter per project;
 kb_write refuses a second, edit with kb_update instead. Injected verbatim
 into every officer/conference turn, so keep it lean: ≤200 lines, ~15 standing

@@ -3,7 +3,7 @@
   "$id": "https://example.com/agent-config.schema.json",
   "title": "Universal Agent Configuration",
   "description": "Configuration schema for the Universal Agent in the workspace-centric architecture",
-  "$comment": "U1 (universal experts): an expert has ONE llm.model. The per-phase tiers llm.strategic / llm.tactical / llm.subagent were removed from this schema; the loader still accepts them in any authored layer (bundled YAML, DB expert, job/thread override, frozen resolved_config) and maps them with a deprecation warning — strategic/tactical lift into llm.model when the layer sets no llm.model (strategic wins; an explicit llm.model in the same layer wins over both), subagent moves to subagents.llm. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
+  "$comment": "U1 (universal experts): an expert has ONE llm.model. The per-phase tiers llm.strategic / llm.tactical / llm.subagent were removed from this schema; the loader still accepts them in any authored layer (bundled YAML, DB expert, job/thread override, frozen resolved_config) and maps them with a deprecation warning — strategic/tactical lift into llm.model when the layer sets no llm.model (strategic wins; an explicit llm.model in the same layer wins over both), subagent moves to subagents.llm.",
   "type": "object",
   "required": ["agent_id", "display_name", "llm", "workspace", "tools", "connections"],
   "properties": {
@@ -13,7 +13,7 @@
     },
     "$extends": {
       "type": "string",
-      "description": "Parent config this file deep-merges onto (objects merge, lists replace, null clears). Chain roots: worker_base / session_base / subagent_base — the role overlays under config/overlays/ by their public names (default(s), persistent_default(s) and overlays/<role> are aliases) — and expert_base, the shared root every overlay extends. Any other value names another expert (config/experts/<name>, config/subagents/<name> or config/<name>.yaml) whose own chain is followed. When a config is resolved FOR a role (a job asks for worker, a session for session, a roster entry for subagent), the link that ends the chain is re-rooted onto that role's overlay, so every expert is usable in every role. See knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.1.",
+      "description": "Parent config this file deep-merges onto (objects merge, lists replace, null clears). Chain roots: worker_base / session_base / subagent_base — the role overlays under config/overlays/ by their public names (default(s), persistent_default(s) and overlays/<role> are aliases) — and expert_base, the shared root every overlay extends. Any other value names another expert (config/experts/<name>, config/subagents/<name> or config/<name>.yaml) whose own chain is followed. When a config is resolved FOR a role (a job asks for worker, a session for session, a roster entry for subagent), the link that ends the chain is re-rooted onto that role's overlay, so every expert is usable in every role.",
       "examples": ["worker_base", "session_base", "expert_base", "critic"]
     },
     "$ignore_keys": {
@@ -62,7 +62,7 @@
     },
     "subagents": {
       "type": "object",
-      "description": "Built-in subagents (universal_experts_and_subagents.md §1.1). `roster` names the children this expert may delegate to: inline small experts (same schema as an expert, resolved on the subagent role overlay) or `$ref` entries — a bundled expert dir name (`critic`), a library entry (`subagents/explorer` / `explorer`) or a DB expert id — with sibling keys deep-merged over the referenced expert. `llm` is the roster-wide model default (below every entry's own `llm`, above the base and the `$ref` target). A job/thread override deep-merges into `subagents.roster.<name>`. Entries are materialised at resolve time (merged chain, settings matrix per entry, parent-only keys pruned); a referenced expert's own `subagents` block is dropped (depth 1). See config/subagents/README.md.",
+      "description": "Built-in subagents. `roster` names the children this expert may delegate to: inline small experts (same schema as an expert, resolved on the subagent role overlay) or `$ref` entries — a bundled expert dir name (`critic`), a library entry (`subagents/explorer` / `explorer`) or a DB expert id — with sibling keys deep-merged over the referenced expert. `llm` is the roster-wide model default (below every entry's own `llm`, above the base and the `$ref` target). A job/thread override deep-merges into `subagents.roster.<name>`. Entries are materialised at resolve time (merged chain, settings matrix per entry, parent-only keys pruned); a referenced expert's own `subagents` block is dropped (depth 1). See config/subagents/README.md.",
       "properties": {
         "default": {
           "type": ["string", "null"],
@@ -249,7 +249,7 @@
           "type": "string",
           "enum": ["sandbox", "vm", "virtual", "none"],
           "default": "sandbox",
-          "description": "Workspace backend type. 'sandbox' (SSH/SFTP to an isolated workspace container) and 'vm' (SSH/SFTP to a KubeVirt VM with sudo gate) get the full shell/git/browser toolset. The lite tiers run with no workspace pod (no_workspace_agent_mode.md): 'virtual' exposes object-store-backed file tools (no shell/git/browser); 'none' exposes no file tools at all. Shell/browser/git are gated off automatically for the lite tiers by backend capability, not by config. The agent never operates on its own filesystem."
+          "description": "Workspace backend type. 'sandbox' (SSH/SFTP to an isolated workspace container) and 'vm' (SSH/SFTP to a KubeVirt VM with sudo gate) get the full shell/git/browser toolset. The lite tiers run with no workspace pod: 'virtual' exposes object-store-backed file tools (no shell/git/browser); 'none' exposes no file tools at all. Shell/browser/git are gated off automatically for the lite tiers by backend capability, not by config. The agent never operates on its own filesystem."
         },
         "remote": {
           "type": "object",
@@ -284,7 +284,7 @@
       }
     },
     "tools": {
-      "description": "Tool configuration by category: one field per TOOL_REGISTRY category, plus mcp. Each value is POLICY, not membership: true / false / {only: [...]} / {except: [...]}, or the legacy spellings (a bare list = only; [] = false). See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md.",
+      "description": "Tool configuration by category: one field per TOOL_REGISTRY category, plus mcp. Each value is POLICY, not membership: true / false / {only: [...]} / {except: [...]}, or the legacy spellings (a bare list = only; [] = false).",
       "type": "object",
       "required": [
         "workspace",
@@ -1993,7 +1993,7 @@
           "type": "integer",
           "minimum": 0,
           "default": 5,
-          "description": "Tier-1 in-process LLM-invoke retries before the worker freezes the job for pause+backoff re-dispatch (llm_outage_pause_and_backoff_redispatch.md)"
+          "description": "Tier-1 in-process LLM-invoke retries before the worker freezes the job for pause+backoff re-dispatch"
         },
         "response_validation": {
           "type": "object",
@@ -2322,7 +2322,7 @@
     },
     "verification": {
       "type": "object",
-      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See knowledge-base/knowledge/features/verification_phase.md.",
+      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback.",
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -2362,7 +2362,7 @@
     },
     "delegation": {
       "type": "object",
-      "description": "The built-in subagents' settings (universal_experts_and_subagents.md §0 D7; runtime in src/agent/subagents/). `enabled` gates `delegate_agent` and all four background controls; each tool exists only when also named in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates or receives the control plane (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
+      "description": "The built-in subagents' settings (runtime in src/agent/subagents/). `enabled` gates `delegate_agent` and all four background controls; each tool exists only when also named in `tools.delegation`. Which children exist, their model, tools, write policy and budgets live in `subagents.roster`; a child never delegates or receives the control plane (depth 1). The pre-U3 keys (`max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`, `mode`, `light`) are no longer accepted by this schema; the loader still drops them from any authored layer with a deprecation warning.",
       "properties": {
         "enabled": {
           "type": "boolean",
