@@ -475,8 +475,6 @@ $EDITOR my-values.yaml
 Edit at minimum:
 - `license.acceptTerms` → `true`
 - `global.domain` → your base hostname
-- `image.{orchestrator,agent,cockpit,mcp,workspace}.tag` → the matching
-  `vX.Y.Z` release tag, or set each component's verified `digest`
 - `secrets.existingSecret` → name of a Secret you create yourself (see below)
 - `databases.{postgres,vector}.externalHost` / `externalDb` → your managed
   Postgres and pgvector (user and password come from the Secret);
@@ -489,11 +487,13 @@ Edit at minimum:
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
 - `ingress.className` and `ingress.tls.issuerName` → your cluster's ingress + cert-manager issuer
 
-The chart source keeps those five image tags at `latest` for the development
-workflow, and selecting an OCI chart version alone does not pin them. Production
-values must override every component tag or digest. If VM workspaces are
-enabled, pin `vmController.image.tag` as well; the default VM base image already
-derives its version from the released chart unless explicitly overridden.
+A published chart version pins every component image to its release commit's
+`sha-<commit>` tag, so you do not set image tags yourself (see
+[Pinning a version](../docs/versioning.md#pinning-a-version)). A chart
+installed from a git checkout is not a release: its image defaults are the
+moving `latest` tags. Pin `image.*.tag` yourself (with VM workspaces, also
+`vmController.image.tag` and `vmController.defaultVmImage`), or install the
+published chart.
 
 ### Per-component hostname overrides
 
@@ -719,8 +719,10 @@ installs. On connected Helm upgrades, the chart reads the existing realm
 ConfigMap, preserves its initial username when the value is empty, and rejects
 an explicit change. This setting seeds a new realm; it does not rename a user
 in an existing Keycloak database. Keep the same explicit value in offline or
-GitOps rendering, where Helm cannot read the existing ConfigMap. Create further
-administrators through SRW user management.
+GitOps rendering, where Helm cannot read the existing ConfigMap. Further
+administrators are made in Keycloak, not in SRW: in the Keycloak admin console,
+open realm `srw`, **Users →** the user **→ Role mapping → Assign role**, and
+assign the realm role `admin`. SRW reads the role at the user's next sign-in.
 
 #### Changing the initial administrator's password
 
@@ -732,8 +734,9 @@ nothing on its own. (Chart 0.1.0 and earlier reset the password to the Secret
 value on every Keycloak restart.)
 
 Treat this account as the way in for the first login, not as a daily
-administrator: create the administrators who work on the install through SRW
-user management, and change this account's password after the first login.
+administrator: give the people who run the install the `admin` realm role in
+Keycloak, as described above, and change this account's password after the
+first login.
 
 To change the password, the administrator signs in to the Keycloak Account
 Console (`https://auth.<domain>/realms/srw/account/`, or
@@ -2018,6 +2021,172 @@ forward instead. Verify the migration ledger and lifecycle smoke tests before
 reopening admission, then clear the acknowledgement on a later all-new-version
 upgrade.
 
+### Moving the bundled Gitea from SQLite to Postgres
+
+The bundled Gitea keeps its metadata (users, organizations, repository
+records, issues, pull requests, tokens and the Keycloak login source) in the
+database `gitea.database.type` names. The default is `postgres`. An
+installation that pins `sqlite3` keeps it in a file on the Gitea volume. The
+Git repositories themselves stay on the Gitea volume either way.
+
+Removing the `sqlite3` pin does not move the data. Gitea would start on the
+empty Postgres as a fresh install, and every repository would sit on disk
+without a record. The `preflight-db-migration` init container refuses to start
+in that state and logs `REFUSING TO START: un-migrated Gitea metadata`. Do not
+remove it. Either put the pin back and upgrade, which restores service as it
+was, or move the data as below.
+
+The commands assume the release and namespace `srw`; Kubernetes object names
+start with the release name. They use the bundled `statefulset` database
+engine. On the `cnpg` engine, the primary Pod is `srw-giteadb-1` and the
+read-write Service is `srw-giteadb-rw`. With an external database, use its
+host, user and database name. You need `kubectl` and `sqlite3` on your
+machine.
+
+1. **Switch the values.** Remove `gitea.database.type: sqlite3` from your
+   values file and upgrade. `srw-giteadb` starts and Gitea stops at the
+   refusal. Nothing has changed yet. If you are reading this because of that
+   refusal, this step is done.
+
+2. **Stop Gitea and back up the SQLite file.** A GitOps controller may scale
+   the StatefulSet back up; pause it for the duration. The Gitea volume is
+   ReadWriteOnce, so the helper Pod mounts it only while Gitea is stopped.
+
+   ```bash
+   kubectl -n srw scale statefulset/srw-gitea --replicas=0
+   kubectl -n srw wait --for=delete pod/srw-gitea-0 --timeout=120s
+   kubectl -n srw run gitea-migrate --image=busybox:1.36 --restart=Never \
+     --overrides='{"spec":{"containers":[{"name":"gitea-migrate","image":"busybox:1.36","command":["sleep","7200"],"volumeMounts":[{"name":"data","mountPath":"/var/lib/gitea"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"srw-gitea-data"}}]}}'
+   kubectl -n srw wait --for=condition=Ready pod/gitea-migrate
+
+   mkdir backup
+   kubectl -n srw exec gitea-migrate -- md5sum /var/lib/gitea/data/gitea.db
+   kubectl -n srw exec gitea-migrate -- \
+     sh -c 'cd /var/lib/gitea/data && tar cf - gitea.db gitea.db-wal gitea.db-shm 2>/dev/null' \
+     | tar xf - -C backup
+   md5sum backup/gitea.db
+   ```
+
+   The two checksums must match. Stream through `tar` as shown: `kubectl cp`
+   can truncate a large file without reporting an error. The `-wal` file holds
+   committed data, so copy it too if it exists. Then fold it in, check the
+   copy, and note the counts you will compare against at the end:
+
+   ```bash
+   sqlite3 backup/gitea.db "PRAGMA wal_checkpoint(TRUNCATE);"
+   sqlite3 backup/gitea.db "PRAGMA integrity_check;"   # must print: ok
+   sqlite3 backup/gitea.db "SELECT (SELECT COUNT(*) FROM user), (SELECT COUNT(*) FROM repository), (SELECT COUNT(*) FROM login_source);"
+   ```
+
+   Also take a volume snapshot of `srw-gitea-data` if your storage supports
+   it.
+
+3. **Let Gitea create its schema in Postgres.** Do not let a migration tool
+   create the tables: a schema derived from SQLite has indexes and column types
+   Gitea cannot reconcile, and Gitea then fails to start. Move the SQLite files
+   aside (keep them, they are your rollback) and start Gitea once:
+
+   ```bash
+   kubectl -n srw exec gitea-migrate -- sh -c 'cd /var/lib/gitea/data &&
+     mv gitea.db gitea.db.migrating &&
+     for s in wal shm; do [ -f gitea.db-$s ] && mv gitea.db-$s gitea.db.migrating-$s; done; true'
+   kubectl -n srw delete pod gitea-migrate
+   kubectl -n srw scale statefulset/srw-gitea --replicas=1
+   kubectl -n srw rollout status statefulset/srw-gitea
+   ```
+
+   Gitea starts on the empty database and creates its tables. Read the database
+   password, then stop Gitea again so nothing writes during the load:
+
+   ```bash
+   PW=$(kubectl -n srw get secret srw -o jsonpath='{.data.GITEA_DB_PASSWORD}' | base64 -d)
+   kubectl -n srw scale statefulset/srw-gitea --replicas=0
+   kubectl -n srw wait --for=delete pod/srw-gitea-0 --timeout=120s
+   ```
+
+   With `secrets.existingSecret`, read the key from that Secret instead.
+
+4. **Find values Postgres will refuse.** SQLite does not enforce
+   `VARCHAR(n)` limits; Postgres does. One value that is too long makes the
+   load drop its whole table while every other table succeeds. Compare each
+   limited column against a working copy of the backup:
+
+   ```bash
+   cp backup/gitea.db backup/gitea-migrate.db
+   kubectl -n srw exec srw-giteadb-0 -- env PGPASSWORD="$PW" psql -U gitea -d gitea -tA -F' ' -c \
+     "SELECT table_name, column_name, character_maximum_length FROM information_schema.columns
+      WHERE table_schema = 'public' AND data_type = 'character varying'
+        AND character_maximum_length IS NOT NULL" |
+   while read -r t c n; do
+     over=$(sqlite3 backup/gitea-migrate.db "SELECT COUNT(*) FROM \"$t\" WHERE LENGTH(\"$c\") > $n" 2>/dev/null)
+     [ "${over:-0}" -gt 0 ] && echo "$t.$c: $over value(s) longer than $n"
+   done
+   ```
+
+   Shorten each value it reports in the working copy, never in the backup.
+   Gitea on Postgres could not have stored them either. For example:
+
+   ```bash
+   sqlite3 backup/gitea-migrate.db "UPDATE release SET title = substr(title, 1, 255) WHERE LENGTH(title) > 255;"
+   ```
+
+5. **Load the data.** Run [pgloader](https://pgloader.io/) in a scratch Pod
+   and load rows only, into the schema Gitea created:
+
+   ```bash
+   kubectl -n srw run pgloader --image=dimitri/pgloader:latest --restart=Never \
+     --env=PW="$PW" --command -- sleep 3600
+   kubectl -n srw wait --for=condition=Ready pod/pgloader
+   kubectl -n srw exec -i pgloader -- sh -c 'cat > /tmp/gitea.db' < backup/gitea-migrate.db
+   kubectl -n srw exec pgloader -- sh -c 'cat > /tmp/gitea.load <<EOF
+   LOAD DATABASE
+     FROM sqlite:///tmp/gitea.db
+     INTO postgresql://gitea:$PW@srw-giteadb:5432/gitea
+   WITH data only, truncate, disable triggers, reset sequences,
+        workers = 4, concurrency = 1
+   SET work_mem to '\''16MB'\'', maintenance_work_mem to '\''128MB'\'';
+   EOF
+   pgloader /tmp/gitea.load'
+   ```
+
+   `data only` keeps Gitea's schema. `reset sequences` keeps the next new user
+   or repository from colliding with an existing id. Read the summary table,
+   not only the exit code: the errors column must be empty or `✓` for every
+   table. If a table reports errors, the details are in `/tmp/pgloader/` in the
+   Pod. Fix the value in the working copy, copy it in again and rerun the load
+   (`truncate` empties the tables first). Then
+   `kubectl -n srw delete pod pgloader`.
+
+6. **Start Gitea on Postgres.**
+
+   ```bash
+   kubectl -n srw scale statefulset/srw-gitea --replicas=1
+   kubectl -n srw logs srw-gitea-0 -c preflight-db-migration
+   # Postgres already holds N users — migration complete, proceeding.
+   ```
+
+   Then move the SQLite files back to their names, so that the rollback below
+   stays one step. Gitea ignores them now that Postgres holds users:
+
+   ```bash
+   kubectl -n srw exec srw-gitea-0 -c gitea -- sh -c 'cd /var/lib/gitea/data &&
+     mv gitea.db.migrating gitea.db &&
+     for s in wal shm; do [ -f gitea.db.migrating-$s ] && mv gitea.db.migrating-$s gitea.db-$s; done; true'
+   ```
+
+7. **Check the result.** Compare the user, repository and login source counts
+   with step 2, and the row count of every table that has rows in the SQLite
+   copy: a table dropped by the load leaves the headline counts correct. Then
+   sign in to Gitea with Keycloak (this needs the login source), open a job's
+   repository in the Cockpit, and create and delete a test repository in
+   Gitea (a missed sequence reset fails here with a duplicate key).
+
+**Rollback.** Until you delete the SQLite file, put
+`gitea.database.type: sqlite3` back in your values file and upgrade. Gitea
+starts on the SQLite file as before. The `srw-giteadb` volume is kept on
+uninstall and on a failed attempt; delete it before you try again, so step 3
+starts on an empty database.
+
 ---
 
 ## Uninstall
@@ -2034,8 +2203,10 @@ kubectl delete namespace srw
 
 ## Configuration reference
 
-The full configurable surface is documented inline in `values.yaml`
-(every option has a `# --` comment):
+Every option is in `values.yaml`, most with a `# --` comment that explains
+it. The [Helm values reference](https://docs.superhuman-remote-worker.com/reference/helm-values/)
+lists them all, with types and defaults from `values.schema.json`; to read the
+file for your chart version:
 
 ```bash
 helm show values oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote-worker \

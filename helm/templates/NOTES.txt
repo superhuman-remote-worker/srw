@@ -142,7 +142,8 @@ authenticated VM lifecycle requests.
 The lifecycle Secret is `{{ include "srw.vmLifecycleAuthSecretName" . }}`.
 {{- end }}
 The SSH key Secret is `{{ include "srw.vmSshKeySecretName" . }}`. See
-helm/README.md#vm-workspaces-on-your-cluster for prerequisites and checks.
+https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md#vm-workspaces-on-your-cluster
+for prerequisites and checks.
 {{- end }}
 {{- if .Values.voiceGateway.enabled }}
 

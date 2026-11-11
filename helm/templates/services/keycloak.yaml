@@ -155,7 +155,7 @@ data:
         {
           "clientId": "cockpit-bff",
           "name": "SRW Cockpit BFF",
-          "description": "Confidential client for the orchestrator's cookie BFF (knowledge-base/knowledge/features/auth_bff_and_api_tokens.md). Distinct from the cockpit SPA's public client — same realm + same user identity, different auth model.",
+          "description": "Confidential client for the orchestrator's cookie BFF. Distinct from the cockpit SPA's public client — same realm + same user identity, different auth model.",
           "enabled": true,
           "publicClient": false,
           "clientAuthenticatorType": "client-secret",

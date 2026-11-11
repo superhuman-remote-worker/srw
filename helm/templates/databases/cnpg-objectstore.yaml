@@ -7,8 +7,8 @@ point them all at one prefix and they would overwrite each other's base
 backups.
 
 Requires the Barman Cloud plugin, which this chart cannot install -- it is a raw
-manifest pinned to the operator's namespace. See
-knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+manifest pinned to the operator's namespace. See helm/README.md, "The Barman
+Cloud plugin".
 */}}
 {{- if and (include "srw.anyDbBacksUp" .) (include "srw.backupIsObjectStore" .) }}
 {{- $backup := .Values.databases.backup }}
