@@ -96,7 +96,6 @@ import {CloudFoldersNoticeComponent} from './cloud-folders-notice/cloud-folders-
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
 import {ChatEmptyStateComponent, type DisplayedSuggestion} from './chat-empty-state/chat-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
-import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
@@ -1013,7 +1012,6 @@ export function clearDraft(threadId: string | null): void {
         AppMenuItemComponent,
         AppMenuTriggerDirective,
         AppBadgeComponent,
-        AppSelectComponent,
         AppIconComponent,
         AppDialogComponent,
         AppToolCardComponent,
@@ -1114,7 +1112,6 @@ export function clearDraft(threadId: string | null): void {
                 <app-menu-item (activated)="copyThreadId()">{{ 'chat.header.copySessionId' | transloco:{ id: tid.slice(0, 8) } }}</app-menu-item>
               }
               <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
-              <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
               @if (chat.citationsByCid().size > 0) {
                 <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
               }
@@ -1271,64 +1268,6 @@ export function clearDraft(threadId: string | null): void {
         [agentOutdated]="chat.cloudFoldersAgentOutdated()"
         (showReview)="showCloudReview()"
       />
-
-      <!-- View menu: device-local display prefs (chatPrefs/localStorage).
-           Session config (model, temperature, mode, tools, …) lives in the
-           settings pane opened via settingsRequested — the old live rows
-           were retired with it (live_session_settings.md, Slice A). -->
-      @if (showViewMenu()) {
-        <div class="settings-panel">
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.reasoning' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chatPrefs.reasoningExpanded() ? 'expanded' : 'collapsed'"
-                        (changed)="onReasoningDefaultChange($event)">
-              <option value="expanded">{{ 'chat.settings.reasoningExpanded' | transloco }}</option>
-              <option value="collapsed">{{ 'chat.settings.reasoningCollapsed' | transloco }}</option>
-            </app-select>
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.toolCalls' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chatPrefs.toolCallsExpanded() ? 'expanded' : 'collapsed'"
-                        (changed)="onToolCallsDefaultChange($event)">
-              <option value="expanded">{{ 'chat.settings.toolCallsExpanded' | transloco }}</option>
-              <option value="collapsed">{{ 'chat.settings.toolCallsCollapsed' | transloco }}</option>
-            </app-select>
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.readingWidth' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chatPrefs.readingWidth()"
-                        (changed)="onReadingWidthChange($event)">
-              <option value="comfortable">{{ 'chat.settings.widthComfortable' | transloco }}</option>
-              <option value="wide">{{ 'chat.settings.widthWide' | transloco }}</option>
-              <option value="full">{{ 'chat.settings.widthFull' | transloco }}</option>
-            </app-select>
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.textSize' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chatPrefs.textSize()"
-                        (changed)="onTextSizeChange($event)">
-              <option value="small">{{ 'chat.settings.textSmall' | transloco }}</option>
-              <option value="medium">{{ 'chat.settings.textMedium' | transloco }}</option>
-              <option value="large">{{ 'chat.settings.textLarge' | transloco }}</option>
-            </app-select>
-          </div>
-          @if (chat.isOfficerThread()) {
-            <div class="settings-row">
-              <label class="settings-label">{{ 'chat.settings.officerLens' | transloco }}</label>
-              <app-select size="sm" [fullWidth]="false"
-                          [value]="chatPrefs.officerLensFolded() ? 'folded' : 'all'"
-                          (changed)="onOfficerLensChange($event)">
-                <option value="folded">{{ 'chat.settings.officerLensFolded' | transloco }}</option>
-                <option value="all">{{ 'chat.settings.officerLensAll' | transloco }}</option>
-              </app-select>
-            </div>
-          }
-        </div>
-      }
 
       <!-- Citations panel (Half-B v2): session citations + view-original/drift -->
       @if (showCitations()) {
@@ -2886,8 +2825,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     inputText = '';
     private composerDraftRevision = 0;
 
-    // Settings panel
-    readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
     /** Citation chips: numbering per answer, and no half-written handle while streaming. */
     protected readonly citationScopeFor = citationScopeFor;
@@ -4373,34 +4310,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chat.setMode('auto_accept');
     }
 
-    /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */
-    onReasoningDefaultChange(value: string | null): void {
-        if (value === 'expanded' || value === 'collapsed') {
-            this.chatPrefs.setReasoningExpanded(value === 'expanded');
-        }
-    }
-
-    /** Display-only: whether tool-call runs render inline ("expanded") or folded. */
-    onToolCallsDefaultChange(value: string | null): void {
-        if (value === 'expanded' || value === 'collapsed') {
-            this.chatPrefs.setToolCallsExpanded(value === 'expanded');
-        }
-    }
-
-    /** Display-only: the reading-column width preset (Comfortable / Wide / Full). */
-    onReadingWidthChange(value: string | null): void {
-        if (value === 'comfortable' || value === 'wide' || value === 'full') {
-            this.chatPrefs.setReadingWidth(value);
-        }
-    }
-
-    /** Display-only: the prose text-size preset (Small / Medium / Large). */
-    onTextSizeChange(value: string | null): void {
-        if (value === 'small' || value === 'medium' || value === 'large') {
-            this.chatPrefs.setTextSize(value);
-        }
-    }
-
     openIde(url: string): void {
         window.open(url, '_blank');
     }
@@ -4769,10 +4678,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
         return turns.map((turn) => ({kind: 'turn' as const, id: turn.id, turn}));
     });
-
-    onOfficerLensChange(value: string | null): void {
-        this.chatPrefs.setOfficerLensFolded(value === 'folded');
-    }
 
     /** Exposed for the wake-cycle template: what the officer said, if anything, before sleeping. */
     readonly trailingText = trailingText;

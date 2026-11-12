@@ -19,6 +19,7 @@ import {ApiService} from '../../core/services/api.service';
 import {ViewModeService} from '../../core/services/view-mode.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {I18nService} from '../../core/services/i18n.service';
+import {ChatPreferencesService} from '../../core/services/chat-preferences.service';
 import {TranslocoService} from '@jsverse/transloco';
 import {ActivatedRoute, Router} from '@angular/router';
 import {SubscriptionLogin, SubscriptionsStatus} from '../../core/models/api.model';
@@ -467,7 +468,10 @@ describe('SettingsComponent — sections', () => {
     );
 
   it.each<[SettingsSection, string[]]>([
-    ['general', ['settings.appearance.title', 'settings.language.title', 'settings.dataVisibility.title']],
+    [
+      'general',
+      ['settings.appearance.title', 'settings.chatDisplay.title', 'settings.language.title', 'settings.dataVisibility.title'],
+    ],
     ['defaults', ['settings.expertDefaults.title', 'settings.preferences.title', 'settings.persistent.title']],
     ['provider-keys', ['settings.providerKeys.title']],
     ['notifications', ['settings.communication.title']],
@@ -519,5 +523,62 @@ describe('SettingsComponent — sections', () => {
     const own = makeSettingsService();
     setup(own, false, 'provider-keys');
     expect(own.loadApiKeys).toHaveBeenCalled();
+  });
+});
+
+// The chat display choices moved here from the session header's "View
+// options" bar. They stay device-local: each control writes straight to
+// ChatPreferencesService (localStorage), which the session view reads.
+describe('SettingsComponent — chat display', () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => localStorage.clear());
+
+  it('writes each choice to the device-local chat preferences', () => {
+    const fixture = setup(makeSettingsService(), false, 'general');
+    const component = fixture.componentInstance;
+    const prefs = TestBed.inject(ChatPreferencesService);
+
+    component.onChatReasoningChange('collapsed');
+    component.onChatToolCallsChange('expanded');
+    component.onChatReadingWidthChange('full');
+    component.onChatTextSizeChange('large');
+    component.onChatOfficerLensChange('all');
+
+    expect(prefs.reasoningExpanded()).toBe(false);
+    expect(prefs.toolCallsExpanded()).toBe(true);
+    expect(prefs.readingWidth()).toBe('full');
+    expect(prefs.textSize()).toBe('large');
+    expect(prefs.officerLensFolded()).toBe(false);
+    fixture.destroy();
+  });
+
+  it('ignores a value that is not one of the options', () => {
+    const fixture = setup(makeSettingsService(), false, 'general');
+    const component = fixture.componentInstance;
+    const prefs = TestBed.inject(ChatPreferencesService);
+    const before = {
+      reasoning: prefs.reasoningExpanded(),
+      toolCalls: prefs.toolCallsExpanded(),
+      width: prefs.readingWidth(),
+      size: prefs.textSize(),
+      lens: prefs.officerLensFolded(),
+    };
+
+    for (const bogus of [null, '', 'huge']) {
+      component.onChatReasoningChange(bogus);
+      component.onChatToolCallsChange(bogus);
+      component.onChatReadingWidthChange(bogus);
+      component.onChatTextSizeChange(bogus);
+      component.onChatOfficerLensChange(bogus);
+    }
+
+    expect({
+      reasoning: prefs.reasoningExpanded(),
+      toolCalls: prefs.toolCallsExpanded(),
+      width: prefs.readingWidth(),
+      size: prefs.textSize(),
+      lens: prefs.officerLensFolded(),
+    }).toEqual(before);
+    fixture.destroy();
   });
 });

@@ -215,16 +215,6 @@
         display: block;
         padding: 0;
       }
-      .settings-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      .settings-label {
-        font-size: 11px;
-        color: var(--text-muted);
-        white-space: nowrap;
-      }
       .settings-slider {
         width: 100px;
         accent-color: var(--accent-color);

@@ -19,6 +19,7 @@ import { chatModelLabel, ModelService } from '../../core/services/model.service'
 import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { normalizePermissionMode } from '../../core/models/permission-mode';
 import { I18nService, SupportedLang } from '../../core/services/i18n.service';
+import { ChatPreferencesService } from '../../core/services/chat-preferences.service';
 import type { ExpertEditorNavigationState } from '../experts/expert-editor.component';
 import {
   ApiKeyProvider,
@@ -140,6 +141,60 @@ const EXPIRY_OPTIONS = [
                 </app-form-field>
                 <app-form-field [label]="'settings.appearance.accentLabel' | transloco">
                   <app-accent-toggle [ariaLabel]="'settings.appearance.accentLabel' | transloco" />
+                </app-form-field>
+              </div>
+            </section>
+
+            <!-- Chat display: how session transcripts render. Device-local
+                 (ChatPreferencesService / localStorage) like the theme above;
+                 nothing here reaches the agent. Lived in a "View options" bar
+                 in the session header until 2026-11. -->
+            <section class="settings-section">
+              <h2 class="section-title">{{ 'settings.chatDisplay.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.chatDisplay.desc' | transloco }}</p>
+              <div class="form-block">
+                <app-form-field [label]="'settings.chatDisplay.reasoning' | transloco">
+                  <app-select [value]="chatPrefs.reasoningExpanded() ? 'expanded' : 'collapsed'"
+                              [ariaLabel]="'settings.chatDisplay.reasoning' | transloco"
+                              (changed)="onChatReasoningChange($event)">
+                    <option value="collapsed">{{ 'settings.chatDisplay.collapsed' | transloco }}</option>
+                    <option value="expanded">{{ 'settings.chatDisplay.expanded' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field [label]="'settings.chatDisplay.toolCalls' | transloco">
+                  <app-select [value]="chatPrefs.toolCallsExpanded() ? 'expanded' : 'collapsed'"
+                              [ariaLabel]="'settings.chatDisplay.toolCalls' | transloco"
+                              (changed)="onChatToolCallsChange($event)">
+                    <option value="collapsed">{{ 'settings.chatDisplay.collapsed' | transloco }}</option>
+                    <option value="expanded">{{ 'settings.chatDisplay.expanded' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field [label]="'settings.chatDisplay.readingWidth' | transloco">
+                  <app-select [value]="chatPrefs.readingWidth()"
+                              [ariaLabel]="'settings.chatDisplay.readingWidth' | transloco"
+                              (changed)="onChatReadingWidthChange($event)">
+                    <option value="comfortable">{{ 'settings.chatDisplay.widthComfortable' | transloco }}</option>
+                    <option value="wide">{{ 'settings.chatDisplay.widthWide' | transloco }}</option>
+                    <option value="full">{{ 'settings.chatDisplay.widthFull' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field [label]="'settings.chatDisplay.textSize' | transloco">
+                  <app-select [value]="chatPrefs.textSize()"
+                              [ariaLabel]="'settings.chatDisplay.textSize' | transloco"
+                              (changed)="onChatTextSizeChange($event)">
+                    <option value="small">{{ 'settings.chatDisplay.textSmall' | transloco }}</option>
+                    <option value="medium">{{ 'settings.chatDisplay.textMedium' | transloco }}</option>
+                    <option value="large">{{ 'settings.chatDisplay.textLarge' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field [label]="'settings.chatDisplay.officerLens' | transloco"
+                                [hint]="'settings.chatDisplay.officerLensHint' | transloco">
+                  <app-select [value]="chatPrefs.officerLensFolded() ? 'folded' : 'all'"
+                              [ariaLabel]="'settings.chatDisplay.officerLens' | transloco"
+                              (changed)="onChatOfficerLensChange($event)">
+                    <option value="folded">{{ 'settings.chatDisplay.officerLensFolded' | transloco }}</option>
+                    <option value="all">{{ 'settings.chatDisplay.officerLensAll' | transloco }}</option>
+                  </app-select>
                 </app-form-field>
               </div>
             </section>
@@ -2447,6 +2502,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly modelLabel = chatModelLabel;
   readonly capabilities = inject(CapabilitiesService);
   readonly i18n = inject(I18nService);
+  readonly chatPrefs = inject(ChatPreferencesService);
   readonly viewMode = inject(ViewModeService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
@@ -3241,6 +3297,43 @@ export class SettingsComponent implements OnInit, OnDestroy {
 
   onLanguageChange(lang: SupportedLang): void {
     this.i18n.setLanguage(lang).subscribe();
+  }
+
+  // ── Chat display (device-local) ────────────────────────────────
+
+  /** Whether reasoning ("thinking") blocks open expanded by default. */
+  onChatReasoningChange(value: string | null): void {
+    if (value === 'expanded' || value === 'collapsed') {
+      this.chatPrefs.setReasoningExpanded(value === 'expanded');
+    }
+  }
+
+  /** Whether tool-call runs render inline ("expanded") or folded. */
+  onChatToolCallsChange(value: string | null): void {
+    if (value === 'expanded' || value === 'collapsed') {
+      this.chatPrefs.setToolCallsExpanded(value === 'expanded');
+    }
+  }
+
+  /** The reading-column width preset (Comfortable / Wide / Full). */
+  onChatReadingWidthChange(value: string | null): void {
+    if (value === 'comfortable' || value === 'wide' || value === 'full') {
+      this.chatPrefs.setReadingWidth(value);
+    }
+  }
+
+  /** The prose text-size preset (Small / Medium / Large). */
+  onChatTextSizeChange(value: string | null): void {
+    if (value === 'small' || value === 'medium' || value === 'large') {
+      this.chatPrefs.setTextSize(value);
+    }
+  }
+
+  /** Officer sessions: fold quiet wake cycles, or show the raw transcript. */
+  onChatOfficerLensChange(value: string | null): void {
+    if (value === 'folded' || value === 'all') {
+      this.chatPrefs.setOfficerLensFolded(value === 'folded');
+    }
   }
 
   // ── Persistent Agent Settings ──────────────────────────────────
