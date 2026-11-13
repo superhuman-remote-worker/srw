@@ -25,6 +25,7 @@ from shared.run_queue import (
     complete_unit,
     queue_state_for,
     record_input_seq,
+    unpark_unit,
 )
 from tests import test_workspace_pull_failure_real_postgres as full
 
@@ -285,6 +286,100 @@ async def test_not_run_result_clears_debt_and_admits_the_next_claim(db, monkeypa
         )
     ex, pa = executor(db, monkeypatch)
     assert await ex._admit_session_tool_history(pa, claim) is True
+    assert ex._stop.is_set() is False
+
+
+async def stamp_own_active_record(db, thread, claim):
+    """The record the claim bundle publishes for this claim's own token."""
+    await db.execute(
+        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1",
+        thread,
+        json.dumps(
+            {
+                "_stateless_active_claim": {
+                    "lease_token": claim.lease_token,
+                    "pod": POD,
+                    "pod_uid": POD_UID,
+                }
+            }
+        ),
+    )
+
+
+async def park_turn_that_left_an_unanswered_approval(db, monkeypatch):
+    """A turn ends while its gated call has no result and its prompt is open."""
+    thread, claim = await seed(db)
+    await stamp_own_active_record(db, thread, claim)
+    await db.execute(
+        "INSERT INTO thread_permission_requests"
+        "(id,thread_id,tool_call_id,tool_name,status,accepted_lease_token) "
+        "VALUES($1,$2,'original_call','run_command','pending',$3)",
+        uuid4(),
+        thread,
+        claim.lease_token,
+    )
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._park_if_turn_left_tool_debt(pa, claim) is True
+    return thread, claim, ex, pa
+
+
+@pytest.mark.asyncio
+async def test_turn_end_with_tool_debt_parks_under_its_own_claim(db, monkeypatch):
+    """The turn that leaves a call without a result parks for the owner's
+    Continue/Stop under its own claim, instead of completing into a state the
+    next claim's admission refuses (the 2026-11-09 incident)."""
+    thread, claim, ex, pa = await park_turn_that_left_an_unanswered_approval(
+        db, monkeypatch
+    )
+
+    after = await rows(db, thread)
+    assert after["queue"]["state"] == "parked"
+    assert after["queue"]["park_reason"] == "loop_died_after_tool_effect"
+    assert "_stateless_active_claim" not in json.loads(after["thread"]["metadata"])
+    assert (
+        await db.fetchval(
+            "SELECT status FROM thread_permission_requests WHERE thread_id=$1",
+            thread,
+        )
+        == "expired"
+    )
+    assert [e["kind"] for e in after["events"]].count("turn.parked") == 1
+    assert ex._stop.is_set() is False
+    # The turn's own pending push is handed off under its own claim.
+    ex._quiesce_claim_before_transition.assert_awaited_once_with(
+        pa, reason="turn_end_tool_debt", claim=claim
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_end_without_tool_debt_completes_normally(db, monkeypatch):
+    thread, claim = await seed(db, resolved=True)
+    await stamp_own_active_record(db, thread, claim)
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._park_if_turn_left_tool_debt(pa, claim) is False
+    assert (await rows(db, thread))["queue"]["state"] == "leased"
+    ex._quiesce_claim_before_transition.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unparked_turn_end_park_parks_again_without_stopping(db, monkeypatch):
+    """An admin unpark of a turn-end park re-parks at the next admission; it
+    does not rebuild the refusal that stops the executor."""
+    thread, claim, ex, pa = await park_turn_that_left_an_unanswered_approval(
+        db, monkeypatch
+    )
+    async with db.acquire() as conn:
+        assert await unpark_unit(conn, unit_id=thread) is True
+        successor = await claim_unit(
+            conn,
+            unit_kind=UNIT_KIND_SESSION_TURN,
+            pod_name=POD,
+            prefer_unit_id=thread,
+            affinity_grace_seconds=0,
+        )
+    assert successor is not None and successor.lease_token > claim.lease_token
+    assert await ex._admit_session_tool_history(pa, successor) is False
+    assert (await rows(db, thread))["queue"]["state"] == "parked"
     assert ex._stop.is_set() is False
 
 

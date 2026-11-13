@@ -13623,6 +13623,30 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
     expect(ctx.service.isParked()).toBe(false);
   });
 
+  it('re-reads the queue when a turn.parked frame arrives so the Continue/Stop card can show', async () => {
+    const ctx = await readyOn('thread-tp');
+    const turnEndPark = {
+      ...parkedBlock,
+      park_reason: 'loop_died_after_tool_effect',
+      retryable: false,
+    };
+    const getQueue = vi.fn().mockReturnValue(of(turnEndPark));
+    (ctx.mockApi as any).getThreadQueue = getQueue;
+
+    // A park journals no target turn id, and here no turn is active either:
+    // the frame alone names nothing to close, yet the queue block changed.
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'turn.parked', params: { reason: 'loop_died_after_tool_effect' } },
+      '2:1',
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(getQueue).toHaveBeenCalledWith('thread-tp');
+    expect(ctx.service.isParked()).toBe(true);
+    expect(ctx.service.queueState()?.park_reason).toBe('loop_died_after_tool_effect');
+  });
+
   it('a refused retry re-reads the block, so a unit settled elsewhere unparks', async () => {
     const ctx = await readyOn('thread-rr', { queue: parkedBlock });
     await new Promise((r) => setTimeout(r, 0));

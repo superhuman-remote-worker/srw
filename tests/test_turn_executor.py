@@ -3959,6 +3959,67 @@ class TestCommitThenEffects:
         assert not harness.has_tool_effect(claim)
 
     @pytest.mark.asyncio
+    async def test_normal_turn_end_parks_instead_of_completing_when_debt_remains(
+        self, harness, monkeypatch
+    ):
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 4, "content": "left a call unanswered"}
+        ]
+        claim = make_claim(token=97, input_seq=4)
+        guard = AsyncMock(return_value=True)
+        complete = AsyncMock(wraps=harness.executor._complete_with_retry)
+        monkeypatch.setattr(harness.executor, "_park_if_turn_left_tool_debt", guard)
+        monkeypatch.setattr(harness.executor, "_complete_with_retry", complete)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        guard.assert_awaited_once_with(pa, claim)
+        complete.assert_not_awaited()
+        assert not harness.calls["complete"]
+
+    @pytest.mark.asyncio
+    async def test_settled_shutdown_parks_instead_of_completing_when_debt_remains(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "settled_effect"
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 4, "content": "settled, debt, then killed"}
+        ]
+        claim = make_claim(token=98, input_seq=4)
+        guard = AsyncMock(return_value=True)
+        complete = AsyncMock(wraps=harness.executor._complete_with_retry)
+        monkeypatch.setattr(harness.executor, "_park_if_turn_left_tool_debt", guard)
+        monkeypatch.setattr(harness.executor, "_complete_with_retry", complete)
+        # Shutdown lands after the turn settled but before the normal turn
+        # end reaches its own guard, so only the settled-shutdown branch runs.
+        entered = asyncio.Event()
+        original_detach = harness.executor._detach_physical_before_transition
+
+        async def detach_blocks_at_turn_end(reason):
+            if reason == "turn_complete":
+                entered.set()
+                await asyncio.sleep(3600)  # cancelled by shutdown
+            await original_detach(reason)
+
+        monkeypatch.setattr(
+            harness.executor,
+            "_detach_physical_before_transition",
+            detach_blocks_at_turn_end,
+        )
+        harness.executor._abort_grace_seconds = 0.05
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        harness.executor._task = serving
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await asyncio.wait_for(harness.executor.stop(timeout=0), timeout=5)
+        await _finish(harness)
+
+        guard.assert_awaited_once_with(pa, claim)
+        complete.assert_not_awaited()
+        assert not harness.calls["complete"]
+        assert not harness.calls["release"]
+
+    @pytest.mark.asyncio
     async def test_cancel_mid_turn_with_durable_tool_results_releases(
         self, harness, monkeypatch
     ):

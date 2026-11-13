@@ -74,6 +74,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Tuple,
@@ -4019,6 +4020,10 @@ class StatelessTurnExecutor:
                 reason="shutdown_after_settle",
                 claim=claim,
             )
+            # A settled turn that left a call without a result parks, as at
+            # the normal turn end, instead of completing or being released.
+            if await self._park_if_turn_left_tool_debt(pa, claim):
+                return
             if not self._lease.lost.is_set():
                 try:
                     state = await asyncio.wait_for(
@@ -4751,6 +4756,10 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._detach_physical_before_transition("turn_complete")
             timing["detach_final"] = time.perf_counter() - t0
+            # A call still without a result parks for the owner's decision:
+            # completing would leave the next claim an admission refusal.
+            if await self._park_if_turn_left_tool_debt(pa, claim):
+                return
             t0 = time.perf_counter()
             state = await self._complete_with_retry(
                 claim, consumed_seq=completion_consumed_seq
@@ -5630,9 +5639,89 @@ class StatelessTurnExecutor:
         # The cache can still belong to the previous unit. Drain under that
         # unit's existing lease; do not hand its push to this new claim or
         # activate the new mutable lease before the admission decision.
-        await self._quiesce_claim_before_transition(
-            pa, reason="unresolved_predecessor_tool"
+        outcome = await self._park_session_tool_debt(
+            pa,
+            claim,
+            quiesce_reason="unresolved_predecessor_tool",
+            release_reason="unresolved_predecessor_tool",
+            quiesce_with_claim=False,
         )
+        if outcome == "lost":
+            logger.error(
+                "session tool-debt park lost its authority: unit=%s token=%d; "
+                "stopping this executor until the pod is replaced",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            self.request_stop()
+        # A real late result may clear the debt under the same locked claim.
+        # A lost commit response is the existing idempotent parked outcome,
+        # never permission to reconstruct model/tool context.
+        return outcome == "clear"
+
+    async def _park_if_turn_left_tool_debt(self, pa: Any, claim: ClaimedUnit) -> bool:
+        """Park, instead of completing, a turn that leaves tool debt.
+
+        A completed turn whose transcript still holds a call without a result
+        would leave the next claim an admission refusal that stops this
+        executor. Park it for the owner's Continue/Stop under this claim's own
+        lease instead. True when the caller must return (parked, or the claim
+        was lost); False when there is no debt and completion proceeds.
+        """
+        row = await self._session_tool_debt(self._db, claim)
+        if row is None or not row["unresolved"]:
+            # No debt under this claim's proven authority: completion fences
+            # or completes exactly as before.
+            return False
+        outcome = await self._park_session_tool_debt(
+            pa,
+            claim,
+            quiesce_reason="turn_end_tool_debt",
+            release_reason="turn_end_tool_debt",
+            quiesce_with_claim=True,
+        )
+        if outcome == "parked":
+            self._clear_claim_tool_effect(pa, claim)
+            logger.warning(
+                "run_queue park: unit=%s token=%d reason=loop_died_after_tool_effect "
+                "(turn ended with unanswered tool calls)",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            return True
+        if outcome == "lost":
+            # The locked recheck found this claim's authority gone (End, a
+            # steal, a stop marker): acknowledge it like a fenced-out
+            # completion. Never stop the executor for it.
+            await self._ack_terminal_claim_loss(claim)
+            self._clear_claim_tool_effect(pa, claim)
+            return True
+        return False
+
+    async def _park_session_tool_debt(
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        *,
+        quiesce_reason: str,
+        release_reason: str,
+        quiesce_with_claim: bool,
+    ) -> Literal["parked", "clear", "lost"]:
+        """Quiesce, then park this claim's Session tool debt for the owner.
+
+        The atomic release/journal transaction rechecks locked current
+        authority and debt before it can retire this queue lease. When it
+        parks, it also retires this claim's active record, expires its
+        pending permission prompts and journals ``turn.parked``. Returns
+        ``"clear"`` when a real late result cleared the debt under the locked
+        claim and ``"lost"`` when the claim's authority is gone.
+        """
+        if quiesce_with_claim:
+            await self._quiesce_claim_before_transition(
+                pa, reason=quiesce_reason, claim=claim
+            )
+        else:
+            await self._quiesce_claim_before_transition(pa, reason=quiesce_reason)
         clear = False
         reason = "loop_died_after_tool_effect"
 
@@ -5653,14 +5742,14 @@ class StatelessTurnExecutor:
                 reason=reason,
             )
             # park_unit's general CAS intentionally accepts only token/state.
-            # This admission path also owes a current, unexpired owner at the
-            # CAS; an expiry while acquiring locks/checking debt rolls back.
+            # This park also owes a current, unexpired owner at the CAS; an
+            # expiry while acquiring locks/checking debt rolls back.
             if state is not None and not await conn.fetchval(
                 "SELECT $1::timestamptz > clock_timestamp()",
                 current["leased_until"],
             ):
                 raise _PostEffectParkError(
-                    "Session admission lease expired before park"
+                    "Session tool-debt lease expired before park"
                 )
             return state
 
@@ -5668,20 +5757,11 @@ class StatelessTurnExecutor:
             claim,
             cas=park_current_debt,
             park_reason=reason,
-            release_reason="unresolved_predecessor_tool",
+            release_reason=release_reason,
         )
-        if outcome is None and not clear:
-            logger.error(
-                "session tool-debt park lost its authority: unit=%s token=%d; "
-                "stopping this executor until the pod is replaced",
-                claim.unit_id,
-                claim.lease_token,
-            )
-            self.request_stop()
-        # A real late result may clear the debt under the same locked claim.
-        # A lost commit response is the existing idempotent parked outcome,
-        # never permission to reconstruct model/tool context.
-        return outcome is None and clear
+        if outcome is not None:
+            return "parked"
+        return "clear" if clear else "lost"
 
     async def _park_post_effect_claim(
         self,

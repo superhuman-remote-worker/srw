@@ -8216,6 +8216,13 @@ export class PersistentChatService {
           : !coveredBySnapshot
             ? this.conversation().activeAssistantTurnId
             : null;
+        // A park changed the queue block, and nothing else re-reads it while
+        // parked: read it now so the Continue/Stop card shows without a
+        // reload. A park journals no target turn, so do this before the
+        // early exit for frames that name no turn to close.
+        if (data.method === 'turn.parked' && !coveredBySnapshot) {
+          void this._pollQueueState();
+        }
         if (!targetId) break;
 
         const closedActive = this._interruptTurnIfSafe(targetId, now, coveredBySnapshot);
