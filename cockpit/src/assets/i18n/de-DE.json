@@ -1082,7 +1082,6 @@
       "executors": "Executors",
       "ready": "bereit",
       "busy": "belegt",
-      "unavailable": "Der Chat ist vorübergehend nicht verfügbar; ein Administrator wurde benachrichtigt. Ihre Nachricht ist gespeichert.",
       "queued": "In der Warteschlange",
       "sessions": "Sitzungen",
       "batches": "Batches",
@@ -2158,6 +2157,7 @@
     "queue": {
       "waiting": "Warten auf einen verfügbaren Agenten…",
       "busy": "Unsere Systeme sind stärker ausgelastet als üblich – das kann einige Minuten dauern. Sie können die Seite verlassen; die Antwort wartet hier auf Sie.",
+      "unavailable": "Der Chat ist vorübergehend nicht verfügbar; ein Administrator wurde benachrichtigt. Ihre Nachricht ist gespeichert.",
       "elapsed": "Wartezeit {{time}}"
     },
     "parked": {

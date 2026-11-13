@@ -1082,7 +1082,6 @@
       "executors": "Executors",
       "ready": "ready",
       "busy": "busy",
-      "unavailable": "Chat is temporarily unavailable; an administrator has been notified. Your message is saved.",
       "queued": "Queued",
       "sessions": "sessions",
       "batches": "batches",
@@ -2158,6 +2157,7 @@
     "queue": {
       "waiting": "Waiting for an available agent…",
       "busy": "Our systems are busier than usual — this may take a few minutes. You can leave this page; the reply will be here when you return.",
+      "unavailable": "Chat is temporarily unavailable; an administrator has been notified. Your message is saved.",
       "elapsed": "Waiting for {{time}}"
     },
     "parked": {
