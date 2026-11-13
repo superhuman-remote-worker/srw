@@ -216,6 +216,22 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
         logger.exception(
             "Project connector entries were not healed; it retries at the next start"
         )
+    from orchestrator.services.manifest_phase_prompt_retirement import (
+        retire_manifest_phase_prompts,
+    )
+
+    # Migration 0567 strips the retired strategic/tactical expert prompts from
+    # the experts rows; this strips current Expert and Project manifests the
+    # same way, as new revisions. Idempotent and never fatal.
+    try:
+        retired = await retire_manifest_phase_prompts(resources.postgres_db)
+        if any(retired.values()):
+            logger.info("Retired expert phase prompts: %s", retired)
+    except Exception:
+        logger.exception(
+            "Retired expert phase prompts were not removed from manifests; "
+            "it retries at the next start"
+        )
     resources.postgres_db.manifests_ready = True
     logger.info(
         "Managed expert defaults ready: worker=%s session=%s",
