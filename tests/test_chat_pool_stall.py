@@ -232,3 +232,29 @@ async def test_resolve_source_raise_on_error_distinguishes_failure():
         await svc.resolve_source(
             "chat_pool", "stateless", resolved_by="system", raise_on_error=True
         )
+
+
+@pytest.mark.asyncio
+async def test_record_chat_executors_unavailable_counts_a_failed_admin_row():
+    from orchestrator.services.notification_service import (
+        NotificationService,
+        RecordResult,
+    )
+
+    svc = NotificationService()
+    db = MagicMock()
+    good, bad = str(uuid4()), str(uuid4())
+    db.list_admin_user_ids = AsyncMock(return_value=[bad, good])
+    svc.connect(db, MagicMock(), MagicMock())
+
+    async def record(**kw):
+        if kw["recipient_id"] == bad:
+            raise RuntimeError("db blip")
+        return RecordResult("n-1", True, {"in_app": True})
+
+    svc.record = AsyncMock(side_effect=record)
+    res = await svc.record_chat_executors_unavailable(
+        incident="2026-11-13T10:00:00+00:00", runnable=1, oldest_age_s=400.0
+    )
+    assert res["notified"] == 1
+    assert res["failed"] == 1

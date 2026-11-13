@@ -1203,10 +1203,10 @@ class NotificationService:
         """The chat pool stalled: queued messages, no live lease, none taken.
         One row per admin; ``incident`` (the oldest queued turn's runnable
         time) is the dedup key, so every replica's watch yields one row per
-        admin per incident. Best-effort; failures are logged, never raised. The result carries
-        ``error`` (admin lookup failed) or ``failed`` (admin rows that did not
-        write) so the caller can retry; retrying is safe, the dedup key is
-        idempotent."""
+        admin per incident. Best-effort; failures are logged, never raised.
+        The result carries ``error`` (admin lookup failed) or ``failed``
+        (admin rows that did not write) so the caller can retry; retrying is
+        safe, the dedup key is idempotent."""
         if not self._available or not self._db:
             return {"error": "NotificationService not initialized"}
         try:
@@ -1245,6 +1245,7 @@ class NotificationService:
                 results["notified"] += 1
                 results["notification_ids"].append(outcome.notification_id)
             except Exception as e:
+                results["failed"] += 1
                 logger.warning("Chat stall notify for admin %s failed: %s", admin_id, e)
         return results
 
