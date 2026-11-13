@@ -372,13 +372,21 @@ class NotificationService:
         return wire
 
     async def resolve_source(
-        self, source_kind: str, source_id: str, *, resolved_by: str
+        self,
+        source_kind: str,
+        source_id: str,
+        *,
+        resolved_by: str,
+        raise_on_error: bool = False,
     ) -> list[str]:
         """The underlying thing was settled — by a user, the officer, or a
         sweeper. Stamp every open row about it, whoever it belongs to (D6).
         Best-effort by design: called from state-change hooks that must not
-        fail because the feed did."""
+        fail because the feed did. A caller that must tell "nothing was open"
+        from "the write failed" passes ``raise_on_error=True``."""
         if not self._available or not self._db:
+            if raise_on_error:
+                raise RuntimeError("NotificationService not initialized")
             return []
         try:
             rows = await self._db.resolve_notifications_by_source(
@@ -390,6 +398,8 @@ class NotificationService:
             logger.warning(
                 "resolve_source(%s, %s) failed: %s", source_kind, source_id, e
             )
+            if raise_on_error:
+                raise
             return []
         for row in rows:
             wire = serialize_notification(row)
@@ -1193,7 +1203,10 @@ class NotificationService:
         """The chat pool stalled: queued messages, no live lease, none taken.
         One row per admin; ``incident`` (the oldest queued turn's runnable
         time) is the dedup key, so every replica's watch yields one row per
-        admin per incident. Best-effort; failures are logged, never raised."""
+        admin per incident. Best-effort; failures are logged, never raised. The result carries
+        ``error`` (admin lookup failed) or ``failed`` (admin rows that did not
+        write) so the caller can retry; retrying is safe, the dedup key is
+        idempotent."""
         if not self._available or not self._db:
             return {"error": "NotificationService not initialized"}
         try:
@@ -1203,7 +1216,11 @@ class NotificationService:
             return {"error": "admin lookup failed"}
 
         minutes = round(oldest_age_s / 60)
-        results: dict[str, Any] = {"notified": 0, "notification_ids": []}
+        results: dict[str, Any] = {
+            "notified": 0,
+            "failed": 0,
+            "notification_ids": [],
+        }
         for admin_id in admin_ids:
             try:
                 outcome = await self.record(

@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from orchestrator.services.stateless_capacity import (
     QueueDemand,
-    _connection,
+    acquire_connection,
     read_demand,
 )
 
@@ -109,7 +109,7 @@ class ChatPoolStallWatch:
         self._may_have_open = True
 
     async def run_once(self) -> bool:
-        async with _connection(self._db) as conn:
+        async with acquire_connection(self._db) as conn:
             demand = await read_demand(conn)
         threshold = (
             self._threshold_s if self._threshold_s is not None else stall_threshold_s()
@@ -118,25 +118,36 @@ class ChatPoolStallWatch:
         if stalled:
             incident = stall_incident_key(demand)
             if incident is not None and incident != self._notified_incident:
+                # Remember the incident only once every admin row is written;
+                # a failed attempt is retried next tick (dedup key = idempotent).
                 try:
-                    await self._notifications.record_chat_executors_unavailable(
-                        incident=incident,
-                        runnable=demand.runnable_session_turn,
-                        oldest_age_s=float(demand.oldest_session_turn_age_s or 0.0),
+                    result = (
+                        await self._notifications.record_chat_executors_unavailable(
+                            incident=incident,
+                            runnable=demand.runnable_session_turn,
+                            oldest_age_s=float(demand.oldest_session_turn_age_s or 0.0),
+                        )
                     )
                 except Exception:
                     logger.exception("chat pool stall notification failed")
-                self._notified_incident = incident
-                self._may_have_open = True
+                else:
+                    if isinstance(result, dict) and (
+                        result.get("error") or result.get("failed")
+                    ):
+                        logger.warning("chat pool stall notification incomplete")
+                    else:
+                        self._notified_incident = incident
+                    self._may_have_open = True
         elif self._may_have_open:
             try:
                 await self._notifications.resolve_source(
-                    SOURCE_KIND, SOURCE_ID, resolved_by="system"
+                    SOURCE_KIND, SOURCE_ID, resolved_by="system", raise_on_error=True
                 )
             except Exception:
                 logger.exception("chat pool stall resolve failed")
-            self._notified_incident = None
-            self._may_have_open = False
+            else:
+                self._notified_incident = None
+                self._may_have_open = False
         return stalled
 
     async def run(self, shutdown_event: asyncio.Event) -> None:

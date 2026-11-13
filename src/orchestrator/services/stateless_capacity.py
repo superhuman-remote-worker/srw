@@ -154,7 +154,7 @@ def desired_replicas(demand: QueueDemand, params: CapacityParams) -> int:
 
 
 @asynccontextmanager
-async def _connection(source: Any) -> AsyncIterator[Any]:
+async def acquire_connection(source: Any) -> AsyncIterator[Any]:
     acquire = getattr(source, "acquire", None)
     if acquire is None:
         yield source
@@ -263,7 +263,7 @@ async def capacity_snapshot(
     """The admin payload: what the scaler sees, plus the pool it is sizing,
     plus the parked worklist (stateless_turn_resilience.md step 2)."""
     params = params or CapacityParams.from_env()
-    async with _connection(db) as conn:
+    async with acquire_connection(db) as conn:
         demand = await read_demand(conn)
         parked_rows = await list_parked(conn, limit=parked_limit)
     inventory: ExecutorInventory | None = None

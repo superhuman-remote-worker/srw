@@ -113,7 +113,7 @@ async def test_watch_resolves_when_the_stall_clears(monkeypatch):
     for _ in range(3):
         await watch.run_once()
     notes.resolve_source.assert_awaited_once_with(
-        "chat_pool", "stateless", resolved_by="system"
+        "chat_pool", "stateless", resolved_by="system", raise_on_error=True
     )
 
 
@@ -126,10 +126,38 @@ async def test_watch_resolves_once_after_start(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_watch_never_raises_on_sink_failure(monkeypatch):
-    watch, notes = _watch(monkeypatch, [_stalled()])
-    notes.record_chat_executors_unavailable.side_effect = RuntimeError("down")
-    assert await watch.run_once() is True
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("down"),
+        {"error": "admin lookup failed"},
+        {"notified": 1, "failed": 1, "notification_ids": ["a"]},
+    ],
+    ids=["raises", "error-dict", "partial"],
+)
+async def test_failed_alert_is_retried_next_tick_then_stops(monkeypatch, failure):
+    watch, notes = _watch(monkeypatch, [_stalled(), _stalled(), _stalled()])
+    ok = {"notified": 2, "failed": 0, "notification_ids": ["a", "b"]}
+    effects = [failure, ok]
+    notes.record_chat_executors_unavailable.side_effect = effects
+    for _ in range(3):
+        assert await watch.run_once() is True  # never raises
+    assert notes.record_chat_executors_unavailable.await_count == 2
+    incidents = {
+        c.kwargs["incident"]
+        for c in notes.record_chat_executors_unavailable.await_args_list
+    }
+    assert incidents == {"2026-11-13T10:00:00+00:00"}
+
+
+@pytest.mark.asyncio
+async def test_failed_resolve_is_retried_next_healthy_tick_then_stops(monkeypatch):
+    watch, notes = _watch(monkeypatch, [_stalled(), _demand(), _demand(), _demand()])
+    notes.record_chat_executors_unavailable.return_value = {"notified": 1, "failed": 0}
+    notes.resolve_source.side_effect = [RuntimeError("db down"), []]
+    for _ in range(4):
+        await watch.run_once()
+    assert notes.resolve_source.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -186,4 +214,21 @@ async def test_record_chat_executors_unavailable_notifies_every_admin():
             "3 chat message(s) have been waiting for 15 min and no chat executor "
             "is working on any of them. Open Admin › Capacity and check the "
             "srw-agent-stateless pods."
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_raise_on_error_distinguishes_failure():
+    from orchestrator.services.notification_service import NotificationService
+
+    svc = NotificationService()
+    db = MagicMock()
+    db.resolve_notifications_by_source = AsyncMock(side_effect=RuntimeError("x"))
+    svc.connect(db, MagicMock(), MagicMock())
+    assert (
+        await svc.resolve_source("chat_pool", "stateless", resolved_by="system") == []
+    )
+    with pytest.raises(RuntimeError):
+        await svc.resolve_source(
+            "chat_pool", "stateless", resolved_by="system", raise_on_error=True
         )
