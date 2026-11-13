@@ -22,10 +22,15 @@ CATALOG_COLUMN_MIGRATIONS = ("0552_",)
 # ``agents`` and ``jobs`` (both present since cutover) and nothing else.
 HARNESS_IMAGE_COLUMN_MIGRATIONS = ("0559_",)
 
+# Today's ``get_job`` and job lists also select ``jobs.title`` (0566). 0566
+# adds one nullable column to ``jobs`` (present since cutover) and nothing else.
+JOB_TITLE_COLUMN_MIGRATIONS = ("0566_",)
+
 
 def is_lease_table_migration(name: str) -> bool:
     return name.startswith(
         LEASE_TABLE_MIGRATIONS
         + CATALOG_COLUMN_MIGRATIONS
         + HARNESS_IMAGE_COLUMN_MIGRATIONS
+        + JOB_TITLE_COLUMN_MIGRATIONS
     )

@@ -282,6 +282,7 @@ GET    /api/jobs                                                                
 POST   /api/jobs                                                                        pat=jobs:write      gated:require_project_member
 DELETE /api/jobs/{job_id}                                                               pat=jobs:write      gated:require_job_access
 GET    /api/jobs/{job_id}                                                               pat=jobs:read       gated:require_job_access
+PATCH  /api/jobs/{job_id}                                                               pat=jobs:write      gated:require_job_access
 POST   /api/jobs/{job_id}/accept                                                        pat=jobs:write      gated:require_job_access
 PUT    /api/jobs/{job_id}/agent-release                                                 pat=refused         internal:require_internal
 POST   /api/jobs/{job_id}/approve                                                       pat=jobs:write      gated:require_internal_or_job_access
