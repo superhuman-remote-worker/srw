@@ -1,5 +1,5 @@
 import {Component, computed, effect, inject, OnInit, signal, viewChild} from '@angular/core';
-import {ActivatedRoute, Router} from '@angular/router';
+import {ActivatedRoute, Router, RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import type {SessionToolGroupsResponse} from '../../core/services/api.service';
@@ -305,6 +305,7 @@ interface EditorForm {
   selector: 'app-expert-editor',
   standalone: true,
   imports: [
+    RouterLink,
     TranslocoPipe,
     AppBadgeComponent,
     AppButtonComponent,
@@ -494,18 +495,30 @@ interface EditorForm {
               (valueChange)="form.persona = $event"
             />
           </app-form-field>
-          <app-form-field
-            [label]="'experts.editor.instructions' | transloco"
-            [optional]="'experts.editor.optional' | transloco"
-            [hint]="'experts.editor.instructionsHint' | transloco"
-          >
-            <app-textarea
-              [value]="form.instructions"
-              [rows]="6"
-              [readonly]="readOnly()"
-              (valueChange)="form.instructions = $event"
-            />
-          </app-form-field>
+          <div class="field-with-note">
+            <app-form-field
+              [label]="'experts.editor.instructions' | transloco"
+              [optional]="'experts.editor.optional' | transloco"
+              [hint]="'experts.editor.instructionsHint' | transloco"
+            >
+              <app-textarea
+                [value]="form.instructions"
+                [rows]="6"
+                [readonly]="readOnly()"
+                (valueChange)="form.instructions = $event"
+              />
+            </app-form-field>
+            <!-- Expert instructions are being phased out in favour of skills
+                 (vault: issues/expert_instructions_phase_out.md). A session
+                 never reads them at all, so that expert is told so. -->
+            <p class="deprecation">
+              <app-badge tone="warning" size="xs">{{ 'experts.editor.deprecated' | transloco }}</app-badge>
+              <span>
+                {{ (mode() === 'session' ? 'experts.editor.instructionsDeprecatedSession' : 'experts.editor.instructionsDeprecated') | transloco }}
+                <a routerLink="/skills">{{ 'experts.editor.instructionsDeprecatedLink' | transloco }}</a>
+              </span>
+            </p>
+          </div>
           <div class="more">
             <button type="button" class="more-toggle" [attr.aria-expanded]="promptsMoreOpen()" (click)="promptsMoreOpen.set(!promptsMoreOpen())">
               <app-icon size="sm" class="more-chevron" [class.open]="promptsMoreOpen()">expand_more</app-icon>
@@ -824,6 +837,31 @@ interface EditorForm {
         display: flex;
         flex-direction: column;
         gap: 1rem;
+      }
+      .field-with-note {
+        display: flex;
+        flex-direction: column;
+        gap: 0.375rem;
+      }
+      .deprecation {
+        display: flex;
+        align-items: baseline;
+        gap: 0.5rem;
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
+      .deprecation app-badge {
+        flex-shrink: 0;
+      }
+      .deprecation a {
+        color: var(--accent-color);
+        text-decoration: none;
+        white-space: nowrap;
+      }
+      .deprecation a:hover {
+        text-decoration: underline;
       }
       .hint {
         margin: 0;

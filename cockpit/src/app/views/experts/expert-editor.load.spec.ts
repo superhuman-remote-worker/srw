@@ -109,6 +109,26 @@ describe('ExpertEditorComponent page shell', () => {
     }
   });
 
+  it('marks expert instructions as deprecated and points to Skills', () => {
+    api.getExpertSource.mockReturnValue(of({...structuredClone(SOURCE), expert_type: 'worker', tags: ['worker']}));
+    const fixture = create();
+    fixture.detectChanges();
+    const note = (fixture.nativeElement as HTMLElement).querySelector('.deprecation');
+
+    expect(note?.textContent).toContain('Deprecated');
+    expect(note?.textContent).toContain('will be removed in a later release');
+    expect(note?.textContent).not.toContain("Sessions don't read");
+    expect(note?.querySelector('a')?.getAttribute('routerLink')).toBe('/skills');
+  });
+
+  it('tells a session expert that sessions never read its instructions', () => {
+    const fixture = create(); // SOURCE is a session expert
+    fixture.detectChanges();
+    const note = (fixture.nativeElement as HTMLElement).querySelector('.deprecation');
+
+    expect(note?.textContent).toContain("Sessions don't read these instructions");
+  });
+
   it('summarises the prompts for the closed section', () => {
     const editor = create().componentInstance;
 
