@@ -5,6 +5,10 @@ lease of any kind is held, and the oldest runnable turn has waited at least
 ``STATELESS_CHAT_STALL_ALARM_S`` (default 300 s, floor 60 s). A busy pool is
 never stalled, however long its turns run or however large a ``worker_batch``
 backlog is.
+
+The admin notice resolves only once the chat backlog has cleared: no runnable
+``session_turn`` has waited the threshold. A lease alone does not resolve it;
+a crash-looping executor holds short leases while chat stays down.
 """
 
 from __future__ import annotations
@@ -58,6 +62,12 @@ def chat_pool_stalled(demand: QueueDemand, *, threshold_s: float) -> bool:
     )
 
 
+def chat_backlog_cleared(demand: QueueDemand, *, threshold_s: float) -> bool:
+    """No runnable chat turn has waited ``threshold_s``: a notice may resolve."""
+    age = demand.oldest_session_turn_age_s
+    return demand.runnable_session_turn == 0 or age is None or age < threshold_s
+
+
 def stall_incident_key(demand: QueueDemand) -> str | None:
     at = demand.oldest_session_turn_runnable_at
     if at is None:
@@ -91,7 +101,7 @@ async def read_chat_pool_stalled(
 
 
 class ChatPoolStallWatch:
-    """Notifies admins once per stall incident and resolves it when it clears."""
+    """Notifies admins once per stall incident; resolves it once the backlog clears."""
 
     def __init__(
         self,
@@ -138,7 +148,9 @@ class ChatPoolStallWatch:
                     else:
                         self._notified_incident = incident
                     self._may_have_open = True
-        elif self._may_have_open:
+        elif self._may_have_open and chat_backlog_cleared(
+            demand, threshold_s=threshold
+        ):
             try:
                 await self._notifications.resolve_source(
                     SOURCE_KIND, SOURCE_ID, resolved_by="system", raise_on_error=True

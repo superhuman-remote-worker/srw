@@ -273,7 +273,12 @@ async def thread_queue_state(
     async with store.acquire() as conn:
         block = await queue_block_for_thread(conn, thread)
         if block["state"] == "queued":
-            block["pool_stalled"] = await read_chat_pool_stalled(conn)
+            # Diagnostics only: a failed read leaves the plain queued bubble.
+            try:
+                block["pool_stalled"] = await read_chat_pool_stalled(conn)
+            except Exception as exc:
+                logger.warning("chat pool stall read failed: %s", exc)
+                block["pool_stalled"] = False
     return {"thread_id": thread_id, "queue": block}
 
 

@@ -179,6 +179,29 @@ async def test_queue_reports_pool_stalled_only_while_queued(owner, monkeypatch):
     stall.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_failed_stall_read_leaves_the_queued_block_unstalled(
+    owner, monkeypatch
+):
+    """The stall verdict is diagnostics only: a failed read never fails the
+    queue read the bubble polls."""
+    from orchestrator.services import chat_pool_stall
+
+    stall = AsyncMock(side_effect=RuntimeError("db down"))
+    monkeypatch.setattr(chat_pool_stall, "read_chat_pool_stalled", stall)
+    conn, _ = _wire(
+        monkeypatch, state={"state": "queued", "attempts": 0}, authority=None
+    )
+
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
+
+    stall.assert_awaited_once()
+    assert body["queue"]["state"] == "queued"
+    assert body["queue"]["pool_stalled"] is False
+
+
 def test_queue_block_always_carries_pool_stalled_false():
     assert sqs.queue_block(None, {})["pool_stalled"] is False
     assert sqs.queue_block({"state": "queued"}, {})["pool_stalled"] is False

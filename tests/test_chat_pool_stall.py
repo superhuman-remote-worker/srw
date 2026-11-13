@@ -118,6 +118,55 @@ async def test_watch_resolves_when_the_stall_clears(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_lease_alone_does_not_resolve_while_an_old_turn_still_waits(
+    monkeypatch,
+):
+    """A crash-looping executor leaves short leases while chat stays down: the
+    notice stays open until no runnable turn has waited the threshold."""
+    leased_but_old = _demand(session_turn=2, busy=1, age=950.0, runnable_at=T0)
+    watch, notes = _watch(
+        monkeypatch,
+        [
+            _stalled(),
+            leased_but_old,
+            _stalled(age=980.0),  # the same incident stalls again
+            leased_but_old,
+            # The backlog drains: what is left has waited under the threshold.
+            _demand(session_turn=1, busy=1, age=40.0, runnable_at=T0),
+            _demand(session_turn=0, busy=1),
+        ],
+    )
+    notes.record_chat_executors_unavailable.return_value = {"notified": 1, "failed": 0}
+    for _ in range(4):
+        await watch.run_once()
+    notes.resolve_source.assert_not_awaited()
+    notes.record_chat_executors_unavailable.assert_awaited_once()
+
+    await watch.run_once()
+    notes.resolve_source.assert_awaited_once_with(
+        "chat_pool", "stateless", resolved_by="system", raise_on_error=True
+    )
+    await watch.run_once()
+    notes.resolve_source.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("demand", "expected"),
+    [
+        (_demand(session_turn=0, busy=0), True),
+        (_demand(session_turn=0, busy=3), True),
+        (_demand(session_turn=1, busy=1, age=299.0, runnable_at=T0), True),
+        (_demand(session_turn=1, busy=1, age=300.0, runnable_at=T0), False),
+        (_demand(session_turn=4, busy=0, age=3600.0, runnable_at=T0), False),
+    ],
+)
+def test_backlog_cleared_means_no_runnable_turn_has_waited_the_threshold(
+    demand, expected
+):
+    assert stall.chat_backlog_cleared(demand, threshold_s=300) is expected
+
+
+@pytest.mark.asyncio
 async def test_watch_resolves_once_after_start(monkeypatch):
     watch, notes = _watch(monkeypatch, [_demand(), _demand()])
     await watch.run_once()

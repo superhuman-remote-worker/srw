@@ -283,6 +283,7 @@ async def capacity_snapshot(
         raise
     except Exception as exc:
         logger.info("stateless capacity: executor inventory unavailable: %s", exc)
+    threshold_s = stall_threshold_s()
     return {
         "observed_at": (demand.observed_at.isoformat() if demand.observed_at else None),
         "executors": {
@@ -298,8 +299,8 @@ async def capacity_snapshot(
         },
         "oldest_queued_age_s": demand.oldest_queued_age_s,
         "oldest_session_turn_age_s": demand.oldest_session_turn_age_s,
-        "chat_pool_stalled": chat_pool_stalled(demand, threshold_s=stall_threshold_s()),
-        "stall_threshold_s": stall_threshold_s(),
+        "chat_pool_stalled": chat_pool_stalled(demand, threshold_s=threshold_s),
+        "stall_threshold_s": threshold_s,
         "desired": desired_replicas(demand, params),
         "params": {"min_replicas": params.min_replicas, "reserve": params.reserve},
         "parked": [parked_entry(row) for row in parked_rows],
