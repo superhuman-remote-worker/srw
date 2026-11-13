@@ -1819,20 +1819,35 @@
       "exportedAlert": "Exported {{count}} notes to:\n{{path}}"
     },
     "datasources": {
-      "selectPlaceholder": "Select a connector...",
-      "searchPlaceholder": "Search available connectors...",
+      "searchPlaceholder": "Search connectors to link…",
       "loadingCandidates": "Loading available connectors...",
       "candidatesLoadFailed": "Available connectors could not be loaded.",
       "retry": "Retry",
-      "noCandidates": "No available connectors match this project and search.",
+      "noCandidates": "No connector matches that search.",
       "link": "Link",
-      "empty": "No connectors linked to this project",
-      "colName": "Name",
-      "colType": "Type",
-      "colDescription": "Project Description",
+      "empty": "No connectors linked yet",
+      "emptyHint": "Link a connector to give this project's jobs and sessions a database, a repository or another service.",
+      "colDescription": "Note for the agents in this project",
       "colAccess": "Access",
-      "colActions": "Actions",
-      "descriptionPlaceholder": "Usage context for this project...",
+      "descriptionPlaceholder": "Add a note for the agents in this project",
+      "editNote": "Edit what the agents in this project are told about this connector",
+      "groups": {
+        "included": {
+          "title": "Included with the project",
+          "hint": "SRW created these with the project and keeps them. A folder's default access applies unless a session chooses another level when it starts."
+        },
+        "linked": {
+          "title": "Linked connectors",
+          "hint": "Databases, repositories and services this project's jobs and sessions may use. New ones are created under Customize → Connectors."
+        }
+      },
+      "picker": {
+        "open": "Link connector",
+        "close": "Close",
+        "nothingLeft": "Every connector you can link is already linked.",
+        "notListed": "Not listed?",
+        "create": "Create a connector"
+      },
       "accessDefault": "Default (Read-write)",
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
@@ -1843,8 +1858,6 @@
       "accessCreatorReadOnly": "Read-only for everyone who uses it: its creator tagged it so, and a project link cannot lift that.",
       "unlink": "Unlink",
       "cloudFolders": {
-        "title": "Cloud folders",
-        "hint": "The project's own folders in the main cloud. Its work binds each one at its default access unless a session chooses another level.",
         "colAccess": "Default access",
         "defaultOption": "Default ({{level}})",
         "notOffered": "not offered by this cloud",

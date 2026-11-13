@@ -1819,20 +1819,35 @@
       "exportedAlert": "{{count}} Notizen exportiert nach:\n{{path}}"
     },
     "datasources": {
-      "selectPlaceholder": "Konnektor auswählen...",
-      "searchPlaceholder": "Verfügbare Konnektoren durchsuchen...",
+      "searchPlaceholder": "Konnektoren zum Verknüpfen suchen…",
       "loadingCandidates": "Verfügbare Konnektoren werden geladen...",
       "candidatesLoadFailed": "Verfügbare Konnektoren konnten nicht geladen werden.",
       "retry": "Erneut versuchen",
-      "noCandidates": "Keine verfügbaren Konnektoren passen zu diesem Projekt und der Suche.",
+      "noCandidates": "Kein Konnektor passt zu dieser Suche.",
       "link": "Verknüpfen",
-      "empty": "Keine Konnektoren mit diesem Projekt verknüpft",
-      "colName": "Name",
-      "colType": "Typ",
-      "colDescription": "Projekt-Beschreibung",
+      "empty": "Noch keine Konnektoren verknüpft",
+      "emptyHint": "Verknüpfe einen Konnektor, damit die Jobs und Sitzungen dieses Projekts eine Datenbank, ein Repository oder einen anderen Dienst nutzen können.",
+      "colDescription": "Hinweis für die Agenten in diesem Projekt",
       "colAccess": "Zugriff",
-      "colActions": "Aktionen",
-      "descriptionPlaceholder": "Nutzungskontext für dieses Projekt...",
+      "descriptionPlaceholder": "Hinweis für die Agenten in diesem Projekt hinzufügen",
+      "editNote": "Bearbeiten, was die Agenten in diesem Projekt über diesen Konnektor erfahren",
+      "groups": {
+        "included": {
+          "title": "Im Projekt enthalten",
+          "hint": "SRW hat diese mit dem Projekt angelegt und verwaltet sie. Der Standardzugriff eines Ordners gilt, sofern eine Sitzung beim Start keine andere Stufe wählt."
+        },
+        "linked": {
+          "title": "Verknüpfte Konnektoren",
+          "hint": "Datenbanken, Repositories und Dienste, die die Jobs und Sitzungen dieses Projekts nutzen dürfen. Neue werden unter Anpassen → Konnektoren angelegt."
+        }
+      },
+      "picker": {
+        "open": "Konnektor verknüpfen",
+        "close": "Schließen",
+        "nothingLeft": "Alle Konnektoren, die du verknüpfen kannst, sind bereits verknüpft.",
+        "notListed": "Nicht dabei?",
+        "create": "Konnektor anlegen"
+      },
       "accessDefault": "Standard (Lesen/Schreiben)",
       "accessReadOnly": "Nur lesen",
       "accessReadWrite": "Lesen/Schreiben",
@@ -1843,8 +1858,6 @@
       "accessCreatorReadOnly": "Nur Lesen für alle, die ihn nutzen: Sein Ersteller hat ihn so markiert, und ein Projekt-Link kann das nicht aufheben.",
       "unlink": "Trennen",
       "cloudFolders": {
-        "title": "Cloud-Ordner",
-        "hint": "Die eigenen Ordner des Projekts in der Haupt-Cloud. Seine Arbeit bindet jeden mit seinem Standardzugriff ein, sofern eine Sitzung keine andere Stufe wählt.",
         "colAccess": "Standardzugriff",
         "defaultOption": "Standard ({{level}})",
         "notOffered": "von dieser Cloud nicht angeboten",

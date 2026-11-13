@@ -37,6 +37,7 @@ import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
 import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {connectorTypeIcon} from '../../core/models/connector-icons';
 import {
   ConnectorDriver,
   liveConnectorDrivers, managedConnectorDrivers,
@@ -4430,24 +4431,7 @@ export class DatasourceListComponent implements OnInit {
   // ===== Helpers =====
 
   getTypeIcon(type: DatasourceType | string): string {
-    const icons: Record<string, string> = {
-      credentials: 'key',
-      generic: 'settings_input_component',
-      repository: 'code',
-      kb: 'menu_book',
-      postgresql: 'database',
-      neo4j: 'hub',
-      mongodb: 'eco',
-      webdav: 'cloud',
-      email: 'mail',
-      kubeconfig: 'rocket_launch',
-      ssh_key: 'key',
-      generic_file: 'description',
-      cloud_folder: 'folder',
-      cloud_folder_checkout: 'folder_copy',
-      cloud_outbox: 'outbox',
-    };
-    return icons[type] || 'storage';
+    return connectorTypeIcon(type);
   }
 
   maskUrl(url: string): string {

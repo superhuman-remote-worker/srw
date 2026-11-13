@@ -4,6 +4,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {ApiService} from '../../core/services/api.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {connectorTypeIcon} from '../../core/models/connector-icons';
 import {
   ConnectorDriver,
   driverForType,
@@ -1044,20 +1045,7 @@ export class DatasourcesGroupComponent {
   }
 
   getTypeIcon(type: DatasourceType | string): string {
-    const icons: Record<string, string> = {
-      credentials: 'key',
-      gpt_live_sip: 'phone',
-      postgresql: 'database',
-      neo4j: 'hub',
-      mongodb: 'eco',
-      webdav: 'cloud',
-      email: 'mail',
-      kb: 'menu_book',
-      cloud_folder: 'folder',
-      cloud_folder_checkout: 'folder_copy',
-      cloud_outbox: 'outbox',
-    };
-    return icons[type] || 'storage';
+    return connectorTypeIcon(type);
   }
 
   /** The type badge: what a platform-owned row is to its user ("Project
