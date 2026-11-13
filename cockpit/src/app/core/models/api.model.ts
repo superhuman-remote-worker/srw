@@ -3336,6 +3336,9 @@ export interface SessionQueueState {
   /** Tool calls whose result is unknown (a parked unit only): the owner's
    * Continue / Stop decision answers them. Empty or absent otherwise. */
   unknown_tool_calls?: SessionUnknownToolCall[];
+  /** True while this unit is queued and the whole chat pool has stalled (no
+   * executor is taking messages). Drives the "chat is unavailable" bubble. */
+  pool_stalled?: boolean;
 }
 
 /** A tool call that started but has no recorded result. `args` is null when

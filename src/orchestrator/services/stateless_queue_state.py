@@ -130,6 +130,7 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
             "attempts": 0,
             "pending_input": False,
             "unknown_tool_calls": [],
+            "pool_stalled": False,
         }
     parked = state.get("state") == STATE_PARKED
     refusal = park_retry_refusal(state.get("park_reason"), metadata) if parked else None
@@ -149,6 +150,7 @@ def queue_block(state: dict[str, Any] | None, metadata: Any) -> dict[str, Any]:
         "attempts": int(state.get("attempts") or 0),
         "pending_input": bool(state.get("pending_input")),
         "unknown_tool_calls": [],
+        "pool_stalled": False,
     }
 
 

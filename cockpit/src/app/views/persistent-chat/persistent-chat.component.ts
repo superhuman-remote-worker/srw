@@ -367,6 +367,16 @@ export function queueWaitTier(elapsedMs: number): QueueWaitTier {
     return 'fresh';
 }
 
+/** Which notice the queued bubble shows under its waiting line. A stalled
+ *  chat pool (no executor taking messages) overrides the "busy" wording at
+ *  every tier; otherwise today's tiers apply. */
+export type QueuedNotice = 'unavailable' | 'busy' | null;
+
+export function queuedNotice(tier: QueueWaitTier, poolStalled: boolean): QueuedNotice {
+    if (poolStalled) return 'unavailable';
+    return tier === 'fresh' ? null : 'busy';
+}
+
 /** m:ss for the queued-turn elapsed counter. */
 export function formatQueueWait(elapsedMs: number): string {
     const s = Math.max(0, Math.floor(elapsedMs / 1000));
@@ -1997,8 +2007,13 @@ export function clearDraft(threadId: string | null): void {
             </div>
             <div class="message-body turn-body queued-body">
               <div class="queued-line">{{ 'chat.queue.waiting' | transloco }}</div>
-              @if (queuedTier() !== 'fresh') {
-                <div class="queued-busy">{{ 'chat.queue.busy' | transloco }}</div>
+              @switch (queuedNoticeKind()) {
+                @case ('unavailable') {
+                  <div class="queued-busy" data-testid="queued-unavailable">{{ 'chat.queue.unavailable' | transloco }}</div>
+                }
+                @case ('busy') {
+                  <div class="queued-busy">{{ 'chat.queue.busy' | transloco }}</div>
+                }
               }
               @if (queuedTier() === 'long') {
                 <div class="queued-elapsed">{{ 'chat.queue.elapsed' | transloco: {time: queuedWaitLabel()} }}</div>
@@ -2765,6 +2780,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** 1s tick driving the elapsed timer; interval runs only mid-compaction. */
     /** Escalation tier + m:ss label for the queued-turn bubble. */
     readonly queuedTier = computed(() => queueWaitTier(this.chat.awaitingElapsedMs()));
+    readonly queuedNoticeKind = computed(() =>
+        queuedNotice(this.queuedTier(), this.chat.queueState()?.pool_stalled === true));
     readonly queuedWaitLabel = computed(() => formatQueueWait(this.chat.awaitingElapsedMs()));
     /** Reason line under the parked bubble, keyed by run_queue.park_reason. */
     readonly parkedReasonKey = computed(() => queueParkReasonKey(this.chat.queueState()?.park_reason));

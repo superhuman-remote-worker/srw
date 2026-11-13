@@ -1082,6 +1082,7 @@
       "executors": "Executors",
       "ready": "ready",
       "busy": "busy",
+      "unavailable": "Chat is temporarily unavailable; an administrator has been notified. Your message is saved.",
       "queued": "Queued",
       "sessions": "sessions",
       "batches": "batches",

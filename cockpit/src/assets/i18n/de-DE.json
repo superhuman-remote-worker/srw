@@ -1082,6 +1082,7 @@
       "executors": "Executors",
       "ready": "bereit",
       "busy": "belegt",
+      "unavailable": "Der Chat ist vorübergehend nicht verfügbar; ein Administrator wurde benachrichtigt. Ihre Nachricht ist gespeichert.",
       "queued": "In der Warteschlange",
       "sessions": "Sitzungen",
       "batches": "Batches",

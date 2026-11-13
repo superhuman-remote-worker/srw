@@ -261,6 +261,7 @@ async def thread_queue_state(
     A thread that never enqueued (pinned lane, or no turn yet) reports
     ``state='none'``.
     """
+    from orchestrator.services.chat_pool_stall import read_chat_pool_stalled
     from orchestrator.services.stateless_queue_state import queue_block_for_thread
 
     try:
@@ -271,6 +272,8 @@ async def thread_queue_state(
     _user, thread = await dependencies.require_thread_owner(request, store, thread_id)
     async with store.acquire() as conn:
         block = await queue_block_for_thread(conn, thread)
+        if block["state"] == "queued":
+            block["pool_stalled"] = await read_chat_pool_stalled(conn)
     return {"thread_id": thread_id, "queue": block}
 
 

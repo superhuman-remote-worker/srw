@@ -133,6 +133,7 @@ async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
         "pending_input": True,
         # The fake connection lists no unanswered tool calls.
         "unknown_tool_calls": [],
+        "pool_stalled": False,
         "cloud_push": None,
     }
     owner.assert_awaited_once()
@@ -145,6 +146,42 @@ async def test_queue_state_reports_none_when_never_enqueued(owner, monkeypatch):
         THREAD, request=object(), dependencies=_deps(owner, conn)
     )
     assert body["queue"]["state"] == "none" and body["queue"]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_queue_reports_pool_stalled_only_while_queued(owner, monkeypatch):
+    from orchestrator.services import chat_pool_stall
+
+    stall = AsyncMock(return_value=True)
+    monkeypatch.setattr(chat_pool_stall, "read_chat_pool_stalled", stall)
+
+    conn, _ = _wire(
+        monkeypatch, state={"state": "queued", "attempts": 0}, authority=None
+    )
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
+    assert body["queue"]["pool_stalled"] is True
+    stall.assert_awaited_once()
+
+    stall.reset_mock()
+    conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
+    assert body["queue"]["pool_stalled"] is False
+
+    conn, _ = _wire(monkeypatch, state=None, authority=None)
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
+    assert body["queue"]["pool_stalled"] is False
+    stall.assert_not_awaited()
+
+
+def test_queue_block_always_carries_pool_stalled_false():
+    assert sqs.queue_block(None, {})["pool_stalled"] is False
+    assert sqs.queue_block({"state": "queued"}, {})["pool_stalled"] is False
 
 
 @pytest.mark.asyncio

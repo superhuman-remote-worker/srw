@@ -23,6 +23,7 @@ import {
     isNearBottom,
     formatQueueWait,
     queueWaitTier,
+    queuedNotice,
     QUEUE_BUSY_AFTER_MS,
     QUEUE_ELAPSED_AFTER_MS,
     isRewindCommand,
@@ -122,6 +123,20 @@ describe('queueWaitTier', () => {
         expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS - 1)).toBe('busy');
         expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS)).toBe('long');
         expect(queueWaitTier(10 * 60_000)).toBe('long');
+    });
+});
+
+describe('queuedNotice', () => {
+    it('shows the unavailable line instead of busy when the queue reports pool_stalled', () => {
+        for (const tier of ['fresh', 'busy', 'long'] as const) {
+            expect(queuedNotice(tier, true)).toBe('unavailable');
+        }
+    });
+
+    it('keeps today\'s tiers when the pool is not stalled', () => {
+        expect(queuedNotice('fresh', false)).toBeNull();
+        expect(queuedNotice('busy', false)).toBe('busy');
+        expect(queuedNotice('long', false)).toBe('busy');
     });
 });
 
