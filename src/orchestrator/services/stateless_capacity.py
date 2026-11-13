@@ -262,6 +262,12 @@ async def capacity_snapshot(
 ) -> dict[str, Any]:
     """The admin payload: what the scaler sees, plus the pool it is sizing,
     plus the parked worklist (stateless_turn_resilience.md step 2)."""
+    # chat_pool_stall imports this module, so import it lazily.
+    from orchestrator.services.chat_pool_stall import (
+        chat_pool_stalled,
+        stall_threshold_s,
+    )
+
     params = params or CapacityParams.from_env()
     async with acquire_connection(db) as conn:
         demand = await read_demand(conn)
@@ -291,6 +297,9 @@ async def capacity_snapshot(
             "total": demand.runnable_total,
         },
         "oldest_queued_age_s": demand.oldest_queued_age_s,
+        "oldest_session_turn_age_s": demand.oldest_session_turn_age_s,
+        "chat_pool_stalled": chat_pool_stalled(demand, threshold_s=stall_threshold_s()),
+        "stall_threshold_s": stall_threshold_s(),
         "desired": desired_replicas(demand, params),
         "params": {"min_replicas": params.min_replicas, "reserve": params.reserve},
         "parked": [parked_entry(row) for row in parked_rows],

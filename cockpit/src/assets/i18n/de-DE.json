@@ -1095,6 +1095,7 @@
       "unparked": "Einheit wieder eingereiht.",
       "unparkFailed": "Freigeben fehlgeschlagen.",
       "loadFailed": "Kapazität konnte nicht geladen werden.",
+      "stalled": "Der Chat ist ausgefallen: {{count}} Nachricht(en) warten seit {{age}}, und kein Executor nimmt sie an. Prüfen Sie die srw-agent-stateless-Pods.",
       "observedAt": "Stand {{time}}",
       "colTitle": "Sitzung",
       "colOwner": "Besitzer",

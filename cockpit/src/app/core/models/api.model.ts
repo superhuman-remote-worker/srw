@@ -3424,6 +3424,9 @@ export interface AdminCapacity {
   executors: { total: number | null; ready: number | null; busy: number };
   queued: { session_turn: number; worker_batch: number; total: number };
   oldest_queued_age_s: number;
+  oldest_session_turn_age_s: number | null;
+  chat_pool_stalled: boolean;
+  stall_threshold_s: number;
   desired: number;
   params: { min_replicas: number; reserve: number };
   parked?: AdminCapacityParkedRow[];

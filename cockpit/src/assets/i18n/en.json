@@ -1095,6 +1095,7 @@
       "unparked": "Unit re-queued.",
       "unparkFailed": "Unpark failed.",
       "loadFailed": "Could not load capacity.",
+      "stalled": "Chat is down: {{count}} message(s) have waited {{age}} and no executor is taking any. Check the srw-agent-stateless pods.",
       "observedAt": "Observed {{time}}",
       "colTitle": "Session",
       "colOwner": "Owner",

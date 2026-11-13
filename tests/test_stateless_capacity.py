@@ -226,6 +226,41 @@ async def test_snapshot_reports_null_inventory_without_kubernetes():
 
 
 @pytest.mark.asyncio
+async def test_snapshot_reports_chat_pool_stalled(monkeypatch):
+    monkeypatch.delenv("STATELESS_CHAT_STALL_ALARM_S", raising=False)
+    stalled = _Conn(
+        _demand_row(
+            busy=0,
+            runnable_session_turn=2,
+            runnable_total=2,
+            oldest_queued_age_s=600.0,
+            oldest_session_turn_age_s=600.0,
+        )
+    )
+    payload = await cap.capacity_snapshot(
+        stalled, core_api_factory=lambda: None, params=cap.CapacityParams(2, 1)
+    )
+    assert payload["chat_pool_stalled"] is True
+    assert payload["stall_threshold_s"] == 300.0
+    assert payload["oldest_session_turn_age_s"] == 600.0
+
+    busy = _Conn(
+        _demand_row(
+            busy=1,
+            runnable_session_turn=2,
+            runnable_total=2,
+            oldest_queued_age_s=600.0,
+            oldest_session_turn_age_s=600.0,
+        )
+    )
+    payload = await cap.capacity_snapshot(
+        busy, core_api_factory=lambda: None, params=cap.CapacityParams(2, 1)
+    )
+    assert payload["chat_pool_stalled"] is False
+    assert payload["stall_threshold_s"] == 300.0
+
+
+@pytest.mark.asyncio
 async def test_snapshot_survives_a_failing_kubernetes_read():
     class _Boom:
         def list_namespaced_pod(self, *a, **k):
