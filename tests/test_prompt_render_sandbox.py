@@ -203,7 +203,7 @@ _ROW = {
     "expert_type": "session",
     "name": "sess-helper",
     "config": {},
-    "prompts": {"persona": "PERSONA-SENTINEL", "tactical": "TAC-SENTINEL"},
+    "prompts": {"persona": "PERSONA-SENTINEL", "summarization": "SUM-SENTINEL"},
 }
 
 _UNFENCE_FORMS = [
@@ -214,7 +214,7 @@ _UNFENCE_FORMS = [
     {"_persona_source": "disk"},
     {"extra": {"_db_prompt_keys": [], "_persona_source": None}},
     {"extra": {"extra": {"_db_prompt_keys": []}}},
-    {"_resolved_prompts": {"tactical": "{{ ''.__class__ }}"}},
+    {"_resolved_prompts": {"summarization": "{{ ''.__class__ }}"}},
 ]
 
 
@@ -231,9 +231,9 @@ def test_no_authored_layer_can_change_which_db_prompts_are_fenced(layer, form):
         **{layer: {"llm": {"temperature": 0.3}, **form}},
     )
     agent = blob["agent"]
-    assert set(agent["_db_prompt_keys"]) == {"persona", "tactical"}
+    assert set(agent["_db_prompt_keys"]) == {"persona", "summarization"}
     assert agent["_persona_source"] == "db"
-    assert blob["prompts"]["tactical"] == "TAC-SENTINEL"
+    assert blob["prompts"]["summarization"] == "SUM-SENTINEL"
     assert agent["llm"]["temperature"] == 0.3  # the honest part of the layer merged
     nested = agent.get("extra") or {}
     assert not any(k.startswith("_") for k in nested)
@@ -245,7 +245,7 @@ def test_expert_rows_own_config_fragment_cannot_unmark_itself(form):
     blob = resolve_config(
         base_config_name="persistent_defaults", expert_row=row, expert_type="session"
     )
-    assert set(blob["agent"]["_db_prompt_keys"]) == {"persona", "tactical"}
+    assert set(blob["agent"]["_db_prompt_keys"]) == {"persona", "summarization"}
     assert blob["agent"]["_persona_source"] == "db"
 
 
@@ -256,7 +256,7 @@ def test_base_defaults_layer_is_stripped_too():
         expert_row=_ROW,
         expert_type="session",
     )
-    assert set(blob["agent"]["_db_prompt_keys"]) == {"persona", "tactical"}
+    assert set(blob["agent"]["_db_prompt_keys"]) == {"persona", "summarization"}
 
 
 def test_a_bundled_resolve_still_carries_no_marker():
@@ -264,7 +264,10 @@ def test_a_bundled_resolve_still_carries_no_marker():
     override tries to plant one (which would fence a trusted bundled prompt)."""
     blob = resolve_config(
         base_config_name="persistent_defaults",
-        request_override={"_db_prompt_keys": ["tactical"], "_persona_source": "db"},
+        request_override={
+            "_db_prompt_keys": ["summarization"],
+            "_persona_source": "db",
+        },
     )
     assert "_db_prompt_keys" not in blob["agent"]
     assert "_persona_source" not in blob["agent"]
@@ -306,7 +309,7 @@ def test_agent_side_override_merge_cannot_unfence(form):
     rebuilt = load_agent_config_from_dict(
         merged, deployment_dir=hydrated._deployment_dir
     )
-    assert set(rebuilt.extra["_db_prompt_keys"]) == {"persona", "tactical"}
+    assert set(rebuilt.extra["_db_prompt_keys"]) == {"persona", "summarization"}
     assert rebuilt.extra["_persona_source"] == "db"
     out = get_phase_system_prompt(
         rebuilt, is_strategic=False, prompt_type="interactive", tool_names=[]
@@ -336,7 +339,7 @@ def test_control_bare_agent_side_merge_is_the_bypass(form):
         deployment_dir=hydrated._deployment_dir,
     )
     assert not (
-        set(bare.extra.get("_db_prompt_keys") or ()) == {"persona", "tactical"}
+        set(bare.extra.get("_db_prompt_keys") or ()) == {"persona", "summarization"}
         and bare.extra.get("_persona_source") == "db"
     )
 

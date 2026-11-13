@@ -21,15 +21,20 @@ class ExpertInfo(BaseModel):
 _ALLOWED_EXPERT_PROMPT_KEYS = {
     "persona",
     "instructions",
-    "strategic",
-    "tactical",
     "summarization",
 }
+
+#: The editor's old strategic/tactical prompt fields. A worker's phase
+#: guidance is the strategic-phase / tactical-phase skills, so these are
+#: dropped on every write and copy (an older export, a stored manifest)
+#: instead of refused; migration 0567 stripped them from the stored rows.
+RETIRED_EXPERT_PROMPT_KEYS = frozenset({"strategic", "tactical"})
 
 
 def validate_expert_prompts(v: dict[str, Any] | None) -> dict[str, Any] | None:
     """Validate the DB-expert prompt boundary (defense-in-depth)."""
     if v:
+        v = {k: val for k, val in v.items() if k not in RETIRED_EXPERT_PROMPT_KEYS}
         unknown = set(v) - _ALLOWED_EXPERT_PROMPT_KEYS
         if unknown:
             raise ValueError(f"Unknown prompt keys: {sorted(unknown)}")

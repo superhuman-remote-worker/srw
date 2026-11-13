@@ -12,8 +12,6 @@ expert actually grants, and pin:
   line says "phase instructions";
 - the tactical body's shell block is present iff the expert grants a shell,
   and every ``has_tool("delegate_agent")`` block follows the grant;
-- a DB expert's phase prompt rides INSIDE the phase block as the fenced
-  ``<expert_workflow>`` addendum (one protected identity per path);
 - a frozen pre-U2 template keeps its phase swap for resume compatibility, while
   every newly resolved template is phase-agnostic.
 
@@ -31,9 +29,7 @@ from shared.runtime.core.loader import (
     PHASE_SKILLS,
     PromptMatrixResolver,
     _has_shell_tools,
-    append_expert_workflow_addendum,
     chain_root,
-    db_phase_addendum,
     delegation_system_floor,
     get_phase_system_prompt,
     get_system_prompt,
@@ -45,10 +41,8 @@ from shared.runtime.core.loader import (
     render_instruction_content,
     resolve_bound_skill_dir,
 )
-from shared.runtime.core.message_markers import protected_path
 from shared.runtime.core.model_registry import family_of
 from shared.runtime.core.skill_format import parse_skill_md
-from shared.runtime.core.workspace_injection import create_phase_instruction_message
 from agent.tools.registry import TOOL_REGISTRY
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -270,59 +264,6 @@ def test_expert_local_bodies_are_used_where_shipped():
                 leaf.parent / "skills" if name in local else _CONFIG / "skills"
             )
             assert skill_dir == expected_root / skill, (name, phase)
-
-
-# ---------------------------------------------------------------------------
-# DB expert addendum inside the phase block
-# ---------------------------------------------------------------------------
-
-
-def test_db_phase_prompt_is_fenced_inside_the_phase_block():
-    cfg = load_agent_config_from_dict(
-        {
-            "agent_id": "forked",
-            "display_name": "Forked",
-            "_db_prompt_keys": ["tactical"],
-            "_resolved_prompts": {
-                "tactical": 'Ship it. Emit {"status": "ok"} when done.',
-            },
-        }
-    )
-    assert db_phase_addendum(cfg, "strategic") is None  # not DB-authored
-    addendum = db_phase_addendum(cfg, "tactical")
-    assert addendum and addendum.startswith("<expert_workflow")
-    assert "{" not in addendum and '"status": "ok"' in addendum  # brace-safe
-
-    _raw, body = _phase_body(
-        "worker_base", _CONFIG / "overlays" / "worker.yaml", "tactical"
-    )
-    composed = append_expert_workflow_addendum(
-        render_instruction_content(body, []), addendum
-    )
-    assert composed.index("You are in TACTICAL mode.") < composed.index(
-        "<expert_workflow"
-    )
-    assert composed.rstrip().endswith("</expert_workflow>")
-
-    block = create_phase_instruction_message(
-        "skills/tactical-phase/SKILL.md", composed, "tactical", "2:tactical"
-    )
-    assert protected_path(block) == "skills/tactical-phase/SKILL.md"
-    assert block.content.startswith("[phase: tactical] Phase instructions")
-    assert block.content.count("<expert_workflow") == 1
-
-
-def test_addendum_needs_both_the_marker_and_the_text():
-    only_marker = load_agent_config_from_dict(
-        {"agent_id": "a", "display_name": "A", "_db_prompt_keys": ["tactical"]}
-    )
-    assert db_phase_addendum(only_marker, "tactical") is None
-    only_text = load_agent_config_from_dict(
-        {"agent_id": "a", "display_name": "A", "_resolved_prompts": {"tactical": "x"}}
-    )
-    assert (
-        db_phase_addendum(only_text, "tactical") is None
-    )  # bundled text is not fenced
 
 
 # ---------------------------------------------------------------------------

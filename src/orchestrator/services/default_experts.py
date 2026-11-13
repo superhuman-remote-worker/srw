@@ -19,7 +19,7 @@ from shared.runtime.core.expert_resolution import (
     validate_expert_persona_placeholders,
     with_role_tag,
 )
-from shared.runtime.core.loader import canonical_config_name, expert_phase_prompt_bodies
+from shared.runtime.core.loader import canonical_config_name
 from shared.runtime.core.srw_manifest_config import read_srw_config
 
 logger = logging.getLogger(__name__)
@@ -184,9 +184,6 @@ def load_seed_bundle(
         path = expert_dir / filename
         if path.exists():
             prompts[key] = path.read_text(encoding="utf-8")
-    # strategic/tactical: the expert-local phase skill bodies (U2), same DB
-    # keys — delivered as the fenced <expert_workflow> addendum of the phase block.
-    prompts.update(expert_phase_prompt_bodies(expert_dir))
     validate_expert_persona_placeholders(prompts)
 
     return {

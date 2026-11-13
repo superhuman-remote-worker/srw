@@ -34,8 +34,6 @@ _COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _ALLOWED_EXPERT_PROMPT_KEYS = {
     "persona",
     "instructions",
-    "strategic",
-    "tactical",
     "summarization",
 }
 

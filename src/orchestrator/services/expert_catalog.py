@@ -25,7 +25,6 @@ from shared.runtime.core.loader import (
     ROOT_NAMES,
     canonical_config_name,
     chain_root,
-    expert_phase_prompt_bodies,
     load_and_merge_config,
     load_role_base,
     normalize_llm_tiers,
@@ -1352,10 +1351,9 @@ class ExpertCatalogService:
         raw = read_srw_config(config_path)
         extends = canonical_config_name(str(raw.pop("$extends", "worker_base")))
         raw.pop("connections", None)
-        # Part 2: capture all prompt segments a fork should round-trip.
-        # strategic/tactical come from the expert-local phase skills (U2: the
-        # bodies of skills/<phase>-phase/SKILL.md), keeping the DB shape — at
-        # delivery they are the fenced <expert_workflow> addendum of the phase block.
+        # Part 2: capture all prompt segments a fork should round-trip. The
+        # expert-local phase skills are not copied into prompts: a copy keeps
+        # this expert as its asset directory and reads them from there.
         prompts: dict[str, Any] = {}
         for key, fname in (
             ("persona", "persona.txt"),
@@ -1365,7 +1363,6 @@ class ExpertCatalogService:
             fp = expert_dir / fname
             if fp.exists():
                 prompts[key] = fp.read_text(encoding="utf-8")
-        prompts.update(expert_phase_prompt_bodies(expert_dir))
         return {
             "name": expert_id,
             "display_name": info.display_name,

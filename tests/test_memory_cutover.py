@@ -1550,15 +1550,15 @@ class TestPhaseSkillBlocks:
         assert request[0].content == "ONE-SYS"
 
     @pytest.mark.asyncio
-    async def test_db_phase_addendum_rides_inside_the_phase_block(self, execute_env):
-        """A DB expert's own tactical prompt is fenced (<expert_workflow>) and
-        appended INSIDE the tactical-phase block — one protected identity per
-        path, delivered once, brace-safe."""
+    async def test_a_frozen_db_phase_prompt_is_no_longer_delivered(self, execute_env):
+        """A job frozen before the strategic/tactical expert prompts were
+        retired still carries one (marker + text): the phase block is the
+        skill body alone, nothing is appended."""
         env = execute_env
         _bind_tactical_phase_skill(env)
         env["config"].extra["_db_prompt_keys"] = ["tactical"]
         env["config"].extra["_resolved_prompts"] = {
-            "tactical": 'FORK TACTICAL RULE {"json": true}',
+            "tactical": "FORK TACTICAL RULE",
         }
         node = _make_execute_node(
             env["config"],
@@ -1574,27 +1574,11 @@ class TestPhaseSkillBlocks:
             patch("agent.graph.get_phase_system_prompt", return_value="ONE-SYS"),
         ):
             first = await node(state)
-            _apply_turn(state, first)
-            second = await node(state)
 
         blocks = [m for m in first["messages"] if is_protected_message(m)]
         assert len(blocks) == 1
-        content = blocks[0].content
-        assert content.index("UNIQUE TACTICAL SKILL BODY") < content.index(
-            "<expert_workflow"
-        )
-        assert "FORK TACTICAL RULE" in content
-        assert (
-            '"json": true' in content
-            and "{" not in content.split("<expert_workflow")[1]
-        )
-        assert content.count("<expert_workflow") == 1
-        assert first["phase_instruction_injections"] == [
-            "2:tactical:skills/tactical-phase/SKILL.md"
-        ]
-        # Second turn: the addendum is in history, nothing is re-delivered.
-        assert not any(is_protected_message(m) for m in second["messages"])
-        requests = [c.args[0] for c in env["llm"].ainvoke.call_args_list]
-        for request in requests:
-            assert _count_text(request, "FORK TACTICAL RULE") == 1
-            assert _count_text(request, "<expert_workflow") == 1
+        assert "UNIQUE TACTICAL SKILL BODY" in blocks[0].content
+        assert "FORK TACTICAL RULE" not in blocks[0].content
+        assert "<expert_workflow" not in blocks[0].content
+        request = env["llm"].ainvoke.call_args_list[0].args[0]
+        assert _count_text(request, "FORK TACTICAL RULE") == 0

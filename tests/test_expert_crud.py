@@ -117,12 +117,11 @@ def test_expert_create_accepts_known_prompt_keys():
         expert_type="worker",
         prompts={
             "persona": "p",
-            "strategic": "s",
-            "tactical": "t",
+            "instructions": "i",
             "summarization": "z",
         },
     )
-    assert e.prompts["strategic"] == "s"
+    assert e.prompts == {"persona": "p", "instructions": "i", "summarization": "z"}
 
 
 def test_expert_create_rejects_unknown_prompt_key():
@@ -141,16 +140,29 @@ def test_expert_update_rejects_unknown_prompt_key():
 
 
 def test_bundled_expert_bundle_captures_all_prompt_segments():
-    """Fork fidelity: bundling a worker captures strategic/tactical/summarization,
-    not just persona+instructions (critic ships all five)."""
+    """Fork fidelity: bundling a worker captures summarization, not just
+    persona+instructions (critic ships all three it can carry)."""
     bundle = catalogue_service().bundled_expert_bundle("critic")
     if bundle is None:
         pytest.skip("critic bundled expert not found in this env")
     prompts = bundle["prompts"]
-    assert prompts.get("strategic", "").strip()
-    assert prompts.get("tactical", "").strip()
     assert prompts.get("summarization", "").strip()
     assert "persona" in prompts  # still captured
+
+
+def test_create_and_update_drop_the_retired_phase_prompts():
+    """The editor's old strategic/tactical fields are retired: an older export
+    or a cached Cockpit still sending them saves, without them."""
+    sent = {"persona": "p", "strategic": "S", "tactical": "T"}
+    create = expert_schemas.ExpertCreate(
+        name="x", display_name="X", expert_type="worker", prompts=sent
+    )
+    assert create.prompts == {"persona": "p"}
+    update = expert_schemas.ExpertUpdate(prompts=sent)
+    assert update.prompts == {"persona": "p"}
+    assert expert_schemas.validate_expert_prompts({"strategic": "S"}) == {}
+    with pytest.raises(ValueError, match="Unknown prompt keys"):
+        expert_schemas.validate_expert_prompts({"phase": "S"})
 
 
 def test_update_payload_drops_unset_fields():
@@ -481,30 +493,19 @@ async def test_list_type_filter_matches_tag(monkeypatch):
     )
 
 
-def test_bundled_expert_bundle_reads_the_phase_skill_bodies():
-    """U2: a fork's prompts.strategic/tactical are the expert-local phase skill
-    BODIES (frontmatter stripped) — the DB shape is unchanged and the text is
-    what the phase block's <expert_workflow> addendum will carry."""
+@pytest.mark.parametrize(
+    "expert", ["developer", "critic", "scholar", "designer", "bughunter", "product-qa"]
+)
+def test_bundled_expert_bundle_leaves_the_phase_skills_in_the_asset_dir(expert):
+    """A copy never carries its expert's phase skill text as prompts: it keeps
+    the expert as its asset directory, and the freeze reads the expert-local
+    skills/<phase>-phase/SKILL.md from there (copying the text too delivered
+    it twice)."""
     from pathlib import Path
 
-    from shared.runtime.core.skill_format import parse_skill_md
-
-    bundle = catalogue_service().bundled_expert_bundle("developer")
+    bundle = catalogue_service().bundled_expert_bundle(expert)
     if bundle is None:
-        pytest.skip("developer bundled expert not found in this env")
-    prompts = bundle["prompts"]
-    dev = Path("config/experts/developer")
-    for phase in ("strategic", "tactical"):
-        _fm, body = parse_skill_md(
-            (dev / "skills" / f"{phase}-phase" / "SKILL.md").read_text(encoding="utf-8")
-        )
-        assert prompts[phase] == body.lstrip("\n")
-        assert not prompts[phase].startswith("---")
-        assert f"name: {phase}-phase" not in prompts[phase]
-        assert f"You are in {phase.upper()} mode." in prompts[phase]
-    assert "tdd_phase" in prompts["strategic"]
-    # An expert with neither a local phase skill nor the legacy .txt has no key.
-    writer = catalogue_service().bundled_expert_bundle("writer")
-    if writer is not None:
-        assert "strategic" not in writer["prompts"]
-        assert "tactical" not in writer["prompts"]
+        pytest.skip(f"{expert} bundled expert not found in this env")
+    assert Path(f"config/experts/{expert}/skills/strategic-phase/SKILL.md").is_file()
+    assert "strategic" not in bundle["prompts"]
+    assert "tactical" not in bundle["prompts"]

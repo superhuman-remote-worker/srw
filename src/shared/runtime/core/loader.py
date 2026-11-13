@@ -5833,8 +5833,10 @@ def render_placeholders(text: str, **known: str) -> str:
 # persistent, protected message (src/core/workspace_injection.py), not
 # re-rendered into every request. An expert overrides a body by shipping
 # ``config/experts/<expert>/skills/<skill>/SKILL.md`` next to its config.yaml
-# (location-primary, like prompt files). A DB expert's ``prompts.strategic`` /
-# ``prompts.tactical`` stays an addendum: fenced and appended to the block.
+# (location-primary, like prompt files). A DB expert has no phase text of its
+# own: the editor's strategic/tactical prompt fields were retired (migration
+# 0567), so a copy of a bundled expert gets its phase skills from the asset
+# directory it points at, and a UI-made expert gets the bundled ones.
 # Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
 
 #: phase name -> the bundled skill that carries that phase's instructions.
@@ -5905,56 +5907,6 @@ def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
         if (local / "SKILL.md").is_file():
             return local
     return skill_dir_under(get_project_root() / "config" / "skills", skill)
-
-
-def expert_phase_prompt_bodies(expert_dir: Union[str, Path]) -> Dict[str, str]:
-    """``{"strategic": body, "tactical": body}`` of an expert directory —
-    the expert-local phase skill bodies with frontmatter stripped.
-
-    Managed-expert seeding and the fork bundle write these into the DB row's
-    ``prompts.strategic`` / ``prompts.tactical`` (shape unchanged); at
-    delivery they become the fenced ``<expert_workflow>`` addendum of the
-    phase block.
-    """
-    from shared.runtime.core.skill_format import skill_body
-
-    expert_dir = Path(expert_dir)
-    out: Dict[str, str] = {}
-    for phase, skill in PHASE_SKILLS.items():
-        skill_md = expert_dir / "skills" / skill / "SKILL.md"
-        if skill_md.is_file():
-            out[phase] = skill_body(skill_md.read_text(encoding="utf-8"))
-    return out
-
-
-def db_phase_addendum(config: Any, phase_name: str) -> Optional[str]:
-    """A DB expert's own ``strategic`` / ``tactical`` prompt for ``phase_name``
-    (present in ``_resolved_prompts`` AND marked DB-authored in
-    ``_db_prompt_keys``), fenced as ``<expert_workflow>``; None otherwise.
-
-    Untrusted text: fenced (braces stripped, subordinated to system rules)
-    exactly as the legacy swap fenced it into the system prompt — never
-    Jinja-rendered.
-    """
-    extra = getattr(config, "extra", None)
-    if not isinstance(extra, dict):
-        return None
-    if phase_name not in (extra.get("_db_prompt_keys") or ()):
-        return None
-    resolved = extra.get("_resolved_prompts")
-    text_value = resolved.get(phase_name) if isinstance(resolved, dict) else None
-    if not isinstance(text_value, str) or not text_value.strip():
-        return None
-    from shared.runtime.core.expert_resolution import fence_phase_directive
-
-    return fence_phase_directive(text_value)
-
-
-def append_expert_workflow_addendum(body: str, addendum: str) -> str:
-    """The phase block body with the fenced DB addendum appended — ONE block
-    per (phase, path), so the addendum shares the skill's protected identity
-    (see src/core/workspace_injection.create_phase_instruction_message)."""
-    return f"{body.rstrip()}\n\n{addendum}\n"
 
 
 def cloud_mount_system_floor(

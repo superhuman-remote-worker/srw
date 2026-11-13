@@ -129,10 +129,7 @@ from shared.runtime.core.llm_retry import (  # noqa: F401
     initial_error_freeze_fields,
 )
 from shared.runtime.core.loader import (
-    PHASE_SKILLS,
     AgentConfig,
-    append_expert_workflow_addendum,
-    db_phase_addendum,
     get_phase_system_prompt,
     load_auxiliary_prompt,
     resolve_model_settings,
@@ -1038,16 +1035,6 @@ def create_execute_node(
                         # A bound skill delivers its instructions, not its
                         # catalog frontmatter.
                         instr_content = skill_body(instr_content)
-                        if entry.skill == PHASE_SKILLS.get(phase_name):
-                            # A DB expert's own strategic/tactical prompt rides
-                            # INSIDE the phase block (one protected identity per
-                            # path), fenced as <expert_workflow> exactly as the
-                            # legacy swap fenced it into the system prompt.
-                            addendum = db_phase_addendum(config, phase_name)
-                            if addendum:
-                                instr_content = append_expert_workflow_addendum(
-                                    instr_content, addendum
-                                )
                     delivered_phase_blocks.append(
                         create_phase_instruction_message(
                             instr_path, instr_content, phase_name, phase_key

@@ -168,10 +168,11 @@ def test_bundled_base_has_no_persona_source_marker():
 # --- Part 2: DB-expert phase-prompt parity ----------------------------------
 
 
-def test_expert_overlays_phase_prompts_and_marks_db_keys():
-    """A DB expert carrying strategic/tactical/summarization gets them overlaid
-    into the blob, and each overridden segment is recorded in _db_prompt_keys so
-    the render path fences the untrusted phase content."""
+def test_expert_overlays_its_prompts_and_marks_db_keys():
+    """A DB expert's persona/instructions/summarization are overlaid into the
+    blob and each is recorded in _db_prompt_keys so the render path fences the
+    untrusted text. A retired strategic/tactical prompt still on the row is
+    neither overlaid nor marked."""
     row = {
         "expert_type": "session",
         "name": "sess-helper",
@@ -189,14 +190,12 @@ def test_expert_overlays_phase_prompts_and_marks_db_keys():
         expert_row=row,
         expert_type="session",
     )
-    assert blob["prompts"]["strategic"] == "STRAT-SENTINEL"
-    assert blob["prompts"]["tactical"] == "TAC-SENTINEL"
     assert blob["prompts"]["summarization"] == "SUMM-SENTINEL"
+    assert "STRAT-SENTINEL" not in str(blob)
+    assert "TAC-SENTINEL" not in str(blob)
     assert set(blob["agent"]["_db_prompt_keys"]) == {
         "persona",
         "instructions",
-        "strategic",
-        "tactical",
         "summarization",
     }
 
@@ -705,10 +704,10 @@ def test_a_db_expert_forked_before_u2_gets_the_phase_bindings_back():
         "tactical-phase",
         "todo-guide",
     ]
-    # The DB prompt keeps its key and its DB-authored marker: at delivery it is
-    # the fenced <expert_workflow> addendum of the strategic block.
-    assert blob["prompts"]["strategic"] == "FORK STRATEGIC ADDENDUM"
-    assert blob["agent"]["_db_prompt_keys"] == ["strategic"]
+    # The retired strategic/tactical prompt (a manifest saved before migration
+    # 0567 can still carry one) never reaches the job: not frozen, not marked.
+    assert "FORK STRATEGIC ADDENDUM" not in str(blob["prompts"])
+    assert blob["agent"]["_db_prompt_keys"] == []
 
 
 def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():

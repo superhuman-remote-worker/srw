@@ -43,14 +43,13 @@ logger = logging.getLogger(__name__)
 
 # Prompt segments a DB/forked expert may override — one family-agnostic version
 # each (model adaptation stays in the systemprompt_<family> wrapper). persona +
-# instructions are v1 (migration 0028); strategic/tactical/summarization are
-# Part 2 (full DB-expert prompt parity). Reused to build the ``_db_prompt_keys``
-# provenance marker the render path fences on.
+# instructions are v1 (migration 0028); summarization is Part 2. Reused to build
+# the ``_db_prompt_keys`` provenance marker the render path fences on. The old
+# strategic/tactical segments are retired (migration 0567): a stored manifest
+# that still carries one is ignored here, so it never reaches a job.
 _OVERLAY_PROMPT_KEYS = (
     "persona",
     "instructions",
-    "strategic",
-    "tactical",
     "summarization",
 )
 
@@ -306,8 +305,8 @@ def resolve_config(
         # decision 7: mark the DB-authored persona so the render path fences it.
         data["_persona_source"] = "db"
         # Part 2: record which prompt segments are DB-authored (untrusted) so the
-        # render path fences strategic/tactical (fence_phase_directive) and brace-
-        # escapes summarization. Only the segments actually present in the row —
+        # render path brace-escapes summarization. Only the segments actually
+        # present in the row —
         # inherited (disk) segments stay trusted.
         data["_db_prompt_keys"] = [
             k for k in _OVERLAY_PROMPT_KEYS if prompts_override.get(k)
