@@ -225,6 +225,7 @@ async def list_datasource_catalog(
     limit: int,
     cursor: str | None,
     dependencies: DatasourceDependencies,
+    managed: bool | None = None,
 ) -> dict[str, Any]:
     """Cursor-paginated connector management catalog.
 
@@ -253,6 +254,7 @@ async def list_datasource_catalog(
             visibility=visibility,
             ownership=ownership,
             availability=availability,
+            managed=managed,
             limit=limit,
             cursor=cursor,
         )

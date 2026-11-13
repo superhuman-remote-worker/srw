@@ -643,6 +643,34 @@ async def test_scoped_catalog_never_enriches_creator_with_hidden_links():
 
 
 @pytest.mark.asyncio
+async def test_catalog_splits_by_who_keeps_the_connector():
+    """``managed`` is the catalog's two views: the connectors SRW provisions
+    for a project or a user, and the ones people created. Applied in SQL,
+    before the limit, so neither view comes back short."""
+    from shared.connectors.platform import platform_owned_sql
+
+    kept = platform_owned_sql("d")
+
+    async def query(**filters) -> str:
+        conn = AsyncMock()
+        conn.fetch.return_value = []
+        await _make_db(conn).list_datasource_catalog(USER_ID, [PROJECT_A], **filters)
+        return conn.fetch.await_args.args[0]
+
+    both = await query()
+    assert kept not in both
+
+    only_kept = await query(managed=True)
+    assert f"AND {kept}" in only_kept
+    assert f"NOT {kept}" not in only_kept
+    assert only_kept.index(kept) < only_kept.index("LIMIT")
+
+    only_created = await query(managed=False)
+    assert f"AND NOT {kept}" in only_created
+    assert only_created.index(kept) < only_created.index("LIMIT")
+
+
+@pytest.mark.asyncio
 async def test_linkable_targets_mark_retained_only_project():
     conn = AsyncMock()
     retained = {

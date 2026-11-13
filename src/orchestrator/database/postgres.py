@@ -52297,10 +52297,16 @@ class PostgresDB:
         visibility: str | None = None,
         ownership: str | None = None,
         availability: str | None = None,
+        managed: bool | None = None,
         limit: int = 50,
         cursor: str | None = None,
     ) -> Dict[str, Any]:
         """Cursor-page the management catalog after authorization/filtering.
+
+        ``managed`` splits the catalog by who keeps a row: True for the ones
+        SRW provisions (``platform_owned_sql``: a project's folders and
+        knowledge base, a user's cloud), False for the ones people created,
+        None for both.
 
         ``visible_project_ids`` must come from the caller's authenticated
         project memberships. ``restrict_to_projects`` is used by a
@@ -52398,6 +52404,10 @@ class PostgresDB:
             conditions.append("d.created_by = $1")
         elif ownership == "shared":
             conditions.append("d.created_by IS DISTINCT FROM $1")
+        if managed is True:
+            conditions.append(platform_owned_sql("d"))
+        elif managed is False:
+            conditions.append(f"NOT {platform_owned_sql('d')}")
         if availability == "all":
             conditions.append("d.scope_mode = 'all'")
         elif availability == "projects":

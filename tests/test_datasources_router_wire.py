@@ -368,6 +368,17 @@ def test_catalog_items_are_redacted_and_the_envelope_survives():
     assert body["items"][0]["connection_url_redacted"] is True
 
 
+def test_catalog_passes_the_managed_split_through_as_a_boolean():
+    wire = _wire()
+    wire.client.get("/api/datasources/catalog")
+    assert wire.store.list_datasource_catalog.await_args.kwargs["managed"] is None
+    wire.client.get("/api/datasources/catalog?managed=false")
+    assert wire.store.list_datasource_catalog.await_args.kwargs["managed"] is False
+    wire.client.get("/api/datasources/catalog?managed=true")
+    assert wire.store.list_datasource_catalog.await_args.kwargs["managed"] is True
+    assert wire.client.get("/api/datasources/catalog?managed=some").status_code == 422
+
+
 def test_eligible_rows_are_redacted():
     wire = _wire()
     body = wire.client.get("/api/datasources/eligible").json()

@@ -136,6 +136,14 @@ async def list_datasource_catalog(
     visibility: str | None = Query(default=None),
     ownership: str | None = Query(default=None),
     availability: str | None = Query(default=None),
+    managed: bool | None = Query(
+        default=None,
+        description=(
+            "true: only the connectors SRW keeps (a project's folders and "
+            "knowledge base, a user's cloud); false: only the ones people "
+            "created; omitted: both"
+        ),
+    ),
     limit: int = Query(default=50, ge=1, le=100),
     cursor: str | None = Query(default=None),
     *,
@@ -157,6 +165,7 @@ async def list_datasource_catalog(
         visibility=visibility,
         ownership=ownership,
         availability=availability,
+        managed=managed,
         limit=limit,
         cursor=cursor,
         dependencies=dependencies.operations,
