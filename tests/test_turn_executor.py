@@ -94,6 +94,66 @@ async def test_singleton_start_cannot_replace_a_quarantined_executor(monkeypatch
         await te.start_stateless_executor()
 
 
+@pytest.fixture
+def exit_recorder(monkeypatch):
+    calls: List[int] = []
+    monkeypatch.setattr(te, "_executor", None)
+    monkeypatch.setattr(te, "_lifespan_stopping", False)
+    monkeypatch.setattr(te, "_hard_exit", calls.append)
+    monkeypatch.setattr(
+        te.StatelessTurnExecutor, "_db", property(lambda self: object())
+    )
+    monkeypatch.setattr(
+        "agent.core.fenced_checkpointer.close_fenced_checkpointer_pool",
+        AsyncMock(),
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_loop_end_outside_shutdown_exits_the_process(monkeypatch, exit_recorder):
+    async def run(self):
+        return None
+
+    monkeypatch.setattr(te.StatelessTurnExecutor, "run", run)
+    await te.start_stateless_executor()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert exit_recorder == [1]
+    assert te.executor_stopped_unexpectedly() is True
+
+
+@pytest.mark.asyncio
+async def test_loop_exception_exits_the_process_and_logs_it(
+    monkeypatch, exit_recorder, caplog
+):
+    async def run(self):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(te.StatelessTurnExecutor, "run", run)
+    with caplog.at_level("CRITICAL"):
+        await te.start_stateless_executor()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    assert exit_recorder == [1]
+    assert any(
+        r.levelname == "CRITICAL" and "boom" in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifespan_stop_does_not_exit_the_process(monkeypatch, exit_recorder):
+    async def run(self):
+        await self._stop.wait()
+
+    monkeypatch.setattr(te.StatelessTurnExecutor, "run", run)
+    await te.start_stateless_executor()
+    await te.stop_stateless_executor(timeout=1)
+    await asyncio.sleep(0)
+    assert exit_recorder == []
+    assert te.executor_stopped_unexpectedly() is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("known", [True, False])
 async def test_client_claim_bundle_parses_only_known_exact_recovery(known):

@@ -7730,6 +7730,31 @@ class TestCreatePersistentApp:
         assert payload["app_guide"] == {"state": "ready"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stopped", "code", "status", "executor"),
+        [(True, 503, "unhealthy", "stopped"), (False, 200, "healthy", "running")],
+    )
+    async def test_stateless_health_reflects_the_executor(
+        self, monkeypatch, stopped, code, status, executor
+    ):
+        import agent.api.persistent_app as pa
+        import agent.api.turn_executor as te
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV, raising=False)
+        monkeypatch.setattr(pa, "_stateless_mode", lambda: True)
+        monkeypatch.setattr(te, "executor_stopped_unexpectedly", lambda: stopped)
+        app = create_persistent_app("config", "tid")
+        route = next(route for route in app.routes if route.path == "/health")
+
+        response = await route.endpoint()
+        payload = json.loads(response.body)
+
+        assert response.status_code == code
+        assert payload["status"] == status
+        assert payload["executor"] == executor
+
+    @pytest.mark.asyncio
     async def test_break_glass_health_is_bounded_degraded_and_still_live(
         self, monkeypatch
     ):

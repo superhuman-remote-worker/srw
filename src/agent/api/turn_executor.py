@@ -6429,27 +6429,61 @@ class StatelessTurnExecutor:
 
 _executor: Optional[StatelessTurnExecutor] = None
 
+# Replaceable in tests.  ``os._exit`` skips the lifespan teardown on purpose: a
+# graceful exit would run ``terminate("shutdown")`` on a session that may have
+# failed to quiesce.
+_hard_exit: Callable[[int], None] = os._exit
+
+# Set once the lifespan shutdown begins; every intended stop (SIGTERM drain,
+# including the timeout path that cancels the loop task) happens after it.
+_lifespan_stopping: bool = False
+
+
+def _on_executor_task_done(task: "asyncio.Task[Any]") -> None:
+    """Exit the process when the claim loop ends outside a lifespan shutdown.
+
+    A live process with a dead loop answers /health 200 forever and the kubelet
+    never restarts it; exiting makes it restart the container.
+    """
+    if _lifespan_stopping:
+        return
+    exc = None if task.cancelled() else task.exception()
+    detail = repr(exc) if exc is not None else "stopped itself; see the preceding error"
+    logger.critical(
+        "stateless turn executor loop ended outside shutdown (%s); "
+        "exiting so the kubelet restarts this container",
+        detail,
+    )
+    for handler in list(logging.getLogger().handlers):
+        with contextlib.suppress(Exception):
+            handler.flush()
+    _hard_exit(1)
+
 
 async def start_stateless_executor() -> StatelessTurnExecutor:
     """Create + start the singleton executor (idempotent)."""
-    global _executor
+    global _executor, _lifespan_stopping
     if _executor is not None and _executor._worker_quarantined:
         raise _ClaimQuiescenceError(
             "quarantined worker runtime requires process replacement"
         )
     if _executor is not None and _executor.running:
         return _executor
+    _lifespan_stopping = False
     executor = StatelessTurnExecutor()
     # Fail fast when the pool is missing — a stateless pod without its app-DB
     # pool can never serve a claim, and /ready must go 503, not lie.
     executor._db
     executor.start()
+    if executor._task is not None:
+        executor._task.add_done_callback(_on_executor_task_done)
     _executor = executor
     return executor
 
 
 async def stop_stateless_executor(timeout: Optional[float] = None) -> None:
-    global _executor
+    global _executor, _lifespan_stopping
+    _lifespan_stopping = True
     try:
         if _executor is not None:
             await _executor.stop(timeout)
@@ -6461,6 +6495,10 @@ async def stop_stateless_executor(timeout: Optional[float] = None) -> None:
         from agent.core.fenced_checkpointer import close_fenced_checkpointer_pool
 
         await close_fenced_checkpointer_pool()
+
+
+def executor_stopped_unexpectedly() -> bool:
+    return _executor is not None and not _executor.running and not _lifespan_stopping
 
 
 def executor_running() -> bool:

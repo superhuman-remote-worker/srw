@@ -2339,19 +2339,30 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     @app.get("/health")
     async def health():
         app_guide = _app_guide_health()
-        return JSONResponse(
-            {
-                "status": (
-                    "healthy" if app_guide.get("state") == "ready" else "degraded"
-                ),
-                "mode": "stateless" if _stateless_mode() else "persistent",
-                "thread_id": _session_identity.thread_id,
-                "uptime_seconds": (datetime.now() - _started_at).total_seconds()
-                if _started_at
-                else 0,
-                "app_guide": app_guide,
-            }
-        )
+        stateless = _stateless_mode()
+        stopped = False
+        if stateless:
+            from agent.api.turn_executor import executor_stopped_unexpectedly
+
+            stopped = executor_stopped_unexpectedly()
+        payload = {
+            "status": (
+                "unhealthy"
+                if stopped
+                else "healthy"
+                if app_guide.get("state") == "ready"
+                else "degraded"
+            ),
+            "mode": "stateless" if stateless else "persistent",
+            "thread_id": _session_identity.thread_id,
+            "uptime_seconds": (datetime.now() - _started_at).total_seconds()
+            if _started_at
+            else 0,
+            "app_guide": app_guide,
+        }
+        if stateless:
+            payload["executor"] = "stopped" if stopped else "running"
+        return JSONResponse(payload, status_code=503 if stopped else 200)
 
     @app.post("/api/lifecycle/termination-fence")
     async def termination_fence(request: Request):
