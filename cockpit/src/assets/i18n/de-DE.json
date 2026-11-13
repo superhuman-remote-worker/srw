@@ -5000,6 +5000,7 @@
       "loop_event": "Loop",
       "automation_disabled": "Automation",
       "user_registered": "Neuer Benutzer",
+      "chat_executors_unavailable": "Chat ausgefallen",
       "session_permission": "Berechtigung",
       "sudo_request": "Sudo",
       "ssh_key_added": "SSH-Schlüssel hinzugefügt"
@@ -5032,7 +5033,8 @@
       "openSession": "Sitzung öffnen",
       "openProject": "Projekt öffnen",
       "openAutomations": "Automationen öffnen",
-      "openAdminUsers": "Benutzer öffnen"
+      "openAdminUsers": "Benutzer öffnen",
+      "openAdminCapacity": "Kapazität öffnen"
     },
     "inputs": {
       "feedback": "Feedback für den Agenten…",

@@ -399,6 +399,10 @@ def register_notification_actions(
     async def _open_admin_users(ctx: ActionContext) -> ActionResult:
         return _navigate("/admin/users")
 
+    @register_action("chat_executors_unavailable", "open")
+    async def _open_admin_capacity(ctx: ActionContext) -> ActionResult:
+        return _navigate("/admin/capacity")
+
     @register_action("ssh_key_added", "open")
     async def _open_ssh_keys(ctx: ActionContext) -> ActionResult:
         # ssh_key_added rows DO carry source_kind="ssh_key" and source_id

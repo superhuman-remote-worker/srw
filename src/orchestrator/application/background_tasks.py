@@ -113,6 +113,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "completion_finalizer",
     "completion_sweep_router",
     "completion_monitor",
+    "chat_pool_stall_watch",
     "security_events_prune",
     "ssh_attachments_prune",
     "connector_lease_sweeper",
@@ -418,6 +419,17 @@ async def start_background_tasks(
         "completion_monitor",
         resources.completion_runtime.monitor().run(resources.shutdown_event),
         name="completion-monitor",
+    )
+    # Every replica ticks; the notification dedup key keeps it to one row per
+    # admin per incident.
+    from orchestrator.services.chat_pool_stall import ChatPoolStallWatch
+
+    tasks.start(
+        "chat_pool_stall_watch",
+        ChatPoolStallWatch(
+            resources.postgres_db, notification_service_module.notification_service
+        ).run(resources.shutdown_event),
+        name="chat-pool-stall-watch",
     )
     from shared.cloud_push_tasks import enabled as cloud_push_recovery_enabled
 

@@ -25,6 +25,7 @@ export type NotificationCategory =
   | 'loop_event'
   | 'automation_disabled'
   | 'user_registered'
+  | 'chat_executors_unavailable'
   | 'session_permission'
   | 'sudo_request'
   | (string & {});
@@ -44,6 +45,7 @@ export const KNOWN_CATEGORIES: readonly string[] = [
   'loop_event',
   'automation_disabled',
   'user_registered',
+  'chat_executors_unavailable',
 ];
 
 export type NotificationActionStyle = 'default' | 'primary' | 'danger';

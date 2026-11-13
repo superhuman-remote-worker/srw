@@ -67,7 +67,20 @@ SELECT clock_timestamp() AS observed_at,
                    ))
                )::float8
           FROM run_queue
-         WHERE {RUNNABLE_PREDICATE}) AS oldest_queued_age_s
+         WHERE {RUNNABLE_PREDICATE}) AS oldest_queued_age_s,
+       (SELECT min(GREATEST(queued_at, run_after))
+          FROM run_queue
+         WHERE {RUNNABLE_PREDICATE}
+           AND unit_kind = 'session_turn') AS oldest_session_turn_runnable_at,
+       (SELECT GREATEST(
+                   0.0,
+                   extract(epoch FROM (
+                       clock_timestamp() - min(GREATEST(queued_at, run_after))
+                   ))
+               )::float8
+          FROM run_queue
+         WHERE {RUNNABLE_PREDICATE}
+           AND unit_kind = 'session_turn') AS oldest_session_turn_age_s
 """
 
 _BUSY_PODS_SQL = f"""
@@ -123,6 +136,8 @@ class QueueDemand:
     runnable_total: int
     oldest_queued_age_s: float | None
     runnable_bg_task: int = 0
+    oldest_session_turn_runnable_at: datetime | None = None
+    oldest_session_turn_age_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +168,7 @@ async def read_demand(conn: Any) -> QueueDemand:
     if row is None:
         return QueueDemand(None, 0, 0, 0, 0, None)
     age = row["oldest_queued_age_s"]
+    turn_age = row.get("oldest_session_turn_age_s")
     return QueueDemand(
         observed_at=row["observed_at"],
         busy=int(row["busy"] or 0),
@@ -161,6 +177,8 @@ async def read_demand(conn: Any) -> QueueDemand:
         runnable_bg_task=int(row.get("runnable_bg_task") or 0),
         runnable_total=int(row["runnable_total"] or 0),
         oldest_queued_age_s=float(age) if age is not None else None,
+        oldest_session_turn_runnable_at=row.get("oldest_session_turn_runnable_at"),
+        oldest_session_turn_age_s=float(turn_age) if turn_age is not None else None,
     )
 
 

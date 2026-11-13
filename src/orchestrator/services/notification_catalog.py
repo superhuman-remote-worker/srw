@@ -270,6 +270,7 @@ ACTION_OPEN_SESSION = ActionSpec("open_session", A + "openSession")
 ACTION_OPEN_PROJECT = ActionSpec("open", A + "openProject")
 ACTION_OPEN_AUTOMATIONS = ActionSpec("open", A + "openAutomations")
 ACTION_OPEN_ADMIN_USERS = ActionSpec("open", A + "openAdminUsers")
+ACTION_OPEN_ADMIN_CAPACITY = ActionSpec("open", A + "openAdminCapacity")
 ACTION_OPEN_SOURCE = ActionSpec("open", A + "open")
 
 
@@ -310,6 +311,10 @@ CATEGORIES: dict[str, CategorySpec] = {
         CategorySpec("automation_disabled", "normal", (ACTION_OPEN_AUTOMATIONS,)),
         # Per admin; resolved when the user is approved.
         CategorySpec("user_registered", "normal", (ACTION_OPEN_ADMIN_USERS,)),
+        # Per admin; resolved by the chat-pool stall watch when the stall ends.
+        CategorySpec(
+            "chat_executors_unavailable", "high", (ACTION_OPEN_ADMIN_CAPACITY,)
+        ),
         # A headless session's permission gate waiting on its owner. The mail
         # carries magic links, so `high` keeps the "approve from your phone"
         # affordance the old thread_notifications email had.

@@ -46,6 +46,8 @@ def _demand_row(**overrides):
         "runnable_bg_task": 0,
         "runnable_total": 0,
         "oldest_queued_age_s": None,
+        "oldest_session_turn_runnable_at": None,
+        "oldest_session_turn_age_s": None,
     }
     row.update(overrides)
     return row
@@ -81,7 +83,16 @@ async def test_demand_sql_uses_the_claim_predicates_verbatim():
     assert cap.RUNNABLE_PREDICATE == "state = 'queued' AND run_after <= now()"
     assert sql.count(cap.BUSY_PREDICATE) == 1
     # Three kinds, total, and oldest age all use the same readiness predicate.
-    assert sql.count(cap.RUNNABLE_PREDICATE) == 5
+    assert sql.count(cap.RUNNABLE_PREDICATE) == 7
+    # The oldest runnable session turn (timestamp and age) is read under the
+    # same predicate, restricted to session turns.
+    assert "AS oldest_session_turn_runnable_at" in sql
+    assert "AS oldest_session_turn_age_s" in sql
+    runnable_at = sql[: sql.index("AS oldest_session_turn_runnable_at")]
+    runnable_at = runnable_at[runnable_at.rindex("(SELECT") :]
+    assert "min(GREATEST(queued_at, run_after))" in runnable_at
+    assert cap.RUNNABLE_PREDICATE in runnable_at
+    assert "unit_kind = 'session_turn'" in runnable_at
     assert "unit_kind = 'session_turn'" in sql
     assert "unit_kind = 'worker_batch'" in sql
     assert "unit_kind = 'bg_task'" in sql
