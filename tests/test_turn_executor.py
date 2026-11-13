@@ -155,6 +155,27 @@ async def test_lifespan_stop_does_not_exit_the_process(monkeypatch, exit_recorde
 
 
 @pytest.mark.asyncio
+async def test_loop_end_after_the_lifespan_marked_its_stop_does_not_exit(
+    monkeypatch, exit_recorder
+):
+    """The lifespan marks the stop before its drain steps; a loop that ends in
+    that window (before stop_stateless_executor runs) is part of the drain."""
+    end_loop = asyncio.Event()
+
+    async def run(self):
+        await end_loop.wait()
+
+    monkeypatch.setattr(te.StatelessTurnExecutor, "run", run)
+    await te.start_stateless_executor()
+    te.mark_lifespan_stopping()
+    end_loop.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert exit_recorder == []
+    assert te.executor_stopped_unexpectedly() is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("known", [True, False])
 async def test_client_claim_bundle_parses_only_known_exact_recovery(known):
     import httpx
@@ -4018,6 +4039,89 @@ class TestCommitThenEffects:
         complete.assert_not_awaited()
         assert not harness.calls["complete"]
         assert not harness.calls["release"]
+
+    @staticmethod
+    def _fail_turn_end_debt_reads(harness, monkeypatch, *, failures: int):
+        """Make the turn-end debt read raise ``failures`` times.
+
+        The admission read before the turn stays healthy; only reads after
+        the turn's final detach (where the turn-end guard runs) fail.
+        """
+        at_turn_end = False
+        reads: List[str] = []
+        original_detach = harness.executor._detach_physical_before_transition
+        original_read = harness.executor._session_tool_debt
+
+        async def detach(reason):
+            nonlocal at_turn_end
+            if reason == "turn_complete":
+                at_turn_end = True
+            await original_detach(reason)
+
+        async def read(conn, claim):
+            if at_turn_end:
+                if len(reads) < failures:
+                    reads.append("failed")
+                    raise ConnectionResetError("transient blip")
+                reads.append("ok")
+            return await original_read(conn, claim)
+
+        monkeypatch.setattr(
+            harness.executor, "_detach_physical_before_transition", detach
+        )
+        monkeypatch.setattr(harness.executor, "_session_tool_debt", read)
+        return reads
+
+    @pytest.mark.asyncio
+    async def test_turn_end_debt_read_blip_is_retried_then_completes(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "settled_effect"  # a tool ran; no debt left
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 4, "content": "answered after a tool"}
+        ]
+        claim = make_claim(token=101, input_seq=4)
+        reads = self._fail_turn_end_debt_reads(harness, monkeypatch, failures=1)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert reads == ["failed", "ok"]
+        assert harness.calls["complete"] == [
+            {"unit_id": claim.unit_id, "lease_token": 101, "consumed_seq": 4}
+        ]
+        assert not harness.calls["park"]
+        assert not harness.calls["release"]
+        assert not harness.has_tool_effect(claim)
+
+    @pytest.mark.asyncio
+    async def test_turn_end_debt_read_that_keeps_failing_completes_as_before(
+        self, harness, monkeypatch
+    ):
+        harness.loop_behavior = "settled_effect"  # a tool ran; no debt left
+        harness.db.pending_rows = [
+            {"id": str(uuid4()), "seq": 4, "content": "answered after a tool"}
+        ]
+        claim = make_claim(token=102, input_seq=4)
+        reads = self._fail_turn_end_debt_reads(
+            harness, monkeypatch, failures=te.COMPLETE_RETRY_ATTEMPTS
+        )
+        complete = AsyncMock(wraps=harness.executor._complete_with_retry)
+        monkeypatch.setattr(harness.executor, "_complete_with_retry", complete)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        # Every attempt failed: the read never decides a park on its own, and
+        # completion runs exactly as it did before the turn-end guard existed.
+        assert reads == ["failed"] * te.COMPLETE_RETRY_ATTEMPTS
+        complete.assert_awaited_once()
+        assert harness.calls["complete"] == [
+            {"unit_id": claim.unit_id, "lease_token": 102, "consumed_seq": 4}
+        ]
+        assert not harness.calls["park"]
+        assert not harness.calls["release"]
+        assert not harness.has_tool_effect(claim)
 
     @pytest.mark.asyncio
     async def test_cancel_mid_turn_with_durable_tool_results_releases(

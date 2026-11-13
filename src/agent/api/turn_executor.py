@@ -3997,15 +3997,17 @@ class StatelessTurnExecutor:
         branches: (1) the turn settled — its answer is durable and the
         interrupt close in ``_serve_claim``'s finally already checkpointed
         ``consumed_seq`` — so complete the unit (idempotent CAS) and leave the
-        push, if any, handed off; a failed CAS releases, never parks. (2) not
-        settled, no tool effect crossed — release with attempts++. (3) not
-        settled, effect crossed, but every persisted tool call has its
-        durable ToolMessage — release: the successor continues from the
-        transcript. (3b) the calls without a result are those of a
-        delegation-only batch whose opened children all have their rows —
-        release: the successor settles the batch (parallel_subagents.md §8).
-        (4) any other in-flight tool with no result row — the only remaining
-        park.
+        push, if any, handed off; a failed CAS releases. A settled turn that
+        still leaves a call without a result is parked first instead, for
+        the owner's Continue/Stop, exactly as at a normal turn end
+        (``_park_if_turn_left_tool_debt``). (2) not settled, no tool effect
+        crossed — release with attempts++. (3) not settled, effect crossed,
+        but every persisted tool call has its durable ToolMessage — release:
+        the successor continues from the transcript. (3b) the calls without
+        a result are those of a delegation-only batch whose opened children
+        all have their rows — release: the successor settles the batch
+        (parallel_subagents.md §8). (4) not settled, any other in-flight tool
+        with no result row — park.
         """
 
         pa = _pa()
@@ -5622,12 +5624,13 @@ class StatelessTurnExecutor:
             # A previous cached owner may still be resident. No validated
             # bundle/attach will retire it on this refusal, so do not accept
             # another owner after an unproven claim or predecessor authority.
-            # The executor stays stopped (pod unready) until it is replaced;
-            # say so, or the pod just goes quiet.
+            # The executor stops and its process exits, so the container
+            # restarts within seconds; say so, or the pod just goes quiet.
             logger.error(
                 "session tool-history admission refused: unit=%s token=%d — "
                 "this claim's authority or the predecessor's claim record is "
-                "unproven; stopping this executor until the pod is replaced",
+                "unproven; stopping this executor (the process exits so the "
+                "container restarts)",
                 claim.unit_id,
                 claim.lease_token,
             )
@@ -5649,7 +5652,8 @@ class StatelessTurnExecutor:
         if outcome == "lost":
             logger.error(
                 "session tool-debt park lost its authority: unit=%s token=%d; "
-                "stopping this executor until the pod is replaced",
+                "stopping this executor (the process exits so the container "
+                "restarts)",
                 claim.unit_id,
                 claim.lease_token,
             )
@@ -5667,8 +5671,29 @@ class StatelessTurnExecutor:
         executor. Park it for the owner's Continue/Stop under this claim's own
         lease instead. True when the caller must return (parked, or the claim
         was lost); False when there is no debt and completion proceeds.
+
+        The read retries like completion does. When it still fails, completion
+        proceeds as it did before this guard existed: a DB blip must never
+        park a healthy, answered turn.
         """
-        row = await self._session_tool_debt(self._db, claim)
+        row = None
+        for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
+            try:
+                row = await self._session_tool_debt(self._db, claim)
+                break
+            except Exception as e:
+                if attempt < COMPLETE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                logger.warning(
+                    "turn-end tool-debt read FAILED after %d attempts: unit=%s "
+                    "token=%d — completing without the check: %s",
+                    COMPLETE_RETRY_ATTEMPTS,
+                    claim.unit_id,
+                    claim.lease_token,
+                    e,
+                )
+                return False
         if row is None or not row["unresolved"]:
             # No debt under this claim's proven authority: completion fences
             # or completes exactly as before.
@@ -6517,6 +6542,17 @@ _hard_exit: Callable[[int], None] = os._exit
 # Set once the lifespan shutdown begins; every intended stop (SIGTERM drain,
 # including the timeout path that cancels the loop task) happens after it.
 _lifespan_stopping: bool = False
+
+
+def mark_lifespan_stopping() -> None:
+    """Record that the lifespan shutdown has begun.
+
+    The lifespan calls this first thing after its ``yield``, before the attach
+    fence and receipt steps, so a claim loop that ends during the SIGTERM drain
+    never hard-exits. ``stop_stateless_executor`` sets it too.
+    """
+    global _lifespan_stopping
+    _lifespan_stopping = True
 
 
 def _on_executor_task_done(task: "asyncio.Task[Any]") -> None:

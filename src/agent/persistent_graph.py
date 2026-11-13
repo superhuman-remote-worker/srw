@@ -523,10 +523,13 @@ class PersistentLoopCallbacks:
     # Read-only: who asked for the pending interrupt of the current turn,
     # without consuming it. ``"user"`` (``USER_INTERRUPT_CAUSE``) is a person's
     # Stop; any other value is the platform's own abort (a stateless executor
-    # shutting down or losing its lease). Only the delegation batch reads it:
-    # it stops its children for a person and leaves a platform abort pending,
+    # shutting down or losing its lease). Two readers: the delegation batch
+    # stops its children for a person and leaves a platform abort pending,
     # so the batch keeps running, writes nothing when the turn is then
-    # cancelled, and the successor settles it (parallel_subagents.md §8).
+    # cancelled, and the successor settles it (parallel_subagents.md §8); and
+    # a Session turn (``close_unrun_calls``) picks the ``not_run`` text of
+    # the calls it leaves un-run, so a platform abort never reads as the
+    # user's Stop (agent/unrun_tool_calls.py).
     # Optional: None ⇒ every interrupt counts as a person's Stop (previous
     # behaviour).
     peek_interrupt_cause: Optional[Callable[[], Optional[str]]] = None

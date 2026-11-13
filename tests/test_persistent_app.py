@@ -7800,6 +7800,74 @@ class TestCreatePersistentApp:
         assert payload["executor"] == executor
 
     @pytest.mark.asyncio
+    async def test_stateless_shutdown_marks_the_stop_before_any_drain_step(
+        self, monkeypatch
+    ):
+        """A claim loop that ends while the attach fence and receipt are still
+        settling is part of the SIGTERM drain: it must never hard-exit."""
+        import agent.api.persistent_app as pa
+        import agent.api.turn_executor as te
+
+        for name in (
+            "_agent",
+            "_session",
+            "_orchestrator_client",
+            "_heartbeat_task",
+            "_started_at",
+        ):
+            monkeypatch.setattr(pa, name, getattr(pa, name))
+        monkeypatch.setattr(pa, "_session", None)
+        monkeypatch.setattr(pa._session_identity, "_thread_id", None)
+        agent = MagicMock()
+        agent.initialize = AsyncMock()
+        agent.shutdown = AsyncMock()
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.close = AsyncMock()
+        monkeypatch.setattr(pa, "_stateless_mode", lambda: True)
+        monkeypatch.setattr(pa.UniversalAgent, "from_config", lambda _path: agent)
+        monkeypatch.setattr(
+            pa, "create_orchestrator_client_from_env", lambda _id: client
+        )
+        monkeypatch.setattr(te, "_lifespan_stopping", False)
+        monkeypatch.setattr(te, "start_stateless_executor", AsyncMock())
+        seen = []
+
+        def fence(source):
+            seen.append(("fence", te._lifespan_stopping))
+            return True
+
+        async def stop_attach(**_kwargs):
+            seen.append(("attach", te._lifespan_stopping))
+            return True
+
+        async def receipt(**_kwargs):
+            seen.append(("receipt", te._lifespan_stopping))
+            return True
+
+        async def stop_executor(timeout=None):
+            seen.append(("executor", te._lifespan_stopping))
+
+        monkeypatch.setattr(
+            pa._session_termination, "activate_termination_admission_fence", fence
+        )
+        monkeypatch.setattr(pa._session_attach, "stop_startup_attach", stop_attach)
+        monkeypatch.setattr(pa._session_attach, "release_shutdown_receipt", receipt)
+        monkeypatch.setattr(te, "stop_stateless_executor", stop_executor)
+
+        manager = pa.lifespan(MagicMock())
+        await manager.__aenter__()
+        assert te._lifespan_stopping is False
+        await manager.__aexit__(None, None, None)
+
+        assert seen == [
+            ("fence", True),
+            ("attach", True),
+            ("receipt", True),
+            ("executor", True),
+        ]
+
+    @pytest.mark.asyncio
     async def test_break_glass_health_is_bounded_degraded_and_still_live(
         self, monkeypatch
     ):

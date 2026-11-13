@@ -22,6 +22,7 @@ literal "User denied this tool call." — a refusal the user never made.
 from __future__ import annotations
 
 import asyncio
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -325,8 +326,17 @@ class TestSessionTurnClosesUnrunCalls:
         )
 
     @staticmethod
-    async def _stop_after_first_tool(*, close_unrun_calls: bool):
-        """Two approved calls; a person's Stop lands while ``tc_0`` runs."""
+    async def _stop_after_first_tool(
+        *,
+        close_unrun_calls: bool,
+        cause: Optional[str] = USER_INTERRUPT_CAUSE,
+        n_calls: int = 2,
+    ):
+        """Approved calls; an interrupt lands while ``tc_0`` runs.
+
+        ``cause`` is what ``peek_interrupt_cause`` reports for it: a person's
+        Stop by default, or the platform's own abort.
+        """
         pending: dict[str, str] = {}
 
         async def _run_tool(_args):
@@ -340,13 +350,14 @@ class TestSessionTurnClosesUnrunCalls:
             return pending.pop("mode", None)
 
         def _peek_cause():
-            return USER_INTERRUPT_CAUSE if "mode" in pending else None
+            return cause if "mode" in pending else None
 
         persisted, persist = _recorder()
         messages: list[BaseMessage] = []
         await _run_turn_with_parallel_tools(
             permission_check=_gates({}),
             messages=messages,
+            n_calls=n_calls,
             tool=tool,
             close_unrun_calls=close_unrun_calls,
             check_interrupt=_check_interrupt,
@@ -366,6 +377,26 @@ class TestSessionTurnClosesUnrunCalls:
         assert row[0].additional_kwargs[TOOL_RESULT_STATE_KEY] == RESULT_NOT_RUN
         assert row[0] in persisted
         assert not any("[tool-call interruption]" in str(m.content) for m in persisted)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cause", ["shutdown", None])
+    async def test_platform_interrupt_between_tools_never_says_the_user_stopped(
+        self, cause
+    ):
+        """A platform abort (an executor shutting down, a lost lease) before a
+        tool is not a person's Stop: the calls left are skipped, not stopped."""
+        messages, persisted = await self._stop_after_first_tool(
+            close_unrun_calls=True, cause=cause, n_calls=3
+        )
+
+        results = _tool_results(messages)
+        for call_id in ("tc_1", "tc_2"):
+            assert len(results[call_id]) == 1
+            row = results[call_id][0]
+            assert row.content == SKIPPED_TURN_ENDED
+            assert row.content != NOT_RUN_STOPPED_BEFORE_START
+            assert row.additional_kwargs[TOOL_RESULT_STATE_KEY] == RESULT_NOT_RUN
+            assert row in persisted
 
     @pytest.mark.asyncio
     async def test_subagent_default_keeps_the_interruption_event(self):

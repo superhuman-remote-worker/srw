@@ -1624,6 +1624,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- Shutdown ---
+    if stateless:
+        # Every executor stop from here on is the intended SIGTERM drain: a
+        # claim loop that ends while the steps below settle must not hard-exit.
+        from agent.api.turn_executor import mark_lifespan_stopping
+
+        mark_lifespan_stopping()
     logger.info("Shutting down persistent agent")
 
     attaching = any(
