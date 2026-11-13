@@ -372,7 +372,7 @@ export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspa
       height: 20px;
       border: none;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
+      background: var(--hover);
       color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;

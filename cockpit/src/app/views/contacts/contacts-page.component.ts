@@ -39,7 +39,7 @@ import {ContactListComponent} from './contact-list.component';
       <main class="page-content">
         <header class="header">
           <div class="header__text">
-            <h2 class="header__title">{{ 'contacts.title' | transloco }}</h2>
+            <h1 class="header__title">{{ 'contacts.title' | transloco }}</h1>
             <p class="header__subtitle">{{ 'contacts.subtitle' | transloco }}</p>
           </div>
           <app-button variant="primary" [disabled]="showForm()" (clicked)="openNew()">
@@ -143,7 +143,7 @@ import {ContactListComponent} from './contact-list.component';
         flex: 1;
         min-height: 0;
         overflow-y: auto;
-        padding: 8px 16px 24px;
+        padding: 1rem 1.5rem 1.5rem;
         max-width: var(--content-max-width);
         width: 100%;
         margin: 0 auto;
@@ -159,9 +159,6 @@ import {ContactListComponent} from './contact-list.component';
 
       .header__title {
         margin: 0;
-        font-size: 24px;
-        font-weight: 600;
-        letter-spacing: -0.02em;
       }
 
       .header__subtitle {

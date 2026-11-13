@@ -96,7 +96,7 @@ type KeyValueRow = {key: string; value: string};
     <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
-        <span class="title">{{ 'datasources.title' | transloco }}</span>
+        <h1 class="title">{{ 'datasources.title' | transloco }}</h1>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
             <app-chip
@@ -109,23 +109,6 @@ type KeyValueRow = {key: string; value: string};
           }
         </div>
         <div class="header-actions">
-          <app-button
-            variant="primary"
-            size="sm"
-            [disabled]="showForm()"
-            (clicked)="openCreateForm()"
-          >
-            <app-icon size="sm">add</app-icon> {{ 'datasources.new' | transloco }}
-          </app-button>
-          <app-icon-button
-            variant="ghost"
-            size="sm"
-            [ariaLabel]="'datasources.refresh' | transloco"
-            [disabled]="isLoading()"
-            (clicked)="refresh()"
-          >
-            <app-icon size="sm">refresh</app-icon>
-          </app-icon-button>
           <a
             class="drivers-link"
             routerLink="/settings/connector-drivers"
@@ -134,6 +117,23 @@ type KeyValueRow = {key: string; value: string};
             <app-icon size="sm">fact_check</app-icon>
             <span class="drivers-link-text">{{ 'datasources.driversLink' | transloco }}</span>
           </a>
+          <app-icon-button
+            variant="ghost"
+            size="sm"
+            [ariaLabel]="'datasources.refresh' | transloco"
+            [tooltip]="'datasources.refresh' | transloco"
+            [disabled]="isLoading()"
+            (clicked)="refresh()"
+          >
+            <app-icon size="sm">refresh</app-icon>
+          </app-icon-button>
+          <app-button
+            variant="primary"
+            [disabled]="showForm()"
+            (clicked)="openCreateForm()"
+          >
+            {{ 'datasources.new' | transloco }}
+          </app-button>
         </div>
       </div>
 
@@ -1470,7 +1470,7 @@ type KeyValueRow = {key: string; value: string};
                   @if (capabilities.datasourceScopeAutoAttachAvailable()) {
                     <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
                   }
-                  <th>{{ 'datasources.table.colActions' | transloco }}</th>
+                  <th class="col-actions">{{ 'datasources.table.colActions' | transloco }}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1692,9 +1692,14 @@ type KeyValueRow = {key: string; value: string};
                            (a project's knowledge base or cloud folder, a
                            user's own): nobody deletes or re-points it here. -->
                       @if (managedLabelKey(ds); as managedKey) {
-                        <span class="managed-note" data-managed>
-                          <app-icon size="xs">lock</app-icon>
-                          {{ managedKey | transloco }}
+                        <span
+                          class="managed-note"
+                          data-managed
+                          role="img"
+                          [attr.aria-label]="managedKey | transloco"
+                          [title]="managedKey | transloco"
+                        >
+                          <app-icon size="sm">lock</app-icon>
                         </span>
                       }
 
@@ -1810,30 +1815,39 @@ type KeyValueRow = {key: string; value: string};
         display: block;
         height: 100%;
         overflow: hidden;
+        /* The page gutter, the same 1.5rem the other Customize tabs use. */
+        --ds-gutter: 1.5rem;
       }
 
       .ds-container {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, var(--panel-bg));
       }
 
-      /* Header */
+      /* Browsing (no form open): the page scrolls as one, so the header, the
+         cloud card and the filters scroll away and the list gets the whole
+         height. Before, only the table scrolled, in whatever height the blocks
+         above it left over (three rows on a 720px-tall window). With a form
+         open the column stays fixed: the form panel is its own scroll region
+         (see .form-panel). */
+      .ds-container:not(.form-open) {
+        overflow-y: auto;
+      }
+
+      /* Header: the same shape as the other Customize tabs (h1, actions at the
+         right edge, filters on the row below). */
       .header-bar {
         display: flex;
         align-items: center;
         gap: 12px;
-        padding: 10px 12px;
-        background: var(--panel-header-bg);
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        padding: 1rem var(--ds-gutter) 0.75rem;
         flex-shrink: 0;
         flex-wrap: wrap;
       }
 
       .title {
-        font-weight: 600;
-        color: var(--text-primary, var(--text-primary));
+        margin: 0;
       }
 
       /* Thirteen type chips never fit beside the title, so they take their
@@ -1841,7 +1855,7 @@ type KeyValueRow = {key: string; value: string};
          the same shape the Jobs header uses. */
       .filter-chips {
         display: flex;
-        gap: 4px;
+        gap: 6px;
         flex-wrap: wrap;
         order: 1;
         flex-basis: 100%;
@@ -1850,7 +1864,7 @@ type KeyValueRow = {key: string; value: string};
 
       .header-actions {
         display: flex;
-        gap: 6px;
+        gap: 8px;
         margin-left: auto;
         align-items: center;
       }
@@ -1876,14 +1890,29 @@ type KeyValueRow = {key: string; value: string};
         }
       }
 
+      /* Wraps: the six controls need about 1100px in one row, more than the
+         content area has on a laptop with the sidebar open, where a fixed grid
+         pushed the last two selects (and the page) off the right edge. */
       .catalog-filter-bar {
-        display: grid;
-        grid-template-columns: minmax(220px, 1fr) minmax(300px, 1.2fr) repeat(4, minmax(130px, auto));
+        display: flex;
+        flex-wrap: wrap;
         gap: 8px;
-        padding: 8px 12px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-header-bg);
+        padding: 0 var(--ds-gutter) 0.75rem;
         flex-shrink: 0;
+      }
+
+      .catalog-filter-bar > app-input {
+        flex: 1 1 220px;
+        min-width: 0;
+      }
+
+      .catalog-filter-bar > .catalog-project-filter {
+        flex: 1.2 1 300px;
+      }
+
+      .catalog-filter-bar > app-select {
+        flex: 1 1 140px;
+        min-width: 0;
       }
 
       .catalog-project-filter {
@@ -1902,7 +1931,7 @@ type KeyValueRow = {key: string; value: string};
         align-items: center;
         justify-content: space-between;
         padding: 8px 12px;
-        margin: 8px 12px 0;
+        margin: 8px var(--ds-gutter) 0;
         border-radius: var(--radius-control);
         font-size: 12px;
         flex-shrink: 0;
@@ -1928,10 +1957,10 @@ type KeyValueRow = {key: string; value: string};
          the panel take only the space left over and hand the overflow to
          .form-body, keeping the title and the Test/Cancel/Create bar pinned. */
       .form-panel {
-        margin: 8px 12px 0;
+        margin: 8px var(--ds-gutter) 0;
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-surface);
-        background: rgba(0, 0, 0, 0.2);
+        background: var(--panel-bg);
         display: flex;
         flex-direction: column;
         flex: 0 1 auto;
@@ -2225,7 +2254,7 @@ type KeyValueRow = {key: string; value: string};
         cursor: pointer;
       }
 
-      .project-option:hover { background: rgba(255, 255, 255, 0.03); }
+      .project-option:hover { background: var(--hover); }
       .project-option.retained-only { color: var(--warning); }
       .project-option small { margin-left: auto; }
 
@@ -2322,7 +2351,7 @@ type KeyValueRow = {key: string; value: string};
         line-height: 1.4;
         padding: 10px 36px 10px 12px;
         margin: 0;
-        background: rgba(0, 0, 0, 0.25);
+        background: var(--surface-1);
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-tag);
         white-space: pre-wrap;
@@ -2396,8 +2425,26 @@ type KeyValueRow = {key: string; value: string};
         min-height: 0;
       }
 
+      /* Browsing: the page is the scroll box (see .ds-container), so the table
+         keeps its natural height and only scrolls sideways when it must. */
+      .ds-container:not(.form-open) .table-container {
+        flex: none;
+        overflow-x: auto;
+        overflow-y: visible;
+      }
+
       .table-inner {
-        padding: 8px;
+        padding: 0 var(--ds-gutter) 1rem;
+        container-type: inline-size;
+      }
+
+      /* The URL column goes first when the table is short of room: it is masked,
+         truncated and empty for most connector types, and the form shows the
+         full value. Same call the phone layout makes below. */
+      @container (max-width: 1000px) {
+        .col-url {
+          display: none;
+        }
       }
 
       .load-more-row {
@@ -2412,7 +2459,7 @@ type KeyValueRow = {key: string; value: string};
 
       /* Name cell */
       .name-cell {
-        max-width: 200px;
+        min-width: 200px;
       }
 
       .ds-name {
@@ -2421,21 +2468,26 @@ type KeyValueRow = {key: string; value: string};
       }
 
       .ds-desc {
-        display: block;
-        font-size: 10px;
-        color: var(--text-muted);
-        white-space: nowrap;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
         overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 200px;
+        margin-top: 2px;
+        font-size: 11px;
+        line-height: 1.4;
+        color: var(--text-muted);
       }
 
+      /* contain: the row fills the name cell but never sets its width. Its
+         nowrap status text would otherwise claim 360px of table width. */
       .index-status-row {
         display: flex;
         align-items: center;
         gap: 6px;
         margin-top: 5px;
         max-width: 360px;
+        contain: inline-size;
       }
 
       .index-status-detail,
@@ -2473,7 +2525,7 @@ type KeyValueRow = {key: string; value: string};
         width: 64px;
         height: 4px;
         border-radius: var(--radius-tag);
-        background: var(--surface-3, rgba(127, 127, 127, 0.25));
+        background: var(--surface-2);
         overflow: hidden;
       }
 
@@ -2523,11 +2575,10 @@ type KeyValueRow = {key: string; value: string};
       .managed-note {
         display: inline-flex;
         align-items: center;
-        gap: 4px;
-        margin-left: 4px;
-        font-size: 12px;
+        margin-left: 6px;
         color: var(--text-muted);
         vertical-align: middle;
+        cursor: help;
       }
 
       .inline-test.test-ok { color: var(--success); }
@@ -2540,7 +2591,12 @@ type KeyValueRow = {key: string; value: string};
          table so it fits without horizontal scroll (the row actions collapse into a
          ⋯ overflow menu in the template). 768px matches ViewportService.isMobile(). */
       @media (max-width: 768px) {
+        :host {
+          --ds-gutter: 12px;
+        }
+
         .catalog-filter-bar {
+          display: grid;
           grid-template-columns: 1fr 1fr;
         }
 
@@ -2633,6 +2689,18 @@ type KeyValueRow = {key: string; value: string};
           min-height: 20px;
           padding-block: 2px;
           line-height: 1.25;
+        }
+
+        /* The badge's icon costs 20px of a 90px column: without it the longest
+           word of a type label ("Knowledge") stays inside the cell. */
+        .ds-table td:first-child app-badge app-icon {
+          display: none;
+        }
+
+        /* The kebab is the whole 48px actions column. A managed row's menu
+           simply has no edit or delete entry. */
+        .managed-note {
+          display: none;
         }
 
         /* Scope shown inline under the name on mobile (its own column is hidden). */

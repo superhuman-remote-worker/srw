@@ -134,7 +134,7 @@ export function cloudRootDetail(status: CloudRootStatus): {key: string; params?:
       display: flex;
       align-items: flex-start;
       gap: 12px;
-      margin: 0 16px 12px;
+      margin: 0 var(--ds-gutter, 16px) 12px;
       padding: 12px 14px;
       border: 1px solid var(--border-color);
       border-radius: var(--radius-surface);
@@ -151,7 +151,7 @@ export function cloudRootDetail(status: CloudRootStatus): {key: string; params?:
     .cloud-root__link { font-size: 13px; color: var(--accent-color); }
     .cloud-root__actions { flex-shrink: 0; display: flex; gap: 8px; }
     @media (max-width: 640px) {
-      .cloud-root { flex-wrap: wrap; margin: 0 12px 12px; }
+      .cloud-root { flex-wrap: wrap; margin: 0 var(--ds-gutter, 12px) 12px; }
       .cloud-root__actions { width: 100%; }
     }
   `],

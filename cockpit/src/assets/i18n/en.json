@@ -2938,7 +2938,7 @@
     }
   },
   "cloudRoot": {
-    "description": "Your own files in the main cloud: everything you see in Files, project folders you belong to included. Connect it once, and your personal project's sessions mount it at cloud/my_cloud with full access.",
+    "description": "Your own files in the main cloud: everything you see in Files, project folders you belong to included. Sessions in your personal project mount it at cloud/my_cloud with full access.",
     "state": {
       "unsupported": "Not available",
       "not_connected": "Not connected",
@@ -2951,7 +2951,7 @@
       "connected": "Connected.",
       "connectedAs": "Connected as {{account}}.",
       "connecting": "Sign in to your cloud in the tab that opened and allow SRW access. This page updates on its own.",
-      "notConnected": "Connect it once to mount your own files in your personal project's sessions."
+      "notConnected": "Not mounted yet. Connect it once and it stays available."
     },
     "failure": {
       "wrong_account": "That cloud account's e-mail isn't yours. Sign in with your own account and connect again.",
@@ -3462,7 +3462,7 @@
     "title": "Contacts",
     "new": "New contact",
     "search": "Search contacts…",
-    "empty": "No contacts yet. Contacts are people your agents may reach — add one and link it to a project.",
+    "empty": "Contacts are people your agents may reach. Add one and link it to a project.",
     "projectsShort": "proj",
     "primary": "primary",
     "noAddresses": "No addresses",

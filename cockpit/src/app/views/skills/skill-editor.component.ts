@@ -161,8 +161,8 @@ import {
         font-size: 0.85rem;
       }
       .file-tab.active {
-        border-color: var(--primary, #6b7280);
-        background: var(--primary-tint, rgba(107, 114, 128, 0.12));
+        border-color: var(--accent-color);
+        background: color-mix(in srgb, var(--accent-color) 12%, transparent);
       }
       .file-remove {
         margin-top: 0.5rem;

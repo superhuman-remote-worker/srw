@@ -2938,7 +2938,7 @@
     }
   },
   "cloudRoot": {
-    "description": "Deine eigenen Dateien in der Haupt-Cloud: alles, was du in Files siehst, auch die Projektordner, zu denen du gehörst. Einmal verbinden, dann binden die Sessions deines persönlichen Projekts sie unter cloud/my_cloud mit vollem Zugriff ein.",
+    "description": "Deine eigenen Dateien in der Haupt-Cloud: alles, was du in Files siehst, auch die Projektordner, zu denen du gehörst. Die Sessions deines persönlichen Projekts binden sie unter cloud/my_cloud mit vollem Zugriff ein.",
     "state": {
       "unsupported": "Nicht verfügbar",
       "not_connected": "Nicht verbunden",
@@ -2951,7 +2951,7 @@
       "connected": "Verbunden.",
       "connectedAs": "Verbunden als {{account}}.",
       "connecting": "Melde dich im geöffneten Tab bei deiner Cloud an und erlaube SRW den Zugriff. Diese Seite aktualisiert sich von selbst.",
-      "notConnected": "Einmal verbinden, um deine eigenen Dateien in den Sessions deines persönlichen Projekts einzubinden."
+      "notConnected": "Noch nicht eingebunden. Einmal verbinden, dann bleibt sie verfügbar."
     },
     "failure": {
       "wrong_account": "Die E-Mail dieses Cloud-Kontos ist nicht deine. Melde dich mit deinem eigenen Konto an und verbinde erneut.",
@@ -3462,7 +3462,7 @@
     "title": "Kontakte",
     "new": "Neuer Kontakt",
     "search": "Kontakte durchsuchen…",
-    "empty": "Noch keine Kontakte. Kontakte sind Personen, die deine Agenten erreichen dürfen — lege einen an und verknüpfe ihn mit einem Projekt.",
+    "empty": "Kontakte sind Personen, die deine Agenten erreichen dürfen. Lege einen an und verknüpfe ihn mit einem Projekt.",
     "projectsShort": "Proj.",
     "primary": "primär",
     "noAddresses": "Keine Adressen",

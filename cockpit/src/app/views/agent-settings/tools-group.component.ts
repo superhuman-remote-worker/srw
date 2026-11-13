@@ -390,7 +390,7 @@ export function delegationOverride(
       padding: 6px 10px;
       border-radius: var(--radius-control);
       border-left: 2px solid var(--border-color, var(--surface-1));
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--hover);
       font-size: 11px;
       line-height: 1.4;
       color: var(--text-muted);
@@ -423,7 +423,7 @@ export function delegationOverride(
       transition: background 0.15s, border-color 0.15s;
     }
     .tool-toggle:hover:not(.disabled) {
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--hover);
     }
     .tool-toggle.modified {
       border-left-color: var(--accent-color, var(--accent-color));
@@ -489,7 +489,7 @@ export function delegationOverride(
       height: 20px;
       border: none;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
+      background: var(--hover);
       color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
@@ -563,7 +563,7 @@ export function delegationOverride(
       font-weight: 600;
     }
     .tool-additions-btn:hover:not(:disabled) {
-      background: rgba(255, 255, 255, 0.06);
+      background: var(--hover);
     }
     .tool-additions-btn:disabled {
       border-color: var(--border-color, var(--surface-1));
