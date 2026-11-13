@@ -1917,7 +1917,7 @@
       "shareMemoriesDesc": "When enabled, automatic memories from any job in this project are visible to all other jobs.",
       "cloudStorage": "Cloud Storage",
       "folder": "Folder",
-      "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Cloud folders (or chosen for a session).",
+      "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Included with the project (or chosen for a session).",
       "cloudUnavailable": "Cloud storage unavailable — not configured.",
       "cloudFolderFailed": {
         "nameTaken": "This project has no cloud folder: the cloud already has folders with its name and its fallback name. Rename the project; SRW retries when it is opened, at most once an hour.",

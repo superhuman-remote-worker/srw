@@ -1009,8 +1009,13 @@ describe('ProjectDetailPageComponent cloud storage settings', () => {
     const {component} = createComponent();
     expect('toggleCloudReadOnly' in component).toBe(false);
     expect('settingsCloudReadOnly' in component).toBe(false);
-    expect(en.projectDetail.settings.cloudAccessHint).toContain('Cloud folders');
-    expect(de.projectDetail.settings.cloudAccessHint).toBeTruthy();
+    // The hint names the group of the Connectors tab that holds the level.
+    expect(en.projectDetail.settings.cloudAccessHint).toContain(
+      en.projectDetail.datasources.groups.included.title,
+    );
+    expect(de.projectDetail.settings.cloudAccessHint).toContain(
+      de.projectDetail.datasources.groups.included.title,
+    );
     expect('readOnlyAgent' in en.projectDetail.settings).toBe(false);
   });
 

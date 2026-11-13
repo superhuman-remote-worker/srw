@@ -1917,7 +1917,7 @@
       "shareMemoriesDesc": "Wenn aktiviert, sind automatische Erinnerungen aus beliebigen Aufträgen dieses Projekts für alle anderen Aufträge sichtbar.",
       "cloudStorage": "Cloud-Speicher",
       "folder": "Ordner",
-      "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Cloud-Ordner (oder der für eine Session gewählten).",
+      "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Im Projekt enthalten (oder der für eine Session gewählten).",
       "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
       "cloudFolderFailed": {
         "nameTaken": "Dieses Projekt hat keinen Cloud-Ordner: In der Cloud gibt es schon Ordner mit seinem Namen und seinem Ausweichnamen. Benennen Sie das Projekt um; SRW versucht es erneut, wenn es geöffnet wird, höchstens einmal pro Stunde.",
