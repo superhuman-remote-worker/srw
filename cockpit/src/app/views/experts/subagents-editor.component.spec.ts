@@ -334,3 +334,75 @@ describe('SubagentsEditorComponent', () => {
     expect(editor.getValue()).toEqual({future_key: 1});
   });
 });
+
+describe('SubagentsEditorComponent: one line per subagent', () => {
+  const ROSTER: SubagentsConfig = {
+    default: 'explorer',
+    roster: {
+      explorer: {$ref: 'subagents/explorer'},
+      scratch: {description: 'Small inline helper', llm: {model: 'inherit'}},
+    },
+  };
+
+  it('loads a stored roster collapsed and opens a newly added entry', () => {
+    const {editor} = createEditor();
+    editor.prefill(ROSTER);
+    const [explorer, scratch] = editor.entries();
+
+    expect(editor.isOpen(explorer.key)).toBe(false);
+    expect(editor.isOpen(scratch.key)).toBe(false);
+
+    editor.add();
+    const added = editor.entries()[2];
+    // All blanks: its name is invalid, and it is the one being written.
+    expect(editor.isOpen(added.key)).toBe(true);
+    expect(editor.isOpen(explorer.key)).toBe(false);
+  });
+
+  it('toggles an entry open and closed', () => {
+    const {editor} = createEditor();
+    editor.prefill(ROSTER);
+    const key = editor.entries()[0].key;
+
+    editor.toggle(key);
+    expect(editor.isOpen(key)).toBe(true);
+    editor.toggle(key);
+    expect(editor.isOpen(key)).toBe(false);
+  });
+
+  it('keeps an entry with a problem open: its message is inside', () => {
+    const {editor} = createEditor();
+    editor.prefill(ROSTER);
+    const key = editor.entries()[1].key;
+    expect(editor.isOpen(key)).toBe(false);
+
+    editor.patch(key, {extraText: '{nope'});
+    expect(editor.isOpen(key)).toBe(true);
+    // Closing it by hand cannot hide the message.
+    editor.toggle(key);
+    editor.toggle(key);
+    expect(editor.isOpen(key)).toBe(true);
+
+    editor.patch(key, {extraText: ''});
+    expect(editor.isOpen(key)).toBe(false);
+  });
+
+  it('collapses everything again when another roster is loaded', () => {
+    const {editor} = createEditor();
+    editor.prefill(ROSTER);
+    editor.toggle(editor.entries()[0].key);
+
+    editor.prefill(ROSTER);
+    expect(editor.entries().every((d) => !editor.isOpen(d.key))).toBe(true);
+  });
+
+  it("names a referenced expert by its display name on the summary line, the raw $ref until the list knows it", () => {
+    const {editor} = createEditor();
+    expect(editor.referenceLabel('subagents/explorer')).toBe('subagents/explorer');
+    expect(editor.referenceLabel('')).toBe('');
+
+    editor.prefill(ROSTER); // a reference entry loads the library
+    expect(editor.referenceLabel('subagents/explorer')).toBe('Explorer');
+    expect(editor.referenceLabel('subagents/unknown')).toBe('subagents/unknown');
+  });
+});

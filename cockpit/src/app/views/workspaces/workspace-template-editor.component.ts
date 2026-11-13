@@ -11,7 +11,7 @@ import {
 } from '../../core/models/workspace-template.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppDialogComponent} from '../../ui/dialog';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {EditorHeaderComponent} from '../../shell/editor-header/editor-header.component';
 import {ScopeOption, WorkspaceTemplateFormComponent} from './workspace-template-form.component';
 import {
   FormField, PreservedParts, TemplateFormValue, canEditItem, duplicateValue, emptyFormValue, errorField,
@@ -29,15 +29,26 @@ const NO_PRESERVED: PreservedParts = {metadata: {}, spec: {}, hasAny: false};
 @Component({
   selector: 'app-workspace-template-editor',
   standalone: true,
-  imports: [TranslocoPipe, AppButtonComponent, AppDialogComponent, SidebarToggleComponent, WorkspaceTemplateFormComponent],
+  imports: [TranslocoPipe, AppButtonComponent, AppDialogComponent, EditorHeaderComponent, WorkspaceTemplateFormComponent],
   template: `
-    <div class="editor">
-      <header class="head">
-        <app-sidebar-toggle />
-        <h1>{{ (isNew() ? 'workspaces.editor.newTitle' : 'workspaces.editor.editTitle') | transloco }}</h1>
-        <app-button variant="ghost" size="sm" (clicked)="back()">{{ 'workspaces.editor.back' | transloco }}</app-button>
-      </header>
+    <!-- The same top edge as the expert and skill editors: back to the list,
+         the template's name, the actions, and a save error where it stays in
+         view. -->
+    <app-editor-header [heading]="heading()" [backLabel]="'workspaces.list.title' | transloco" backLink="/workspaces">
+      <div editorActions class="head-actions">
+        @if (!isNew()) {
+          <app-button variant="secondary" (clicked)="duplicate()">{{ 'workspaces.editor.duplicate' | transloco }}</app-button>
+        }
+        @if (!readOnly()) {
+          <app-button variant="primary" [loading]="saving()" (clicked)="save()">{{ 'common.save' | transloco }}</app-button>
+        }
+      </div>
+      @if (errorMessage()) {
+        <div editorAlert class="banner err" role="alert">{{ errorMessage() }}</div>
+      }
+    </app-editor-header>
 
+    <div class="editor">
       @if (isBuiltin()) {
         <div class="banner info">{{ 'workspaces.editor.builtin' | transloco }}</div>
       } @else if (readOnly()) {
@@ -53,7 +64,6 @@ const NO_PRESERVED: PreservedParts = {metadata: {}, spec: {}, hasAny: false};
           }
         </div>
       }
-      @if (errorMessage()) { <div class="banner err" role="alert">{{ errorMessage() }}</div> }
       @if (savedMessage()) { <div class="banner ok">{{ savedMessage() }}</div> }
 
       <section class="card">
@@ -64,18 +74,12 @@ const NO_PRESERVED: PreservedParts = {metadata: {}, spec: {}, hasAny: false};
           [preservedNotice]="preserved().hasAny" [serverErrors]="fieldErrors()" [showErrors]="showErrors()" />
       </section>
 
-      <footer class="actions">
-        @if (!isNew() && !readOnly()) {
+      <!-- Delete stays down here, away from Save. -->
+      @if (!isNew() && !readOnly()) {
+        <footer class="actions">
           <app-button variant="danger" (clicked)="confirmDelete.set(true)">{{ 'common.delete' | transloco }}</app-button>
-        }
-        <span class="spacer"></span>
-        @if (!isNew()) {
-          <app-button variant="secondary" (clicked)="duplicate()">{{ 'workspaces.editor.duplicate' | transloco }}</app-button>
-        }
-        @if (!readOnly()) {
-          <app-button variant="primary" [loading]="saving()" (clicked)="save()">{{ 'common.save' | transloco }}</app-button>
-        }
-      </footer>
+        </footer>
+      }
 
       <app-dialog [open]="confirmDelete()" [title]="'workspaces.editor.deleteTitle' | transloco" (closed)="confirmDelete.set(false)">
         <p>{{ 'workspaces.editor.deleteBody' | transloco: {name: value().name} }}</p>
@@ -87,14 +91,14 @@ const NO_PRESERVED: PreservedParts = {metadata: {}, spec: {}, hasAny: false};
     </div>
   `,
   styles: [`
-    :host { display: block; height: 100%; overflow-y: auto; }
-    .editor { padding: 1rem 1.5rem; max-width: 900px; margin: 0 auto; }
-    .head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
-    .head h1 { flex: 1; margin: 0; }
-    .card { background: var(--panel-bg); border: 1px solid var(--border-color); padding: 1rem; border-radius: var(--radius-surface, 8px); margin-bottom: 1rem; }
+    :host { display: block; height: 100%; overflow-y: auto; --editor-width: 920px; }
+    .editor { padding: 1rem 1.5rem 3rem; max-width: var(--editor-width); margin: 0 auto; }
+    .head-actions { display: flex; gap: 0.5rem; }
+    .card { background: var(--panel-bg); border: 1px solid var(--border-hairline); padding: 1.25rem; border-radius: var(--radius-surface, 8px); margin-bottom: 1rem; }
     .actions { display: flex; gap: 0.5rem; align-items: center; }
-    .spacer { flex: 1; }
-    .banner { margin-bottom: 1rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-control); display: flex; gap: 0.75rem; align-items: center; }
+    .banner { margin-bottom: 1rem; padding: 0.5rem 0.75rem; border-radius: var(--radius-control); display: flex; gap: 0.75rem; align-items: center; font-size: 0.875rem; }
+    app-editor-header .banner { margin-bottom: 0; }
+    @media (max-width: 640px) { .editor { padding: 0.75rem 1rem 3rem; } .card { padding: 1rem; } }
     .banner.ok { background: var(--success-tint); color: var(--success); }
     .banner.err { background: var(--danger-tint); color: var(--danger); }
     .banner.info { background: var(--info-tint); color: var(--text-primary); }
@@ -123,6 +127,12 @@ export class WorkspaceTemplateEditorComponent implements OnInit {
   readonly confirmDelete = signal(false);
 
   readonly isNew = computed(() => this.item() === null);
+  /** The page title: the template's own name once it has one. */
+  readonly heading = computed(() => {
+    if (this.isNew()) return this.transloco.translate('workspaces.editor.newTitle');
+    const value = this.value();
+    return value.displayName.trim() || value.name || this.transloco.translate('workspaces.editor.editTitle');
+  });
   readonly isBuiltin = computed(() => !!this.item()?.installationManaged);
   readonly readOnly = computed(() => {
     const item = this.item();
@@ -248,10 +258,6 @@ export class WorkspaceTemplateEditorComponent implements OnInit {
     const doc = this.item()!.resource;
     const state: WorkspaceEditorNavigationState = {duplicateOf: doc};
     void this.router.navigate(['/workspaces/new'], {state});
-  }
-
-  back(): void {
-    void this.router.navigate(['/workspaces']);
   }
 
   private handleError(err: unknown, fallbackKey: string): void {

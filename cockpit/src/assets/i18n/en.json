@@ -2758,11 +2758,80 @@
     "saveFailed": "Save failed",
     "invalidJson": "Invalid JSON file",
     "view": "View",
-    "back": "Back",
     "readonlyNotice": "You can't edit this expert. Duplicate it to get an editable copy.",
     "duplicateToEdit": "Duplicate to edit",
     "duplicateFailed": "Duplicate failed",
     "loadFailed": "Couldn't load this expert: {{detail}}",
+    "editor": {
+      "profile": "Profile",
+      "readOnly": "Read-only",
+      "displayName": "Name",
+      "type": "Type",
+      "typeHint": "Can't be changed later.",
+      "typeWorker": "Worker (runs jobs)",
+      "typeSession": "Session (interactive chat)",
+      "description": "Description",
+      "descriptionHint": "One line, shown where people pick an expert.",
+      "id": "ID",
+      "idHint": "Lowercase letters, digits, hyphens and underscores. Can't be changed later.",
+      "tags": "Tags",
+      "tagsHint": "Comma separated, for your own filtering.",
+      "listedFor": "Listed for",
+      "listedForHint": "Which pickers list this expert. It stays usable in every role either way.",
+      "icon": "Icon",
+      "color": "Color",
+      "iconName": "Icon name (Material Symbols)",
+      "colorHex": "Color (hex)",
+      "persona": "Persona",
+      "personaHint": "Who this expert is and how it works. Plain prose; it becomes part of the system prompt.",
+      "personaPlaceholder": "You are a careful reviewer who…",
+      "instructions": "Instructions",
+      "optional": "optional",
+      "instructionsHint": "Standing instructions, placed in the job's workspace as instructions.md. Leave empty to use the framework default.",
+      "more": "More",
+      "moreSet": "{{n}} set",
+      "summarization": "Summarization prompt",
+      "summarizationHint": "Replaces the prompt used when older conversation is summarized to free up context. Leave empty to use the framework default.",
+      "summarizationPlaceholder": "Framework default",
+      "otherKeys": "Other config keys (JSON)",
+      "otherKeysHint": "Config keys the controls above don't cover, such as instruction_files. Credential sections are rejected on save.",
+      "sections": {
+        "persona": {
+          "title": "Persona and instructions"
+        },
+        "tools": {
+          "title": "Tools"
+        },
+        "defaults": {
+          "titleJob": "Job defaults",
+          "titleSession": "Session defaults",
+          "hintJob": "What a job gets when it runs with this expert, unless the job says otherwise.",
+          "hintSession": "What a session gets when it starts with this expert, unless the session says otherwise."
+        },
+        "advanced": {
+          "title": "Advanced"
+        }
+      },
+      "summary": {
+        "promptsEmpty": "Not written yet",
+        "persona": "Persona, {{words}} words",
+        "personaNone": "No persona",
+        "instructions": "instructions, {{words}} words",
+        "summarization": "own summarization prompt",
+        "subagentModel": "subagents on {{model}}",
+        "tools": "{{groups}} tool groups on, {{tools}} tools",
+        "toolsNoCount": "{{groups}} tool groups on",
+        "subagentsNone": "None",
+        "subagentsMore": "{{names}} and {{n}} more",
+        "autonomy": "Autonomy: {{value}}",
+        "permission": "Permissions: {{value}}",
+        "workspace": "{{value}} workspace",
+        "scholar": "scholar on",
+        "critic": "critic on",
+        "advancedSet": "{{n}} set by this expert",
+        "advancedDefaults": "Framework defaults"
+      }
+    },
     "model": {
       "title": "Model",
       "model": "Model",
@@ -2771,17 +2840,17 @@
       "subagentHint": "Roster-wide default for subagents — every entry without a model of its own runs on it; unset means they inherit this expert's model."
     },
     "tags": {
-      "title": "Tags",
-      "hint": "Role tags decide which pickers list this expert — every expert stays usable in every role. Other tags are free text for your own filtering.",
-      "roles": "Roles",
       "roleLocked": "{{role}} — this expert's type, always on",
-      "free": "Other tags (comma separated)",
       "freePlaceholder": "research, academic"
     },
     "subagents": {
       "title": "Subagents",
       "hint": "The roster this expert may delegate to: small inline experts, or references to any other expert (a referenced expert's workspace, autonomy and verification settings are ignored when it runs as a subagent). The name is the subagent_type the parent passes to delegate_agent.",
       "empty": "No roster entries yet.",
+      "unnamed": "Unnamed",
+      "kindInlineShort": "Inline",
+      "kindReferenceShort": "Reference",
+      "needsAttention": "Needs attention",
       "add": "Add subagent",
       "remove": "Remove subagent",
       "name": "Name",
@@ -2911,7 +2980,6 @@
     "editor": {
       "newTitle": "New workspace template",
       "editTitle": "Workspace template",
-      "back": "All workspaces",
       "builtin": "Built-in template, managed by the installation. Duplicate it to make your own.",
       "notEditable": "You can't edit this template. Duplicate it to make your own.",
       "duplicate": "Duplicate",

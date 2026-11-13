@@ -2758,11 +2758,80 @@
     "saveFailed": "Speichern fehlgeschlagen",
     "invalidJson": "Ungültige JSON-Datei",
     "view": "Ansehen",
-    "back": "Zurück",
     "readonlyNotice": "Sie können diesen Experten nicht bearbeiten. Duplizieren Sie ihn, um eine bearbeitbare Kopie zu erhalten.",
     "duplicateToEdit": "Zum Bearbeiten duplizieren",
     "duplicateFailed": "Duplizieren fehlgeschlagen",
     "loadFailed": "Experte konnte nicht geladen werden: {{detail}}",
+    "editor": {
+      "profile": "Profil",
+      "readOnly": "Schreibgeschützt",
+      "displayName": "Name",
+      "type": "Typ",
+      "typeHint": "Später nicht änderbar.",
+      "typeWorker": "Worker (führt Jobs aus)",
+      "typeSession": "Session (interaktiver Chat)",
+      "description": "Beschreibung",
+      "descriptionHint": "Eine Zeile, sichtbar bei der Auswahl eines Experten.",
+      "id": "ID",
+      "idHint": "Kleinbuchstaben, Ziffern, Binde- und Unterstriche. Später nicht änderbar.",
+      "tags": "Tags",
+      "tagsHint": "Durch Komma getrennt, zum eigenen Filtern.",
+      "listedFor": "Aufgeführt für",
+      "listedForHint": "In welchen Auswahllisten dieser Experte erscheint. Nutzbar bleibt er in jeder Rolle.",
+      "icon": "Icon",
+      "color": "Farbe",
+      "iconName": "Icon-Name (Material Symbols)",
+      "colorHex": "Farbe (Hex)",
+      "persona": "Persona",
+      "personaHint": "Wer dieser Experte ist und wie er arbeitet. Fließtext; er wird Teil des System-Prompts.",
+      "personaPlaceholder": "Du bist ein sorgfältiger Reviewer, der …",
+      "instructions": "Anweisungen",
+      "optional": "optional",
+      "instructionsHint": "Dauerhafte Anweisungen, im Workspace des Jobs als instructions.md abgelegt. Leer lassen für den Framework-Standard.",
+      "more": "Mehr",
+      "moreSet": "{{n}} gesetzt",
+      "summarization": "Prompt für Zusammenfassungen",
+      "summarizationHint": "Ersetzt den Prompt, mit dem ältere Gesprächsteile zusammengefasst werden, um Kontext freizugeben. Leer lassen für den Framework-Standard.",
+      "summarizationPlaceholder": "Framework-Standard",
+      "otherKeys": "Weitere Config-Keys (JSON)",
+      "otherKeysHint": "Config-Keys, die die Felder oben nicht abdecken, etwa instruction_files. Abschnitte mit Zugangsdaten werden beim Speichern abgelehnt.",
+      "sections": {
+        "persona": {
+          "title": "Persona und Anweisungen"
+        },
+        "tools": {
+          "title": "Tools"
+        },
+        "defaults": {
+          "titleJob": "Job-Standards",
+          "titleSession": "Session-Standards",
+          "hintJob": "Was ein Job mit diesem Experten erhält, solange der Job nichts anderes festlegt.",
+          "hintSession": "Was eine Session mit diesem Experten erhält, solange die Session nichts anderes festlegt."
+        },
+        "advanced": {
+          "title": "Erweitert"
+        }
+      },
+      "summary": {
+        "promptsEmpty": "Noch nicht geschrieben",
+        "persona": "Persona, {{words}} Wörter",
+        "personaNone": "Keine Persona",
+        "instructions": "Anweisungen, {{words}} Wörter",
+        "summarization": "eigener Prompt für Zusammenfassungen",
+        "subagentModel": "Subagenten auf {{model}}",
+        "tools": "{{groups}} Tool-Gruppen aktiv, {{tools}} Tools",
+        "toolsNoCount": "{{groups}} Tool-Gruppen aktiv",
+        "subagentsNone": "Keine",
+        "subagentsMore": "{{names}} und {{n}} weitere",
+        "autonomy": "Autonomie: {{value}}",
+        "permission": "Berechtigungen: {{value}}",
+        "workspace": "Workspace: {{value}}",
+        "scholar": "Scholar aktiv",
+        "critic": "Critic aktiv",
+        "advancedSet": "{{n}} von diesem Experten gesetzt",
+        "advancedDefaults": "Framework-Standards"
+      }
+    },
     "model": {
       "title": "Modell",
       "model": "Modell",
@@ -2771,17 +2840,17 @@
       "subagentHint": "Standard für alle Subagenten — jeder Eintrag ohne eigenes Modell läuft darauf; ohne Auswahl übernehmen sie das Modell dieses Experten."
     },
     "tags": {
-      "title": "Tags",
-      "hint": "Rollen-Tags bestimmen, in welchen Auswahllisten dieser Experte erscheint — jeder Experte bleibt in jeder Rolle nutzbar. Weitere Tags sind Freitext zum eigenen Filtern.",
-      "roles": "Rollen",
       "roleLocked": "{{role}} — Typ dieses Experten, immer aktiv",
-      "free": "Weitere Tags (durch Komma getrennt)",
       "freePlaceholder": "research, academic"
     },
     "subagents": {
       "title": "Subagenten",
       "hint": "Die Riege, an die dieser Experte delegieren darf: kleine Inline-Experten oder Verweise auf beliebige andere Experten (Workspace-, Autonomie- und Prüfeinstellungen eines verwiesenen Experten werden als Subagent ignoriert). Der Name ist der subagent_type, den der Eltern-Agent an delegate_agent übergibt.",
       "empty": "Noch keine Einträge.",
+      "unnamed": "Ohne Namen",
+      "kindInlineShort": "Inline",
+      "kindReferenceShort": "Verweis",
+      "needsAttention": "Braucht Aufmerksamkeit",
       "add": "Subagent hinzufügen",
       "remove": "Subagent entfernen",
       "name": "Name",
@@ -2911,7 +2980,6 @@
     "editor": {
       "newTitle": "Neue Workspace-Vorlage",
       "editTitle": "Workspace-Vorlage",
-      "back": "Alle Workspaces",
       "builtin": "Eingebaute Vorlage, von der Installation verwaltet. Duplizieren Sie sie für eine eigene.",
       "notEditable": "Sie können diese Vorlage nicht bearbeiten. Duplizieren Sie sie für eine eigene.",
       "duplicate": "Duplizieren",

@@ -63,6 +63,75 @@ function create(data: Record<string, unknown> = {}) {
   return fixture;
 }
 
+describe('ExpertEditorComponent page shell', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getExpertSource.mockReturnValue(of(structuredClone(SOURCE)));
+  });
+
+  it('offers Cancel and Save in the header on an editable expert, and titles the page with its name', () => {
+    const fixture = create();
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+
+    expect(fixture.componentInstance.heading()).toBe('Design Studio (copy)');
+    const buttons = Array.from(el.querySelectorAll('[editorActions] app-button')).map((b) => b.textContent?.trim());
+    expect(buttons).toEqual(['Cancel', 'Save']);
+    expect(el.querySelector('footer')).toBeNull();
+  });
+
+  it('shows a save error in the header, which stays in view, not at the foot of the form', () => {
+    const fixture = create();
+    const editor = fixture.componentInstance;
+    editor.form.configText = '{nope';
+    editor.save();
+    fixture.detectChanges();
+
+    const alert = (fixture.nativeElement as HTMLElement).querySelector('app-editor-header [editorAlert]');
+    expect(alert?.textContent).toContain('Config:');
+    expect(alert?.getAttribute('role')).toBe('alert');
+    expect(api.updateExpert).not.toHaveBeenCalled();
+  });
+
+  it('keeps every section mounted while it is closed, so save still reads its controls', () => {
+    const fixture = create();
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+
+    // Six sections, one of them open; the groups sit inside the closed ones.
+    expect(el.querySelectorAll('app-expander').length).toBe(6);
+    for (const tag of ['app-tools-group', 'app-subagents-editor', 'app-execution-group', 'app-advanced-accordion']) {
+      expect(el.querySelector(`app-expander ${tag}`), tag).not.toBeNull();
+    }
+  });
+
+  it('summarises the prompts for the closed section', () => {
+    const editor = create().componentInstance;
+
+    expect(editor.personaSummary()).toBe('Persona, 2 words');
+    editor.form.instructions = 'Always write the test first.';
+    editor.form.summarization = 'Keep decisions.';
+    expect(editor.personaSummary()).toBe('Persona, 2 words · instructions, 5 words · own summarization prompt');
+    editor.form.persona = '';
+    editor.form.instructions = '';
+    editor.form.summarization = '';
+    expect(editor.personaSummary()).toBe('Not written yet');
+  });
+
+  it('counts the keys only the JSON field carries as settings the expert sets', () => {
+    const editor = create().componentInstance;
+
+    // SOURCE: instruction_files is not owned by a control, so it is in the JSON field.
+    expect(editor.advancedSummary()).toBe('1 set by this expert');
+    editor.form.configText = '';
+    expect(editor.advancedSummary()).toBe('Framework defaults');
+  });
+});
+
 describe('ExpertEditorComponent loading a stored expert', () => {
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
@@ -107,10 +176,13 @@ describe('ExpertEditorComponent loading a stored expert', () => {
     const el = fixture.nativeElement as HTMLElement;
     const editor = fixture.componentInstance;
 
-    expect(el.querySelector('h1')?.textContent?.trim()).toBe('View');
+    // The page is titled with the expert's own name; the header's back link
+    // is the way out, so the only action is the one that makes it editable.
+    expect(editor.heading()).toBe('Design Studio (copy)');
+    expect(el.querySelector('[editorBadges]')?.textContent).toContain('Read-only');
     expect(editor.form.persona).toBe('<role>Design collaborator</role>');
-    const buttons = Array.from(el.querySelectorAll('footer app-button')).map((b) => b.textContent?.trim());
-    expect(buttons).toEqual(['Back', 'Duplicate to edit']);
+    const buttons = Array.from(el.querySelectorAll('[editorActions] app-button')).map((b) => b.textContent?.trim());
+    expect(buttons).toEqual(['Duplicate to edit']);
 
     editor.save();
     expect(api.updateExpert).not.toHaveBeenCalled();

@@ -1,5 +1,4 @@
 import {Component, computed, effect, inject, OnInit, signal, viewChild} from '@angular/core';
-import {FormsModule} from '@angular/forms';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
@@ -22,7 +21,9 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppIconComponent} from '../../ui/icon';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {AppBadgeComponent} from '../../ui/badge';
+import {AppExpanderComponent} from '../../ui/expander';
+import {EditorHeaderComponent} from '../../shell/editor-header/editor-header.component';
 import {ExecutionGroupComponent} from '../agent-settings/execution-group.component';
 import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {AdvancedAccordionComponent} from '../agent-settings/advanced-accordion.component';
@@ -252,6 +253,35 @@ export function expertEditorHeadingKey(readOnly: boolean, isEdit: boolean): stri
   return isEdit ? 'experts.edit' : 'experts.new';
 }
 
+/**
+ * Suggested looks for an expert. Any Material Symbols name and any hex colour
+ * still work through the two small fields under the choices: these only save
+ * the author from knowing icon names by heart.
+ */
+export const EXPERT_ICON_CHOICES: readonly string[] = [
+  'smart_toy', 'code', 'terminal', 'bug_report', 'science', 'travel_explore',
+  'lightbulb', 'menu_book', 'edit_note', 'palette', 'fact_check', 'gavel',
+  'shield', 'support_agent', 'engineering', 'build', 'rate_review', 'radar',
+];
+
+/** The bundled experts' palette, plus the neutral default. */
+export const EXPERT_COLOR_CHOICES: readonly string[] = [
+  '#89b4fa', '#89dceb', '#94e2d5', '#a6e3a1', '#f9e2af',
+  '#fab387', '#f38ba8', '#f5c2e7', '#cba6f7', '#6B7280',
+];
+
+/** How many settings a config fragment sets: its leaves (a list is one). */
+export function countLeaves(value: unknown): number {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return 1;
+  return Object.values(value).reduce<number>((n, child) => n + countLeaves(child), 0);
+}
+
+/** Words in a prompt, for a section summary. */
+export function wordCount(text: string): number {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
 interface EditorForm {
   name: string;
   display_name: string;
@@ -275,235 +305,43 @@ interface EditorForm {
   selector: 'app-expert-editor',
   standalone: true,
   imports: [
-    FormsModule,
     TranslocoPipe,
+    AppBadgeComponent,
     AppButtonComponent,
     AppChipComponent,
+    AppExpanderComponent,
     AppInputComponent,
     AppTextareaComponent,
     AppSelectComponent,
     AppFormFieldComponent,
     AppIconComponent,
-    SidebarToggleComponent,
+    EditorHeaderComponent,
     ExecutionGroupComponent,
     ToolsGroupComponent,
     AdvancedAccordionComponent,
     SubagentsEditorComponent,
   ],
   template: `
-    <div class="editor">
-      <header class="head">
-        <!-- Full-page route (no page shell), so carry the mobile sidebar toggle
-             here too — otherwise the off-canvas nav is unreachable on mobile.
-             Renders nothing on desktop (sidebar always expanded). -->
-        <app-sidebar-toggle />
-        <h1>{{ headingKey() | transloco }}</h1>
-      </header>
-
-      @if (forkNotice()) {
-        <div class="banner info">{{ forkNotice() }}</div>
+    <app-editor-header
+      [heading]="heading()"
+      [backLabel]="'experts.title' | transloco"
+      backLink="/experts"
+    >
+      @if (isEdit()) {
+        <span editorIcon class="title-icon" [style.color]="form.color" aria-hidden="true">
+          <app-icon size="lg">{{ form.icon || 'smart_toy' }}</app-icon>
+        </span>
       }
-      @if (readOnly()) {
-        <div class="banner info">{{ 'experts.readonlyNotice' | transloco }}</div>
+      @if (isEdit()) {
+        <span editorBadges class="title-badges">
+          <app-badge class="type-badge" tone="neutral">{{ form.expert_type }}</app-badge>
+          @if (readOnly()) {
+            <app-badge tone="info" [title]="'experts.readonlyNotice' | transloco">{{ 'experts.editor.readOnly' | transloco }}</app-badge>
+          }
+        </span>
       }
-      @if (loadError()) {
-        <div class="banner err">{{ loadError() }}</div>
-      }
-
-      <section class="card">
-        <app-form-field label="Display name" [required]="true">
-          <app-input [value]="form.display_name" [readonly]="readOnly()" (valueChange)="onDisplayName($event)" />
-        </app-form-field>
-        <app-form-field label="Name (slug)" [required]="true" hint="lowercase; immutable after create">
-          <app-input [value]="form.name" [disabled]="isEdit()" (valueChange)="onNameEdit($event)" />
-        </app-form-field>
-        <app-form-field label="Type" [required]="true">
-          <app-select [value]="form.expert_type" [disabled]="isEdit()" (valueChange)="onTypeChange($event)">
-            <option value="worker">worker</option>
-            <option value="session">session</option>
-          </app-select>
-        </app-form-field>
-        <app-form-field label="Description">
-          <app-input [value]="form.description" [readonly]="readOnly()" (valueChange)="form.description = $event" />
-        </app-form-field>
-        <div class="row">
-          <app-form-field label="Icon (Material Symbol)">
-            <app-input [value]="form.icon" [readonly]="readOnly()" (valueChange)="form.icon = $event" placeholder="smart_toy" />
-          </app-form-field>
-          <app-icon size="xl" [style.color]="form.color">{{ form.icon || 'smart_toy' }}</app-icon>
-          <app-form-field label="Color (hex)">
-            <app-input [value]="form.color" [readonly]="readOnly()" (valueChange)="form.color = $event" placeholder="#6B7280" />
-          </app-form-field>
-        </div>
-      </section>
-
-      <!-- Tags: role chips (the expert's own type locked on) + free text. A
-           soft UI filter — every expert stays usable in every role (U1 D4). -->
-      <section class="card">
-        <h2>{{ 'experts.tags.title' | transloco }}</h2>
-        <p class="hint">{{ 'experts.tags.hint' | transloco }}</p>
-        <app-form-field [label]="'experts.tags.roles' | transloco">
-          <div class="role-chips">
-            @for (role of expertRoles; track role) {
-              <app-chip
-                [selected]="hasRoleTag(role)"
-                [disabled]="readOnly() || role === form.expert_type"
-                [ariaLabel]="role === form.expert_type ? ('experts.tags.roleLocked' | transloco: {role}) : role"
-                (clicked)="toggleRoleTag(role)"
-              >{{ role }}</app-chip>
-            }
-          </div>
-        </app-form-field>
-        <app-form-field [label]="'experts.tags.free' | transloco">
-          <app-input
-            [value]="form.tags"
-            [readonly]="readOnly()"
-            [placeholder]="'experts.tags.freePlaceholder' | transloco"
-            (valueChange)="form.tags = $event"
-          />
-        </app-form-field>
-      </section>
-
-      <section class="card">
-        <h2>Persona</h2>
-        <app-textarea
-          [value]="form.persona"
-          [rows]="8"
-          [readonly]="readOnly()"
-          (valueChange)="form.persona = $event"
-          placeholder="The expert's persona / system style…"
-        />
-        <h2>Instructions (optional)</h2>
-        <app-textarea
-          [value]="form.instructions"
-          [rows]="5"
-          [readonly]="readOnly()"
-          (valueChange)="form.instructions = $event"
-        />
-      </section>
-
-      <section class="card">
-        <h2>Summarization prompt (advanced)</h2>
-        <p class="hint">
-          Replaces the prompt used when older conversation is summarized to
-          free up context. Leave it empty to inherit the framework default.
-        </p>
-        <app-textarea
-          [value]="form.summarization"
-          [rows]="5"
-          [readonly]="readOnly()"
-          (valueChange)="form.summarization = $event"
-          placeholder="Inherit framework default…"
-        />
-      </section>
-
-      <!-- Structured config: reuses the launch-flow groups. [config] = base ⊕ fragment
-           drives "default: X" displays; getOverrides() + the model selects feed the
-           saved config (see save()). -->
-      <section class="card">
-        <h2>Execution</h2>
-        <app-execution-group
-          [config]="baseForGroups()"
-          [mode]="mode()"
-          [disabled]="readOnly()"
-          [showProjectMemory]="false"
-          [gatedCapabilities]="gatedCapabilities()"
-          [catalog]="catalog()"
-          [workspaceBackendLabel]="'agentSettings.execution.workspaceRecommended'"
-        />
-      </section>
-
-      <!-- ONE model since U1 (llm.model, worker and session alike) plus, for a
-           worker expert, the roster-wide subagent model (subagents.llm.model). -->
-      <section class="card">
-        <h2>{{ 'experts.model.title' | transloco }}</h2>
-        <label class="ml">{{ 'experts.model.model' | transloco }}
-          <select class="model-select" [disabled]="readOnly() || isModelGated()" [ngModel]="form.model" (ngModelChange)="form.model = $event">
-            <option [ngValue]="''">{{ baseDefaultLabel('model') }}</option>
-            @for (g of models(); track g.group) {
-              <optgroup [label]="g.group">
-                @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ modelLabel(g, m) }}</option> }
-              </optgroup>
-            }
-          </select>
-        </label>
-        @if (mode() === 'job') {
-          <label class="ml">{{ 'experts.model.subagent' | transloco }}
-            <select class="model-select" [disabled]="readOnly() || isModelGated()" [ngModel]="form.subagentModel" (ngModelChange)="form.subagentModel = $event">
-              <option [ngValue]="''">{{ baseDefaultLabel('subagent') }}</option>
-              @for (g of models(); track g.group) {
-                <optgroup [label]="g.group">
-                  @for (m of g.models; track m) { <option [ngValue]="m" [disabled]="!modelAllowed(m)">{{ modelLabel(g, m) }}</option> }
-                </optgroup>
-              }
-            </select>
-          </label>
-          <p class="hint">{{ 'experts.model.subagentHint' | transloco }}</p>
-        }
-        @if (isModelGated()) {
-          <small class="lock-hint">🔒 {{ 'grants.locked.model_selection' | transloco }}</small>
-        }
-      </section>
-
-      <!-- The subagent roster (config.subagents.default / .roster). -->
-      <section class="card">
-        <h2>{{ 'experts.subagents.title' | transloco }}</h2>
-        <p class="hint">{{ 'experts.subagents.hint' | transloco }}</p>
-        <app-subagents-editor
-          [models]="models()"
-          [modelGated]="isModelGated()"
-          [modelAllowed]="modelAllowed"
-          [disabled]="readOnly()"
-        />
-      </section>
-
-      <section class="card">
-        <h2>Tools</h2>
-        <app-tools-group
-          [config]="baseForGroups()"
-          [mode]="mode()"
-          [disabled]="readOnly()"
-          [enumerateOnly]="enumerateOnly()"
-          [gatedCapabilities]="gatedCapabilities()"
-          [resolved]="toolPreview()"
-          [readsResolvedToolset]="true"
-        />
-      </section>
-
-      <section class="card">
-        <h2>Advanced</h2>
-        <app-advanced-accordion
-          [config]="baseForGroups()"
-          [mode]="mode()"
-          [disabled]="readOnly()"
-          [settingsMatrix]="settingsMatrix()"
-          [modelOverride]="form.model || null"
-          [backendOverride]="execBackendOverride()"
-        />
-      </section>
-
-      <section class="card">
-        <h2>Advanced (other keys) — JSON</h2>
-        <p class="hint">
-          Config keys not covered by the controls above (e.g. <code>instruction_files</code>).
-          Credential sections are rejected on save.
-        </p>
-        <app-textarea
-          [value]="form.configText"
-          [rows]="6"
-          [readonly]="readOnly()"
-          (valueChange)="form.configText = $event"
-          placeholder='{ "instruction_files": [] }'
-        />
-      </section>
-
-      @if (errorMessage()) {
-        <div class="banner err">{{ errorMessage() }}</div>
-      }
-
-      <footer class="actions">
+      <div editorActions class="actions">
         @if (readOnly()) {
-          <app-button variant="secondary" (clicked)="cancel()">{{ 'experts.back' | transloco }}</app-button>
           <app-button variant="primary" [loading]="saving()" (clicked)="duplicate()">
             {{ 'experts.duplicateToEdit' | transloco }}
           </app-button>
@@ -513,7 +351,337 @@ interface EditorForm {
             {{ 'experts.save' | transloco }}
           </app-button>
         }
-      </footer>
+      </div>
+      @if (errorMessage()) {
+        <div editorAlert class="banner err save-error" role="alert">{{ errorMessage() }}</div>
+      }
+    </app-editor-header>
+
+    <div class="editor">
+      @if (forkNotice()) {
+        <div class="banner info">{{ forkNotice() }}</div>
+      }
+      @if (loadError()) {
+        <div class="banner err">{{ loadError() }}</div>
+      }
+
+      <!-- Profile: what the expert is called and how it shows up in lists.
+           Always in view; everything below is a section that opens. -->
+      <section class="profile" [attr.aria-label]="'experts.editor.profile' | transloco">
+        <div class="look" [class.only-avatar]="readOnly()">
+          <div class="avatar" [style.color]="form.color" aria-hidden="true">
+            <app-icon size="xl">{{ form.icon || 'smart_toy' }}</app-icon>
+          </div>
+          @if (!readOnly()) {
+            <div class="swatches" role="group" [attr.aria-label]="'experts.editor.color' | transloco">
+              @for (c of colorChoices; track c) {
+                <button
+                  type="button"
+                  class="swatch"
+                  [class.selected]="isColor(c)"
+                  [style.background]="c"
+                  [attr.aria-label]="c"
+                  [attr.aria-pressed]="isColor(c)"
+                  (click)="form.color = c"
+                ></button>
+              }
+            </div>
+            <div class="icon-choices" role="group" [attr.aria-label]="'experts.editor.icon' | transloco">
+              @for (i of iconChoices; track i) {
+                <button
+                  type="button"
+                  class="icon-choice"
+                  [class.selected]="form.icon === i"
+                  [attr.aria-label]="i"
+                  [attr.aria-pressed]="form.icon === i"
+                  (click)="form.icon = i"
+                >
+                  <app-icon size="sm">{{ i }}</app-icon>
+                </button>
+              }
+            </div>
+            <div class="look-custom">
+              <app-input
+                size="sm"
+                [value]="form.icon"
+                [ariaLabel]="'experts.editor.iconName' | transloco"
+                [placeholder]="'experts.editor.iconName' | transloco"
+                (valueChange)="form.icon = $event"
+              />
+              <app-input
+                size="sm"
+                [value]="form.color"
+                [ariaLabel]="'experts.editor.colorHex' | transloco"
+                placeholder="#6B7280"
+                (valueChange)="form.color = $event"
+              />
+            </div>
+          }
+        </div>
+
+        <div class="profile-fields">
+          <div class="pair wide-narrow">
+            <app-form-field [label]="'experts.editor.displayName' | transloco" [required]="true">
+              <app-input [value]="form.display_name" [readonly]="readOnly()" (valueChange)="onDisplayName($event)" />
+            </app-form-field>
+            <app-form-field
+              [label]="'experts.editor.type' | transloco"
+              [required]="true"
+              [hint]="isEdit() ? '' : ('experts.editor.typeHint' | transloco)"
+            >
+              <app-select [value]="form.expert_type" [disabled]="isEdit()" (valueChange)="onTypeChange($event)">
+                <option value="worker">{{ 'experts.editor.typeWorker' | transloco }}</option>
+                <option value="session">{{ 'experts.editor.typeSession' | transloco }}</option>
+              </app-select>
+            </app-form-field>
+          </div>
+          <app-form-field
+            [label]="'experts.editor.description' | transloco"
+            [hint]="'experts.editor.descriptionHint' | transloco"
+          >
+            <app-input [value]="form.description" [readonly]="readOnly()" (valueChange)="form.description = $event" />
+          </app-form-field>
+          <div class="pair">
+            <app-form-field
+              [label]="'experts.editor.id' | transloco"
+              [required]="true"
+              [hint]="isEdit() ? '' : ('experts.editor.idHint' | transloco)"
+            >
+              <app-input class="mono" [value]="form.name" [disabled]="isEdit()" (valueChange)="onNameEdit($event)" />
+            </app-form-field>
+            <app-form-field [label]="'experts.editor.tags' | transloco" [hint]="'experts.editor.tagsHint' | transloco">
+              <app-input
+                [value]="form.tags"
+                [readonly]="readOnly()"
+                [placeholder]="'experts.tags.freePlaceholder' | transloco"
+                (valueChange)="form.tags = $event"
+              />
+            </app-form-field>
+          </div>
+          <!-- Role tags: the expert's own type locked on. A soft filter for the
+               pickers; every expert stays usable in every role (U1 D4). -->
+          <app-form-field [label]="'experts.editor.listedFor' | transloco" [hint]="'experts.editor.listedForHint' | transloco">
+            <div class="role-chips">
+              @for (role of expertRoles; track role) {
+                <app-chip
+                  [selected]="hasRoleTag(role)"
+                  [disabled]="readOnly() || role === form.expert_type"
+                  [ariaLabel]="role === form.expert_type ? ('experts.tags.roleLocked' | transloco: {role}) : role"
+                  (clicked)="toggleRoleTag(role)"
+                >{{ role }}</app-chip>
+              }
+            </div>
+          </app-form-field>
+        </div>
+      </section>
+
+      <app-expander
+        icon="psychology"
+        [heading]="'experts.editor.sections.persona.title' | transloco"
+        [summary]="personaSummary()"
+        [(expanded)]="personaOpen"
+      >
+        <div class="section">
+          <app-form-field
+            [label]="'experts.editor.persona' | transloco"
+            [hint]="'experts.editor.personaHint' | transloco"
+          >
+            <app-textarea
+              [value]="form.persona"
+              [rows]="12"
+              [readonly]="readOnly()"
+              [placeholder]="'experts.editor.personaPlaceholder' | transloco"
+              (valueChange)="form.persona = $event"
+            />
+          </app-form-field>
+          <app-form-field
+            [label]="'experts.editor.instructions' | transloco"
+            [optional]="'experts.editor.optional' | transloco"
+            [hint]="'experts.editor.instructionsHint' | transloco"
+          >
+            <app-textarea
+              [value]="form.instructions"
+              [rows]="6"
+              [readonly]="readOnly()"
+              (valueChange)="form.instructions = $event"
+            />
+          </app-form-field>
+          <div class="more">
+            <button type="button" class="more-toggle" [attr.aria-expanded]="promptsMoreOpen()" (click)="promptsMoreOpen.set(!promptsMoreOpen())">
+              <app-icon size="sm" class="more-chevron" [class.open]="promptsMoreOpen()">expand_more</app-icon>
+              {{ 'experts.editor.more' | transloco }}
+              @if (form.summarization.trim()) {
+                <span class="more-count">{{ 'experts.editor.moreSet' | transloco: {n: 1} }}</span>
+              }
+            </button>
+            <div class="more-body" [hidden]="!promptsMoreOpen()">
+              <app-form-field
+                [label]="'experts.editor.summarization' | transloco"
+                [hint]="'experts.editor.summarizationHint' | transloco"
+              >
+                <app-textarea
+                  [value]="form.summarization"
+                  [rows]="5"
+                  [readonly]="readOnly()"
+                  [placeholder]="'experts.editor.summarizationPlaceholder' | transloco"
+                  (valueChange)="form.summarization = $event"
+                />
+              </app-form-field>
+            </div>
+          </div>
+        </div>
+      </app-expander>
+
+      <!-- ONE model since U1 (llm.model, worker and session alike) plus, for a
+           worker expert, the roster-wide subagent model (subagents.llm.model). -->
+      <app-expander
+        icon="neurology"
+        [heading]="'experts.model.title' | transloco"
+        [summary]="modelSummary()"
+        [(expanded)]="modelOpen"
+      >
+        <div class="section">
+          <div class="pair">
+            <app-form-field [label]="'experts.model.model' | transloco">
+              <app-select
+                [value]="form.model"
+                [disabled]="readOnly() || isModelGated()"
+                (valueChange)="form.model = $event ?? ''"
+              >
+                <option value="">{{ baseDefaultLabel('model') }}</option>
+                @for (g of models(); track g.group) {
+                  <optgroup [label]="g.group">
+                    @for (m of g.models; track m) {
+                      <option [value]="m" [disabled]="!modelAllowed(m)">{{ modelLabel(g, m) }}</option>
+                    }
+                  </optgroup>
+                }
+              </app-select>
+            </app-form-field>
+            @if (mode() === 'job') {
+              <app-form-field
+                [label]="'experts.model.subagent' | transloco"
+                [hint]="'experts.model.subagentHint' | transloco"
+              >
+                <app-select
+                  [value]="form.subagentModel"
+                  [disabled]="readOnly() || isModelGated()"
+                  (valueChange)="form.subagentModel = $event ?? ''"
+                >
+                  <option value="">{{ baseDefaultLabel('subagent') }}</option>
+                  @for (g of models(); track g.group) {
+                    <optgroup [label]="g.group">
+                      @for (m of g.models; track m) {
+                        <option [value]="m" [disabled]="!modelAllowed(m)">{{ modelLabel(g, m) }}</option>
+                      }
+                    </optgroup>
+                  }
+                </app-select>
+              </app-form-field>
+            }
+          </div>
+          @if (isModelGated()) {
+            <p class="lock-hint"><app-icon size="xs">lock</app-icon> {{ 'grants.locked.model_selection' | transloco }}</p>
+          }
+        </div>
+      </app-expander>
+
+      <!-- Structured config: reuses the launch-flow groups. [config] = base ⊕ fragment
+           drives "default: X" displays; getOverrides() + the model selects feed the
+           saved config (see save()). The expander hides a closed section with the
+           hidden attribute, so every group stays alive for prefill and save. -->
+      <app-expander
+        icon="build"
+        [heading]="'experts.editor.sections.tools.title' | transloco"
+        [summary]="toolsSummary()"
+        [(expanded)]="toolsOpen"
+      >
+        <div class="section">
+          <app-tools-group
+            [config]="baseForGroups()"
+            [mode]="mode()"
+            [disabled]="readOnly()"
+            [showGroupLabel]="false"
+            [enumerateOnly]="enumerateOnly()"
+            [gatedCapabilities]="gatedCapabilities()"
+            [resolved]="toolPreview()"
+            [readsResolvedToolset]="true"
+          />
+        </div>
+      </app-expander>
+
+      <!-- The subagent roster (config.subagents.default / .roster). -->
+      <app-expander
+        icon="account_tree"
+        [heading]="'experts.subagents.title' | transloco"
+        [summary]="subagentsSummary()"
+        [(expanded)]="subagentsOpen"
+      >
+        <div class="section">
+          <p class="hint">{{ 'experts.subagents.hint' | transloco }}</p>
+          <app-subagents-editor
+            [models]="models()"
+            [modelGated]="isModelGated()"
+            [modelAllowed]="modelAllowed"
+            [disabled]="readOnly()"
+          />
+        </div>
+      </app-expander>
+
+      <app-expander
+        icon="tune"
+        [heading]="(mode() === 'job' ? 'experts.editor.sections.defaults.titleJob' : 'experts.editor.sections.defaults.titleSession') | transloco"
+        [summary]="defaultsSummary()"
+        [(expanded)]="defaultsOpen"
+      >
+        <div class="section">
+          <p class="hint">
+            {{ (mode() === 'job' ? 'experts.editor.sections.defaults.hintJob' : 'experts.editor.sections.defaults.hintSession') | transloco }}
+          </p>
+          <app-execution-group
+            [config]="baseForGroups()"
+            [mode]="mode()"
+            [disabled]="readOnly()"
+            [showGroupLabel]="false"
+            [showProjectMemory]="false"
+            [gatedCapabilities]="gatedCapabilities()"
+            [catalog]="catalog()"
+            [workspaceBackendLabel]="'agentSettings.execution.workspaceRecommended'"
+          />
+        </div>
+      </app-expander>
+
+      <app-expander
+        icon="settings"
+        [heading]="'experts.editor.sections.advanced.title' | transloco"
+        [summary]="advancedSummary()"
+        [(expanded)]="advancedOpen"
+      >
+        <div class="section">
+          <app-advanced-accordion
+            [flat]="true"
+            [config]="baseForGroups()"
+            [mode]="mode()"
+            [disabled]="readOnly()"
+            [settingsMatrix]="settingsMatrix()"
+            [modelOverride]="form.model || null"
+            [backendOverride]="execBackendOverride()"
+          />
+          <app-form-field
+            [label]="'experts.editor.otherKeys' | transloco"
+            [hint]="'experts.editor.otherKeysHint' | transloco"
+          >
+            <app-textarea
+              class="mono"
+              [value]="form.configText"
+              [rows]="6"
+              [readonly]="readOnly()"
+              (valueChange)="form.configText = $event"
+              placeholder='{ "instruction_files": [] }'
+            />
+          </app-form-field>
+        </div>
+      </app-expander>
     </div>
   `,
   styles: [
@@ -522,94 +690,237 @@ interface EditorForm {
         display: block;
         height: 100%;
         overflow-y: auto;
+        --editor-width: 920px;
       }
       .editor {
-        padding: 1rem 1.5rem;
-      }
-      .head {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 0.5rem;
-        margin-bottom: 1rem;
-      }
-      .head h1 {
-        margin: 0;
-      }
-      .card {
-        background: var(--panel-bg);
-        border: 1px solid var(--border-color);
-        color: var(--text-primary);
-        padding: 1rem;
-        border-radius: var(--radius-surface, 8px);
-        margin-bottom: 1rem;
+        max-width: var(--editor-width);
+        margin: 0 auto;
+        padding: 1rem 1.5rem 3rem;
         display: flex;
         flex-direction: column;
         gap: 0.75rem;
       }
-      .card h2 {
-        margin: 0;
-        font-size: 0.95rem;
+      .title-icon {
+        display: inline-flex;
+        flex-shrink: 0;
+      }
+      .title-badges {
+        display: inline-flex;
+        gap: 0.375rem;
+        flex-shrink: 0;
+      }
+      .actions {
+        display: flex;
+        gap: 0.5rem;
+      }
+
+      /* Profile */
+      .profile {
+        display: flex;
+        gap: 1.5rem;
+        padding: 1.25rem;
+        background: var(--panel-bg);
+        border: 1px solid var(--border-hairline);
+        border-radius: var(--radius-surface);
+      }
+      .look {
+        flex: 0 0 12.75rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      /* Read-only: nothing to pick, so the column is just the avatar. */
+      .look.only-avatar {
+        flex-basis: auto;
+      }
+      .avatar {
+        display: grid;
+        place-items: center;
+        width: 4.5rem;
+        height: 4.5rem;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+      }
+      .swatches,
+      .icon-choices {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.375rem;
+      }
+      .swatch {
+        width: 1.25rem;
+        height: 1.25rem;
+        padding: 0;
+        border: 2px solid var(--panel-bg);
+        border-radius: 50%;
+        cursor: pointer;
+      }
+      .swatch.selected {
+        box-shadow: 0 0 0 2px var(--text-primary);
+      }
+      .icon-choice {
+        display: grid;
+        place-items: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        padding: 0;
+        border: 1px solid transparent;
+        border-radius: var(--radius-control);
+        background: none;
+        color: var(--text-secondary);
+        cursor: pointer;
+      }
+      .icon-choice:hover {
+        background: var(--hover);
         color: var(--text-primary);
       }
-      .row {
+      .icon-choice.selected {
+        border-color: var(--accent-color);
+        color: var(--text-primary);
+        background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+      }
+      .swatch:focus-visible,
+      .icon-choice:focus-visible,
+      .more-toggle:focus-visible {
+        outline: 2px solid var(--accent-color);
+        outline-offset: 2px;
+      }
+      .look-custom {
         display: flex;
-        gap: 1rem;
-        align-items: flex-end;
+        flex-direction: column;
+        gap: 0.375rem;
+      }
+      .profile-fields {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.875rem;
+      }
+      .pair {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.875rem;
+        align-items: start;
+      }
+      .pair.wide-narrow {
+        grid-template-columns: 2fr 1fr;
       }
       .role-chips {
         display: flex;
         flex-wrap: wrap;
         gap: 0.5rem;
       }
-      .ml {
+      .mono {
+        font-family: var(--font-mono, monospace);
+      }
+
+      /* Sections */
+      app-expander {
+        display: block;
+      }
+      .section {
         display: flex;
         flex-direction: column;
-        gap: 0.25rem;
-        font-size: 0.85rem;
-        color: var(--text-secondary);
-      }
-      .model-select {
-        padding: 7px 10px;
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-control, 6px);
-        background: var(--surface-0, var(--panel-bg));
-        color: var(--text-primary);
-        font: inherit;
-      }
-      .model-select:disabled {
-        opacity: 0.55;
-        cursor: not-allowed;
-      }
-      .lock-hint {
-        display: block;
-        margin-top: 0.35rem;
-        color: var(--text-muted);
-        font-size: 0.8rem;
+        gap: 1rem;
       }
       .hint {
         margin: 0;
+        max-width: 72ch;
         color: var(--text-muted);
-        font-size: 0.85rem;
+        font-size: 0.8125rem;
+        line-height: 1.5;
       }
-      .actions {
+      .lock-hint {
         display: flex;
-        justify-content: flex-end;
-        gap: 0.5rem;
+        align-items: center;
+        gap: 0.375rem;
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 0.8125rem;
+      }
+
+      /* One more level, then no further: the rarely-touched fields of a section. */
+      .more {
+        border-top: 1px solid var(--border-hairline);
+        padding-top: 0.5rem;
+      }
+      .more-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.25rem 0.5rem 0.25rem 0.125rem;
+        border: 0;
+        border-radius: var(--radius-control);
+        background: none;
+        color: var(--text-secondary);
+        font: inherit;
+        font-size: 0.8125rem;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .more-toggle:hover {
+        color: var(--text-primary);
+      }
+      .more-chevron {
+        transition: transform 0.15s ease;
+      }
+      .more-chevron.open {
+        transform: rotate(180deg);
+      }
+      .more-count {
+        margin-left: 0.375rem;
+        color: var(--text-muted);
+        font-weight: 400;
+      }
+      .more-body {
+        padding-top: 0.75rem;
+      }
+      .more-body[hidden] {
+        display: none;
+      }
+
+      .banner {
+        padding: 0.5rem 0.75rem;
+        border-radius: var(--radius-control);
+        font-size: 0.875rem;
       }
       .banner.err {
         background: var(--danger-tint);
         color: var(--danger);
-        padding: 0.5rem 0.75rem;
-        border-radius: var(--radius-control);
-        margin-bottom: 1rem;
       }
       .banner.info {
         background: var(--info-tint);
         color: var(--info);
-        padding: 0.5rem 0.75rem;
-        border-radius: var(--radius-control);
-        margin-bottom: 1rem;
+      }
+
+      @media (max-width: 720px) {
+        .editor {
+          padding: 0.75rem 1rem 3rem;
+        }
+        /* The Type field is right below; the title gets the room. */
+        .type-badge {
+          display: none;
+        }
+        .profile {
+          flex-direction: column;
+          padding: 1rem;
+        }
+        /* Name first on a phone; the look follows. */
+        .look {
+          order: 2;
+          flex-basis: auto;
+        }
+        .pair,
+        .pair.wide-narrow {
+          grid-template-columns: 1fr;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .more-chevron {
+          transition: none;
+        }
       }
     `,
   ],
@@ -744,6 +1055,106 @@ export class ExpertEditorComponent implements OnInit {
   private readonly expertType = signal<'worker' | 'session'>('worker');
   isEdit = computed(() => this.editingId() !== null);
   headingKey = computed(() => expertEditorHeadingKey(this.readOnly(), this.isEdit()));
+
+  readonly iconChoices = EXPERT_ICON_CHOICES;
+  readonly colorChoices = EXPERT_COLOR_CHOICES;
+
+  /** Which sections are open. Persona is where an expert is written, so it
+   *  starts open; every other section shows its one-line summary until asked.
+   *  A closed section keeps its controls alive (the expander hides, it does
+   *  not remove), so prefill and save see every group either way. */
+  readonly personaOpen = signal(true);
+  readonly promptsMoreOpen = signal(false);
+  readonly modelOpen = signal(false);
+  readonly toolsOpen = signal(false);
+  readonly subagentsOpen = signal(false);
+  readonly defaultsOpen = signal(false);
+  readonly advancedOpen = signal(false);
+
+  /** The page title: the expert's own name once it has one. */
+  heading(): string {
+    if (!this.isEdit()) return this.transloco.translate('experts.new');
+    return this.form.display_name.trim() || this.transloco.translate(this.headingKey());
+  }
+
+  isColor(color: string): boolean {
+    return this.form.color.trim().toLowerCase() === color.toLowerCase();
+  }
+
+  // --- Section summaries: one line each, readable while the section is
+  // closed. Methods, not computeds: `form` is a plain object, so only a
+  // template read picks up its edits.
+
+  private summary(key: string, params?: Record<string, unknown>): string {
+    return this.transloco.translate(`experts.editor.summary.${key}`, params);
+  }
+
+  private modelName(id: string): string {
+    for (const group of this.models()) {
+      if (group.models.includes(id)) return chatModelLabel(group, id);
+    }
+    return id;
+  }
+
+  personaSummary(): string {
+    const persona = wordCount(this.form.persona);
+    const instructions = wordCount(this.form.instructions);
+    const summarization = !!this.form.summarization.trim();
+    if (!persona && !instructions && !summarization) return this.summary('promptsEmpty');
+    const parts = [persona ? this.summary('persona', {words: persona}) : this.summary('personaNone')];
+    if (instructions) parts.push(this.summary('instructions', {words: instructions}));
+    if (summarization) parts.push(this.summary('summarization'));
+    return parts.join(' · ');
+  }
+
+  modelSummary(): string {
+    const main = this.form.model ? this.modelName(this.form.model) : this.baseDefaultLabel('model');
+    if (this.mode() !== 'job' || !this.form.subagentModel) return main;
+    return `${main} · ${this.summary('subagentModel', {model: this.modelName(this.form.subagentModel)})}`;
+  }
+
+  toolsSummary(): string {
+    const on = this.toolsGroup()?.onSummary();
+    if (!on) return '';
+    return on.tools
+      ? this.summary('tools', {groups: on.categories, tools: on.tools})
+      : this.summary('toolsNoCount', {groups: on.categories});
+  }
+
+  subagentsSummary(): string {
+    const names = this.subagentsEditor()?.names() ?? [];
+    if (!names.length) return this.summary('subagentsNone');
+    const shown = names.slice(0, 4).join(', ');
+    return names.length > 4 ? this.summary('subagentsMore', {names: shown, n: names.length - 4}) : shown;
+  }
+
+  defaultsSummary(): string {
+    const exec = this.execGroup();
+    if (!exec) return '';
+    const parts: string[] = [];
+    if (this.mode() === 'job') {
+      const autonomy = exec.autonomy() ?? exec.resolvedAutonomy();
+      parts.push(this.summary('autonomy', {value: this.transloco.translate(`agentSettings.autonomy.${autonomy}.label`)}));
+    } else {
+      const permission = exec.permissionMode() ?? exec.resolvedPermissionMode();
+      parts.push(
+        this.summary('permission', {value: this.transloco.translate(`agentSettings.permissionModes.${permission}.label`)}),
+      );
+    }
+    parts.push(this.summary('workspace', {value: exec.tierLabel(exec.effectiveBackend())}));
+    if (this.mode() === 'job') {
+      if (exec.scholar() ?? exec.resolvedScholar()) parts.push(this.summary('scholar'));
+      if (exec.effectiveCritic()) parts.push(this.summary('critic'));
+    }
+    return parts.join(' · ');
+  }
+
+  advancedSummary(): string {
+    const advanced = this.advancedGroup();
+    const other = parseConfigText(this.form.configText).config ?? {};
+    const n = (advanced ? countLeaves(advanced.getOverrides()) : 0) + Object.keys(other).length;
+    return n ? this.summary('advancedSet', {n}) : this.summary('advancedDefaults');
+  }
   mode = computed<'job' | 'session'>(() => expertEditorMode(this.expertType()));
   /** Base config for the structured controls' "default: X" displays: the type
    *  base merged with the expert's own fragment. */

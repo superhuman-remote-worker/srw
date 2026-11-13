@@ -4,6 +4,7 @@ import {
   buildPromptsPayload,
   buildSubagentsFragment,
   buildTagsPayload,
+  countLeaves,
   expertBaseConfigName,
   expertEditorMode,
   expertToolPreviewRequest,
@@ -12,6 +13,7 @@ import {
   slugify,
   splitTags,
   stripEmptySubagents,
+  wordCount,
 } from './expert-editor.component';
 import {assembleExpertConfig, liftLegacyTiers} from './expert-config';
 
@@ -27,6 +29,20 @@ describe('slugify', () => {
     expect(slugify('123 go')).toMatch(/^[a-z][a-z0-9_-]*$/));
   it('strips non-ascii', () => expect(slugify('Über Helper')).toMatch(/^[a-z][a-z0-9_-]*$/));
   it('empty falls back to expert', () => expect(slugify('   ')).toBe('expert'));
+});
+
+describe('section summary helpers', () => {
+  it('counts the settings a fragment sets: its leaves, a list being one', () => {
+    expect(countLeaves({})).toBe(0);
+    expect(countLeaves({llm: {temperature: 0.3, top_p: 0.95}, tools: {shell: ['run_command', 'read']}})).toBe(3);
+    expect(countLeaves({workspace: {git: {enabled: false}}})).toBe(1);
+  });
+
+  it('counts words, ignoring surrounding and repeated whitespace', () => {
+    expect(wordCount('')).toBe(0);
+    expect(wordCount('   ')).toBe(0);
+    expect(wordCount('  one two\n\nthree  ')).toBe(3);
+  });
 });
 
 describe('parseConfigText', () => {

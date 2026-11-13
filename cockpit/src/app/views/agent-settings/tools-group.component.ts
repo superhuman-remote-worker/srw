@@ -164,8 +164,10 @@ export function delegationOverride(
   imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="settings-group">
-      <div class="group-header">
-        <span class="group-label">{{ 'agentSettings.tools.group' | transloco }}</span>
+      <div class="group-header" [class.label-hidden]="!showGroupLabel()">
+        @if (showGroupLabel()) {
+          <span class="group-label">{{ 'agentSettings.tools.group' | transloco }}</span>
+        }
         <button
           type="button"
           class="select-all-btn"
@@ -355,6 +357,12 @@ export function delegationOverride(
       margin-bottom: 12px;
       padding-bottom: 6px;
       border-bottom: 1px solid var(--border-color, var(--surface-0));
+    }
+    .group-header.label-hidden {
+      justify-content: flex-end;
+      margin-bottom: 8px;
+      padding-bottom: 0;
+      border-bottom: none;
     }
     .group-label {
       font-size: 11px;
@@ -607,6 +615,9 @@ export class ToolsGroupComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
+  /** The "Tools" label beside Select all. Off where the host already titles
+   *  the block (the expert editor's own section heading). */
+  showGroupLabel = input(true);
   /**
    * The server's resolved answer — a measurement from the running agent, or a
    * labelled prediction. When present it supplies the category set, the three
