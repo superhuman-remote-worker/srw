@@ -73,8 +73,9 @@ const FAMILIES = ['gemma', 'gemini-4-argon', 'gemini-3.8-flash', 'gpt-5', 'gpt-5
         <h2 class="section-title">How prompts are used</h2>
         <p class="section-desc">
           Where each prompt and instruction file below runs in an agent's loop.
-          Workers (jobs) alternate strategic and tactical phase prompts;
-          persistent sessions use a single interactive prompt every turn.
+          Workers (jobs) keep one system prompt and alternate strategic and
+          tactical phases, each opened by its phase skill; persistent sessions
+          use a single interactive prompt every turn.
         </p>
         <app-agent-loop-diagram />
       </section>

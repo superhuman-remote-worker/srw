@@ -113,8 +113,6 @@ export function expertEditorMode(expertType: 'worker' | 'session'): 'job' | 'ses
 export interface PromptFields {
   persona: string;
   instructions: string;
-  strategic: string;
-  tactical: string;
   summarization: string;
 }
 
@@ -122,13 +120,10 @@ export interface PromptFields {
  * Assemble the `prompts` save payload from the editor fields. Only non-empty
  * segments are emitted — an empty field inherits the framework default, and
  * because the API replaces the `prompts` column wholesale, a cleared field drops
- * its override. Strategic/tactical are worker-only (session experts don't run the
- * phase loop), so they are excluded in session mode.
+ * its override. A worker's phase guidance is not an expert prompt: it is the
+ * strategic-phase / tactical-phase skills.
  */
-export function buildPromptsPayload(
-  fields: PromptFields,
-  mode: 'job' | 'session',
-): Record<string, string> {
+export function buildPromptsPayload(fields: PromptFields): Record<string, string> {
   const out: Record<string, string> = {};
   const add = (k: keyof PromptFields): void => {
     if (fields[k].trim()) out[k] = fields[k];
@@ -136,10 +131,6 @@ export function buildPromptsPayload(
   add('persona');
   add('instructions');
   add('summarization');
-  if (mode === 'job') {
-    add('strategic');
-    add('tactical');
-  }
   return out;
 }
 
@@ -272,8 +263,6 @@ interface EditorForm {
   expert_type: 'worker' | 'session';
   persona: string;
   instructions: string;
-  strategic: string;
-  tactical: string;
   summarization: string;
   /** The one model (`llm.model`); '' = inherit the base default. */
   model: string;
@@ -394,31 +383,11 @@ interface EditorForm {
       </section>
 
       <section class="card">
-        <h2>Phase prompts (advanced)</h2>
+        <h2>Summarization prompt (advanced)</h2>
         <p class="hint">
-          Override the workflow prompts. Leave a field empty to inherit the
-          framework default. Custom strategic/tactical text is treated as
-          untrusted and stays subordinate to system rules &amp; safety.
+          Replaces the prompt used when older conversation is summarized to
+          free up context. Leave it empty to inherit the framework default.
         </p>
-        @if (mode() === 'job') {
-          <h2>Strategic (planning)</h2>
-          <app-textarea
-            [value]="form.strategic"
-            [rows]="6"
-            [readonly]="readOnly()"
-            (valueChange)="form.strategic = $event"
-            placeholder="Inherit framework default…"
-          />
-          <h2>Tactical (execution)</h2>
-          <app-textarea
-            [value]="form.tactical"
-            [rows]="6"
-            [readonly]="readOnly()"
-            (valueChange)="form.tactical = $event"
-            placeholder="Inherit framework default…"
-          />
-        }
-        <h2>Summarization</h2>
         <app-textarea
           [value]="form.summarization"
           [rows]="5"
@@ -766,8 +735,6 @@ export class ExpertEditorComponent implements OnInit {
     expert_type: 'worker',
     persona: '',
     instructions: '',
-    strategic: '',
-    tactical: '',
     summarization: '',
     model: '',
     subagentModel: '',
@@ -859,8 +826,6 @@ export class ExpertEditorComponent implements OnInit {
     const prompts = b.prompts ?? {};
     this.form.persona = (prompts['persona'] as string) ?? '';
     this.form.instructions = (prompts['instructions'] as string) ?? '';
-    this.form.strategic = (prompts['strategic'] as string) ?? '';
-    this.form.tactical = (prompts['tactical'] as string) ?? '';
     this.form.summarization = (prompts['summarization'] as string) ?? '';
     // A pre-U1 fragment's per-phase tiers are lifted onto llm.model /
     // subagents.llm here, once, layer-locally (an explicit llm.model wins) —
@@ -940,10 +905,8 @@ export class ExpertEditorComponent implements OnInit {
     this.form.subagentModel = '';
     // The new type's role chip locks on; whatever else was ticked stays.
     if (!this.roleTags().includes(v)) this.roleTags.update((tags) => [...tags, v]);
-    // Phase-prompt overrides are mode-specific (strategic/tactical are worker-
-    // only) — clear them so a worker→session switch on CREATE doesn't carry over.
-    this.form.strategic = '';
-    this.form.tactical = '';
+    // The summarization override is written for one mode's context — clear it
+    // so a worker→session switch on CREATE doesn't carry it over.
     this.form.summarization = '';
   }
 
@@ -994,7 +957,7 @@ export class ExpertEditorComponent implements OnInit {
 
   /** Assemble the prompts payload for save (see buildPromptsPayload). */
   private buildPrompts(): Record<string, string> {
-    return buildPromptsPayload(this.form, this.mode());
+    return buildPromptsPayload(this.form);
   }
 
   save(): void {

@@ -39,9 +39,11 @@ describe('AgentLoopDiagramComponent', () => {
 
   it('labels the prompt used in each context', () => {
     const text = render().textContent ?? '';
+    // one phase-agnostic worker prompt: no strategic/tactical prompt files
     expect(text).toContain('PROMPT · EVERY LLM CALL');
-    expect(text).toContain('strategic');
-    expect(text).toContain('tactical');
+    expect(text).toContain('system · persona');
+    expect(text).not.toContain('strategic.txt');
+    expect(text).not.toContain('tactical.txt');
     expect(text).toContain('PROMPT · EVERY TURN');
     expect(text).toContain('interactive');
   });
@@ -49,9 +51,10 @@ describe('AgentLoopDiagramComponent', () => {
   it('shows instruction files and their triggers per context', () => {
     const text = render().textContent ?? '';
     expect(text).toContain('INSTRUCTION FILES');
-    // worker: gated before next_phase_todos (strategic) + auto on tactical phase
-    expect(text).toContain('todo_guide.md');
-    expect(text).toContain('research_guide.md');
+    // worker: each phase opens with its phase skill
+    expect(text).toContain('PHASE SKILLS · AT PHASE START');
+    expect(text).toContain('strategic-phase');
+    expect(text).toContain('tactical-phase');
     // persistent: injected once on session setup
     expect(text).toContain('design_guide.md');
   });

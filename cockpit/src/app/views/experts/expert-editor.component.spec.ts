@@ -18,8 +18,6 @@ import {assembleExpertConfig, liftLegacyTiers} from './expert-config';
 const FIELDS = {
   persona: 'P',
   instructions: 'I',
-  strategic: 'S',
-  tactical: 'T',
   summarization: 'Z',
 };
 
@@ -84,29 +82,26 @@ describe('expertToolPreviewRequest', () => {
 });
 
 describe('buildPromptsPayload', () => {
-  it('worker mode emits all five segments', () => {
-    expect(buildPromptsPayload(FIELDS, 'job')).toEqual({
+  it('emits the three expert prompt segments', () => {
+    expect(buildPromptsPayload(FIELDS)).toEqual({
       persona: 'P',
       instructions: 'I',
-      strategic: 'S',
-      tactical: 'T',
       summarization: 'Z',
     });
   });
 
-  it('session mode drops the worker-only phase prompts', () => {
-    const out = buildPromptsPayload(FIELDS, 'session');
-    expect(out).toEqual({persona: 'P', instructions: 'I', summarization: 'Z'});
-    expect(out['strategic']).toBeUndefined();
-    expect(out['tactical']).toBeUndefined();
+  it('omits empty/whitespace segments (empty ⇒ inherit / clear)', () => {
+    const out = buildPromptsPayload({persona: 'P', instructions: '   ', summarization: ''});
+    expect(out).toEqual({persona: 'P'});
   });
 
-  it('omits empty/whitespace segments (empty ⇒ inherit / clear)', () => {
-    const out = buildPromptsPayload(
-      {persona: 'P', instructions: '', strategic: '   ', tactical: 'T', summarization: ''},
-      'job',
-    );
-    expect(out).toEqual({persona: 'P', tactical: 'T'});
+  it('never writes the retired strategic/tactical phase prompts', () => {
+    // A loaded row may still carry them on the wire; the form has no field
+    // for them, so the save payload drops them.
+    const loaded = {...FIELDS, strategic: 'S', tactical: 'T'} as typeof FIELDS;
+    const out = buildPromptsPayload(loaded);
+    expect(out['strategic']).toBeUndefined();
+    expect(out['tactical']).toBeUndefined();
   });
 });
 
