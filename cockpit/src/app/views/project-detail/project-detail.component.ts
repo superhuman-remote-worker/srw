@@ -2101,6 +2101,15 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       flex-wrap: wrap;
     }
 
+    /* One row: the fields share it instead of each taking a row of its own
+       (ui/input and ui/select are full width unless told otherwise). Wide
+       screens only; a phone stacks the form (see the media block below). */
+    @media (min-width: 769px) {
+      .inline-form > app-input { flex: 1 1 200px; min-width: 0; }
+      .inline-form > app-select { flex: 0 1 170px; min-width: 0; }
+      .inline-form > app-select:first-child { flex: 1 1 240px; }
+    }
+
     /* User cell */
     .user-cell {
       display: flex;
