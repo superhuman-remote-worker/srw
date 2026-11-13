@@ -602,6 +602,9 @@ export interface DatasourceCatalogFilters {
   visibility?: 'private' | 'public';
   ownership?: 'mine' | 'shared';
   availability?: 'all' | 'projects' | 'unavailable';
+  /** true: only the connectors SRW keeps (a project's folders and knowledge
+   *  base, a user's cloud); false: only the ones people created. */
+  managed?: boolean;
   cursor?: string;
   limit?: number;
 }

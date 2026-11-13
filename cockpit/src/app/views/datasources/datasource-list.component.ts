@@ -23,6 +23,7 @@ import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppChipComponent} from '../../ui/chip';
+import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
 import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {AppTextareaComponent} from '../../ui/textarea';
@@ -48,6 +49,7 @@ import {
 import {
   isPlatformOwned,
   PROJECT_KB,
+  platformKindLabelKey,
   platformManagedLabelKey,
   platformOwnedKind,
 } from '../../core/models/platform-connector';
@@ -63,6 +65,8 @@ import {
 } from './connector-forms/schema-form';
 
 type McpTransport = 'http' | 'sse';
+/** The catalog's two views. */
+export type CatalogView = 'yours' | 'managed';
 type KeyValueRow = {key: string; value: string};
 
 /**
@@ -77,6 +81,8 @@ type KeyValueRow = {key: string; value: string};
     AppIconButtonComponent,
     AppBadgeComponent,
     AppChipComponent,
+    AppTabBarComponent,
+    AppTabComponent,
     AppInputComponent,
     AppSelectComponent,
     AppTextareaComponent,
@@ -98,17 +104,6 @@ type KeyValueRow = {key: string; value: string};
       <!-- Header -->
       <div class="header-bar">
         <h1 class="title">{{ 'datasources.title' | transloco }}</h1>
-        <div class="filter-chips">
-          @for (filter of typeFilters; track filter.value) {
-            <app-chip
-              size="sm"
-              [selected]="typeFilter() === filter.value"
-              (clicked)="onTypeFilter(filter.value)"
-            >
-              {{ filter.labelKey | transloco }}
-            </app-chip>
-          }
-        </div>
         <div class="header-actions">
           <a
             class="drivers-link"
@@ -142,14 +137,60 @@ type KeyValueRow = {key: string; value: string};
            connection is theirs to make, here (main cloud slice 4). -->
       <app-cloud-root-card />
 
-      @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-        <div class="catalog-filter-bar">
-          <app-input
+      <!-- Two views of one catalog: the connectors people made, and the ones
+           SRW keeps for a project or a user. Apart, because on an installation
+           with a few projects the second outnumbers the first many times over;
+           both one click away, because every connector an execution receives
+           is one its user can see (main_cloud_as_connectors, direction). -->
+      <div class="catalog-toolbar">
+        <app-tab-bar class="view-tabs" [value]="catalogView()" (valueChange)="onCatalogView($event)">
+          <app-tab [value]="'yours'">{{ 'datasources.view.yours' | transloco }}</app-tab>
+          <app-tab [value]="'managed'">{{ 'datasources.view.managed' | transloco }}</app-tab>
+        </app-tab-bar>
+        <div class="toolbar-filters">
+          @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+            <app-input
+              class="toolbar-search"
+              size="sm"
+              [value]="catalogSearch()"
+              (valueChange)="onCatalogSearch($event)"
+              [placeholder]="'datasources.catalog.search' | transloco"
+              [ariaLabel]="'datasources.catalog.search' | transloco"
+            />
+          }
+          <app-select
+            class="toolbar-type"
             size="sm"
-            [value]="catalogSearch()"
-            (valueChange)="onCatalogSearch($event)"
-            [placeholder]="'datasources.catalog.search' | transloco"
-          />
+            [value]="typeFilter()"
+            [ariaLabel]="'datasources.table.colType' | transloco"
+            (changed)="onTypeFilter($event ?? 'all')"
+          >
+            @for (filter of typeFilters; track filter.value) {
+              <option [value]="filter.value">
+                {{ (filter.value === 'all' ? 'datasources.catalog.anyType' : filter.labelKey) | transloco }}
+              </option>
+            }
+          </app-select>
+          @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+            <app-button
+              variant="secondary"
+              size="sm"
+              data-filters-toggle
+              [attr.aria-expanded]="filtersOpen()"
+              (clicked)="toggleFilters()"
+            >
+              <app-icon size="sm">tune</app-icon>
+              {{ 'datasources.catalog.filters' | transloco }}
+              @if (activeFilterCount(); as count) {
+                <span class="filter-count">{{ count }}</span>
+              }
+            </app-button>
+          }
+        </div>
+      </div>
+
+      @if (capabilities.datasourceScopeAutoAttachAvailable() && filtersOpen()) {
+        <div class="catalog-filter-bar" data-catalog-filters>
           <div class="catalog-project-filter">
             <app-input
               size="sm"
@@ -198,7 +239,16 @@ type KeyValueRow = {key: string; value: string};
             <option value="private">{{ 'datasources.catalog.private' | transloco }}</option>
             <option value="public">{{ 'datasources.catalog.public' | transloco }}</option>
           </app-select>
+          @if (activeFilterCount()) {
+            <app-button size="sm" variant="ghost" data-filters-clear (clicked)="clearFilters()">
+              {{ 'datasources.catalog.clearFilters' | transloco }}
+            </app-button>
+          }
         </div>
+      }
+
+      @if (catalogView() === 'managed') {
+        <p class="view-note" data-managed-note>{{ 'datasources.view.managedHint' | transloco }}</p>
       }
 
       <!-- Messages -->
@@ -1448,12 +1498,22 @@ type KeyValueRow = {key: string; value: string};
         </div>
       }
 
-      <!-- Empty State -->
+      <!-- Empty State: nothing matches the filters, nothing SRW keeps, or
+           nothing made yet (the one case that offers to make the first). -->
       @if (!isLoading() && filteredDatasources().length === 0 && !showForm()) {
-        <div class="center-state">
-          <app-icon size="inherit" class="empty-icon">database</app-icon>
-          <span>{{ 'datasources.table.empty' | transloco }}</span>
-          <span class="hint">{{ 'datasources.table.emptyHint' | transloco }}</span>
+        <div class="center-state" data-empty [attr.data-empty-kind]="emptyKind()">
+          <app-icon size="inherit" class="empty-icon">{{ emptyKind() === 'filtered' ? 'filter_alt_off' : 'cable' }}</app-icon>
+          <span class="empty-title">{{ 'datasources.empty.' + emptyKind() + '.title' | transloco }}</span>
+          <span class="hint">{{ 'datasources.empty.' + emptyKind() + '.hint' | transloco }}</span>
+          @if (emptyKind() === 'filtered') {
+            <app-button variant="secondary" size="sm" (clicked)="clearFilters()">
+              {{ 'datasources.catalog.clearFilters' | transloco }}
+            </app-button>
+          } @else if (emptyKind() === 'none') {
+            <app-button variant="primary" size="sm" (clicked)="openCreateForm()">
+              {{ 'datasources.new' | transloco }}
+            </app-button>
+          }
         </div>
       }
 
@@ -1464,27 +1524,30 @@ type KeyValueRow = {key: string; value: string};
             <table class="ds-table app-table">
               <thead>
                 <tr>
-                  <th>{{ 'datasources.table.colType' | transloco }}</th>
                   <th>{{ 'datasources.table.colName' | transloco }}</th>
                   <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
                   <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
                   @if (capabilities.datasourceScopeAutoAttachAvailable()) {
                     <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
                   }
-                  <th class="col-actions">{{ 'datasources.table.colActions' | transloco }}</th>
+                  <th class="col-actions"><span class="sr-only">{{ 'datasources.table.colActions' | transloco }}</span></th>
                 </tr>
               </thead>
               <tbody>
                 @for (ds of filteredDatasources(); track ds.id) {
                   <tr>
-                    <td>
-                      <app-badge [tone]="dsTypeTone(ds.type)" size="sm">
-                        <app-icon size="sm">{{ getTypeIcon(ds.type) }}</app-icon>
-                        {{ 'datasources.filter.' + ds.type | transloco }}
-                      </app-badge>
-                    </td>
+                    <!-- One cell says what the connector is: its icon, its
+                         name with the type beside it, then what it is for. -->
                     <td class="name-cell">
-                      <span class="ds-name">{{ ds.name }}</span>
+                      <div class="name-row">
+                      <span class="ds-icon" [attr.data-type]="ds.type">
+                        <app-icon size="md">{{ getTypeIcon(ds.type) }}</app-icon>
+                      </span>
+                      <div class="name-text">
+                      <span class="ds-title">
+                        <span class="ds-name">{{ ds.name }}</span>
+                        <span class="ds-type">{{ typeLabelKey(ds) | transloco }}</span>
+                      </span>
                       @if (ds.description) {
                         <span class="ds-desc">{{ ds.description }}</span>
                       }
@@ -1542,6 +1605,8 @@ type KeyValueRow = {key: string; value: string};
                         </div>
                       }
                       @if (viewport.isMobile()) {
+                        <!-- Visibility and availability, whose columns a phone hides. -->
+                        <div class="ds-scope-row">
                         <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
                           {{ scopeLabelKey(ds) | transloco }}
                         </app-badge>
@@ -1564,7 +1629,10 @@ type KeyValueRow = {key: string; value: string};
                             </app-badge>
                           }
                         }
+                        </div>
                       }
+                      </div>
+                      </div>
                     </td>
                     <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
                     <td class="col-scope">
@@ -1634,6 +1702,8 @@ type KeyValueRow = {key: string; value: string};
                           }
                         </app-menu>
                       } @else if (canManage(ds)) {
+                        <!-- Two actions in view, the rest behind one menu: a
+                             knowledge base used to show five icons in a row. -->
                         <app-icon-button
                           variant="ghost"
                           size="sm"
@@ -1644,28 +1714,6 @@ type KeyValueRow = {key: string; value: string};
                         >
                           <app-icon size="sm">cable</app-icon>
                         </app-icon-button>
-                        @if (ds.type === 'kb') {
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.reindexTooltip' | transloco"
-                            [tooltip]="'datasources.table.reindexTooltip' | transloco"
-                            [loading]="reindexingIds().has(ds.id)"
-                            (clicked)="reindexDatasource(ds)"
-                          >
-                            <app-icon size="sm">sync</app-icon>
-                          </app-icon-button>
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.fullReindexTooltip' | transloco"
-                            [tooltip]="'datasources.table.fullReindexTooltip' | transloco"
-                            [disabled]="reindexingIds().has(ds.id)"
-                            (clicked)="reindexDatasource(ds, true)"
-                          >
-                            <app-icon size="sm">restart_alt</app-icon>
-                          </app-icon-button>
-                        }
                         @if (canEditRow(ds)) {
                           <app-icon-button
                             variant="ghost"
@@ -1677,16 +1725,38 @@ type KeyValueRow = {key: string; value: string};
                             <app-icon size="sm">edit</app-icon>
                           </app-icon-button>
                         }
-                        @if (canDeleteRow(ds)) {
+                        @if (hasRowMenu(ds)) {
                           <app-icon-button
-                            variant="danger"
+                            variant="ghost"
                             size="sm"
-                            [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
-                            [tooltip]="'datasources.table.deleteTooltip' | transloco"
-                            (clicked)="deleteDatasource(ds)"
+                            data-row-menu
+                            [ariaLabel]="'datasources.table.moreActions' | transloco"
+                            [tooltip]="'datasources.table.moreActions' | transloco"
+                            [loading]="reindexingIds().has(ds.id)"
+                            [appMenuTrigger]="rowMoreMenu"
+                            menuPlacement="bottom-end"
                           >
-                            <app-icon size="sm">delete</app-icon>
+                            <app-icon size="sm">more_vert</app-icon>
                           </app-icon-button>
+                          <!-- One item per block: a block with two roots is
+                               not projected into the menu. -->
+                          <app-menu #rowMoreMenu>
+                            @if (ds.type === 'kb') {
+                              <app-menu-item (activated)="reindexDatasource(ds)">
+                                {{ 'datasources.table.reindexTooltip' | transloco }}
+                              </app-menu-item>
+                            }
+                            @if (ds.type === 'kb') {
+                              <app-menu-item (activated)="reindexDatasource(ds, true)">
+                                {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                              </app-menu-item>
+                            }
+                            @if (canDeleteRow(ds)) {
+                              <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                                {{ 'datasources.table.deleteTooltip' | transloco }}
+                              </app-menu-item>
+                            }
+                          </app-menu>
                         }
                       }
                       <!-- SRW provisions and manages a platform-owned row
@@ -1851,18 +1921,6 @@ type KeyValueRow = {key: string; value: string};
         margin: 0;
       }
 
-      /* Thirteen type chips never fit beside the title, so they take their
-         own row (order + full basis) and the actions stay on the title row —
-         the same shape the Jobs header uses. */
-      .filter-chips {
-        display: flex;
-        gap: 6px;
-        flex-wrap: wrap;
-        order: 1;
-        flex-basis: 100%;
-        min-width: 0;
-      }
-
       .header-actions {
         display: flex;
         gap: 8px;
@@ -1891,29 +1949,109 @@ type KeyValueRow = {key: string; value: string};
         }
       }
 
-      /* Wraps: the six controls need about 1100px in one row, more than the
-         content area has on a laptop with the sidebar open, where a fixed grid
-         pushed the last two selects (and the page) off the right edge. */
-      .catalog-filter-bar {
+      /* The catalog's two views and its three everyday controls on one row;
+         the filters behind the button take the row under it. */
+      .catalog-toolbar {
         display: flex;
+        align-items: center;
+        justify-content: space-between;
         flex-wrap: wrap;
-        gap: 8px;
+        gap: 10px 16px;
         padding: 0 var(--ds-gutter) 0.75rem;
         flex-shrink: 0;
       }
 
-      .catalog-filter-bar > app-input {
-        flex: 1 1 220px;
+      .toolbar-filters {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 1 1 420px;
+        justify-content: flex-end;
         min-width: 0;
+      }
+
+      .toolbar-search {
+        flex: 1 1 200px;
+        max-width: 320px;
+        min-width: 0;
+      }
+
+      .toolbar-type {
+        flex: 0 1 180px;
+        min-width: 0;
+      }
+
+      .filter-count {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 18px;
+        height: 18px;
+        margin-left: 2px;
+        padding: 0 5px;
+        border-radius: var(--radius-pill);
+        background: var(--accent-color);
+        color: var(--app-bg);
+        font-size: 11px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* A grid, so a control left alone on the last row keeps the width of
+         the others instead of stretching across the page. */
+      .catalog-filter-bar {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+        align-items: center;
+        gap: 8px;
+        margin: 0 var(--ds-gutter) 0.75rem;
+        padding: 10px;
+        border: 1px solid var(--border-hairline);
+        border-radius: var(--radius-surface);
+        background: var(--panel-bg);
+        flex-shrink: 0;
       }
 
       .catalog-filter-bar > .catalog-project-filter {
-        flex: 1.2 1 300px;
+        grid-column: span 2;
       }
 
       .catalog-filter-bar > app-select {
-        flex: 1 1 140px;
         min-width: 0;
+      }
+
+      .catalog-filter-bar > app-button {
+        justify-self: start;
+      }
+
+      .view-note {
+        margin: 0;
+        padding: 0 var(--ds-gutter) 0.75rem;
+        max-width: 78ch;
+        font-size: 13px;
+        line-height: 1.45;
+        color: var(--text-muted);
+        flex-shrink: 0;
+      }
+
+      /* Authoring: the form has the page. The browse controls filter a list
+         the open form has taken the place of, so they step aside (they keep
+         their state) and return when it closes. */
+      .form-open app-cloud-root-card,
+      .form-open .catalog-toolbar,
+      .form-open .catalog-filter-bar,
+      .form-open .view-note,
+      .form-open .table-container {
+        display: none;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
       }
 
       .catalog-project-filter {
@@ -1958,7 +2096,7 @@ type KeyValueRow = {key: string; value: string};
          the panel take only the space left over and hand the overflow to
          .form-body, keeping the title and the Test/Cancel/Create bar pinned. */
       .form-panel {
-        margin: 8px var(--ds-gutter) 0;
+        margin: 0 var(--ds-gutter) 1rem;
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-surface);
         background: var(--panel-bg);
@@ -1966,24 +2104,48 @@ type KeyValueRow = {key: string; value: string};
         flex-direction: column;
         flex: 0 1 auto;
         min-height: 0;
+        /* A form reads badly at the full width of a wide window. */
+        width: min(100% - 2 * var(--ds-gutter), 860px);
       }
 
       .form-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 10px 14px;
+        padding: 12px 16px;
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         font-weight: 600;
-        font-size: 13px;
+        font-size: 15px;
         color: var(--text-primary, var(--text-primary));
         flex-shrink: 0;
       }
 
+      /* The fields stood edge to edge; a column with one gap spaces every
+         field and row alike. */
       .form-body {
-        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 16px;
         overflow-y: auto;
         min-height: 0;
+      }
+
+      /* The column scrolls; nothing in it gives up height. Without this a
+         row that clips its overflow (.form-row) shrinks to nothing once the
+         form is taller than the panel. */
+      .form-body > * {
+        flex-shrink: 0;
+      }
+
+      /* A note or a row of buttons that follows a field belongs to it: it
+         keeps its own small distance instead of the gap between fields. */
+      .form-body > .form-hint,
+      .form-body > .credential-retain-hint,
+      .form-body > .trust-notice,
+      .form-body > .ssh-key-actions,
+      .form-body > .cred-file-actions {
+        margin-top: -8px;
       }
 
       .form-row {
@@ -2401,6 +2563,13 @@ type KeyValueRow = {key: string; value: string};
         flex: 1;
         color: var(--text-muted);
         font-size: 13px;
+        text-align: center;
+      }
+
+      .empty-title {
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text-primary);
       }
 
       .empty-icon {
@@ -2409,8 +2578,9 @@ type KeyValueRow = {key: string; value: string};
       }
 
       .hint {
-        font-size: 11px;
-        opacity: 0.7;
+        max-width: 56ch;
+        font-size: 13px;
+        line-height: 1.45;
       }
 
       /* Table
@@ -2458,14 +2628,67 @@ type KeyValueRow = {key: string; value: string};
         margin-right: 4px;
       }
 
-      /* Name cell */
+      /* Name cell: icon, then the name with its type beside it, then what the
+         connector is for. The same anatomy as a row of a project's Connectors
+         tab. */
       .name-cell {
-        min-width: 200px;
+        min-width: 260px;
+      }
+
+      .name-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+      }
+
+      /* As tall as the icon at least, so a row with a name and nothing under
+         it sits level with its icon rather than above it. */
+      .name-text {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        flex: 1;
+        min-width: 0;
+        min-height: 32px;
+      }
+
+      .ds-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        flex-shrink: 0;
+        border-radius: var(--radius-control);
+        background: var(--surface-1);
+        color: var(--text-secondary);
+      }
+
+      .ds-icon[data-type='kb'] { color: var(--accent-color); }
+      .ds-icon[data-type='postgresql'],
+      .ds-icon[data-type='repository'],
+      .ds-icon[data-type='mcp'],
+      .ds-icon[data-type^='cloud_'] { color: var(--info); }
+      .ds-icon[data-type='neo4j'] { color: var(--success); }
+      .ds-icon[data-type='email'],
+      .ds-icon[data-type='webdav'] { color: var(--warning); }
+
+      .ds-title {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 0 8px;
       }
 
       .ds-name {
-        display: block;
-        font-weight: 500;
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+
+      .ds-type {
+        font-size: 12px;
+        color: var(--text-muted);
+        white-space: nowrap;
       }
 
       .ds-desc {
@@ -2475,8 +2698,9 @@ type KeyValueRow = {key: string; value: string};
         line-clamp: 2;
         overflow: hidden;
         margin-top: 2px;
-        font-size: 11px;
-        line-height: 1.4;
+        max-width: 72ch;
+        font-size: 12px;
+        line-height: 1.45;
         color: var(--text-muted);
       }
 
@@ -2497,7 +2721,7 @@ type KeyValueRow = {key: string; value: string};
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        font-size: 10px;
+        font-size: 11px;
       }
 
       .index-status-detail {
@@ -2587,86 +2811,54 @@ type KeyValueRow = {key: string; value: string};
       .inline-test.test-unsupported { color: var(--text-muted); }
 
       /* ===== Mobile (≤768px) =====
-         This page never had a responsive pass. Mirror the Jobs header (a single
-         horizontally-scrollable chip strip with a right edge-fade) and shrink the
-         table so it fits without horizontal scroll (the row actions collapse into a
-         ⋯ overflow menu in the template). 768px matches ViewportService.isMobile(). */
+         The toolbar wraps onto two rows and the table shrinks to the name and a
+         kebab, so nothing scrolls sideways (the row actions collapse into a ⋯
+         overflow menu in the template). 768px matches ViewportService.isMobile(). */
       @media (max-width: 768px) {
         :host {
           --ds-gutter: 12px;
         }
 
         .catalog-filter-bar {
-          display: grid;
           grid-template-columns: 1fr 1fr;
         }
 
-        /* The browse controls cost ~215px of an 800px phone viewport (a 165px
-           3-row filter grid + the 32px chip strip), which came straight out of
-           the form's scroll window. They filter a list the open form has already
-           squeezed to nothing, so drop them while authoring and give the height
-           to the fields. Everything returns when the form closes. */
-        .form-open .catalog-filter-bar,
-        .form-open .filter-chips {
-          display: none;
-        }
-        /* Filter chips: scroll sideways instead of overflowing 599px and getting
-           clipped by :host{overflow:hidden}. order:1 + flex-basis:100% drops the
-           strip onto its own row below the title + actions. */
-        .filter-chips {
-          order: 1;
+        /* The views take the first row, the search and type the second. */
+        .toolbar-filters {
           flex-basis: 100%;
-          min-width: 0;
-          flex-wrap: nowrap;
-          overflow-x: auto;
-          -webkit-overflow-scrolling: touch;
-          scrollbar-width: none;
-          padding-bottom: 2px;
-          -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
-          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+          flex-wrap: wrap;
+          justify-content: flex-start;
         }
 
-        .filter-chips::-webkit-scrollbar {
-          display: none;
+        .toolbar-search {
+          flex-basis: 100%;
+          max-width: none;
         }
 
-        .filter-chips app-chip {
-          flex-shrink: 0;
+        .toolbar-type {
+          flex: 1 1 140px;
         }
 
-        /* Trailing space so the last chip clears the fade when scrolled fully right. */
-        .filter-chips app-chip:last-child {
-          margin-right: 28px;
+        .form-panel {
+          width: auto;
         }
 
-        /* Compact the chips for the scroll strip (the global mobile rule gives
-           selectable chips a chunky 44px target). Scoped local to this strip. */
-        .filter-chips ::ng-deep .app-chip__btn[data-selectable] {
-          min-height: 0;
-          height: 30px;
-          padding: 0 7px;
-          font-size: 10px;
-        }
-
-        /* Drop the low-value (masked + truncated) URL column, and the Scope column
-           (scope is folded into the name cell as a badge below) so Type / Name +
-           the kebab fit without horizontal scroll. URL stays editable in the form. */
+        /* Drop the low-value (masked + truncated) URL column, and the Visibility
+           and Availability columns (both fold into the name cell as badges
+           below), so the name and the kebab fit without horizontal scroll. */
         .col-url,
         .col-scope,
         .col-availability {
           display: none;
         }
 
-        /* Fixed layout so the three remaining columns share the phone width:
-           under auto layout the type badge alone took 183px and pushed the
-           actions column (the kebab) off-screen (measured 461px in 390px). */
+        /* Fixed layout: the name takes what the 48px kebab column leaves. */
         .ds-table {
           table-layout: fixed;
         }
 
-        .ds-table th:first-child,
-        .ds-table td:first-child {
-          width: 32%;
+        .name-cell {
+          min-width: 0;
         }
 
         .ds-table th:last-child,
@@ -2675,37 +2867,17 @@ type KeyValueRow = {key: string; value: string};
           padding-inline: 4px;
         }
 
-        /* A lone kebab column: the "Actions" label doesn't fit 48px and clipped
-           at the screen edge (same trick as the jobs table; the text stays in
-           the accessibility tree). */
-        .ds-table th:last-child {
-          font-size: 0;
-        }
-
-        /* The type badge wraps to a second line in its narrower column
-           (same treatment the project cards give their badges). */
-        .ds-table td:first-child app-badge {
-          white-space: normal;
-          height: auto;
-          min-height: 20px;
-          padding-block: 2px;
-          line-height: 1.25;
-        }
-
-        /* The badge's icon costs 20px of a 90px column: without it the longest
-           word of a type label ("Knowledge") stays inside the cell. */
-        .ds-table td:first-child app-badge app-icon {
-          display: none;
-        }
-
         /* The kebab is the whole 48px actions column. A managed row's menu
            simply has no edit or delete entry. */
         .managed-note {
           display: none;
         }
 
-        /* Scope shown inline under the name on mobile (its own column is hidden). */
-        .ds-scope-inline {
+        /* Scope shown under the name on mobile (its own column is hidden). */
+        .ds-scope-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
           margin-top: 4px;
         }
 
@@ -2862,6 +3034,12 @@ export class DatasourceListComponent implements OnInit {
   // State signals
   readonly datasources = signal<Datasource[]>([]);
   readonly isLoading = signal(false);
+  /** Which half of the catalog is listed: the connectors people made, or the
+   *  ones SRW keeps for a project or a user. */
+  readonly catalogView = signal<CatalogView>('yours');
+  /** Whether the less used filters (project, availability, default,
+   *  ownership, visibility) are shown. */
+  readonly filtersOpen = signal(false);
   readonly typeFilter = signal<string>('all');
   readonly catalogSearch = signal('');
   readonly scopeFilter = signal<'all' | 'scope-all' | 'projects' | 'unavailable'>('all');
@@ -3005,9 +3183,33 @@ export class DatasourceListComponent implements OnInit {
   // Computed filtered list
   readonly filteredDatasources = computed(() => {
     const filter = this.typeFilter();
-    const all = this.datasources();
+    // The server splits the catalog (`managed`); the same split here covers
+    // the unpaged legacy list and an orchestrator that predates the filter.
+    const managed = this.catalogView() === 'managed';
+    const all = this.datasources().filter((ds) => isPlatformOwned(ds) === managed);
     if (filter === 'all') return all;
     return all.filter((ds) => ds.type === filter);
+  });
+
+  /** How many of the filters behind the Filters button are set. */
+  readonly activeFilterCount = computed(
+    () =>
+      [
+        this.catalogProjectId() !== '',
+        this.scopeFilter() !== 'all',
+        this.automaticFilter() !== 'all',
+        this.ownershipFilter() !== 'all',
+        this.visibilityFilter() !== 'all',
+      ].filter(Boolean).length,
+  );
+
+  /** Why the list is empty: something narrows it, SRW keeps nothing for this
+   *  user yet, or they have made no connector. */
+  readonly emptyKind = computed<'filtered' | 'managed' | 'none'>(() => {
+    if (this.catalogSearch().trim() || this.typeFilter() !== 'all' || this.activeFilterCount() > 0) {
+      return 'filtered';
+    }
+    return this.catalogView() === 'managed' ? 'managed' : 'none';
   });
 
   // URL placeholder based on type
@@ -3441,6 +3643,7 @@ export class DatasourceListComponent implements OnInit {
     if (ownership !== 'all') filters.ownership = ownership;
     const visibility = this.visibilityFilter();
     if (visibility !== 'all') filters.visibility = visibility;
+    filters.managed = this.catalogView() === 'managed';
     return filters;
   }
 
@@ -3458,6 +3661,43 @@ export class DatasourceListComponent implements OnInit {
   onTypeFilter(value: string): void {
     this.typeFilter.set(value);
     this.refresh();
+  }
+
+  onCatalogView(value: CatalogView | null): void {
+    const view: CatalogView = value === 'managed' ? 'managed' : 'yours';
+    if (view === this.catalogView()) return;
+    this.catalogView.set(view);
+    this.refresh();
+  }
+
+  toggleFilters(): void {
+    this.filtersOpen.update((open) => !open);
+  }
+
+  /** Back to the whole view: the search, the type and every filter behind
+   *  the Filters button. One request, not one per filter. */
+  clearFilters(): void {
+    if (this.catalogSearchTimer) clearTimeout(this.catalogSearchTimer);
+    this.catalogSearch.set('');
+    this.typeFilter.set('all');
+    this.catalogProjectId.set('');
+    this.scopeFilter.set('all');
+    this.automaticFilter.set('all');
+    this.ownershipFilter.set('all');
+    this.visibilityFilter.set('all');
+    this.refresh();
+  }
+
+  /** What a row is, beside its name: what a connector SRW keeps is to its
+   *  project or user ("Project folder"), else the connector type. */
+  typeLabelKey(ds: Datasource): string {
+    return platformKindLabelKey(ds) ?? 'datasources.filter.' + ds.type;
+  }
+
+  /** Whether a row has anything behind its menu: the two reindex actions of
+   *  a knowledge base, and Delete where the row may be deleted. */
+  hasRowMenu(ds: Datasource): boolean {
+    return ds.type === 'kb' || this.canDeleteRow(ds);
   }
 
   onCatalogSearch(value: string): void {
@@ -4050,7 +4290,10 @@ export class DatasourceListComponent implements OnInit {
     if (!canSeeCompleteScope || (ds.project_count === undefined && ds.project_ids === undefined)) {
       return this.transloco.translate('datasources.table.availabilityScoped');
     }
-    return this.transloco.translate('datasources.table.availabilityProjects', {count});
+    return this.transloco.translate(
+      count === 1 ? 'datasources.table.availabilityProject' : 'datasources.table.availabilityProjects',
+      {count},
+    );
   }
 
   availabilityTone(ds: Datasource): BadgeTone {

@@ -3078,6 +3078,25 @@
     }
   },
   "datasources": {
+    "view": {
+      "yours": "Deine Konnektoren",
+      "managed": "Von SRW verwaltet",
+      "managedHint": "Ordner und Knowledge Bases, die SRW für deine Projekte angelegt hat, und deine eigene Cloud. SRW verwaltet sie: Sie werden hier weder bearbeitet noch gelöscht. Die eines Projekts richtest du in dessen Tab „Konnektoren“ ein."
+    },
+    "empty": {
+      "none": {
+        "title": "Noch keine Konnektoren",
+        "hint": "Ein Konnektor gibt Agenten eine Datenbank, ein Repository, ein Postfach oder einen anderen Dienst, mit dem sie arbeiten können."
+      },
+      "managed": {
+        "title": "Noch nichts von SRW verwaltet",
+        "hint": "Die Ordner und die Knowledge Base eines Projekts erscheinen hier, sobald das Projekt besteht."
+      },
+      "filtered": {
+        "title": "Kein Konnektor passt",
+        "hint": "Nichts passt zur gesetzten Suche und zu den Filtern."
+      }
+    },
     "driversLink": "Treiber-Fähigkeiten",
     "driversLinkHint": "Was jeder Konnektortreiber anbietet und was es durchsetzt",
     "driverEnvNames": "Setzt:",
@@ -3176,7 +3195,10 @@
       "public": "Öffentlich",
       "loadMore": "Mehr laden",
       "loadFailed": "Der Konnektoren-Katalog konnte nicht geladen werden. Bitte erneut versuchen.",
-      "loadMoreFailed": "Weitere Konnektoren konnten nicht geladen werden."
+      "loadMoreFailed": "Weitere Konnektoren konnten nicht geladen werden.",
+      "anyType": "Alle Typen",
+      "filters": "Filter",
+      "clearFilters": "Filter zurücksetzen"
     },
     "form": {
       "editTitle": "Konnektor bearbeiten",
@@ -3395,8 +3417,6 @@
     },
     "table": {
       "loading": "Konnektoren werden geladen...",
-      "empty": "Keine Konnektoren gefunden",
-      "emptyHint": "Erstellen Sie einen Konnektor, um Agenten mit externen Systemen und Daten zu verbinden",
       "colType": "Typ",
       "colName": "Name",
       "colUrl": "URL",
@@ -3409,6 +3429,7 @@
       "scopePrivate": "Privat",
       "availabilityAll": "Alle Projekte",
       "availabilityScoped": "Projektbezogen",
+      "availabilityProject": "1 Projekt",
       "availabilityProjects": "{{count}} Projekte",
       "availabilityNone": "Nicht verfügbar",
       "badgeAuto": "Auto",

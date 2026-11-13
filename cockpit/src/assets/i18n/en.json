@@ -3078,6 +3078,25 @@
     }
   },
   "datasources": {
+    "view": {
+      "yours": "Your connectors",
+      "managed": "Kept by SRW",
+      "managedHint": "Folders and knowledge bases SRW created for your projects, and your own cloud. SRW keeps them: they are not edited or deleted here. A project's are set up on its Connectors tab."
+    },
+    "empty": {
+      "none": {
+        "title": "No connectors yet",
+        "hint": "A connector gives agents a database, a repository, a mailbox or another service to work with."
+      },
+      "managed": {
+        "title": "Nothing kept by SRW yet",
+        "hint": "A project's folders and knowledge base appear here once the project exists."
+      },
+      "filtered": {
+        "title": "No connector matches",
+        "hint": "Nothing fits the search and filters that are set."
+      }
+    },
     "driversLink": "Driver capabilities",
     "driversLinkHint": "What each connector driver offers, and what enforces it",
     "driverEnvNames": "Sets:",
@@ -3176,7 +3195,10 @@
       "public": "Public",
       "loadMore": "Load more",
       "loadFailed": "Could not load the connector catalog. Try again.",
-      "loadMoreFailed": "Could not load more connectors."
+      "loadMoreFailed": "Could not load more connectors.",
+      "anyType": "All types",
+      "filters": "Filters",
+      "clearFilters": "Clear filters"
     },
     "form": {
       "editTitle": "Edit Connector",
@@ -3395,8 +3417,6 @@
     },
     "table": {
       "loading": "Loading connectors...",
-      "empty": "No connectors found",
-      "emptyHint": "Create a connector to give agents access to external systems and data",
       "colType": "Type",
       "colName": "Name",
       "colUrl": "URL",
@@ -3409,6 +3429,7 @@
       "scopePrivate": "Private",
       "availabilityAll": "All projects",
       "availabilityScoped": "Project scoped",
+      "availabilityProject": "1 project",
       "availabilityProjects": "{{count}} projects",
       "availabilityNone": "Unavailable",
       "badgeAuto": "Auto",

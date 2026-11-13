@@ -1173,6 +1173,9 @@ describe('DatasourceListComponent availability policy', () => {
     );
     expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 2}))
       .toBe('datasources.table.availabilityProjects');
+    // One project is "1 project", not "1 projects".
+    expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 1}))
+      .toBe('datasources.table.availabilityProject');
     expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 0}))
       .toBe('datasources.table.availabilityNone');
   });
@@ -1894,5 +1897,164 @@ describe('DatasourceListComponent managed MCP servers', () => {
         credentials: {token: 'gitea-token'},
       }),
     );
+  });
+});
+
+describe('DatasourceListComponent catalog views and filters', () => {
+  const PROJECT = '33333333-3333-3333-3333-333333333333';
+  const OWN = kbDatasource({id: 'own-pg', name: 'Sales database', type: 'postgresql'});
+  const OWN_KB = kbDatasource({id: 'own-kb', name: 'Handbook'});
+  const FOLDER = kbDatasource({
+    id: 'folder',
+    name: 'Atlas cloud folder (11111111)',
+    type: 'cloud_folder',
+    managed_key: `project-cloud:${PROJECT}`,
+  });
+  const PROJECT_KB = kbDatasource({
+    id: 'project-kb',
+    name: 'Atlas Knowledge (11111111)',
+    managed_key: `project-kb:${PROJECT}`,
+  });
+
+  it('opens on the connectors people made and asks the server for those only', () => {
+    const {api, component} = createComponent();
+    component.refresh();
+
+    expect(component.catalogView()).toBe('yours');
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: false}),
+    );
+  });
+
+  it('lists what SRW keeps in a view of its own, one request per switch', () => {
+    const {api, component} = createComponent();
+    component.refresh();
+    const before = api.getDatasourceCatalog.mock.calls.length;
+
+    component.onCatalogView('managed');
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: true}),
+    );
+    // Choosing the view that is already shown asks for nothing.
+    component.onCatalogView('managed');
+    expect(api.getDatasourceCatalog.mock.calls.length).toBe(before + 1);
+
+    component.onCatalogView('yours');
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: false}),
+    );
+  });
+
+  it('splits the rows itself too, for the legacy list and an older orchestrator', () => {
+    // Policy off: one unpaged list of everything the user may see.
+    const {component} = createComponent(false);
+    component.datasources.set([FOLDER, OWN, PROJECT_KB, OWN_KB]);
+
+    expect(component.filteredDatasources().map((ds) => ds.id)).toEqual(['own-pg', 'own-kb']);
+    component.catalogView.set('managed');
+    expect(component.filteredDatasources().map((ds) => ds.id)).toEqual(['folder', 'project-kb']);
+  });
+
+  it('keeps the type filter inside the view', () => {
+    const {component} = createComponent(false);
+    component.datasources.set([FOLDER, OWN, PROJECT_KB, OWN_KB]);
+    component.typeFilter.set('kb');
+
+    expect(component.filteredDatasources().map((ds) => ds.id)).toEqual(['own-kb']);
+    component.catalogView.set('managed');
+    expect(component.filteredDatasources().map((ds) => ds.id)).toEqual(['project-kb']);
+  });
+
+  it('counts the filters behind the Filters button, not the search or the type', () => {
+    const {component} = createComponent();
+    expect(component.activeFilterCount()).toBe(0);
+
+    component.catalogSearch.set('sales');
+    component.typeFilter.set('postgresql');
+    expect(component.activeFilterCount()).toBe(0);
+
+    component.ownershipFilter.set('mine');
+    component.visibilityFilter.set('public');
+    component.catalogProjectId.set('project-a');
+    expect(component.activeFilterCount()).toBe(3);
+  });
+
+  it('clears the search, the type and every filter with one request', () => {
+    const {api, component} = createComponent();
+    component.catalogSearch.set('sales');
+    component.typeFilter.set('postgresql');
+    component.ownershipFilter.set('mine');
+    component.scopeFilter.set('projects');
+    component.automaticFilter.set('manual');
+    component.visibilityFilter.set('private');
+    component.catalogProjectId.set('project-a');
+    component.catalogView.set('managed');
+    const before = api.getDatasourceCatalog.mock.calls.length;
+
+    component.clearFilters();
+
+    expect(api.getDatasourceCatalog.mock.calls.length).toBe(before + 1);
+    // The view is not a filter: clearing stays in it.
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith({limit: 50, managed: true});
+    expect(component.activeFilterCount()).toBe(0);
+    expect(component.catalogSearch()).toBe('');
+    expect(component.typeFilter()).toBe('all');
+  });
+
+  it('says why the list is empty', () => {
+    const {component} = createComponent();
+    expect(component.emptyKind()).toBe('none');
+
+    component.catalogView.set('managed');
+    expect(component.emptyKind()).toBe('managed');
+
+    component.catalogSearch.set('nothing like this');
+    expect(component.emptyKind()).toBe('filtered');
+    component.catalogSearch.set('');
+    component.typeFilter.set('neo4j');
+    expect(component.emptyKind()).toBe('filtered');
+    component.typeFilter.set('all');
+    component.visibilityFilter.set('public');
+    expect(component.emptyKind()).toBe('filtered');
+  });
+
+  it('names a row SRW keeps for what it is, and any other by its type', () => {
+    const {component} = createComponent();
+    expect(component.typeLabelKey(FOLDER)).toBe('datasources.platform.kind.projectCloud');
+    expect(component.typeLabelKey(PROJECT_KB)).toBe('datasources.platform.kind.projectKb');
+    expect(component.typeLabelKey(OWN)).toBe('datasources.filter.postgresql');
+  });
+
+  it('gives a row a menu only when something is behind it', () => {
+    const {component} = createComponent();
+    // Delete, for a connector its user made.
+    expect(component.hasRowMenu(OWN)).toBe(true);
+    // The two reindex actions, for a knowledge base SRW keeps (no Delete).
+    expect(component.canDeleteRow(PROJECT_KB)).toBe(false);
+    expect(component.hasRowMenu(PROJECT_KB)).toBe(true);
+    // Nothing, for a folder SRW keeps.
+    expect(component.hasRowMenu(FOLDER)).toBe(false);
+  });
+
+  it('has the strings of both views, the filters and the three empty states in English and German', () => {
+    for (const bundle of [en, de]) {
+      const strings = (bundle as unknown as {
+        datasources: {
+          view: Record<string, string>;
+          catalog: Record<string, string>;
+          empty: Record<string, {title: string; hint: string}>;
+        };
+      }).datasources;
+      for (const key of ['yours', 'managed', 'managedHint']) {
+        expect(strings.view[key], key).toBeTruthy();
+      }
+      for (const key of ['anyType', 'filters', 'clearFilters']) {
+        expect(strings.catalog[key], key).toBeTruthy();
+      }
+      for (const kind of ['none', 'managed', 'filtered']) {
+        expect(strings.empty[kind].title, kind).toBeTruthy();
+        expect(strings.empty[kind].hint, kind).toBeTruthy();
+      }
+    }
   });
 });
