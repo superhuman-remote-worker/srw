@@ -1275,7 +1275,8 @@ async def update_project_datasource(
 ) -> dict[str, str]:
     """Update project-level settings for a linked connector. F3: project owner only.
 
-    Pass null to clear an override and fall back to connector defaults.
+    A partial update: a field the request leaves out is left as it is. Pass
+    null to clear an override and fall back to connector defaults.
     """
     store = dependencies.store
 
@@ -1296,13 +1297,25 @@ async def update_project_datasource(
         # level that says it writes nothing.
         raise HTTPException(status_code=409, detail=managed_refusal(ds, "link_access"))
     read_only, access = _link_access_settings(ds, body)
-    effective_read_only = True if _link_forced_read_only(ds) else read_only
+    sent = body.model_fields_set
+    # The store writes every field it is handed, so a field the request left
+    # out must reach it as "unchanged" (...), not as None. Before, a note edit
+    # reset a read-only link to its connector's default (read-write), and an
+    # access change wiped the note.
+    stored_read_only: Any
+    if _link_forced_read_only(ds):
+        stored_read_only = True
+    elif spec is not None and strict_access(spec):
+        # A strict link holds a level, never the boolean: kept NULL.
+        stored_read_only = None
+    else:
+        stored_read_only = read_only if "read_only" in sent else ...
     try:
         success = await store.update_project_datasource(
             project_id,
             datasource_id,
-            read_only=effective_read_only,
-            description=body.description,
+            read_only=stored_read_only,
+            description=body.description if "description" in sent else ...,
             access=access,
             authority_user_id=str(user["id"]),
             authority_is_admin=bool(user.get("is_admin")),
