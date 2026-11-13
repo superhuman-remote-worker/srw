@@ -1795,6 +1795,51 @@ class TestPersistentLoopMemoryOutboxWiring:
             release.set()
             await loop_task
 
+    @pytest.mark.asyncio
+    async def test_session_transport_closes_unrun_calls(self, monkeypatch):
+        """The Session transport has its turns write a ``not_run`` result for
+        each call they leave un-run, read from the gate's recorded status."""
+        from agent.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        captured = {}
+        release = asyncio.Event()
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+
+            async def wait_for_release():
+                await release.wait()
+
+            return wait_for_release()
+
+        async def no_completion_cleanup(_task):
+            return None
+
+        session = MagicMock()
+        session.thread_id = "tid"
+        session.tool_decisions = {"x": "expired"}
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
+            patch.object(pa, "_loop_task", None),
+            patch.object(pa, "_session_ready", return_value=True),
+            patch.object(pa, "run_persistent_loop", new=fake_run),
+            patch.object(
+                pa._session_termination,
+                "loop_completion_handler",
+                no_completion_cleanup,
+            ),
+        ):
+            assert pa._ensure_persistent_loop_started("test") is True
+            loop_task = pa._loop_task
+            callbacks = captured["callbacks"]
+            assert callbacks.close_unrun_calls is True
+            assert callbacks.permission_no_answer_status("x") == "expired"
+            assert callbacks.permission_no_answer_status("unknown") is None
+            release.set()
+            await loop_task
+
 
 # ---------------------------------------------------------------------------
 # 3.4a _persist_one_message() + _loop_persist_message() — incremental (Phase 2)

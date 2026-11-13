@@ -86,6 +86,11 @@ from agent.services.image_content import (
     make_multimodal_user_message,
     resolve_image_max_edge,
 )
+from agent.unrun_tool_calls import (
+    SKIPPED_TURN_ENDED,
+    gated_call_text,
+    interrupted_call_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +629,19 @@ class PersistentLoopCallbacks:
     announce_permission_batch: Optional[
         Callable[[List[Dict[str, Any]]], Awaitable[None]]
     ] = None
+
+    # A turn that ends before a call runs (an unanswered approval, or an
+    # interrupt between tools) writes a ``not_run`` result for each call it
+    # leaves un-run (agent/unrun_tool_calls.py). A Session sets it: a call
+    # without a result is tool debt, which stops the stateless executor that
+    # claims the next message. False keeps the previous behaviour (subagents):
+    # no result, and an interruption event for the unexecuted calls.
+    close_unrun_calls: bool = False
+
+    # The final status of an unanswered approval ('expired', 'interrupted',
+    # 'unavailable', ...) by tool_call_id, read for the text of its
+    # ``not_run`` result. Optional: None ⇒ the neutral "not answered" text.
+    permission_no_answer_status: Optional[Callable[[str], Optional[str]]] = None
 
     # P0 Officer runtime-grant gate. Called after the accepted input is added
     # to truthful durable history but before retrieval, compaction, SITREP
@@ -2591,6 +2609,50 @@ async def _execute_turn(
                     exc_info=True,
                 )
 
+    def _interrupt_cause() -> Optional[str]:
+        """Who asked for the pending interrupt, without consuming it.
+
+        Read it before ``check_interrupt``, which consumes the interrupt.
+        Without ``peek_interrupt_cause`` every interrupt is a person's Stop.
+        """
+        peek = callbacks.peek_interrupt_cause
+        return peek() if peek is not None else USER_INTERRUPT_CAUSE
+
+    async def _close_unrun_calls(closing: Sequence[tuple[str, str]]) -> int:
+        """Write a ``not_run`` result for each ``(call_id, text)`` pair.
+
+        The calls this turn ends before running each get a truthful result
+        row, so the turn leaves no tool debt (agent/unrun_tool_calls.py). As
+        for the calls a workspace loss never started: no result frame, and a
+        row that cannot be saved is logged while the turn still ends. Returns
+        the number of rows added to the history.
+        """
+
+        added = 0
+        for call_id, content in closing:
+            if not call_id:
+                continue
+            message = _adopt(
+                _ensure_msg_id(
+                    ToolMessage(
+                        content=content,
+                        tool_call_id=call_id,
+                        additional_kwargs={TOOL_RESULT_STATE_KEY: RESULT_NOT_RUN},
+                    )
+                )
+            )
+            messages.append(message)
+            added += 1
+            try:
+                await _persist(message)
+            except Exception:
+                logger.warning(
+                    "Could not record the not-run result of %s",
+                    call_id,
+                    exc_info=True,
+                )
+        return added
+
     # --- Memory retrieval (once per turn, before the inner loop) ---
     charter_block = ""
     # The store records behind each kind, in rank order (the planner's
@@ -4407,9 +4469,31 @@ async def _execute_turn(
         for i, tool_call in enumerate(
             [] if _execute_delegation_batch else response.tool_calls
         ):
-            # Check for interrupt before each tool
+            # Check for interrupt before each tool. A Session reads who asked
+            # first: check_interrupt consumes the interrupt.
+            cause = _interrupt_cause() if callbacks.close_unrun_calls else None
             if callbacks.check_interrupt():
                 logger.info(f"Interrupt received before tool {tool_call['name']}")
+                if callbacks.close_unrun_calls:
+                    # This call and the rest of the batch never start. Their
+                    # results go before the batch's images, so every result
+                    # still follows the assistant message directly.
+                    text = interrupted_call_text(
+                        user_stop=cause == USER_INTERRUPT_CAUSE
+                    )
+                    messages_added += await _close_unrun_calls(
+                        [
+                            (str(call.get("id") or ""), text)
+                            for call in response.tool_calls[i:]
+                        ]
+                    )
+                    messages_added += await _flush_batch_images()
+                    return TurnResult(
+                        turn_id=0,
+                        messages_added=messages_added,
+                        tool_calls_made=tool_calls_made,
+                        interrupted=True,
+                    )
                 messages_added += await _flush_batch_images()
                 await _record_unexecuted_tool_batch(
                     list(response.tool_calls[i:]),
@@ -4501,13 +4585,15 @@ async def _execute_turn(
                 continue
 
             if outcome is PermissionOutcome.NO_ANSWER:
-                # The gate was never answered (TTL elapsed, or the approval
-                # card never reached the browser). Park the turn: write NO
-                # ToolMessage and leave this call and every call after it
-                # un-run. Returning is the whole handling — the turn ends
-                # here, and the transport's on_turn_complete retires the
-                # announced rows for the calls we never reached so they
-                # can't resurface as an approval card that runs nothing.
+                # The gate was never answered (TTL elapsed, the approval card
+                # never reached the browser, or a Stop or platform abort ended
+                # the wait). Park the turn: this call and every call after it
+                # stay un-run, and the turn ends here. The transport's
+                # on_turn_complete retires the announced rows for the calls
+                # we never reached so they can't resurface as an approval
+                # card that runs nothing. A Session (close_unrun_calls) gives
+                # each of them a not_run result, never a refusal; without it
+                # no ToolMessage is written.
                 logger.info(
                     "Permission gate unanswered for tool %s (%s) — parking turn; "
                     "%d call(s) left ungated",
@@ -4515,6 +4601,24 @@ async def _execute_turn(
                     tool_call_id,
                     len(response.tool_calls) - i,
                 )
+                if callbacks.close_unrun_calls:
+                    status_of = callbacks.permission_no_answer_status
+                    status = status_of(tool_call_id) if status_of is not None else None
+                    # 'interrupted' is a person's Stop only when one is
+                    # pending; a lease loss or an owner-fence rejection
+                    # reports it too, with no person's Stop behind it.
+                    user_stop = (
+                        status == "interrupted"
+                        and _interrupt_cause() == USER_INTERRUPT_CAUSE
+                    )
+                    closing = [
+                        (tool_call_id, gated_call_text(status, user_stop=user_stop))
+                    ]
+                    closing.extend(
+                        (str(call.get("id") or ""), SKIPPED_TURN_ENDED)
+                        for call in response.tool_calls[i + 1 :]
+                    )
+                    messages_added += await _close_unrun_calls(closing)
                 messages_added += await _flush_batch_images()
                 return TurnResult(
                     turn_id=0,

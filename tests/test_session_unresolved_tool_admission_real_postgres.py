@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent.api import turn_executor as te
+from agent.unrun_tool_calls import NOT_RUN_STOPPED_AT_APPROVAL
 from orchestrator.services.stateless_queue_state import queue_block
 from shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
@@ -253,6 +254,38 @@ async def test_unresolved_debt_cannot_retire_an_older_active_record(db, monkeypa
     assert ex._stop.is_set()
     assert await rows(db, thread) == before
     ex._quiesce_claim_before_transition.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_not_run_result_clears_debt_and_admits_the_next_claim(db, monkeypatch):
+    """The 2026-11-09 incident shape, with the fix: the turn that left the
+    approval unanswered wrote a ``not_run`` result for the call, so the next
+    claim finds no tool debt and the executor keeps serving."""
+    thread, claim = await seed(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO thread_messages(id,thread_id,role,content,tool_call_id,turn_number) "
+            "VALUES($1,$2,'tool',$3,'original_call',1)",
+            uuid4(),
+            thread,
+            NOT_RUN_STOPPED_AT_APPROVAL,
+        )
+        await conn.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1",
+            thread,
+            json.dumps(
+                {
+                    "_stateless_active_claim": {
+                        "lease_token": claim.lease_token - 1,
+                        "pod": POD,
+                        "pod_uid": POD_UID,
+                    }
+                }
+            ),
+        )
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._admit_session_tool_history(pa, claim) is True
+    assert ex._stop.is_set() is False
 
 
 @pytest.mark.asyncio

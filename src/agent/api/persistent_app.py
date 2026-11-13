@@ -1280,6 +1280,13 @@ def _ensure_persistent_loop_started(
             on_tool_result=_loop_on_tool_result,
             permission_check=_loop_permission_check,
             announce_permission_batch=_loop_announce_permission_batch,
+            # A call a turn leaves un-run gets a not_run result: without one
+            # it is tool debt, which stops the executor claiming the next
+            # message. The gate records each call's final status.
+            close_unrun_calls=True,
+            permission_no_answer_status=lambda call_id: (
+                _session.tool_decisions.get(call_id) if _session is not None else None
+            ),
             current_permission_mode=_loop_current_permission_mode,
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
