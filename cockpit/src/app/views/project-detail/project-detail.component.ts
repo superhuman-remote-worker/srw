@@ -754,12 +754,13 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                                   (keydown.escape)="editingLinkNote.set(null)"
                                 />
                               } @else {
+                                <!-- Named by its text (the note itself); the
+                                     tooltip says that a click edits it. -->
                                 <button
                                   type="button"
                                   class="cx-note"
                                   data-link-note
                                   [class.cx-note--empty]="!(ds.project_description || ds.description)"
-                                  [attr.aria-label]="'projectDetail.datasources.editNote' | transloco"
                                   [title]="'projectDetail.datasources.editNote' | transloco"
                                   (click)="startLinkNoteEdit(ds.id)"
                                 >
