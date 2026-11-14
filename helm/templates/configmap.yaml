@@ -336,6 +336,9 @@ data:
   AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
   AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
   AUDIT_POSTGRES_SSLMODE: {{ .Values.databases.audit.sslMode | default "prefer" | quote }}
+  # Tool steps keep their full arguments and result in agent_audit when on
+  # (agent.core.archiver.full_tool_io_enabled).
+  AUDIT_FULL_TOOL_IO: {{ .Values.agent.auditFullToolIo | default "false" | quote }}
 
   # App-DB asyncpg pool sizing for provisioned agent pods, which inherit this
   # ConfigMap via envFrom. Kept SMALL on purpose: the connection multiplier is

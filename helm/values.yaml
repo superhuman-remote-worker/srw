@@ -1010,6 +1010,14 @@ agent:
   # D5b): its image runs as a managed MCP server (connectors.drivers), and
   # the former agent.mcpStdioEnabled fails the render when set to true.
   mcpDatasourcesEnabled: "false"
+  # -- Keep every tool step's full arguments and full result in the audit
+  # store (`agent_audit`), next to the 200/500-character previews. Off by
+  # default: a tool result is also part of the next model request, so the
+  # preview is enough to debug with. Turn it on for a record that must hold
+  # each tool call as it ran, including a job's last tool batch, which no
+  # later request carries, and results a compaction shortens afterwards.
+  # Tool input and output then take about twice the room in the audit DB.
+  auditFullToolIo: "false"
   # -- Temporary compatibility gate for REST/session requests that omit
   # datasource_ids. Omission always attaches the project's own platform-owned
   # connectors (knowledge base, cloud folder); this gate adds the owner's and

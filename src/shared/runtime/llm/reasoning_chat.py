@@ -12,13 +12,26 @@ actual HTTP request body before sending.
 Set DEBUG_LLM_STREAM=1 to print a tail of LLM responses to stderr after each call.
 """
 
+import hashlib
 import json
 import logging
 import os
 import sys
+import time
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+)
 
 import httpx
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -61,6 +74,9 @@ class _CallCapture:
 
     reasoning: Optional[str] = None
     stream_tap: Optional["_SSEReasoningTap"] = None
+    # One record per request the SDK sent for this call (its own retries
+    # included) — see _begin_wire_attempt.
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # The capture of the model call this context is inside, if any. ``send`` falls
@@ -69,6 +85,177 @@ class _CallCapture:
 _CALL_CAPTURE: ContextVar[Optional[_CallCapture]] = ContextVar(
     "reasoning_call_capture", default=None
 )
+
+# A caller's own list of the requests sent while it is open (see
+# record_wire_attempts). The same records as the call capture holds; this one
+# also survives a call that never returns to its caller, such as one cancelled
+# by ``asyncio.wait_for``.
+_WIRE_LOG: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar(
+    "llm_wire_log", default=None
+)
+
+#: ``response_metadata`` key a reply carries its wire attempts under until the
+#: archiver takes them (take_wire_attempts).
+WIRE_ATTEMPTS_KEY = "srw_wire"
+
+# Body fields left out of a wire record's ``params``: the conversation and the
+# tool schemas, which the archive stores once as the request itself.
+_WIRE_BULK_FIELDS = frozenset({"messages", "input", "tools", "instructions"})
+
+
+@contextmanager
+def record_wire_attempts() -> Iterator[List[Dict[str, Any]]]:
+    """Collect a record of every model request sent inside the block.
+
+    For a caller that must account for a call even when it fails or is
+    cancelled: the list is the caller's own, filled as each request goes out.
+    A context copied into a task (``asyncio.wait_for``) shares it.
+    """
+    attempts: List[Dict[str, Any]] = []
+    outer = _WIRE_LOG.get()
+    _WIRE_LOG.set(attempts)
+    try:
+        yield attempts
+    finally:
+        _WIRE_LOG.set(outer)
+
+
+def take_wire_attempts(message: Any) -> List[Dict[str, Any]]:
+    """Remove and return the wire attempts a reply carries.
+
+    The archiver calls this once per reply, so the records are stored with the
+    call and do not ride along in the conversation state afterwards.
+    """
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return []
+    attempts = metadata.pop(WIRE_ATTEMPTS_KEY, None)
+    return attempts if isinstance(attempts, list) else []
+
+
+def wire_attempts_of(error: Optional[BaseException]) -> List[Dict[str, Any]]:
+    """The wire attempts of a model call that raised ``error``, if recorded."""
+    attempts = getattr(error, "srw_wire_attempts", None)
+    return attempts if isinstance(attempts, list) else []
+
+
+def _wire_shape(body: Dict[str, Any]) -> Dict[str, Any]:
+    """What the request carried, in numbers: messages by role, tools, and how
+    much reasoning was sent back with the assistant turns."""
+    shape: Dict[str, Any] = {}
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        roles: Dict[str, int] = {}
+        assistant = present = non_empty = chars = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role"))
+            roles[role] = roles.get(role, 0) + 1
+            if role != "assistant":
+                continue
+            assistant += 1
+            if "reasoning_content" in message:
+                present += 1
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    non_empty += 1
+                    chars += len(reasoning)
+        shape["messages"] = len(messages)
+        shape["roles"] = roles
+        if present:
+            shape["reasoning_content"] = {
+                "assistant_messages": assistant,
+                "present": present,
+                "non_empty": non_empty,
+                "chars": chars,
+            }
+    elif isinstance(body.get("input"), list):
+        shape["input_items"] = len(body["input"])
+    if isinstance(body.get("tools"), list):
+        shape["tools"] = len(body["tools"])
+    return shape
+
+
+def _begin_wire_attempt(request: httpx.Request) -> Optional[Dict[str, Any]]:
+    """Start the record of one model request, as it goes out.
+
+    Holds the send time (UTC), the parameters in the body exactly as sent
+    (everything but the conversation and the tool schemas), the request's
+    shape, and the size and SHA-256 of the body bytes. Never a header: the
+    key travels there. Returns None when nobody collects records, so an
+    unwatched request costs nothing.
+    """
+    capture = _CALL_CAPTURE.get()
+    log = _WIRE_LOG.get()
+    if capture is None and log is None:
+        return None
+    try:
+        content = request.content or b""
+        attempt: Dict[str, Any] = {
+            "sent_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "host": request.url.host,
+            "path": request.url.path,
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        try:
+            body = json.loads(content) if content else None
+        except (json.JSONDecodeError, ValueError):
+            body = None
+        if isinstance(body, dict):
+            attempt["params"] = {
+                key: value
+                for key, value in body.items()
+                if key not in _WIRE_BULK_FIELDS
+            }
+            attempt["shape"] = _wire_shape(body)
+        attempt["_t0"] = time.monotonic()
+    except Exception as exc:  # the record must never fail the request
+        logger.debug("wire attempt record failed (non-fatal): %s", exc)
+        return None
+    if capture is not None:
+        capture.attempts.append(attempt)
+    if log is not None:
+        log.append(attempt)
+    return attempt
+
+
+def _end_wire_attempt(
+    attempt: Optional[Dict[str, Any]],
+    response: Optional[httpx.Response] = None,
+    *,
+    error: Optional[BaseException] = None,
+    not_sent: Optional[str] = None,
+    key_rotated: bool = False,
+) -> None:
+    """Close a wire record with how the request ended.
+
+    ``elapsed_ms`` runs to the response headers (a stream's body follows).
+    ``not_sent`` marks a request refused before the network, with the reason.
+    """
+    if attempt is None:
+        return
+    try:
+        t0 = attempt.pop("_t0", None)
+        if t0 is not None:
+            attempt["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+        if not_sent:
+            attempt["not_sent"] = not_sent
+        if key_rotated:
+            attempt["key_rotated"] = True
+        if response is not None:
+            attempt["status"] = response.status_code
+            for header in ("x-request-id", "retry-after"):
+                value = response.headers.get(header)
+                if value:
+                    attempt[header.replace("-", "_")] = value
+        if error is not None:
+            attempt["error"] = type(error).__name__
+            attempt["error_message"] = str(error)[:300]
+    except Exception as exc:
+        logger.debug("wire attempt record failed (non-fatal): %s", exc)
+
 
 # Token counting constants
 DEFAULT_MAX_CONTEXT_TOKENS = 100_000
@@ -675,18 +862,27 @@ class ReasoningCapturingClient(httpx.Client):
             max_context_tokens=self._max_context_tokens,
             key_ring=self._key_ring,
         )
-        if overflow_response is not None:
-            return overflow_response
         is_llm_request = is_chat or is_responses
+        attempt = _begin_wire_attempt(request) if is_llm_request else None
+        if overflow_response is not None:
+            _end_wire_attempt(attempt, overflow_response, not_sent="context_overflow")
+            return overflow_response
 
         # Send the request
-        response = super().send(request, **kwargs)
+        try:
+            response = super().send(request, **kwargs)
+        except BaseException as exc:
+            _end_wire_attempt(attempt, error=exc)
+            raise
 
         # Key rotation: retry once on auth/quota errors
+        key_rotated = False
         if is_llm_request and self._key_ring and self._key_ring.has_alternatives:
             rotated_response = self._handle_key_rotation(request, response, **kwargs)
             if rotated_response is not None:
                 response = rotated_response
+                key_rotated = True
+        _end_wire_attempt(attempt, response, key_rotated=key_rotated)
 
         # Capture reasoning_content from response.
         # When stream=True, httpx doesn't eagerly read the body — install an
@@ -839,20 +1035,29 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
             max_context_tokens=self._max_context_tokens,
             key_ring=self._key_ring,
         )
-        if overflow_response is not None:
-            return overflow_response
         is_llm_request = is_chat or is_responses
+        attempt = _begin_wire_attempt(request) if is_llm_request else None
+        if overflow_response is not None:
+            _end_wire_attempt(attempt, overflow_response, not_sent="context_overflow")
+            return overflow_response
 
         # Send the request (async)
-        response = await super().send(request, **kwargs)
+        try:
+            response = await super().send(request, **kwargs)
+        except BaseException as exc:
+            _end_wire_attempt(attempt, error=exc)
+            raise
 
         # Key rotation: retry once on auth/quota errors
+        key_rotated = False
         if is_llm_request and self._key_ring and self._key_ring.has_alternatives:
             rotated_response = await self._handle_key_rotation(
                 request, response, **kwargs
             )
             if rotated_response is not None:
                 response = rotated_response
+                key_rotated = True
+        _end_wire_attempt(attempt, response, key_rotated=key_rotated)
 
         # Capture reasoning_content from response.
         # Streaming path: install an SSE tap on the response so reasoning is
@@ -1100,6 +1305,38 @@ def mark_anthropic_cache_breakpoints(messages: list, payload_messages: list) -> 
     return out
 
 
+def _attach_wire_attempts(error: BaseException, capture: _CallCapture) -> None:
+    """Let a failed call's error carry its wire attempts (wire_attempts_of)."""
+    if not capture.attempts:
+        return
+    try:
+        error.srw_wire_attempts = capture.attempts  # type: ignore[attr-defined]
+    except Exception:  # an error type without a __dict__
+        pass
+
+
+def _stream_trailer(
+    reasoning: Optional[str], capture: _CallCapture
+) -> Optional[ChatGenerationChunk]:
+    """The synthetic last chunk of a stream: what the HTTP layer captured.
+
+    Reasoning the deltas carried (LangChain drops it from each chunk) and the
+    call's wire attempts, so the merged message has both like a non-streamed
+    reply. None when there is neither.
+    """
+    if not reasoning and not capture.attempts:
+        return None
+    return ChatGenerationChunk(
+        message=AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_content": reasoning} if reasoning else {},
+            response_metadata=(
+                {WIRE_ATTEMPTS_KEY: capture.attempts} if capture.attempts else {}
+            ),
+        )
+    )
+
+
 class ReasoningChatOpenAI(ChatOpenAI):
     """ChatOpenAI that captures reasoning_content and validates context limits.
 
@@ -1231,6 +1468,14 @@ class ReasoningChatOpenAI(ChatOpenAI):
             if hasattr(gen, "message"):
                 _extract_responses_api_reasoning(gen.message)
 
+        # 2b. Hand the call's wire attempts to whoever archives the reply
+        if capture is not None and capture.attempts:
+            for gen in result.generations:
+                message = getattr(gen, "message", None)
+                if message is not None and isinstance(message.response_metadata, dict):
+                    message.response_metadata[WIRE_ATTEMPTS_KEY] = capture.attempts
+                    break
+
         # 3. Debug: print tail of response to stderr
         if _is_debug_stream():
             tail_chars = _get_debug_tail_chars()
@@ -1287,6 +1532,9 @@ class ReasoningChatOpenAI(ChatOpenAI):
         _CALL_CAPTURE.set(capture)
         try:
             result = super()._generate(*args, **kwargs)
+        except BaseException as exc:
+            _attach_wire_attempts(exc, capture)
+            raise
         finally:
             _CALL_CAPTURE.set(outer)
         return self._post_process_result(result, capture)
@@ -1298,6 +1546,9 @@ class ReasoningChatOpenAI(ChatOpenAI):
         _CALL_CAPTURE.set(capture)
         try:
             result = await super()._agenerate(*args, **kwargs)
+        except BaseException as exc:
+            _attach_wire_attempts(exc, capture)
+            raise
         finally:
             _CALL_CAPTURE.set(outer)
         return self._post_process_result(result, capture)
@@ -1326,18 +1577,18 @@ class ReasoningChatOpenAI(ChatOpenAI):
                 chunk = next(stream)
             except StopIteration:
                 break
+            except BaseException as exc:
+                _attach_wire_attempts(exc, capture)
+                raise
             finally:
                 _CALL_CAPTURE.set(outer)
             yield chunk
         rc = capture.stream_tap.reasoning_content if capture.stream_tap else None
         if rc:
             logger.debug(f"Captured reasoning_content from stream: {len(rc)} chars")
-            yield ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content="",
-                    additional_kwargs={"reasoning_content": rc},
-                )
-            )
+        trailer = _stream_trailer(rc, capture)
+        if trailer is not None:
+            yield trailer
 
     async def _astream(self, *args, **kwargs):
         """Async counterpart of :meth:`_stream`."""
@@ -1351,15 +1602,15 @@ class ReasoningChatOpenAI(ChatOpenAI):
                 chunk = await stream.__anext__()
             except StopAsyncIteration:
                 break
+            except BaseException as exc:
+                _attach_wire_attempts(exc, capture)
+                raise
             finally:
                 _CALL_CAPTURE.set(outer)
             yield chunk
         rc = capture.stream_tap.reasoning_content if capture.stream_tap else None
         if rc:
             logger.debug(f"Captured reasoning_content from astream: {len(rc)} chars")
-            yield ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content="",
-                    additional_kwargs={"reasoning_content": rc},
-                )
-            )
+        trailer = _stream_trailer(rc, capture)
+        if trailer is not None:
+            yield trailer

@@ -50,6 +50,7 @@ import re
 import asyncio
 import time
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
 
@@ -68,6 +69,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from agent.core.archiver import get_archiver, inflight_tool_calls
+from shared.runtime.llm.reasoning_chat import record_wire_attempts
 from agent.core.context import (
     ContextManager,
     ContextConfig,
@@ -1768,12 +1770,36 @@ def create_execute_node(
         while True:
             try:
                 start_time = time.time()
+                call_started_at = datetime.now(timezone.utc)
+                # The requests this try puts on the wire. The caller's own
+                # list, so a try that times out or raises still has them.
+                wire_attempts: List[Dict[str, Any]] = []
                 try:
-                    response = await asyncio.wait_for(
-                        llm_with_tools.ainvoke(prepared_messages),
-                        timeout=llm_timeout,
-                    )
+                    with record_wire_attempts() as wire_attempts:
+                        response = await asyncio.wait_for(
+                            llm_with_tools.ainvoke(prepared_messages),
+                            timeout=llm_timeout,
+                        )
                 except Exception as invoke_error:
+                    # Every try that raised leaves its own llm_requests row
+                    # (status "error"): the request, when it went out, and
+                    # how it ended. Only the answered try has a reply row.
+                    if auditor:
+                        auditor.archive_error(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            messages=prepared_messages,
+                            model=phase_model,
+                            error=str(invoke_error),
+                            error_type=type(invoke_error).__name__,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                            iteration=iteration,
+                            tool_schemas=tool_schemas,
+                            model_kwargs=model_kwargs,
+                            started_at=call_started_at,
+                            attempt=attempt + 1,
+                            wire_attempts=wire_attempts,
+                        )
                     # A 413 "request too big" is deterministic: hand it to
                     # the emergency compaction below, not the retry ladder.
                     overflow = _as_context_overflow(invoke_error)
@@ -1846,6 +1872,31 @@ def create_execute_node(
                 # reaches the checkpoint raw and poisons every subsequent
                 # request (knowledge-base/knowledge/features/outbound_message_hygiene.md).
                 response = repair_tool_call_arguments(response)
+
+                def _archive_reply(rejected: Optional[str] = None) -> Optional[str]:
+                    """Store this call in llm_requests; ``rejected`` names the
+                    guard that threw the reply away. Every reply the provider
+                    produced gets a row, used or not."""
+                    if not auditor:
+                        return None
+                    return auditor.archive(
+                        job_id=job_id,
+                        agent_type=config.agent_id,
+                        messages=prepared_messages,
+                        history_messages=prepared_history,
+                        response=response,
+                        model=phase_model,
+                        latency_ms=latency_ms,
+                        iteration=iteration,
+                        metadata=state.get("metadata"),
+                        phase=phase_str,
+                        phase_number=phase_number,
+                        tool_schemas=tool_schemas,
+                        model_kwargs=model_kwargs,
+                        started_at=call_started_at,
+                        attempt=attempt + 1,
+                        rejected=rejected,
+                    )
 
                 tool_calls_count = (
                     len(response.tool_calls)
@@ -1938,6 +1989,7 @@ def create_execute_node(
                         f"(finish_reason=length, max_output_tokens={_cap}): reasoning "
                         f"consumed the entire output budget before answering."
                     )
+                    _archive_reply(rejected="output_truncated")
                     return {
                         "error": {
                             "message": (
@@ -2005,6 +2057,7 @@ def create_execute_node(
                         f"[{job_id}] Empty response streak exceeded "
                         f"(streak {empty_streak}): failing job"
                     )
+                    _archive_reply(rejected="empty_response")
                     return {
                         "error": {
                             "message": (
@@ -2083,6 +2136,7 @@ def create_execute_node(
                         f"(streak {no_tc_streak}, model={phase_model}): "
                         f"failing job"
                     )
+                    _archive_reply(rejected="parser_failure")
                     return {
                         "error": {
                             "message": (
@@ -2124,6 +2178,8 @@ def create_execute_node(
                     )
 
                     if validation.is_degenerate:
+                        # Both exits below drop the reply.
+                        _archive_reply(rejected="response_degeneration")
                         _degeneration_streak[0] += 1
                         streak = _degeneration_streak[0]
                         pattern_names = [p.name for p in validation.matched_patterns]
@@ -2255,21 +2311,7 @@ def create_execute_node(
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
                 if auditor:
-                    request_id = auditor.archive(
-                        job_id=job_id,
-                        agent_type=config.agent_id,
-                        messages=prepared_messages,
-                        history_messages=prepared_history,
-                        response=response,
-                        model=phase_model,
-                        latency_ms=latency_ms,
-                        iteration=iteration,
-                        metadata=state.get("metadata"),
-                        phase=phase_str,
-                        phase_number=phase_number,
-                        tool_schemas=tool_schemas,
-                        model_kwargs=model_kwargs,
-                    )
+                    request_id = _archive_reply()
 
                     # Build tool calls preview
                     tool_calls_preview = []
