@@ -610,7 +610,10 @@ _REASONING_BLOCK_TYPES = frozenset(
 # langchain-openai never serializes them outbound, but custom transports have
 # no such guarantee — and a reasoning_content + tool_calls combo crashes
 # gpt-oss chat templates server-side. Foreign reasoning carries no replay
-# value, so it is dropped at the boundary.
+# value, so it is dropped at the boundary. The one case it is kept: a turn
+# replayed to the family that produced it, when that family's requests send
+# the reasoning back (``replay_reasoning_content``, DeepSeek) — the request
+# must then carry it as the live one did.
 _REASONING_KWARGS_KEYS = ("reasoning_content", "reasoning", "reasoning_details")
 
 # Mistral validates tool-call ids as exactly 9 alphanumerics; everything else
@@ -665,7 +668,10 @@ def sanitize_history_for_provider_boundary(
     """
     from shared.runtime.core.model_registry import family_of
 
+    from shared.runtime.core.loader import replays_reasoning_content
+
     target_family = family_of(target_model or "")
+    target_replays_reasoning = replays_reasoning_content(target_model or "")
     id_map: Dict[str, str] = {}
 
     def _map_id(raw_id: str) -> str:
@@ -714,7 +720,17 @@ def sanitize_history_for_provider_boundary(
                         update["content"] = kept
 
             ak = m.additional_kwargs or {}
-            removed_keys = [k for k in _REASONING_KWARGS_KEYS if k in ak]
+            keeps_own_reasoning = (
+                target_replays_reasoning
+                and target_family != "default"
+                and family_of((m.response_metadata or {}).get("model_name") or "")
+                == target_family
+            )
+            removed_keys = (
+                []
+                if keeps_own_reasoning
+                else [k for k in _REASONING_KWARGS_KEYS if k in ak]
+            )
             if removed_keys:
                 stripped_kwargs += len(removed_keys)
                 update["additional_kwargs"] = {
@@ -1048,10 +1064,24 @@ class ContextConfig:
     compaction: Optional[Dict[str, Any]] = None
 
 
+def _replayed_reasoning(msg: BaseMessage) -> str:
+    """The reasoning an assistant turn is sent back with, or ``""``.
+
+    Only for a family with ``replay_reasoning_content`` on: there the text in
+    ``additional_kwargs["reasoning_content"]`` is part of every later request
+    (``attach_reasoning_content``), so it is part of the context size.
+    """
+    if not isinstance(msg, AIMessage):
+        return ""
+    reasoning = (getattr(msg, "additional_kwargs", None) or {}).get("reasoning_content")
+    return reasoning if isinstance(reasoning, str) else ""
+
+
 def count_tokens_tiktoken(
     messages: List[BaseMessage],
     model: str = "gpt-4",
     image_config: Optional[Dict[str, Any]] = None,
+    count_reasoning: bool = False,
 ) -> int:
     """Count tokens using tiktoken for accurate counting.
 
@@ -1060,12 +1090,14 @@ def count_tokens_tiktoken(
         model: Model name for tokenizer selection
         image_config: Resolved per-family image-token estimator config; image
             blocks are billed by their pixel dimensions, never their base64.
+        count_reasoning: Count each assistant turn's captured reasoning too
+            (a family that gets it sent back, see ``_replayed_reasoning``).
 
     Returns:
         Token count
     """
     if not TIKTOKEN_AVAILABLE:
-        return count_tokens_approximate(messages, image_config)
+        return count_tokens_approximate(messages, image_config, count_reasoning)
 
     try:
         # Try to get encoding for specific model
@@ -1107,6 +1139,11 @@ def count_tokens_tiktoken(
                 )
                 msg_tokens += tool_call_tokens
 
+            if count_reasoning:
+                reasoning = _replayed_reasoning(msg)
+                if reasoning:
+                    msg_tokens += len(enc.encode(reasoning, disallowed_special=()))
+
             # Add overhead for message structure (role, etc.)
             msg_tokens += 4  # Approximate overhead per message
             total += msg_tokens
@@ -1134,12 +1171,13 @@ def count_tokens_tiktoken(
 
     except Exception as e:
         logger.warning(f"tiktoken error, falling back to approximate: {e}")
-        return count_tokens_approximate(messages, image_config)
+        return count_tokens_approximate(messages, image_config, count_reasoning)
 
 
 def count_tokens_approximate(
     messages: List[BaseMessage],
     image_config: Optional[Dict[str, Any]] = None,
+    count_reasoning: bool = False,
 ) -> int:
     """Approximate token count using character-based estimation.
 
@@ -1149,6 +1187,7 @@ def count_tokens_approximate(
     Args:
         messages: List of messages to count
         image_config: Resolved per-family image-token estimator config.
+        count_reasoning: Count each assistant turn's captured reasoning too.
 
     Returns:
         Approximate token count
@@ -1165,6 +1204,9 @@ def count_tokens_approximate(
         # Add tool calls if present
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             total_chars += len(str(msg.tool_calls))
+
+        if count_reasoning:
+            total_chars += len(_replayed_reasoning(msg))
 
     # ~4 chars per token on average, plus flat per-image tokens
     return total_chars // 4 + total_image_tokens
@@ -1185,9 +1227,16 @@ def get_token_counter(
     Returns:
         Token counter function
     """
+    # A family that gets its reasoning sent back carries it in every request,
+    # so its counter counts it; every other family's count is unchanged.
+    from shared.runtime.core.loader import replays_reasoning_content
+
+    count_reasoning = replays_reasoning_content(model)
     if TIKTOKEN_AVAILABLE:
-        return lambda msgs: count_tokens_tiktoken(msgs, model, image_config)
-    return lambda msgs: count_tokens_approximate(msgs, image_config)
+        return lambda msgs: count_tokens_tiktoken(
+            msgs, model, image_config, count_reasoning
+        )
+    return lambda msgs: count_tokens_approximate(msgs, image_config, count_reasoning)
 
 
 def _client_model_name(llm: Any) -> str:

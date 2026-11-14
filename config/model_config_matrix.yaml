@@ -235,6 +235,15 @@ deepseek:
     top_p: 0.95
     multimodal: false  # V4 Pro + Flash are text-only
     parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
+    # Send each assistant turn's `reasoning_content` back on every later
+    # request. DeepSeek's thinking-mode guide asks for it whenever the request
+    # carries `tools` ("must be fully passed back ... the API will return a 400
+    # error") and only then continues from its earlier reasoning. Measured on
+    # the direct API 2026-11-14: without it the API still answered 200, so
+    # this is the documented contract and reasoning continuity, not a crash
+    # fix. A job or expert turns it off with `llm.replay_reasoning_content:
+    # false`. See attach_reasoning_content in reasoning_chat.py.
+    replay_reasoning_content: true
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
@@ -375,11 +384,12 @@ muse-spark-1.3:
 # always thinks. `tool_choice: required` is accepted.
 #
 # Moonshot asks for the complete assistant message, `reasoning_content`
-# included, to be sent back on every turn (Preserved Thinking). The
-# OpenAI-compatible transport does not serialize reasoning back, so K3
-# loses its prior reasoning between calls. No 400 is documented for that, but
-# it is a quality gap; the K3 prompts ask for a one-line visible intent before
-# each tool call so the thread survives.
+# included, to be sent back on every turn (Preserved Thinking). SRW sends
+# reasoning back only for a family with `replay_reasoning_content: true`
+# (see `deepseek`); this one does not have it yet, so K3 loses its prior
+# reasoning between calls. No 400 is documented for that, but it is a quality
+# gap; the K3 prompts ask for a one-line visible intent before each tool call
+# so the thread survives. Turning the setting on here needs one live check.
 kimi-k3:
   reasoning:
     method: effort_enum
@@ -489,7 +499,8 @@ qwen3.8-27b:
 # tool), so structured output stays on json_schema. Alibaba documents no rule
 # for system messages after the first; the open variant's template raises on
 # them, so fold them (see qwen3.8-27b). `preserve_thinking` is on and asks for
-# prior reasoning_content, which SRW never replays (all families). Very verbose:
+# prior reasoning_content, which SRW does not send back for this family
+# (`replay_reasoning_content`, on for `deepseek` only). Very verbose:
 # Artificial Analysis measured about twice the median output tokens.
 #
 # Sampling: Alibaba publishes no thinking-mode set for Max; this is Qwen's set
@@ -541,7 +552,8 @@ qwen3.8-max:
 # compaction starts at 400K and long jobs pay double for most late turns. To
 # stay under the tier, give the model a 250K `context_window` in Admin -> Models.
 # xAI also calls omitted reasoning_content "the top cause of cache misses";
-# SRW never replays it (all families), so expect fewer cache hits.
+# SRW does not send it back for this family (`replay_reasoning_content`, on
+# for `deepseek` only), so expect fewer cache hits.
 grok-4.7:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh] }
   settings:

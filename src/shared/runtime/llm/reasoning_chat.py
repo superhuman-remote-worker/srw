@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
 
 import httpx
@@ -42,6 +43,31 @@ logger = logging.getLogger(__name__)
 # See knowledge-base/knowledge/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md
 _STREAM_REASONING_SINK: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
     "stream_reasoning_sink", default=None
+)
+
+
+@dataclass
+class _CallCapture:
+    """What the HTTP layer captured for ONE model call.
+
+    A client is shared: the main loop, the summarizer and background
+    auxiliary tasks can all hold the same ``ReasoningChatOpenAI`` and call it
+    at once. One slot on the client then hands a call the reasoning of
+    whichever response arrived last, or nothing because another call already
+    took it. Each ``_generate`` / ``_stream`` call opens its own capture in
+    :data:`_CALL_CAPTURE`; the client's ``send`` runs inside that call's
+    context and writes there.
+    """
+
+    reasoning: Optional[str] = None
+    stream_tap: Optional["_SSEReasoningTap"] = None
+
+
+# The capture of the model call this context is inside, if any. ``send`` falls
+# back to the client's own slot when none is open (a request made straight on
+# the HTTP client).
+_CALL_CAPTURE: ContextVar[Optional[_CallCapture]] = ContextVar(
+    "reasoning_call_capture", default=None
 )
 
 # Token counting constants
@@ -188,6 +214,11 @@ def count_request_tokens(body: dict, model: str = "gpt-4") -> int:
             for part in content:
                 if isinstance(part, dict) and "text" in part:
                     total += len(enc.encode(part["text"]))
+
+        # Reasoning sent back with an assistant turn (replay_reasoning_content)
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            total += len(enc.encode(reasoning, disallowed_special=()))
 
         # Count tool calls in assistant messages
         if "tool_calls" in msg:
@@ -561,6 +592,31 @@ def _prepare_reasoning_request(
     return is_chat, is_responses, None
 
 
+def _record_chat_reasoning(client: Any, response: httpx.Response, *, stream: bool):
+    """Keep a Chat Completions response's reasoning for the call that sent it.
+
+    Streaming: tap the response, so the reasoning is collected per delta as the
+    SDK reads it. Otherwise parse the body. Both land in the open
+    :class:`_CallCapture`, or on ``client`` when no call opened one.
+    """
+    capture = _CALL_CAPTURE.get()
+    if stream:
+        tap = _install_streaming_reasoning_tap(response)
+        if capture is not None:
+            capture.stream_tap = tap
+        else:
+            client._active_stream_tap = tap
+        return
+    try:
+        reasoning = _extract_reasoning_from_response(json.loads(response.content))
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return
+    if capture is not None:
+        capture.reasoning = reasoning
+    else:
+        client._last_reasoning_content = reasoning
+
+
 class ReasoningCapturingClient(httpx.Client):
     """HTTP client that captures reasoning_content and validates context limits.
 
@@ -639,16 +695,7 @@ class ReasoningCapturingClient(httpx.Client):
         # after the stream finishes. Non-streaming case parses the full
         # body directly.
         if is_chat:
-            if kwargs.get("stream", False):
-                self._active_stream_tap = _install_streaming_reasoning_tap(response)
-            else:
-                try:
-                    data = json.loads(response.content)
-                    self._last_reasoning_content = _extract_reasoning_from_response(
-                        data
-                    )
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    pass
+            _record_chat_reasoning(self, response, stream=kwargs.get("stream", False))
 
         return response
 
@@ -813,16 +860,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         # consumed by ReasoningChatOpenAI._astream once the stream finishes.
         # Non-streaming path: parse the full body directly.
         if is_chat:
-            if kwargs.get("stream", False):
-                self._active_stream_tap = _install_streaming_reasoning_tap(response)
-            else:
-                try:
-                    data = json.loads(response.content)
-                    self._last_reasoning_content = _extract_reasoning_from_response(
-                        data
-                    )
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    pass
+            _record_chat_reasoning(self, response, stream=kwargs.get("stream", False))
 
         # Diagnostic: dump raw /v1/responses payloads when DEBUG_CODEX_RAW_RESPONSE=1.
         # The codex proxy + openai SDK Pydantic deserialization path can produce
@@ -955,6 +993,38 @@ def fold_system_messages(messages: list) -> list:
     return out
 
 
+def attach_reasoning_content(messages: list, payload_messages: list) -> list:
+    """Send each assistant turn's reasoning back as ``reasoning_content``.
+
+    For Chat Completions providers that continue from their earlier reasoning
+    only when the client returns it. DeepSeek asks for it on every assistant
+    message of a request that carries ``tools`` and documents a 400 otherwise.
+    langchain-openai builds the assistant message from content and tool calls
+    alone, so the reasoning captured on the way in
+    (``additional_kwargs["reasoning_content"]``) is put back here, unchanged.
+    An assistant message without any (one SRW wrote itself, or one whose
+    reasoning a restore did not bring back) gets the empty string, so the
+    field is present on every assistant turn.
+
+    ``messages`` are the LangChain messages ``payload_messages`` were converted
+    from. The conversion is one-to-one; on a length mismatch the indices cannot
+    be mapped and the payload is returned unchanged. Returns a new list; the
+    payload dicts are not mutated.
+    """
+    if len(messages) != len(payload_messages):
+        return payload_messages
+    out = []
+    for message, wire in zip(messages, payload_messages):
+        if isinstance(message, AIMessage) and wire.get("role") == "assistant":
+            reasoning = (message.additional_kwargs or {}).get("reasoning_content")
+            wire = {
+                **wire,
+                "reasoning_content": reasoning if isinstance(reasoning, str) else "",
+            }
+        out.append(wire)
+    return out
+
+
 def mark_anthropic_cache_breakpoints(messages: list, payload_messages: list) -> list:
     """Put Anthropic cache breakpoints on the system prompt and the stable history.
 
@@ -1057,6 +1127,11 @@ class ReasoningChatOpenAI(ChatOpenAI):
     # the request down to one leading system message before it is sent.
     single_system_message: bool = False
 
+    # Family setting `replay_reasoning_content` (model_config_matrix.yaml): send
+    # each assistant turn's captured reasoning back — see
+    # attach_reasoning_content.
+    replay_reasoning_content: bool = False
+
     # Claude over an OpenAI-format transport (the subscription proxy): add
     # explicit cache breakpoints — see mark_anthropic_cache_breakpoints.
     anthropic_cache_breakpoints: bool = False
@@ -1104,6 +1179,12 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # First: the payload is still one-to-one with the input messages here
+        # (folding the system messages changes the count).
+        if self.replay_reasoning_content and isinstance(payload.get("messages"), list):
+            payload["messages"] = attach_reasoning_content(
+                self._convert_input(input_).to_messages(), payload["messages"]
+            )
         if self.single_system_message and isinstance(payload.get("messages"), list):
             payload["messages"] = fold_system_messages(payload["messages"])
         if self.anthropic_cache_breakpoints and isinstance(
@@ -1114,15 +1195,18 @@ class ReasoningChatOpenAI(ChatOpenAI):
             )
         return payload
 
-    def _post_process_result(self, result):
+    def _post_process_result(self, result, capture: Optional[_CallCapture] = None):
         """Post-process LLM result: capture reasoning and debug output.
 
         Handles both Chat Completions (reasoning via HTTP client) and
-        Responses API (reasoning in content blocks) formats.
+        Responses API (reasoning in content blocks) formats. ``capture`` is the
+        call's own capture; without one the clients' slots are read.
         """
         # 1. Inject Chat Completions reasoning from HTTP layer (sync or async client)
         reasoning_content = None
-        if self._reasoning_client and self._reasoning_client._last_reasoning_content:
+        if capture is not None:
+            reasoning_content = capture.reasoning
+        elif self._reasoning_client and self._reasoning_client._last_reasoning_content:
             reasoning_content = self._reasoning_client._last_reasoning_content
             self._reasoning_client._last_reasoning_content = None
         elif (
@@ -1198,13 +1282,25 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
     def _generate(self, *args, **kwargs):
         self._refuse_missing_route()
-        result = super()._generate(*args, **kwargs)
-        return self._post_process_result(result)
+        capture = _CallCapture()
+        outer = _CALL_CAPTURE.get()
+        _CALL_CAPTURE.set(capture)
+        try:
+            result = super()._generate(*args, **kwargs)
+        finally:
+            _CALL_CAPTURE.set(outer)
+        return self._post_process_result(result, capture)
 
     async def _agenerate(self, *args, **kwargs):
         self._refuse_missing_route()
-        result = await super()._agenerate(*args, **kwargs)
-        return self._post_process_result(result)
+        capture = _CallCapture()
+        outer = _CALL_CAPTURE.get()
+        _CALL_CAPTURE.set(capture)
+        try:
+            result = await super()._agenerate(*args, **kwargs)
+        finally:
+            _CALL_CAPTURE.set(outer)
+        return self._post_process_result(result, capture)
 
     def _stream(self, *args, **kwargs):
         """Wrap the parent stream and emit a trailing reasoning chunk.
@@ -1218,13 +1314,22 @@ class ReasoningChatOpenAI(ChatOpenAI):
         matching the non-streaming code path's contract.
         """
         self._refuse_missing_route()
-        for chunk in super()._stream(*args, **kwargs):
+        capture = _CallCapture()
+        stream = super()._stream(*args, **kwargs)
+        while True:
+            # The capture is open only while the parent runs (it sends the
+            # request on its first step), never while the consumer holds a
+            # chunk: a generator's caller may be in another context by then.
+            outer = _CALL_CAPTURE.get()
+            _CALL_CAPTURE.set(capture)
+            try:
+                chunk = next(stream)
+            except StopIteration:
+                break
+            finally:
+                _CALL_CAPTURE.set(outer)
             yield chunk
-        rc = (
-            self._reasoning_client.consume_streamed_reasoning()
-            if self._reasoning_client
-            else None
-        )
+        rc = capture.stream_tap.reasoning_content if capture.stream_tap else None
         if rc:
             logger.debug(f"Captured reasoning_content from stream: {len(rc)} chars")
             yield ChatGenerationChunk(
@@ -1237,13 +1342,19 @@ class ReasoningChatOpenAI(ChatOpenAI):
     async def _astream(self, *args, **kwargs):
         """Async counterpart of :meth:`_stream`."""
         self._refuse_missing_route()
-        async for chunk in super()._astream(*args, **kwargs):
+        capture = _CallCapture()
+        stream = super()._astream(*args, **kwargs)
+        while True:
+            outer = _CALL_CAPTURE.get()
+            _CALL_CAPTURE.set(capture)
+            try:
+                chunk = await stream.__anext__()
+            except StopAsyncIteration:
+                break
+            finally:
+                _CALL_CAPTURE.set(outer)
             yield chunk
-        rc = (
-            self._async_reasoning_client.consume_streamed_reasoning()
-            if self._async_reasoning_client
-            else None
-        )
+        rc = capture.stream_tap.reasoning_content if capture.stream_tap else None
         if rc:
             logger.debug(f"Captured reasoning_content from astream: {len(rc)} chars")
             yield ChatGenerationChunk(

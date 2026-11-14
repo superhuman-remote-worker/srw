@@ -1057,6 +1057,31 @@ create a catalog row. Sources: the
 [Argon guide](https://ai.google.dev/gemini-api/docs/generate-content/latest-model),
 and the [3.8 Flash model page](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash).
 
+## DeepSeek V4
+
+The `deepseek` family covers DeepSeek V4 Pro and Flash, on DeepSeek's own API
+(`https://api.deepseek.com/v1`, an OpenAI-compatible endpoint) or through
+OpenRouter. Thinking is on by default; the reasoning arrives beside the answer
+as `reasoning_content` and is kept on the assistant message.
+
+The family sets `replay_reasoning_content: true`: every later request sends each
+assistant turn's `reasoning_content` back, unchanged. DeepSeek's
+[thinking-mode guide](https://api-docs.deepseek.com/guides/thinking_mode) asks
+for this whenever the request carries tools, and documents a 400 without it.
+Measured on the direct API on 2026-11-14, a request without it still returned
+200, and the model kept its reasoning only until the next user message. With the
+setting on, it keeps it across SRW's phase changes and reminders too, and the
+request no longer depends on what the provider remembers. An assistant message
+SRW wrote itself is sent with an empty `reasoning_content`.
+
+The reasoning sent back counts as input tokens. A job or an expert turns it off
+with `llm.replay_reasoning_content: false`. The setting can only be turned off
+this way, not on: a family without it never gets the field. OpenRouter documents
+`reasoning_content` as an alias of its own `reasoning` field on input. Other
+families whose providers ask for the same (Kimi K3, Qwen with
+`preserve_thinking`, GLM with `clear_thinking: false`, MiniMax) do not have the
+setting yet; each needs one live check first.
+
 ## Schema Validation
 
 Add the schema comment at the top of your YAML file for IDE autocompletion:

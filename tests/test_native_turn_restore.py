@@ -488,32 +488,28 @@ class TestAnthropic:
 # ---------------------------------------------------------------------------
 
 
+def _reasoning_turn(model: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "read_file", "args": {"path": "a.md"}, "id": "c1"}],
+        additional_kwargs={"reasoning_content": "Open a.md first."},
+        response_metadata={"model_name": model, "model_provider": "openai"},
+    )
+
+
 class TestChatCompletionsReasoning:
     @RESTORES
-    @pytest.mark.parametrize(
-        "config",
-        [
-            _config("deepseek/deepseek-v3.2", "openrouter", reasoning_level="high"),
-            _config(
-                "MiniMax-M2",
-                "openai",
-                base_url="http://vllm-fixture.invalid/v1",
-                extra_body={"reasoning_split": True},
-            ),
-        ],
-        ids=["deepseek-openrouter", "minimax-vllm"],
-    )
-    def test_the_live_request_does_not_replay_reasoning_and_neither_does_a_restore(
-        self, config, restore
+    def test_a_family_without_the_replay_sends_no_reasoning_live_or_restored(
+        self, restore
     ):
-        llm = loader.create_llm(config)
-        turn = AIMessage(
-            content="",
-            tool_calls=[{"name": "read_file", "args": {"path": "a.md"}, "id": "c1"}],
-            additional_kwargs={"reasoning_content": "Open a.md first."},
-            response_metadata={"model_name": config.model, "model_provider": "openai"},
+        config = _config(
+            "MiniMax-M2",
+            "openai",
+            base_url="http://vllm-fixture.invalid/v1",
+            extra_body={"reasoning_split": True},
         )
-        live = _history(turn, {"c1": "file text"})
+        llm = loader.create_llm(config)
+        live = _history(_reasoning_turn(config.model), {"c1": "file text"})
         rows = _rows(live)
 
         restored = _restored(live, restore, config.model)
@@ -527,6 +523,65 @@ class TestChatCompletionsReasoning:
         ai_row = rows[1]
         assert ai_row["thinking"] == "Open a.md first."
         assert "provider_raw" not in ai_row
+
+    @RESTORES
+    @pytest.mark.parametrize(
+        "config",
+        [
+            _config("deepseek/deepseek-v3.2", "openrouter", reasoning_level="high"),
+            _config(
+                "deepseek-flash",
+                "openai",
+                base_url="http://deepseek-fixture.invalid/v1",
+                reasoning_level="high",
+            ),
+        ],
+        ids=["deepseek-openrouter", "deepseek-direct"],
+    )
+    def test_a_family_with_the_replay_sends_its_reasoning_live_and_restored(
+        self, config, restore
+    ):
+        """DeepSeek (``replay_reasoning_content``): the reasoning is part of
+        every later request, so a restored turn must carry it like the live
+        one — the stored row keeps it with the model that produced it."""
+        llm = loader.create_llm(config)
+        live = _history(_reasoning_turn(config.model), {"c1": "file text"})
+        rows = _rows(live)
+
+        restored = _restored(live, restore, config.model)
+
+        def wire(history):
+            payload = llm._get_request_payload([SystemMessage(SYSTEM), *history])
+            return payload["messages"]
+
+        assert json.dumps(wire(restored)) == json.dumps(wire(live))
+        assistant = next(m for m in wire(live) if m["role"] == "assistant")
+        assert assistant["reasoning_content"] == "Open a.md first."
+        ai_row = rows[1]
+        assert ai_row["thinking"] == "Open a.md first."
+        assert ai_row["provider_raw"]["additional_kwargs"] == {
+            "reasoning_content": "Open a.md first."
+        }
+        assert ai_row["provider_raw"]["model"] == config.model
+
+    @RESTORES
+    def test_another_family_does_not_get_the_stored_reasoning(self, restore):
+        """The envelope names the producer, so the boundary still strips the
+        reasoning when the history is replayed to a different family."""
+        live = _history(_reasoning_turn("deepseek-flash"), {"c1": "file text"})
+        for target in ("MiniMax-M2", "kimi-k3", "gpt-oss-120b"):
+            turn = _turn(_restored(live, restore, target))
+            assert "reasoning_content" not in turn.additional_kwargs
+
+    def test_an_unstamped_turn_is_not_replayed(self):
+        """A row from before the envelope (no producing model) comes back
+        without reasoning: nothing says it is this family's own."""
+        turn = _reasoning_turn("deepseek-flash")
+        turn.response_metadata = {}
+        live = _history(turn, {"c1": "file text"})
+        assert "provider_raw" not in _rows(live)[1]
+        restored = _turn(_restored(live, _session_restore, "deepseek-flash"))
+        assert "reasoning_content" not in restored.additional_kwargs
 
 
 # ---------------------------------------------------------------------------

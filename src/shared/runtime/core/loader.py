@@ -1091,6 +1091,21 @@ def resolve_model_settings(
     return settings
 
 
+def replays_reasoning_content(model: str) -> bool:
+    """Whether ``model``'s family gets its earlier reasoning sent back.
+
+    The family setting ``replay_reasoning_content`` (model_config_matrix.yaml):
+    on, every assistant turn of a Chat Completions request carries the
+    ``reasoning_content`` the model returned for it (see
+    ``attach_reasoning_content``). Read by the client factories and by the
+    local token count, which then counts that text too.
+    """
+    try:
+        return resolve_model_settings(model).get("replay_reasoning_content") is True
+    except Exception:  # an unreadable matrix must not fail a client or a count
+        return False
+
+
 def bundled_settings_for_family(family: str, name: str) -> Any:
     """File-resolved settings leaf for <family> (default ⊕ family), ignoring DB
     overrides. ``name`` may be a dotted path into limits (e.g.
@@ -2150,6 +2165,15 @@ class LLMConfig:
     # keyless prefix caches, so they get neither.
     prompt_cache_key: Optional[str] = None
 
+    # ``False`` stops the reasoning replay for a family that has it on
+    # (``replay_reasoning_content`` in the family matrix, which writes its own
+    # value here): an expert or a job's ``llm.replay_reasoning_content: false``
+    # sends every assistant turn without its earlier reasoning. It cannot turn
+    # the replay on for a family that does not declare it — the factory asks
+    # the family of the model the client is built for, so a summarization or
+    # roster model of another family is never sent a field it does not know.
+    replay_reasoning_content: Optional[bool] = None
+
     # How a long context is compacted for this model: ``{strategy, recipe}``,
     # ``strategy: native`` = the model writes its own summary with the named
     # recipe, anything else = the auxiliary fold. From the family matrix
@@ -2250,6 +2274,7 @@ class LLMConfig:
             if override.extra_headers is not None
             else self.extra_headers,
             served_model=served_model,
+            replay_reasoning_content=self.replay_reasoning_content,
             compaction=self.compaction,
             # Phase overrides not inherited to resolved config
             summarization=None,
@@ -3102,6 +3127,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         extra_body=llm_data.get("extra_body"),
         extra_headers=llm_data.get("extra_headers"),
         served_model=llm_data.get("served_model"),
+        replay_reasoning_content=llm_data.get("replay_reasoning_content"),
         compaction=llm_data.get("compaction"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
@@ -4966,6 +4992,13 @@ def _create_openai_llm(
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
 
+    # Family setting for providers that continue from their earlier reasoning
+    # only when it is sent back (DeepSeek) — see attach_reasoning_content.
+    if config.replay_reasoning_content is not False and replays_reasoning_content(
+        config.model
+    ):
+        llm_kwargs["replay_reasoning_content"] = True
+
     # Claude through the subscription proxy: without explicit breakpoints the
     # proxy marks the last message, which is the per-turn injection tail, and
     # the history never reads from cache (compaction refactor note, F17).
@@ -5510,6 +5543,13 @@ def _create_openrouter_llm(
     # only (Qwen3.8 raises on any other) — see fold_system_messages.
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
+
+    # Family setting for providers that continue from their earlier reasoning
+    # only when it is sent back (DeepSeek) — see attach_reasoning_content.
+    if config.replay_reasoning_content is not False and replays_reasoning_content(
+        config.model
+    ):
+        llm_kwargs["replay_reasoning_content"] = True
 
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
