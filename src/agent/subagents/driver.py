@@ -426,7 +426,24 @@ class SubagentDriver:
         self.inbox.put_nowait(self._item(brief, role))
         await self.turn_done.wait()
         self.running = False
+        await self._drain_archive_tasks()
         return self.classify()
+
+    async def _drain_archive_tasks(self, timeout: float = 20.0) -> None:
+        """Let this brief's model-call rows reach the audit store.
+
+        ``archive_llm_call`` hands each row to a thread and returns. Without
+        this the child's report could reach the parent, and the parent's job
+        end, while the rows of its last calls were still on their way. Bounded:
+        a row that takes longer is still written, just not waited for.
+        """
+        pending = [task for task in self._bg_tasks if not task.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait(pending, timeout=timeout)
+        except Exception:  # never fail a brief over its audit rows
+            pass
 
     async def _persist_seed_before_start(self) -> None:
         """Persist a fork seed exactly once before any provider task exists."""

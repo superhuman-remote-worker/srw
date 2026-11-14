@@ -1403,6 +1403,7 @@ class UniversalAgent:
                     return dict(final_state)
                 finally:
                     await self._quiesce_subagent_runtime("parent graph ended")
+                    await self._close_audit_record()
                     if not getattr(self, "_defer_job_cleanup", False):
                         self._current_job_id = None
                         self._cleanup_shell_manager()
@@ -2804,6 +2805,10 @@ class UniversalAgent:
                 except Exception as e:
                     logger.debug(f"Memory drain at job-end failed (non-fatal): {e}")
 
+            # After everything above that still archives (child reports, the
+            # memory drain): flush the audit spool and leave the receipt.
+            await self._close_audit_record()
+
             # Worker claims defer teardown until their driver classifies the
             # exit (rotation/lease loss preserves tmux; genuine end destroys
             # it).  Every other caller keeps the historical eager cleanup.
@@ -2812,6 +2817,30 @@ class UniversalAgent:
                 self._cleanup_shell_manager()
                 self._close_datasource_connections()
                 await self._cleanup_checkpointer()
+
+    async def _close_audit_record(self) -> None:
+        """Flush the audit spool for this job and leave its receipt.
+
+        The audit writer keeps rows it could not write while the store was
+        down; a job that ends must give them their chance before this process
+        moves on or exits, and say whether its record is whole
+        (``LLMArchiver.close_job_record``). Runs in a thread: the flush waits.
+        Never raises.
+        """
+        job_id = self._current_job_id
+        if not job_id:
+            return
+        try:
+            from agent.core.archiver import get_archiver
+
+            archiver = get_archiver()
+            if archiver is None:
+                return
+            await asyncio.to_thread(
+                archiver.close_job_record, str(job_id), self.config.agent_id
+            )
+        except Exception as e:
+            logger.warning(f"[{job_id}] closing the audit record failed: {e}")
 
     async def _poll_job_workspace_ready(
         self, job_id: str, timeout: int = 300, poll_interval: float = 2.0

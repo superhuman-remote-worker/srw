@@ -1018,6 +1018,15 @@ agent:
   # later request carries, and results a compaction shortens afterwards.
   # Tool input and output then take about twice the room in the audit DB.
   auditFullToolIo: "false"
+  # -- `synchronous_commit` for the agents' audit writes: "off" (default) or
+  # "on". Off, the audit database acknowledges a row before it is on disk, so
+  # a database crash can lose the last ~600 ms of rows the agent was told were
+  # written. On, every audit write waits for the flush: a few milliseconds
+  # more per row and more fsyncs on the audit volume, for a record that must
+  # not lose an acknowledged row. A clean restart loses nothing either way;
+  # rows written while the database is away are spooled by the agent and
+  # written when it is back.
+  auditSynchronousCommit: "off"
   # -- Temporary compatibility gate for REST/session requests that omit
   # datasource_ids. Omission always attaches the project's own platform-owned
   # connectors (knowledge base, cloud folder); this gate adds the owner's and

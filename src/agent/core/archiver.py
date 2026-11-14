@@ -1161,6 +1161,74 @@ class LLMArchiver:
             logger.warning(f"Failed to update LLM response: {e}")
             return False
 
+    def close_job_record(
+        self,
+        job_id: str,
+        agent_type: str,
+        flush_timeout_s: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """End a job's run in this process: flush, then leave a receipt.
+
+        Rows the audit store did not take yet (it was down) are written now,
+        waiting up to ``flush_timeout_s`` (``AUDIT_FLUSH_TIMEOUT_S``, 30 s) for
+        it to come back. Then one ``agent_audit`` row with
+        ``step_type = "audit_receipt"`` says what this process did with the
+        job's rows: written, replayed after an outage, dropped. Whoever
+        collects the job's record reads it like this:
+
+        - a receipt with ``complete: true`` — every row is in the store;
+        - a receipt with ``dropped > 0`` — the record has a hole;
+        - no receipt — unknown: the store never came back, or the process
+          died first.
+
+        A job that runs in several pieces (worker batches) leaves one receipt
+        per piece; their counts add up. Blocks: call it off the event loop.
+        Returns the counts at the close, or None when the job wrote nothing.
+        Never raises.
+        """
+        writer = self._writer
+        if writer is None or not hasattr(writer, "insert_job_receipt"):
+            return None
+        try:
+            if flush_timeout_s is None:
+                try:
+                    flush_timeout_s = float(
+                        os.environ.get("AUDIT_FLUSH_TIMEOUT_S", "") or 30.0
+                    )
+                except ValueError:
+                    flush_timeout_s = 30.0
+            flushed = writer.flush(flush_timeout_s)
+            stats = writer.job_stats(job_id)
+            if not stats["rows"] and not stats["spooled"]:
+                return None
+            writer.insert_job_receipt(
+                {
+                    "job_id": job_id,
+                    "agent_type": agent_type,
+                    "iteration": None,
+                    "step_type": "audit_receipt",
+                    "node_name": "job_end",
+                    "timestamp": datetime.now(timezone.utc),
+                    "payload": {"closed_at": _iso_utc_now()},
+                    "metadata": None,
+                }
+            )
+            if not flushed or not stats["complete"]:
+                logger.error(
+                    f"[AUDIT] job={job_id[:8]}... record incomplete at job end: "
+                    f"dropped={stats['dropped']} still_spooled={stats['spooled']} "
+                    f"last_error={stats.get('last_error')}"
+                )
+            elif stats["replayed"]:
+                logger.info(
+                    f"[AUDIT] job={job_id[:8]}... record complete; "
+                    f"{stats['replayed']} row(s) written after an outage"
+                )
+            return stats
+        except Exception as e:
+            logger.warning(f"Failed to close the audit record of job {job_id}: {e}")
+            return None
+
     def close(self):
         """Close the audit backend's connection."""
         if self._writer is not None:

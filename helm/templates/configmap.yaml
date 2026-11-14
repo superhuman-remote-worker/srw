@@ -339,6 +339,9 @@ data:
   # Tool steps keep their full arguments and result in agent_audit when on
   # (agent.core.archiver.full_tool_io_enabled).
   AUDIT_FULL_TOOL_IO: {{ .Values.agent.auditFullToolIo | default "false" | quote }}
+  # synchronous_commit of the agents' audit writer sessions
+  # (agent.database.audit_writer._synchronous_commit).
+  AUDIT_SYNCHRONOUS_COMMIT: {{ .Values.agent.auditSynchronousCommit | default "off" | quote }}
 
   # App-DB asyncpg pool sizing for provisioned agent pods, which inherit this
   # ConfigMap via envFrom. Kept SMALL on purpose: the connection multiplier is
