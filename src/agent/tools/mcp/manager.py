@@ -18,14 +18,27 @@ remote server gets. When the front refuses the lease (it was revoked or
 expired: a 401, or :data:`LEASE_ENDED_CODE` on a call in flight), the agent
 is told so in plain words and nothing reconnects until the entry carries
 another lease.
+
+Every call goes through one path, :meth:`MCPManager._call_session`, and
+every result through one converter, :func:`_render_result`. Text reaches the
+model as text. An image reaches a multimodal model as an image, through the
+``<image_data>`` contract both graphs lift into a real image block. A tool's
+own error (``isError``, or a JSON-RPC error from a live session) reaches the
+model in the server's words. A call the server answered is never re-run: only
+a dead session reconnects
+(knowledge-base/knowledge/features/mcp_client_2026_07_28_elicitation.md,
+Phase A).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
@@ -62,6 +75,16 @@ LEASE_REFUSED = (
     "the connector's lease was revoked or has expired, so this execution no "
     "longer holds this connector"
 )
+#: The most of a server's error text the model is shown.
+MCP_ERROR_TEXT_LIMIT = 4000
+#: The largest inline image (base64 characters, ~15 MB decoded) passed on
+#: to the model; a larger one is described instead.
+MCP_INLINE_IMAGE_LIMIT = 20 * 1024 * 1024
+#: Image types every provider the agent talks to accepts.
+_VISIBLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_BASE64 = re.compile(r"[A-Za-z0-9+/=\s]+")
+#: Pages of tools/list read from one server before giving up on the rest.
+_MAX_TOOL_PAGES = 50
 
 
 @dataclass
@@ -210,7 +233,6 @@ class _ServerHandle:
     reconnected_once: bool = False
     #: When a managed server reconnected, within the budget's window.
     reconnects: deque[float] = field(default_factory=deque)
-    generation: int = 0
     #: The headers (its bearer) a managed server's front refused as a dead
     #: lease; ``None`` while none was refused.
     refused_lease: dict[str, str] | None = None
@@ -389,11 +411,8 @@ class MCPManager:
                 await session.initialize()
                 handle.session = session
 
-                from langchain_mcp_adapters.tools import load_mcp_tools
-
-                raw_tools = await load_mcp_tools(session)
-                handle.generation += 1
-                handle.tools = self._namespace_and_wrap(handle, raw_tools)
+                listed = await _list_all_tools(session)
+                handle.tools = self._wrap_tools(handle, listed)
                 handle.refused_lease = None
                 handle.status = "connected"
                 handle.ready.set()
@@ -438,13 +457,37 @@ class MCPManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def get_langchain_tools(self) -> list[Any]:
-        """Return tools backed by currently connected server handles."""
-        return [
+    def get_langchain_tools(
+        self, sees_images: Callable[[], bool] | None = None
+    ) -> list[Any]:
+        """Return tools backed by currently connected server handles.
+
+        ``sees_images`` is the loading agent's own "does my model take
+        images" check, asked at call time. Each agent (a Session and its
+        subagents share this manager) gets copies bound to its check, so
+        an image only ever reaches a model that can take it. Without one,
+        images are described in text.
+        """
+        tools = [
             tool
             for handle in self._handles
             if handle.status == "connected"
             for tool in handle.tools
+        ]
+        if sees_images is None:
+            return tools
+        handles = {handle.slug: handle for handle in self._handles}
+        return [
+            tool.model_copy(
+                update={
+                    "coroutine": self._guarded(
+                        handles[tool.metadata["mcp_server_slug"]],
+                        tool.metadata["mcp_tool_name"],
+                        sees_images,
+                    )
+                }
+            )
+            for tool in tools
         ]
 
     @property
@@ -457,11 +500,12 @@ class MCPManager:
             handle.ds["_mcp_status"] = handle.status
             handle.ds["_mcp_tools"] = [tool.name for tool in handle.tools]
 
-    def _namespace_and_wrap(
-        self,
-        handle: _ServerHandle,
-        raw_tools: list[Any],
-    ) -> list[Any]:
+    def _wrap_tools(self, handle: _ServerHandle, listed: list[Any]) -> list[Any]:
+        """One LangChain tool per MCP tool, each calling through this manager.
+
+        The tool's ``inputSchema`` is its argument schema as is. Its
+        annotations decide the permission effect.
+        """
         from langchain_core.tools import StructuredTool
 
         taken = {
@@ -469,21 +513,24 @@ class MCPManager:
         }
         managed_block = _managed_block(handle.ds) if handle.managed else None
         wrapped = []
-        for tool in raw_tools:
+        for tool in listed:
             namespaced_name = namespace_mcp_tool(handle.slug, tool.name, taken)
             taken.add(namespaced_name)
+            annotations = (
+                tool.annotations.model_dump() if tool.annotations is not None else None
+            )
             wrapped.append(
                 StructuredTool(
                     name=namespaced_name,
                     description=tool.description or "",
-                    args_schema=tool.args_schema,
-                    coroutine=self._guarded(handle, tool),
+                    args_schema=tool.inputSchema,
+                    coroutine=self._guarded(handle, tool.name),
                     metadata={
                         "mcp_server": handle.name,
                         "mcp_server_slug": handle.slug,
                         "mcp_tool_name": tool.name,
                         "effect": mcp_tool_effect(
-                            getattr(tool, "metadata", None), managed_block, tool.name
+                            annotations, managed_block, tool.name
                         ),
                     },
                 )
@@ -567,18 +614,31 @@ class MCPManager:
             await self._await_ready(handle)
             return self._is_live(handle)
 
-    async def _call_current_session(
+    async def _call_session(
         self,
         handle: _ServerHandle,
         tool_name: str,
         arguments: dict[str, Any],
+        sees_images: Callable[[], bool] | None = None,
     ) -> str:
-        result = await self._raced(
-            handle, handle.session.call_tool(tool_name, arguments)
-        )
-        if getattr(result, "isError", False):
-            return _tool_error(handle, tool_name, "server reported an error")
-        return _content_to_str(result)
+        """Call a tool on the server's current session, within the call
+        timeout, and render what it answered."""
+        session = handle.session
+        if session is None:
+            raise ConnectionError("the server's session ended")
+        try:
+            result = await asyncio.wait_for(
+                self._raced(handle, _send_tool_call(session, tool_name, arguments)),
+                timeout=MCP_CALL_TIMEOUT,
+            )
+        except TimeoutError:
+            return _tool_error(
+                handle,
+                tool_name,
+                f"no answer within {int(MCP_CALL_TIMEOUT)}s. The call may still "
+                "have run on the server; check before calling it again",
+            )
+        return _render_result(handle, tool_name, result, _asks_yes(sees_images))
 
     @staticmethod
     async def _raced(handle: _ServerHandle, call: Any) -> Any:
@@ -608,21 +668,18 @@ class MCPManager:
         await asyncio.gather(pending, return_exceptions=True)
         raise ConnectionError("the server's session ended")
 
-    def _guarded(self, handle: _ServerHandle, tool: Any):
-        """Bound calls, reconnect one dead server once, and return string errors."""
-        original_name = tool.name
-        wrapper_generation = handle.generation
+    def _guarded(
+        self,
+        handle: _ServerHandle,
+        tool_name: str,
+        sees_images: Callable[[], bool] | None = None,
+    ):
+        """Bound calls, reconnect a dead session, and return string errors.
 
-        async def _invoke(**kwargs):
-            if handle.generation != wrapper_generation:
-                return await self._call_current_session(
-                    handle,
-                    original_name,
-                    kwargs,
-                )
-            if tool.coroutine is not None:
-                return await self._raced(handle, tool.coroutine(**kwargs))
-            return await self._raced(handle, tool.ainvoke(kwargs))
+        Only a session that died reconnects and retries the call. A server
+        that answered, even with an error, keeps its session, and the call is
+        never sent again: it reached the tool, which may have acted.
+        """
 
         async def _call(**kwargs):
             if not self._is_live(handle):
@@ -632,75 +689,57 @@ class MCPManager:
                         if handle.refused_lease is not None
                         else "server unavailable"
                     )
-                    return _tool_error(handle, original_name, detail)
+                    return _tool_error(handle, tool_name, detail)
                 try:
-                    return await asyncio.wait_for(
-                        self._call_current_session(handle, original_name, kwargs),
-                        timeout=MCP_CALL_TIMEOUT,
-                    )
-                except TimeoutError:
-                    return _tool_error(
-                        handle,
-                        original_name,
-                        f"timed out after {int(MCP_CALL_TIMEOUT)}s",
+                    return await self._call_session(
+                        handle, tool_name, kwargs, sees_images
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return _tool_error(handle, original_name, _mark_failed(handle, exc))
+                    return _tool_error(handle, tool_name, _mark_failed(handle, exc))
 
             try:
-                return await asyncio.wait_for(
-                    _invoke(**kwargs),
-                    timeout=MCP_CALL_TIMEOUT,
-                )
-            except TimeoutError:
-                return _tool_error(
-                    handle,
-                    original_name,
-                    f"timed out after {int(MCP_CALL_TIMEOUT)}s",
-                )
+                return await self._call_session(handle, tool_name, kwargs, sees_images)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if handle.managed and (
-                    _lease_ended(exc) or handle.refused_lease is not None
-                ):
-                    # The front refused the lease (on this call, or the
-                    # session ended on it): a reconnect would be refused too.
-                    return _tool_error(handle, original_name, _mark_failed(handle, exc))
-                if handle.managed and _tool_level(exc):
-                    # The server answered: the session is alive, the tool
-                    # (or the front, for a tool this binding may not call)
-                    # refused. Reconnecting would only spend the budget.
-                    return _tool_error(handle, original_name, type(exc).__name__)
+                if (
+                    handle.managed
+                    and (_lease_ended(exc) or handle.refused_lease is not None)
+                ) or _tool_level(exc):
+                    # The front refused the lease (a reconnect would be
+                    # refused too), or the server answered with an error (the
+                    # session is alive and the call reached it).
+                    return _tool_error(handle, tool_name, _mark_failed(handle, exc))
                 handle.status = f"unavailable: {type(exc).__name__}"
                 if await self._restart_server(handle, force=True):
                     try:
-                        return await asyncio.wait_for(
-                            self._call_current_session(handle, original_name, kwargs),
-                            timeout=MCP_CALL_TIMEOUT,
-                        )
-                    except TimeoutError:
-                        return _tool_error(
-                            handle,
-                            original_name,
-                            f"timed out after {int(MCP_CALL_TIMEOUT)}s",
+                        return await self._call_session(
+                            handle, tool_name, kwargs, sees_images
                         )
                     except asyncio.CancelledError:
                         raise
                     except Exception as retry_exc:
                         return _tool_error(
-                            handle,
-                            original_name,
-                            _mark_failed(handle, retry_exc),
+                            handle, tool_name, _mark_failed(handle, retry_exc)
                         )
                 if handle.refused_lease is not None:
                     # The reconnect was refused the lease.
-                    return _tool_error(handle, original_name, LEASE_REFUSED)
-                return _tool_error(handle, original_name, type(exc).__name__)
+                    return _tool_error(handle, tool_name, LEASE_REFUSED)
+                return _tool_error(handle, tool_name, type(exc).__name__)
 
         return _call
+
+
+def _asks_yes(probe: Callable[[], bool] | None) -> bool:
+    """A yes/no check's answer; a missing or failing check is no."""
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        return False
 
 
 def _ready_client() -> Any:
@@ -712,14 +751,17 @@ def _ready_client() -> Any:
 
 
 def _mark_failed(handle: _ServerHandle, exc: BaseException) -> str:
-    """A failed call marks the server unavailable, unless a managed server
-    answered with a tool error (its session is alive). Returns what the
-    agent is told: the lease refusal in plain words, else the error type."""
+    """A failed call marks the server unavailable, unless the server answered
+    with an error (its session is alive). Returns what the agent is told:
+    the lease refusal in plain words, the server's own error message, or
+    else only the error type (a transport error may carry a URL or a
+    header)."""
     if handle.managed and (_lease_ended(exc) or handle.refused_lease is not None):
         _refuse_lease(handle)
         return LEASE_REFUSED
-    if not (handle.managed and _tool_level(exc)):
-        handle.status = f"unavailable: {type(exc).__name__}"
+    if _tool_level(exc):
+        return _server_error_message(exc)
+    handle.status = f"unavailable: {type(exc).__name__}"
     return type(exc).__name__
 
 
@@ -784,13 +826,9 @@ def _lease_ended(exc: BaseException) -> bool:
 
 
 def _tool_level(exc: BaseException) -> bool:
-    """Whether a call failed in the tool, not in the session: the adapter's
-    ToolException (a result with isError) or a JSON-RPC error other than a
-    terminated session or a closed connection."""
-    from langchain_core.tools import ToolException
-
-    if isinstance(exc, ToolException):
-        return True
+    """Whether the server answered the call with an error, so its session is
+    alive: a JSON-RPC error other than a terminated session or a closed
+    connection. (A result with ``isError`` is an answer, not an exception.)"""
     try:
         from mcp.shared.exceptions import McpError
     except ImportError:  # pragma: no cover - the SDK is a dependency
@@ -801,21 +839,171 @@ def _tool_level(exc: BaseException) -> bool:
     return False
 
 
+def _server_error_message(exc: BaseException) -> str:
+    """A JSON-RPC error's message, the server's own words, bounded."""
+    message = str(getattr(getattr(exc, "error", None), "message", "") or "")
+    return _bounded(message) or type(exc).__name__
+
+
+def _bounded(text: str, limit: int = MCP_ERROR_TEXT_LIMIT) -> str:
+    text = text.strip()
+    if len(text) > limit:
+        return text[:limit].rstrip() + " […]"
+    return text
+
+
 def _tool_error(handle: _ServerHandle, tool_name: str, detail: str) -> str:
-    """Build a useful error without reflecting transport or credential data."""
-    return (
-        f"MCP tool error ({handle.name}/{tool_name}): {detail}. "
-        "Continue without this tool."
+    """A failed call, as the model reads it.
+
+    It starts with ``Error:``, which is how a Session tells a failed call
+    from a result. It names the server and the tool, carries the server's
+    own words when it answered, and only says to give up on the server
+    when the server is no longer usable. Transport errors are reported by
+    type only, so no URL or credential is echoed.
+    """
+    detail = detail.rstrip()
+    if not detail.endswith((".", "!", "?", "]", ")")):
+        detail += "."
+    message = f"Error: MCP tool {handle.name}/{tool_name} failed: {detail}"
+    if handle.status != "connected":
+        message += " Continue without this server's tools."
+    return message
+
+
+async def _list_all_tools(session: Any) -> list[Any]:
+    """Every tool a server lists, across pages."""
+    from mcp.types import PaginatedRequestParams
+
+    tools: list[Any] = []
+    cursor = None
+    for _ in range(_MAX_TOOL_PAGES):
+        params = PaginatedRequestParams(cursor=cursor) if cursor else None
+        page = await session.list_tools(params=params)
+        tools.extend(page.tools)
+        cursor = page.nextCursor
+        if not cursor:
+            break
+    return tools
+
+
+async def _send_tool_call(session: Any, name: str, arguments: dict[str, Any]) -> Any:
+    """Send ``tools/call`` and return the server's result as it came.
+
+    ``ClientSession.call_tool`` validates ``structuredContent`` against the
+    tool's output schema *after* the tool ran and raises a bare
+    ``RuntimeError`` on a mismatch. That would read as a dead session,
+    reconnect, run the tool a second time and lose its answer, so the
+    request is sent directly. A server's off-schema answer is still its
+    answer.
+    """
+    from mcp import types
+
+    return await session.send_request(
+        types.ClientRequest(
+            types.CallToolRequest(
+                params=types.CallToolRequestParams(name=name, arguments=arguments),
+            )
+        ),
+        types.CallToolResult,
     )
 
 
-def _content_to_str(result: Any) -> str:
-    """Flatten an MCP ``CallToolResult`` into its textual representation."""
+def _render_result(
+    handle: _ServerHandle, tool_name: str, result: Any, sees_images: bool
+) -> str:
+    """What the model reads for a tool's result.
+
+    A result with ``isError`` is the tool's own failure, reported in the
+    server's words. Otherwise each content block becomes text: images go
+    through the ``<image_data>`` contract when the model sees images, and
+    are described when it does not. ``structuredContent`` is shown only when
+    the result has no content blocks: the spec asks servers to put the same
+    data in a text block, and a server that answered with blocks (an image
+    its structured copy repeats, say) has said what it meant to show.
+    """
+    blocks = list(getattr(result, "content", None) or [])
+    structured = getattr(result, "structuredContent", None)
+    if getattr(result, "isError", False):
+        text = "\n".join(_render_block(b, sees_images=False) for b in blocks)
+        if not blocks and structured is not None:
+            text = _json(structured)
+        return _tool_error(
+            handle,
+            tool_name,
+            _bounded(text) or "the server reported an error without a message",
+        )
+    parts = [_render_block(block, sees_images) for block in blocks]
+    if not blocks and structured is not None:
+        parts.append(_json(structured))
+    text = "\n".join(part for part in parts if part)
+    return text if text else "(the tool returned no content)"
+
+
+def _render_block(block: Any, sees_images: bool) -> str:
+    kind = getattr(block, "type", None)
+    if kind == "text":
+        return str(getattr(block, "text", "") or "")
+    if kind == "image":
+        return _render_image(
+            str(getattr(block, "data", "") or ""),
+            str(getattr(block, "mimeType", "") or ""),
+            sees_images,
+            "image",
+        )
+    if kind == "audio":
+        mime = getattr(block, "mimeType", "") or "audio"
+        size = _decoded_size(str(getattr(block, "data", "") or ""))
+        return (
+            f"[audio: {mime}, {size:,} bytes, not shown: the model cannot hear audio]"
+        )
+    if kind == "resource_link":
+        name = getattr(block, "title", None) or getattr(block, "name", "") or ""
+        line = f"[resource link] {name}: {getattr(block, 'uri', '')}"
+        mime = getattr(block, "mimeType", None)
+        if mime:
+            line += f" ({mime})"
+        description = getattr(block, "description", None)
+        if description:
+            line += f" - {description}"
+        return line
+    if kind == "resource":
+        resource = getattr(block, "resource", None)
+        uri = getattr(resource, "uri", "")
+        text = getattr(resource, "text", None)
+        if text is not None:
+            return f"[resource {uri}]\n{text}"
+        blob = str(getattr(resource, "blob", "") or "")
+        mime = str(getattr(resource, "mimeType", "") or "")
+        if mime.startswith("image/"):
+            return _render_image(blob, mime, sees_images, f"resource {uri}")
+        return (
+            f"[resource {uri}: {mime or 'binary'}, {_decoded_size(blob):,} bytes, "
+            "not shown]"
+        )
+    return f"[{kind or 'unknown'} content not shown]"
+
+
+def _render_image(data: str, mime: str, sees_images: bool, label: str) -> str:
+    size = _decoded_size(data)
+    if not sees_images:
+        return f"[{label}: {mime}, {size:,} bytes, not shown: this model cannot see images]"
+    if mime not in _VISIBLE_IMAGE_TYPES:
+        return f"[{label}: {mime}, {size:,} bytes, not shown: not an image type the model can view]"
+    if len(data) > MCP_INLINE_IMAGE_LIMIT:
+        return f"[{label}: {mime}, {size:,} bytes, not shown: too large to view]"
+    if not data or _BASE64.fullmatch(data) is None:
+        return f"[{label}: {mime}, not shown: the server sent malformed image data]"
+    from agent.services.image_content import IMAGE_DATA_TAG_TEMPLATE
+
+    return IMAGE_DATA_TAG_TEMPLATE.format(mime=mime, b64=data)
+
+
+def _decoded_size(data: str) -> int:
+    return len(data) * 3 // 4
+
+
+def _json(value: Any) -> str:
     try:
-        parts = []
-        for block in getattr(result, "content", []) or []:
-            text = getattr(block, "text", None)
-            parts.append(text if text is not None else str(block))
-        return "\n".join(parts) if parts else str(result)
-    except Exception:
-        return str(result)
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)

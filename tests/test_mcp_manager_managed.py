@@ -159,15 +159,15 @@ def test_a_managed_server_reconnects_within_a_budget(monkeypatch):
 
 
 def test_a_tool_error_is_not_a_dead_session():
-    from langchain_core.tools import ToolException
     from mcp.shared.exceptions import McpError
     from mcp.types import ErrorData
 
     def mcp_error(code: int) -> McpError:
         return McpError(ErrorData(code=code, message="x"))
 
-    assert manager_module._tool_level(ToolException("the tool failed"))
-    # The front refusing a tool this binding may not call.
+    # A result with isError is an answer, not an exception; a JSON-RPC
+    # error is the server answering too: the front refusing a tool this
+    # binding may not call.
     assert manager_module._tool_level(mcp_error(-32602))
     # A terminated session (404 from a replaced pod) or a closed connection.
     assert not manager_module._tool_level(mcp_error(32600))
@@ -280,14 +280,13 @@ async def test_a_call_told_its_lease_ended_says_so_and_never_reconnects():
 
     manager._restart_server = restart
 
-    class Tool:
-        name = "whoami"
-
+    class Session:
         @staticmethod
-        async def coroutine(**_kwargs):
+        async def send_request(*_args, **_kwargs):
             raise _lease_ended_error()
 
-    call = manager._guarded(handle, Tool())
+    handle.session = Session()
+    call = manager._guarded(handle, "whoami")
     answer = await call()
     assert manager_module.LEASE_REFUSED in answer
     assert handle.status == f"unavailable: {manager_module.LEASE_REFUSED}"

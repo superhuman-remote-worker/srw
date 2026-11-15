@@ -257,16 +257,10 @@ def _tool(manager: MCPManager, suffix: str):
 
 
 async def _text(tool, **arguments) -> str:
-    """A tool call's text, as the model reads it."""
+    """A tool call's text, as the model reads it: always a plain string."""
     result = await tool.coroutine(**arguments)
-    if isinstance(result, tuple):  # the adapter's (content, artifact)
-        result = result[0]
-    if isinstance(result, list):
-        result = "\n".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in result
-        )
-    return str(result)
+    assert isinstance(result, str), type(result)
+    return result
 
 
 @pytest.mark.asyncio

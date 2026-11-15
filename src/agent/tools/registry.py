@@ -669,7 +669,11 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             try:
                 manager = context.connection_for("mcp")
                 requested = set(tools_by_category["mcp"])
-                for tool in manager.get_langchain_tools():
+                # Bound to this context's model: an image a server returns
+                # reaches only a model that takes images.
+                for tool in manager.get_langchain_tools(
+                    sees_images=context.get_phase_multimodal
+                ):
                     if tool.name in requested:
                         all_tools.append(tool)
                         logger.debug(f"Loaded MCP tool: {tool.name}")

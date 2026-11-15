@@ -428,7 +428,7 @@ async def test_a_crashed_process_is_replaced_when_the_client_reconnects(pod):
         # The call the process died on is answered at once as a session
         # that ended: the client reconnects (and retries it once, on a
         # process that dies too) instead of waiting for its call timeout.
-        assert "MCP tool error" in await _text(crash)
+        assert (await _text(crash)).startswith("Error: MCP tool Memory/crash failed")
         assert time.monotonic() - began < manager_module.MCP_CALL_TIMEOUT / 2
         assert await _until(lambda: not _alive(first))
         answer = json.loads(await _text(whoami))
