@@ -245,6 +245,13 @@ deepseek:
     # fix. A job or expert turns it off with `llm.replay_reasoning_content:
     # false`. See attach_reasoning_content in reasoning_chat.py.
     replay_reasoning_content: true
+    # Send the output cap as `max_tokens`. The client library renames it to
+    # `max_completion_tokens`, and DeepSeek's own API does not apply a cap
+    # under that name: measured 2026-11-16, a request with
+    # `max_completion_tokens: 96` came back with 2,425 completion tokens and
+    # `finish_reason: stop`; with `max_tokens: 96` every reply was cut at 96.
+    # The cap counts reasoning tokens. OpenRouter takes `max_tokens` too.
+    send_max_tokens: true
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 

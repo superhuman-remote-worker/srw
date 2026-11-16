@@ -1082,6 +1082,16 @@ families whose providers ask for the same (Kimi K3, Qwen with
 `preserve_thinking`, GLM with `clear_thinking: false`, MiniMax) do not have the
 setting yet; each needs one live check first.
 
+The family also sets `send_max_tokens: true`: the output cap goes out as
+`max_tokens`. The client library sends it as `max_completion_tokens`, and
+DeepSeek's own API does not apply a cap under that name. Measured on 2026-11-16:
+a request with `max_completion_tokens: 96` came back with 2,425 completion
+tokens and a normal finish; with `max_tokens: 96` every reply was cut at 96
+tokens, all of them reasoning. The cap counts reasoning tokens.
+Without the setting, the family's `max_output_tokens` is not what limits a
+reply; the provider's default is. Other OpenAI-compatible endpoints may need
+the same; check one request with a low cap before trusting it.
+
 ## Schema Validation
 
 Add the schema comment at the top of your YAML file for IDE autocompletion:

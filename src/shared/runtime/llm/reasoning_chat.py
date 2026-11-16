@@ -1369,6 +1369,12 @@ class ReasoningChatOpenAI(ChatOpenAI):
     # attach_reasoning_content.
     replay_reasoning_content: bool = False
 
+    # Family setting `send_max_tokens` (model_config_matrix.yaml): send the
+    # output cap as `max_tokens`. langchain-openai renames it to
+    # `max_completion_tokens` on every request; an endpoint that only knows
+    # the older name ignores the cap (DeepSeek's own API, measured).
+    send_max_tokens: bool = False
+
     # Claude over an OpenAI-format transport (the subscription proxy): add
     # explicit cache breakpoints — see mark_anthropic_cache_breakpoints.
     anthropic_cache_breakpoints: bool = False
@@ -1416,6 +1422,8 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if self.send_max_tokens and "max_completion_tokens" in payload:
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
         # First: the payload is still one-to-one with the input messages here
         # (folding the system messages changes the count).
         if self.replay_reasoning_content and isinstance(payload.get("messages"), list):

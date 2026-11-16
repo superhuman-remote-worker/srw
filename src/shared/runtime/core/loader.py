@@ -4991,6 +4991,10 @@ def _create_openai_llm(
     # only (Qwen3.8 raises on any other) — see fold_system_messages.
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
+    # An endpoint that ignores `max_completion_tokens` gets the cap as
+    # `max_tokens` (family setting, see ReasoningChatOpenAI.send_max_tokens).
+    if resolve_model_settings(config.model).get("send_max_tokens") is True:
+        llm_kwargs["send_max_tokens"] = True
 
     # Family setting for providers that continue from their earlier reasoning
     # only when it is sent back (DeepSeek) — see attach_reasoning_content.
@@ -5543,6 +5547,10 @@ def _create_openrouter_llm(
     # only (Qwen3.8 raises on any other) — see fold_system_messages.
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
+    # An endpoint that ignores `max_completion_tokens` gets the cap as
+    # `max_tokens` (family setting, see ReasoningChatOpenAI.send_max_tokens).
+    if resolve_model_settings(config.model).get("send_max_tokens") is True:
+        llm_kwargs["send_max_tokens"] = True
 
     # Family setting for providers that continue from their earlier reasoning
     # only when it is sent back (DeepSeek) — see attach_reasoning_content.
