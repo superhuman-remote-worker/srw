@@ -20,16 +20,16 @@ from agent.tools.registry import (
 ECHO_SERVER = textwrap.dedent(
     """
     import sys
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
-    mcp = FastMCP("echo", host="127.0.0.1", port=int(sys.argv[1]), log_level="ERROR")
+    mcp = MCPServer("echo", log_level="ERROR")
 
     @mcp.tool()
     def echo(text: str) -> str:
         \"\"\"Echo the input back.\"\"\"
         return f"echo: {text}"
 
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=int(sys.argv[1]))
     """
 )
 

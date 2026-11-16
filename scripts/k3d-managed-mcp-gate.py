@@ -435,7 +435,7 @@ async def main():
                     record["text"] = "\n".join(
                         getattr(block, "text", "") or "" for block in result.content
                     )
-                    record["is_error"] = bool(result.isError)
+                    record["is_error"] = bool(result.is_error)
             elif name in tools:
                 record["text"] = text(await tools[name].coroutine(**arguments))
             else:

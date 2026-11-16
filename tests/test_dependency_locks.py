@@ -28,6 +28,9 @@ ORCHESTRATOR_IMAGE_PACKAGES = {"orchestrator", "shared"}
 TILT_ROLES = {"orchestrator", "vm-controller"}
 #: Roles that talk to the Kubernetes API and so carry the shared SDK policy.
 SDK_ROLES = {"orchestrator", "vm-controller"}
+#: Shared modules the orchestrator reaches a third-party SDK through: the MCP
+#: client its connector probe opens. Their imports are the orchestrator's.
+ORCHESTRATOR_SHARED_MODULES = ("src/shared/mcp_sdk.py",)
 
 
 def third_party_imports(package: Path) -> dict[str, set[str]]:
@@ -37,7 +40,9 @@ def third_party_imports(package: Path) -> dict[str, set[str]]:
     boots, then fails every call (the connector probes' "connection failed").
     """
     found: dict[str, set[str]] = {}
-    for path in sorted(package.rglob("*.py")):
+    paths = [package] if package.is_file() else sorted(package.rglob("*.py"))
+    base = package.parent if package.is_file() else package
+    for path in paths:
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.Import):
                 modules = [alias.name for alias in node.names]
@@ -51,9 +56,17 @@ def third_party_imports(package: Path) -> dict[str, set[str]]:
                     name not in sys.stdlib_module_names
                     and name not in ORCHESTRATOR_IMAGE_PACKAGES
                 ):
-                    found.setdefault(name, set()).add(
-                        path.relative_to(package).as_posix()
-                    )
+                    found.setdefault(name, set()).add(path.relative_to(base).as_posix())
+    return found
+
+
+def orchestrator_imports() -> dict[str, set[str]]:
+    """The orchestrator's third-party imports, with those it makes through
+    :data:`ORCHESTRATOR_SHARED_MODULES` (named by their path under ``src``)."""
+    found = third_party_imports(ROOT / "src/orchestrator")
+    for module in ORCHESTRATOR_SHARED_MODULES:
+        for name in third_party_imports(ROOT / module):
+            found.setdefault(name, set()).add(module.removeprefix("src/"))
     return found
 
 
@@ -220,16 +233,17 @@ def test_shared_sdk_policy_matches_both_resolutions(role):
 def test_orchestrator_imports_resolve_against_its_lock():
     """Every third-party package an orchestrator module imports is in its image."""
     pins = locks.pinned_versions(ROOT / locks.paths("orchestrator")[1])
-    imports = third_party_imports(ROOT / "src/orchestrator")
-    assert unlocked_imports(imports, pins) == []
+    assert unlocked_imports(orchestrator_imports(), pins) == []
 
 
 def test_import_scan_sees_the_lazy_connector_probe_imports():
-    imports = third_party_imports(ROOT / "src/orchestrator")
+    imports = orchestrator_imports()
     probes = "services/connector_drivers/"
     for name in ("neo4j", "pymongo", "webdav3"):
         assert probes + "managed.py" in imports[name]
-    assert probes + "mcp_client.py" in imports["mcp"]
+    # The MCP probe opens its client through the shared module.
+    assert "shared/mcp_sdk.py" in imports["mcp"]
+    assert "shared/mcp_sdk.py" in imports["httpx2"]
 
 
 def test_lazy_import_missing_from_the_lock_is_reported(tmp_path):

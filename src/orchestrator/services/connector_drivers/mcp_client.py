@@ -196,9 +196,8 @@ async def test_mcp_datasource(
     transport = str(credentials.get("transport") or "http").lower()
 
     async def _probe() -> dict[str, Any]:
-        from shared.mcp_sdk import ensure_mcp_sdk
+        from shared.mcp_sdk import open_client
 
-        ensure_mcp_sdk()
         async with AsyncExitStack() as stack:
             headers: dict[str, str] = {}
             auth = credentials.get("auth") or {}
@@ -207,42 +206,13 @@ async def test_mcp_datasource(
             elif auth.get("type") == "headers":
                 headers.update(auth.get("headers") or {})
 
-            if transport == "sse":
-                from mcp.client.sse import sse_client
-
-                read, write = await stack.enter_async_context(
-                    sse_client(connection_url, headers=headers or None)
-                )
-            else:
-                from mcp.client import streamable_http
-
-                http_transport = getattr(
-                    streamable_http,
-                    "streamable_http_client",
-                    None,
-                )
-                if http_transport is not None:
-                    from mcp.shared._httpx_utils import create_mcp_http_client
-
-                    http_client = await stack.enter_async_context(
-                        create_mcp_http_client(headers=headers or None)
-                    )
-                    transport_context = http_transport(
-                        connection_url,
-                        http_client=http_client,
-                    )
-                else:
-                    transport_context = streamable_http.streamablehttp_client(
-                        connection_url,
-                        headers=headers or None,
-                    )
-                read, write, _ = await stack.enter_async_context(transport_context)
-
-            from mcp import ClientSession
-
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            listing = await session.list_tools()
+            client = await open_client(
+                stack,
+                url=connection_url,
+                transport="sse" if transport == "sse" else "http",
+                headers=headers,
+            )
+            listing = await client.list_tools()
             names = [tool.name for tool in listing.tools]
             preview = ", ".join(names[:8])
             if len(names) > 8:
@@ -260,8 +230,20 @@ async def test_mcp_datasource(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        # Transport exceptions can contain URLs/headers. Report only the class.
-        return {
-            "status": "error",
-            "message": f"MCP connection failed ({type(exc).__name__})",
-        }
+        # Transport exceptions can contain URLs/headers. Report only the
+        # class, or the HTTP status the server refused the connection with.
+        from shared.mcp_sdk import http_status
+
+        status = http_status(exc)
+        reason = f"HTTP {status}" if status is not None else _leaf_name(exc)
+        return {"status": "error", "message": f"MCP connection failed ({reason})"}
+
+
+def _leaf_name(exc: BaseException) -> str:
+    """The type of the first exception an exception group wraps (the SDK's
+    task groups wrap a transport's failure), else the exception's own."""
+    grouped = getattr(exc, "exceptions", None)
+    while isinstance(grouped, (list, tuple)) and grouped:
+        exc = grouped[0]
+        grouped = getattr(exc, "exceptions", None)
+    return type(exc).__name__

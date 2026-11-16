@@ -20,6 +20,7 @@ import asyncio
 import sys
 import textwrap
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 from mcp import types
@@ -38,11 +39,12 @@ PNG = (
 SERVER = textwrap.dedent(
     f"""
     import sys
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import ImageContent, ResourceLink
 
     port, ledger = int(sys.argv[1]), sys.argv[2]
-    mcp = FastMCP("gen", host="127.0.0.1", port=port, log_level="ERROR")
+    mcp = MCPServer("gen", log_level="ERROR")
 
     def executed(name):
         with open(ledger, "a") as f:
@@ -58,7 +60,8 @@ SERVER = textwrap.dedent(
     def charge(amount: int) -> str:
         \"\"\"Spend credit, and fail like a paid API does.\"\"\"
         executed("charge")
-        raise ValueError(f"insufficient credit for {{amount}}")
+        # A failure the tool anticipated: the SDK passes its words on.
+        raise ToolError(f"insufficient credit for {{amount}}")
 
     @mcp.tool()
     def picture() -> ImageContent:
@@ -72,7 +75,7 @@ SERVER = textwrap.dedent(
         executed("workflow")
         return {{"workflowId": "wf-1", "status": "submitted"}}
 
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=port)
     """
 )
 
@@ -140,6 +143,12 @@ async def test_a_text_result_is_plain_text_in_a_session_and_in_a_job(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_current_server_is_spoken_to_in_2026_07_28(tmp_path):
+    async with _server(tmp_path) as (manager, _ledger):
+        assert manager._handles[0].session.protocol_version == "2026-07-28"
+
+
+@pytest.mark.asyncio
 async def test_a_json_result_reads_as_json_once(tmp_path):
     async with _server(tmp_path) as (manager, _ledger):
         workflow = _tool(manager.get_langchain_tools(), "__workflow")
@@ -199,7 +208,7 @@ async def test_an_image_reaches_only_a_model_that_sees_images(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_json_rpc_error_from_a_remote_server_is_its_answer_not_a_dead_session():
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     manager = MCPManager(
         [{"type": "mcp", "name": "R", "connection_url": "https://r.example/mcp"}]
@@ -212,12 +221,10 @@ async def test_a_json_rpc_error_from_a_remote_server_is_its_answer_not_a_dead_se
     class Session:
         @staticmethod
         async def send_request(request, _result_type):
-            sent.append(request.root.params.name)
-            raise McpError(
-                types.ErrorData(code=-32602, message="amount must be positive")
-            )
+            sent.append(request.params.name)
+            raise MCPError(code=-32602, message="amount must be positive")
 
-    handle.session = Session()
+    handle.session = SimpleNamespace(session=Session())
     restarts: list[bool] = []
 
     async def restart(_handle, *, force=False):
@@ -262,10 +269,10 @@ async def test_a_dead_session_still_reconnects_and_retries(monkeypatch):
                 content=[types.TextContent(type="text", text="done")]
             )
 
-    handle.session = DeadSession()
+    handle.session = SimpleNamespace(session=DeadSession())
 
     async def restart(_handle, *, force=False):
-        handle.session = FreshSession()
+        handle.session = SimpleNamespace(session=FreshSession())
         handle.status = "connected"
         return True
 
@@ -399,3 +406,123 @@ def test_a_long_error_is_cut():
 
 def test_an_empty_result_says_so():
     assert _render() == "(the tool returned no content)"
+
+
+# -- 2026-07-28 answers that are not results yet ------------------------------
+
+
+class _Session:
+    """A client session that answers ``tools/call`` from a script."""
+
+    def __init__(self, *answers, elicit=None):
+        self.answers = list(answers)
+        self.sent: list = []
+        self.asked: list = []
+        self.elicit = elicit
+
+    async def send_request(self, request, _result_type):
+        self.sent.append(request.params)
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    async def dispatch_input_request(self, context, request):
+        self.asked.append((context.request_id, request.params.message))
+        return self.elicit
+
+
+class _Client:
+    def __init__(self, session):
+        self.session = session
+        self.listed: list[str] = []
+
+    async def list_tools(self, cursor=None, cache_mode="use"):
+        self.listed.append(cache_mode)
+        return types.ListToolsResult(tools=[])
+
+
+def _done(text="done"):
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+
+
+def _asks(state="s1"):
+    question = types.ElicitRequest(
+        params=types.ElicitRequestFormParams(
+            message="Spend 12 Buzz?",
+            requested_schema={"type": "object", "properties": {}},
+        )
+    )
+    return types.InputRequiredResult(
+        input_requests={"q1": question}, request_state=state
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stale_tool_copy_is_listed_again_and_the_call_resent_once():
+    from mcp.shared.exceptions import MCPError
+
+    mismatch = MCPError(code=types.HEADER_MISMATCH, message="schema changed")
+    client = _Client(_Session(mismatch, _done()))
+    result = await manager_module._send_tool_call(client, "go", {"a": 1})
+    assert result.content[0].text == "done"
+    assert client.listed == ["refresh"]
+    assert len(client.session.sent) == 2
+
+    # A second refusal is the server's answer.
+    client = _Client(_Session(mismatch, mismatch))
+    with pytest.raises(MCPError):
+        await manager_module._send_tool_call(client, "go", {})
+    assert len(client.session.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_answered_question_goes_back_with_the_servers_state():
+    accepted = types.ElicitResult(action="accept", content={})
+    session = _Session(_asks("s1"), _done("charged"), elicit=accepted)
+    result = await manager_module._send_tool_call(_Client(session), "charge", {})
+    assert result.content[0].text == "charged"
+    assert session.asked == [("q1", "Spend 12 Buzz?")]
+    first, second = session.sent
+    assert first.request_state is None and first.input_responses is None
+    assert second.request_state == "s1"
+    assert second.input_responses == {"q1": accepted}
+
+
+@pytest.mark.asyncio
+async def test_state_only_rounds_are_resent_until_the_result():
+    pending = types.InputRequiredResult(request_state="s2")
+    session = _Session(pending, _done())
+    assert (await manager_module._send_tool_call(_Client(session), "go", {})).content
+    assert [params.request_state for params in session.sent] == [None, "s2"]
+
+
+@pytest.mark.asyncio
+async def test_a_question_the_client_cannot_answer_ends_the_call_unrepeated():
+    """Without an elicitation callback the SDK declines; the server has
+    answered, so the call is reported, never re-sent after a reconnect."""
+    manager = MCPManager(
+        [{"type": "mcp", "name": "R", "connection_url": "https://r.example/mcp"}]
+    )
+    handle = manager._handles[0]
+    handle.status = "connected"
+    handle.task = asyncio.create_task(asyncio.sleep(3600))
+    refused = types.ErrorData(code=-32600, message="Elicitation not supported")
+    session = _Session(_asks(), elicit=refused)
+    handle.session = _Client(session)
+    restarts: list[bool] = []
+
+    async def restart(_handle, *, force=False):
+        restarts.append(force)
+        return False
+
+    manager._restart_server = restart
+    try:
+        answer = await manager._guarded(handle, "charge")()
+        assert answer.startswith("Error: MCP tool R/charge failed:"), answer
+        assert "Elicitation not supported" in answer
+        assert len(session.sent) == 1
+        assert restarts == []
+        assert handle.status == "connected"
+    finally:
+        handle.task.cancel()

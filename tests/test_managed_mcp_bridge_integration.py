@@ -321,9 +321,9 @@ async def test_read_only_hides_write_tools_before_any_process_sees_them(pod):
     try:
         names = {t.metadata["mcp_tool_name"] for t in manager.get_langchain_tools()}
         assert names == set(READ_TOOLS)
-        from mcp.shared.exceptions import McpError
+        from mcp.shared.exceptions import MCPError
 
-        with pytest.raises(McpError) as refused:
+        with pytest.raises(MCPError) as refused:
             await manager._handles[0].session.call_tool("notes_write", {})
         assert "Unknown tool" in str(refused.value)
         assert manager.statuses == {"Memory": "connected"}

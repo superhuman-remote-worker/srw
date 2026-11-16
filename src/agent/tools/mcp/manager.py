@@ -45,7 +45,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from agent.tools.mcp.naming import mcp_server_slug, namespace_mcp_tool
-from shared.mcp_sdk import ensure_mcp_sdk
+from shared.mcp_sdk import (
+    REMOTE_TRANSPORTS,
+    ensure_mcp_sdk,
+    http_status,
+    open_client,
+    walk_exception,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +67,13 @@ MANAGED_MCP_CONNECT_TIMEOUT = 30.0
 MANAGED_MCP_RECONNECTS = 3
 MANAGED_MCP_RECONNECT_WINDOW = 600.0
 _READY_POLL_SECONDS = (1.0, 2.0, 3.0, 5.0)
-_TRANSPORTS = ("http", "sse")
+_TRANSPORTS = REMOTE_TRANSPORTS
 #: JSON-RPC errors that mean the session is gone, not that a tool failed:
 #: the transport's "Session terminated" (a 404 from the server) and a
 #: closed connection.
-_SESSION_ERROR_CODES = frozenset({32600, -32000})
+_SESSION_ERROR_CODES = frozenset({-32600, -32000})
+#: Rounds of a 2026-07-28 server's "input required" answer one call may take.
+_MAX_INPUT_ROUNDS = 10
 #: The error a managed server's front gives a call in flight when its lease
 #: ends (drivers/mcp-front, ``leaseEndedCode``), with this message prefix.
 LEASE_ENDED_CODE = -32091
@@ -374,44 +382,21 @@ class MCPManager:
                     logger.warning("Managed MCP server %s %s", handle.name, exc)
                     return
             async with AsyncExitStack() as stack:
-                if config.transport == "sse":
-                    from mcp.client.sse import sse_client
+                client = await open_client(
+                    stack,
+                    url=config.url,
+                    transport=config.transport,
+                    headers=config.headers,
+                )
+                handle.session = client
 
-                    read, write = await stack.enter_async_context(
-                        sse_client(config.url, headers=config.headers or None)
-                    )
-                else:
-                    from mcp.client import streamable_http
-
-                    http_transport = getattr(
-                        streamable_http,
-                        "streamable_http_client",
-                        None,
-                    )
-                    if http_transport is not None:
-                        from mcp.shared._httpx_utils import create_mcp_http_client
-
-                        http_client = await stack.enter_async_context(
-                            create_mcp_http_client(headers=config.headers or None)
-                        )
-                        transport_context = http_transport(
-                            config.url,
-                            http_client=http_client,
-                        )
-                    else:
-                        transport_context = streamable_http.streamablehttp_client(
-                            config.url,
-                            headers=config.headers or None,
-                        )
-                    read, write, _ = await stack.enter_async_context(transport_context)
-
-                from mcp import ClientSession
-
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                handle.session = session
-
-                listed = await _list_all_tools(session)
+                listed = await _list_all_tools(client)
+                logger.info(
+                    "MCP server %s connected over protocol %s with %d tools",
+                    handle.name,
+                    client.protocol_version,
+                    len(listed),
+                )
                 handle.tools = self._wrap_tools(handle, listed)
                 handle.refused_lease = None
                 handle.status = "connected"
@@ -420,10 +405,14 @@ class MCPManager:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            if handle.shutdown.is_set():
-                pass
-            elif handle.managed and _lease_ended(exc):
+            if handle.managed and _lease_ended(exc):
+                # Recorded even when a reconnect already asked this task to
+                # stop: the SDK fails a call in flight as soon as the
+                # connection drops, so the reconnect can start before the
+                # refusal is known, and must not use the same lease again.
                 _refuse_lease(handle)
+            elif handle.shutdown.is_set():
+                pass
             else:
                 handle.status = f"unavailable: {type(exc).__name__}"
                 logger.warning(
@@ -517,13 +506,15 @@ class MCPManager:
             namespaced_name = namespace_mcp_tool(handle.slug, tool.name, taken)
             taken.add(namespaced_name)
             annotations = (
-                tool.annotations.model_dump() if tool.annotations is not None else None
+                tool.annotations.model_dump(by_alias=True, exclude_none=True)
+                if tool.annotations is not None
+                else None
             )
             wrapped.append(
                 StructuredTool(
                     name=namespaced_name,
                     description=tool.description or "",
-                    args_schema=tool.inputSchema,
+                    args_schema=tool.input_schema,
                     coroutine=self._guarded(handle, tool.name),
                     metadata={
                         "mcp_server": handle.name,
@@ -580,8 +571,6 @@ class MCPManager:
             if not force and self._is_live(handle):
                 return True
 
-            handle.reconnected_once = True
-            handle.reconnects.append(time.monotonic())
             old_task = handle.task
             handle.shutdown.set()
             if old_task is not None and not old_task.done():
@@ -594,6 +583,13 @@ class MCPManager:
                 except TimeoutError:
                     old_task.cancel()
                     await asyncio.gather(old_task, return_exceptions=True)
+            if handle.refused_lease is not None and not _lease_renewed(handle):
+                # The old connection ended on a refused lease, which its
+                # teardown has now recorded.
+                return False
+
+            handle.reconnected_once = True
+            handle.reconnects.append(time.monotonic())
 
             try:
                 handle.config = parse_mcp_config(handle.ds)
@@ -796,51 +792,45 @@ def _lease_ended(exc: BaseException) -> bool:
     failure: an HTTP 401 (a new request on a dead lease), or the front's
     lease-ended error on a call in flight. Exception groups (the
     transport's task group) and causes are searched."""
-    import httpx
+    from mcp.shared.exceptions import MCPError
 
-    try:
-        from mcp.shared.exceptions import McpError
-    except ImportError:  # pragma: no cover - the SDK is a dependency
-        McpError = None  # noqa: N806
-    seen: set[int] = set()
-    pending: list[BaseException | None] = [exc]
-    while pending:
-        current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        if isinstance(current, httpx.HTTPStatusError):
-            if current.response.status_code == 401:
-                return True
-        elif McpError is not None and isinstance(current, McpError):
-            error = getattr(current, "error", None)
-            if getattr(error, "code", None) == LEASE_ENDED_CODE and str(
-                getattr(error, "message", "")
-            ).startswith(_LEASE_ENDED_PREFIX):
-                return True
-        grouped = getattr(current, "exceptions", None)  # an exception group
-        if isinstance(grouped, (list, tuple)):
-            pending.extend(e for e in grouped if isinstance(e, BaseException))
-        pending.extend((current.__cause__, current.__context__))
-    return False
+    if http_status(exc) == 401:
+        return True
+    return any(
+        isinstance(current, MCPError)
+        and current.code == LEASE_ENDED_CODE
+        and str(current.message).startswith(_LEASE_ENDED_PREFIX)
+        for current in walk_exception(exc)
+    )
+
+
+class _InputRefused(Exception):
+    """A 2026-07-28 server asked for input mid-call that this client did not
+    give. The server answered: the call is not sent again."""
 
 
 def _tool_level(exc: BaseException) -> bool:
-    """Whether the server answered the call with an error, so its session is
-    alive: a JSON-RPC error other than a terminated session or a closed
-    connection. (A result with ``isError`` is an answer, not an exception.)"""
-    try:
-        from mcp.shared.exceptions import McpError
-    except ImportError:  # pragma: no cover - the SDK is a dependency
-        return False
-    if isinstance(exc, McpError):
-        code = getattr(getattr(exc, "error", None), "code", None)
-        return code not in _SESSION_ERROR_CODES
-    return False
+    """Whether the server answered the call, so its session is alive and the
+    call must not be sent again: a JSON-RPC error other than a terminated
+    session or a closed connection, a result that is not valid MCP, or a
+    request for input this client did not give. (A result with ``isError``
+    is an answer, not an exception.)"""
+    from mcp.shared.exceptions import MCPError
+    from pydantic import ValidationError
+
+    if isinstance(exc, MCPError):
+        return exc.code not in _SESSION_ERROR_CODES
+    return isinstance(exc, (ValidationError, _InputRefused))
 
 
 def _server_error_message(exc: BaseException) -> str:
-    """A JSON-RPC error's message, the server's own words, bounded."""
+    """What the server answered, in its own words where it has any, bounded."""
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        return "the server's answer is not a valid MCP tool result"
+    if isinstance(exc, _InputRefused):
+        return _bounded(str(exc)) or type(exc).__name__
     message = str(getattr(getattr(exc, "error", None), "message", "") or "")
     return _bounded(message) or type(exc).__name__
 
@@ -870,42 +860,110 @@ def _tool_error(handle: _ServerHandle, tool_name: str, detail: str) -> str:
     return message
 
 
-async def _list_all_tools(session: Any) -> list[Any]:
-    """Every tool a server lists, across pages."""
-    from mcp.types import PaginatedRequestParams
-
+async def _list_all_tools(client: Any, *, refresh: bool = False) -> list[Any]:
+    """Every tool a server lists, across pages. The client keeps what it
+    needs to call them on a 2026-07-28 connection (``Mcp-Param`` headers);
+    ``refresh`` reads past its cache."""
     tools: list[Any] = []
     cursor = None
     for _ in range(_MAX_TOOL_PAGES):
-        params = PaginatedRequestParams(cursor=cursor) if cursor else None
-        page = await session.list_tools(params=params)
+        page = await client.list_tools(
+            cursor=cursor, cache_mode="refresh" if refresh else "use"
+        )
         tools.extend(page.tools)
-        cursor = page.nextCursor
+        cursor = page.next_cursor
         if not cursor:
             break
     return tools
 
 
-async def _send_tool_call(session: Any, name: str, arguments: dict[str, Any]) -> Any:
+_CALL_RESULT: Any = None
+
+
+def _call_result_type() -> Any:
+    """``tools/call``'s answer: its result, or a 2026-07-28 server's request
+    for input first."""
+    global _CALL_RESULT
+    if _CALL_RESULT is None:
+        from mcp import types
+        from pydantic import TypeAdapter
+
+        _CALL_RESULT = TypeAdapter(types.CallToolResult | types.InputRequiredResult)
+    return _CALL_RESULT
+
+
+async def _send_tool_call(client: Any, name: str, arguments: dict[str, Any]) -> Any:
     """Send ``tools/call`` and return the server's result as it came.
 
-    ``ClientSession.call_tool`` validates ``structuredContent`` against the
+    The SDK's ``call_tool`` validates ``structuredContent`` against the
     tool's output schema *after* the tool ran and raises a bare
     ``RuntimeError`` on a mismatch. That would read as a dead session,
     reconnect, run the tool a second time and lose its answer, so the
     request is sent directly. A server's off-schema answer is still its
     answer.
-    """
-    from mcp import types
 
-    return await session.send_request(
-        types.ClientRequest(
+    Two 2026-07-28 answers are not results yet, and the call is sent again
+    as the protocol asks. ``HEADER_MISMATCH`` means the server refused the
+    call unrun because this client's copy of the tool is stale: the tools
+    are listed again and the call is resent once. An "input required"
+    answer carries the server's questions and its state: they go to the
+    session's callbacks, and the call is resent with the answers and the
+    state. A question the client cannot answer ends the call
+    (:class:`_InputRefused`).
+    """
+    import anyio
+    from mcp import types
+    from mcp.client import ClientRequestContext
+    from mcp.shared.exceptions import MCPError
+
+    session = client.session
+
+    async def send(responses: Any = None, state: str | None = None) -> Any:
+        return await session.send_request(
             types.CallToolRequest(
-                params=types.CallToolRequestParams(name=name, arguments=arguments),
+                params=types.CallToolRequestParams(
+                    name=name,
+                    arguments=arguments,
+                    input_responses=responses,
+                    request_state=state,
+                ),
+            ),
+            _call_result_type(),
+        )
+
+    try:
+        result = await send()
+    except MCPError as exc:
+        if exc.code != types.HEADER_MISMATCH:
+            raise
+        await _list_all_tools(client, refresh=True)
+        result = await send()
+
+    for round_number in range(_MAX_INPUT_ROUNDS):
+        if not isinstance(result, types.InputRequiredResult):
+            return result
+        responses: dict[str, Any] = {}
+        for key, request in (result.input_requests or {}).items():
+            meta = request.params.meta if request.params else None
+            answer = await session.dispatch_input_request(
+                ClientRequestContext(session=session, request_id=key, meta=meta),
+                request,
             )
-        ),
-        types.CallToolResult,
-    )
+            if isinstance(answer, types.ErrorData):
+                raise _InputRefused(
+                    "the server asked for input this client cannot give "
+                    f"({answer.message})"
+                )
+            responses[key] = answer
+        if not responses:
+            # Only its state came back: the server is not done yet.
+            await anyio.sleep(min(0.05 * 2**round_number, 0.25))
+        result = await send(responses or None, result.request_state)
+    if isinstance(result, types.InputRequiredResult):
+        raise _InputRefused(
+            f"the server still asked for input after {_MAX_INPUT_ROUNDS} rounds"
+        )
+    return result
 
 
 def _render_result(
@@ -922,8 +980,8 @@ def _render_result(
     its structured copy repeats, say) has said what it meant to show.
     """
     blocks = list(getattr(result, "content", None) or [])
-    structured = getattr(result, "structuredContent", None)
-    if getattr(result, "isError", False):
+    structured = getattr(result, "structured_content", None)
+    if getattr(result, "is_error", False):
         text = "\n".join(_render_block(b, sees_images=False) for b in blocks)
         if not blocks and structured is not None:
             text = _json(structured)
@@ -946,12 +1004,12 @@ def _render_block(block: Any, sees_images: bool) -> str:
     if kind == "image":
         return _render_image(
             str(getattr(block, "data", "") or ""),
-            str(getattr(block, "mimeType", "") or ""),
+            str(getattr(block, "mime_type", "") or ""),
             sees_images,
             "image",
         )
     if kind == "audio":
-        mime = getattr(block, "mimeType", "") or "audio"
+        mime = getattr(block, "mime_type", "") or "audio"
         size = _decoded_size(str(getattr(block, "data", "") or ""))
         return (
             f"[audio: {mime}, {size:,} bytes, not shown: the model cannot hear audio]"
@@ -959,7 +1017,7 @@ def _render_block(block: Any, sees_images: bool) -> str:
     if kind == "resource_link":
         name = getattr(block, "title", None) or getattr(block, "name", "") or ""
         line = f"[resource link] {name}: {getattr(block, 'uri', '')}"
-        mime = getattr(block, "mimeType", None)
+        mime = getattr(block, "mime_type", None)
         if mime:
             line += f" ({mime})"
         description = getattr(block, "description", None)
@@ -973,7 +1031,7 @@ def _render_block(block: Any, sees_images: bool) -> str:
         if text is not None:
             return f"[resource {uri}]\n{text}"
         blob = str(getattr(resource, "blob", "") or "")
-        mime = str(getattr(resource, "mimeType", "") or "")
+        mime = str(getattr(resource, "mime_type", "") or "")
         if mime.startswith("image/"):
             return _render_image(blob, mime, sees_images, f"resource {uri}")
         return (

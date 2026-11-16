@@ -20,16 +20,11 @@ from shared.connectors.builtin import MCP_STDIO_RETIRED
 HTTP_ECHO_SERVER = textwrap.dedent(
     """
     import sys
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     port = int(sys.argv[1])
     transport = sys.argv[2]
-    mcp = FastMCP(
-        "echo",
-        host="127.0.0.1",
-        port=port,
-        log_level="ERROR",
-    )
+    mcp = MCPServer("echo", log_level="ERROR")
 
     @mcp.tool()
     def echo(text: str) -> str:
@@ -41,7 +36,7 @@ HTTP_ECHO_SERVER = textwrap.dedent(
         \"\"\"Add two integers.\"\"\"
         return a + b
 
-    mcp.run(transport=transport)
+    mcp.run(transport=transport, host="127.0.0.1", port=port)
     """
 )
 

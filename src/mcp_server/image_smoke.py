@@ -19,7 +19,7 @@ import threading
 from typing import Any
 from urllib.parse import urlparse
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from mcp_server.capabilities import TOOL_CAPABILITIES
@@ -141,57 +141,54 @@ async def _connect_and_list(api_url: str, *, exercise: bool) -> list[dict[str, A
     )
     with open(os.devnull, "w", encoding="utf-8") as child_stderr:
         transport_context = stdio_client(parameters, errlog=child_stderr)
-        async with transport_context as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.list_tools()
-                tools = list(result.tools)
-                cursor = result.nextCursor
-                while cursor:
-                    result = await session.list_tools(cursor=cursor)
-                    tools.extend(result.tools)
-                    cursor = result.nextCursor
+        # The client this image's users have: 2026-07-28 where the server
+        # speaks it, the initialize handshake otherwise.
+        async with Client(transport_context, mode="auto") as session:
+            result = await session.list_tools()
+            tools = list(result.tools)
+            cursor = result.next_cursor
+            while cursor:
+                result = await session.list_tools(cursor=cursor)
+                tools.extend(result.tools)
+                cursor = result.next_cursor
 
-                if exercise:
-                    read = await session.call_tool("list_jobs", {})
-                    assert not read.isError and "job-read-1" in _text(read)
+            if exercise:
+                read = await session.call_tool("list_jobs", {})
+                assert not read.is_error and "job-read-1" in _text(read)
 
-                    mutation = await session.call_tool(
-                        "create_job", {"description": "protocol smoke mutation"}
-                    )
-                    mutation_text = _text(mutation)
-                    assert not mutation.isError and "job-created-1" in mutation_text
-                    assert "automatic workspace provisioning" in mutation_text
+                mutation = await session.call_tool(
+                    "create_job", {"description": "protocol smoke mutation"}
+                )
+                mutation_text = _text(mutation)
+                assert not mutation.is_error and "job-created-1" in mutation_text
+                assert "automatic workspace provisioning" in mutation_text
 
-                    steer = await session.call_tool(
-                        "steer_job",
-                        {
-                            "job_id": "job-read-1",
-                            "message": "continue with the current plan",
-                            "urgent": True,
-                        },
-                    )
-                    assert not steer.isError
-                    assert "guidance_next_turn" in _text(steer)
+                steer = await session.call_tool(
+                    "steer_job",
+                    {
+                        "job_id": "job-read-1",
+                        "message": "continue with the current plan",
+                        "urgent": True,
+                    },
+                )
+                assert not steer.is_error
+                assert "guidance_next_turn" in _text(steer)
 
-                    denied = await session.call_tool("reload_skills", {})
-                    assert denied.isError
-                    denied_text = _text(denied)
-                    assert (
-                        "403" in denied_text
-                        or "administrator role required" in denied_text
-                    )
+                denied = await session.call_tool("reload_skills", {})
+                assert denied.is_error
+                denied_text = _text(denied)
+                assert (
+                    "403" in denied_text or "administrator role required" in denied_text
+                )
 
-                    degraded = await session.call_tool(
-                        "get_workspace_file",
-                        {"job_id": "job-degraded", "path": "report.md"},
-                    )
-                    assert not degraded.isError
-                    assert "Gitea unavailable in disposable smoke stub" in _text(
-                        degraded
-                    )
+                degraded = await session.call_tool(
+                    "get_workspace_file",
+                    {"job_id": "job-degraded", "path": "report.md"},
+                )
+                assert not degraded.is_error
+                assert "Gitea unavailable in disposable smoke stub" in _text(degraded)
 
-                return _tool_document(tools)
+            return _tool_document(tools)
 
 
 async def _run() -> None:
