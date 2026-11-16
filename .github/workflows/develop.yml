@@ -1785,8 +1785,14 @@ jobs:
       - name: Build sudo_gate.so (C plugin)
         working-directory: vm/sudo-plugin
         run: |
-          gcc -fPIC -shared -Wall -Wextra -Werror -O2 -I./include \
-            -o sudo_gate.so sudo_gate.c json_util.c
+          # -march=x86-64: the VM image's sudo loads this plugin on any x86-64
+          # CPU (packer's build VM has no AVX). The ubuntu-26.04 runner's gcc
+          # defaults to a newer level, and sudo died with SIGILL in stage2.
+          gcc -fPIC -shared -Wall -Wextra -Werror -O2 -march=x86-64 -mtune=generic \
+            -I./include -o sudo_gate.so sudo_gate.c json_util.c
+          if objdump -d sudo_gate.so | grep -qE '%[yz]mm|[[:space:]]v[a-z0-9]+[[:space:]]+%'; then
+            echo "::error::sudo_gate.so contains AVX instructions"; exit 1
+          fi
           file sudo_gate.so
           ls -lh sudo_gate.so
       - name: Upload sudo gate artifacts
