@@ -456,6 +456,15 @@ class DeploymentSettings:
     #: most :data:`MAX_BIND_WAIT_SECONDS`), and a user's live spec pods.
     connector_bind_time_max_pods: int = 10
     connector_bind_time_deadline_seconds: float = 120.0
+    #: The dispatcher stall watchdog (``services.dispatch_watchdog``): seconds
+    #: without a scheduling pass from which an ERROR is logged (0: no alarm),
+    #: and from which the replica ends itself so that dispatch starts again
+    #: (0, the default: never).
+    dispatch_stall_alarm_seconds: float = 180.0
+    dispatch_stall_restart_seconds: float = 0.0
+    #: Seconds one of the dispatcher's workspace preflights may run before it
+    #: is cancelled and its slot freed (0: no limit).
+    dispatch_preflight_timeout_seconds: float = 1800.0
     connector_bind_time_wait_seconds: float = 20.0
     connector_bind_time_spec_pods_per_user: int = 2
 
@@ -694,6 +703,24 @@ class DeploymentSettings:
                 os.environ.get("CONNECTOR_BIND_TIME_DEADLINE_SECONDS"),
                 default=120.0,
                 minimum=30.0,
+            ),
+            dispatch_stall_alarm_seconds=parse_positive_number(
+                "DISPATCH_STALL_ALARM_SECONDS",
+                os.environ.get("DISPATCH_STALL_ALARM_SECONDS"),
+                default=180.0,
+                minimum=0.0,
+            ),
+            dispatch_stall_restart_seconds=parse_positive_number(
+                "DISPATCH_STALL_RESTART_SECONDS",
+                os.environ.get("DISPATCH_STALL_RESTART_SECONDS"),
+                default=0.0,
+                minimum=0.0,
+            ),
+            dispatch_preflight_timeout_seconds=parse_positive_number(
+                "DISPATCH_PREFLIGHT_TIMEOUT_SECONDS",
+                os.environ.get("DISPATCH_PREFLIGHT_TIMEOUT_SECONDS"),
+                default=1800.0,
+                minimum=0.0,
             ),
             connector_bind_time_wait_seconds=min(
                 MAX_BIND_WAIT_SECONDS,

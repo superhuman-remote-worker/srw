@@ -39,6 +39,7 @@ from orchestrator.services import (
     container_provisioner as container_provisioner_module,
     cron_dispatcher,
     default_project_knowledge,
+    dispatch_watchdog,
     ide_session,
     ide_settings,
     imap_poller as imap_poller_module,
@@ -102,6 +103,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "token_cleanup",
     "session_cleanup",
     "dispatcher",
+    "dispatch_watchdog",
     "vm_readiness",
     "vm_creation_retry",
     "vm_workspace_recovery",
@@ -315,6 +317,20 @@ async def start_background_tasks(
         functools.partial(
             job_dispatcher.auto_assign_dispatcher,
             dependencies=jobs_composition.job_dispatch_dependencies(resources),
+        ),
+    )
+    # Reads the dispatcher's pass timestamps on the same replica: an ERROR when
+    # passes stop, and the replica ends itself when the deployment asks for it.
+    tasks.start_leader_gated(
+        "dispatch_watchdog",
+        functools.partial(
+            dispatch_watchdog.dispatch_stall_watchdog,
+            state=resources.job_dispatch_state,
+            may_schedule=job_dispatcher.may_schedule,
+            interval=job_dispatcher.DISPATCH_INTERVAL_SECONDS,
+            alarm_seconds=resources.settings.dispatch_stall_alarm_seconds,
+            restart_seconds=resources.settings.dispatch_stall_restart_seconds,
+            preflight_timeout=(resources.settings.dispatch_preflight_timeout_seconds),
         ),
     )
     if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster":

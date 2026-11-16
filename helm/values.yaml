@@ -670,6 +670,19 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- The job dispatcher's own safeguards against a stall.
+  dispatcher:
+    # -- Log an error when the dispatcher has made no scheduling pass for
+    # this many seconds (0: no alarm).
+    stallAlarmSeconds: 180
+    # -- End the orchestrator replica when the dispatcher has made no
+    # scheduling pass for this many seconds, so that Kubernetes restarts it
+    # or another replica takes the lead (0: never). Keep it well above
+    # stallAlarmSeconds; unattended batch runs use 600.
+    stallRestartSeconds: 0
+    # -- Cancel a workspace preparation that has not returned after this many
+    # seconds and free its slot for the next job (0: no limit).
+    preflightTimeoutSeconds: 1800
   # -- Enable durable completion-command admission/finalization. Ships dark;
   # open only after the Gate-3 parity and crash-recovery proof is complete.
   completionCommandsEnabled: false

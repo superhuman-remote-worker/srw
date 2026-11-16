@@ -119,6 +119,9 @@ def job_dispatch_dependencies(
         workspace_suspension=workspace_suspension.workspace_suspension_service,
         auto_assign_enabled=resources.settings.auto_assign_enabled,
         stateless_worker_enabled=resources.settings.stateless_worker_enabled,
+        preflight_timeout_seconds=(
+            resources.settings.dispatch_preflight_timeout_seconds
+        ),
         manifest_execution_service=functools.partial(
             catalogue_composition.manifest_execution_service, resources
         ),

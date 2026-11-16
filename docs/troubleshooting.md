@@ -70,6 +70,40 @@ kubectl -n srw delete pvc srw-workspace
 
 With `ReadWriteOnce`, workspace pods run on one node at a time.
 
+## Jobs stay in `created` and nothing is dispatched
+
+**Symptom.** New jobs stay in `created` although agents and workspaces are
+available. The orchestrator log has no `Dispatcher:` line for minutes, and
+shows:
+
+```text
+ERROR orchestrator.services.dispatch_watchdog: Dispatcher stalled: a scheduling pass has been running for 240 s (2 workspace preparation(s) running, 14 job(s) waiting for one)
+```
+
+**Cause.** The job dispatcher runs on one orchestrator replica (the leader)
+and makes a scheduling pass every 30 seconds. A pass that waits on something
+that never answers stops all dispatch. The orchestrator logs this error once
+no pass has finished for `orchestrator.dispatcher.stallAlarmSeconds` (180 by
+default) and repeats it every five minutes.
+
+**Fix.** Restart the leader:
+
+```bash
+kubectl -n srw rollout restart deploy/srw-orchestrator
+```
+
+Jobs that were waiting are picked up by the next pass; running jobs are not
+affected. To have SRW do this by itself, set
+`orchestrator.dispatcher.stallRestartSeconds` (for example `600`): the replica
+then ends itself after a stall of that length, and Kubernetes starts it again.
+It is off by default.
+
+A related line, `workspace preflight for job … did not return within 1800 s;
+cancelled it and freed its slot`, means one job's workspace preparation hung.
+SRW prepares two workspaces at a time, so it cancels a preparation after
+`orchestrator.dispatcher.preflightTimeoutSeconds` and retries that job later
+instead of letting it block the others.
+
 ## Certificates are not issued
 
 **Symptom.** The browser warns about an untrusted or self-signed certificate on

@@ -1729,6 +1729,15 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUTO_ASSIGN_ENABLED
+            # The dispatcher's stall safeguards (orchestrator.dispatcher). A
+            # values file from before these keys existed gets the defaults;
+            # an explicit 0 turns the one it is set on off.
+            - name: DISPATCH_STALL_ALARM_SECONDS
+              value: {{ dig "dispatcher" "stallAlarmSeconds" 180 .Values.orchestrator | quote }}
+            - name: DISPATCH_STALL_RESTART_SECONDS
+              value: {{ dig "dispatcher" "stallRestartSeconds" 0 .Values.orchestrator | quote }}
+            - name: DISPATCH_PREFLIGHT_TIMEOUT_SECONDS
+              value: {{ dig "dispatcher" "preflightTimeoutSeconds" 1800 .Values.orchestrator | quote }}
             # Infrastructure metering Slice 0 dark-launch gates. All default
             # off; setting them does not grant Kubernetes RBAC.
             - name: INFRASTRUCTURE_METERING_V2_READS_ENABLED

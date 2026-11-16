@@ -94,6 +94,13 @@ DISCOVERY_HEAD_LIMIT = 10
 DISCOVERY_PROGRESS_LIMIT = 40
 #: Seconds between the leader loop's catch-all passes.
 DISPATCH_INTERVAL_SECONDS = 30.0
+#: Seconds one workspace preflight may run before it is cancelled and its slot
+#: freed (0: no limit). Only ``MUTATION_PREFLIGHT_LIMIT`` preflights create
+#: workspaces at a time, so two that never return stop every waiting job
+#: (dispatcher_stalls_on_workspace_mutation_lock.md). Far above anything a
+#: preflight legitimately waits for: creators return ``PENDING`` and are
+#: polled, they do not wait a workspace out.
+PREFLIGHT_TIMEOUT_SECONDS = 1800.0
 #: A replica that is not the leader asks the leader's loop for a pass on this
 #: channel. :func:`trigger_dispatch` alone is in-process and leader-gated, so
 #: a job created behind the load balancer on another replica would wait for
@@ -149,6 +156,9 @@ class JobDispatchState:
     pending: dict[str, _PendingPreflight] = field(default_factory=dict)
     discovery: dict[str, _DiscoverySweep] = field(default_factory=dict)
     active: dict[str, tuple[str, bool]] = field(default_factory=dict)
+    #: When each active preflight was started (``time.monotonic()``), for the
+    #: stall watchdog: one that outlives its time limit ignored its cancel.
+    active_since: dict[str, float] = field(default_factory=dict)
     completed: dict[str, _PreparedCandidate] = field(default_factory=dict)
     runner: asyncio.Task[Any] | None = None
     requested: JobDispatchDependencies | None = None
@@ -158,6 +168,12 @@ class JobDispatchState:
     leader_bound: bool = False
     tick_started_at: float | None = None
     tick_finished_at: float | None = None
+    #: When the leader loop's current catch-all pass began and when its last
+    #: one returned (``time.monotonic()``). The stall watchdog reads them
+    #: (``dispatch_watchdog``); a pass that never returns leaves the first
+    #: ahead of the second.
+    loop_pass_started_at: float | None = None
+    loop_pass_finished_at: float | None = None
 
     def spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Run ``coro`` as one of this dispatcher's tracked tasks."""
@@ -189,6 +205,7 @@ class JobDispatchState:
         # A task cancelled before its coroutine first runs has no finally
         # block to remove its reserved owner slot. Every worker is now joined.
         self.active.clear()
+        self.active_since.clear()
         self.pending.clear()
         self.completed.clear()
 
@@ -207,6 +224,7 @@ class JobDispatchState:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self.active.clear()
+        self.active_since.clear()
         self.pending.clear()
         self.completed.clear()
 
@@ -276,6 +294,8 @@ class JobDispatchDependencies:
     listen_for_dispatch_requests: (
         Callable[[asyncio.Event, asyncio.Event], Awaitable[None]] | None
     ) = None
+    #: Seconds one workspace preflight may run (0: no limit).
+    preflight_timeout_seconds: float = PREFLIGHT_TIMEOUT_SECONDS
 
 
 async def request_leader_dispatch(store: Any) -> None:
@@ -321,6 +341,12 @@ def _may_schedule(state: JobDispatchState) -> bool:
 
         return is_leader.is_set()
     return True
+
+
+def may_schedule(state: JobDispatchState) -> bool:
+    """Whether this replica's dispatcher is expected to make passes now: it
+    leads (when leader-bound) and is neither paused nor closing."""
+    return _may_schedule(state)
 
 
 def _owner_key(job: dict[str, Any]) -> str:
@@ -464,9 +490,26 @@ async def _run_preflight(
         before = workspace_runtime_authority_digest(
             job, vm_mode=dependencies.vm_provisioner.mode
         )
-        candidate = await _preflight_job(
-            job, dependencies=dependencies, mutation=mutation
-        )
+        limit = dependencies.preflight_timeout_seconds
+        if not isinstance(limit, (int, float)) or limit <= 0:
+            limit = None
+        try:
+            async with asyncio.timeout(limit) as due:
+                candidate = await _preflight_job(
+                    job, dependencies=dependencies, mutation=mutation
+                )
+        except TimeoutError:
+            if not due.expired():
+                raise  # the preflight's own timeout, reported below as before
+            # Cancelled like a preflight at leadership loss: the job keeps
+            # whatever became durable and returns on a later discovery sweep.
+            logger.error(
+                "Dispatcher: workspace preflight for job %s did not return "
+                "within %.0f s; cancelled it and freed its slot",
+                job_id,
+                limit,
+            )
+            return
         if candidate is not None:
             state.completed[job_id] = _PreparedCandidate(
                 copy.deepcopy(candidate),
@@ -500,6 +543,7 @@ async def _run_preflight(
         )
     finally:
         state.active.pop(job_id, None)
+        state.active_since.pop(job_id, None)
         if not state.closing:
             _request_dispatch(dependencies, discover=False)
 
@@ -522,6 +566,7 @@ def _pump_preflights(dependencies: JobDispatchDependencies) -> None:
             continue
         state.pending.pop(job_id)
         state.active[job_id] = (owner, mutation)
+        state.active_since[job_id] = time.monotonic()
         active_owners.add(owner)
         counts[mutation] += 1
         task = state.spawn(
@@ -1654,10 +1699,13 @@ async def auto_assign_dispatcher(
     )
     try:
         while not shutdown_event.is_set():
+            dependencies.state.loop_pass_started_at = time.monotonic()
             try:
                 await dispatch_pending_jobs(dependencies=dependencies)
             except Exception as e:
                 logger.error(f"Error in auto-assign dispatcher: {e}")
+            finally:
+                dependencies.state.loop_pass_finished_at = time.monotonic()
 
             if await _until_next_pass(shutdown_event, wake, dependencies):
                 break
