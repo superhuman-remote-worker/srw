@@ -73,6 +73,7 @@ from shared.subagent_lifecycle import (
 from agent.tools import ToolContext, load_tools, apply_instruction_enforcement
 from agent.tools.description_manager import (
     apply_description_overrides,
+    apply_job_complete_description,
     apply_phase_description_prefixes,
 )
 from shared.db_url import (
@@ -4787,6 +4788,13 @@ class UniversalAgent:
         context._resolved_tool_names = loaded_tool_names
         context._limits = self.config.limits
 
+        # The todo list's header and footer name todo_complete only when the
+        # job has it; the manager was built before the tools loaded.
+        if self._todo_manager is not None:
+            from agent.core.bound_tools import binds_todo_tool
+
+            self._todo_manager.todo_tool_bound = binds_todo_tool(loaded_tool_names)
+
         # Built-in subagents (U3): the parent host + per-job runtime behind
         # delegate_agent. Installed after load_tools so the runtime sees the
         # resolved tool names; the tool reads it lazily at call time.
@@ -4965,6 +4973,10 @@ class UniversalAgent:
             [t for t in self._tools if t.name in union],
             both_phases=self.config.phase_settings.strategic_tools,
         )
+        # Without todo_complete, job_complete closes the job's one task: its
+        # bound copy says so instead of describing a final strategic phase
+        # (this replaces its phase prefix too).
+        bound_tools = apply_job_complete_description(bound_tools, all_names)
         bound_tools = apply_guardrails_to_tools(bound_tools, model=llm_cfg.model)
         self._llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)
         self._strategic_llm_with_tools = self._llm_with_tools
@@ -5195,6 +5207,7 @@ class UniversalAgent:
         # the exists()-probe precedence dance and the "rewrite if it vanished"
         # repair path — a virtual file cannot go missing.
         from agent.core.virtual_dirs import build_instruction_providers
+        from agent.core.bound_tools import binds_phase_tool
         from agent.core.deliverables import (
             format_cloud_connectors_block,
             format_deliverable_contract_block,
@@ -5232,7 +5245,8 @@ class UniversalAgent:
             # manifest as an explicit block — workers can't be held to a floor
             # they were never shown. Empty string when the job has no manifest.
             contract_block = format_deliverable_contract_block(
-                meta.get("required_deliverables")
+                meta.get("required_deliverables"),
+                phased=binds_phase_tool(loaded_tool_names),
             )
             if contract_block:
                 parts.append(contract_block)

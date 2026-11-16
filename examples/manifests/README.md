@@ -9,7 +9,9 @@ then [project.yaml](project.yaml) for the basic composition.
 reference is a placeholder for one you approved);
 [claude-code-harness-job.yaml](claude-code-harness-job.yaml) runs the Claude Code harness image
 ([README](../../harnesses/claude-code/README.md)) against a sandbox workspace and an env connector;
-[retained-job.yaml](retained-job.yaml) selects an existing workspace instance. Images, credentials,
+[retained-job.yaml](retained-job.yaml) selects an existing workspace instance;
+[agent-mode-job.yaml](agent-mode-job.yaml) runs a small task in agent mode (`spec.jobMode: agent`):
+one loop without a plan or phases, for SRW's own worker only. Images, credentials,
 scopes and instance IDs in these examples are illustrative.
 
 [native-process-job.yaml](native-process-job.yaml) and

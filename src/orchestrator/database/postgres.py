@@ -4305,6 +4305,10 @@ class PostgresDB:
                        j.config_override AS _workspace_config_override,
                        j.context AS _workspace_context,
                        j.context->'snapshot'->>'status' AS snapshot_status,
+                       -- How the job runs (shared.job_mode), from its
+                       -- requested config; anything but 'agent' is a worker.
+                       CASE WHEN j.config_override->>'job_mode' = 'agent'
+                            THEN 'agent' ELSE 'worker' END AS job_mode,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        (pa.id IS NOT NULL) AS pending_approval,

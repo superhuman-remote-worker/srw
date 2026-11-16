@@ -459,6 +459,14 @@ def filter_bound_skills(blob: dict[str, Any]) -> dict[str, Any]:
     }
     if not bound:
         return blob
+    # An agent-mode job (shared.job_mode) binds the agent-mode skill in place of
+    # the phase-procedure skills. Those must not come back as optional menu
+    # entries: they describe planning phases and to-do tools the job does not
+    # have.
+    from shared.job_mode import AGENT_MODE_SKILL, PHASE_PROCEDURE_SKILLS
+
+    if AGENT_MODE_SKILL in bound:
+        bound |= set(PHASE_PROCEDURE_SKILLS)
     if skills.get("menu"):
         skills["menu"] = [m for m in skills["menu"] if m.get("name") not in bound]
     if skills.get("files"):

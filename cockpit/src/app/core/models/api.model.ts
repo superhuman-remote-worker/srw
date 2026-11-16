@@ -2619,7 +2619,17 @@ export interface Job {
   vm_creation?: VMCreationView | null;
   workspace_creation?: WorkspaceCreationView | null;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
+  /** How the job runs (see {@link JobMode}). Absent from older responses:
+   *  read a missing value as `worker`. */
+  job_mode?: JobMode;
 }
+
+/**
+ * How a job runs. `worker` (the default) is the planned procedure: the agent
+ * plans, works through todos in phases and reviews its result. `agent` does a
+ * small task in one loop, without a plan or phases. Any expert runs in either.
+ */
+export type JobMode = 'worker' | 'agent';
 
 /**
  * Public job-create projection owned by orchestrator.schemas.job_create.
@@ -2698,6 +2708,8 @@ export interface JobCreateRequest {
   execution_lane?: 'pinned' | 'stateless';
   /** Start inside a live session (needs execution.session; set by live automations). */
   live_session?: boolean;
+  /** Omitted means worker mode; the form sends it only for agent mode. */
+  job_mode?: JobMode;
 }
 
 /**

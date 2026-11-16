@@ -43,6 +43,7 @@ from orchestrator.services.config_overrides import (
 )
 from orchestrator.services.default_experts import ExpertSelectionError
 from orchestrator.services.session_tool_policy import with_validated_tool_overrides
+from shared.job_mode import JOB_MODE_AGENT, JOB_MODE_KEY, normalize_job_mode
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -215,6 +216,26 @@ async def _resolve_automation_or_404(
     raise HTTPException(status_code=404, detail="Automation not found")
 
 
+def _check_job_mode(override: dict[str, Any] | None, *, live: bool) -> None:
+    """Check the job mode an automation's jobs run in (``job_mode`` in its
+    ``config_override``): one of the two modes, and never agent mode on a live
+    automation, whose jobs start inside a live session. The value is stored
+    normalized, so a fire never meets a mode admission would refuse."""
+    if not override or JOB_MODE_KEY not in override:
+        return
+    try:
+        mode = normalize_job_mode(override[JOB_MODE_KEY])
+    except ValueError as exc:
+        raise HTTPException(422, f"config_override.{exc}") from None
+    if live and mode == JOB_MODE_AGENT:
+        raise HTTPException(
+            422,
+            "A live automation starts its jobs inside a live session, and an "
+            "agent-mode job cannot run in one. Use job_mode worker.",
+        )
+    override[JOB_MODE_KEY] = mode
+
+
 LIVE_TAKEN = "live_connector_taken"
 
 
@@ -338,6 +359,7 @@ async def create_automation(
     # otherwise pair it with the deployment's stored key at each dispatch.
     refuse_caller_transport_keys(body.config_override)
     refuse_execution_owned_workspace_keys(body.config_override)
+    _check_job_mode(body.config_override, live=live)
     validated_override = with_validated_tool_overrides(body.config_override)
 
     if body.project_id:
@@ -519,6 +541,7 @@ async def update_automation(
     if "config_override" in fields:
         refuse_caller_transport_keys(fields["config_override"])
         refuse_execution_owned_workspace_keys(fields["config_override"])
+        _check_job_mode(fields["config_override"], live=live)
         fields["config_override"] = with_validated_tool_overrides(
             fields["config_override"]
         )

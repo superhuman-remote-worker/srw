@@ -199,6 +199,18 @@ class TestJobErrorFormatters:
             assert "blocked_undelivered" in rendered
             assert "Status: cancelled" not in rendered
 
+    @pytest.mark.parametrize(
+        ("job_mode", "expected"),
+        [("agent", "Mode: agent"), ("worker", "Mode: worker"), (None, "Mode: worker")],
+    )
+    def test_job_detail_names_the_job_mode(self, job_mode, expected):
+        job = {"id": "job1", "status": "processing", "config_name": "general-worker"}
+        if job_mode is not None:
+            job["job_mode"] = job_mode
+        lines = format_job_detail(job).splitlines()
+        # One line, worker for a job row that carries no mode.
+        assert [line for line in lines if line.startswith("Mode:")] == [expected]
+
     def test_operator_pause_hold_is_visible_in_job_detail(self):
         held = {
             "id": "job1",

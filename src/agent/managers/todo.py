@@ -188,6 +188,12 @@ class TodoManager:
         # Sequential numbering: phase 1, 2, 3, 4... (increments every transition)
         self._phase_number: int = 1
         self._current_phase_name: str = ""  # Human-readable name for current phase
+        # Whether the job's loaded tools include ``todo_complete``. The manager
+        # is built before the tools load, so the agent sets this afterwards.
+        # Without the tool the job's one task is closed by ``job_complete``,
+        # and the rendering below must not tell the model to call
+        # ``todo_complete`` (see ``format_for_injection``).
+        self.todo_tool_bound: bool = True
 
     @property
     def is_strategic_phase(self) -> bool:
@@ -426,7 +432,11 @@ class TodoManager:
 
         phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
         phase_name = self._current_phase_name
-        if phase_name:
+        if not self.todo_tool_bound:
+            # A job without todo_complete works through one task and ends with
+            # job_complete: no phase in the header.
+            lines = ["Current task"]
+        elif phase_name:
             lines = [
                 f"Current Tasks — Phase {self._phase_number} ({phase_type}): {phase_name}"
             ]
@@ -478,7 +488,12 @@ class TodoManager:
         from shared.runtime.services.guardrails import format_nudge
 
         lines.append("")
-        lines.append(format_nudge("todo_list_footer", model=self._model_name))
+        footer_key = (
+            "todo_list_footer"
+            if self.todo_tool_bound
+            else "todo_list_footer_job_complete"
+        )
+        lines.append(format_nudge(footer_key, model=self._model_name))
 
         return "\n".join(lines)
 

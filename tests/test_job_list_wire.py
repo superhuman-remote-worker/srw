@@ -75,6 +75,7 @@ def row(**fields):
         "is_display_root": True,
         "subjob_count": 1,
         "workspace_contract": {"state": "waiting"},
+        "job_mode": "worker",
         **fields,
     }
 

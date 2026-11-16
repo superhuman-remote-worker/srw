@@ -125,8 +125,15 @@ async def resolve_live_voice(
     expert_row: dict[str, Any] | None,
     config_override: dict[str, Any] | None,
 ) -> LiveVoice:
-    """The live voice of the job's expert, as dispatch will resolve it."""
+    """The live voice of the job's expert, as dispatch will resolve it.
+
+    Also refuses an expert or project default of agent mode (the resolved
+    blob shows the effective mode): a live job has its own procedure and
+    starts in a tactical phase, where ``job_complete`` is refused. A mode the
+    request names itself is refused earlier, in ``job_admission.admit_job_mode``.
+    """
     from orchestrator.services.config_resolver import resolve_config
+    from shared.job_mode import is_agent_mode
     from shared.runtime.core.loader import canonical_config_name
     from shared.runtime.core.subagent_roster import RosterResolutionError
 
@@ -155,6 +162,11 @@ async def resolve_live_voice(
         raise LiveVoiceError(
             f"The expert's config could not be resolved ({type(exc).__name__})"
         ) from None
+    if is_agent_mode(blob.get("agent")):
+        raise LiveVoiceError(
+            "This job's configuration runs it in agent mode, which a "
+            "live-session job cannot use: set job_mode to 'worker' for it."
+        )
     return live_voice_of(blob.get("agent") or {})
 
 

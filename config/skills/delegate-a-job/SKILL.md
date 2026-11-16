@@ -1,6 +1,6 @@
 ---
 name: delegate-a-job
-description: Use before creating a worker job that needs a specific model, a VM or lite workspace, or different lifecycle passes — the config_override knobs and what each one costs.
+description: Use before creating a worker job that needs a specific model, a VM or lite workspace, different lifecycle passes, or agent mode for a small task — the config_override knobs and job_mode, and what each one costs.
 display_name: Delegate a Job
 icon: rocket_launch
 color: "#89b4fa"
@@ -15,7 +15,8 @@ tags:
 `create_job` starts a worker with the defaults its expert and project
 supply. That is the right choice most of the time — reach for this skill only
 when the work genuinely needs something else: a stronger or cheaper model, root
-access, a repo checkout, or a different set of lifecycle passes.
+access, a repo checkout, a different set of lifecycle passes, or one small task
+done in one loop.
 
 Overrides go in `config_override`, a JSON object merged **last** — it wins over
 both the project default and the expert. Set only the keys you mean to change;
@@ -61,6 +62,13 @@ leave the project's knowledge better than it found it.
 
 Lets the job run to completion without pausing for review. Capped by your
 `autonomy_ceiling` grant.
+
+**Job mode** — `job_mode="agent"` on `create_job`
+
+Use it for a small task with an obvious end; the worker then skips the plan
+and the phases and does the task in one loop. Leave it out for anything long
+or open-ended. Any expert can run in either mode. An agent-mode job stops only
+at its end, so `partial`, `guided` and `dependent` autonomy act like `review`.
 
 **Memory** — `{"memory": {"required": true}}`
 

@@ -329,6 +329,33 @@ def apply_phase_description_prefixes(
     return out
 
 
+def apply_job_complete_description(
+    tools: List[Any], loaded_tool_names: Iterable[str]
+) -> List[Any]:
+    """Give ``job_complete`` the description that fits the job's tools.
+
+    Its docstring speaks of a final strategic phase, remaining to-dos and
+    ``todo_complete``. A job whose loaded tools do not include
+    ``todo_complete`` closes its one task with ``job_complete``, so its bound
+    copy gets a description that only says the call ends the job (see
+    ``agent.tools.core.job.job_complete_description``). Applied at bind time
+    like the phase prefixes; returns copies, every other tool unchanged, and
+    the full list unchanged for every other job.
+    """
+    from agent.tools.core.job import job_complete_description
+
+    description = job_complete_description(list(loaded_tool_names))
+    if description is None:
+        return list(tools)
+    manager = _get_manager()
+    return [
+        manager._copy_with_description(tool, description)
+        if getattr(tool, "name", "") == "job_complete"
+        else tool
+        for tool in tools
+    ]
+
+
 def get_deferred_tools() -> List[str]:
     """Get list of tool names that are deferred to workspace.
 

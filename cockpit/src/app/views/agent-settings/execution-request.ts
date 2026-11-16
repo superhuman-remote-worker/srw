@@ -11,7 +11,7 @@
  *   not Expert content; they travel separately in `config_override`.
  */
 import {deepMergeConfig} from './config-merge';
-import type {ExpertTemplateSource} from '../../core/models/api.model';
+import type {ExpertTemplateSource, JobMode} from '../../core/models/api.model';
 
 export type {ExpertTemplateSource};
 
@@ -72,6 +72,8 @@ export interface ManifestView {
   connectors: Array<{id: string; name: string; access?: string | null}>;
   /** Task- or session-level settings sent beside the execution. */
   settings?: Record<string, unknown>;
+  /** A Job's mode. Worker mode is the default and is not printed. */
+  jobMode?: JobMode;
 }
 
 /**
@@ -98,7 +100,11 @@ export function executionManifest(view: ManifestView): Record<string, unknown> {
   }
   const metadata: Record<string, unknown> = {name: slug(view.name ?? '') || 'new-job'};
   if (view.projectName) metadata['scope'] = {kind: 'Project', name: slug(view.projectName)};
-  const spec: Record<string, unknown> = {task: {text: view.task?.trim() || ''}, execution};
+  const spec: Record<string, unknown> = {task: {text: view.task?.trim() || ''}};
+  // A sibling of the task and the execution, never inside `execution`: that
+  // block is the three bricks a session shares.
+  if (view.jobMode === 'agent') spec['jobMode'] = 'agent';
+  spec['execution'] = execution;
   if (view.settings && Object.keys(view.settings).length) spec['settings'] = view.settings;
   return {apiVersion: 'srw/v1alpha1', kind: 'Job', metadata, spec};
 }

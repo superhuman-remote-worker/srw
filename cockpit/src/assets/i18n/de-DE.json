@@ -584,7 +584,8 @@
       "project": "Projekt",
       "noProject": "Kein Projekt",
       "projectPersonal": "(Persönlich)",
-      "projectFixed": "Beim Anlegen der Automation festgelegt; lässt sich nicht ändern."
+      "projectFixed": "Beim Anlegen der Automation festgelegt; lässt sich nicht ändern.",
+      "jobMode": "Job-Modus"
     },
     "preview": {
       "timezoneNote": "Zeiten in {{tz}}. Der Orchestrator speichert intern in UTC und beachtet Sommerzeit automatisch.",
@@ -992,6 +993,19 @@
       "removeFile": "Datei entfernen",
       "settingsStillLoading": "Die Einstellungen werden noch geladen. Versuchen Sie es gleich noch einmal."
     },
+    "mode": {
+      "label": "Job-Modus",
+      "worker": {
+        "label": "Worker-Modus",
+        "option": "Worker-Modus (große Aufgaben)",
+        "hint": "Wie ein Kollege für große Aufgaben: plant die Arbeit, arbeitet Aufgaben in Phasen ab und prüft das Ergebnis."
+      },
+      "agent": {
+        "label": "Agent-Modus",
+        "option": "Agent-Modus (kleine Aufgaben)",
+        "hint": "Wie ein Agent für kleine Aufgaben: erledigt die Aufgabe in einem Durchlauf, ohne Plan und ohne Phasen."
+      }
+    },
     "detail": {
       "auditSteps": "Audit-Schritte",
       "cost": "Kosten",
@@ -1004,6 +1018,7 @@
       "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
       "duration": "Dauer",
       "expert": "Experte",
+      "mode": "Job-Modus",
       "heldForReview": "Zur Prüfung angehalten",
       "loading": "Details werden geladen…",
       "model": "Modell",
@@ -4259,7 +4274,8 @@
       "dependent": {
         "label": "Abhängig",
         "description": "Stoppt nach jeder Phase (strategisch und taktisch)"
-      }
+      },
+      "agentModeNote": "Im Agent-Modus stoppt ein Job nur einmal, am Ende. Diese Stufe wirkt deshalb wie Review."
     },
     "permissionModes": {
       "read_only": {
@@ -4612,6 +4628,7 @@
       "noJobHint": "Aufgaben erscheinen hier",
       "noTodos": "Keine Aufgaben in dieser Phase",
       "planningHint": "Der Agent befindet sich möglicherweise in der strategischen Planung",
+      "agentModeHint": "Dieser Job läuft im Agent-Modus und hat keine Aufgabenliste.",
       "archiveHint": "Für dieses Archiv sind keine Aufgaben erfasst"
     },
     "priorityHigh": "HOCH",

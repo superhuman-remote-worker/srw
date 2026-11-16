@@ -142,6 +142,34 @@ async def test_job_creation_forwards_preferred_expert_kickoff_context_and_priori
 
 
 @pytest.mark.asyncio
+async def test_job_clients_send_the_job_mode_only_when_it_is_set() -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(201, json={"id": "job-1", "status": "created"})
+
+    client = AsyncCockpitClient(
+        "http://orchestrator.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        await client.create_job("one step", job_mode="agent")
+        await client.create_project_job("project-1", "one unit", job_mode="agent")
+        await client.create_job("big task")
+        await client.create_project_job("project-1", "big project task")
+    finally:
+        await client.close()
+
+    assert [(path, body.get("job_mode")) for path, body in captured[:2]] == [
+        ("/api/jobs", "agent"),
+        ("/api/projects/project-1/jobs", "agent"),
+    ]
+    # Omitted means worker mode on the server, and an older server that does
+    # not know the field never sees it.
+    assert all("job_mode" not in body for _, body in captured[2:])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ds_type", "fields"),
     [

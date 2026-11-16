@@ -33,6 +33,9 @@ $ignore_keys:
   - workspace.git_versioning
   # Pause-for-review semantics — a child is driven by its parent's turn.
   - autonomy
+  # How a job runs (shared/job_mode.py) — a job-level choice; a child runs in
+  # its parent's turn whatever mode the parent job has.
+  - job_mode
   # Subjob spawning after/before the parent job (critic, research pass, KB
   # curation at archive_phase) — orchestrator-side, parent-only.
   - verification

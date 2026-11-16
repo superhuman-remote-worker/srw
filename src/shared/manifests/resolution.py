@@ -396,6 +396,16 @@ class _Bundle:
                 number,
                 (*path, "execution", "connectors", alias),
             )
+        if spec.get("jobMode") == "agent" and spec.get("liveSession"):
+            # A live-session Job starts in its tactical phase; an agent-mode
+            # Job has no phases.
+            fail(
+                "AgentModeLiveSession",
+                "An agent-mode Job (jobMode: agent) cannot start inside a live "
+                "session. Use jobMode: worker or remove liveSession.",
+                document=number,
+                path=pointer((*path, "jobMode")),
+            )
         session = execution.get("session")
         if bool(spec.get("liveSession")) != (session is not None):
             fail(

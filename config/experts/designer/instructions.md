@@ -36,16 +36,21 @@ Record findings in `reference/pattern_audit.md`:
 - Plan the responsive behavior: what changes between mobile (< 768px) and desktop
 - Plan the interaction model: clicks, hovers, keyboard shortcuts, transitions
 
+{% if has_tool("next_phase_todos") -%}
 Write the plan to `plan.md`:
 - Feature overview (one paragraph)
 - Screen/component inventory (what to mock up)
 - Reuse map (existing component → where it's used in the new feature)
 - Mockup priority order (which screens to design first)
 
+{% endif -%}
 ## 4. Create Mockups
 
+{% if has_tool("next_phase_todos") -%}
 Work through the mockup list from plan.md, one per todo.
-
+{% else -%}
+Work through the screens and components you listed, one mockup at a time.
+{% endif %}
 ### Mockup Requirements
 
 Every mockup file must:

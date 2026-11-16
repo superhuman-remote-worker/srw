@@ -584,7 +584,8 @@
       "project": "Project",
       "noProject": "No project",
       "projectPersonal": "(Personal)",
-      "projectFixed": "Set when the automation was created; it can't be changed."
+      "projectFixed": "Set when the automation was created; it can't be changed.",
+      "jobMode": "Job mode"
     },
     "preview": {
       "timezoneNote": "Times are shown in {{tz}}. The orchestrator stores schedules in UTC and applies DST automatically.",
@@ -992,6 +993,19 @@
       "removeFile": "Remove file",
       "settingsStillLoading": "The settings are still loading. Try again in a moment."
     },
+    "mode": {
+      "label": "Job mode",
+      "worker": {
+        "label": "Worker mode",
+        "option": "Worker mode (big tasks)",
+        "hint": "A coworker for big tasks: plans the work, works through todos in phases and reviews the result."
+      },
+      "agent": {
+        "label": "Agent mode",
+        "option": "Agent mode (small tasks)",
+        "hint": "An agent for small tasks: does the task in one loop, without a plan or phases."
+      }
+    },
     "detail": {
       "auditSteps": "Audit steps",
       "cost": "Cost",
@@ -1004,6 +1018,7 @@
       "costUnpriced": "Metered, but no rate card covers these models — tokens are exact, cost is unknown.",
       "duration": "Duration",
       "expert": "Expert",
+      "mode": "Job mode",
       "heldForReview": "Held for review",
       "loading": "Loading details…",
       "model": "Model",
@@ -4268,7 +4283,8 @@
       "dependent": {
         "label": "Dependent",
         "description": "Freezes after every phase (strategic and tactical)"
-      }
+      },
+      "agentModeNote": "In agent mode a job stops once, at its end, so this level works like Review."
     },
     "permissionModes": {
       "read_only": {
@@ -4612,6 +4628,7 @@
       "noJobHint": "Todos will appear here",
       "noTodos": "No todos in this phase",
       "planningHint": "The agent may be in strategic planning",
+      "agentModeHint": "This job runs in agent mode and has no todo list to show.",
       "archiveHint": "This archive has no recorded todos"
     },
     "priorityHigh": "HIGH",

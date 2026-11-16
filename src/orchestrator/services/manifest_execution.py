@@ -33,6 +33,7 @@ from orchestrator.services.manifest_harness_egress import (
 )
 from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_store import ManifestStore, decoded
+from shared.job_mode import JOB_MODE_KEY, normalize_job_mode
 from shared.manifests.resolution import content_revision
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,18 @@ class ManifestExecutionService:
                 "A live-session Job runs the SRW harness (its voice subagent is "
                 "SRW's); a generic or custom image cannot take a live session.",
             )
+        job_mode = spec.get("jobMode")
+        if job_mode is not None:
+            if adapter != "srw/v1" or custom_image:
+                raise HTTPException(
+                    422,
+                    "jobMode chooses how SRW's own worker runs a Job; a generic "
+                    "or custom image runs its own loop. Remove jobMode.",
+                )
+            try:
+                job_mode = normalize_job_mode(job_mode)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
         live_connector_id = None
         for alias, connector in execution["connectors"].items():
             value = connector["inline"]
@@ -283,6 +296,11 @@ class ManifestExecutionService:
                     workspace, instance_recipe=instance_recipe
                 )
             }
+            if job_mode is not None:
+                # Frozen with the snapshot below and stored on the job, where
+                # the job's mode is read back. An omitted jobMode leaves the
+                # Expert's own setting (worker mode when it has none).
+                config_override[JOB_MODE_KEY] = job_mode
             if (
                 spec["completion"]["mode"] != "Reported"
                 or spec["retry"]["maxAttempts"] != 1

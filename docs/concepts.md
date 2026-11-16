@@ -76,10 +76,17 @@ SRW runs work in two shapes.
   irreversible or outbound actions and shell commands; **Autonomous** never
   asks.
 - A **job** is a goal the agent works on without you: you describe it, SRW
-  queues it, an agent picks it up and works through it in phases, and you
-  review the result. Jobs are the shape for long, unattended work.
+  queues it, an agent picks it up and works through it, and you review the
+  result. Jobs are the shape for unattended work.
 
-Both use the same experts, workspaces and connectors.
+A job runs in one of two modes. **Worker mode**, the default, is for big
+tasks: the agent plans, works through todos in phases and reviews its result.
+**Agent mode** is for small tasks: the agent does the task in one loop and
+ends. Both keep the queue, the review, the deliverable checks and the record.
+Any expert can run in either mode; you choose the mode for each job. A job
+that starts inside a live session runs in worker mode.
+
+Both shapes use the same experts, workspaces and connectors.
 
 ## Job statuses
 
@@ -100,7 +107,8 @@ decides.
 
 ## Strategic and tactical phases
 
-A job runs as one loop that alternates between two kinds of phase:
+A job in worker mode runs as one loop that alternates between two kinds of
+phase:
 
 - **Strategic phases** plan. The agent reviews where it stands, updates its
   notes and memory, and stages the todo list for the next phase. Only here can
@@ -113,7 +121,7 @@ and carries knowledge forward through workspace files, project knowledge and
 memory. This keeps long jobs inside the model's context window and gives
 review points between planning and execution. The phase number counts up from
 0, the first strategic phase. Sessions do not use phases; they run a
-continuous conversation loop.
+continuous conversation loop. A job in agent mode has no phases.
 
 ## Autonomy levels
 
@@ -130,6 +138,9 @@ A job's autonomy level decides when it stops for review.
 Approving a job stopped at a phase boundary lets it continue; approving a
 finished job completes it. Administrators can limit the highest autonomy level
 each user may choose.
+
+A job in agent mode stops once, at its end: `partial`, `guided` and
+`dependent` then behave like `review`.
 
 A job at `full` also applies its own changes to the project's cloud folder when
 it completes, where the other levels show them to the owner as a diff first.

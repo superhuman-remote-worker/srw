@@ -2049,6 +2049,18 @@
           "default": 5000,
           "description": "Job-wide tool-call ceiling — the only automatic stop for a runaway job. Exceeding it freezes with budget_exceeded for human review (0 disables)"
         },
+        "max_llm_calls_per_job": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Optional cap on model calls per round of work (from the job's start or its last resume with feedback), held across batch rotations. At the cap the job stops before the next call and ends failed (0 = off)"
+        },
+        "max_plain_replies_in_a_row": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Optional stop after this many replies in a row without a tool call while a todo is pending, whatever their wording. With 3: two reminders, then the third such reply ends the job as failed (0 = off)"
+        },
         "tool_category_timeouts": {
           "type": "object",
           "description": "Per-tool-category audited batch timeout ceilings (seconds). Empty values use graph defaults.",
@@ -2407,6 +2419,12 @@
       "enum": ["full", "review", "partial", "guided", "dependent"],
       "default": "review",
       "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
+    },
+    "job_mode": {
+      "type": "string",
+      "enum": ["worker", "agent"],
+      "default": "worker",
+      "description": "How a job runs. worker=the planned procedure in phases (plan, work through todos, review), for big tasks. agent=one small task in one loop: one predefined todo, no phase tools, and the job ends with job_complete. Frozen into the job's configuration when it is created."
     },
     "image_quality": {
       "type": "string",

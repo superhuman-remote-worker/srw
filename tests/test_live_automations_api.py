@@ -684,3 +684,130 @@ class TestPatch:
             OTHER_LINE_ID, exclude_id=AUTOMATION_ID
         )
         db.update_automation.assert_not_called()
+
+
+# =============================================================================
+# Job mode (config_override.job_mode)
+# =============================================================================
+
+
+def _cron_body(**overrides) -> mod.AutomationCreate:
+    # Paused, so the create computes no schedule (the env fixture refuses it).
+    body = {
+        "name": "Nightly",
+        "expert": "developer",
+        "prompt": "Rename one heading",
+        "cron_expr": "0 * * * *",
+        "enabled": False,
+    }
+    body.update(overrides)
+    return mod.AutomationCreate(**body)
+
+
+class TestJobMode:
+    """An automation's jobs run in the mode its ``config_override`` names. The
+    value is checked on save, since a fire never crosses ``POST /api/jobs``;
+    a live automation's jobs start inside a live session, which an agent-mode
+    job cannot run in."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["worker", "agent"])
+    async def test_a_scheduled_automation_stores_either_mode(self, env, mode):
+        db = _store()
+        await mod.create_automation(
+            MagicMock(),
+            _cron_body(config_override={"job_mode": mode, "autonomy": "full"}),
+            dependencies=_deps(db),
+        )
+        stored = db.create_automation.await_args.kwargs["config_override"]
+        assert stored == {"job_mode": mode, "autonomy": "full"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["light", "Agent", 1, ["agent"]])
+    async def test_an_unknown_mode_is_refused(self, env, value):
+        db = _store()
+        with pytest.raises(HTTPException) as caught:
+            await mod.create_automation(
+                MagicMock(),
+                _cron_body(config_override={"job_mode": value}),
+                dependencies=_deps(db),
+            )
+        assert caught.value.status_code == 422
+        assert "job_mode" in caught.value.detail
+        db.create_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_mode_is_stored_as_worker(self, env):
+        db = _store()
+        await mod.create_automation(
+            MagicMock(),
+            _cron_body(config_override={"job_mode": None}),
+            dependencies=_deps(db),
+        )
+        stored = db.create_automation.await_args.kwargs["config_override"]
+        assert stored == {"job_mode": "worker"}
+
+    @pytest.mark.asyncio
+    async def test_a_live_automation_refuses_agent_mode(self, env):
+        db = _store()
+        with pytest.raises(HTTPException) as caught:
+            await mod.create_automation(
+                MagicMock(),
+                _live_body(config_override={"job_mode": "agent"}),
+                dependencies=_deps(db),
+            )
+        assert caught.value.status_code == 422
+        assert "live session" in caught.value.detail
+        db.create_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_live_automation_takes_worker_mode(self, env):
+        db = _store()
+        await mod.create_automation(
+            MagicMock(),
+            _live_body(config_override={"job_mode": "worker"}),
+            dependencies=_deps(db),
+        )
+        stored = db.create_automation.await_args.kwargs["config_override"]
+        assert stored == {"job_mode": "worker"}
+
+    @pytest.mark.asyncio
+    async def test_patching_a_live_automation_to_agent_mode_is_refused(
+        self, env, monkeypatch
+    ):
+        _row(monkeypatch, _live_row())
+        db = _store()
+        with pytest.raises(HTTPException) as caught:
+            await mod.update_automation(
+                MagicMock(),
+                AUTOMATION_ID,
+                mod.AutomationUpdate(config_override={"job_mode": "agent"}),
+                dependencies=_deps(db),
+            )
+        assert caught.value.status_code == 422
+        db.update_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patching_a_scheduled_automation_checks_the_mode(
+        self, env, monkeypatch
+    ):
+        _row(monkeypatch, _cron_row())
+        db = _store()
+        await mod.update_automation(
+            MagicMock(),
+            AUTOMATION_ID,
+            mod.AutomationUpdate(config_override={"job_mode": "agent"}),
+            dependencies=_deps(db),
+        )
+        db.update_automation.assert_awaited_once_with(
+            AUTOMATION_ID, config_override={"job_mode": "agent"}
+        )
+        with pytest.raises(HTTPException) as caught:
+            await mod.update_automation(
+                MagicMock(),
+                AUTOMATION_ID,
+                mod.AutomationUpdate(config_override={"job_mode": "batch"}),
+                dependencies=_deps(db),
+            )
+        assert caught.value.status_code == 422
+        assert db.update_automation.await_count == 1

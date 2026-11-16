@@ -1,7 +1,8 @@
-import { Component, inject, effect, OnInit } from '@angular/core';
+import { Component, computed, inject, effect, OnInit } from '@angular/core';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { TodoService } from '../../core/services/todo.service';
 import { DataService } from '../../core/services/data.service';
+import { isAgentModeJob } from '../../core/util/job-mode';
 import { TodoItem } from '../../core/models/todo.model';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconButtonComponent } from '../../ui/icon-button';
@@ -135,8 +136,8 @@ import { AppSpinnerComponent } from '../../ui/spinner';
         <div class="empty-state">
           <span class="empty-icon">&#x2705;</span>
           <span>{{ 'todoList.empty.noTodos' | transloco }}</span>
-          <span class="empty-hint">
-            {{ (todo.isShowingCurrent() ? 'todoList.empty.planningHint' : 'todoList.empty.archiveHint') | transloco }}
+          <span class="empty-hint" data-testid="todo-empty-hint">
+            {{ emptyHintKey() | transloco }}
           </span>
         </div>
       }
@@ -442,6 +443,24 @@ export class TodoListComponent implements OnInit {
   readonly todo = inject(TodoService);
   readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
+
+  /** The selected job runs in agent mode: it has no plan and no phases, so
+   *  its current todo list stays empty for the whole run. Read from the job
+   *  rows the workbench already holds; a row without the field is a worker job. */
+  readonly currentJobIsAgentMode = computed(() => {
+    const id = this.data.currentJobId();
+    return !!id && isAgentModeJob(this.data.jobs().find((job) => job.id === id));
+  });
+
+  /** Why the list is empty: an agent-mode job (whose current list may not
+   *  exist at all), a worker job that is still planning, or an archive with
+   *  no todos. */
+  readonly emptyHintKey = computed(() => {
+    if (this.todo.selectedArchive() === null && this.currentJobIsAgentMode()) {
+      return 'todoList.empty.agentModeHint';
+    }
+    return this.todo.isShowingCurrent() ? 'todoList.empty.planningHint' : 'todoList.empty.archiveHint';
+  });
 
   constructor() {
     // Load todos when selected job changes

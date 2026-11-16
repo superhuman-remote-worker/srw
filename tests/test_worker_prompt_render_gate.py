@@ -15,6 +15,13 @@ expert actually grants, and pin:
 - a frozen pre-U2 template keeps its phase swap for resume compatibility, while
   every newly resolved template is phase-agnostic.
 
+An agent-mode job binds none of the phase tools (it does one task in one loop
+and ends on ``job_complete``). Every template keeps the phased procedure inside
+``has_tool("next_phase_todos")`` blocks, so the same expert x family render with
+the agent-mode tool list must name none of it, must name ``job_complete``, and
+must not leave a gap where a block dropped out. Worker-mode renders are pinned
+byte for byte by ``test_worker_mode_prompts_unchanged.py``.
+
 Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
 """
 
@@ -25,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from shared.job_mode import PHASE_PROCEDURE_TOOLS
 from shared.runtime.core.loader import (
     PHASE_SKILLS,
     PromptMatrixResolver,
@@ -83,6 +91,33 @@ _PER_CALL_GATE_SENTENCE = (
     "calling one outside its phase returns an error for that call without "
     "affecting the other calls in the batch."
 )
+#: The tools of the phased procedure. An agent-mode job binds none of them and
+#: binds ``job_complete`` instead.
+_PHASE_TOOLS = PHASE_PROCEDURE_TOOLS
+#: Text about the phased procedure that an agent-mode prompt must not carry.
+_PHASE_PROCEDURE_TEXT = (
+    "todo_complete",
+    "next_phase_todos",
+    "request_replan",
+    "todo_list",
+    "todos.yaml",
+    "plan.md",
+    "phase_model",
+    "multiphase",
+    "strategic",
+    "tactical",
+    "[PHASE_TRANSITION]",
+)
+
+
+def _worker_templates() -> list[Path]:
+    templates = sorted(
+        p
+        for p in (_CONFIG / "prompts").glob("systemprompt*.txt")
+        if "interactive" not in p.name and "subagent" not in p.name
+    )
+    assert len(templates) == 14, templates
+    return templates
 
 
 def _worker_experts() -> list[tuple[str, Path]]:
@@ -109,6 +144,20 @@ def _granted_tools(leaf: Path) -> list[str]:
         if isinstance(name, str) and name in TOOL_REGISTRY
     }
     return sorted(names)
+
+
+def _agent_mode_tools(tools: list[str]) -> list[str]:
+    """An agent-mode job's tools: the phase tools removed, ``job_complete`` added."""
+    return sorted((set(tools) - set(_PHASE_TOOLS)) | {"job_complete"})
+
+
+def _assert_no_phase_procedure(text: str, label: str) -> None:
+    for needle in _PHASE_PROCEDURE_TEXT:
+        assert needle not in text, f"{label}: names {needle!r}"
+    assert not any(m in text for m in _PHASE_MODEL_MARKERS), label
+    assert _PER_CALL_GATE_SENTENCE not in text, label
+    assert "job_complete" in text, label
+    assert "{%" not in text and "%}" not in text, f"{label}: unrendered Jinja"
 
 
 def _config(leaf: Path):
@@ -197,6 +246,81 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
         cfg, is_strategic=False, phase_number=2, model=model, tool_names=tools
     )
     assert strategic == prompt == tactical, label
+
+
+# ---------------------------------------------------------------------------
+# The same system prompt for an agent-mode job (no phase tools)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILY_MODELS))
+@pytest.mark.parametrize("name,leaf", _WORKERS, ids=_WORKER_IDS)
+def test_agent_mode_system_prompt_names_no_phase_procedure(name, leaf, family):
+    cfg = _config(leaf)
+    worker_tools = _granted_tools(leaf)
+    tools = _agent_mode_tools(worker_tools)
+    model = _FAMILY_MODELS[family]
+
+    prompt = get_system_prompt(cfg, model=model, tool_names=tools)
+    label = f"{name}/{family} agent-mode system prompt"
+    _assert_clean(prompt, label)
+    assert cfg.display_name in prompt, label
+    # The persona is the expert's own prose, not the scaffold's; some personas
+    # describe their phased method and are not part of this gate.
+    persona = PromptMatrixResolver(str(leaf.parent), family).load("persona").strip()
+    assert persona and persona in prompt, label
+    scaffold = prompt.replace(persona, "")
+    _assert_no_phase_procedure(scaffold, label)
+    assert "phase instructions" not in scaffold, label
+    # Blocks that drop out leave no extra blank lines behind.
+    worker = get_system_prompt(cfg, model=model, tool_names=worker_tools)
+    worker_scaffold = worker.replace(persona, "")
+    assert scaffold.count("\n\n\n") <= worker_scaffold.count("\n\n\n"), label
+
+    strategic = get_phase_system_prompt(
+        cfg, is_strategic=True, phase_number=0, model=model, tool_names=tools
+    )
+    assert strategic == prompt, label
+
+
+#: Agent-mode tool lists that take each other condition of the templates
+#: (``kb_write``, ``memory_search``, ``delegate_agent``) both ways.
+_AGENT_MODE_TOOL_LISTS = {
+    "every_tool": _agent_mode_tools(sorted(TOOL_REGISTRY)),
+    "job_complete_only": ["job_complete"],
+}
+
+
+@pytest.mark.parametrize("tool_list", sorted(_AGENT_MODE_TOOL_LISTS))
+@pytest.mark.parametrize("template", _worker_templates(), ids=lambda p: p.name)
+def test_every_worker_template_renders_for_an_agent_mode_job(template, tool_list):
+    raw = template.read_text(encoding="utf-8")
+    assert 'has_tool("next_phase_todos")' in raw, template.name
+    tools = _AGENT_MODE_TOOL_LISTS[tool_list]
+    rendered = render_instruction_content(raw, tools)
+    label = f"{template.name} ({tool_list})"
+    assert rendered.strip(), label
+    _assert_no_phase_procedure(rendered, label)
+    with_phase_tools = render_instruction_content(raw, sorted({*tools, *_PHASE_TOOLS}))
+    assert rendered.count("\n\n\n") <= with_phase_tools.count("\n\n\n"), label
+    assert rendered != with_phase_tools, label
+
+
+@pytest.mark.parametrize("tool_list", sorted(_AGENT_MODE_TOOL_LISTS))
+@pytest.mark.parametrize("expert", ["engineer", "designer"])
+def test_expert_instructions_name_no_phase_procedure_in_agent_mode(expert, tool_list):
+    raw = (_CONFIG / "experts" / expert / "instructions.md").read_text(encoding="utf-8")
+    tools = _AGENT_MODE_TOOL_LISTS[tool_list]
+    rendered = render_instruction_content(raw, tools)
+    label = f"{expert} instructions ({tool_list})"
+    assert rendered.strip(), label
+    for needle in _PHASE_PROCEDURE_TEXT:
+        assert needle not in rendered, f"{label}: names {needle!r}"
+    assert "{%" not in rendered and "%}" not in rendered, label
+    with_phase_tools = render_instruction_content(raw, sorted({*tools, *_PHASE_TOOLS}))
+    assert rendered.count("\n\n\n") <= with_phase_tools.count("\n\n\n"), label
+    if expert == "engineer":
+        assert "`job_complete`" in rendered, label
 
 
 # ---------------------------------------------------------------------------

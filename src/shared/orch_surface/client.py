@@ -1295,6 +1295,7 @@ class AsyncCockpitClient:
         work_category: str | None = None,
         workspace: dict[str, Any] | None = None,
         workspace_supplied: bool = False,
+        job_mode: str | None = None,
     ) -> dict[str, Any]:
         """Create a new job.
 
@@ -1326,6 +1327,8 @@ class AsyncCockpitClient:
                 category in the kickoff contract
             workspace / workspace_supplied: the REST WorkspaceBinding (None = no
                 workspace), sent only when supplied.
+            job_mode: "worker" or "agent", sent only when set; the server
+                treats an absent mode as worker mode.
 
         Returns:
             Created job record with ID
@@ -1335,6 +1338,8 @@ class AsyncCockpitClient:
             "config_name": config_name,
             "priority": priority,
         }
+        if job_mode:
+            body["job_mode"] = job_mode
         if ticket:
             body["ticket"] = ticket
         if work_category:
@@ -2513,6 +2518,7 @@ class AsyncCockpitClient:
         required_deliverables: list[str] | None = None,
         workspace: dict[str, Any] | None = None,
         workspace_supplied: bool = False,
+        job_mode: str | None = None,
     ) -> dict[str, Any]:
         """Create a job within a project context.
 
@@ -2535,6 +2541,8 @@ class AsyncCockpitClient:
                 replace a refused publication contract with a note.
             workspace / workspace_supplied: the REST WorkspaceBinding (None = no
                 workspace), sent only when supplied.
+            job_mode: "worker" or "agent", sent only when set; the server
+                treats an absent mode as worker mode.
 
         Returns:
             Created job record with ID
@@ -2544,6 +2552,8 @@ class AsyncCockpitClient:
             "config_name": config_name,
             "priority": priority,
         }
+        if job_mode:
+            body["job_mode"] = job_mode
         if expert_id:
             body["expert_id"] = expert_id
         if datasource_ids is not None:

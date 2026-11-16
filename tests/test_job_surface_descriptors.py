@@ -164,6 +164,7 @@ def test_shared_surface_imports_only_stdlib_httpx_and_shared_contracts() -> None
         "shared.worker_execution_hold",
         "shared.permission_modes",
         "shared.workspace_disk",
+        "shared.job_mode",
     )
     for path in SHARED_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -497,6 +498,50 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
         "prior_deliverable_contract",
         "required_pr_repositories",
     }
+
+
+@pytest.mark.asyncio
+async def test_create_job_sends_the_job_mode_as_the_typed_field() -> None:
+    """The descriptor forwards ``job_mode`` as the request's own field; it
+    does not write a ``config_override`` key. Omitted, nothing is sent."""
+    observed_bodies: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed_bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "status": "created",
+                "config_name": "worker_base",
+            },
+        )
+
+    client = AsyncCockpitClient(
+        base_url="http://orchestrator.test",
+        transport=httpx.MockTransport(handler),
+    )
+    invoke = make_bound_handler(
+        get_descriptor("create_job"),
+        client_provider=lambda: client,
+        caller_provider=lambda: CallerCtx(kind="session", user_id="user-1"),
+    )
+    try:
+        await invoke(description="rename one heading", job_mode="agent")
+        await invoke(description="plan the release")
+    finally:
+        await client.close()
+
+    agent_body, worker_body = observed_bodies
+    assert agent_body["job_mode"] == "agent"
+    assert "config_override" not in agent_body
+    assert "job_mode" not in worker_body
+
+    # The orchestrator's request model reads the field the tool sends.
+    from orchestrator.schemas.job_create import JobCreate
+
+    assert JobCreate.model_validate(agent_body).job_mode == "agent"
+    assert JobCreate.model_validate(worker_body).job_mode is None
 
 
 @pytest.mark.asyncio

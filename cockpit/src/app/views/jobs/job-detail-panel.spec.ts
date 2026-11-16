@@ -11,6 +11,7 @@ import {
   failureReason,
   heldForReviewReason,
   jobExpertLabel,
+  jobModeFactKey,
   jobModelLabel,
   liveSubjobCount,
   JobDetailPanelComponent,
@@ -516,6 +517,68 @@ describe('jobExpertLabel', () => {
       expect(expert?.querySelector('.fact-value')?.textContent?.trim()).toBe(
         'Küppelsmühle Empfang (Demo)',
       );
+    });
+  });
+});
+
+describe('jobModeFactKey', () => {
+  it('names the mode the server returned, preferring the loaded detail', () => {
+    expect(jobModeFactKey({job_mode: 'agent'}, null)).toBe('jobs.mode.agent.label');
+    expect(jobModeFactKey({job_mode: 'worker'}, null)).toBe('jobs.mode.worker.label');
+    expect(jobModeFactKey({job_mode: 'worker'}, {job_mode: 'agent'})).toBe('jobs.mode.agent.label');
+  });
+
+  it('reads a job without the field as a worker job', () => {
+    expect(jobModeFactKey({}, null)).toBe('jobs.mode.worker.label');
+    expect(jobModeFactKey(null, {})).toBe('jobs.mode.worker.label');
+  });
+
+  it('never derives the mode from config_override', () => {
+    const detail = {config_override: {job_mode: 'agent'}} as unknown as Job;
+    expect(jobModeFactKey({}, detail)).toBe('jobs.mode.worker.label');
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    function facts(jobMode: string | undefined): {labels: string[]; mode: string | undefined} {
+      TestBed.configureTestingModule({
+        imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+          langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        })],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+        id: 'job-4', description: 'Rename the heading', status: 'completed',
+        created_at: '2026-11-16T08:00:00Z', config_name: 'developer',
+        ...(jobMode === undefined ? {} : {job_mode: jobMode}),
+      } as JobSummary)});
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+      fixture.detectChanges();
+      const root = fixture.nativeElement as HTMLElement;
+      return {
+        labels: [...root.querySelectorAll('.detail-grid .fact-label')].map((el) => el.textContent?.trim() ?? ''),
+        mode: root.querySelector('[data-testid="job-mode-fact"] .fact-value')?.textContent?.trim(),
+      };
+    }
+
+    it('shows "Agent mode" right after the Expert fact', () => {
+      const {labels, mode} = facts('agent');
+      expect(mode).toBe(en.jobs.mode.agent.label);
+      expect(labels.indexOf(en.jobs.detail.mode)).toBe(labels.indexOf(en.jobs.detail.expert) + 1);
+    });
+
+    it('shows "Worker mode" for a worker job and for a row without the field', () => {
+      expect(facts('worker').mode).toBe(en.jobs.mode.worker.label);
+      TestBed.resetTestingModule();
+      expect(facts(undefined).mode).toBe(en.jobs.mode.worker.label);
     });
   });
 });

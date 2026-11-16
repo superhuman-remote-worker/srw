@@ -14,6 +14,8 @@ from typing import Any, Callable, Protocol
 
 from fastapi import HTTPException
 
+from orchestrator.services.job_projection import effective_job_mode
+
 
 class JobReadConnection(Protocol):
     async def fetch(self, query: str, *args: Any) -> Sequence[Mapping[str, Any]]: ...
@@ -56,7 +58,12 @@ async def read_job(
             job["audit_count"] = await dependencies.audit_reader.get_audit_count(job_id)
         else:
             job["audit_count"] = None
-        return dependencies.with_cloud_review_mode(dependencies.redact_job(job))
+        # Read from the unredacted row: the frozen configuration says how the
+        # job runs, the requested override is the fallback.
+        job_mode = effective_job_mode(job)
+        result = dependencies.with_cloud_review_mode(dependencies.redact_job(job))
+        result["job_mode"] = job_mode
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -87,12 +94,15 @@ async def read_project_jobs(
         async with dependencies.store.acquire() as conn:
             # The review mode reads the diff, the baseline and the checkout's
             # level (job_projection.cloud_review_mode); the summary view has
-            # none of them.
+            # none of them. The job's mode is read from its requested config,
+            # as on the jobs list (shared.job_mode: anything else is worker).
             query = (
                 "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
                 "jcr.delivery_sha, jcr.record_type AS change_record_type, "
                 "j.diff_status, j.cloud_diff_baseline_commit, j.title, "
-                "j.context->'cloud_checkout' AS cloud_checkout "
+                "j.context->'cloud_checkout' AS cloud_checkout, "
+                "CASE WHEN j.config_override->>'job_mode' = 'agent' "
+                "THEN 'agent' ELSE 'worker' END AS job_mode "
                 "FROM job_summary js "
                 "JOIN jobs j ON j.id = js.id "
                 "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "

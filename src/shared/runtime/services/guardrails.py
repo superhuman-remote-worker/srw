@@ -42,6 +42,11 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     "degenerate_recovery_user": {"pattern_detail"},
     "loop_warning_suffix": set(),
     "tool_not_found_suffix": set(),
+    # The same three for a job that does not bind todo_complete: they point
+    # at job_complete instead (the caller picks the key from the loaded tools)
+    "todo_action_job_complete": set(),
+    "loop_warning_suffix_job_complete": set(),
+    "tool_not_found_suffix_job_complete": set(),
     "phase_transition_strategic_to_tactical": {
         "phase_number",
         "phase_name",
@@ -55,6 +60,8 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     "phase_gate_batch_note": set(),
     # src/managers/todo.py
     "todo_list_footer": set(),
+    # ... for a job that does not bind todo_complete
+    "todo_list_footer_job_complete": set(),
     # src/services/recall_store.py
     "memory_entry_header": set(),
     "memory_summary_header": {"count"},

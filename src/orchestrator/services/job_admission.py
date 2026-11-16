@@ -61,9 +61,52 @@ from orchestrator.services.live.admission import (
     prepare_live_session,
     refuse_session_contradictions,
 )
+from shared.job_mode import JOB_MODE_AGENT, JOB_MODE_KEY, normalize_job_mode
 
 
 logger = logging.getLogger(__name__)
+
+
+def admit_job_mode(command: JobCreate) -> None:
+    """Check the job's mode and fold the request field into ``config_override``.
+
+    The mode is an ordinary config key (``config_override.job_mode``), so the
+    resolver freezes it with the rest of the job's configuration. The typed
+    ``job_mode`` field is written there before the config stage reads the
+    override; a different value already in the override is refused (400), as
+    is a value that names no mode. An agent-mode job cannot be a live-session
+    job (422): a live job has its own procedure, starting in a tactical phase
+    where ``job_complete`` is refused. A mode that comes from an expert or
+    project default is checked against a live session in
+    :func:`orchestrator.services.live.admission.resolve_live_voice`.
+    """
+    override = command.config_override
+    requested: str | None = None
+    if isinstance(override, dict) and JOB_MODE_KEY in override:
+        try:
+            requested = normalize_job_mode(override[JOB_MODE_KEY])
+        except ValueError as exc:
+            raise HTTPException(400, f"config_override.{exc}") from None
+    if command.job_mode is not None:
+        stated = override.get(JOB_MODE_KEY) if isinstance(override, dict) else None
+        if stated not in (None, "") and requested != command.job_mode:
+            raise HTTPException(
+                400,
+                f"job_mode is {command.job_mode!r} but config_override.job_mode "
+                f"is {stated!r}; name the mode once",
+            )
+        command.config_override = {
+            **(override if isinstance(override, dict) else {}),
+            JOB_MODE_KEY: command.job_mode,
+        }
+        requested = command.job_mode
+    if requested == JOB_MODE_AGENT and command.live_session:
+        raise HTTPException(
+            422,
+            "A live-session job cannot run in agent mode: it has its own "
+            "procedure and starts in a tactical phase. Leave job_mode unset or "
+            "set it to 'worker'.",
+        )
 
 
 @dataclass(frozen=True)
@@ -96,6 +139,8 @@ async def admit_job(
     command.config_override = dependencies.validate_tool_overrides(
         command.config_override
     )
+    # Before the config stage reads config_override (prepare_job_admission_config).
+    admit_job_mode(command)
     refuse_connector_selector_conflict(command)
     if refuse_session_contradictions(command) is not None and dependencies.live is None:
         raise HTTPException(422, "Live-session jobs are not available here")

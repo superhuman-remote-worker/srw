@@ -123,7 +123,7 @@ from shared.runtime.core.loader import (  # noqa: E402
 from agent.tools.context import ToolContext  # noqa: E402
 from agent.tools.registry import apply_instruction_enforcement  # noqa: E402
 
-_BIND_TOOLS = ("job_complete", "request_replan", "read_file")
+_BIND_TOOLS = ("job_complete", "request_replan", "read_file", "todo_complete")
 
 
 def _structured(name: str) -> StructuredTool:
@@ -205,6 +205,25 @@ class TestBindJobTools:
             else {}
         )
         assert bound.kwargs == expected
+
+    def test_job_complete_without_todo_complete_says_it_ends_the_job(self):
+        """A job whose tools do not include todo_complete closes its one task
+        with job_complete: the bound copy gets the description that says the
+        call ends the job (no phase prefix, no remaining todos)."""
+        from agent.tools.core.job import JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL
+
+        names = ("job_complete", "read_file")
+        tools = [_structured(n) for n in names]
+        agent = _bind(_make_config({}), tools)
+
+        (bound,) = agent._llm.calls
+        assert (
+            bound.descriptions["job_complete"]
+            == JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL
+        )
+        assert bound.descriptions["read_file"].startswith("Does read_file.")
+        # The ToolNode's object keeps its own description.
+        assert tools[0].description == "Does job_complete."
 
     def test_unregistered_tools_are_not_bound(self):
         agent = _bind(

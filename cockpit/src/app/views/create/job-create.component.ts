@@ -13,7 +13,8 @@ import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
-import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, ExpertTemplateSource, JobCreateRequest, Project} from '../../core/models/api.model';
+import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, ExpertTemplateSource, JobCreateRequest, JobMode, Project} from '../../core/models/api.model';
+import {JOB_MODES, jobModeOf, withJobMode} from '../../core/util/job-mode';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
 import {hasGrant} from '../agent-settings/capability-gates';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
@@ -73,6 +74,7 @@ import {ViewportService} from '../../core/services/viewport.service';
           <app-agent-settings
             (keydown.enter)="blockImplicitSubmit($event)"
             mode="job"
+            [jobMode]="selectedJobMode()"
             [workspacePicker]="true"
             [pickerBackend]="pickerBackend()"
             [config]="workspaceConfig()"
@@ -223,10 +225,25 @@ import {ViewportService} from '../../core/services/viewport.service';
               </div>
             </div>
 
-            <!-- Project and priority sit beside autonomy, in the settings
-                 groups' own field look so the three line up. [selected] on
-                 each option, not [value] on the select: the project list
+            <!-- Job mode, project and priority sit beside autonomy, in the
+                 settings groups' own field look so the row lines up. [selected]
+                 on each option, not [value] on the select: the project list
                  arrives after the selection is known. -->
+            <div settingsTopAside class="aside-field">
+              <label class="aside-label" for="job-mode">{{ 'jobs.mode.label' | transloco }}</label>
+              <select
+                id="job-mode"
+                class="aside-select"
+                data-testid="job-mode"
+                [disabled]="isSubmitting()"
+                (change)="onJobModeChange($any($event.target).value)"
+              >
+                @for (mode of jobModes; track mode.value) {
+                  <option [value]="mode.value" [selected]="mode.value === selectedJobMode()">{{ mode.optionKey | transloco }}</option>
+                }
+              </select>
+              <span class="aside-hint" data-testid="job-mode-hint">{{ selectedJobModeHintKey() | transloco }}</span>
+            </div>
             @if (projects().length > 0) {
               <div settingsTopAside class="aside-field project-field">
                 <label class="aside-label" for="job-project">{{ 'jobs.create.projectLabel' | transloco }}</label>
@@ -1234,6 +1251,23 @@ export class JobCreateComponent implements OnInit, AfterViewInit {
   readonly selectedPriority = signal<number>(5);
   readonly priorityLevels = PRIORITY_LEVELS;
 
+  /** Worker mode (the default) plans and works in phases; agent mode does a
+   *  small task in one loop. Sent as the top-level `job_mode`, agent only. */
+  readonly selectedJobMode = signal<JobMode>('worker');
+  readonly jobModes = JOB_MODES;
+  readonly selectedJobModeHintKey = computed(
+    () => (JOB_MODES.find((m) => m.value === this.selectedJobMode()) ?? JOB_MODES[0]).hintKey,
+  );
+
+  /** The mode changes the toolset the job binds, so it re-reads the preview. */
+  onJobModeChange(value: unknown): void {
+    const mode = jobModeOf(value);
+    if (mode === this.selectedJobMode()) return;
+    this.selectedJobMode.set(mode);
+    this.loadToolPreview();
+    this.refreshManifest();
+  }
+
   getPriorityKey(value: number): string {
     if (value === 0) return 'jobs.create.priorityLow';
     if (value === 10) return 'jobs.create.priorityHigh';
@@ -1481,7 +1515,9 @@ export class JobCreateComponent implements OnInit, AfterViewInit {
 
     this.api
       .previewToolGroups({
-      config_override: this.agentSettings?.getOverrides() ?? {},
+      // The preview has no mode field of its own: the mode rides in its
+      // config_override under the key the server reads for a job.
+      config_override: withJobMode(this.agentSettings?.getOverrides() ?? {}, this.selectedJobMode()),
         ...choiceRequestFields(this.workspaceChoice()),
         expert_type: 'worker',
         config_name: isBundled ? expert!.id : null,
@@ -1871,6 +1907,10 @@ export class JobCreateComponent implements OnInit, AfterViewInit {
     const priority = this.selectedPriority();
     if (priority !== 5) request.priority = priority;
 
+    // Beside the expert, whichever form it took (selector or inline copy).
+    // Omitted means worker mode, the default.
+    if (this.selectedJobMode() === 'agent') request.job_mode = 'agent';
+
     const currentUserId = this.userService.currentUserId();
     if (currentUserId) request.user_id = currentUserId;
     return request;
@@ -1903,6 +1943,7 @@ export class JobCreateComponent implements OnInit, AfterViewInit {
       workspace: request.workspace,
       connectors: this.availableDatasources().filter((d) => selected.has(d.id)).map((d) => ({id: d.id, name: d.name})),
       settings,
+      jobMode: request.job_mode,
     });
     this.manifestText.set(toYaml(doc));
   }
@@ -1952,12 +1993,16 @@ export class JobCreateComponent implements OnInit, AfterViewInit {
     this.expertSelectionTouched = false;
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
+    const modeWasAgent = this.selectedJobMode() === 'agent';
+    this.selectedJobMode.set('worker');
     this.workspaceChoice.set({kind: 'default'});
     this.picker?.reset();
     this.agentSettings?.resetAll();
     this.selectDefaultProject(this.projects());
     this.afterProjectSelection();
     this.artifacts.reset();
+    // The preview still answers for agent mode until it is asked again.
+    if (modeWasAgent) this.loadToolPreview();
   }
 
   clearError(): void { this.errorMessage.set(null); this.settingsStillLoading.set(false); }

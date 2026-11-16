@@ -26,7 +26,9 @@ PROJECT_SQL = (
     "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
     "jcr.delivery_sha, jcr.record_type AS change_record_type, "
     "j.diff_status, j.cloud_diff_baseline_commit, j.title, "
-    "j.context->'cloud_checkout' AS cloud_checkout "
+    "j.context->'cloud_checkout' AS cloud_checkout, "
+    "CASE WHEN j.config_override->>'job_mode' = 'agent' "
+    "THEN 'agent' ELSE 'worker' END AS job_mode "
     "FROM job_summary js "
     "JOIN jobs j ON j.id = js.id "
     "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
@@ -109,7 +111,12 @@ async def test_detail_reads_exact_authorized_row_and_preserves_optional_audit(
 
     result = await read_job(job_id=JOB, authorized_job=row, dependencies=reads.deps)
 
-    assert result == {**row, "audit_count": count, "cloud_review_mode": "open_folder"}
+    assert result == {
+        **row,
+        "audit_count": count,
+        "cloud_review_mode": "open_folder",
+        "job_mode": "worker",
+    }
     # Existing access-row mutation remains observable to in-process callers.
     assert row["audit_count"] == count
     assert reads.deps.redact_job.call_args.args[0] is row

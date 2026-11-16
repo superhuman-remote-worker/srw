@@ -114,6 +114,8 @@ limits:
   # Exceeding it freezes with budget_exceeded, which parks for human review
   # rather than auto-redispatching, so it cannot livelock. 0 disables it.
   max_tool_calls_per_job: 5000
+  max_llm_calls_per_job: 0         # model calls per round of work (start or last feedback) before the job fails; 0 = off
+  max_plain_replies_in_a_row: 0    # replies without a tool call in a row, a todo pending, before the job fails; 0 = off
   # Act-ratio tripwire: after N consecutive tool actions that touch ONLY
   # process artifacts (patterns below), inject a one-line "stop planning"
   # nudge. Any action on a non-process target resets the counter. 0 disables.

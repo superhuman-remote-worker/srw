@@ -140,6 +140,7 @@ describe('Create Job: a native change from a projected field starts no settings 
     ['the task box', '.task-fields textarea'],
     ['the file input', 'input[type="file"]'],
     ['the priority select', '[settingsTopAside] #job-priority'],
+    ['the job mode select, left as it was', '[settingsTopAside] #job-mode'],
   ])('a bubbling change from %s reaches no handler', (_label, selector) => {
     const {host, onSettingsChange, api: stub} = mount();
     const field = host.querySelector(selector);
@@ -163,6 +164,27 @@ describe('Create Job: a native change from a projected field starts no settings 
 
     expect(onSettingsChange).not.toHaveBeenCalled();
     expect(stub.previewToolGroups).toHaveBeenCalledOnce();
+  });
+
+  it('a job mode change starts its own preview, never through the settings host', () => {
+    const {fixture, component, host, onSettingsChange, api: stub} = mount();
+    const select = host.querySelector('[settingsTopAside] #job-mode') as HTMLSelectElement;
+    expect([...select.options].map((o) => [o.value, o.textContent?.trim()])).toEqual([
+      ['worker', en.jobs.mode.worker.option],
+      ['agent', en.jobs.mode.agent.option],
+    ]);
+    expect(select.value).toBe('worker');
+    expect(host.querySelector('[data-testid="job-mode-hint"]')?.textContent?.trim()).toBe(en.jobs.mode.worker.hint);
+
+    select.value = 'agent';
+    bubblingChange(select);
+    fixture.detectChanges();
+
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    expect(stub.previewToolGroups).toHaveBeenCalledOnce();
+    expect(component.selectedJobMode()).toBe('agent');
+    expect(host.querySelector('[data-testid="job-mode-hint"]')?.textContent?.trim()).toBe(en.jobs.mode.agent.hint);
+    expect(host.querySelector('label[for="job-mode"]')?.textContent?.trim()).toBe(en.jobs.mode.label);
   });
 
   it('the form asks for one text: there is no second message field', () => {

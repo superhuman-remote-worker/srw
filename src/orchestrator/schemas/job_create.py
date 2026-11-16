@@ -219,6 +219,20 @@ class JobCreate(BaseModel):
             "execution.session; refused without one."
         ),
     )
+    job_mode: Literal["worker", "agent"] | None = Field(
+        None,
+        description=(
+            "How the job runs. 'worker' (the default) is the planned "
+            "procedure for big tasks: it plans, works through to-dos in "
+            "phases and reviews its work. 'agent' does one small task with an "
+            "obvious end in one loop and ends it with job_complete. Any "
+            "expert can run in either mode. Omit to use the mode the "
+            "configuration names (the expert's or the project's default, "
+            "else 'worker'). Stored as config_override.job_mode; a different "
+            "value there is refused. Agent mode cannot be combined with "
+            "live_session."
+        ),
+    )
 
     @model_validator(mode="after")
     def reject_null_datasource_selection(self) -> "JobCreate":
@@ -273,6 +287,7 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "workspace",
     "execution_lane",
     "live_session",
+    "job_mode",
 )
 
 

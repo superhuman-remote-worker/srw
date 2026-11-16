@@ -486,6 +486,10 @@ def test_create_job_schema_has_no_model_selectable_lineage() -> None:
         # parent's workspace; the server refuses it on them. See
         # tests/test_mcp_workspace_choice.py.
         "workspace",
+        # How the job runs: "worker" (the default) or "agent". A closed
+        # vocabulary, so the schema carries it as an enum
+        # (tests/test_tool_vocabularies.py).
+        "job_mode",
     }
     assert not {"user_id", "thread_id", "parent_job_id"} & fields
 

@@ -1,7 +1,7 @@
 import {Component, computed, contentChild, inject, input, linkedSignal, output, signal, viewChild, ViewChild} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {toSignal} from '@angular/core/rxjs-interop';
-import {Datasource, EffectiveModels} from '../../core/models/api.model';
+import {Datasource, EffectiveModels, JobMode} from '../../core/models/api.model';
 import type {
     SessionToolCategory,
     SessionToolGroupsResponse,
@@ -66,6 +66,7 @@ import type {BadgeTone} from '../../ui/badge';
               section="task"
               [config]="config()"
               [mode]="mode()"
+              [jobMode]="jobMode()"
               [disabled]="disabled()"
               [gatedCapabilities]="gatedCapabilities()"
               (settingsChange)="onChange()"
@@ -445,6 +446,9 @@ export class AgentSettingsComponent {
   /** Merged expert/framework config for resolved defaults. */
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
+  /** The New Job form's job mode. It changes only the autonomy hint: the
+   *  form sends the mode itself, never through these settings' overrides. */
+  jobMode = input<JobMode>('worker');
   disabled = input(false);
   /** Caller's resolved capability grants for control-greying; null ⇒ no gating
    * (admin / unrestricted). The New-Session and settings flows hide

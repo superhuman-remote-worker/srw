@@ -148,14 +148,16 @@ config/
 │       ├── model_config_matrix.yaml # Expert-level matrix override (optional)
 │       └── skills/                  # Expert-local skill overrides (optional)
 │           ├── strategic-phase/SKILL.md
-│           └── tactical-phase/SKILL.md
+│           ├── tactical-phase/SKILL.md
+│           └── agent-mode/SKILL.md  # Its own agent-mode method (see Job Mode)
 ├── subagents/                   # Subagent library — small experts a roster references by name (see subagents/README.md)
 │   └── <name>/
 │       ├── config.yaml              # Expert manifest; SRW private leaf extends expert_base
 │       └── persona.txt              # Prompt files next to the config, like an expert's
 ├── skills/                      # Bundled skills, including the two hidden worker phase skills
 │   ├── strategic-phase/SKILL.md
-│   └── tactical-phase/SKILL.md
+│   ├── tactical-phase/SKILL.md
+│   └── agent-mode/SKILL.md      # The instructions of an agent-mode job (see Job Mode)
 ├── prompts/                     # System, persona, and auxiliary prompt templates
 │   ├── systemprompt.txt         # Worker (job) system prompt scaffold
 │   ├── systemprompt_interactive.txt # Session system prompt scaffold
@@ -192,6 +194,9 @@ config/
     ├── strategic_todos_resume.yaml      # Todos for job resume with feedback
     ├── live_tactical_todos.yaml         # First (tactical) phase of a live-session job
     ├── live_post_session_todos.yaml     # Strategic phase after a live session ended
+    ├── agent_todos_initial.yaml         # The one to-do of an agent-mode job
+    ├── agent_todos_resume.yaml          # Its to-do after a resume with feedback
+    ├── agent_instructions.md            # Default instructions of an agent-mode job
     ├── workspace_template.md            # (deprecated; workspace.md removed — unused)
     └── phase_retrospective_template.md  # Template for phase retrospectives
 ```
@@ -499,6 +504,58 @@ under `review`. Autonomy applies to jobs only; sessions and subagents ignore it.
 - **`dependent`** — Freezes at every phase boundary (strategic and tactical). Maximum human oversight.
 
 When frozen at a phase boundary (`freeze_type: "phase_boundary"`), approving the job sets its status back to `processing` and the agent continues. When frozen at job completion (`freeze_type: "job_complete"`), approving writes `job_completion.json` and sets status to `completed`.
+
+### Job Mode
+
+A job runs in one of two modes. **Worker mode** is the planned procedure in
+phases: plan, work through todos, review. It is the default and suits big or
+open-ended tasks. **Agent mode** does one small task in one loop and ends it
+with `job_complete`, without a plan, todos to stage or phases. It suits a small
+task with an obvious end, such as one step of an automation or one unit of a
+batch.
+
+```yaml
+job_mode: agent  # worker | agent; absent means worker
+```
+
+The key sits at the top level, next to `autonomy`, and applies to jobs only.
+The mode is chosen per job: the `job_mode` field of `POST /api/jobs` and of
+the `create_job` tools, `spec.jobMode` in a Job manifest, or `job_mode` in an
+automation's `config_override`. Any expert can run in either mode, and an
+expert does not need to set the key; when an expert or a project default does
+set it, the job's own choice still wins. The mode is frozen with the rest of
+the job's configuration when the job is created, and agent mode cannot be
+combined with a live session.
+
+In agent mode the framework replaces, for any expert:
+
+- the to-do templates (`strategic_todos_*.yaml`, including an expert's own)
+  with one to-do (`templates/agent_todos_initial.yaml`, and
+  `templates/agent_todos_resume.yaml` after feedback);
+- the four procedure skills (`strategic-phase`, `tactical-phase`,
+  `todo-guide`, `verify-before-done`) with the `agent-mode` skill;
+- the five phase tools (`next_phase_todos`, `todo_complete`, `todo_list`,
+  `request_replan`, `mark_complete`); `job_complete` ends the job;
+- the framework's default instructions (`templates/instructions.md`) with the
+  short `templates/agent_instructions.md`.
+
+It keeps the expert's persona, its own `instructions.md`, its tools,
+connectors and model, and the job's autonomy level. A job in agent mode stops
+once, at its end, so `partial`, `guided` and `dependent` act like `review`.
+
+An expert can bring its own method for agent mode. Put these files in its
+folder:
+
+- `agent_todos_initial.yaml` and `agent_todos_resume.yaml`, with exactly one
+  to-do each. A file with any other number of to-dos is ignored and the
+  framework's file is used.
+- `skills/agent-mode/SKILL.md`, in place of the framework's `agent-mode`
+  skill.
+
+An expert whose persona or instructions describe a phased method, such as the
+developer or the curator, is not a good fit for agent mode: its texts would
+ask for steps that agent mode does not have. Run such an expert in worker
+mode.
 
 ### LLM Configuration
 

@@ -354,3 +354,74 @@ class TestPhaseGateNudges:
             assert "job_complete" not in strategic, family
             note = format_nudge("phase_gate_batch_note", family=family)
             assert note == "Other calls in this batch were executed normally.", family
+
+
+# =============================================================================
+# *_job_complete — the variants for a job without todo_complete
+# =============================================================================
+
+
+#: Each nudge that names todo_complete (or a todo to mark blocked), and the
+#: variant the caller picks when the job's loaded tools lack todo_complete.
+_JOB_COMPLETE_VARIANTS = {
+    "todo_action": "todo_action_job_complete",
+    "todo_list_footer": "todo_list_footer_job_complete",
+    "loop_warning_suffix": "loop_warning_suffix_job_complete",
+    "tool_not_found_suffix": "tool_not_found_suffix_job_complete",
+}
+
+
+class TestJobCompleteVariants:
+    """A job whose tools do not include todo_complete closes its one task
+    with job_complete. The texts it gets in place of the originals name
+    job_complete and never todo_complete, and a family file that overrides
+    an original (for its wire format) overrides the variant too."""
+
+    def test_variants_are_known_keys_without_placeholders(self):
+        for variant in _JOB_COMPLETE_VARIANTS.values():
+            assert KNOWN_NUDGES[variant] == set()
+
+    def test_every_family_overriding_an_original_overrides_its_variant(self):
+        from shared.runtime.core.loader import _load_guardrails_matrix
+
+        matrix = _load_guardrails_matrix(None)
+        for family in sorted(matrix):
+            own = matrix[family].get("nudges") or {}
+            for original, variant in _JOB_COMPLETE_VARIANTS.items():
+                if original in own:
+                    assert variant in own, (family, variant)
+
+    def test_no_family_names_todo_complete_in_a_variant(self):
+        from shared.runtime.core.loader import _load_guardrails_matrix
+
+        matrix = _load_guardrails_matrix(None)
+        for family in sorted(matrix):
+            for variant in _JOB_COMPLETE_VARIANTS.values():
+                text = format_nudge(variant, family=family)
+                assert "todo_complete" not in text, (family, variant)
+                assert "job_complete" in text, (family, variant)
+                assert "Tools available" not in text, (family, variant)
+
+    def test_reminder_says_end_or_continue(self):
+        text = format_nudge("todo_action_job_complete", model="gpt-4o")
+        assert text.startswith("Your last reply contained no tool call.")
+        assert "If the task is done, call the `job_complete` tool now." in text
+        assert "say so in the summary" in text
+        assert "Otherwise continue with a tool call." in text
+
+    def test_footer_keeps_the_status_reminder_sentence(self):
+        from shared.runtime.core.loader import _load_guardrails_matrix
+
+        for family in sorted(_load_guardrails_matrix(None)):
+            footer = format_nudge("todo_list_footer_job_complete", family=family)
+            assert "not a tool list" in footer, family
+            assert "When the task is done, invoke the `job_complete` tool." in footer
+
+    def test_gemma_variants_carry_the_wire_format(self):
+        model = "google/gemma-4-31b"
+        assert "Gemma" in format_nudge("todo_action_job_complete", model=model)
+        assert "Gemma" in format_nudge("todo_list_footer_job_complete", model=model)
+        # Not overridden: the default text, like the originals.
+        assert format_nudge("loop_warning_suffix_job_complete", model=model) == (
+            format_nudge("loop_warning_suffix_job_complete", model="gpt-4o")
+        )

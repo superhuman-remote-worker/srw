@@ -113,6 +113,9 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "tools.memory",
         "memory.pipeline.extensions",
         "memory.retrieval",
+        # The two optional job limits, stated off (0 = the dataclass default).
+        "limits.max_llm_calls_per_job",
+        "limits.max_plain_replies_in_a_row",
     ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass

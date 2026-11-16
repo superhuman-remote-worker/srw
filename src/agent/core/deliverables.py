@@ -106,12 +106,16 @@ def resolve_workspace_deliverable(
     return canonical, False
 
 
-def format_deliverable_contract_block(deliverables: Any) -> str:
+def format_deliverable_contract_block(deliverables: Any, phased: bool = True) -> str:
     """Render the "Required deliverables (contract)" block for the task brief.
 
     Returns ``""`` when there is no manifest so callers can append
     unconditionally. The wording is the authoritative source feeding
     plan.md's "## Deliverables" section (strategic templates reference it).
+
+    ``phased=False`` is for a job whose tools do not include
+    ``next_phase_todos``: it has no phases and no ``plan.md``, so the two
+    rules about them are left out.
     """
     manifest = parse_required_deliverables(deliverables)
     if not manifest:
@@ -140,19 +144,26 @@ def format_deliverable_contract_block(deliverables: Any) -> str:
             )
         else:
             lines.append(f"- `{path}`")
-    lines += [
+    scaffold_rule = (
+        "- Scaffold each deliverable file EARLY (phase 1), even as an outline."
+    )
+    plan_rule = '- Keep plan.md\'s "## Deliverables" section mapped to these paths.'
+    rules = [
         "",
         "Rules:",
-        "- Scaffold each deliverable file EARLY (phase 1), even as an outline.",
+        scaffold_rule,
         "- Keep each deliverable current as work progresses; Git-backed workspaces",
         "  commit and push progress automatically.",
         "- Do not create a separate manifest or status file for this contract; the",
         "  platform validates the listed artifacts directly.",
-        '- Keep plan.md\'s "## Deliverables" section mapped to these paths.',
+        plan_rule,
         "- Paths are workspace-relative; `repo/` prefix is accepted either way.",
         "- A `pr:owner/repository` item is satisfied only by a server-recorded,",
         "  forge-verifiable pull request for that exact attached repository.",
     ]
+    if not phased:
+        rules = [line for line in rules if line not in (scaffold_rule, plan_rule)]
+    lines += rules
     return "\n".join(lines)
 
 

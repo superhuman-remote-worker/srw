@@ -326,6 +326,120 @@ describe('AutomationsPageComponent', () => {
 });
 
 
+describe('automation job mode', () => {
+  const stored = (configOverride: unknown) => ({
+    id: 'a-7', trigger_type: 'cron', cron_expr: '0 9 * * *', timezone: 'UTC', name: 'Daily',
+    expert: 'scholar', prompt: 'Review', enabled: true, autonomy: 'review', priority: 5, max_fires_per_day: 100,
+    catchup_window_seconds: 3600, project_id: null, config_override: configOverride,
+  }) as unknown as Automation;
+
+  function create() {
+    const result = createComponent();
+    result.component.ngOnInit();
+    return result;
+  }
+
+  it('a new automation starts in worker mode and sends no config_override', () => {
+    const {component, automationsServiceMock} = create();
+    component.openNewEditor();
+    expect(component.editor()?.jobMode).toBe('worker');
+    component.updateEditor('name', 'Daily review');
+    component.updateEditor('prompt', 'Review the project.');
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.create.mock.calls[0][0]).not.toHaveProperty('config_override');
+  });
+
+  it('agent mode on a new automation is sent as config_override.job_mode', () => {
+    const {component, automationsServiceMock} = create();
+    component.openNewEditor();
+    component.updateEditor('name', 'Daily review');
+    component.updateEditor('prompt', 'Review the project.');
+    component.onJobModeChange('agent');
+
+    component.saveEditor();
+
+    const body = automationsServiceMock.create.mock.calls[0][0];
+    expect(body.config_override).toEqual({job_mode: 'agent'});
+    expect(body).not.toHaveProperty('job_mode');
+  });
+
+  it('reads the stored mode and switching to agent keeps every other key', () => {
+    const {component, automationsServiceMock} = create();
+    component.openEditor(stored({autonomy: 'full', llm: {model: 'm1'}}));
+    expect(component.editor()?.jobMode).toBe('worker');
+    component.onJobModeChange('agent');
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.update.mock.calls[0][0]).toBe('a-7');
+    expect(automationsServiceMock.update.mock.calls[0][1].config_override)
+      .toEqual({autonomy: 'full', llm: {model: 'm1'}, job_mode: 'agent'});
+  });
+
+  it('switching back to worker mode removes the key and keeps the rest', () => {
+    const {component, automationsServiceMock} = create();
+    component.openEditor(stored({job_mode: 'agent', tools: {web: true}}));
+    expect(component.editor()?.jobMode).toBe('agent');
+    component.onJobModeChange('worker');
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.update.mock.calls[0][1].config_override).toEqual({tools: {web: true}});
+  });
+
+  it('an edit that leaves the mode alone does not send config_override', () => {
+    const {component, automationsServiceMock} = create();
+    component.openEditor(stored({job_mode: 'agent', tools: {web: true}}));
+    component.updateEditor('prompt', 'Review it again');
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.update.mock.calls[0][1]).not.toHaveProperty('config_override');
+  });
+
+  it('reads an override that arrived as JSON text, or none at all', () => {
+    const {component, automationsServiceMock} = create();
+    component.openEditor(stored('{"job_mode": "agent", "autonomy": "full"}'));
+    expect(component.editor()?.jobMode).toBe('agent');
+    component.onJobModeChange('worker');
+    component.saveEditor();
+    expect(automationsServiceMock.update.mock.calls[0][1].config_override).toEqual({autonomy: 'full'});
+
+    component.openEditor(stored(undefined));
+    expect(component.editor()).toMatchObject({jobMode: 'worker', configOverride: {}});
+  });
+
+  it('a live automation always sends worker mode: its jobs start inside a live session', () => {
+    const {component, automationsServiceMock, apiServiceMock} = createComponent();
+    apiServiceMock.getEligibleDatasources.mockReturnValue(of([{id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'}]));
+    component.ngOnInit();
+    component.openNewEditor();
+    component.onJobModeChange('agent');
+    component.updateEditor('triggerType', 'live');
+    component.updateEditor('name', 'Incoming');
+    component.updateEditor('prompt', 'Help the caller');
+    component.setConnectorIds(['phone-1']);
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.create).toHaveBeenCalledOnce();
+    expect(automationsServiceMock.create.mock.calls[0][0]).not.toHaveProperty('config_override');
+  });
+
+  it('reads anything but "agent" as worker mode, and the hint follows the mode', () => {
+    const {component} = create();
+    component.openNewEditor();
+    component.onJobModeChange('agent');
+    expect(component.jobModeHintKey(component.editor()!.jobMode)).toBe('jobs.mode.agent.hint');
+    component.onJobModeChange('bogus');
+    expect(component.editor()?.jobMode).toBe('worker');
+    expect(component.jobModeHintKey('worker')).toBe('jobs.mode.worker.hint');
+  });
+});
+
+
 describe('live automations', () => {
   const line = {id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'};
   const extra = {id: 'kb-1', name: 'Empfang', type: 'kb'};
@@ -605,6 +719,33 @@ describe('live automation rendering', () => {
     expect(link?.textContent).toContain('Clinic');
     expect(link?.getAttribute('href')).toBe('/projects/p1');
     expect(field.textContent).toContain(en.automations.editor.projectFixed);
+  });
+
+  it('puts the Job mode select directly after Expert, with both modes and the selected hint', () => {
+    const {fixture, component, host} = mount();
+    component.openNewEditor();
+    fixture.detectChanges();
+    const labels = [...host.querySelectorAll('.editor-grid > .field > .field-label')]
+      .map((el) => el.textContent?.trim());
+    expect(labels.indexOf(en.automations.editor.jobMode)).toBe(labels.indexOf(en.automations.editor.expert) + 1);
+    const field = host.querySelector('[data-testid="automation-job-mode"]')!;
+    expect([...field.querySelectorAll('option')].map((o) => [o.value, o.textContent?.trim()])).toEqual([
+      ['worker', en.jobs.mode.worker.option],
+      ['agent', en.jobs.mode.agent.option],
+    ]);
+    expect(field.querySelector('.field-note')?.textContent?.trim()).toBe(en.jobs.mode.worker.hint);
+    component.onJobModeChange('agent');
+    fixture.detectChanges();
+    expect((field.querySelector('app-select') as unknown as {value: string}).value).toBe('agent');
+    expect(field.querySelector('.field-note')?.textContent?.trim()).toBe(en.jobs.mode.agent.hint);
+  });
+
+  it('offers no job mode on a live trigger', () => {
+    const {fixture, component, host} = mount();
+    component.openNewEditor();
+    component.updateEditor('triggerType', 'live');
+    fixture.detectChanges();
+    expect(host.querySelector('[data-testid="automation-job-mode"]')).toBeNull();
   });
 
   it('tells a live trigger without a project that project lines appear once one is chosen', () => {

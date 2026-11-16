@@ -220,6 +220,25 @@
             </app-select>
           </label>
 
+          <!-- Stored in the automation's config_override (key job_mode),
+               which every fire hands to the job it creates. A live trigger's
+               jobs start inside a live session, which agent mode cannot run
+               in, so a live automation always runs in worker mode. -->
+          @if (ed.triggerType !== 'live') {
+            <label class="field" data-testid="automation-job-mode">
+              <span class="field-label">{{ 'automations.editor.jobMode' | transloco }}</span>
+              <app-select
+                [value]="ed.jobMode"
+                (changed)="onJobModeChange($event)"
+              >
+                @for (mode of jobModes; track mode.value) {
+                  <option [value]="mode.value">{{ mode.optionKey | transloco }}</option>
+                }
+              </app-select>
+              <span class="field-note">{{ jobModeHintKey(ed.jobMode) | transloco }}</span>
+            </label>
+          }
+
           <label class="field">
             <span class="field-label">{{ 'automations.editor.enabled' | transloco }}</span>
             <div class="switch-row">

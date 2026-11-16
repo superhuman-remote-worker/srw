@@ -38,7 +38,7 @@ not guaranteed.
    You can also ask for a specific model, or for a VM-backed job when the work
    needs root — the session applies those as per-job settings, and anything
    above your permissions is refused when the job is created rather than
-   failing later.
+   failing later. For a small task with an obvious end, ask for agent mode.
 3. If connector access matters, say which of this session's selected
    connectors the worker needs.
 4. Ask the session to create the job. It should return the job ID; the job
@@ -51,7 +51,8 @@ unless the agent explicitly selects none or another allowed set. Merely
 putting the job in a project does not silently attach every project connector.
 
 If Fleet Management is unavailable, use **Jobs → New Job** and fill the same
-brief, expert, project, priority, autonomy, and connector choices manually.
+brief, expert, project, priority, autonomy, job mode, and connector choices
+manually.
 
 ## What Fleet Management can do
 
@@ -79,6 +80,12 @@ When the corresponding tools are actually loaded, a session can:
 - omitted, for the project default.
 
 A child job inherits its parent's workspace.
+
+`create_job` also takes `job_mode`. Omit it for worker mode, the default: the
+job plans, works through todos in phases and reviews its result. Pass
+`"agent"` for a small task with an obvious end, such as one step of an
+automation or one unit of a batch: the job does it in one loop and ends it
+with `job_complete`. Any expert can run in either mode.
 
 Some workspace tiers also expose a project-repository checkout or a workspace
 upgrade request. Treat those as current-session capabilities, not universal

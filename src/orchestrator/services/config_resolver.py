@@ -17,11 +17,13 @@ import copy
 import logging
 from typing import Awaitable, Callable, Optional
 
+from shared.job_mode import is_agent_mode
 from shared.runtime.core.loader import (
     INHERIT_MODEL,
     ROLE_ROOTS,
     ROOT_NAMES,
     _apply_settings_matrix,
+    apply_agent_job_mode,
     authored_llm_keys,
     canonical_config_name,
     deep_merge,
@@ -324,8 +326,19 @@ def resolve_config(
     # before U2, a session expert dispatched as a worker) would otherwise lose
     # its phase guidance silently. Restored here, before the capture and the
     # freeze, so the PDP view and the blob agree.
+    #
+    # An agent-mode job (shared.job_mode) skips that floor: its tools, bindings
+    # and phase gate are rewritten for one task in one loop instead. This has
+    # to run before the capture too: the captured fragment is stored as the
+    # job's policy, whose `tools` section is merged back onto the frozen blob
+    # at every dispatch, so a tool removed after the capture would return.
+    # Roster entries are resolved below from their own layers and keep their
+    # tools.
     if role == "worker":
-        data = ensure_worker_phase_skill_bindings(data)
+        if is_agent_mode(data):
+            data = apply_agent_job_mode(data)
+        else:
+            data = ensure_worker_phase_skill_bindings(data)
 
     # Roster materialisation: every `subagents.roster` entry becomes its fully
     # merged subagent-role config (pruning point 3 of 3 runs per entry inside).

@@ -75,6 +75,8 @@ def create_phase_instruction_message(
     content: str,
     phase_name: str,
     phase_key: str,
+    *,
+    whole_job: bool = False,
 ) -> HumanMessage:
     """Build the persistent, protected phase instruction block.
 
@@ -95,11 +97,18 @@ def create_phase_instruction_message(
         content: Body of the artifact (already rendered)
         phase_name: ``"strategic"`` or ``"tactical"``
         phase_key: ``"<phase_number>:<phase_name>"`` of the concrete phase
+        whole_job: The job has no phases to speak of (its tools do not
+            include ``next_phase_todos``): the header names no phase and says
+            the instructions apply for the whole job. The markers are the same.
     """
-    body = (
-        f"{PHASE_INSTRUCTION_CONTENT_PREFIX}{phase_name}] Phase instructions "
-        f"(from {file_path}). They apply for the whole phase.\n\n{content}"
-    )
+    if whole_job:
+        header = f"Instructions (from {file_path}). They apply for the whole job."
+    else:
+        header = (
+            f"{PHASE_INSTRUCTION_CONTENT_PREFIX}{phase_name}] Phase instructions "
+            f"(from {file_path}). They apply for the whole phase."
+        )
+    body = f"{header}\n\n{content}"
     return HumanMessage(
         content=body,
         additional_kwargs={

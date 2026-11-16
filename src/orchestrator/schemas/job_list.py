@@ -135,6 +135,14 @@ class PublicJobListItem(BaseModel):
     )
     cloud_review_mode: str
     exported_folder_url: str | None
+    job_mode: str = Field(
+        description=(
+            "How the job runs: 'worker' (the planned procedure in phases) or "
+            "'agent' (one task in one loop). Read from the job's requested "
+            "configuration; a mode that only an expert's default names shows "
+            "as 'worker' here, and the job detail shows the effective one."
+        )
+    )
 
 
 class PublicJobListFilters(BaseModel):

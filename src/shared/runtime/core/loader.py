@@ -1968,6 +1968,13 @@ class InstructionMatrixResolver(MatrixResolver):
         "live_tactical_todos": "live_tactical_todos.yaml",
         "live_post_session_todos": "live_post_session_todos.yaml",
         "workspace_template": "workspace_template.md",
+        # Agent-mode jobs (shared.job_mode): the one to-do at the start and
+        # after a resume, and the standing instructions for an expert that has
+        # no instructions file of its own. Frozen only for an agent-mode job,
+        # under the keys the worker already reads (serialize_resolved_config).
+        "agent_todos_initial": "agent_todos_initial.yaml",
+        "agent_todos_resume": "agent_todos_resume.yaml",
+        "agent_instructions": "agent_instructions.md",
     }
 
 
@@ -2526,6 +2533,15 @@ class LimitsConfig:
     # so this is the floor that stops mail being stranded. 0 disables it,
     # leaving delivery entirely break-driven.
     queued_reply_max_wait_seconds: int = 300
+    # Optional cap on the model calls of one round of work (from the job's
+    # start or its last resume with feedback), counted on checkpointed graph
+    # state so it holds across batch rotations. At the cap the worker stops
+    # the job before the next call; the job ends failed. 0 = off.
+    max_llm_calls_per_job: int = 0
+    # Optional stop after this many replies in a row without a tool call
+    # while a todo is pending (any wording): with 3, two reminders, and the
+    # third such reply ends the job as failed. 0 = off.
+    max_plain_replies_in_a_row: int = 0
 
 
 @dataclass
@@ -3674,6 +3690,8 @@ def load_agent_config(
         queued_reply_max_wait_seconds=limits_data.get(
             "queued_reply_max_wait_seconds", 300
         ),
+        max_llm_calls_per_job=limits_data.get("max_llm_calls_per_job", 0),
+        max_plain_replies_in_a_row=limits_data.get("max_plain_replies_in_a_row", 0),
     )
 
     context_data = data.get("context_management", {})
@@ -3950,6 +3968,8 @@ def load_agent_config_from_dict(
         queued_reply_max_wait_seconds=limits_data.get(
             "queued_reply_max_wait_seconds", 300
         ),
+        max_llm_calls_per_job=limits_data.get("max_llm_calls_per_job", 0),
+        max_plain_replies_in_a_row=limits_data.get("max_plain_replies_in_a_row", 0),
     )
 
     context_data = data.get("context_management", {})
@@ -5931,6 +5951,212 @@ def ensure_phase_skill_bindings(
     return (missing + entries, [b["skill"] for b in missing])
 
 
+# =============================================================================
+# Agent mode (shared.job_mode) — one task in one loop, written at admission
+# =============================================================================
+#
+# An agent-mode job runs on the unchanged worker graph: it stays in strategic
+# phase 0, works through one predefined to-do and ends on one job_complete.
+# Everything that makes it do so is written into the frozen configuration by
+# the orchestrator's resolver (apply_agent_job_mode on the merged config,
+# serialize_resolved_config for the frozen texts); the worker never reads the
+# mode itself.
+
+#: Instruction types that exist only for agent-mode jobs. They are frozen under
+#: the keys the worker already reads (``strategic_todos_*``, ``instructions``)
+#: and never under their own names, so a worker-mode blob does not change.
+AGENT_MODE_INSTRUCTION_TYPES: Tuple[str, ...] = (
+    "agent_todos_initial",
+    "agent_todos_resume",
+    "agent_instructions",
+)
+
+
+def _tactical_only_tool_names() -> List[str]:
+    """Catalog tools the per-call phase gate refuses in a strategic phase.
+
+    Read from the framework-free tool catalog with the gate's own default (a
+    tool without ``phases`` metadata runs in both phases), in catalog order.
+    """
+    from shared.tool_catalog import TOOL_REGISTRY
+
+    both = ("strategic", "tactical")
+    names: List[str] = []
+    for name, meta in TOOL_REGISTRY.items():
+        phases = meta.get("phases", both)
+        if phases is None:
+            phases = both
+        if "strategic" not in phases:
+            names.append(name)
+    return names
+
+
+def apply_agent_job_mode(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the merged worker config ``data`` rewritten for an agent-mode job.
+
+    * ``tools.core`` loses the phase-procedure tools and gains ``job_complete``
+      when it is missing; the order of the remaining names is kept.
+    * ``instruction_files`` loses every binding of a phase-procedure skill
+      (whatever its trigger) and every ``before_tool`` gate on a removed tool.
+      The remaining ``phase_start:tactical`` entries move to
+      ``phase_start:strategic``, because the job never enters a tactical phase
+      and an expert's domain guide bound there must still arrive. The
+      ``agent-mode`` skill is bound first, at ``phase_start:strategic``.
+    * ``phase_settings.strategic_tools`` gains every tactical-only tool of the
+      catalog and ``job_complete``, so the per-call phase gate refuses none of
+      the job's tools in its one strategic phase.
+
+    Pure (``data`` is not modified) and idempotent. The caller decides whether
+    the job is in agent mode; subagent roster entries are not touched.
+    """
+    from shared.job_mode import (
+        AGENT_MODE_SKILL,
+        PHASE_PROCEDURE_SKILLS,
+        PHASE_PROCEDURE_TOOLS,
+    )
+
+    job_complete = "job_complete"
+    result = dict(data)
+
+    tools = dict(result["tools"]) if isinstance(result.get("tools"), dict) else {}
+    core = tools.get("core")
+    if core is None:
+        core = []
+    elif not isinstance(core, (list, tuple)):
+        # Layers are normalised before they merge, so this is a list in
+        # practice; a policy shape (true, {only: ...}) is expanded first.
+        from shared.runtime.core.tool_policy import normalize_tool_policy
+
+        core = normalize_tool_policy(
+            {"tools": {"core": core}}, source="agent-job-mode"
+        )["tools"]["core"]
+        if not isinstance(core, (list, tuple)):
+            core = []
+    kept_tools = [name for name in core if name not in PHASE_PROCEDURE_TOOLS]
+    if job_complete not in kept_tools:
+        kept_tools.append(job_complete)
+    tools["core"] = kept_tools
+    result["tools"] = tools
+
+    bindings: List[Any] = [
+        {
+            "skill": AGENT_MODE_SKILL,
+            "trigger": "phase_start:strategic",
+            "enforce": False,
+        }
+    ]
+    entries = result.get("instruction_files")
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            bindings.append(entry)
+            continue
+        skill = entry.get("skill")
+        if skill in PHASE_PROCEDURE_SKILLS or skill == AGENT_MODE_SKILL:
+            continue
+        kind, _, target = str(entry.get("trigger") or "").partition(":")
+        if kind == "before_tool" and target in PHASE_PROCEDURE_TOOLS:
+            continue
+        if kind in ("phase_start", "phase") and target == "tactical":
+            entry = {**entry, "trigger": "phase_start:strategic"}
+        bindings.append(entry)
+    result["instruction_files"] = bindings
+
+    phase_settings = (
+        dict(result["phase_settings"])
+        if isinstance(result.get("phase_settings"), dict)
+        else {}
+    )
+    current = phase_settings.get("strategic_tools")
+    strategic_tools: List[str] = []
+    for name in [
+        *(current if isinstance(current, (list, tuple)) else ()),
+        *_tactical_only_tool_names(),
+        job_complete,
+    ]:
+        if name not in strategic_tools:
+            strategic_tools.append(name)
+    phase_settings["strategic_tools"] = strategic_tools
+    result["phase_settings"] = phase_settings
+    return result
+
+
+def _is_single_todo_template(
+    content: Optional[str], tool_names: List[str], origin: str
+) -> bool:
+    """True when ``content`` renders and parses to exactly one to-do.
+
+    An agent-mode job with more than one to-do can never end: ``job_complete``
+    closes the open to-do only when exactly one is pending. The template is
+    rendered with the configured tool names, as the worker renders it with the
+    loaded ones.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return False
+    try:
+        rendered = render_instruction_content(content, tool_names, origin=origin)
+        return len(_parse_strategic_todos_yaml_from_string(rendered)) == 1
+    except Exception:
+        return False
+
+
+def _freeze_agent_mode_instructions(
+    instructions: Dict[str, Any], config: "AgentConfig", model_family: str
+) -> None:
+    """Write an agent-mode job's texts into ``instructions`` (the frozen map).
+
+    The one to-do (``agent_todos_initial``) is frozen under both
+    ``strategic_todos_initial`` and ``strategic_todos_transition`` and the
+    resume to-do (``agent_todos_resume``) under ``strategic_todos_resume``:
+    the keys the worker's three to-do getters read. Lookup is location-first,
+    so an expert may ship its own files; one that does not parse to exactly
+    one to-do is replaced by the framework's. ``agent_instructions`` replaces
+    ``instructions`` only when the job would otherwise get the framework's
+    default file; an expert's own ``instructions.md`` stays.
+    """
+    resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
+    framework = InstructionMatrixResolver(None, model_family)
+    tool_names = get_all_tool_names(config)
+
+    def one_todo(instruction_type: str) -> Optional[str]:
+        try:
+            content: Optional[str] = resolver.load(instruction_type)
+        except FileNotFoundError:
+            content = None
+        if _is_single_todo_template(
+            content, tool_names, origin=f"template {instruction_type!r}"
+        ):
+            return content
+        if content is not None:
+            logger.warning(
+                "Expert %r: %s does not hold exactly one to-do; the framework's "
+                "template is used instead",
+                getattr(config, "agent_id", "?"),
+                instruction_type,
+            )
+        try:
+            return framework.load(instruction_type, bundled_only=True)
+        except FileNotFoundError:
+            return None
+
+    initial = one_todo("agent_todos_initial")
+    instructions["strategic_todos_initial"] = initial
+    instructions["strategic_todos_transition"] = initial
+    instructions["strategic_todos_resume"] = one_todo("agent_todos_resume")
+
+    try:
+        source = resolver._resolve_path("instructions").resolve()
+        framework_default = source.is_relative_to(
+            resolver._file_resolver.framework_dir.resolve()
+        )
+    except FileNotFoundError:
+        framework_default = True
+    if framework_default:
+        try:
+            instructions["instructions"] = resolver.load("agent_instructions")
+        except FileNotFoundError:
+            pass
+
+
 def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
     """Directory a bound skill's ``SKILL.md`` is read from — location-primary
     like prompt files: ``<deployment_dir>/skills/<skill>`` when the expert
@@ -7703,10 +7929,28 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     instr_resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
     instructions = {}
     for it in InstructionMatrixResolver.HARDCODED_DEFAULTS:
+        if it in AGENT_MODE_INSTRUCTION_TYPES:
+            continue
         try:
             instructions[it] = instr_resolver.load(it)
         except FileNotFoundError:
             instructions[it] = None
+
+    # An agent-mode job's to-dos and standing instructions replace the
+    # procedure's under the keys the worker reads. Only a config the worker
+    # resolver rewrote for the mode gets them (apply_agent_job_mode binds the
+    # agent-mode skill at the strategic phase start): a session keeps every
+    # key it inherits, job_mode included, and the mode does nothing there.
+    # ``job_mode`` is no AgentConfig field, so it arrives in ``extra``.
+    from shared.job_mode import AGENT_MODE_SKILL, JOB_MODE_KEY, is_agent_mode
+
+    if is_agent_mode(
+        {JOB_MODE_KEY: getattr(config, JOB_MODE_KEY, config.extra.get(JOB_MODE_KEY))}
+    ) and any(
+        entry.skill == AGENT_MODE_SKILL and entry.trigger == "phase_start:strategic"
+        for entry in config.instruction_files
+    ):
+        _freeze_agent_mode_instructions(instructions, config, model_family)
 
     # Also resolve custom instruction files from config.instruction_files
     # (e.g. research_guide.md) AND bound skills (skill:) — these aren't in the

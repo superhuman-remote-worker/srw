@@ -172,6 +172,40 @@ describe('typed workspace creation on job rows', () => {
   });
 });
 
+describe('job mode badge on job rows', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('marks agent-mode rows only; worker rows and rows without the field carry no badge', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([
+        job('agent-job', {job_mode: 'agent'}),
+        job('worker-job', {job_mode: 'worker'}),
+        job('older-job'),
+      ]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+
+    const rows = [...(fixture.nativeElement as HTMLElement).querySelectorAll('tr:not(.detail-row)')]
+      .filter((row) => row.querySelector('.job-id'));
+    const badgeFor = (id: string) => rows
+      .find((row) => row.querySelector('.job-id')?.textContent?.includes(id))
+      ?.querySelector('[data-testid="job-mode-badge"]');
+    expect(rows).toHaveLength(3);
+    const badge = badgeFor('agent-job');
+    // The stub pipe renders the key; the real one renders en.jobs.mode.agent.label.
+    expect(badge?.textContent?.trim()).toBe('jobs.mode.agent.label');
+    expect(en.jobs.mode.agent.label).toBe('Agent mode');
+    expect(badge?.classList.contains('config-badge')).toBe(true);
+    expect(badgeFor('worker-job')).toBeNull();
+    expect(badgeFor('older-job')).toBeNull();
+  });
+});
+
 function paramMap(values: Record<string, string | string[]>) {
   const normalised = new Map<string, string[]>(
     Object.entries(values).map(([key, value]) => [key, Array.isArray(value) ? value : [value]]),

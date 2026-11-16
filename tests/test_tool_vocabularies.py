@@ -102,6 +102,38 @@ class TestVocabularyDrift:
         assert enum is not None
         assert set(enum) == set(_AUTONOMY_VALUES)
 
+    def test_job_mode_literals_match_job_modes(self):
+        """create_job (the shared descriptor behind the agent, officer and MCP
+        tools) and MCP create_project_job spell the mode literally; both must
+        stay the two modes shared.job_mode names."""
+        import ast
+        import inspect
+        from pathlib import Path
+
+        from shared.job_mode import JOB_MODES
+        from shared.orch_surface.jobs import get_descriptor
+
+        handler = get_descriptor("create_job").handler
+        hint = inspect.get_annotations(handler, eval_str=True)["job_mode"]
+        (literal,) = [arg for arg in get_args(hint) if get_args(arg)]
+        assert get_args(literal) == JOB_MODES
+
+        # The MCP module is read, not imported: FastMCP wraps the function.
+        server = Path(__file__).resolve().parents[1] / "src/mcp_server/server.py"
+        (function,) = [
+            node
+            for node in ast.walk(ast.parse(server.read_text(encoding="utf-8")))
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "create_project_job"
+        ]
+        (argument,) = [a for a in function.args.args if a.arg == "job_mode"]
+        values = tuple(
+            node.value
+            for node in ast.walk(argument.annotation)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        )
+        assert values == JOB_MODES
+
     def test_backlog_ticket_types_are_in_every_vocabulary(self):
         """A ticket type missing from any one site silently degrades: the tool
         rejects it, or kb_reindex rewrites it to 'learning' on the next pass."""
@@ -263,6 +295,15 @@ class TestOtherToolConstraints:
             "archived",
         }
         assert "datasource" in _enum_of(tools["kb_list"], "type")
+
+    def test_create_job_mode_is_constrained(self):
+        """The agent and officer create_job carries the two modes as an enum,
+        not only in its docstring."""
+        from agent.tools.context import ToolContext
+        from agent.tools.orchestrator.jobs import create_orchestrator_tools
+
+        tools = {t.name: t for t in create_orchestrator_tools(ToolContext())}
+        assert _enum_of(tools["create_job"], "job_mode") == ["worker", "agent"]
 
     def test_task_add_priority_is_constrained(self):
         """Silently downgraded anything unrecognised to 'medium', with no word

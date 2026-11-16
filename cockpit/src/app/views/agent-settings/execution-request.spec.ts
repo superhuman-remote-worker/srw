@@ -87,6 +87,27 @@ describe('executionManifest', () => {
     expect(doc.spec.settings).toEqual({priority: 7});
   });
 
+  it('prints agent mode as spec.jobMode, beside the task and outside execution and settings', () => {
+    const doc = executionManifest({
+      kind: 'job', task: 'Rename the heading', expert: 'developer', connectors: [],
+      settings: {priority: 7}, jobMode: 'agent',
+    }) as {spec: Record<string, unknown> & {execution: Record<string, unknown>; settings: Record<string, unknown>}};
+    expect(doc.spec['jobMode']).toBe('agent');
+    expect(Object.keys(doc.spec)).toEqual(['task', 'jobMode', 'execution', 'settings']);
+    expect(doc.spec.execution).not.toHaveProperty('jobMode');
+    expect(doc.spec.settings).toEqual({priority: 7});
+    expect(toYaml(doc)).toContain('\n  jobMode: agent\n');
+  });
+
+  it('prints no mode for worker mode, the default, and none for a session', () => {
+    for (const jobMode of [undefined, 'worker'] as const) {
+      const doc = executionManifest({kind: 'job', expert: null, connectors: [], jobMode}) as {spec: Record<string, unknown>};
+      expect(doc.spec).not.toHaveProperty('jobMode');
+      expect(Object.keys(doc.spec)).toEqual(['task', 'execution']);
+    }
+    expect(executionManifest({kind: 'session', expert: null, connectors: [], jobMode: 'agent'})).toEqual({execution: {connectors: {}}});
+  });
+
   it('omits workspace for the default choice and renders a session as its execution block', () => {
     const doc = executionManifest({kind: 'session', expert: null, connectors: []}) as Record<string, unknown>;
     expect(doc).toEqual({execution: {connectors: {}}});

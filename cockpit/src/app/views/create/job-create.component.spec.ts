@@ -558,6 +558,160 @@ describe('JobCreateComponent project picker', () => {
     expect(yaml).toContain('text: Fix the flaky test');
   });
 
+  describe('job mode', () => {
+    it('defaults to worker mode and sends no job_mode field', async () => {
+      const {component, api} = setup(null);
+      component.formData.description = 'Write the quarterly report';
+      expect(component.selectedJobMode()).toBe('worker');
+
+      await component.onSubmit();
+
+      expect(api.createJob.mock.calls.at(-1)![0]).not.toHaveProperty('job_mode');
+    });
+
+    it('an untouched template sends its selector, job_mode agent beside it, and no mode in config_override', async () => {
+      const {component, api} = setup(null);
+      component.formData.description = 'Rename the heading in README.md';
+      component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+      component.expertTemplate.set(TEMPLATE);
+      component.agentSettings = expertSettings({changed: false});
+      component.onJobModeChange('agent');
+
+      await component.onSubmit();
+
+      const request = api.createJob.mock.calls.at(-1)![0];
+      expect(request.config_name).toBe('developer');
+      expect(request).not.toHaveProperty('expert');
+      expect(request.job_mode).toBe('agent');
+      expect(request.config_override).toEqual({autonomy: 'full'});
+    });
+
+    it('a DB expert by id carries job_mode agent too', async () => {
+      const {component, api} = setup(null);
+      component.formData.description = 'Rename the heading in README.md';
+      component.selectedExpert.set({id: '44444444-4444-4444-8444-444444444444', storage_kind: 'db'} as Expert);
+      component.onJobModeChange('agent');
+
+      await component.onSubmit();
+
+      expect(api.createJob).toHaveBeenCalledExactlyOnceWith({
+        description: 'Rename the heading in README.md', expert_id: '44444444-4444-4444-8444-444444444444',
+        datasource_ids: [], project_id: 'proj-1', job_mode: 'agent', user_id: 'user-1',
+      });
+    });
+
+    it('a changed template sent as an inline copy keeps job_mode agent beside it', async () => {
+      const {component, api} = setup(null);
+      component.formData.description = 'Rename the heading in README.md';
+      component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+      component.expertTemplate.set(TEMPLATE);
+      component.agentSettings = expertSettings({changed: true});
+      component.onJobModeChange('agent');
+
+      await component.onSubmit();
+
+      const request = api.createJob.mock.calls.at(-1)![0];
+      expect(request).not.toHaveProperty('config_name');
+      expect(request.expert_based_on).toBe('developer');
+      expect(request.expert).toHaveProperty('inline');
+      expect(request.job_mode).toBe('agent');
+      expect(request.config_override).toEqual({autonomy: 'full'});
+      expect(JSON.stringify(request.expert)).not.toContain('job_mode');
+    });
+
+    it('switching back to worker mode sends no field again', async () => {
+      const {component, api} = setup(null);
+      component.formData.description = 'Write the quarterly report';
+      component.onJobModeChange('agent');
+      component.onJobModeChange('worker');
+
+      await component.onSubmit();
+
+      expect(api.createJob.mock.calls.at(-1)![0]).not.toHaveProperty('job_mode');
+    });
+
+    it('reads anything but "agent" as worker mode', () => {
+      const {component} = setup(null);
+      component.onJobModeChange('agent');
+      component.onJobModeChange('bogus');
+      expect(component.selectedJobMode()).toBe('worker');
+    });
+
+    it('the hint follows the selected mode', () => {
+      const {component} = setup(null);
+      expect(component.selectedJobModeHintKey()).toBe('jobs.mode.worker.hint');
+      component.onJobModeChange('agent');
+      expect(component.selectedJobModeHintKey()).toBe('jobs.mode.agent.hint');
+    });
+
+    it('a mode change re-reads the tool preview with the mode in its config_override', () => {
+      const {component, api} = setup(null);
+      component.agentSettings = {
+        getOverrides: () => ({autonomy: 'full'}),
+        hasToolEdits: () => false,
+        prefillFromResolvedToolset: vi.fn(),
+      } as unknown as JobCreateComponent['agentSettings'];
+      api.previewToolGroups.mockClear();
+
+      component.onJobModeChange('agent');
+      expect(api.previewToolGroups).toHaveBeenCalledOnce();
+      expect(api.previewToolGroups.mock.calls[0][0].config_override).toEqual({autonomy: 'full', job_mode: 'agent'});
+      expect(api.previewToolGroups.mock.calls[0][0].expert_type).toBe('worker');
+
+      component.onJobModeChange('worker');
+      expect(api.previewToolGroups).toHaveBeenCalledTimes(2);
+      expect(api.previewToolGroups.mock.calls[1][0].config_override).toEqual({autonomy: 'full'});
+    });
+
+    it('picking the mode already selected starts no preview', () => {
+      const {component, api} = setup(null);
+      api.previewToolGroups.mockClear();
+      component.onJobModeChange('worker');
+      expect(api.previewToolGroups).not.toHaveBeenCalled();
+    });
+
+    it('an open manifest view prints jobMode at spec level for agent mode only', () => {
+      const {component} = setup(null);
+      component.formData.description = 'Rename the heading';
+      component.toggleManifest();
+      expect(component.manifestText()).not.toContain('jobMode');
+
+      component.onJobModeChange('agent');
+      const yaml = component.manifestText();
+      expect(yaml).toContain('\n  jobMode: agent\n');
+      expect(yaml).not.toContain('job_mode');
+
+      component.onJobModeChange('worker');
+      expect(component.manifestText()).not.toContain('jobMode');
+    });
+
+    it('resetForm sets worker mode again and re-reads the preview', async () => {
+      const {component, api} = setup(null);
+      component.onJobModeChange('agent');
+      api.previewToolGroups.mockClear();
+
+      component.resetForm();
+
+      expect(component.selectedJobMode()).toBe('worker');
+      expect(api.previewToolGroups).toHaveBeenCalled();
+      expect(api.previewToolGroups.mock.calls.at(-1)![0].config_override).not.toHaveProperty('job_mode');
+      component.formData.description = 'After the reset';
+      await component.onSubmit();
+      expect(api.createJob.mock.calls.at(-1)![0]).not.toHaveProperty('job_mode');
+    });
+
+    it('a server refusal keeps the selected mode', async () => {
+      const {component, api} = setup(null);
+      api.createJob.mockReturnValue(throwError(() => ({status: 400})));
+      component.formData.description = 'Rename the heading';
+      component.onJobModeChange('agent');
+
+      await component.onSubmit();
+
+      expect(component.selectedJobMode()).toBe('agent');
+    });
+  });
+
   // The task fields used to refresh an open manifest only through the native
   // `change` bubbling out of the settings host — the same event that lost the
   // first click on Create. They refresh it themselves now, and start no preview.

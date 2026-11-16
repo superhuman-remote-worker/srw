@@ -72,6 +72,7 @@ import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 import {newRequestId} from '../../core/util/request-id';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
 import {JOB_TITLE_MAX_LENGTH, jobDisplayName, jobNameSuggestion} from '../../core/util/job-name';
+import {isAgentModeJob} from '../../core/util/job-mode';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 
 /**
@@ -333,6 +334,10 @@ export type {JobCloudAction};
                       {{ row.job.id }}
                       @if (row.isChild && row.job.config_name) {
                         <span class="config-badge">{{ row.job.config_name }}</span>
+                      }
+                      <!-- Agent-mode rows only: worker mode is the default. -->
+                      @if (isAgentModeJob(row.job)) {
+                        <span class="config-badge mode-badge" data-testid="job-mode-badge">{{ 'jobs.mode.agent.label' | transloco }}</span>
                       }
                     </div>
                     @if (row.job.workspace_contract) {
@@ -890,6 +895,11 @@ export type {JobCloudAction};
         color: var(--accent-color);
         margin-left: 2px;
         flex-shrink: 0;
+      }
+
+      .config-badge.mode-badge {
+        background: color-mix(in srgb, var(--info) 15%, transparent);
+        color: var(--info);
       }
 
       .delegation-badge {
@@ -1558,6 +1568,8 @@ export class JobListComponent implements OnInit, OnDestroy {
   readonly jobName = jobDisplayName;
   readonly jobNameSuggestion = jobNameSuggestion;
   readonly jobTitleMaxLength = JOB_TITLE_MAX_LENGTH;
+  /** Agent-mode rows carry a badge; a row without the field is a worker job. */
+  readonly isAgentModeJob = isAgentModeJob;
 
   /** Rename from the row's pencil: shown at once, put back if the server refuses. */
   onRenameJob(job: JobSummary, title: string): void {
