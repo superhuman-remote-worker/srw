@@ -18,6 +18,11 @@ from shared.runtime.services.auxiliary import (  # noqa: E402
     CurationResult,
 )
 from agent.tools.context import ToolContext  # noqa: E402
+from tests._kb_context import attached_project_bindings
+
+#: The job's project; its knowledge-base connector is attached where a test
+#: gives the context bindings.
+PROJECT_ID = "1a387b4d-0000-4000-8000-000000000123"
 
 
 def _load_config(name: str):
@@ -82,7 +87,8 @@ class TestCurateAndStoreKnowledge:
         ]
         ctx.knowledge_graph = mock_kg
         ctx.knowledge_store = MagicMock()
-        ctx.project_id = "proj-123"
+        ctx.project_id = PROJECT_ID
+        ctx.knowledge_bindings = attached_project_bindings(PROJECT_ID, None)
 
         curation_result = CurationResult(
             notes_created=2, notes_updated=1, summary="Curated 3 notes"
@@ -118,7 +124,8 @@ class TestCurateAndStoreKnowledge:
         ctx.knowledge_graph = MagicMock()
         ctx.knowledge_graph.list_notes.return_value = []
         ctx.knowledge_store = MagicMock()
-        ctx.project_id = "proj-123"
+        ctx.project_id = PROJECT_ID
+        ctx.knowledge_bindings = attached_project_bindings(PROJECT_ID, None)
 
         mock_llm = MagicMock()
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
@@ -370,7 +377,8 @@ class TestInlineCurationWiring:
         ctx = ToolContext(workspace_manager=workspace_manager, config={})
         ctx.knowledge_graph = MagicMock()
         ctx.knowledge_store = MagicMock()
-        ctx.project_id = "proj-123"
+        ctx.project_id = PROJECT_ID
+        ctx.knowledge_bindings = attached_project_bindings(PROJECT_ID, None)
 
         archive_fn = create_archive_phase_node(
             todo_manager=todo_manager,

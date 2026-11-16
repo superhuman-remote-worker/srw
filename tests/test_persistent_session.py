@@ -3316,10 +3316,12 @@ class TestSetupMemory:
 
         assert session.recall_store is None
 
-    def test_knowledge_store_always_created_with_vector_conn(self):
-        """KnowledgeStore created regardless of memory.enabled setting."""
+    def test_knowledge_store_created_for_an_attached_knowledge_base(self):
+        """With a knowledge base attached the store is created, whatever
+        memory.enabled says."""
         cfg = _make_config(memory_enabled=False)
-        session = _make_session(config=cfg)
+        session = _session_with_its_project_knowledge_base()
+        session.config = cfg
         session.tool_context = MagicMock()
 
         mock_ks = MagicMock()
@@ -3340,6 +3342,43 @@ class TestSetupMemory:
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
 
         assert session.knowledge_store is mock_ks
+
+    @pytest.mark.parametrize("memory_enabled", [True, False])
+    def test_no_knowledge_store_without_an_attached_knowledge_base(
+        self, memory_enabled
+    ):
+        """A session in a project whose knowledge-base connector is not
+        attached gets no knowledge store from the memory setup either. This
+        store is what the memory manager's note retriever and the charter
+        read through, so with it the unattached knowledge base leaked into
+        the session's context."""
+        cfg = _make_config(memory_enabled=memory_enabled)
+        session = _make_session(config=cfg)
+        session.tool_context = MagicMock()
+        session.project_ids = [str(uuid.uuid4())]
+        session.knowledge_bindings = []
+
+        store_cls = MagicMock()
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "shared.runtime.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock()
+                    ),
+                    "shared.runtime.services.recall_store": MagicMock(
+                        RecallStore=MagicMock(return_value=MagicMock())
+                    ),
+                    "shared.runtime.services.knowledge_store": MagicMock(
+                        KnowledgeStore=store_cls
+                    ),
+                },
+            ),
+        ):
+            session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
+
+        assert session.knowledge_store is None
+        store_cls.assert_not_called()
 
     def test_recall_store_failure_non_fatal(self):
         """RecallStore creation failure is non-fatal."""
@@ -3499,7 +3538,44 @@ class TestSetupMemory:
                 )
 
 
+def _session_with_its_project_knowledge_base():
+    """A session in one project whose own knowledge-base connector is attached."""
+    from tests._kb_context import attached_project_bindings
+
+    project_id = str(uuid.uuid4())
+    session = _make_session()
+    session.project_ids = [project_id]
+    session.knowledge_bindings = attached_project_bindings(project_id, None)
+    return session
+
+
 class TestSetupKnowledge:
+    def test_a_project_without_its_knowledge_base_attached_gets_no_store(self):
+        """The attached connectors decide. A session's project alone opens
+        no knowledge store, so nothing downstream (tools, injection, the
+        charter, curation) can reach that project's knowledge base."""
+        session = _make_session()
+        session.project_ids = [str(uuid.uuid4())]
+        session.knowledge_bindings = []
+
+        with (
+            patch(
+                "shared.runtime.services.embedding_service.get_kb_embedding_service"
+            ) as embedding,
+            patch(
+                "shared.runtime.services.knowledge_store.KnowledgeStore"
+            ) as store_cls,
+            patch(
+                "shared.runtime.services.knowledge_graph.KnowledgeGraphDB"
+            ) as graph_cls,
+        ):
+            session._setup_knowledge(MagicMock(name="vector_conn"))
+
+        assert session.knowledge_store is None
+        embedding.assert_not_called()
+        store_cls.assert_not_called()
+        graph_cls.assert_not_called()
+
     def test_external_only_scope_initializes_store_without_graph(self):
         session = _make_session()
         session.project_ids = []
@@ -3523,8 +3599,7 @@ class TestSetupKnowledge:
 
     def test_vector_store_is_available_when_graph_connection_fails(self):
         """Neo4j failure must not hide the pgvector-backed knowledge tools."""
-        session = _make_session()
-        session.project_ids = [str(uuid.uuid4())]
+        session = _session_with_its_project_knowledge_base()
         vector_conn = MagicMock(name="vector_conn")
         embedding_service = MagicMock(name="embedding_service")
         knowledge_store = MagicMock(name="knowledge_store")
@@ -3560,8 +3635,7 @@ class TestSetupKnowledge:
         """No NEO4J_URL (Neo4j is off by default) means no localhost:7687 dial."""
         import logging
 
-        session = _make_session()
-        session.project_ids = [str(uuid.uuid4())]
+        session = _session_with_its_project_knowledge_base()
         knowledge_store = MagicMock(name="knowledge_store")
         env = {k: v for k, v in os.environ.items() if k != "NEO4J_URL"}
 
@@ -3587,8 +3661,7 @@ class TestSetupKnowledge:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_embedding_failure_marks_store_degraded(self):
-        session = _make_session()
-        session.project_ids = [str(uuid.uuid4())]
+        session = _session_with_its_project_knowledge_base()
         knowledge_graph = MagicMock()
         knowledge_graph.connect.return_value = False
 

@@ -337,9 +337,12 @@ guarantees it.
   linked. A connector someone owns is theirs and stays, whatever credential
   it holds.
 - **An explicit empty connector list means no connectors.** No folder
-  mounts and no connector binds. The project's knowledge base stays
-  reachable as project memory, which follows project membership, not the
-  connector list.
+  mounts, no connector binds and no knowledge base: the agent reads and
+  writes a project's knowledge base only when that knowledge base's
+  connector is attached to the Session or Job. Work that could never choose
+  the connector keeps the knowledge base (a project without one, or work
+  older than its project's connector); see
+  [What a Session or Job gets by default](cloud-folders.md#what-a-session-or-job-gets-by-default).
 - **Nothing takes a failed folder's place.** A folder that can't be bound
   is shown left out, with the reason, and the others mount anyway; SRW
   mounts no other folder in its stead.

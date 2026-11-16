@@ -46,6 +46,9 @@ from orchestrator.services import connector_bind_time, connector_credential_leas
 from orchestrator.services.config_resolver import unrouted_model_slots
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.job_datasource_selection import shell_connector_names
+from orchestrator.services.implied_project_knowledge import (
+    with_implied_project_knowledge,
+)
 from orchestrator.services.job_workspace_runtime import (
     JobWorkspaceRuntimeDependencies,
     apply_sticky_sudo_denial,
@@ -510,6 +513,15 @@ async def build_job_start_request(
         )
         dependencies.apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = dependencies.build_datasources_payload(resolved_ds)
+        # The agent binds a knowledge base only when its connector is among
+        # these entries. A job that was never offered its project's
+        # knowledge-base connector keeps the knowledge base all the same.
+        datasources_payload = await with_implied_project_knowledge(
+            datasources_payload,
+            store=postgres_db,
+            project_ids=[job.get("project_id")],
+            created_at=job.get("created_at"),
+        )
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
         if resolved_ds:

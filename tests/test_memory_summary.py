@@ -720,7 +720,12 @@ class Session:
             messages=messages,
             knowledge_store=self.knowledge_store,
             project_ids=[harness.PROJECT_ID],
-            tool_context=SimpleNamespace(knowledge_bindings=[], citation_engine=None),
+            tool_context=SimpleNamespace(
+                knowledge_bindings=harness.attach_project_knowledge(
+                    self.knowledge_store
+                ),
+                citation_engine=None,
+            ),
             memory_service=self.memory,
         )
         assert self.errors == []

@@ -693,22 +693,18 @@ def create_degraded_knowledge_tools(names: List[str]) -> List[Any]:
 
 
 def _get_project_id(context: ToolContext) -> Optional[str]:
-    """Get the sole writable native KB id, preserving legacy contexts."""
-    bindings = _explicit_bindings(context)
-    if bindings:
-        for binding in bindings:
-            if binding.is_native and binding.writable:
-                return str(binding.kb_id)
-        return None
-    return context.project_id
+    """The sole writable knowledge base: this work's own project's, and only
+    when its connector is attached (``build_knowledge_bindings``). The
+    context's project id alone names no knowledge base."""
+    for binding in _explicit_bindings(context):
+        if binding.is_native and binding.writable:
+            return str(binding.kb_id)
+    return None
 
 
 def _get_project_ids(context: ToolContext) -> List[str]:
-    """Get every authorized KB id, preserving legacy project scoping."""
-    bindings = _explicit_bindings(context)
-    if bindings:
-        return [str(binding.kb_id) for binding in bindings]
-    return list(context.project_ids)
+    """Every knowledge base this runtime may read: the bound ones, no more."""
+    return [str(binding.kb_id) for binding in _explicit_bindings(context)]
 
 
 def _explicit_bindings(context: ToolContext) -> List[KnowledgeBinding]:
@@ -720,31 +716,9 @@ def _explicit_bindings(context: ToolContext) -> List[KnowledgeBinding]:
 
 
 def _read_bindings(context: ToolContext) -> List[KnowledgeBinding]:
-    """Authorized KBs, synthesized from project ids for old runtimes/tests."""
-    bindings = _explicit_bindings(context)
-    if bindings:
-        return bindings
-
-    result: List[KnowledgeBinding] = []
-    for index, raw_id in enumerate(context.project_ids):
-        try:
-            kb_id = uuid.UUID(str(raw_id))
-        except (TypeError, ValueError):
-            continue
-        alias = "project" if index == 0 else f"project-{kb_id.hex[:8]}"
-        result.append(
-            KnowledgeBinding(
-                kb_id=kb_id,
-                alias=alias,
-                name="Project Knowledge"
-                if index == 0
-                else f"Project Knowledge {kb_id.hex[:8]}",
-                kind="native",
-                writable=index == 0,
-                root_path="knowledge",
-            )
-        )
-    return result
+    """The bound knowledge bases. Nothing is synthesized from project ids:
+    a project whose knowledge-base connector is not attached is not read."""
+    return _explicit_bindings(context)
 
 
 def _native_bindings(context: ToolContext) -> List[KnowledgeBinding]:

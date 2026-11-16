@@ -32,6 +32,7 @@ import pytest
 
 from orchestrator.services import kb_materialize as km
 from orchestrator.services.kb_reindex import KbRepoRef
+from tests._kb_context import KbMockContext
 
 PROJECT = "1a387b4d-0000-0000-0000-000000000000"
 REPO = "vault"
@@ -252,12 +253,11 @@ def _run_tool(tool_name, args, *, files, index_rows, row=None, kg_note=None, kg=
 
         return asyncio.run(go())
 
-    ctx = MagicMock()
+    ctx = KbMockContext()  # the project's knowledge base is attached
     ctx.project_id = PROJECT
     ctx.project_ids = [PROJECT]
     ctx.job_id = None
     ctx.config = {}
-    ctx.knowledge_bindings = None
     ctx.workspace_manager = None
     ctx._job_metadata = {"config_name": "developer"}
     ctx.knowledge_store = AsyncMock()

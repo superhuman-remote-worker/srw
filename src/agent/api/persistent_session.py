@@ -2344,8 +2344,9 @@ class PersistentSession:
             if isinstance(b, KnowledgeBinding)
         ]
         if not bindings:
-            # No explicit bindings travelled with this construction path; the
-            # single project id above synthesizes the sole native writable KB.
+            # No knowledge base is attached, so there is no write target to
+            # check. The officer then runs with the fail-closed knowledge
+            # tools (see _setup_tools): its project alone binds nothing.
             return
 
         writable = [b for b in bindings if b.writable]
@@ -2377,8 +2378,11 @@ class PersistentSession:
 
         Mirrors the worker agent pattern in agent.py._setup_job_tools().
         """
-        if not self.knowledge_bindings and not self.project_ids:
-            return  # No native or selected external knowledge scope
+        if not self.knowledge_bindings:
+            # No knowledge-base connector is attached. The session's project
+            # alone binds nothing: the attached connectors decide
+            # (build_knowledge_bindings).
+            return
 
         self._kb_degraded = False
         try:
@@ -2397,7 +2401,7 @@ class PersistentSession:
             )
             logger.info(
                 "Knowledge store initialized for %d KB binding(s)",
-                len(self.knowledge_bindings) or len(self.project_ids),
+                len(self.knowledge_bindings),
             )
         except Exception as e:
             self._kb_degraded = True
@@ -3998,9 +4002,11 @@ class PersistentSession:
                 )
                 self._memory_degraded = True
 
-        # KnowledgeStore (knowledge injection, project-scoped)
-        # Skip if already initialized by _setup_knowledge() (for tool loading)
-        if self.knowledge_store is None:
+        # KnowledgeStore (knowledge injection). Only for a session with a
+        # knowledge base attached, as in _setup_knowledge(): the project alone
+        # opens no store. Skip if _setup_knowledge() already opened it (for
+        # tool loading).
+        if self.knowledge_store is None and self.knowledge_bindings:
             try:
                 from shared.runtime.services.embedding_service import (
                     get_kb_embedding_service,
@@ -4102,9 +4108,11 @@ class PersistentSession:
         # loud rather than silently mid-turn. Sessions without a vector_conn
         # return above and keep the legacy (no-op) paths.
         if self.config.memory.manager_enabled:
+            from agent.core.knowledge_injection import attached_project_knowledge_ids
             from agent.services.memory import MemoryManager as MemorySeamManager
             from agent.services.memory import MemoryRuntime
 
+            _attached_kb_projects = attached_project_knowledge_ids(self)
             try:
                 self.memory_service = MemorySeamManager.from_config(
                     self.config.memory,
@@ -4117,8 +4125,10 @@ class PersistentSession:
                         extraction_prompt=self.memory_extraction_prompt,
                         job_id=self.thread_id,
                         agent_type=self.config.agent_id,
-                        project_id=self.project_id,
-                        project_ids=list(self.project_ids),
+                        # The knowledge scope (kb_notes): the projects whose
+                        # own knowledge base is attached, not every project.
+                        project_id=next(iter(_attached_kb_projects), None),
+                        project_ids=_attached_kb_projects,
                         # The legacy persistent path bounds each store call at
                         # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
                         retrieval_timeout=5.0,

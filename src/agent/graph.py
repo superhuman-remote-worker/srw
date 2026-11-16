@@ -1448,40 +1448,6 @@ def create_execute_node(
                 logger.warning(
                     f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
                 )
-        elif memory_service is None and knowledge_store and tool_context.project_id:
-            try:
-                import uuid as _uuid
-
-                project_uuid = (
-                    _uuid.UUID(tool_context.project_id)
-                    if isinstance(tool_context.project_id, str)
-                    else tool_context.project_id
-                )
-
-                # Build retrieval context from current todo + phase info
-                pending_todos = todo_manager.list_pending()
-                kb_context_parts = []
-                if pending_todos:
-                    kb_context_parts.append(pending_todos[0].content)
-                kb_context_parts.append(
-                    f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}"
-                )
-                kb_context_text = " ".join(kb_context_parts)
-
-                kb_notes = await knowledge_store.hybrid_search(
-                    project_id=project_uuid,
-                    query=kb_context_text,
-                    match_count=5,
-                )
-                if kb_notes:
-                    _knowledge_records = list(kb_notes)
-                    logger.debug(
-                        f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
-                )
 
         # Citation verification feedback (Phase 2b / D4): surface still-failed
         # citations so the agent can correct them. DB-driven — re-computed from
@@ -6272,6 +6238,9 @@ def build_phase_alternation_graph(
         from agent.services.memory import MemoryManager as MemorySeamManager
         from agent.services.memory import MemoryRuntime
 
+        from agent.core.knowledge_injection import attached_project_knowledge_ids
+
+        _attached_kb_projects = attached_project_knowledge_ids(tool_context)
         memory_service = MemorySeamManager.from_config(
             config.memory,
             MemoryRuntime(
@@ -6289,8 +6258,10 @@ def build_phase_alternation_graph(
                 extraction_prompt=memory_extraction_prompt,
                 job_id=tool_context.job_id if tool_context else None,
                 agent_type=config.agent_id,
-                project_id=tool_context.project_id if tool_context else None,
-                project_ids=list(tool_context.project_ids) if tool_context else [],
+                # The knowledge scope (kb_notes): the projects whose own
+                # knowledge base is attached, not every project of the job.
+                project_id=next(iter(_attached_kb_projects), None),
+                project_ids=_attached_kb_projects,
                 retrieval_timeout=None,  # worker path runs unbounded (legacy)
             ),
         )

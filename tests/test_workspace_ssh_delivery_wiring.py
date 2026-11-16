@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from orchestrator import main as orch_main
+from tests._kb_context import connector_has_always_existed  # noqa: E402
 from orchestrator.application import controls as controls_composition
 from orchestrator.services import container_provisioner as container_provisioner_module
 from orchestrator.services import deployment_gates as deployment_gates_module
@@ -299,3 +300,16 @@ def test_agent_accepts_a_neutral_protected_wait_payload_with_the_field():
         "workspace_ssh_identities": None,
     }
     assert session_workspace.protected_workspace_delivery(payload) == "engaging"
+
+
+@pytest.fixture(autouse=True)
+def _project_knowledge_connector_has_always_existed():
+    """These tests deliver what they select. The unconnected application
+    store cannot answer the one extra lookup the delivery makes."""
+    store = orch_main.app.state.resources.postgres_db
+    with patch.object(
+        store,
+        "get_datasource_by_managed_key",
+        connector_has_always_existed(store),
+    ):
+        yield

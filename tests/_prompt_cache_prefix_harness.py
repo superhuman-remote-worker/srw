@@ -51,6 +51,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import httpx
+
+from tests._kb_context import attached_project_bindings
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -751,6 +753,22 @@ def knowledge_records(*, churn: bool = False, call: int = 0) -> List[Any]:
     ]
 
 
+def attach_project_knowledge(knowledge_store: Any) -> List[Any]:
+    """The bindings of a session whose project knowledge base is attached,
+    with ``knowledge_store`` answering the retrieval from it.
+
+    A session reads a project's knowledge base (its notes and its charter)
+    only when that knowledge base's connector is attached; the project id
+    alone binds nothing. Returns the session's ``knowledge_bindings``.
+    """
+    knowledge_store.embedding_service.model = "harness-embed"
+    knowledge_store.embedding_service.expected_dimensions = 16
+    knowledge_store.search_chunks = AsyncMock(
+        side_effect=lambda **_kwargs: knowledge_records()
+    )
+    return attached_project_bindings(PROJECT_ID, None)
+
+
 #: The project-memory statistics behind the up-front memory summary (D35),
 #: consistent with ``MEMORY_FACTS``.
 MEMORY_SUMMARY_TOPICS = ("release", "workspace")
@@ -1348,6 +1366,7 @@ async def run_session_scenario(
         )
         knowledge_store = MagicMock()
         knowledge_store.get_charter_note = AsyncMock(return_value=CHARTER)
+        tool_context.knowledge_bindings = attach_project_knowledge(knowledge_store)
         memory_service = RecordingMemoryManager(lag=memory_lag)
         kwargs = {
             "memory_service": memory_service,

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator import main as orch_main
+from tests._kb_context import connector_has_always_existed  # noqa: E402
 from shared.runtime_actor import RuntimeActorContext
 from orchestrator.services import session_attach_payload
 from orchestrator.application import controls as controls_composition
@@ -376,3 +377,16 @@ async def test_persistent_reattach_payload_uses_resolved_repository_uuid():
     assert payload is not None
     assert payload["datasources"][0]["datasource_id"] == DATASOURCE_ID
     assert "id" not in payload["datasources"][0]
+
+
+@pytest.fixture(autouse=True)
+def _project_knowledge_connector_has_always_existed():
+    """These tests deliver what they select. The unconnected application
+    store cannot answer the one extra lookup the delivery makes."""
+    store = orch_main.app.state.resources.postgres_db
+    with patch.object(
+        store,
+        "get_datasource_by_managed_key",
+        connector_has_always_existed(store),
+    ):
+        yield

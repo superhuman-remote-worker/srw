@@ -28,6 +28,7 @@ from agent.tools.knowledge.knowledge_tools import (
     _post_vault_file,
     create_kb_tools,
 )
+from tests._kb_context import KbMockContext
 
 
 # =============================================================================
@@ -36,8 +37,8 @@ from agent.tools.knowledge.knowledge_tools import (
 
 
 def _make_context(project_id=None, project_ids=None, job_id=None):
-    """Create a mock ToolContext."""
-    ctx = MagicMock()
+    """Create a mock ToolContext with its projects' knowledge bases attached."""
+    ctx = KbMockContext()
     ctx.project_id = project_id or str(uuid.uuid4())
     ctx.project_ids = project_ids or [ctx.project_id]
     ctx.job_id = job_id or str(uuid.uuid4())
@@ -547,8 +548,8 @@ class TestKbRead:
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "n1"})
         assert "# My Note" in result
         assert "decision" in result
-        assert "[[n2]]" in result
-        assert "[[n0]]" in result
+        assert "[[project:n2]]" in result
+        assert "[[project:n0]]" in result
         assert "→ this" in result
 
     def test_not_found(self):
@@ -973,7 +974,7 @@ class TestKbGrep:
         out = _invoke(
             _get_tool(tools, "kb_grep"), {"pattern": "sales_page", "max_matches": 1}
         )
-        assert "**n1** — Note One" in out
+        assert "**project:n1** — Note One" in out
         assert "L7: see sales_page_2026_09" in out
         assert "ctx before" in out and "ctx after" in out
         assert "2 more matching note(s)" in out
@@ -2826,7 +2827,7 @@ class TestKbDelete:
                 _get_tool(tools, "kb_delete"),
                 {"note": "old-state", "reason": "superseded by iter-13 state note"},
             )
-        assert result.startswith("Retired **old-state**")
+        assert result.startswith("Retired **project:old-state**")
         assert "kb_update" in result and 'status="active"' in result
         assert len(calls) == 1
         committed = calls[0]["content"]
@@ -3334,7 +3335,7 @@ def _kb_neighbour(note_id, content, title="N"):
 
 def _gated_tools(kg, ks, verdict, prompt="ADJUDICATE"):
     """Build kb tools with a real verdict service (asyncio NOT mocked)."""
-    ctx = MagicMock()
+    ctx = KbMockContext()
     ctx.project_id = str(uuid.uuid4())
     ctx.project_ids = [ctx.project_id]
     ctx.job_id = str(uuid.uuid4())
@@ -3428,7 +3429,7 @@ class TestKbWriteVerdictGate:
         kg = MagicMock()
         kg.create_note.return_value = "slug"
         ks = _GateStore(neighbours=[_kb_neighbour("x", "some content")])
-        ctx = MagicMock()
+        ctx = KbMockContext()
         ctx.project_id = str(uuid.uuid4())
         ctx.job_id = str(uuid.uuid4())
         ctx.config = {"current_phase": 1}

@@ -15,7 +15,7 @@ skips without a container runtime or the neo4j driver.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -24,6 +24,7 @@ from orchestrator.services.kb_reindex import note_fields
 from shared.runtime.database import neo4j_db
 from shared.runtime.knowledge.gardener import parse_note_md
 from shared.runtime.services.knowledge_graph import KnowledgeGraphDB
+from tests._kb_context import KbMockContext
 
 _PASSWORD = "kb-forward-links"
 
@@ -60,7 +61,7 @@ def kg(neo4j_server):
 
 
 def _tools(kg, project_id):
-    ctx = MagicMock()
+    ctx = KbMockContext()  # the project's knowledge base is attached
     ctx.project_id = project_id
     ctx.project_ids = [project_id]
     ctx.job_id = str(uuid.uuid4())
@@ -190,7 +191,7 @@ def test_a_forward_link_becomes_an_edge_once_its_target_is_written(kg):
         {"type": "REFERENCES", "target": "token-rotation"}
     ]
     # The reader still sees the link while its target is missing.
-    assert "- **REFERENCES** → [[token-rotation]]" in tools["kb_read"].invoke(
+    assert "- **REFERENCES** → [[project:token-rotation]]" in tools["kb_read"].invoke(
         {"note": "auth"}
     )
 
@@ -202,7 +203,7 @@ def test_a_forward_link_becomes_an_edge_once_its_target_is_written(kg):
     assert _edges(kg, project_id, "auth") == {("REFERENCES", "token-rotation")}
     assert _pending(kg, project_id, "auth") == []
     read = tools["kb_read"].invoke({"note": "token-rotation"})
-    assert "[[auth]] (Auth) **REFERENCES** → this" in read
+    assert "[[project:auth]] (Auth) **REFERENCES** → this" in read
 
 
 def test_an_update_makes_the_edge_an_older_write_never_made(kg):

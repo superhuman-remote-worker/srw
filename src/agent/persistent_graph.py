@@ -2670,7 +2670,10 @@ async def _execute_turn(
     # alone); [] = none failed (the cleared rendering, O6).
     failed_citations: Optional[List[Any]] = None
 
-    from agent.core.knowledge_injection import selected_knowledge_bindings
+    from agent.core.knowledge_injection import (
+        attached_project_knowledge_ids,
+        selected_knowledge_bindings,
+    )
     from shared.runtime.core.skill_resolution import (
         managed_product_guide_turn_boundary as _product_guide_turn_boundary,
     )
@@ -2791,32 +2794,6 @@ async def _execute_turn(
                 type(e).__name__,
                 e,
             )
-    elif memory_service is None and knowledge_store and effective_pids:
-        try:
-            if _provider_admission_closed():
-                return _closed_result()
-            kb_context = last_user_text(messages)
-
-            kb_notes = await asyncio.wait_for(
-                knowledge_store.hybrid_search(
-                    project_ids=[_uuid.UUID(p) for p in effective_pids],
-                    query=kb_context,
-                    match_count=5,
-                ),
-                timeout=_RETRIEVAL_TIMEOUT,
-            )
-            if kb_notes:
-                knowledge_records = list(kb_notes)
-                logger.debug(f"Knowledge injection: {len(kb_notes)} notes retrieved")
-        except asyncio.TimeoutError:
-            logger.warning("Knowledge retrieval timed out — skipping injection")
-        except Exception as e:
-            # See sibling memory-retrieval handler above for rationale.
-            logger.warning(
-                "Knowledge retrieval failed (non-fatal): %s: %s",
-                type(e).__name__,
-                e,
-            )
 
     # Charter injection (centurion.md §5): the project's pinned standing
     # orders, fetched by (project_id, note_type='charter') — a dedicated read,
@@ -2824,15 +2801,20 @@ async def _execute_turn(
     # context entry: appended again whenever the history no longer holds it
     # (a compaction evicted it) or it changed (D21), so compaction cannot
     # strip the standing orders silently.
+    # Only for a project whose own knowledge base is attached: the charter is
+    # a note of that knowledge base, and the attached connectors decide what
+    # a session reads (build_knowledge_bindings).
+    _attached_native = set(attached_project_knowledge_ids(tool_context))
+    charter_pids = [p for p in effective_pids if str(p) in _attached_native]
     if (
         knowledge_store is not None
-        and effective_pids
+        and charter_pids
         and _charter_injection_enabled(config)
     ):
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            for _pid in effective_pids:
+            for _pid in charter_pids:
                 _charter = await asyncio.wait_for(
                     knowledge_store.get_charter_note(_uuid.UUID(_pid)),
                     timeout=_RETRIEVAL_TIMEOUT,

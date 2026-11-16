@@ -744,10 +744,17 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Knowledge tools
     if "knowledge" in tools_by_category:
         if not context.has_knowledge():
-            logger.warning(
-                "Knowledge tools require knowledge_store in ToolContext "
-                "(knowledge_graph/Neo4j is optional — graph tools degrade)"
-            )
+            if getattr(context, "knowledge_bindings", None):
+                logger.warning(
+                    "Knowledge tools require knowledge_store in ToolContext "
+                    "(knowledge_graph/Neo4j is optional — graph tools degrade)"
+                )
+            else:
+                # Not a fault: this job or session runs without a knowledge
+                # base (its connector list leaves it out).
+                logger.info(
+                    "No knowledge base is attached; knowledge tools are not loaded"
+                )
         else:
             try:
                 knowledge_tools = create_knowledge_tools(context)

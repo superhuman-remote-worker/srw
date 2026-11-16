@@ -115,9 +115,13 @@ refused when it conflicts.
   `agent.datasourceDefaultsOnOmission` on, every default. The MCP tools
   that omit the list ask for every default.
 - **An explicit empty list attaches nothing**, the project's own connectors
-  included: no cloud folder mounts. The agent still reaches the project's
-  knowledge base as project memory, which follows project membership, not
-  the connector list.
+  included: no cloud folder mounts and no knowledge base. A list that leaves
+  the project's knowledge base out runs without it: no notes are added to the
+  agent's context and the knowledge tools are not offered. Two kinds of work
+  keep the project's knowledge base without naming it, because its connector
+  could not be chosen when they were created: work in a project that has no
+  knowledge base connector, and work created before its project's knowledge
+  base connector existed.
 - Work nobody starts by hand (project loops, automations, an officer's
   tickets) does not default to your outbox.
 - A Job never gets a cloud folder: a Job request that names one is refused,
