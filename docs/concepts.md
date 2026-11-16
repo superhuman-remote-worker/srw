@@ -131,6 +131,10 @@ Approving a job stopped at a phase boundary lets it continue; approving a
 finished job completes it. Administrators can limit the highest autonomy level
 each user may choose.
 
+A job at `full` also applies its own changes to the project's cloud folder when
+it completes, where the other levels show them to the owner as a diff first.
+[Cloud folders](cloud-folders.md#jobs) has the rules.
+
 ## Projects
 
 A project is the durable scope that several sessions and jobs share. It holds

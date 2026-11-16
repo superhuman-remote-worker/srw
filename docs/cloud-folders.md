@@ -46,7 +46,7 @@ its next start; switching a live Session to or from protected is refused
 | Protected (`protected`) | Project folder | Writes, after review | That reader below an overlay: the agent's writes stay in the workspace until an owner or editor of the folder's project approves them in review. |
 | Read-write (`read_write`) | Project folder, My cloud, Session outbox | Writes, directly | A credential that can write the folder; see the [support matrix](#provider-support-matrix) for which. The cockpit calls My cloud's level "Full access". |
 | Read-only (`read_only`) | Project folder copy | Nothing | SRW never applies the copy's changes. |
-| Reviewed write-back (`reviewed_write_back`) | Project folder copy | Writes, after review | A diff the Job's owner reviews; SRW writes back only an accepted diff, and refuses one whose files changed in the cloud since the copy was made. |
+| Reviewed write-back (`reviewed_write_back`) | Project folder copy | Writes, after review; a Job at `full` autonomy writes without one | A diff the Job's owner reviews; SRW writes back only an accepted diff, and refuses one whose files changed in the cloud since the copy was made. A Job that runs at `full` autonomy has nobody to review it, so SRW applies its diff when the Job completes, under the same rule: only if none of those files changed in the cloud. |
 
 The levels are strict. A level a folder can't have where it is used is
 refused, never swapped for another, and a binding that may only read takes
@@ -214,6 +214,21 @@ to read-only nor to one folder. Attach a project folder when you want less.
   sets none), the Job's changes there become a diff when it completes; the
   Job waits in review, and its owner's accept writes the diff back. At
   `read_only` nothing is written back. Remove the chip for no copy.
+  - **A Job at `full` autonomy applies its own changes.** When it completes,
+    SRW writes its diff back without a review and the Job ends `completed`.
+    Its brief tells the agent so. If a file the diff touches changed in the
+    cloud after the copy was made, or a write fails, nothing is overwritten:
+    the Job waits in review like any other, and its error message says why.
+    Accept is refused while the cloud's version is newer; reject discards the
+    Job's changes.
+  - **A read-only copy stays read-only** at every autonomy level. To keep the
+    review for a project, set its folder copy to `read_only`, or limit the
+    autonomy its members may choose.
+  - **Jobs that share a folder run one after another.** The copy is made when
+    a Job is created. Two Jobs created together both copy the same state; the
+    one that completes second finds the cloud changed and waits in review.
+  - **A Job whose expert runs a critic** still waits for its owner after the
+    critic approves, also at `full` autonomy.
 - **Outbox.** A top-level Job a user starts, with their outbox attached, has
   its declared deliverables (or `output/`) copied into a cloud folder shared
   with them once it completes or reaches review. The review page says what

@@ -11,7 +11,10 @@ folder at completion) is the ``cloud_outbox`` connector:
 * ``context.cloud_checkout = {datasource_id, access}``: the attached
   checkout and its level. Provisioning seeds the copy only for a job that
   carries it (or a loop, whose copy is unconditional: ``loop_floor``), and
-  completion captures a diff only at ``reviewed_write_back``. A job without
+  completion captures a diff only at ``reviewed_write_back``. A job that
+  runs at ``full`` autonomy applies that diff itself when it is free of
+  conflicts (:func:`unattended_write_back`); every other job's diff waits
+  for its owner's accept. A job without
   the key and with a baseline is an older one, created when every job of a
   cloud project got the copy implicitly at reviewed write-back
   (:func:`legacy_checkout`): it keeps that rule to the end.
@@ -130,11 +133,55 @@ def capture_applies(job: Mapping[str, Any]) -> bool:
     return legacy_checkout(job)
 
 
-def checkout_edits(access: str | None, *, loop: bool) -> str:
-    """What happens to edits under the copy (``shared.job_cloud_connectors``)."""
+def unattended_write_back(job: Mapping[str, Any], *, autonomy: str | None) -> bool:
+    """Whether completion applies the copy's changes itself instead of
+    holding them for the owner's accept: a job that runs at ``full``
+    autonomy, with a copy whose changes go back at all
+    (:func:`capture_applies`). Full autonomy lifts the review, never the
+    level: a read-only copy stays read-only. Only a conflict-free diff is
+    applied (``job_cloud_baseline.deliver_loop_diff_to_cloud``); anything
+    else still waits for review."""
+    return autonomy == "full" and capture_applies(job)
+
+
+def checkout_edits(access: str | None, *, loop: bool, unattended: bool = False) -> str:
+    """What happens to edits under the copy (``shared.job_cloud_connectors``).
+    ``unattended``: the job applies its own changes
+    (:func:`unattended_write_back`)."""
     if access is not None:
-        return EDITS_REVIEWED if access == REVIEWED_WRITE_BACK else EDITS_DISCARDED
-    return EDITS_APPLIED if loop else EDITS_REVIEWED
+        if access != REVIEWED_WRITE_BACK:
+            return EDITS_DISCARDED
+        return EDITS_APPLIED if unattended else EDITS_REVIEWED
+    return EDITS_APPLIED if loop or unattended else EDITS_REVIEWED
+
+
+def restated_for_autonomy(
+    context: Mapping[str, Any] | None,
+    *,
+    job: Mapping[str, Any],
+    autonomy: str | None,
+) -> list[dict[str, Any]] | None:
+    """``context.cloud_connectors`` as a job that applies its own changes
+    has to be told, or ``None`` when nothing changes.
+
+    Admission and provisioning write the entry before the job's
+    configuration is resolved, so they say "reviewed". The job's start
+    knows the autonomy it runs at: a copy whose changes completion will
+    apply (:func:`unattended_write_back`) is restated as "applied", so the
+    brief does not promise a review nobody makes.
+    """
+    if not unattended_write_back(job, autonomy=autonomy):
+        return None
+    from shared.job_cloud_connectors import CHECKOUT_KIND, parse_cloud_connectors
+
+    entries = parse_cloud_connectors(dict(context or {}))
+    restated = [
+        {**entry, "edits": EDITS_APPLIED}
+        if entry["kind"] == CHECKOUT_KIND and entry.get("edits") == EDITS_REVIEWED
+        else entry
+        for entry in entries
+    ]
+    return restated if restated != entries else None
 
 
 def project_has_folder(project: Mapping[str, Any] | None) -> bool:
@@ -474,4 +521,6 @@ __all__ = [
     "project_has_folder",
     "provisioning_stamp",
     "resolve_checkout",
+    "restated_for_autonomy",
+    "unattended_write_back",
 ]
