@@ -1294,6 +1294,13 @@ agent:
       # -- Minimum wall-clock budget for one worker batch. Production keeps a
       # five-minute floor; local acceptance may explicitly lower it.
       batchMinWallSeconds: 300
+      # -- Base wait in seconds before a worker job is tried again after a
+      # batch that ended in a recoverable failure, such as a model provider
+      # that stopped answering. The wait grows with each failed try in a row
+      # (1x, 2x, 3x, 4x) and the fifth failure ends the job, so 5 tolerates
+      # about 50 seconds of outage and 60 about ten minutes. Unattended batch
+      # runs use 60 to 90. Range 1 to 900.
+      errorBackoffSeconds: 5
 
 # =============================================================================
 # Cockpit (Angular frontend)

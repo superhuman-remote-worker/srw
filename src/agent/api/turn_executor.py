@@ -215,6 +215,15 @@ def _uncertain_worker_workspace_report(
 IDLE_POLL_SECONDS = 0.5
 IDLE_POLL_BACKOFF_SECONDS = 2.0
 IDLE_POLLS_BEFORE_BACKOFF = 30
+# How long a worker job waits before its next try after a batch that ended in a
+# recoverable failure (a provider that stopped answering, a workspace hiccup).
+# The wait grows with each failed try in a row: base, 2 x base, 3 x base, 4 x
+# base, and the fifth failure ends the job (``worker_retry_exhausted``). At the
+# default of 5 s that tolerates about 50 s of outage, at 60 s about ten
+# minutes. ``STATELESS_WORKER_ERROR_BACKOFF_SECONDS`` sets it for a deployment
+# that would rather wait out a provider outage than fail every job in flight.
+WORKER_ERROR_BACKOFF_SECONDS = 5.0
+WORKER_ERROR_BACKOFF_MAX_SECONDS = 900.0
 POLL_JITTER = 0.2  # ±20%
 # How long a pod keeps an idle thread's session attached, hoping for the next
 # turn (§5.3.4). The win it buys is the whole attach (measured 7.4s on k3d);
@@ -266,6 +275,24 @@ _WORKER_PRESERVE_SHELL_STATUSES = frozenset(
 _WORKER_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _WORKER_UNFINISHED_COMMAND_STATES = frozenset({"pending", "finalizing"})
 _WORKER_FINALIZED_COMMAND_STATES = frozenset({"done", "superseded", "force_resolved"})
+
+
+def worker_error_backoff_seconds() -> float:
+    """The base wait after a failed worker batch, from
+    ``STATELESS_WORKER_ERROR_BACKOFF_SECONDS`` (1 to 900 s, default 5)."""
+    raw = os.getenv("STATELESS_WORKER_ERROR_BACKOFF_SECONDS", "").strip()
+    if not raw:
+        return WORKER_ERROR_BACKOFF_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "STATELESS_WORKER_ERROR_BACKOFF_SECONDS=%r is not a number; using %s",
+            raw,
+            WORKER_ERROR_BACKOFF_SECONDS,
+        )
+        return WORKER_ERROR_BACKOFF_SECONDS
+    return min(WORKER_ERROR_BACKOFF_MAX_SECONDS, max(1.0, value))
 
 
 def _enabled_env(name: str, default: bool = False) -> bool:
@@ -1222,6 +1249,7 @@ class StatelessTurnExecutor:
         bg_task_enabled: Optional[bool] = None,
         completion_commands_enabled: Optional[bool] = None,
         audit_writer: Any = _AUDIT_WRITER_UNSET,
+        worker_error_backoff: Optional[float] = None,
     ) -> None:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
@@ -1234,6 +1262,11 @@ class StatelessTurnExecutor:
         self._cloud_push_wait_seconds = cloud_push_wait_seconds
         self._abort_grace_seconds = abort_grace_seconds
         self._warm_session_idle_ttl = warm_session_idle_ttl_seconds
+        self._worker_error_backoff_seconds = (
+            worker_error_backoff_seconds()
+            if worker_error_backoff is None
+            else float(worker_error_backoff)
+        )
         self._warm_since: Optional[float] = None
         self._worker_enabled = (
             _enabled_env("STATELESS_EXECUTOR", False)
@@ -1628,13 +1661,15 @@ class StatelessTurnExecutor:
         current_lease.set(self._lease)
         logger.info(
             "stateless turn executor started: pod=%s idle_poll=%.2fs "
-            "backoff=%.2fs/%d heartbeat=%ss worker_enabled=%s",
+            "backoff=%.2fs/%d heartbeat=%ss worker_enabled=%s "
+            "worker_error_backoff=%.0fs",
             self._pod_name,
             self._idle_poll_seconds,
             self._idle_backoff_seconds,
             self._idle_polls_before_backoff,
             HEARTBEAT_INTERVAL_SECONDS,
             self._worker_enabled,
+            self._worker_error_backoff_seconds,
         )
         idle_polls = 0
         while not self._stop.is_set():
@@ -3722,6 +3757,7 @@ class StatelessTurnExecutor:
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
                 park_on_exhaustion=park_on_exhaustion,
+                backoff_base_seconds=self._worker_error_backoff_seconds,
             )
         except Exception:
             logger.warning(

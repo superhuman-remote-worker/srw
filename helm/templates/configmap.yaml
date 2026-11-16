@@ -373,6 +373,9 @@ data:
   SESSION_REWIND_IDLE_CONVERSATION_ENABLED: {{ .Values.agent.stateless.rewind.idleConversationEnabled | default false | quote }}
   STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
   STATELESS_WORKER_DEFAULT_ENABLED: {{ .Values.agent.stateless.worker.defaultEnabled | default false | quote }}
+  # Base wait after a worker batch that ended in a recoverable failure; it
+  # grows with each failed try in a row (agent.stateless.worker.errorBackoffSeconds).
+  STATELESS_WORKER_ERROR_BACKOFF_SECONDS: {{ .Values.agent.stateless.worker.errorBackoffSeconds | default 5 | quote }}
   # Hold-aware workers and the orchestrator read the same default-off protocol
   # gate. Recovery budgets remain visible even while automation is disabled so
   # an enable is one coordinated Pod rollout rather than an implicit default.

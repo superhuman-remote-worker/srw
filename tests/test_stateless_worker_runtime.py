@@ -1579,6 +1579,7 @@ async def test_child_quiescence_failure_retries_cleanup_then_releases_without_re
         unit_id=claim.unit_id,
         lease_token=claim.lease_token,
         park_on_exhaustion=False,
+        backoff_base_seconds=5.0,
     )
 
 
@@ -1674,6 +1675,7 @@ async def test_nonterminal_effective_wire_payload_fails_closed_before_report(
         unit_id=claim.unit_id,
         lease_token=claim.lease_token,
         park_on_exhaustion=True,
+        backoff_base_seconds=5.0,
     )
     assert agent.cleanup_calls == [True]
     assert agent.hold_calls == 0
@@ -1760,6 +1762,7 @@ async def test_coded_nonterminal_422_releases_normally_then_successor_reclaims(
         unit_id=first.unit_id,
         lease_token=41,
         park_on_exhaustion=True,
+        backoff_base_seconds=5.0,
     )
     assert agent.cleanup_calls == [True]
     assert agent.hold_calls == 0
@@ -1837,6 +1840,7 @@ async def test_coded_nonterminal_422_cleanup_fault_at_cap_never_rereports(
         unit_id=claim.unit_id,
         lease_token=43,
         park_on_exhaustion=True,
+        backoff_base_seconds=5.0,
     )
     assert agent.hold_calls == 0
     assert executor._worker_terminal_report_generation is None
@@ -2534,6 +2538,7 @@ async def test_recoverable_end_releases_without_reporting(worker_runtime, monkey
         unit_id=claim.unit_id,
         lease_token=claim.lease_token,
         park_on_exhaustion=True,
+        backoff_base_seconds=5.0,
     )
     rotate.assert_not_awaited()
     complete.assert_not_awaited()
@@ -2717,6 +2722,7 @@ async def test_giveup_checkpoint_ambiguity_never_starts_http_or_parks(
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
                 park_on_exhaustion=False,
+                backoff_base_seconds=5.0,
             )
         assert agent.cleanup_calls == [True]
     finally:
@@ -2762,6 +2768,7 @@ async def test_failed_max_give_up_successor_re_reports_without_running_work(
         unit_id=first.unit_id,
         lease_token=first.lease_token,
         park_on_exhaustion=False,
+        backoff_base_seconds=5.0,
     )
     complete.assert_awaited_once_with(
         executor._db,
@@ -2854,6 +2861,7 @@ async def test_over_budget_successor_re_reports_genuine_end_unchanged(
         unit_id=first.unit_id,
         lease_token=first.lease_token,
         park_on_exhaustion=False,
+        backoff_base_seconds=5.0,
     )
     complete.assert_awaited_once_with(
         executor._db,
@@ -2920,6 +2928,7 @@ async def test_post_report_tail_failure_never_reports_twice_or_parks_at_max(
         unit_id=claim.unit_id,
         lease_token=claim.lease_token,
         park_on_exhaustion=False,
+        backoff_base_seconds=5.0,
     )
     assert agent.cleanup_calls == [True]
 
@@ -2947,6 +2956,7 @@ async def test_terminal_report_failure_preserves_shell_and_error_releases(
         unit_id=claim.unit_id,
         lease_token=claim.lease_token,
         park_on_exhaustion=False,
+        backoff_base_seconds=5.0,
     )
 
 
@@ -3046,6 +3056,7 @@ async def test_terminal_report_failure_reclaims_end_and_second_report_closes_que
         unit_id=first.unit_id,
         lease_token=21,
         park_on_exhaustion=False,
+        backoff_base_seconds=5.0,
     )
     complete.assert_awaited_once_with(
         executor._db,
@@ -3746,3 +3757,56 @@ def test_managed_connectors_leave_the_worker_environment_alone():
     )
 
     assert agent._worker_env_restore == {}
+
+
+# ---------------------------------------------------------------------------
+# The wait after a failed batch is a deployment setting (thesis T6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 5.0),
+        ("", 5.0),
+        ("60", 60.0),
+        ("90.5", 90.5),
+        ("0", 1.0),
+        ("-3", 1.0),
+        ("86400", 900.0),
+        ("soon", 5.0),
+    ],
+)
+def test_worker_error_backoff_setting(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("STATELESS_WORKER_ERROR_BACKOFF_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("STATELESS_WORKER_ERROR_BACKOFF_SECONDS", raw)
+
+    assert turn_executor.worker_error_backoff_seconds() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("raw", "expected"), [(None, 5.0), ("60", 60.0)])
+async def test_a_failed_batch_is_released_with_the_configured_wait(
+    worker_runtime, monkeypatch, raw, expected
+):
+    """A provider that stops answering for a few minutes ends every job in
+    flight at the default wait (5, 10, 15, 20 s between five tries). A
+    deployment that sets 60 s gives the same five tries ten minutes."""
+    if raw is None:
+        monkeypatch.delenv("STATELESS_WORKER_ERROR_BACKOFF_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("STATELESS_WORKER_ERROR_BACKOFF_SECONDS", raw)
+    claim = _claim(input_seq=1, prior="processing")
+    executor, *_rest, release = _install(monkeypatch, claim, {})
+
+    await executor._release_worker_claim(claim, reason="graph_error")
+
+    release.assert_awaited_once_with(
+        executor._db,
+        unit_id=claim.unit_id,
+        lease_token=claim.lease_token,
+        park_on_exhaustion=True,
+        backoff_base_seconds=expected,
+    )
