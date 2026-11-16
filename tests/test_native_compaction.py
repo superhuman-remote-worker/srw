@@ -43,6 +43,16 @@ SYSTEM = SystemMessage(content="You are the agent.", id="sys")
 NATIVE_SUMMARY = "Progress: the exporter is written.\nNext: run the tests."
 FOLD_SUMMARY = "## Objective\n- Ship the CSV export.\n\n## Work State\n- Tests pass."
 CODEX_HEAD = "You are performing a CONTEXT CHECKPOINT COMPACTION."
+DEEPSEEK_SECTIONS = (
+    "## Primary Request and Intent",
+    "## Key Technical Concepts",
+    "## Files and Code",
+    "## Errors and Fixes",
+    "## Pending Jobs",
+    "## Current Work",
+    "## Next Step",
+    "## Critical Context",
+)
 
 
 class ForkLLM:
@@ -148,6 +158,22 @@ class TestSettings:
         assert "(6) specific details that would be hard to reconstruct" in text
         assert text.endswith("Do not call any tools.")
 
+    def test_deepseek_recipe_is_deepseek_harness_instruction(self):
+        from agent.core.context import SUMMARY_LEAD_IN
+
+        text = recipe_instruction("deepseek")
+        assert text.startswith(
+            "You are now acting as a compaction engine for this AI coding assistant."
+        )
+        positions = [text.index(heading) for heading in DEEPSEEK_SECTIONS]
+        assert positions == sorted(positions)
+        assert "do not call any tool or take any other action" in text
+        # The prior-checkpoint rule names SRW's hand-back, not DeepSeek's
+        # <compacted-summary> block, which SRW never writes.
+        assert "<compacted-summary>" not in text
+        assert "summary of earlier compacted turns, it is a PRIOR checkpoint" in text
+        assert "were compacted" in SUMMARY_LEAD_IN and "summary" in SUMMARY_LEAD_IN
+
     def test_unknown_recipe_names_never_become_paths(self):
         for name in ("gemini", "../codex", None, ""):
             assert recipe_instruction(name) is None
@@ -163,6 +189,8 @@ class TestSettings:
             ("claude-sonnet-5-5", {"strategy": "native", "recipe": "claude"}),
             ("claude-fable-5-1", {"strategy": "native", "recipe": "claude"}),
             ("claude-haiku-4-5-20251001", {"strategy": "native", "recipe": "claude"}),
+            ("deepseek-flash", {"strategy": "native", "recipe": "deepseek"}),
+            ("deepseek-v4-flash", {"strategy": "native", "recipe": "deepseek"}),
             ("muse-spark-1.3-contributor", {"strategy": "auxiliary"}),
             ("MiniMax-M3", {"strategy": "auxiliary"}),
         ):
@@ -313,6 +341,20 @@ class TestHelpers:
             None,
             "empty",
         )
+
+    def test_a_deepseek_reply_without_sections_is_rejected(self):
+        reply = AIMessage(content="Sure, I will keep going with the export.")
+        assert summary_from_reply(reply, "deepseek") == (None, "no_sections")
+        # Codex prescribes no headings, so the same text passes there.
+        assert summary_from_reply(reply, "codex")[1] is None
+
+    def test_a_deepseek_checkpoint_is_the_reply_text(self):
+        checkpoint = "\n\n".join(f"{h}\n- (none)" for h in DEEPSEEK_SECTIONS)
+        reply = AIMessage(
+            content=checkpoint,
+            additional_kwargs={"reasoning_content": "first the goal, then files"},
+        )
+        assert summary_from_reply(reply, "deepseek") == (checkpoint, None)
 
     def test_reasoning_blocks_are_not_the_summary(self):
         reply = AIMessage(

@@ -225,6 +225,7 @@ deepseek:
   guardrails:
     file: deepseek.yaml
   settings:
+    compaction: { strategy: native, recipe: deepseek }  # the model summarizes itself with DeepSeek Harness's instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     # In THINKING mode DeepSeek V4 ignores temperature/top_p/penalties — tune the
     # prompt, not sampling. These values apply only to any non-thinking fallback
