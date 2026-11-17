@@ -561,6 +561,15 @@ steps it has no tools for, and the method in its phase skills would not reach
 it. The bundled developer, scholar, curator, designer, bughunter, product-qa,
 critic and receptionist do this.
 
+Such an expert should also ship `skills/direct-task/SKILL.md`, because a job
+can override the setting with `phases: false`. That file is the expert's
+method folded into one flow, for a job that has no planning tools; without it
+the job gets the framework's generic text. Lines of the expert's
+`instructions.md` that name phases, to-do tools or `plan.md` belong inside
+`{% if has_tool("next_phase_todos") %}` blocks. The bundled developer,
+scholar, curator, designer, bughunter and product-qa do both
+(`tests/test_expert_direct_task_skills.py`).
+
 ### LLM Configuration
 
 ```yaml
