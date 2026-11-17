@@ -295,6 +295,9 @@ OFFICE_SKILLS = (
     "spreadsheet",
     "document",
     "slides",
+    # Not an office format, but the same contract: a catalog skill whose
+    # bundled scripts and references must ship as text and compile.
+    "image",
 )
 
 
@@ -338,3 +341,24 @@ def test_office_skill_descriptions_point_at_their_siblings():
         _, desc = skill_identity(fm)
         siblings = [s for s in OFFICE_SKILLS if s != skill and f"`{s}`" in desc]
         assert siblings, f"{skill}: description names no sibling skill"
+
+
+def test_image_skill_offers_only_the_ways_in_that_are_bound():
+    """The image skill names generate_image only when a model is pinned, and
+    the shell scripts only when there is a shell (image_generation WP2)."""
+    md = (_SKILLS / "image" / "SKILL.md").read_text(encoding="utf-8")
+    full = render_instruction_content(
+        md, ["generate_image", "run_command", "read_file", "compose_images"]
+    )
+    virtual = render_instruction_content(md, ["read_file", "compose_images"])
+
+    assert "`generate_image`. It saves into the" in full
+    assert "skills/image/scripts/batch.py --max-spend" in full
+    assert "No image model is pinned here" not in full
+
+    assert "No image model is pinned here" in virtual
+    assert "Admin → Models → Defaults → Image generation" in virtual
+    assert "batch.py" not in virtual
+    assert "these need a shell" in virtual
+    for rendered in (full, virtual):
+        assert "{%" not in rendered and "region=[left, top, right, bottom]" in rendered
