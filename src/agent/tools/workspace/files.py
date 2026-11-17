@@ -909,7 +909,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
           decode error
 
         Args:
-            path: Relative path to the file (e.g., "plan.md")
+            path: Relative path to the file (e.g., "notes.md")
             offset: For text files: starting line number (1-indexed, default: 1)
             limit: For text files: number of lines to read (default/max: 2000)
             page_start: For documents: first page/slide to read (1-indexed)
@@ -1097,7 +1097,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         accidental data loss from blind overwrites.
 
         Use this to:
-        - Create new files (plan.md, research.md)
+        - Create new files (report.md, research.md)
         - Save research notes (document_analysis.md)
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
@@ -1232,7 +1232,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
            beginning of the file. The `old_string` parameter is ignored.
 
         Args:
-            path: Relative path to the file (e.g., "plan.md")
+            path: Relative path to the file (e.g., "notes.md")
             old_string: Text to find and replace (required for replace mode)
             new_string: Replacement text or content to insert
             position: Insert position - "start", "end", or None for replace mode

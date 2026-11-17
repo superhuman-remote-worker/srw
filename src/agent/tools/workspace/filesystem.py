@@ -169,7 +169,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
 
             Files:
               instructions.md
-              plan.md
+              notes.md
         """
         # Cap depth at 3 to prevent excessive output
         depth = max(0, min(3, depth))

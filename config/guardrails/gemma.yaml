@@ -46,7 +46,7 @@ tool_examples:
         <|tool_call>call:git_diff{}<tool_call|>                                                                 # uncommitted changes
         <|tool_call>call:git_diff{ref1:<|"|>HEAD~5<|"|>}<tool_call|>                                            # last 5 commits vs working dir
         <|tool_call>call:git_diff{ref1:<|"|>phase-1-tactical-complete<|"|>,ref2:<|"|>HEAD<|"|>}<tool_call|>     # between tag and HEAD
-        <|tool_call>call:git_diff{file_path:<|"|>plan.md<|"|>}<tool_call|>                                 # uncommitted changes in one file
+        <|tool_call>call:git_diff{file_path:<|"|>report.md<|"|>}<tool_call|>                               # uncommitted changes in one file
 
   git_status: |-
     Example output (clean):
@@ -62,7 +62,7 @@ tool_examples:
           + updated.md
 
         Modified (1):
-          M plan.md
+          M report.md
 
   git_tags: |-
     Examples:
@@ -104,7 +104,7 @@ tool_examples:
   edit_file: |-
     Examples:
         # Replace mode (default)
-        <|tool_call>call:edit_file{path:<|"|>plan.md<|"|>,old_string:<|"|>## Draft<|"|>,new_string:<|"|>## Final<|"|>}<tool_call|>
+        <|tool_call>call:edit_file{path:<|"|>report.md<|"|>,old_string:<|"|>## Draft<|"|>,new_string:<|"|>## Final<|"|>}<tool_call|>
 
         # Append mode — add to end of file
         <|tool_call>call:edit_file{path:<|"|>notes.md<|"|>,new_string:<|"|>\n## New Section<|"|>,position:<|"|>end<|"|>}<tool_call|>
@@ -114,7 +114,7 @@ tool_examples:
 
   move_file: |-
     Examples:
-        <|tool_call>call:move_file{source:<|"|>todos.yaml<|"|>,dest:<|"|>archive/todos_phase_1.yaml<|"|>}<tool_call|>     # move to subdir
+        <|tool_call>call:move_file{source:<|"|>draft.md<|"|>,dest:<|"|>archive/draft_v1.md<|"|>}<tool_call|>     # move to subdir
         <|tool_call>call:move_file{source:<|"|>draft.md<|"|>,dest:<|"|>final.md<|"|>}<tool_call|>                        # rename in place
 
   read_file: |-

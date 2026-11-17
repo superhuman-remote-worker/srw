@@ -57,7 +57,7 @@ tool_examples:
         git_diff()                                                          # uncommitted changes
         git_diff(ref1="HEAD~5")                                             # last 5 commits vs working dir
         git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")             # between tag and HEAD
-        git_diff(file_path="plan.md")                                  # uncommitted changes in one file
+        git_diff(file_path="report.md")                                # uncommitted changes in one file
         git_diff(ref1="main", ref2="HEAD", repo="WidgetShop")          # inside an ATTACHED repository
 
   git_status: |-
@@ -78,7 +78,7 @@ tool_examples:
           + updated.md
 
         Modified (1):
-          M plan.md
+          M report.md
 
   git_tags: |-
     Examples:
@@ -122,7 +122,7 @@ tool_examples:
   edit_file: |-
     Examples:
         # Replace mode (default)
-        edit_file(path="plan.md", old_string="## Draft", new_string="## Final")
+        edit_file(path="report.md", old_string="## Draft", new_string="## Final")
 
         # Append mode — add to end of file
         edit_file(path="notes.md", new_string="\n## New Section", position="end")
@@ -132,7 +132,7 @@ tool_examples:
 
   move_file: |-
     Examples:
-        move_file(source="todos.yaml", dest="archive/todos_phase_1.yaml")    # move to subdir
+        move_file(source="draft.md", dest="archive/draft_v1.md")    # move to subdir
         move_file(source="draft.md", dest="final.md")                        # rename in place
 
   read_file: |-
