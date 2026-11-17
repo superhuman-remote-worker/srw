@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/superhuman-remote-worker/srw/cli/internal/exit"
-	"github.com/superhuman-remote-worker/srw/cli/internal/target"
+	"github.com/superhuman-remote-worker/srw/cli/internal/remote"
 )
 
 const token = "ak_secret_token"
@@ -29,7 +29,7 @@ func clientFor(t *testing.T, server string, options Options) *Client {
 	if options.Pauses == nil {
 		options.Pauses = []time.Duration{0, 0}
 	}
-	client, err := New(&target.Target{Server: base, Token: token}, "1.2.3", options)
+	client, err := New(&remote.Target{Server: base, Token: token}, "1.2.3", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestACAFileReplacesTheSystemRootsAndMustHoldACertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	base, _ := url.Parse(server.URL)
-	client, err := New(&target.Target{Server: base, Token: token, CAFile: good}, "1.2.3", Options{})
+	client, err := New(&remote.Target{Server: base, Token: token, CAFile: good}, "1.2.3", Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestACAFileReplacesTheSystemRootsAndMustHoldACertificate(t *testing.T) {
 	}
 	empty := filepath.Join(directory, "empty.pem")
 	os.WriteFile(empty, []byte("not a certificate\n"), 0o600)
-	if _, err := New(&target.Target{Server: base, CAFile: empty}, "1.2.3", Options{}); err == nil || coded(t, err).Code != exit.Usage {
+	if _, err := New(&remote.Target{Server: base, CAFile: empty}, "1.2.3", Options{}); err == nil || coded(t, err).Code != exit.Usage {
 		t.Errorf("a CA file without a certificate: %v", err)
 	}
 }

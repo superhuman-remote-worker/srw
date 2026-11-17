@@ -17,8 +17,8 @@ import (
 	"github.com/superhuman-remote-worker/srw/cli/internal/config"
 	"github.com/superhuman-remote-worker/srw/cli/internal/exit"
 	"github.com/superhuman-remote-worker/srw/cli/internal/output"
+	"github.com/superhuman-remote-worker/srw/cli/internal/remote"
 	"github.com/superhuman-remote-worker/srw/cli/internal/routes"
-	"github.com/superhuman-remote-worker/srw/cli/internal/target"
 )
 
 const tokenMenu = "Settings → API Keys"
@@ -105,7 +105,7 @@ func (a *App) login(ctx context.Context) error {
 		}
 		server = strings.TrimSpace(line)
 	}
-	base, err := target.ParseServer(server, a.flags.insecureHTTP)
+	base, err := remote.ParseServer(server, a.flags.insecureHTTP)
 	if err != nil {
 		return err
 	}
@@ -131,8 +131,8 @@ func (a *App) login(ctx context.Context) error {
 		fmt.Fprintln(a.Err, "warning: this is an MCP token (srw_…). srw is built for personal access tokens (ak_…), which carry scopes; some commands may behave differently.")
 	}
 
-	to := &target.Target{
-		Mode: target.Context, Server: base, Context: name, Token: token,
+	to := &remote.Target{
+		Mode: remote.Context, Server: base, Context: name, Token: token,
 		CAFile: a.flags.caFile, InsecureHTTP: a.flags.insecureHTTP,
 	}
 	client, err := a.client(to)
@@ -320,7 +320,7 @@ func (a *App) whoami(ctx context.Context) error {
 	table := a.table()
 	fmt.Fprintf(table, "User:\t%s\n", who.label())
 	fmt.Fprintf(table, "Server:\t%s\n", to.Server)
-	if to.Mode == target.Context {
+	if to.Mode == remote.Context {
 		fmt.Fprintf(table, "Context:\t%s\n", to.Context)
 	} else {
 		fmt.Fprintf(table, "Context:\tnone (server and token come from the environment)\n")

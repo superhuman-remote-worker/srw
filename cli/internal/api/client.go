@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/superhuman-remote-worker/srw/cli/internal/exit"
-	"github.com/superhuman-remote-worker/srw/cli/internal/target"
+	"github.com/superhuman-remote-worker/srw/cli/internal/remote"
 )
 
 // Deadlines per request. A cancel has been seen to take more than 30 s, so
@@ -64,7 +64,7 @@ type Options struct {
 }
 
 // New builds the client for a target.
-func New(to *target.Target, version string, options Options) (*Client, error) {
+func New(to *remote.Target, version string, options Options) (*Client, error) {
 	transport := options.Transport
 	if transport == nil {
 		// Clone the default: proxy variables, HTTP/2 and the dial timeouts

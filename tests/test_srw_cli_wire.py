@@ -70,6 +70,34 @@ def user(installation):
     return installation.user()
 
 
+def test_no_cli_source_file_is_ignored_by_git():
+    """The binary below is built from the working directory, so a source file
+    that ``.gitignore`` hides still compiles here and is missing from every
+    clean checkout. It happened: a package named ``target`` was ignored by the
+    repository-wide ``target/`` rule."""
+    import subprocess
+
+    from tests._srw_cli_harness import REPO_ROOT
+
+    listed = subprocess.run(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--", "cli"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode != 0:
+        pytest.skip("not a git checkout")
+    hidden = [
+        path
+        for path in listed.stdout.splitlines()
+        if path.endswith((".go", "go.mod", "go.sum"))
+    ]
+    assert not hidden, (
+        "git ignores these Go files; rename the directory or the file: "
+        + ", ".join(hidden)
+    )
+
+
 def write(tmp_path, name: str, document) -> str:
     path = tmp_path / name
     text = document if isinstance(document, str) else json.dumps(document)

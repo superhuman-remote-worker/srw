@@ -9,7 +9,7 @@ import (
 	"github.com/superhuman-remote-worker/srw/cli/internal/config"
 	"github.com/superhuman-remote-worker/srw/cli/internal/exit"
 	"github.com/superhuman-remote-worker/srw/cli/internal/output"
-	"github.com/superhuman-remote-worker/srw/cli/internal/target"
+	"github.com/superhuman-remote-worker/srw/cli/internal/remote"
 )
 
 func (a *App) configCommand() *cobra.Command {
@@ -166,7 +166,7 @@ func (a *App) setContext(name, project string, projectGiven bool) error {
 	}
 	insecure := a.flags.insecureHTTP || entry.InsecureHTTP
 	if a.flags.server != "" {
-		base, err := target.ParseServer(a.flags.server, insecure)
+		base, err := remote.ParseServer(a.flags.server, insecure)
 		if err != nil {
 			return err
 		}

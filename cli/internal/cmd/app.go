@@ -21,7 +21,7 @@ import (
 	"github.com/superhuman-remote-worker/srw/cli/internal/config"
 	"github.com/superhuman-remote-worker/srw/cli/internal/exit"
 	"github.com/superhuman-remote-worker/srw/cli/internal/output"
-	"github.com/superhuman-remote-worker/srw/cli/internal/target"
+	"github.com/superhuman-remote-worker/srw/cli/internal/remote"
 )
 
 // App is one run of srw: its streams, its surroundings and its global flags.
@@ -197,27 +197,27 @@ func (a *App) paths() (config.Paths, error) {
 	return paths, nil
 }
 
-func (a *App) host() target.Host {
-	return target.Host{
+func (a *App) host() remote.Host {
+	return remote.Host{
 		Getenv: a.Getenv, Home: a.Home, Stdin: a.In, Stderr: a.Err,
 		StdinIsTerminal: a.StdinIsTerminal,
 	}
 }
 
-func (a *App) options() target.Options {
-	return target.Options{
+func (a *App) options() remote.Options {
+	return remote.Options{
 		Server: a.flags.server, Context: a.flags.context, TokenStdin: a.flags.tokenStdin,
 		CAFile: a.flags.caFile, InsecureHTTP: a.flags.insecureHTTP,
 	}
 }
 
 // connect resolves the server and the token and builds the client.
-func (a *App) connect(wantToken bool) (*target.Target, *api.Client, error) {
+func (a *App) connect(wantToken bool) (*remote.Target, *api.Client, error) {
 	paths, err := a.paths()
 	if err != nil {
 		return nil, nil, err
 	}
-	to, err := target.Resolve(a.options(), a.host(), paths, wantToken)
+	to, err := remote.Resolve(a.options(), a.host(), paths, wantToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -225,7 +225,7 @@ func (a *App) connect(wantToken bool) (*target.Target, *api.Client, error) {
 	return to, client, err
 }
 
-func (a *App) client(to *target.Target) (*api.Client, error) {
+func (a *App) client(to *remote.Target) (*api.Client, error) {
 	return api.New(to, a.Version, api.Options{Transport: a.Transport, Pauses: a.Pauses})
 }
 
