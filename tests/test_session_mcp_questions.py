@@ -69,6 +69,8 @@ class TestSessionQuestionHandler:
         mod._events_epoch = 0
         mod._next_seq = 0
         mod._session_input._hard_interrupt_event = None
+        mod._session_input._interrupt_mode = None
+        mod._session_input._interrupt_target_turn_id = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
@@ -77,6 +79,8 @@ class TestSessionQuestionHandler:
         mod._session_identity._thread_id = None
         mod._subscribers.clear()
         mod._session_input._hard_interrupt_event = None
+        mod._session_input._interrupt_mode = None
+        mod._session_input._interrupt_target_turn_id = None
 
     @pytest.mark.asyncio
     async def test_autonomous_asks_nobody(self):
@@ -160,6 +164,132 @@ class TestSessionQuestionHandler:
         _install_session(postgres_conn=_postgres(status), permission_mode="auto_accept")
         answer = await mod._session_question_handler(_question())
         assert (answer.action, answer.content) == (action, None)
+
+    @staticmethod
+    def _retires(postgres) -> list:
+        return [
+            call
+            for call in postgres._fake_conn.execute.call_args_list
+            if "SET status = 'expired'" in call.args[0]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stop_retires_the_question_and_closes_its_card(self, monkeypatch):
+        """Found on k3d 2026-11-17: after Stop the row stayed pending, so the
+        card came back on every reload with buttons that reached nobody."""
+        import agent.api.persistent_app as mod
+
+        postgres = _postgres("expired")
+        _install_session(postgres_conn=postgres, permission_mode="auto_accept")
+        monkeypatch.setattr(
+            mod,
+            "_wait_for_permission_resolution",
+            AsyncMock(return_value="interrupted"),
+        )
+        queue = mod._subscribe("client-S")
+
+        answer = await mod._session_question_handler(_question())
+
+        assert (answer.action, answer.content) == ("cancel", None)
+        (retire,) = self._retires(postgres)
+        assert retire.args[1] == "row-q"
+        assert "status = 'pending' AND kind = 'question'" in retire.args[0]
+        assert queue.get_nowait()["method"] == "question.request"
+        resolved = queue.get_nowait()
+        assert resolved["method"] == "question.resolved"
+        assert resolved["params"]["decision"] == "expired"
+        assert queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_a_graceful_stop_answers_cancel_so_the_tool_can_return(
+        self, monkeypatch
+    ):
+        """A Stop with a tool in flight is graceful: it waits for the tool,
+        which waits for the answer. Found on k3d 2026-11-17, where the card
+        stayed until the pod went away."""
+        import asyncio
+
+        import agent.api.persistent_app as mod
+
+        postgres = _postgres("expired")
+        _install_session(postgres_conn=postgres, permission_mode="auto_accept")
+        asked = asyncio.Event()
+        inner_cancelled = []
+
+        async def wait_forever(request_id):
+            asked.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                inner_cancelled.append(request_id)
+                raise
+
+        stop = {"cause": None}
+        monkeypatch.setattr(mod, "_wait_for_permission_resolution", wait_forever)
+        monkeypatch.setattr(mod, "_QUESTION_INTERRUPT_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(
+            mod._session_input, "peek_interrupt_cause", lambda: stop["cause"]
+        )
+        queue = mod._subscribe("client-G")
+
+        task = asyncio.create_task(mod._session_question_handler(_question()))
+        await asked.wait()
+        await asyncio.sleep(0.05)
+        assert not task.done()  # no Stop yet: still waiting for the user
+        stop["cause"] = "user"
+        answer = await asyncio.wait_for(task, timeout=2)
+
+        assert (answer.action, answer.content) == ("cancel", None)
+        assert inner_cancelled == ["row-q"]
+        (retire,) = self._retires(postgres)
+        assert retire.args[1] == "row-q"
+        assert queue.get_nowait()["method"] == "question.request"
+        resolved = queue.get_nowait()
+        assert resolved["params"]["decision"] == "expired"
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_call_retires_its_question_before_unwinding(
+        self, monkeypatch
+    ):
+        """A stateless turn's Stop cancels the running tool, so the wait never
+        returns: the card must still close."""
+        import asyncio
+
+        import agent.api.persistent_app as mod
+
+        postgres = _postgres("expired")
+        _install_session(postgres_conn=postgres, permission_mode="read_only")
+        waiting = asyncio.Event()
+
+        async def wait_forever(request_id):
+            waiting.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mod, "_wait_for_permission_resolution", wait_forever)
+        queue = mod._subscribe("client-C")
+
+        task = asyncio.create_task(mod._session_question_handler(_question()))
+        await waiting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        (retire,) = self._retires(postgres)
+        assert retire.args[1] == "row-q"
+        assert queue.get_nowait()["method"] == "question.request"
+        resolved = queue.get_nowait()
+        assert resolved["method"] == "question.resolved"
+        assert resolved["params"]["decision"] == "expired"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["approved", "denied", "expired"])
+    async def test_an_answered_question_is_left_as_it_is(self, status):
+        import agent.api.persistent_app as mod
+
+        postgres = _postgres(status, {"content": CONFIRM})
+        _install_session(postgres_conn=postgres, permission_mode="auto_accept")
+        await mod._session_question_handler(_question())
+        assert self._retires(postgres) == []
 
     @pytest.mark.asyncio
     async def test_a_question_that_cannot_be_stored_is_declined_with_why(self):

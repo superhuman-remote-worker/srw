@@ -7241,6 +7241,73 @@ async def _pending_question_requests() -> List[Dict[str, Any]]:
     return cards
 
 
+#: How often a question's wait checks for a Stop of its turn.
+_QUESTION_INTERRUPT_POLL_SECONDS: float = 0.5
+
+
+async def _wait_for_question_answer(request_id: str) -> str:
+    """The permission wait, ended also by any interrupt pending for this turn.
+
+    A tool's gate is answered before its tool runs, so a Stop reaches it as a
+    hard interrupt. A question is asked while its tool runs, and a Stop with a
+    tool in flight is graceful: it waits for the tool, which waits for the
+    answer, so the card stayed until the pod went away (k3d, 2026-11-17).
+    Here a pending interrupt of the current turn (a person's Stop, the
+    executor shutting down, a lost lease) ends the wait as ``interrupted``:
+    the server hears ``cancel``, its tool returns, and the Stop completes.
+    """
+    waiting = asyncio.create_task(_wait_for_permission_resolution(request_id))
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {waiting}, timeout=_QUESTION_INTERRUPT_POLL_SECONDS
+            )
+            if waiting in done:
+                return waiting.result()
+            if _session_input.peek_interrupt_cause() is not None:
+                logger.info(
+                    "MCP question %s ends unanswered: its turn was stopped", request_id
+                )
+                return "interrupted"
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def _retire_unanswered_question(request_id: str) -> str:
+    """Expire a question its call can no longer use; return the row's status.
+
+    A tool's gate stays pending after Stop, because the turn that calls the
+    tool again picks it up. A question belongs to one call: once that call has
+    ended, an answer has nowhere to go, and a pending row would put the card
+    back on every reload with buttons that do nothing. So it is retired as a
+    non-decision ('expired', which the server hears as ``cancel``). A decision
+    that landed first is kept and returned.
+    """
+    if _session is None or _session.postgres_conn is None:
+        return "unavailable"
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            await conn.execute(
+                "UPDATE thread_permission_requests "
+                "SET status = 'expired', decided_at = now(), "
+                "    decided_by = 'system' "
+                "WHERE id = $1 AND status = 'pending' AND kind = 'question'",
+                request_id,
+            )
+            status = await conn.fetchval(
+                "SELECT status FROM thread_permission_requests WHERE id = $1",
+                request_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "Retiring an unanswered MCP question failed (id=%s): %s", request_id, e
+        )
+        return "unavailable"
+    return str(status) if status is not None else "expired"
+
+
 async def _session_question_handler(question: Any) -> Any:
     """Ask this Session's user an MCP server's question, on a card.
 
@@ -7307,7 +7374,25 @@ async def _session_question_handler(question: Any) -> Any:
                 name="mcp-question-awaiting-user",
             )
 
-    final_status = await _wait_for_permission_resolution(request_id)
+    try:
+        final_status = await _wait_for_question_answer(request_id)
+    except asyncio.CancelledError:
+        # The call was cancelled while its question waited. Close the card
+        # before the call unwinds; the server's request ends with the call.
+        status = await asyncio.shield(_retire_unanswered_question(request_id))
+        _broadcast(
+            "question.resolved",
+            {
+                "id": tool_call_id,
+                "approval_id": request_id,
+                "server": question.server,
+                "decision": status,
+            },
+        )
+        raise
+    if final_status not in ("approved", "denied", "expired"):
+        # A Stop, or a database the wait could not read.
+        final_status = await _retire_unanswered_question(request_id)
     response: Dict[str, Any] = {}
     if final_status == "approved" and _session is not None:
         try:

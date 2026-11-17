@@ -72,6 +72,8 @@ Users**; without one, the question is declined.
 - A question that needs typed input or a link to open always comes to the user
   as a card in a Read-only or Auto-accept session, and is declined in a job or
   an Autonomous session.
+- **Stop** while a card waits closes it unanswered: the server is told the
+  question was cancelled, and its tool returns before the turn stops.
 - When SRW answers a question on its own, the tool result says what it
   answered and which setting decided, so the agent can tell the user what to
   change.
