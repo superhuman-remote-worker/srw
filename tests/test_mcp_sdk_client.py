@@ -67,3 +67,36 @@ def test_the_status_is_found_wherever_the_transport_put_it():
         assert http_status(wrapped) == 401
         assert refused in list(walk_exception(wrapped))
     assert http_status(ConnectionError("gone")) is None
+
+
+@pytest.mark.parametrize(
+    ("token", "header"),
+    [
+        ("abc123", "Bearer abc123"),
+        ("Bearer abc123", "Bearer abc123"),
+        ("  bearer   abc123 ", "Bearer abc123"),
+        ("BEARER abc123", "Bearer abc123"),
+        ("Bearerabc123", "Bearer Bearerabc123"),
+    ],
+)
+def test_a_pasted_bearer_scheme_is_sent_once(token, header):
+    from shared.mcp_sdk import bearer_authorization
+
+    assert bearer_authorization(token) == header
+
+
+def test_the_agent_sends_a_pasted_bearer_token_once():
+    from agent.tools.mcp.manager import parse_mcp_config
+
+    config = parse_mcp_config(
+        {
+            "type": "mcp",
+            "name": "Civitai",
+            "connection_url": "https://orchestration.civitai.example/mcp/v2",
+            "credentials": {
+                "transport": "http",
+                "auth": {"type": "bearer", "token": "Bearer key-1"},
+            },
+        }
+    )
+    assert config.headers == {"Authorization": "Bearer key-1"}

@@ -75,6 +75,8 @@ from shared.mcp_questions import (
 )
 from shared.mcp_sdk import (
     REMOTE_TRANSPORTS,
+    bare_bearer_token,
+    bearer_authorization,
     ensure_mcp_sdk,
     http_status,
     open_client,
@@ -341,9 +343,9 @@ def parse_mcp_config(ds: dict[str, Any]) -> MCPServerConfig:
     auth_type = auth.get("type") or "none"
     if auth_type == "bearer":
         token = auth.get("token")
-        if not isinstance(token, str) or not token:
+        if not isinstance(token, str) or not bare_bearer_token(token):
             raise ValueError("bearer auth requires a token")
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = bearer_authorization(token)
     elif auth_type == "headers":
         custom_headers = auth.get("headers") or {}
         if not isinstance(custom_headers, dict) or not all(

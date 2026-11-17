@@ -132,6 +132,27 @@ class McpDriver(DatasourceDriver):
     def effective_access(self, row: Mapping[str, Any]) -> str | None:
         return "ReadWrite"
 
+    @staticmethod
+    def stored_credentials(
+        draft: ConnectorDraft, existing: Mapping[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """The credentials to store, a bearer token without a pasted
+        ``Bearer`` scheme (SRW adds it when it sends the token)."""
+        credentials = DatasourceDriver.stored_credentials(draft, existing)
+        auth = credentials.get("auth") if isinstance(credentials, dict) else None
+        if (
+            isinstance(auth, Mapping)
+            and auth.get("type") == "bearer"
+            and isinstance(auth.get("token"), str)
+        ):
+            from shared.mcp_sdk import bare_bearer_token
+
+            credentials = {
+                **credentials,
+                "auth": {**auth, "token": bare_bearer_token(auth["token"])},
+            }
+        return credentials
+
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
     ) -> dict[str, Any] | None:
@@ -225,13 +246,13 @@ async def test_mcp_datasource(
     transport = str(credentials.get("transport") or "http").lower()
 
     async def _probe() -> dict[str, Any]:
-        from shared.mcp_sdk import open_client
+        from shared.mcp_sdk import bearer_authorization, open_client
 
         async with AsyncExitStack() as stack:
             headers: dict[str, str] = {}
             auth = credentials.get("auth") or {}
             if auth.get("type") == "bearer":
-                headers["Authorization"] = f"Bearer {auth['token']}"
+                headers["Authorization"] = bearer_authorization(auth["token"])
             elif auth.get("type") == "headers":
                 headers.update(auth.get("headers") or {})
 

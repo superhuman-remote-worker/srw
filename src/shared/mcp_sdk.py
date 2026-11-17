@@ -20,6 +20,7 @@ probe in any shape, and the SDK falls back on it.
 
 from __future__ import annotations
 
+import re
 from contextlib import AsyncExitStack
 from importlib import import_module
 from types import ModuleType
@@ -27,6 +28,20 @@ from typing import Any
 
 #: Transports a remote server is reached over.
 REMOTE_TRANSPORTS = ("http", "sse")
+
+_PASTED_SCHEME = re.compile(r"^\s*bearer\s+", re.IGNORECASE)
+
+
+def bare_bearer_token(token: str) -> str:
+    """A bearer token without a pasted scheme. People paste the header value
+    ("Bearer abc…") into the token field; sent as is it became
+    ``Authorization: Bearer Bearer abc…``, which a server refuses (401)."""
+    return _PASTED_SCHEME.sub("", token).strip()
+
+
+def bearer_authorization(token: str) -> str:
+    """The ``Authorization`` value for a bearer token, its scheme once."""
+    return f"Bearer {bare_bearer_token(token)}"
 
 
 def ensure_mcp_sdk() -> ModuleType:

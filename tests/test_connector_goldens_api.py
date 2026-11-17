@@ -779,6 +779,17 @@ CASES: dict[str, ApiCase] = {
     "create/mcp/server_questions_accept": _create(
         _with(MCP_REMOTE, config={"server_questions": "accept"})
     ),
+    # A token pasted with its scheme is stored bare: SRW adds "Bearer " when it
+    # sends it, and "Bearer Bearer …" is a 401 (seen with Civitai, 2026-11-17).
+    "create/mcp/bearer_scheme_pasted": _create(
+        _with(
+            MCP_REMOTE,
+            credentials={
+                "transport": "http",
+                "auth": {"type": "bearer", "token": "Bearer mcp-secret"},
+            },
+        )
+    ),
     "create/mcp/server_questions_invalid": _create(
         _with(MCP_REMOTE, config={"server_questions": "always"})
     ),
