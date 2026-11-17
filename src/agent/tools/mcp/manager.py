@@ -64,6 +64,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from agent.tools.mcp.naming import mcp_server_slug, namespace_mcp_tool
+from agent.tools.mcp.schema import model_safe_schema
 from shared.mcp_questions import (
     ACCEPT,
     FACTORY_DEFAULT,
@@ -818,8 +819,9 @@ class MCPManager:
     def _wrap_tools(self, handle: _ServerHandle, listed: list[Any]) -> list[Any]:
         """One LangChain tool per MCP tool, each calling through this manager.
 
-        The tool's ``inputSchema`` is its argument schema as is. Its
-        annotations decide the permission effect.
+        The tool's ``inputSchema`` is its argument schema, with its regular
+        expressions moved into descriptions (:mod:`agent.tools.mcp.schema`).
+        Its annotations decide the permission effect.
         """
         from langchain_core.tools import StructuredTool
 
@@ -840,7 +842,9 @@ class MCPManager:
                 StructuredTool(
                     name=namespaced_name,
                     description=tool.description or "",
-                    args_schema=tool.input_schema,
+                    # Without regular expressions a provider would check
+                    # with its own engine (one it rejects fails the turn).
+                    args_schema=model_safe_schema(tool.input_schema),
                     coroutine=self._guarded(handle, tool.name),
                     metadata={
                         "mcp_server": handle.name,
