@@ -647,6 +647,26 @@ class TestGuidance:
         assert [i["key"] for i in entry_meta(entry)["items"]] == ["g1", "g2"]
         assert planned.guidance_ids == ["g1", "g2"]
 
+    def test_a_job_without_phases_gets_the_header_without_a_plan(self):
+        planned = plan(
+            base_history(),
+            ContextSources(guidance=[guidance("g1", "Focus on tests.")], phased=False),
+        )
+        entry = only(planned, "guidance")
+        assert "Focus on tests." in entry.content
+        assert "Your task remains in force" in entry.content
+        assert "re-planning" not in entry.content
+        assert "plan and todos" not in entry.content
+
+    def test_the_default_header_is_the_phased_one(self):
+        planned = plan(
+            base_history(), ContextSources(guidance=[guidance("g1", "Focus.")])
+        )
+        assert (
+            "Your current plan and todos remain in force"
+            in only(planned, "guidance").content
+        )
+
     def test_delivered_ids_are_filtered(self):
         planned = plan(
             base_history(),

@@ -1667,6 +1667,7 @@ def create_execute_node(
             failed_citations=_failed_citations,
             guidance=_guidance_entries,
             delivered_guidance_ids=_delivered_guidance_ids,
+            phased=binds_phase_tool(tool_names),
             subagents=_subagents_state,
         )
         _max_memories = max_memories_per_entry(config)
@@ -3904,12 +3905,18 @@ def _write_reply_files(
         workspace.git_manager.commit(f"Received {len(replies)} queued reply(ies)")
 
 
-def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
+def _format_drained_replies(
+    replies: List[Dict[str, Any]], *, phased: bool = True
+) -> str:
     """Render human/operator queued replies as one visible message-block.
 
     Injected as a persistent HumanMessage at a natural break/expiry or the
     tactical→strategic backstop because the audit files alone would be a dead
     letter box: nothing tells the worker to read them.
+
+    ``phased=False`` is a job that does not plan phases (it is not offered
+    ``next_phase_todos``): its closing line does not point at a plan or a
+    strategic review, which that job never reaches.
     """
     lines = [
         "[QUEUED MESSAGES] Messages received while you were working "
@@ -3923,10 +3930,13 @@ def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
         lines.append(f"--- ({meta}) ---")
         lines.append(str(reply.get("message", "")).strip())
         lines.append("")
-    lines.append(
-        "Weigh these against the current plan during the strategic review; "
-        "they do not force a re-plan by themselves."
-    )
+    if phased:
+        lines.append(
+            "Weigh these against the current plan during the strategic review; "
+            "they do not force a re-plan by themselves."
+        )
+    else:
+        lines.append("Take these into account in the work in progress.")
     return "\n".join(lines)
 
 
@@ -3966,6 +3976,8 @@ def _format_subagent_replies(replies: List[Dict[str, Any]]) -> str:
 
 def _drained_reply_messages(
     replies: List[Dict[str, Any]],
+    *,
+    phased: bool = True,
 ) -> List[HumanMessage]:
     """Build source-correct persistent carriers without reordering entries.
 
@@ -3989,7 +4001,9 @@ def _drained_reply_messages(
                 )
             )
         else:
-            messages.append(HumanMessage(content=_format_drained_replies(group)))
+            messages.append(
+                HumanMessage(content=_format_drained_replies(group, phased=phased))
+            )
         group = []
 
     for reply in replies:
@@ -4145,6 +4159,9 @@ def _deliver_queued_replies(
     tool_context: "ToolContext",
     config: AgentConfig,
     result: Dict[str, Any],
+    *,
+    todo_tool_bound: bool = True,
+    phased: bool = True,
 ) -> None:
     """Drain queued replies into the conversation at their source cadence.
 
@@ -4162,6 +4179,13 @@ def _deliver_queued_replies(
     is the better break: same intent ("finish the current unit of work, then
     read your mail"), roughly an order of magnitude more often, and independent
     of phase structure.
+
+    A job without ``todo_complete`` (``todo_tool_bound=False``) has no such
+    break: it works through one task, and the only to-do it has is closed by
+    ``job_complete``, its last call. Waiting for a completed todo would append
+    the mail after the model's final turn, where nobody reads it, so that job
+    gets human mail on the next tool pass. ``phased=False`` (no
+    ``next_phase_todos``) picks the closing line that names no plan.
 
     Entries are persistent rather than transient. Human mail uses an ordinary
     ``HumanMessage``. Child reports use the provider-portable HumanMessage
@@ -4186,7 +4210,9 @@ def _deliver_queued_replies(
     at_break = tool_context.consume_reply_drain()
     max_wait = float(getattr(config.limits, "queued_reply_max_wait_seconds", 300) or 0)
     human_replies = [reply for reply in pending if not _is_subagent_reply(reply)]
-    deliver_human = at_break or _replies_overdue(human_replies, max_wait)
+    deliver_human = (
+        at_break or not todo_tool_bound or _replies_overdue(human_replies, max_wait)
+    )
     replies = [reply for reply in pending if _is_subagent_reply(reply) or deliver_human]
     if not replies:
         return
@@ -4201,7 +4227,7 @@ def _deliver_queued_replies(
             logger.warning(f"[{job_id}] Failed to archive queued replies: {e}")
 
     result["messages"] = list(result.get("messages") or []) + (
-        _drained_reply_messages(replies)
+        _drained_reply_messages(replies, phased=phased)
     )
 
     delivered.update(_reply_key(r) for r in replies)
@@ -4221,10 +4247,13 @@ def _deliver_queued_replies(
     if immediate:
         cadence.append(f"{immediate} child event(s) immediately")
     if human:
-        cadence.append(
-            f"{human} human reply(ies) at "
-            f"{'a completed todo' if at_break else 'the wall-clock floor'}"
-        )
+        if at_break:
+            where = "a completed todo"
+        elif not todo_tool_bound:
+            where = "the next tool step (the job has no todo steps)"
+        else:
+            where = "the wall-clock floor"
+        cadence.append(f"{human} human reply(ies) at {where}")
     logger.info(
         f"[{job_id}] Delivered {len(replies)} queued reply(ies): {', '.join(cadence)}"
     )
@@ -5408,6 +5437,7 @@ def create_audited_tool_node(
     # A job without todo_complete cannot mark a todo as blocked: its two
     # recovery suffixes point at job_complete instead.
     _todo_tool_bound = binds_todo_tool([getattr(t, "name", "") for t in tools])
+    _phase_tool_bound = binds_phase_tool([getattr(t, "name", "") for t in tools])
     _loop_warning_key = (
         "loop_warning_suffix"
         if _todo_tool_bound
@@ -6176,7 +6206,14 @@ def create_audited_tool_node(
         # turn in execute() and is unaffected.
         if tool_context is not None:
             try:
-                _deliver_queued_replies(job_id, tool_context, config, result)
+                _deliver_queued_replies(
+                    job_id,
+                    tool_context,
+                    config,
+                    result,
+                    todo_tool_bound=_todo_tool_bound,
+                    phased=_phase_tool_bound,
+                )
             except Exception as e:
                 logger.warning(f"[{job_id}] Queued-reply delivery failed: {e}")
 

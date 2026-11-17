@@ -255,7 +255,8 @@ class ContextSources:
     - ``failed_citations``: the failed citations; None when there is no
       citation engine (or the lookup failed).
     - ``guidance``: pending supervisor guidance entries; ``delivered_guidance_ids``
-      the ids already delivered (spec §C, D21).
+      the ids already delivered (spec §C, D21). ``phased`` is False for a job
+      that does not plan phases, which changes the guidance header only.
     - ``subagents``: the rendered active-subagents block; None when there is
       no subagent runtime, "" when none is running.
     - ``permission_mode``: the session's permission mode (D13 of
@@ -273,6 +274,7 @@ class ContextSources:
     failed_citations: Optional[Sequence[Any]] = None
     guidance: Sequence[Mapping[str, Any]] = ()
     delivered_guidance_ids: Collection[str] = ()
+    phased: bool = True
     subagents: Optional[str] = None
     permission_mode: Optional[str] = None
     turn_boundary: str = ""
@@ -421,7 +423,9 @@ def _plan_guidance(
         new.append(item)
     if not new:
         return None
-    body = format_supervisor_guidance([dict(item.record) for item in new]).strip()
+    body = format_supervisor_guidance(
+        [dict(item.record) for item in new], phased=sources.phased
+    ).strip()
     if not body:
         return None
     entry = make_context_entry(

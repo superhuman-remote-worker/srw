@@ -466,6 +466,131 @@ class TestDelivery:
         assert acks == [], "stateless ack must follow the absorbing checkpoint"
 
 
+class TestJobWithoutTodoSteps:
+    """A job without ``todo_complete`` never completes a todo before its last
+    call: ``job_complete`` closes the only one it has. Its human mail is
+    delivered on the next tool pass, where the model can still act on it."""
+
+    def test_fresh_human_mail_is_delivered_on_the_tool_pass(
+        self, monkeypatch, acks, written
+    ):
+        reply = {"thread_id": "t1", "message": "also do Y", "timestamp": iso(5)}
+        set_inbox(monkeypatch, [reply])
+        ctx = make_context()
+        result = {"messages": []}
+
+        _deliver_queued_replies(
+            "job-1", ctx, make_config(), result, todo_tool_bound=False
+        )
+
+        assert len(result["messages"]) == 1
+        assert "also do Y" in result["messages"][0].content
+        assert acks == [
+            {
+                "job_id": "job-1",
+                "guidance_ids": None,
+                "reply_threads": None,
+                "reply_keys": [_reply_key(reply)],
+            }
+        ]
+        assert written and written[0][0]["message"] == "also do Y"
+
+    def test_the_same_mail_waits_in_a_job_with_todo_steps(
+        self, monkeypatch, acks, written
+    ):
+        set_inbox(
+            monkeypatch,
+            [{"thread_id": "t1", "message": "also do Y", "timestamp": iso(5)}],
+        )
+        ctx = make_context()
+        result = {"messages": []}
+
+        _deliver_queued_replies(
+            "job-1", ctx, make_config(), result, todo_tool_bound=True
+        )
+
+        assert result["messages"] == []
+        assert acks == []
+
+    def test_delivery_does_not_depend_on_the_wall_clock_floor(
+        self, monkeypatch, acks, written
+    ):
+        set_inbox(
+            monkeypatch,
+            [{"thread_id": "t1", "message": "also do Y", "timestamp": iso(5)}],
+        )
+        ctx = make_context()
+        result = {"messages": []}
+
+        _deliver_queued_replies(
+            "job-1", ctx, make_config(max_wait=0), result, todo_tool_bound=False
+        )
+
+        assert len(result["messages"]) == 1
+
+    def test_the_closing_line_names_no_plan_for_a_job_without_phases(
+        self, monkeypatch, acks, written
+    ):
+        set_inbox(
+            monkeypatch,
+            [{"thread_id": "t1", "message": "also do Y", "timestamp": iso(5)}],
+        )
+        result = {"messages": []}
+
+        _deliver_queued_replies(
+            "job-1",
+            make_context(),
+            make_config(),
+            result,
+            todo_tool_bound=False,
+            phased=False,
+        )
+
+        text = result["messages"][0].content
+        assert text.endswith("Take these into account in the work in progress.")
+        for word in ("plan", "strategic", "re-plan"):
+            assert word not in text
+
+    def test_the_closing_line_is_unchanged_for_a_phased_job(
+        self, monkeypatch, acks, written
+    ):
+        set_inbox(
+            monkeypatch,
+            [{"thread_id": "t1", "message": "check X", "timestamp": iso(5)}],
+        )
+        ctx = make_context()
+        ctx.request_reply_drain()
+        result = {"messages": []}
+
+        _deliver_queued_replies("job-1", ctx, make_config(), result)
+
+        assert result["messages"][0].content.endswith(
+            "Weigh these against the current plan during the strategic review; "
+            "they do not force a re-plan by themselves."
+        )
+
+    def test_a_delivered_reply_is_not_repeated_on_the_next_pass(
+        self, monkeypatch, acks, written
+    ):
+        set_inbox(
+            monkeypatch,
+            [{"thread_id": "t1", "message": "also do Y", "timestamp": iso(5)}],
+        )
+        ctx = make_context()
+        first, second = {"messages": []}, {"messages": []}
+
+        _deliver_queued_replies(
+            "job-1", ctx, make_config(), first, todo_tool_bound=False
+        )
+        _deliver_queued_replies(
+            "job-1", ctx, make_config(), second, todo_tool_bound=False
+        )
+
+        assert len(first["messages"]) == 1
+        assert second["messages"] == []
+        assert len(acks) == 1
+
+
 class TestSourceAwareArchive:
     def test_child_report_file_never_claims_to_be_user_mail(self):
         workspace = MagicMock()

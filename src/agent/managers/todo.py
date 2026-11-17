@@ -578,8 +578,15 @@ class TodoManager:
         Returns:
             Formatted commit message
         """
-        phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
-        header = f"[Phase {self._phase_number} {phase_type}] {todo.id}: {todo.content}"
+        if self.todo_tool_bound:
+            phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
+            header = (
+                f"[Phase {self._phase_number} {phase_type}] {todo.id}: {todo.content}"
+            )
+        else:
+            # A job without todo_complete works through one task: its commit
+            # carries no phase label.
+            header = f"[Task] {todo.content}"
 
         body_lines = [
             f"Completed: {datetime.now(timezone.utc).isoformat()}",

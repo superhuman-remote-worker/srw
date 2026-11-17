@@ -22,6 +22,8 @@ checkpoint) and pin what such a job does:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from agent.tools.core.job import _final_phase_data, _missing_deliverable_refused
@@ -278,6 +280,75 @@ class TestPlainReplies:
         assert out["error"]["type"] == "parser_failure"
         assert out["should_stop"] is True
         assert out["completion_report_payload"]["error"]["type"] == "parser_failure"
+
+
+class TestMessageWhileRunning:
+    """A message sent to a running job reaches the model on its next call.
+
+    Non-urgent mail waits for a completed todo in a job that works through
+    todos. Here the only todo is closed by ``job_complete``, the last call, so
+    waiting for it would append the mail after the final turn.
+    """
+
+    @staticmethod
+    def _fresh_reply() -> dict:
+        # Just sent: the wall-clock floor (300 s) does not deliver it.
+        return {
+            "thread_id": "officer",
+            "message": "Please also write extra.txt.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_queued_message_is_in_the_next_request(self, tmp_path, monkeypatch):
+        reply = self._fresh_reply()
+        monkeypatch.setattr(
+            "agent.graph._get_queued_replies", lambda job_id: [dict(reply)]
+        )
+        monkeypatch.setattr(
+            "agent.graph._ack_supervisor_guidance", lambda *args, **kwargs: None
+        )
+        job = build_job(
+            tmp_path,
+            [
+                write_file_call("call_write"),
+                write_file_call("call_extra", path="extra.txt"),
+                job_complete_call(),
+            ],
+        )
+
+        await job.start()
+
+        assert "Please also write extra.txt." not in request_text(job.requests[0])
+        # Delivered with the first tool step, before the job's last call.
+        assert "Please also write extra.txt." in request_text(job.requests[1])
+        # Once: the delivered message stays in the history, it is not appended
+        # again on the next tool step.
+        assert request_text(job.requests[2]).count("Please also write extra.txt.") == 1
+        # The wrapper does not send the job to a review step it never reaches.
+        assert "Take these into account in the work in progress." in request_text(
+            job.requests[1]
+        )
+        _assert_no_phase_words(job.requests)
+
+    @pytest.mark.asyncio
+    async def test_with_todo_steps_the_same_message_waits(self, tmp_path, monkeypatch):
+        reply = self._fresh_reply()
+        monkeypatch.setattr(
+            "agent.graph._get_queued_replies", lambda job_id: [dict(reply)]
+        )
+        monkeypatch.setattr(
+            "agent.graph._ack_supervisor_guidance", lambda *args, **kwargs: None
+        )
+        job = build_job(
+            tmp_path,
+            [write_file_call("call_write"), job_complete_call()],
+            tool_names=WORKER_TOOLS,
+        )
+
+        await job.start()
+
+        assert "Please also write extra.txt." not in request_text(job.requests[1])
 
 
 class TestFeedbackResume:
