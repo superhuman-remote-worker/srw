@@ -70,8 +70,10 @@ import { classifyResumeError, ConfigDriftItem } from './resume-error';
 import { reduce, ReducerAction } from './turn-reducer';
 import {
   attachmentDedupeKey,
+  attachmentTypeFromName,
   classifyUploadFailure,
   composeAgentContent,
+  parseAttachmentHint,
   PendingUpload,
   progressWriteDue,
 } from './upload-stage';
@@ -9608,12 +9610,27 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     if (!isUser && !isAssistant && !isTool) continue;
 
     if (isUser) {
+      // The stored content carries the attachment hint the agent read; the
+      // bubble shows the user's text and the files as chips again, as it
+      // did before the reload (image_generation.md WP5).
+      const {text, names} = parseAttachmentHint(m.content || '');
       const u: UserTurn = {
         kind: 'user',
         id: m.id,
-        content: m.content || '',
+        content: text,
         timestamp: ts,
         historical: true,
+        ...(names.length
+          ? {
+              attachments: names.map((name, index) => ({
+                id: `${m.id}:attachment:${index}`,
+                name: name.split('/').pop() || name,
+                size: 0,
+                mimeType: attachmentTypeFromName(name),
+                path: `uploads/${name}`,
+              })),
+            }
+          : {}),
       };
       turns.push(u);
       continue;

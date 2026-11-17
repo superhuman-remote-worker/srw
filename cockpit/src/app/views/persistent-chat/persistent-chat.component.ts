@@ -110,6 +110,7 @@ import {queueParkReasonKey} from '../../core/models/queue-park-reason';
 import type {SessionUnknownToolCall, SessionUnknownToolResultDecision} from '../../core/models/api.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ExternalImageDirective} from '../../ui/external-image';
+import {AttachmentThumbComponent, canThumbnail} from './attachment-thumb.component';
 import {SessionListService} from '../../core/services/session-list.service';
 
 interface SlashCommand {
@@ -1002,6 +1003,7 @@ export function clearDraft(threadId: string | null): void {
         DatePipe,
         MarkdownComponent,
         ExternalImageDirective,
+        AttachmentThumbComponent,
         CitationRefDirective,
         WorkspaceFileLinkDirective,
         KatexDirective,
@@ -1555,6 +1557,14 @@ export function clearDraft(threadId: string | null): void {
                   @if (turn.attachments?.length) {
                     <div class="user-attachments">
                       @for (att of turn.attachments; track att.id) {
+                        @if (att.path && canThumbnail(att.path) && chat.threadId(); as tid) {
+                          <app-attachment-thumb
+                            [threadId]="tid"
+                            [path]="att.path"
+                            [name]="att.name"
+                            (opened)="openAttachmentPreview($event)"
+                          />
+                        }
                         <span class="user-attachment-chip" [title]="att.path ?? att.name">
                           <app-icon size="sm">{{
                             att.mimeType.startsWith('image/') ? 'image' :
@@ -3779,6 +3789,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.imagePreviewName.set(preview.name);
         this.imagePreviewUrl.set(preview.preview);
     }
+
+    /** A sent image's thumbnail, opened in the same dialog. */
+    openAttachmentPreview(preview: {url: string; name: string}): void {
+        this.imagePreviewName.set(preview.name);
+        this.imagePreviewUrl.set(preview.url);
+    }
+
+    /** Whether a sent file gets a thumbnail (raster images only). */
+    readonly canThumbnail = canThumbnail;
 
     closeImagePreview(): void {
         this.imagePreviewUrl.set(null);

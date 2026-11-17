@@ -190,3 +190,67 @@ def with_png_text(data: bytes, entries: dict[str, str]) -> bytes:
             struct.pack(">I", len(body)) + chunk_type + body + struct.pack(">I", crc)
         )
     return data[:iend_at] + b"".join(chunks) + data[iend_at:]
+
+
+@dataclass(frozen=True)
+class CroppedImage:
+    data: bytes
+    mime_type: str
+    width: int
+    height: int
+    source_width: int
+    source_height: int
+    box: tuple[int, int, int, int]
+
+
+def region_problem(region: Sequence[float] | None) -> str | None:
+    """Why ``region`` ([left, top, right, bottom] in percent) is unusable."""
+    if region is None:
+        return None
+    if len(region) != 4:
+        return "region needs four numbers: [left, top, right, bottom] in percent"
+    try:
+        left, top, right, bottom = (float(v) for v in region)
+    except (TypeError, ValueError):
+        return "region values must be numbers (percent of the width and height)"
+    if not all(0 <= v <= 100 for v in (left, top, right, bottom)):
+        return "region values are percentages from 0 to 100"
+    if right <= left or bottom <= top:
+        return "region must have right > left and bottom > top"
+    return None
+
+
+def crop_region(data: bytes, region: Sequence[float]) -> CroppedImage:
+    """The part of an image inside ``region`` (percent edges), at the
+    original resolution after EXIF orientation. A crop is for reading small
+    text and detail, so a lossless source stays lossless (PNG); only a JPEG
+    source is cropped to a high-quality JPEG."""
+    problem = region_problem(region)
+    if problem:
+        raise ImageComposeError(problem)
+    image = open_image(data)
+    width, height = image.size
+    left, top, right, bottom = (float(v) / 100 for v in region)
+    box = (
+        int(round(left * width)),
+        int(round(top * height)),
+        max(int(round(right * width)), int(round(left * width)) + 1),
+        max(int(round(bottom * height)), int(round(top * height)) + 1),
+    )
+    part = image.crop(box)
+    out = io.BytesIO()
+    if part.mode == "RGBA" or sniff_mime(data) != "image/jpeg":
+        part.save(out, format="PNG", optimize=True)
+        mime = "image/png"
+    else:
+        part.save(out, format="JPEG", quality=92)
+        mime = "image/jpeg"
+    return CroppedImage(
+        data=out.getvalue(),
+        mime_type=mime,
+        width=part.width,
+        height=part.height,
+        source_width=width,
+        source_height=height,
+        box=box,
+    )

@@ -1,8 +1,10 @@
 import {describe, expect, it} from 'vitest';
 import {
     attachmentDedupeKey,
+    attachmentTypeFromName,
     classifyUploadFailure,
     composeAgentContent,
+    parseAttachmentHint,
     progressWriteDue,
     PROGRESS_WRITE_INTERVAL_MS,
     sendProgressPercent,
@@ -235,5 +237,35 @@ describe('topLevelUploadTargets', () => {
     it('ignores an empty name rather than targeting the uploads root', () => {
         // A DELETE of '' would address uploads/ itself.
         expect(topLevelUploadTargets(['', '/leading.txt'])).toEqual([]);
+    });
+});
+
+
+describe('parseAttachmentHint (image_generation WP5: chips survive a reload)', () => {
+    it('undoes composeAgentContent', () => {
+        const sent = composeAgentContent('Look at these', ['cat.png', 'notes.pdf']);
+        expect(parseAttachmentHint(sent)).toEqual({
+            text: 'Look at these',
+            names: ['cat.png', 'notes.pdf'],
+        });
+    });
+
+    it('reads a message that is only the hint', () => {
+        expect(parseAttachmentHint(composeAgentContent('', ['a.jpg']))).toEqual({
+            text: '',
+            names: ['a.jpg'],
+        });
+    });
+
+    it('leaves a message without a trailing hint alone', () => {
+        const text = 'I wrote [Attached files in uploads/: x] in the middle\nand more';
+        expect(parseAttachmentHint(text)).toEqual({text, names: []});
+        expect(parseAttachmentHint('plain')).toEqual({text: 'plain', names: []});
+    });
+
+    it('guesses the type from the name for the chip icon', () => {
+        expect(attachmentTypeFromName('IMG_0001.JPG')).toBe('image/jpeg');
+        expect(attachmentTypeFromName('talk.m4a')).toBe('audio/mp4');
+        expect(attachmentTypeFromName('data.bin')).toBe('application/octet-stream');
     });
 });

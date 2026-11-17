@@ -88,6 +88,13 @@ from shared.db_url import (
 _PG_CHECKPOINT_SCHEMA_READY = False
 
 
+def _image_max_edge(config: object) -> int | None:
+    """The longest image edge the model is shown (read_file's region hint)."""
+    from agent.services.image_content import safe_image_max_edge
+
+    return safe_image_max_edge(config)
+
+
 def _remote_workspace_authority(
     metadata: Dict[str, Any],
     worker_lease_token: Optional[int],
@@ -4478,6 +4485,9 @@ class UniversalAgent:
             **self.config.extra,
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,  # For vision-aware file reading
+            # The longest edge the model is shown, so read_file can say "you
+            # see this at W×H; use region" (image_generation.md WP5).
+            "image_max_edge": _image_max_edge(self.config),
             # Lets bulk readers cap a single tool result relative to the main
             # model's window (session_silent_failure_audit.md #5).
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,

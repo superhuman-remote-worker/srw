@@ -1672,6 +1672,17 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "effect": "write",
         "phases": ["strategic", "tactical"],
     },
+    "compose_images": {
+        "module": "workspace.images",
+        "function": "compose_images",
+        "description": (
+            "Put several workspace images into one labelled grid (contact "
+            "sheet, character sheet) and save it as a PNG"
+        ),
+        "category": "workspace",
+        "effect": "write",
+        "phases": ["strategic", "tactical"],
+    },
 }
 
 

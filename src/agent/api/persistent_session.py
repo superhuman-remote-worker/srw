@@ -65,6 +65,13 @@ from agent.tools.description_manager import apply_description_overrides
 logger = logging.getLogger(__name__)
 
 
+def _image_max_edge(config: object) -> int | None:
+    """The longest image edge the model is shown (read_file's region hint)."""
+    from agent.services.image_content import safe_image_max_edge
+
+    return safe_image_max_edge(config)
+
+
 class MemoryUnavailableError(RuntimeError):
     """A configured (required) memory component could not be set up.
 
@@ -2474,6 +2481,9 @@ class PersistentSession:
             ),
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
+            # The longest edge the model is shown, so read_file can say "you
+            # see this at W×H; use region" (image_generation.md WP5).
+            "image_max_edge": _image_max_edge(self.config),
             # Whether the parent model may send several tool calls per message
             # (matrix `parallel_tool_calls`): the delegate_agent description
             # offers session fan-out only to a model that can issue it.

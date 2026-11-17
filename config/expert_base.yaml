@@ -106,6 +106,8 @@ tools:
     - get_document_info
     - create_directory
     - delete_directory
+    # Contact and character sheets from workspace images (Pillow, every tier).
+    - compose_images
   # Skill tools - use_skill loads a skill from skills/<name>/ (src/agent/tools/workspace/skills.py).
   # Its own group so that a `workspace` list written by an expert cannot drop it.
   # The skill list in the prompt follows this tool: `skills: []` means no list and

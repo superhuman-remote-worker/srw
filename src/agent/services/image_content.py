@@ -176,6 +176,14 @@ def make_multimodal_user_message(
     )
 
 
+def safe_image_max_edge(config: object) -> int | None:
+    """:func:`resolve_image_max_edge`, or ``None`` when the config cannot say."""
+    try:
+        return resolve_image_max_edge(config)
+    except Exception:  # noqa: BLE001 - a hint, never a failure
+        return None
+
+
 def resolve_image_max_edge(config: object) -> int | None:
     """Resolve the downscale max-edge (px) for images from an agent config.
 

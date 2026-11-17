@@ -2019,6 +2019,9 @@
   },
   "chat": {
     "defaultTitle": "Persistent Agent",
+    "attachment": {
+      "openPreview": "Open {{name}}"
+    },
     "subagent": {
       "banner": "Subagent transcript · {{handle}} · {{type}} · {{status}}",
       "parentJob": "Parent job {{id}}",

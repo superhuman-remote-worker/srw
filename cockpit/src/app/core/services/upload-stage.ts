@@ -77,6 +77,46 @@ export function composeAgentContent(text: string, names: readonly string[]): str
     return text ? `${text}\n\n${hint}` : hint;
 }
 
+const ATTACHMENT_HINT_RE = /(?:^|\n\n)\[Attached files in uploads\/: ([^\n]+)\]\s*$/;
+
+/**
+ * The inverse of {@link composeAgentContent} for a message read back from
+ * history: the user's text without the hint, and the file names it named.
+ * Names are split on ", ", so a name that itself contains ", " comes back
+ * split (structured attachments are a follow-up, image_generation.md §10).
+ */
+export function parseAttachmentHint(content: string): {text: string; names: string[]} {
+    const match = ATTACHMENT_HINT_RE.exec(content);
+    if (!match) return {text: content, names: []};
+    const names = match[1].split(', ').map((name) => name.trim()).filter(Boolean);
+    return {text: content.slice(0, match.index), names};
+}
+
+const ATTACHMENT_TYPES: Readonly<Record<string, string>> = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    heic: 'image/heic',
+    svg: 'image/svg+xml',
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+    mov: 'video/quicktime',
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    m4a: 'audio/mp4',
+    ogg: 'audio/ogg',
+    pdf: 'application/pdf',
+};
+
+/** A best guess at an uploaded file's type from its name (for the chip icon). */
+export function attachmentTypeFromName(name: string): string {
+    const dot = name.lastIndexOf('.');
+    const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+    return ATTACHMENT_TYPES[ext] ?? 'application/octet-stream';
+}
+
 /**
  * A permanent refusal from the `none` workspace tier. Matched on the detail
  * text because the endpoint returns 409 for this AND for a pod that is merely

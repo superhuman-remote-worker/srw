@@ -102,6 +102,7 @@ spec:
             - file_exists
             - move_file
             - copy_file
+            - compose_images
             - get_document_info
             - create_directory
           shell:

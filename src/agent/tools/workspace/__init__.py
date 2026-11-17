@@ -35,10 +35,12 @@ def create_workspace_tools(context: ToolContext) -> List[Any]:
 
     from agent.tools.workspace.files import create_file_tools
     from agent.tools.workspace.filesystem import create_filesystem_tools
+    from agent.tools.workspace.images import create_image_tools
 
     tools = []
     tools.extend(create_file_tools(context))
     tools.extend(create_filesystem_tools(context))
+    tools.extend(create_image_tools(context))
 
     return tools
 

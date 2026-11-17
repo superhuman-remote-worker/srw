@@ -207,13 +207,17 @@ _POST_SPLIT_TOOL_ADDITIONS: dict[str, dict[str, tuple[str, ...]]] = {
     # the shared root's knowledge category alongside kb_search.
     # Citation engine overhaul (D7): withdraw_citation joined the shared root's
     # citation category next to edit_citation (flag, never delete).
+    # Image generation WP5 (2026-11-17): compose_images joined the shared
+    # root's workspace category (contact and character sheets on every tier).
     "worker": {
         "knowledge": ("kb_delete", "kb_grep"),
         "citation": ("withdraw_citation",),
+        "workspace": ("compose_images",),
     },
     "session": {
         "knowledge": ("kb_delete", "kb_grep"),
         "citation": ("withdraw_citation",),
+        "workspace": ("compose_images",),
     },
 }
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->

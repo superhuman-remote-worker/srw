@@ -89,6 +89,7 @@ WRITE_TOOLS = frozenset(
         "kb_update",
         "kb_delete",
         "generate_image",
+        "compose_images",
     }
 )
 #: Argument names that carry a workspace path on the write tools.
@@ -97,6 +98,13 @@ WRITE_POLICIES = ("none", "scratch_only", "owned_paths", "full")
 ISOLATIONS = ("shared", "worktree")
 
 _WORKTREE_INDEX = itertools.count(1)
+
+
+def _image_max_edge(config: object) -> int | None:
+    """The longest image edge the model is shown (read_file's region hint)."""
+    from agent.services.image_content import safe_image_max_edge
+
+    return safe_image_max_edge(config)
 
 
 class SpawnRefused(ValueError):
@@ -754,6 +762,7 @@ def child_tool_config(
         {
             "agent_id": cfg.agent_id,
             "multimodal": cfg.llm.multimodal,
+            "image_max_edge": _image_max_edge(cfg),
             "model_max_context_tokens": cfg.limits.model_max_context_tokens,
             "pdf_render_dpi": getattr(cfg.limits, "pdf_render_dpi", None),
             "tags": list(getattr(cfg, "tags", []) or []),

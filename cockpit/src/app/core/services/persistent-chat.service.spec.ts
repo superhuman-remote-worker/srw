@@ -10512,6 +10512,34 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     expect(u.reasoningEstimated).toBe(true);
   });
 
+  describe('historyToTurns — sent files come back as chips after a reload', () => {
+    it('strips the attachment hint and rebuilds the attachments', () => {
+      const [turn] = historyToTurns([
+        {
+          id: 'u1',
+          role: 'human',
+          content: 'Make this brighter\n\n[Attached files in uploads/: photo.jpg, brief.pdf]',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: '2026-11-17T22:00:00Z',
+        },
+      ] as never) as UserTurn[];
+      expect(turn.content).toBe('Make this brighter');
+      expect(turn.attachments).toEqual([
+        { id: 'u1:attachment:0', name: 'photo.jpg', size: 0, mimeType: 'image/jpeg', path: 'uploads/photo.jpg' },
+        { id: 'u1:attachment:1', name: 'brief.pdf', size: 0, mimeType: 'application/pdf', path: 'uploads/brief.pdf' },
+      ]);
+    });
+
+    it('leaves a message without attachments as it was', () => {
+      const [turn] = historyToTurns([
+        { id: 'u2', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-11-17T22:00:00Z' },
+      ] as never) as UserTurn[];
+      expect(turn.content).toBe('hi');
+      expect(turn.attachments).toBeUndefined();
+    });
+  });
+
   describe('historyToTurns — a returned tool error stays an error after replay', () => {
     // The live `tool.completed` frame carries is_error; history rows do not.
     // Without the replay rule a reloaded "Error: File not found" showed as a
