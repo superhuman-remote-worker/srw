@@ -113,11 +113,15 @@ deployment authorization.
 - **Progress**: a collapsible checklist shows the agent's current todos; a
   token-usage panel shows context fill; reasoning and tool calls can be
   expanded or collapsed.
+- **Chat display**: whether reasoning blocks and tool calls start expanded or
+  collapsed, the reading width, the text size, and how officer logs fold are
+  set in **Settings → General → Chat display**, not inside the session. They
+  are saved on this device and apply to every session.
 - **Header**: the model and permission-mode badges (each opens **Session
   settings**), the **Canvas** and shared-browser buttons when the session
   offers them, **Disconnect**, and a **More actions** (⋮) menu. That menu
-  always holds **Copy session ID**, **Session settings** (including the live
-  workspace and tool controls), and **View options**; it adds **Citations**
+  always holds **Copy session ID** and **Session settings** (including the
+  live workspace and tool controls); it adds **Citations**
   once anything is cited, **Files** only when the session has a session folder
   in the cloud, and **Git**, **IDE**, or **SSH** when the workspace provides
   them. A session without a session folder has no **Files** entry anywhere.
