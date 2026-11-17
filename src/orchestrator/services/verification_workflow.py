@@ -657,9 +657,10 @@ async def setup_verification_critic_workspace(
     from_branch = target_job.get("branch_name") or "main"
     branch_name = f"subjob/{short_id}/{effective_config}"
     try:
-        parent_authority = await effects.prepare_job_repository_authority(
-            dependencies.store, effects.forge, target_job
-        )
+        # The effect arrives with the store and the forge bound
+        # (application/completion.py); passing them again raised a TypeError
+        # and the parent never settled after the critic's verdict.
+        parent_authority = await effects.prepare_job_repository_authority(target_job)
         if parent_authority is None:
             raise RuntimeError("Target repository authority is unavailable")
         parent_repo_name = str(parent_authority["repo_name"])

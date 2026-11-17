@@ -217,12 +217,65 @@ def resolve_scholar_config_from_disk(
 
 
 def get_autonomy_level(job: dict[str, Any]) -> str:
-    """Read the autonomy level from resolved_config (default: 'review')."""
+    """Read the autonomy level from resolved_config (default: 'review').
+
+    A job row has no ``resolved_config`` when its frozen configuration lives
+    in its execution snapshot. The level is then read the way
+    :func:`is_verification_enabled` reads its section: the job's own override,
+    else the expert's file, else the worker base. Without this a ``full`` job
+    read as ``review`` here, and a critic's approval left it waiting for a
+    person.
+    """
     rc = _parse_resolved_config(job)
     agent_block = rc.get("agent")
     if isinstance(agent_block, dict):
         return agent_block.get("autonomy", "review")
-    return rc.get("autonomy", "review")
+    if rc:
+        return rc.get("autonomy", "review")
+    return _autonomy_without_resolved_config(job)
+
+
+def _autonomy_without_resolved_config(job: dict[str, Any]) -> str:
+    """The autonomy level of a job row that carries no resolved_config.
+
+    A stored expert named by id is not read here (no database at hand): such
+    a job falls through to the worker base unless it states its own level.
+    """
+    config_override = job.get("config_override")
+    if isinstance(config_override, str):
+        try:
+            config_override = json.loads(config_override)
+        except (json.JSONDecodeError, ValueError):
+            config_override = None
+    if isinstance(config_override, dict):
+        stated = config_override.get("autonomy")
+        if isinstance(stated, str) and stated:
+            return stated
+
+    config_name = job.get("config_name") or "worker_base"
+    for path in (
+        _REPO_ROOT / "config" / "experts" / config_name / "config.yaml",
+        _REPO_ROOT / "config" / f"{config_name}.yaml",
+    ):
+        if path.exists():
+            try:
+                from shared.runtime.core.srw_manifest_config import read_srw_config
+
+                stated = read_srw_config(path).get("autonomy")
+                if isinstance(stated, str) and stated:
+                    return stated
+            except Exception as e:
+                logger.warning("Failed to read %s for the autonomy level: %s", path, e)
+            break
+    try:
+        from shared.runtime.core.loader import load_role_base
+
+        stated = load_role_base("worker").get("autonomy")
+        if isinstance(stated, str) and stated:
+            return stated
+    except Exception as e:
+        logger.warning("Failed to read the worker base for the autonomy level: %s", e)
+    return "review"
 
 
 # ---------------------------------------------------------------------------
