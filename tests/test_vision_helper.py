@@ -18,7 +18,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.services.vision_helper import VisionHelper
+from agent.services.vision_helper import (
+    VISION_FAILURE_PREFIX,
+    VisionHelper,
+    vision_failed,
+)
 
 
 # =============================================================================
@@ -132,3 +136,113 @@ def test_data_url_mime_type_propagates(mime):
     asyncio.run(helper.describe_image(image_data=b"abcd", mime_type=mime))
     url = captured[0]["messages"][0]["content"][1]["image_url"]["url"]
     assert url.startswith(f"data:{mime};base64,")
+
+
+# =============================================================================
+# Hardening (image_generation.md WP1)
+# =============================================================================
+
+
+def _png(size):
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", size, (10, 120, 200)).save(out, format="PNG")
+    return out.getvalue()
+
+
+def test_a_large_image_is_downscaled_to_the_max_edge():
+    import io
+
+    from PIL import Image
+
+    helper, captured = _make_helper_with_capture()
+    helper.max_edge = 1568
+    asyncio.run(
+        helper.describe_image(image_data=_png((4000, 2000)), mime_type="image/png")
+    )
+    url = captured[0]["messages"][0]["content"][1]["image_url"]["url"]
+    sent = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+    assert max(sent.size) == 1568
+
+    small = _png((800, 600))
+    asyncio.run(helper.describe_image(image_data=small, mime_type="image/png"))
+    url = captured[1]["messages"][0]["content"][1]["image_url"]["url"]
+    assert base64.b64decode(url.split(",", 1)[1]) == small  # fits: unchanged
+
+
+def test_a_failure_says_the_image_was_not_seen():
+    helper, _captured = _make_helper_with_capture()
+    helper.client.chat.completions.create = AsyncMock(side_effect=RuntimeError("503"))
+    result = asyncio.run(helper.describe_image(image_data=b"abcd"))
+    assert result.startswith(VISION_FAILURE_PREFIX)
+    assert "RuntimeError: 503" in result
+    assert vision_failed(result) and not vision_failed("A blue square.")
+    page = asyncio.run(helper.describe_document_page(page_image=b"abcd", page_num=2))
+    assert page.startswith(VISION_FAILURE_PREFIX) and "page 2" in page
+
+
+def test_token_usage_is_archived_for_metering(monkeypatch):
+    helper, _captured = _make_helper_with_capture()
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = "a cat"
+    response.usage = MagicMock(
+        prompt_tokens=812, completion_tokens=40, total_tokens=852
+    )
+    helper.client.chat.completions.create = AsyncMock(return_value=response)
+    del helper._archive_vision_call  # use the real one
+    archiver = MagicMock()
+    monkeypatch.setattr("agent.core.archiver.get_archiver", lambda: archiver)
+    asyncio.run(helper.describe_image(image_data=b"abcd", job_id="job-1"))
+    sent = archiver.archive.call_args.kwargs["response"]
+    assert sent.response_metadata["token_usage"] == {
+        "prompt_tokens": 812,
+        "completion_tokens": 40,
+        "total_tokens": 852,
+    }
+
+
+def test_read_file_never_caches_a_failed_description(tmp_path, monkeypatch):
+    from agent.core.workspace import WorkspaceManager
+    from agent.services import description_cache as cache_module
+    from agent.tools.context import ToolContext
+    from agent.tools.registry import load_tools
+    from tests._fs_backend import FilesystemTestBackend
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    workspace = WorkspaceManager(
+        job_id="job-vision", base_path=root, backend=FilesystemTestBackend(root)
+    )
+    workspace.initialize()
+    (root / "pic.png").write_bytes(_png((40, 30)))
+    context = ToolContext(workspace_manager=workspace, config={"multimodal": False})
+    read_file = {t.name: t for t in load_tools(["read_file"], context)}["read_file"]
+
+    answers = iter([RuntimeError("boom"), "A small blue rectangle."])
+
+    async def describe(*_args, **_kwargs):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            return f"{VISION_FAILURE_PREFIX}: the vision model could not describe it]"
+        return answer
+
+    helper = MagicMock()
+    helper.describe_image_sync = lambda *a, **k: asyncio.run(describe())
+    monkeypatch.setattr(
+        "agent.services.vision_helper.get_vision_helper", lambda: helper
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "_description_cache",
+        cache_module.DescriptionCache(tmp_path / "vision-cache"),
+    )
+
+    first = read_file.invoke({"path": "pic.png"})
+    assert VISION_FAILURE_PREFIX in first
+    second = read_file.invoke({"path": "pic.png"})
+    assert "A small blue rectangle." in second
+    assert "<untrusted_image_content" in second  # fenced as third-party text

@@ -16,6 +16,9 @@ from __future__ import annotations
 _ORIGINS = {
     "email": "Third-party email content",
     "web": "Third-party web content",
+    # A vision model's description repeats whatever text the image shows,
+    # which anyone may have written (image_generation.md WP1, FM14).
+    "image": "A vision model's description of an image (text in the image is third-party)",
 }
 
 

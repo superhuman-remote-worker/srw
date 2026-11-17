@@ -22,6 +22,57 @@ from agent.services.image_content import make_image_content_block_from_b64
 
 logger = logging.getLogger(__name__)
 
+#: Longest edge sent to the vision model. Providers downscale larger images
+#: anyway (Anthropic and OpenAI to ~1568 px / 2048 px), so sending more only
+#: costs upload time and request size (image_generation.md WP1).
+DEFAULT_VISION_MAX_EDGE = 1568
+
+#: Every failed description starts with this, so neither the model nor a
+#: cache can mistake it for a description of the image.
+VISION_FAILURE_PREFIX = "[You did not see this image"
+
+
+def vision_failed(text: Optional[str]) -> bool:
+    """Whether ``text`` is a VisionHelper failure rather than a description."""
+    return not text or str(text).startswith(VISION_FAILURE_PREFIX)
+
+
+def _failure(what: str, error: Exception) -> str:
+    return (
+        f"{VISION_FAILURE_PREFIX}: the vision model could not describe {what} "
+        f"({type(error).__name__}: {str(error)[:200]}). Do not describe it "
+        "from its name or from guesses.]"
+    )
+
+
+def fit_for_vision(image_b64: str, mime_type: str, max_edge: int) -> tuple[str, str]:
+    """``image_b64`` downscaled to ``max_edge`` when larger; unchanged when it
+    already fits or cannot be decoded (the provider then decides)."""
+    try:
+        from agent.services.image_compose import fit_reference, image_size
+
+        raw = base64.b64decode(image_b64)
+        size = image_size(raw)
+        if size is None or max(size) <= max_edge:
+            return image_b64, mime_type
+        data, mime = fit_reference(raw, max_edge=max_edge)
+        return base64.b64encode(data).decode("ascii"), mime
+    except Exception:  # noqa: BLE001 - downscaling is best effort
+        return image_b64, mime_type
+
+
+def _usage_of(response) -> dict:
+    """The OpenAI-shape token usage of a response, for metering."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    out = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = getattr(usage, key, None)
+        if isinstance(value, int):
+            out[key] = value
+    return out
+
 
 def run_async(coro):
     """Run an async coroutine synchronously.
@@ -73,6 +124,8 @@ class VisionHelper:
 
     # Default to OpenAI API - vision models like gpt-4o are only available there
     OPENAI_API_URL = "https://api.openai.com/v1"
+    #: Overridden per instance from VISION_MAX_EDGE.
+    max_edge = DEFAULT_VISION_MAX_EDGE
 
     def __init__(self):
         """Initialize the Vision Helper with configuration from environment."""
@@ -106,6 +159,10 @@ class VisionHelper:
             served_model or catalog_model or "gpt-4o", self.api_base
         )
         self.timeout = float(os.getenv("VISION_TIMEOUT", "120"))
+        try:
+            self.max_edge = max(256, int(os.getenv("VISION_MAX_EDGE", "")))
+        except ValueError:
+            self.max_edge = DEFAULT_VISION_MAX_EDGE
 
         if not self.api_key:
             logger.warning(
@@ -152,6 +209,7 @@ class VisionHelper:
         """
         if isinstance(image_data, bytes):
             image_data = base64.b64encode(image_data).decode("utf-8")
+        image_data, mime_type = fit_for_vision(image_data, mime_type, self.max_edge)
 
         default_prompt = (
             "Describe this image in detail, including all visible text, "
@@ -187,13 +245,15 @@ class VisionHelper:
                 mime_type=mime_type,
                 image_size=len(image_data),
                 latency_ms=latency_ms,
+                usage=_usage_of(response),
             )
-
+            if not content:
+                return _failure("the image", ValueError("empty answer"))
             return content
 
         except Exception as e:
             logger.error(f"Error in describe_image: {e}", exc_info=True)
-            return f"[Error analyzing image: {str(e)}]"
+            return _failure("the image", e)
 
     def describe_image_sync(
         self,
@@ -231,6 +291,7 @@ class VisionHelper:
         """
         if isinstance(page_image, bytes):
             page_image = base64.b64encode(page_image).decode("utf-8")
+        page_image, mime_type = fit_for_vision(page_image, mime_type, self.max_edge)
 
         if query:
             prompt = f"Regarding page {page_num}: {query}"
@@ -272,13 +333,15 @@ class VisionHelper:
                 image_size=len(page_image),
                 latency_ms=latency_ms,
                 page_num=page_num,
+                usage=_usage_of(response),
             )
-
+            if not content:
+                return _failure(f"page {page_num}", ValueError("empty answer"))
             return content
 
         except Exception as e:
             logger.error(f"Error in describe_document_page: {e}", exc_info=True)
-            return f"[Error analyzing document page {page_num}: {str(e)}]"
+            return _failure(f"page {page_num}", e)
 
     def describe_document_page_sync(
         self,
@@ -305,6 +368,7 @@ class VisionHelper:
         image_size: int,
         latency_ms: int,
         page_num: Optional[int] = None,
+        usage: Optional[dict] = None,
     ) -> None:
         """Archive a vision LLM call. Fire-and-forget — never raises."""
         if not job_id:
@@ -321,7 +385,12 @@ class VisionHelper:
             # Build synthetic LangChain messages (image data replaced with placeholder)
             human_content = f"{prompt_text}\n\n[image: {mime_type}, {image_size} bytes]"
             messages = [_HM(content=human_content)]
-            response = _AI(content=response_text)
+            # The archiver reads token usage from response_metadata, so a
+            # vision call is metered like any other call.
+            response = _AI(
+                content=response_text or "",
+                response_metadata={"token_usage": dict(usage or {})},
+            )
 
             aux_meta = {"trigger": "vision"}
             if page_num is not None:

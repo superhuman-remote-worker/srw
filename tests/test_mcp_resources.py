@@ -67,6 +67,17 @@ SERVER = textwrap.dedent(
     def archive() -> bytes:
         return {ZIP_BYTES!r}
 
+    # Servers that send a binary resource as a text item (image_generation
+    # FM19): one as URL-safe, unpadded, line-wrapped base64, one unusable.
+    @mcp.resource("textblobs://good", mime_type="image/png")
+    def text_good() -> str:
+        raw = "{PNG}".rstrip("=").translate(str.maketrans("+/", "-_"))
+        return "\\n".join(raw[i:i + 20] for i in range(0, len(raw), 20))
+
+    @mcp.resource("textblobs://bad", mime_type="image/png")
+    def text_bad() -> str:
+        return "\\u2030PNG\\r\\n this is the file's bytes read as text"
+
     @mcp.tool()
     def generate() -> list:
         \"\"\"Answer with a link to the generated picture.\"\"\"
@@ -196,6 +207,33 @@ async def test_a_resource_is_saved_into_the_workspace_byte_for_byte(tmp_path):
             {"server": "gen", "uri": "files://archive.zip", "path": "a.zip"}
         )
         assert workspace.get_path("a.zip").read_bytes() == ZIP_BYTES
+
+
+@pytest.mark.asyncio
+async def test_a_binary_resource_sent_as_text_is_never_saved_corrupt(tmp_path):
+    workspace = _workspace(tmp_path)
+    async with _server(tmp_path) as manager:
+        tools = _loaded(manager, workspace=workspace, sees_images=True)
+        save, read = tools[SAVE_RESOURCE_TOOL], tools[READ_RESOURCE_TOOL]
+
+        # Base64 in any common spelling decodes to the real bytes.
+        await save.ainvoke(
+            {"server": "gen", "uri": "textblobs://good", "path": "good.png"}
+        )
+        assert workspace.get_path("good.png").read_bytes() == base64.b64decode(PNG)
+        shown = await _as_job(read, server="gen", uri="textblobs://good")
+        _text, images = extract_image_tags(shown)
+        assert [image.base64_data for image in images] == [PNG]
+
+        # Anything else is refused instead of written as a broken PNG.
+        refused = await save.ainvoke(
+            {"server": "gen", "uri": "textblobs://bad", "path": "bad.png"}
+        )
+        assert refused.startswith("Error: ")
+        assert "not base64" in refused and "download it" in refused
+        assert not workspace.get_path("bad.png").exists()
+        described = await read.ainvoke({"server": "gen", "uri": "textblobs://bad"})
+        assert "sent as text that is not base64" in described
 
 
 @pytest.mark.asyncio

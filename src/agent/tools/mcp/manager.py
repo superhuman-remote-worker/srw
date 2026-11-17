@@ -1568,6 +1568,30 @@ def _render_resource(result: Any, sees_images: bool) -> str:
         uri = str(getattr(item, "uri", "") or "")
         mime = str(getattr(item, "mime_type", "") or "")
         text = getattr(item, "text", None)
+        if text is not None and not _is_textual_mime(mime):
+            # A binary resource sent as text: shown only if it is base64.
+            decoded = _lenient_b64decode(text)
+            if decoded is None:
+                parts.append(
+                    f"[resource {uri}: {mime}, sent as text that is not base64, "
+                    "not shown: the server's copy is unusable here; use the "
+                    "download URL the server gave for it, if any]"
+                )
+            elif mime.startswith("image/"):
+                parts.append(
+                    _render_image(
+                        base64.b64encode(decoded).decode("ascii"),
+                        mime,
+                        sees_images,
+                        f"resource {uri}",
+                    )
+                )
+            else:
+                parts.append(
+                    f"[resource {uri}: {mime}, {len(decoded):,} bytes, not shown: "
+                    f"save it into the workspace with {SAVE_RESOURCE_TOOL}]"
+                )
+            continue
         if text is not None:
             header = f"[resource {uri}" + (f" ({mime})" if mime else "") + "]"
             if len(text) > MCP_RESOURCE_TEXT_LIMIT:
@@ -1617,7 +1641,21 @@ async def _save_resource(
         )
     item = chosen[0]
     text = getattr(item, "text", None)
-    if text is not None:
+    mime = str(getattr(item, "mime_type", "") or "")
+    if text is not None and not _is_textual_mime(mime):
+        # Saving the characters of a binary file as UTF-8 writes a corrupt
+        # file that looks like the real one (image_generation.md FM19).
+        decoded = _lenient_b64decode(text)
+        if decoded is None:
+            return _tool_error(
+                handle,
+                tool_name,
+                f"the server sent this {mime} resource as text that is not "
+                "base64, so saving it would write a corrupt file; download it "
+                "from the URL the server gave for it instead",
+            )
+        data = decoded
+    elif text is not None:
         data = text.encode("utf-8")
     else:
         blob = str(getattr(item, "blob", "") or "")
@@ -1627,12 +1665,12 @@ async def _save_resource(
                 tool_name,
                 f"the resource is larger than {MCP_RESOURCE_SAVE_LIMIT:,} bytes",
             )
-        try:
-            data = base64.b64decode(blob, validate=True)
-        except (binascii.Error, ValueError):
+        decoded_blob = _lenient_b64decode(blob)
+        if decoded_blob is None:
             return _tool_error(
                 handle, tool_name, "the server sent malformed resource data"
             )
+        data = decoded_blob
     if len(data) > MCP_RESOURCE_SAVE_LIMIT:
         return _tool_error(
             handle,
@@ -1739,6 +1777,52 @@ def _decoded_size(data: str) -> int:
     less the padding."""
     data = "".join(data.split())
     return len(data) * 3 // 4 - (len(data) - len(data.rstrip("=")))
+
+
+_TEXTUAL_MIME_EXACT = frozenset(
+    {
+        "application/json",
+        "application/ld+json",
+        "application/xml",
+        "application/javascript",
+        "application/ecmascript",
+        "application/x-yaml",
+        "application/yaml",
+        "application/toml",
+        "application/sql",
+        "application/csv",
+        "application/x-sh",
+        "application/graphql",
+        "image/svg+xml",
+    }
+)
+
+
+def _is_textual_mime(mime: str) -> bool:
+    """Whether a resource of ``mime`` may arrive as text (no MIME type: yes)."""
+    base = mime.split(";", 1)[0].strip().lower()
+    if not base:
+        return True
+    return (
+        base.startswith("text/")
+        or base in _TEXTUAL_MIME_EXACT
+        or base.endswith("+json")
+        or base.endswith("+xml")
+    )
+
+
+def _lenient_b64decode(data: str) -> bytes | None:
+    """Decode standard or URL-safe base64, padded or not, wrapped or not;
+    ``None`` when ``data`` is not base64 at all."""
+    compact = "".join(data.split())
+    if not compact:
+        return None
+    compact = compact.translate(str.maketrans("-_", "+/"))
+    compact += "=" * (-len(compact) % 4)
+    try:
+        return base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError):
+        return None
 
 
 def _json(value: Any) -> str:

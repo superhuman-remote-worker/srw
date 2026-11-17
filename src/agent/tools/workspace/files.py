@@ -173,6 +173,13 @@ def _absolute(workspace: Any, path: str) -> str:
         return path
 
 
+def _fence_description(description: str) -> str:
+    """A vision description, fenced as third-party data (WP1, FM14)."""
+    from shared.untrusted_content import fence_untrusted
+
+    return fence_untrusted(description, origin="image", strip_braces=False)
+
+
 def _get_mime_type(file_path: Path) -> str:
     """Get MIME type for a file based on extension."""
     mime_type, _ = mimetypes.guess_type(str(file_path))
@@ -441,10 +448,12 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 vision = get_vision_helper()
 
                 # Check cache first
+                from agent.services.vision_helper import vision_failed
+
                 cached = cache.get(local_path, query=describe)
-                if cached:
+                if cached and not vision_failed(cached):
                     logger.debug(f"Cache hit for image: {name}")
-                    return f"[IMAGE: {name}]\n\n{cached}"
+                    return f"[IMAGE: {name}]\n\n{_fence_description(cached)}"
 
                 # Generate description
                 image_data = local_path.read_bytes()
@@ -455,8 +464,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     job_id=context.job_id,
                 )
 
-                # Cache for future use
-                cache.set(local_path, description, query=describe)
+                # Cache only a real description: a failure must be retried
+                # next time, not served from the cache.
+                from agent.services.vision_helper import vision_failed
+
+                if not vision_failed(description):
+                    cache.set(local_path, description, query=describe)
+                    description = _fence_description(description)
 
                 return f"[IMAGE: {name}]\n\n{description}"
 
@@ -636,10 +650,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 vision = get_vision_helper()
 
                 # Check cache first
+                from agent.services.vision_helper import vision_failed
+
                 cached = cache.get(full_path, page=page_num, query=describe)
-                if cached:
+                if cached and not vision_failed(cached):
                     logger.debug(f"Cache hit for page {page_num} of {full_path.name}")
-                    return f"\n[PAGE {page_num} - VISUAL CONTENT]\n{cached}"
+                    return (
+                        f"\n[PAGE {page_num} - VISUAL CONTENT]\n"
+                        f"{_fence_description(cached)}"
+                    )
 
                 # Generate description
                 description = vision.describe_document_page_sync(
@@ -649,8 +668,12 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     job_id=context.job_id,
                 )
 
-                # Cache for future use
-                cache.set(full_path, description, page=page_num, query=describe)
+                # Cache only a real description (a failure is retried).
+                from agent.services.vision_helper import vision_failed
+
+                if not vision_failed(description):
+                    cache.set(full_path, description, page=page_num, query=describe)
+                    description = _fence_description(description)
 
                 if describe:
                     return f'\n[PAGE {page_num} - VISUAL CONTENT (Query: "{describe[:50]}...")]\n{description}'

@@ -557,10 +557,14 @@ def create_image_generation_tools(context: ToolContext) -> List[Any]:
             )
         except Exception:  # noqa: BLE001
             description = None
-        if description and not str(description).startswith("[Error"):
+        from agent.services.vision_helper import vision_failed
+        from shared.untrusted_content import fence_untrusted
+
+        if not vision_failed(description):
             lines.append(
                 "Description by a vision model (unverified for counts, spelling and "
-                f"hands): {description}"
+                "hands):\n"
+                + fence_untrusted(str(description), origin="image", strip_braces=False)
             )
         else:
             lines.append(
