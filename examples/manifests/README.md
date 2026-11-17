@@ -283,8 +283,8 @@ account/project/catalogue authority on the server. Apply can admit and dispatch 
 | POST | `/api/manifests/preview` | `{source, format, default_scope?, resolution?}` → resolved resources and provenance |
 | POST | `/api/manifests/export` | `{source, format, default_scope?, output_format}` → `{format, source}` |
 | POST | `/api/manifests/apply` | `{source, format, default_scope?, expected_versions?, plan_revision?, idempotency_key?}` → stored/admitted resources |
-| GET | `/api/resources` | `scope_kind`, `scope_name`, optional `kind` → authorized resource list |
-| GET | `/api/resources/{uid}` | Authored resource, UID, `resourceVersion`, revision and available observed status |
+| GET | `/api/resources` | `scope_kind`, `scope_name`, optional `kind` and `name` → `{resources, truncated}`: the authorized resources, at most 500 |
+| GET | `/api/resources/{uid}` | Authored resource, UID, `resourceVersion`, revision, `redacted`, and available observed status |
 | DELETE | `/api/resources/{uid}` | Required `expected_version` query parameter; ownership and active dependencies checked |
 | POST | `/api/resources/{uid}/outcome` | `{attempt, outcome: "Succeeded" | "Failed"}` for generic Manual/Reported Jobs |
 | PUT | `/api/resource-secrets/{name}` | `{scope?, values, expected_version?}`; encrypted storage, version-only response |
@@ -292,6 +292,19 @@ account/project/catalogue authority on the server. Apply can admit and dispatch 
 | DELETE | `/api/workspace-instances/{uid}` | Required `expected_generation`; deletes only an exclusively released, fenced instance |
 
 `source` is the JSON/YAML text. `format` and `output_format` accept `yaml` or `json`.
+In place of `source` and `format`, the four `POST /api/manifests/…` operations take
+`sources`: a list of `{name, source, format}`, read as one bundle. Each text has its
+own format, so YAML and JSON can be mixed, and together they obey the limits of one
+source (1 MiB, 100 documents). An error then carries `source`, the name of the text
+it is in, and `document` counts inside that text.
+
+`GET /api/resources` refuses a `kind` the schema does not know (`422`). `kind` and
+`name` together identify at most one resource. `truncated: true` means the scope
+holds more resources than one call returns; narrow the list with `kind` or `name`.
+A resource view says `redacted: true` when the reader got less than the stored
+document (a reader below owner, and something was hidden). Do not apply a redacted
+document back: the hidden values would be dropped. A view also carries `linkedId`,
+`managedBy`, `createdAt` and `updatedAt`.
 `default_scope` is `{kind: "Account", name: "personal"}`, for example. Defaults to
 YAML when format is omitted. Field names in the HTTP request envelope use the
 existing Python API convention; fields inside resources follow the manifest schema.

@@ -23,6 +23,7 @@ from orchestrator.services.datasource_policy_errors import (
 from orchestrator.services.manifest_authority import ManifestAuthority
 from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_store import (
+    LIST_LIMIT,
     ManifestStore,
     resource_key,
     resource_view,
@@ -36,6 +37,23 @@ from shared.manifests.resolution import content_revision
 #: Both kinds are top-level documents only: a Project's inline children are
 #: Experts, Connectors and templates.
 _CONTENT_SCOPES = {"Job": "jobs:write", "Project": "projects:write"}
+
+
+def _for_reader(view, full_fidelity):
+    """Finish a resource view for its reader, in place, and return it.
+
+    A reader below owner gets the document through the public redactor.
+    ``redacted`` says whether that changed anything. A redacted document is
+    not the stored one: applied back, it would drop what was hidden, so a
+    client must not treat it as an export.
+    """
+    if full_fidelity:
+        view["redacted"] = False
+        return view
+    stored = view["resource"]
+    view["resource"] = redact_public_config_override(deepcopy(stored))
+    view["redacted"] = view["resource"] != stored
+    return view
 
 
 class ManifestResourceService:
@@ -80,9 +98,7 @@ class ManifestResourceService:
 
     async def reader_view(self, row, user, **extra):
         view = {**resource_view(row), **extra}
-        if not await self.full_fidelity(row, user):
-            view["resource"] = redact_public_config_override(view["resource"])
-        return view
+        return _for_reader(view, await self.full_fidelity(row, user))
 
     async def resolve(self, documents, user, *, request=None, default_scope=None):
         authority = ManifestAuthority(self.db, user, request=request)
@@ -189,10 +205,7 @@ class ManifestResourceService:
                                 409, "An operation resource has since been deleted."
                             )
                         await authority.resource(current)
-                        if not await self.full_fidelity(current, user):
-                            item["resource"] = redact_public_config_override(
-                                item["resource"]
-                            )
+                        _for_reader(item, await self.full_fidelity(current, user))
                     return result
             resolver = await self.resolve(
                 documents, user, request=request, default_scope=default_scope
@@ -500,11 +513,22 @@ class ManifestResourceService:
                     }
         return result
 
-    async def list(self, user, *, scope=None, kind=None, request=None):
+    async def list(self, user, *, scope=None, kind=None, name=None, request=None):
+        """The resources of one scope the caller may see, at most ``LIST_LIMIT``.
+
+        ``truncated`` says the scope holds more rows than one call returns.
+        It is decided from the store's count, one row past the limit and
+        before the visibility filter: the filter only shrinks a page, so the
+        length of ``resources`` cannot say whether rows were left out. A
+        ``kind`` and a ``name`` together identify at most one resource.
+        """
         authority = ManifestAuthority(self.db, user, request=request)
         scope = await authority.scope(scope)
+        rows = await self.store.list_scope(
+            scope, kind=kind, name=name, limit=LIST_LIMIT + 1
+        )
         visible = []
-        for row in await self.store.list_scope(scope, kind=kind):
+        for row in rows[:LIST_LIMIT]:
             try:
                 await authority.resource(row)
             except HTTPException as error:
@@ -512,7 +536,7 @@ class ManifestResourceService:
                     continue
                 raise
             visible.append(await self.reader_view(row, user))
-        return {"resources": visible}
+        return {"resources": visible, "truncated": len(rows) > LIST_LIMIT}
 
     async def delete(self, resource_id, user, *, expected_version, request=None):
         """Delete a resource at ``expected_version``.

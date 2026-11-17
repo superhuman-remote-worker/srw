@@ -42,8 +42,24 @@ LINKED_CONNECTOR_MESSAGE = (
 )
 
 
+#: Rows one list call returns. The service reads one more, to tell a complete
+#: list from a cut one.
+LIST_LIMIT = 500
+
+
+def _identity(value):
+    return str(value) if value else None
+
+
+def _timestamp(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
 def resource_view(row):
-    """Keep the portable document separate from observed database identity."""
+    """Keep the portable document separate from observed database identity.
+
+    Every value is JSON: an apply stores its views as the operation's result.
+    """
     return {
         "resource": deepcopy(row["document"]),
         "uid": str(row["id"]),
@@ -52,6 +68,12 @@ def resource_view(row):
         "activeRevision": row.get("active_revision"),
         "installationManaged": bool(row.get("installation_managed")),
         "platformManaged": row.get("platform_managed"),
+        # The domain row this resource is (a project, an expert, a
+        # datasource), and the Project resource that owns an inline child.
+        "linkedId": _identity(row.get("linked_id")),
+        "managedBy": _identity(row.get("managed_by")),
+        "createdAt": _timestamp(row.get("created_at")),
+        "updatedAt": _timestamp(row.get("updated_at")),
     }
 
 
@@ -118,13 +140,14 @@ class ManifestStore:
             )
         )
 
-    async def list_scope(self, scope, *, kind=None, limit=500):
+    async def list_scope(self, scope, *, kind=None, name=None, limit=LIST_LIMIT):
         rows = await self.db.fetch(
-            "SELECT * FROM srw_resources WHERE scope_kind=$1 AND scope_name=$2 AND ($3::text IS NULL OR kind=$3) AND deleted_at IS NULL ORDER BY kind,name LIMIT $4",
+            "SELECT * FROM srw_resources WHERE scope_kind=$1 AND scope_name=$2 AND ($3::text IS NULL OR kind=$3) AND ($5::text IS NULL OR name=$5) AND deleted_at IS NULL ORDER BY kind,name LIMIT $4",
             scope["kind"],
             scope["name"],
             kind,
             limit,
+            name,
         )
         return [decoded(row) for row in rows]
 

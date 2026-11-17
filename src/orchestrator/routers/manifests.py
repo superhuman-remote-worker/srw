@@ -19,10 +19,13 @@ from orchestrator.schemas.manifests import (
     ManifestScope,
 )
 from orchestrator.services.manifests import ManifestService
-from shared.manifests import ManifestError
+from shared.manifests import ManifestError, load_schema, parse_sources
 from shared.manifests.validation import MAX_SOURCE_BYTES
 
 router = APIRouter(tags=["Manifests"])
+
+#: The kinds a manifest can declare, in the schema's order.
+RESOURCE_KINDS: tuple[str, ...] = tuple(load_schema()["properties"]["kind"]["enum"])
 
 
 @dataclass(frozen=True)
@@ -40,11 +43,38 @@ def get_manifest_dependencies(request: Request) -> ManifestDependencies:
     return request.app.state.manifest_dependencies_factory()
 
 
-async def _call(operation, *args, **kwargs):
+def _refused(exc: ManifestError, origins) -> HTTPException:
+    """The 422 for a manifest error, naming the source when there were several."""
+    if origins:
+        exc = exc.located(origins)
+    return HTTPException(status_code=422, detail=exc.as_dict())
+
+
+async def _source(body: ManifestInput):
+    """What to hand a service as its source, and where each document came from.
+
+    One text goes through unparsed. Several are read here as one bundle
+    (``shared.manifests.parse_sources``); the services accept that bundle in
+    place of the text. The second value is None for one text, and otherwise
+    the bundle's origins, which turn an error's document number back into a
+    source name.
+    """
+    if body.sources is None:
+        return body.source, None
+    try:
+        bundle = await run_in_threadpool(
+            parse_sources, [item.model_dump() for item in body.sources]
+        )
+    except ManifestError as exc:
+        raise _refused(exc, None) from None
+    return bundle, bundle.origins
+
+
+async def _call(operation, *args, origins=None, **kwargs):
     try:
         return await run_in_threadpool(operation, *args, **kwargs)
     except ManifestError as exc:
-        raise HTTPException(status_code=422, detail=exc.as_dict()) from None
+        raise _refused(exc, origins) from None
 
 
 @router.get("/api/manifests/schema")
@@ -67,7 +97,14 @@ async def validate_manifests(
 ) -> dict:
     """Check JSON/YAML structure and project-local aliases without resolving access."""
     await dependencies.require_approved_user(request)
-    return await _call(dependencies.service.validate, body.source, format=body.format)
+    source, origins = await _source(body)
+    result = await _call(
+        dependencies.service.validate, source, format=body.format, origins=origins
+    )
+    if origins:
+        for document, (name, _) in zip(result["documents"], origins):
+            document["source"] = name
+    return result
 
 
 @router.post("/api/manifests/preview")
@@ -83,22 +120,25 @@ async def preview_manifests(
     returns a dependency plan digest that apply can check for intervening edits.
     """
     user = await dependencies.require_approved_user(request)
+    source, origins = await _source(body)
     if body.resolution == "stored":
         return await _resource_call(
             _resources(dependencies).preview,
-            body.source,
+            source,
             user,
             request=request,
             format=body.format,
             default_scope=body.default_scope.model_dump()
             if body.default_scope
             else None,
+            origins=origins,
         )
     return await _call(
         dependencies.service.preview,
-        body.source,
+        source,
         format=body.format,
         default_scope=body.default_scope.model_dump() if body.default_scope else None,
+        origins=origins,
     )
 
 
@@ -108,11 +148,11 @@ def _resources(dependencies):
     return dependencies.resources
 
 
-async def _resource_call(operation, *args, **kwargs):
+async def _resource_call(operation, *args, origins=None, **kwargs):
     try:
         return await operation(*args, **kwargs)
     except ManifestError as exc:
-        raise HTTPException(422, exc.as_dict()) from None
+        raise _refused(exc, origins) from None
 
 
 @router.post("/api/manifests/apply")
@@ -123,9 +163,10 @@ async def apply_manifests(
     dependencies: ManifestDependencies = Depends(get_manifest_dependencies),
 ) -> dict:
     user = await dependencies.require_approved_user(request)
+    source, origins = await _source(body)
     result = await _resource_call(
         _resources(dependencies).apply,
-        body.source,
+        source,
         user,
         request=request,
         format=body.format,
@@ -133,6 +174,7 @@ async def apply_manifests(
         expected_versions=body.expected_versions,
         plan_revision=body.plan_revision,
         idempotency_key=body.idempotency_key,
+        origins=origins,
     )
     if dependencies.trigger_dispatch:
         dependencies.trigger_dispatch()
@@ -145,16 +187,34 @@ async def list_resources(
     scope_kind: str = "Account",
     scope_name: str = "me",
     kind: str | None = None,
+    name: str | None = Query(default=None, min_length=1, max_length=253),
     *,
     dependencies: ManifestDependencies = Depends(get_manifest_dependencies),
 ) -> dict:
+    """List the stored resources of one scope that the caller may see.
+
+    ``kind`` and ``name`` narrow the list; together they identify at most one
+    resource. An unknown ``kind`` is refused, because an empty list would
+    read as "none stored". ``truncated`` is true when the scope holds more
+    resources than one call returns; narrow the list with ``kind`` or
+    ``name`` then.
+    """
     user = await dependencies.require_approved_user(request)
     try:
         scope = ManifestScope(kind=scope_kind, name=scope_name).model_dump()
     except ValueError:
         raise HTTPException(422, "Invalid resource scope.") from None
+    if kind is not None and kind not in RESOURCE_KINDS:
+        raise HTTPException(
+            422, f"Unknown resource kind. Choose one of: {', '.join(RESOURCE_KINDS)}."
+        )
     return await _resource_call(
-        _resources(dependencies).list, user, scope=scope, kind=kind, request=request
+        _resources(dependencies).list,
+        user,
+        scope=scope,
+        kind=kind,
+        name=name,
+        request=request,
     )
 
 
@@ -344,10 +404,12 @@ async def export_manifests(
 ) -> dict:
     """Export authored ownership/references with explicit scopes, without deployment."""
     await dependencies.require_approved_user(request)
+    source, origins = await _source(body)
     return await _call(
         dependencies.service.export,
-        body.source,
+        source,
         format=body.format,
         default_scope=body.default_scope.model_dump() if body.default_scope else None,
         output_format=body.output_format,
+        origins=origins,
     )
