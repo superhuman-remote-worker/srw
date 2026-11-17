@@ -597,7 +597,9 @@ Print a job's audit trail: the model's steps and the tools it called. This
 is the record the Cockpit shows.
 
 -f follows a running job and ends when the job ends or stops for a person.
-It exits 0 whatever the job's result; use `srw wait` for the outcome.
+It exits 0 whatever the job's result; use `srw wait` for the outcome. A
+server that stops answering in the middle is asked again for up to ten
+minutes.
 ```
 
 | Flag | Meaning |
@@ -791,10 +793,14 @@ code:
   10  stopped and needs a person: in review, waiting for a reply, or paused
       by someone
    9  --timeout passed
+   7  the server stopped answering for more than ten minutes
  130  interrupted; the job keeps running
 
 A job paused by the system counts as running: it is picked up again by
 itself. A status srw does not know counts as running too.
+
+A server that stops answering in the middle, for example while it is
+upgraded, is asked again for up to ten minutes.
 ```
 
 | Flag | Meaning |

@@ -166,6 +166,48 @@ func TestARequestThatNeverLeftIsNotOutcomeUnknown(t *testing.T) {
 	}
 }
 
+// Away marks what passes by itself, so that wait and logs -f ask again. It
+// must not mark what asking again cannot cure.
+func TestOnlyAServerThatIsAwayIsMarkedAsPassing(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	listener.Close()
+	_, err = clientFor(t, "http://"+address, Options{}).Do(context.Background(), Request{Method: "GET", Path: "/api/jobs"})
+	if failure := coded(t, err); failure.Code != exit.Unreachable || !failure.Away {
+		t.Errorf("a refused connection passes: %+v", failure)
+	}
+	untrusted := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer untrusted.Close()
+	_, err = clientFor(t, untrusted.URL, Options{}).Do(context.Background(), Request{Method: "GET", Path: "/api/jobs"})
+	if failure := coded(t, err); failure.Code != exit.Unreachable || failure.Away {
+		t.Errorf("an untrusted certificate does not pass: %+v", failure)
+	}
+	dropping := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if connection, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			connection.Close()
+		}
+	}))
+	defer dropping.Close()
+	_, err = clientFor(t, dropping.URL, Options{}).Do(context.Background(), Request{Method: "POST", Path: "/api/jobs"})
+	if failure := coded(t, err); failure.Code != exit.Unknown || failure.Away {
+		t.Errorf("a lost mutation is outcome unknown, not an outage: %+v", failure)
+	}
+	// A web server in front of the API answers a page for any path.
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<!doctype html><title>Cockpit</title>"))
+	}))
+	defer page.Close()
+	var out map[string]any
+	err = clientFor(t, page.URL, Options{}).JSON(context.Background(), Request{Method: "GET", Path: "/api/jobs"}, &out)
+	if failure := coded(t, err); failure.Code != exit.Failed || !failure.Away || !strings.Contains(failure.Message, "the API address?") {
+		t.Errorf("a page instead of JSON: %+v", failure)
+	}
+}
+
 func TestARedirectIsReportedAndNotFollowed(t *testing.T) {
 	var followed atomic.Bool
 	elsewhere := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { followed.Store(true) }))
@@ -239,26 +281,43 @@ func TestStatusErrors(t *testing.T) {
 		code    int
 		message string
 		hint    string
+		// away: the answer passes by itself (exit.Error.Away).
+		away bool
 	}{
-		{"unknown token", 401, `{"detail":"Invalid token"}`, exit.Auth, "the token is unknown, revoked or expired", "srw login"},
+		{"unknown token", 401, `{"detail":"Invalid token"}`, exit.Auth, "the token is unknown, revoked or expired", "run `srw login` or set SRW_TOKEN", false},
 		{"a missing scope names it", 403, `{"detail":"Insufficient token scope: requires jobs:write, projects:write"}`, exit.Auth,
-			"Insufficient token scope: requires jobs:write, projects:write", "also has `jobs:write` and `projects:write`"},
-		{"a route no token may use", 403, `{"detail":"Insufficient token scope: personal access tokens cannot use this endpoint"}`, exit.Auth, "this route is not available to tokens", ""},
-		{"another refusal is the server's line", 403, `{"detail":"Access denied by MCP token scope"}`, exit.Auth, "Access denied by MCP token scope", ""},
-		{"a route the server does not have", 404, `{"detail":"Not Found"}`, exit.NotFound, "this server does not have GET /api/x", ""},
-		{"an object that is not there", 404, `{"detail":"Job 'abc' not found"}`, exit.NotFound, "Job 'abc' not found", ""},
-		{"conflict", 409, `{"detail":"Resource version changed; read the current resource and retry."}`, exit.Conflict, "Resource version changed; read the current resource and retry.", ""},
-		{"a server error without a body", 502, `<html>bad gateway</html>`, exit.Failed, "GET /api/x answered 502 Bad Gateway", ""},
+			"Insufficient token scope: requires jobs:write, projects:write", "also has `jobs:write` and `projects:write`", false},
+		{"a route no token may use", 403, `{"detail":"Insufficient token scope: personal access tokens cannot use this endpoint"}`, exit.Auth, "this route is not available to tokens", "", false},
+		{"another refusal is the server's line", 403, `{"detail":"Access denied by MCP token scope"}`, exit.Auth, "Access denied by MCP token scope", "", false},
+		{"a route the server does not have", 404, `{"detail":"Not Found"}`, exit.NotFound, "this server does not have GET /api/x", "", false},
+		{"an object that is not there", 404, `{"detail":"Job 'abc' not found"}`, exit.NotFound, "Job 'abc' not found", "", false},
+		// The API answers every 404 with a JSON object, with or without
+		// "detail".
+		{"the API's 404 in another shape", 404, `{"error":"no_such_workspace"}`, exit.NotFound, "GET /api/x answered 404 Not Found", "", false},
+		{"conflict", 409, `{"detail":"Resource version changed; read the current resource and retry."}`, exit.Conflict, "Resource version changed; read the current resource and retry.", "", false},
+		// Something in front of the API answered: that says nothing about
+		// the object, so it is "not reached", never "not found".
+		{"a proxy's 404", 404, "404 page not found\n", exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 404 Not Found from something in front of it", "may be restarting", true},
+		{"a proxy's 404 without a body", 404, "", exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 404 Not Found from something in front of it", "check the server URL", true},
+		{"a gateway status", 502, `<html>bad gateway</html>`, exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 502 Bad Gateway from something in front of it", "may be restarting", true},
+		{"a JSON value that is no object is not the API's", 504, `"timeout"`, exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 504 Gateway Timeout from something in front of it", "", true},
+		// The API's own 503 keeps its message and its code; it passes too.
+		{"the API's own 503", 503, `{"detail":"Database unavailable"}`, exit.Failed, "Database unavailable", "", true},
+		{"a server error is not an outage", 500, `{"detail":"Internal server error"}`, exit.Failed, "Internal server error", "", false},
 		{"a validation list never echoes the input", 422,
 			`{"detail":[{"type":"missing","loc":["body","source"],"msg":"Field required","input":{"sourec":"ak_secret_token PRIVATE"}}]}`,
-			exit.Failed, "the request was not accepted: source: Field required", ""},
+			exit.Failed, "the request was not accepted: source: Field required", "", false},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			client := clientFor(t, "https://api.example.com", Options{})
 			request := Request{Method: "GET", Path: "/api/x"}
 			failure := coded(t, client.StatusError(request, &Response{Status: test.status, Body: []byte(test.body)}))
-			if failure.Code != test.code || failure.Message != test.message || failure.Status != test.status {
+			if failure.Code != test.code || failure.Message != test.message || failure.Status != test.status || failure.Away != test.away {
 				t.Errorf("%+v", failure)
 			}
 			if test.hint != "" && !strings.Contains(failure.Hint, test.hint) {

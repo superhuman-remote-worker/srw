@@ -174,10 +174,10 @@ format never depends on whether the output goes to a terminal.
 | 1 | The operation failed (anything not listed below) |
 | 2 | Wrong usage |
 | 3 | Not logged in, or the token may not do this |
-| 4 | Not found |
+| 4 | Not found: the API says the object does not exist |
 | 5 | Conflict: something changed in between |
 | 6 | Outcome unknown: a change was sent and the answer was lost |
-| 7 | The server could not be reached, or its certificate was not accepted |
+| 7 | The API could not be reached, or its certificate was not accepted. Also an answer from a proxy in front of it |
 | 8 | `wait`: the job failed or was cancelled |
 | 9 | `wait`: timed out |
 | 10 | `wait`: the job stopped and needs a person |
@@ -218,6 +218,9 @@ srw run -f task.md --expert reviewer --autonomy full --wait --timeout 2h
   job stops for review and `--wait` exits with 10. If a review is what you
   want, `srw wait JOB --for status=pending_review` exits with 0 at that
   point.
+- `wait` and `logs -f` ride out a server that stops answering in the middle,
+  for example during an upgrade: they ask again for up to ten minutes before
+  they exit with code 7.
 - Starting a job with `run` cannot be repeated safely. If the answer is lost
   (code 6), look at `srw get jobs` before starting it again. A start that can
   be repeated is a Job manifest applied with
@@ -283,6 +286,7 @@ the authority's PEM file at `srw login`; it is saved with the context. Plain
 | `Insufficient token scope: requires …` | Create a token that also has the named scope. |
 | `this server does not have …` | The server is older than your `srw`. Install the `srw` of the server's version. |
 | `the server's TLS certificate was not accepted` | Pass `--ca-file` with your certificate authority's file. |
+| `the API at … is not answering: … from something in front of it` | A proxy answered instead of the API. The server may be restarting; if it stays, the address is not the API's. |
 | `… redirects to …` | The server address is not the API's. Check `https`, the host and the path. |
 
 Shell completion: `srw completion bash`, `zsh`, `fish` or `powershell` print

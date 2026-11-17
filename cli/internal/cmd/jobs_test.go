@@ -22,11 +22,18 @@ func jobRoute(suffix string) string { return "/api/jobs/" + jobID + suffix }
 
 // progressOf answers the progress route with these statuses in turn; the
 // last one repeats. A status may carry ":held" for a job held by a person.
+// progressOf scripts the answers to the progress route, one per poll; the
+// last one repeats. "status:held" is held by a person. "away:<how>" is a
+// server that does not answer as itself (see awayAnswer).
 func progressOf(h *harness, statuses ...string) *int {
 	polls := 0
 	h.handle("GET "+jobRoute("/progress"), func(w http.ResponseWriter, _ *http.Request) {
 		status := statuses[min(polls, len(statuses)-1)]
 		polls++
+		if how, away := strings.CutPrefix(status, "away:"); away {
+			awayAnswer(w, how)
+			return
+		}
 		answer := map[string]any{"status": status, "state": "running", "reasons": []string{}, "held_by": nil}
 		if name, found := strings.CutSuffix(status, ":held"); found {
 			answer["status"], answer["held_by"] = name, "operator"
@@ -38,6 +45,99 @@ func progressOf(h *harness, statuses ...string) *int {
 		json.NewEncoder(w).Encode(answer)
 	})
 	return &polls
+}
+
+// awayAnswer answers as the things in front of a restarting server do.
+func awayAnswer(w http.ResponseWriter, how string) {
+	switch how {
+	case "404": // an ingress without a backend
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(404)
+		w.Write([]byte("404 page not found\n"))
+	case "502":
+		w.WriteHeader(502)
+		w.Write([]byte("<html>Bad Gateway</html>"))
+	case "page": // a web server that answers its app for any path
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<!doctype html><title>Cockpit</title>"))
+	case "503": // the API itself, not ready yet
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		w.Write([]byte(`{"detail":"Database unavailable"}`))
+	case "drop": // the connection dies
+		if connection, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			connection.Close()
+		}
+	}
+}
+
+// An upgrade of the server must not end a wait that a pipeline sits in.
+func TestWaitAsksAgainWhileTheServerIsAway(t *testing.T) {
+	for _, how := range []string{"404", "502", "page", "503", "drop"} {
+		t.Run(how, func(t *testing.T) {
+			h := newHarness(t)
+			h.login()
+			// Four in a row: a GET is tried three times on a dropped
+			// connection, so fewer would not fail a whole poll.
+			away := "away:" + how
+			progressOf(h, "processing", away, away, away, away, "processing", "completed")
+			out, errOut, code := h.run("", "wait", jobID)
+			if code != exit.OK || out != "job/"+jobID+" completed\n" {
+				t.Fatalf("%d %q %s", code, out, errOut)
+			}
+			// Said once per outage, and once when it is over.
+			if strings.Count(errOut, "The server stopped answering") != 1 || strings.Count(errOut, "The server answers again.") != 1 {
+				t.Errorf("stderr:\n%s", errOut)
+			}
+			// The status did not change across the outage: not printed twice.
+			if strings.Count(errOut, "job/"+jobID+" processing\n") != 1 {
+				t.Errorf("stderr:\n%s", errOut)
+			}
+		})
+	}
+}
+
+func TestWaitGivesUpOnAServerThatStaysAway(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	progressOf(h, "processing", "away:404")
+	out, errOut, code := h.run("", "wait", jobID)
+	if code != exit.Unreachable || out != "" {
+		t.Fatalf("%d %q %s", code, out, errOut)
+	}
+	want(t, errOut, "the server has not answered for 10m0s", "srw wait job/"+jobID)
+	// It asked for the whole grace and not much longer.
+	if waited := h.clock.Sub(now); waited < awayGrace || waited > awayGrace+time.Minute {
+		t.Errorf("waited %s", waited)
+	}
+	// --timeout still ends the wait first, and says what it knows.
+	h.clock = now
+	progressOf(h, "processing", "away:502")
+	_, errOut, code = h.run("", "wait", jobID, "--timeout", "1m")
+	if code != exit.WaitTimeout {
+		t.Fatalf("%d %s", code, errOut)
+	}
+	want(t, errOut, "the server stopped answering; the job was processing")
+}
+
+// Before the server has answered once, nothing says the address is right:
+// the error comes at once. And an answer of the API itself is never an
+// outage.
+func TestWaitDoesNotAskAgainWithoutReason(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	polls := progressOf(h, "away:404")
+	_, errOut, code := h.run("", "wait", jobID)
+	// "Not reached", not "not found": a proxy's 404 says nothing about the job.
+	if code != exit.Unreachable || *polls != 1 {
+		t.Fatalf("%d after %d polls: %s", code, *polls, errOut)
+	}
+	want(t, errOut, "is not answering", "from something in front of it")
+
+	asked := h.record("GET "+jobRoute("/progress"), 404, map[string]string{"detail": "Job '" + jobID + "' not found"})
+	if _, errOut, code := h.run("", "wait", jobID); code != exit.NotFound || len(*asked) != 1 {
+		t.Errorf("the API's own 404: %d after %d polls: %s", code, len(*asked), errOut)
+	}
 }
 
 func TestAJobIsNamedByItsIdOrTheStartOfIt(t *testing.T) {
@@ -267,6 +367,13 @@ func TestRunWaitExitsByTheOutcomeAndPrintsTheIdFirst(t *testing.T) {
 		t.Errorf("stdout: %q", out)
 	}
 	want(t, errOut, "srw approve job/"+jobID)
+
+	// The start was answered, so the server is known: an outage that begins
+	// before the first poll is ridden out too.
+	progressOf(h, "away:404", "away:404", "completed")
+	if out, errOut, code := h.run("", "run", "Task", "--wait"); code != exit.OK || !strings.HasSuffix(out, "job/"+jobID+" completed\n") {
+		t.Errorf("%d %q %s", code, out, errOut)
+	}
 }
 
 func TestALostAnswerToRunIsOutcomeUnknown(t *testing.T) {
@@ -517,6 +624,43 @@ func TestLogsFollowWaitsForAStepToFinish(t *testing.T) {
 		t.Errorf("each step once, the tool only when finished:\n%s", out)
 	}
 	want(t, errOut, "job/"+jobID+" is completed")
+}
+
+func TestLogsFollowAsksAgainWhileTheServerIsAway(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	all := []any{
+		step(1, "llm", true, map[string]any{"llm": map[string]any{"response_content_preview": "Start"}}),
+		step(2, "tool", true, map[string]any{"tool": map[string]any{"name": "run_command", "success": true, "result_preview": "done"}}),
+	}
+	reads := 0
+	h.handle("GET "+jobRoute("/audit"), func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		if reads == 2 {
+			// The log read fails too, after a progress answer that came.
+			awayAnswer(w, "502")
+			return
+		}
+		// The second step exists only after the outage.
+		have := all[:1]
+		if reads > 2 {
+			have = all
+		}
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		offset = min(offset, len(have))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"entries": have[offset:], "hasMore": false})
+	})
+	progressOf(h, "processing", "away:404", "processing", "completed")
+	out, errOut, code := h.run("", "logs", jobID, "-f")
+	if code != 0 {
+		t.Fatalf("%d %s", code, errOut)
+	}
+	// Each step once: the cursor kept its place across the outage.
+	if strings.Count(out, "\n") != 2 || strings.Count(out, "model  Start") != 1 || strings.Count(out, "tool   run_command ok: done") != 1 {
+		t.Errorf("stdout:\n%s", out)
+	}
+	want(t, errOut, "The server stopped answering", "The server answers again.", "job/"+jobID+" is completed")
 }
 
 func TestFilesAndCp(t *testing.T) {

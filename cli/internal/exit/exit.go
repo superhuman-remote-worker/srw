@@ -18,7 +18,8 @@ const (
 	Usage = 2
 	// Auth: not authenticated or not allowed (401, 403).
 	Auth = 3
-	// NotFound: 404.
+	// NotFound: the API answered 404. A 404 from a proxy in front of it is
+	// Unreachable.
 	NotFound = 4
 	// Conflict: 409.
 	Conflict = 5
@@ -53,6 +54,10 @@ type Error struct {
 	Document int
 	Path     string
 	File     string
+	// Away says the server did not answer as itself: no connection, a
+	// gateway status, or an answer from something in front of it. It
+	// passes, so wait and logs -f ask again.
+	Away bool
 }
 
 func (e *Error) Error() string { return e.Message }

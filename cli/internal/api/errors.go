@@ -26,6 +26,9 @@ func (c *Client) StatusError(request Request, response *Response) error {
 			WithHint("check the server URL (https, host and path)")
 	}
 	failure := &exit.Error{Code: codeFor(status), Status: status}
+	if c.notTheAPI(request, response, failure) {
+		return failure
+	}
 	detail := decodeDetail(response.Body)
 	switch value := detail.(type) {
 	case string:
@@ -55,7 +58,7 @@ func (c *Client) StatusError(request Request, response *Response) error {
 	case status == http.StatusUnauthorized && failure.Message == "Invalid token":
 		// The server cannot say which of the three it is.
 		failure.Message = "the token is unknown, revoked or expired"
-		failure.Hint = "check Settings → API Keys in the Cockpit, then run `srw login`"
+		failure.Hint = "create a new one under Settings → API Keys in the Cockpit, then run `srw login` or set SRW_TOKEN"
 	case status == http.StatusForbidden && strings.HasSuffix(failure.Message, "personal access tokens cannot use this endpoint"):
 		failure.Message = "this route is not available to tokens"
 	case status == http.StatusForbidden:
@@ -71,6 +74,30 @@ func (c *Client) StatusError(request Request, response *Response) error {
 		}
 	}
 	return failure
+}
+
+// notTheAPI recognises an answer that something in front of the API gave: a
+// 404 or a gateway status whose body is not a JSON object. The API answers
+// every error with one. Such an answer says nothing about the object asked
+// for, so it is "not reached" (exit 7), not "not found" (exit 4), and it
+// passes when the server is back.
+func (c *Client) notTheAPI(request Request, response *Response, failure *exit.Error) bool {
+	status := response.Status
+	gateway := status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+	if !gateway && status != http.StatusNotFound {
+		return false
+	}
+	// The API's own 503 passes too, but it carries the API's message.
+	failure.Away = gateway
+	var object map[string]any
+	if json.Unmarshal(response.Body, &object) == nil && object != nil {
+		return false
+	}
+	failure.Code, failure.Away = exit.Unreachable, true
+	failure.Message = fmt.Sprintf("the API at %s is not answering: %s %s got %d %s from something in front of it",
+		c.base, request.Method, request.Path, status, http.StatusText(status))
+	failure.Hint = "the server may be restarting; if this stays, check the server URL"
+	return true
 }
 
 func codeFor(status int) int {

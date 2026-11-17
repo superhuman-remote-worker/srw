@@ -259,7 +259,7 @@ func (a *App) run(command *cobra.Command, args []string, flags runFlags) error {
 	if !flags.wait {
 		return nil
 	}
-	return a.wait(ctx, client, created.ID, waitFlags{timeout: flags.timeout, interval: flags.interval}, format != output.Default)
+	return a.wait(ctx, client, created.ID, waitFlags{timeout: flags.timeout, interval: flags.interval, answered: true}, format != output.Default)
 }
 
 // expertReference turns what was typed after --expert into what the server
@@ -358,6 +358,52 @@ type waitFlags struct {
 	statuses []string
 	timeout  time.Duration
 	interval time.Duration
+	// answered: the server has already answered this command (run --wait).
+	answered bool
+}
+
+// awayGrace is how long wait and logs -f keep asking a server that stopped
+// answering in the middle, for example while it is upgraded.
+const awayGrace = 10 * time.Minute
+
+// outage tracks a server that stopped answering as itself.
+type outage struct {
+	app   *App
+	since time.Time // zero while the server answers
+}
+
+// rideOut says whether to ask again after err: only when the server is
+// away (exit.Error.Away), and for at most awayGrace in a row.
+func (o *outage) rideOut(err error) bool {
+	var failure *exit.Error
+	if !errors.As(err, &failure) || !failure.Away {
+		return false
+	}
+	now := o.app.Now()
+	if o.since.IsZero() {
+		o.since = now
+		fmt.Fprintf(o.app.Err, "The server stopped answering (%s). Asking again for up to %s.\n", failure.Message, awayGrace)
+		return true
+	}
+	return now.Sub(o.since) < awayGrace
+}
+
+// back notes an answer after an outage.
+func (o *outage) back() {
+	if !o.since.IsZero() {
+		fmt.Fprintln(o.app.Err, "The server answers again.")
+		o.since = time.Time{}
+	}
+}
+
+// giveUp is the error to end with. After an outage that outlasted the
+// grace it is exit 7, whatever the last failed request looked like.
+func (o *outage) giveUp(err error, id string) error {
+	if o.since.IsZero() {
+		return err
+	}
+	return exit.New(exit.Unreachable, "the server has not answered for %s: %s", awayGrace, err).
+		WithHint("the job is not ended by this; watch it again with: srw wait job/%s", id)
 }
 
 func (a *App) waitCommand() *cobra.Command {
@@ -373,9 +419,12 @@ func (a *App) waitCommand() *cobra.Command {
 			"  10  stopped and needs a person: in review, waiting for a reply, or paused\n" +
 			"      by someone\n" +
 			"   9  --timeout passed\n" +
+			"   7  the server stopped answering for more than ten minutes\n" +
 			" 130  interrupted; the job keeps running\n\n" +
 			"A job paused by the system counts as running: it is picked up again by\n" +
-			"itself. A status srw does not know counts as running too.",
+			"itself. A status srw does not know counts as running too.\n\n" +
+			"A server that stops answering in the middle, for example while it is\n" +
+			"upgraded, is asked again for up to ten minutes.",
 		Example: "  srw wait job/0b5c2f6e --timeout 2h\n  srw wait 0b5c2f6e --for status=pending_review",
 		Args:    exactArgs(1, "one job: job/<id> or the id"),
 		RunE: func(command *cobra.Command, args []string) error {
@@ -409,53 +458,41 @@ func (a *App) waitCommand() *cobra.Command {
 }
 
 // wait polls a job's progress. quiet leaves the final line to the caller's
-// machine output.
+// machine output. Once the server has answered, a server that goes away is
+// asked again (see outage): an upgrade of the server must not end a wait.
 func (a *App) wait(ctx context.Context, client *api.Client, id string, flags waitFlags, quiet bool) error {
 	started := a.Now()
 	pause := 2 * time.Second
 	last := ""
+	answered := flags.answered
+	away := outage{app: a}
 	for {
 		seen, err := a.progress(ctx, client, id, true)
-		if err != nil {
-			if ctx.Err() != nil {
-				fmt.Fprintf(a.Err, "The job keeps running. Watch it again with: srw wait job/%s\n", id)
-			}
-			return err
-		}
-		changed := seen.Status != last
-		last = seen.Status
-		done := func(code int, note string) error {
-			if !quiet {
-				line := fmt.Sprintf("job/%s %s", id, seen.Status)
-				if seen.Outcome != "" && seen.Outcome != seen.Status {
-					line += " (" + seen.Outcome + ")"
-				}
-				fmt.Fprintln(a.Out, line)
-			}
-			if code == exit.OK {
-				return nil
-			}
-			return exit.New(code, "%s", note)
-		}
 		switch {
-		case contains(flags.statuses, seen.Status):
-			return done(exit.OK, "")
-		case len(flags.statuses) > 0 && finalStatus(seen.Status):
-			return done(exit.WaitFailed, fmt.Sprintf("the job ended %s and cannot reach %s any more", seen.Status, strings.Join(flags.statuses, " or ")))
-		case seen.Status == "completed":
-			return done(exit.OK, "")
-		case finalStatus(seen.Status):
-			return done(exit.WaitFailed, "the job ended "+seen.Status)
-		case len(flags.statuses) == 0 && seen.needsPerson():
-			return done(exit.WaitNeedsPerson, waitingFor(id, seen))
-		}
-		// Progress goes to stderr. The line that ends the wait went to
-		// stdout above, so a status is printed in one place only.
-		if changed {
-			fmt.Fprintf(a.Err, "job/%s %s\n", id, seen.Status)
+		case err != nil && ctx.Err() != nil:
+			fmt.Fprintf(a.Err, "The job keeps running. Watch it again with: srw wait job/%s\n", id)
+			return err
+		case err != nil && !(answered && away.rideOut(err)):
+			return away.giveUp(err, id)
+		case err == nil:
+			answered = true
+			away.back()
+			if ended, result := a.waitVerdict(id, seen, flags, quiet); ended {
+				return result
+			}
+			// Progress goes to stderr. The line that ends the wait goes to
+			// stdout, so a status is printed in one place only.
+			if seen.Status != last {
+				fmt.Fprintf(a.Err, "job/%s %s\n", id, seen.Status)
+			}
+			last = seen.Status
 		}
 		if flags.timeout > 0 && a.Now().Sub(started) >= flags.timeout {
-			return exit.New(exit.WaitTimeout, "the job did not end within %s; it is %s and keeps running", flags.timeout, seen.Status).
+			state := "it is " + last + " and keeps running"
+			if !away.since.IsZero() {
+				state = "the server stopped answering; the job was " + last
+			}
+			return exit.New(exit.WaitTimeout, "the job did not end within %s; %s", flags.timeout, state).
 				WithHint("watch it again with: srw wait job/%s", id)
 		}
 		step := pause
@@ -469,6 +506,36 @@ func (a *App) wait(ctx context.Context, client *api.Client, id string, flags wai
 			return err
 		}
 	}
+}
+
+// waitVerdict says whether a progress answer ends the wait, and with what.
+func (a *App) waitVerdict(id string, seen *progress, flags waitFlags, quiet bool) (bool, error) {
+	done := func(code int, note string) (bool, error) {
+		if !quiet {
+			line := fmt.Sprintf("job/%s %s", id, seen.Status)
+			if seen.Outcome != "" && seen.Outcome != seen.Status {
+				line += " (" + seen.Outcome + ")"
+			}
+			fmt.Fprintln(a.Out, line)
+		}
+		if code == exit.OK {
+			return true, nil
+		}
+		return true, exit.New(code, "%s", note)
+	}
+	switch {
+	case contains(flags.statuses, seen.Status):
+		return done(exit.OK, "")
+	case len(flags.statuses) > 0 && finalStatus(seen.Status):
+		return done(exit.WaitFailed, fmt.Sprintf("the job ended %s and cannot reach %s any more", seen.Status, strings.Join(flags.statuses, " or ")))
+	case seen.Status == "completed":
+		return done(exit.OK, "")
+	case finalStatus(seen.Status):
+		return done(exit.WaitFailed, "the job ended "+seen.Status)
+	case len(flags.statuses) == 0 && seen.needsPerson():
+		return done(exit.WaitNeedsPerson, waitingFor(id, seen))
+	}
+	return false, nil
 }
 
 func waitingFor(id string, seen *progress) string {
@@ -991,7 +1058,9 @@ func (a *App) logsCommand() *cobra.Command {
 		Long: "Print a job's audit trail: the model's steps and the tools it called. This\n" +
 			"is the record the Cockpit shows.\n\n" +
 			"-f follows a running job and ends when the job ends or stops for a person.\n" +
-			"It exits 0 whatever the job's result; use `srw wait` for the outcome.",
+			"It exits 0 whatever the job's result; use `srw wait` for the outcome. A\n" +
+			"server that stops answering in the middle is asked again for up to ten\n" +
+			"minutes.",
 		Example: "  srw logs job/0b5c2f6e --tail 20\n  srw logs 0b5c2f6e -f --filter tools",
 		Args:    exactArgs(1, "one job: job/<id> or the id"),
 		RunE: func(command *cobra.Command, args []string) error {
@@ -1106,15 +1175,25 @@ func (a *App) logs(ctx context.Context, client *api.Client, id string, flags log
 		return printer.finish()
 	}
 	pause := 2 * time.Second
+	// The first read was answered. A server that goes away after it is
+	// asked again, as in wait; the cursor keeps its place.
+	away := outage{app: a}
 	for {
 		seen, err := a.progress(ctx, client, id, true)
-		if err != nil {
-			return err
+		printed := 0
+		if err == nil {
+			printed, err = read()
 		}
-		printed, err := read()
 		if err != nil {
-			return err
+			if ctx.Err() != nil || !away.rideOut(err) {
+				return away.giveUp(err, id)
+			}
+			if err := a.sleep(ctx, pause); err != nil {
+				return err
+			}
+			continue
 		}
+		away.back()
 		if (finalStatus(seen.Status) || seen.needsPerson()) && printed == 0 {
 			// One more read brought nothing new: print what is still held
 			// back, finished or not, and end.

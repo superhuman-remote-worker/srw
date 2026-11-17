@@ -273,14 +273,17 @@ func (c *Client) transportError(method string, wrote bool, err error) error {
 		return exit.New(exit.Unknown, "the request was sent but no response arrived: %s", message).
 			WithHint("the change may or may not have happened; check before sending it again")
 	}
+	// What is left can pass by itself: the server restarts, the network
+	// comes back.
+	failure := exit.New(exit.Unreachable, "cannot reach %s: %s", c.base.Host, message)
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
-		return exit.New(exit.Unreachable, "cannot resolve %s", c.base.Hostname())
+		failure = exit.New(exit.Unreachable, "cannot resolve %s", c.base.Hostname())
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		failure = exit.New(exit.Unreachable, "%s did not answer in time", c.base.Host)
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return exit.New(exit.Unreachable, "%s did not answer in time", c.base.Host)
-	}
-	return exit.New(exit.Unreachable, "cannot reach %s: %s", c.base.Host, message)
+	failure.Away = true
+	return failure
 }
 
 // Send performs a request and fails for every status that is not 2xx.
@@ -305,7 +308,11 @@ func (c *Client) JSON(ctx context.Context, request Request, out any) error {
 		return nil
 	}
 	if err := json.Unmarshal(response.Body, out); err != nil {
-		return exit.New(exit.Failed, "%s %s did not answer JSON; is %s the API address?", request.Method, request.Path, c.base)
+		// A web server in front of the API answers a page for any path,
+		// also while the API restarts behind it.
+		failure := exit.New(exit.Failed, "%s %s did not answer JSON; is %s the API address?", request.Method, request.Path, c.base)
+		failure.Away = true
+		return failure
 	}
 	return nil
 }
