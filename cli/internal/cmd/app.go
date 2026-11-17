@@ -37,6 +37,9 @@ type App struct {
 
 	// StdinIsTerminal says whether a person can be asked something.
 	StdinIsTerminal bool
+	// StdoutIsTerminal says whether a person reads the output. It decides
+	// presentation only (short ids), never the format.
+	StdoutIsTerminal bool
 	// ReadSecret reads a line without echoing it.
 	ReadSecret func(prompt string) (string, error)
 
@@ -69,9 +72,10 @@ func Main() int {
 	app := &App{
 		In: os.Stdin, Out: os.Stdout, Err: os.Stderr,
 		Getenv: os.Getenv, Home: home, Now: time.Now,
-		StdinIsTerminal: term.IsTerminal(int(os.Stdin.Fd())),
-		ReadSecret:      readSecret,
-		Version:         buildinfo.Version, Commit: buildinfo.Commit,
+		StdinIsTerminal:  term.IsTerminal(int(os.Stdin.Fd())),
+		StdoutIsTerminal: term.IsTerminal(int(os.Stdout.Fd())),
+		ReadSecret:       readSecret,
+		Version:          buildinfo.Version, Commit: buildinfo.Commit,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -145,6 +149,13 @@ func (a *App) Root() *cobra.Command {
 		a.configCommand(),
 		a.versionCommand(),
 		a.apiCommand(),
+		a.validateCommand(),
+		a.previewCommand(),
+		a.applyCommand(),
+		a.getCommand(),
+		a.exportCommand(),
+		a.deleteCommand(),
+		a.cacheCommand(),
 	)
 	return root
 }

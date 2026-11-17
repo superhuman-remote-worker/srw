@@ -18,7 +18,29 @@ type Route struct {
 var (
 	AuthMe  = Route{"GET", "/api/auth/me", "any"}
 	Version = Route{"GET", "/api/version", "any"}
+
+	ManifestValidate = Route{"POST", "/api/manifests/validate", "jobs:read"}
+	ManifestPreview  = Route{"POST", "/api/manifests/preview", "jobs:read"}
+	ManifestExport   = Route{"POST", "/api/manifests/export", "jobs:read"}
+	ManifestApply    = Route{"POST", "/api/manifests/apply", "resources:write"}
+
+	ResourceList   = Route{"GET", "/api/resources", "jobs:read"}
+	ResourceGet    = Route{"GET", "/api/resources/{resource_id}", "jobs:read"}
+	ResourceDelete = Route{"DELETE", "/api/resources/{resource_id}", "resources:write"}
+
+	CacheList   = Route{"GET", "/api/workspace-cache", "jobs:read"}
+	CacheDelete = Route{"DELETE", "/api/workspace-cache/{artifact_id}", "admin"}
+
+	ExpertList       = Route{"GET", "/api/experts", "jobs:read"}
+	ProjectList      = Route{"GET", "/api/projects", "jobs:read"}
+	ConnectorCatalog = Route{"GET", "/api/datasources/catalog", "jobs:read"}
 )
 
 // All is every route above.
-var All = []Route{AuthMe, Version}
+var All = []Route{
+	AuthMe, Version,
+	ManifestValidate, ManifestPreview, ManifestExport, ManifestApply,
+	ResourceList, ResourceGet, ResourceDelete,
+	CacheList, CacheDelete,
+	ExpertList, ProjectList, ConnectorCatalog,
+}

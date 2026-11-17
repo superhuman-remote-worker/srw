@@ -38,6 +38,10 @@ type harness struct {
 	// server that does not have /api/version yet.
 	identity map[string]any
 	info     map[string]any
+	// routes answers further paths, keyed by "METHOD /path".
+	routes map[string]http.HandlerFunc
+	// stdoutTerminal says a person reads the output.
+	stdoutTerminal bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -77,6 +81,13 @@ func (h *harness) serve(w http.ResponseWriter, r *http.Request) {
 		answer(401, map[string]string{"detail": "Invalid token"})
 		return
 	}
+	h.mu.Lock()
+	handler := h.routes[r.Method+" "+r.URL.Path]
+	h.mu.Unlock()
+	if handler != nil {
+		handler(w, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/api/auth/me":
 		answer(200, identity)
@@ -103,9 +114,9 @@ func (h *harness) run(stdin string, args ...string) (stdout, stderr string, code
 		In: strings.NewReader(stdin), Out: &out, Err: &errOut,
 		Getenv: func(name string) string { return h.env[name] },
 		Home:   h.home, Now: func() time.Time { return now },
-		StdinIsTerminal: h.terminal,
-		ReadSecret:      func(string) (string, error) { return h.secret, nil },
-		Version:         h.version, Commit: "c0ffee1",
+		StdinIsTerminal: h.terminal, StdoutIsTerminal: h.stdoutTerminal,
+		ReadSecret: func(string) (string, error) { return h.secret, nil },
+		Version:    h.version, Commit: "c0ffee1",
 		Pauses: []time.Duration{0, 0},
 	}
 	code = app.Run(context.Background(), args)
