@@ -173,8 +173,36 @@ def test_no_image_data_is_a_failure():
 
 def test_size_words_map_to_the_images_api():
     assert openai_size("portrait") == "1024x1536"
-    assert openai_size("2048x1152") == "2048x1152"
     assert openai_size("") is None
+    assert openai_size("big please", "gpt-image-2") is None
+
+
+@pytest.mark.parametrize(
+    "size, model, expected",
+    [
+        # Inside the gpt-image-2.x bounds: sent as asked.
+        ("2048x1152", "gpt-image-2.6-flare", "2048x1152"),
+        ("1536x1024", "gpt-image-2", "1536x1024"),
+        # Too few pixels (the live k3d 400, 2026-11-17): scaled up, same shape.
+        ("512x512", "gpt-image-2.6-flare", "816x816"),
+        # Too many pixels, or an aspect beyond 3:1: fitted.
+        ("8000x8000", "gpt-image-2", "2880x2880"),
+        ("3840x1000", "gpt-image-2", "3392x1136"),
+        # Older models know only the three standard sizes.
+        ("512x512", "gpt-image-1.5", "1024x1024"),
+        ("1920x1080", "gpt-image-1.5", "1536x1024"),
+        ("1080x1920", None, "1024x1536"),
+    ],
+)
+def test_sizes_the_model_would_refuse_are_fitted(size, model, expected):
+    fitted = openai_size(size, model)
+    assert fitted == expected
+    if model and model.startswith("gpt-image-2"):
+        width, height = (int(v) for v in fitted.split("x"))
+        assert width % 16 == 0 and height % 16 == 0
+        assert 655_360 <= width * height <= 8_294_400
+        assert max(width, height) <= 3840
+        assert max(width, height) / min(width, height) <= 3
 
 
 GEMINI = {

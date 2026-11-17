@@ -128,14 +128,72 @@ def _classify(status: int, text: str) -> str:
     return "unavailable"
 
 
-def openai_size(size: str | None) -> str | None:
-    """The Images API ``size`` for a size, an aspect ratio or a word."""
+#: gpt-image-2.x custom sizes (OpenAI image guide, read 2026-11-17;
+#: research reference_1 E4): edges multiples of 16, aspect within 3:1, no
+#: edge above 3840, 655,360–8,294,400 pixels in total.
+_CUSTOM_MIN_PIXELS = 655_360
+_CUSTOM_MAX_PIXELS = 8_294_400
+_CUSTOM_MAX_EDGE = 3840
+
+
+def _takes_custom_sizes(model: str | None) -> bool:
+    name = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return name.startswith(("gpt-image-2", "chatgpt-image-2"))
+
+
+def _fit_custom_size(width: int, height: int) -> str:
+    """The nearest size the gpt-image-2.x bounds accept, same aspect."""
+    import math
+
+    ratio = min(max(width / height, 1 / 3), 3.0)
+    pixels = min(max(width * height, _CUSTOM_MIN_PIXELS), _CUSTOM_MAX_PIXELS)
+    h = math.sqrt(pixels / ratio)
+    w = h * ratio
+    scale = min(1.0, _CUSTOM_MAX_EDGE / max(w, h))
+    w, h = w * scale, h * scale
+    w16 = max(16, int(round(w / 16)) * 16)
+    h16 = max(16, int(round(h / 16)) * 16)
+    while w16 * h16 < _CUSTOM_MIN_PIXELS:
+        if w16 <= h16 and w16 + 16 <= _CUSTOM_MAX_EDGE:
+            w16 += 16
+        else:
+            h16 += 16
+    while w16 * h16 > _CUSTOM_MAX_PIXELS:
+        if w16 >= h16:
+            w16 -= 16
+        else:
+            h16 -= 16
+    return f"{min(w16, _CUSTOM_MAX_EDGE)}x{min(h16, _CUSTOM_MAX_EDGE)}"
+
+
+def openai_size(size: str | None, model: str | None = None) -> str | None:
+    """The Images API ``size`` for a size, an aspect ratio or a word.
+
+    A ``WxH`` the model would refuse is fitted instead of sent: gpt-image-2.x
+    gets the nearest size inside its custom-size bounds (a 512x512 request
+    becomes 816x816), older models the standard size of the same shape.
+    ``None`` (the model's default) for anything unreadable.
+    """
     if not size:
         return None
     text = size.strip().lower()
     if text in _OPENAI_SIZES:
         return _OPENAI_SIZES[text]
-    return text if "x" in text else None
+    parts = text.replace("×", "x").split("x")
+    try:
+        width, height = (int(parts[0]), int(parts[1])) if len(parts) == 2 else (0, 0)
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    if _takes_custom_sizes(model):
+        return _fit_custom_size(width, height)
+    ratio = width / height
+    if ratio >= 1.2:
+        return "1536x1024"
+    if ratio <= 1 / 1.2:
+        return "1024x1536"
+    return "1024x1024"
 
 
 def _normalise_openai_usage(usage: Any) -> dict[str, int]:
@@ -195,7 +253,7 @@ async def call_openai_images(
         "prompt": request.prompt,
         "n": max(1, int(request.n)),
     }
-    size = openai_size(request.size)
+    size = openai_size(request.size, str(section.get("model") or ""))
     if size:
         payload["size"] = size
     if request.quality in _QUALITIES:
