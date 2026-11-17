@@ -96,3 +96,37 @@ async def put_tts_library_settings(
     return await system_settings.put_tts_library_settings(
         body=body, admin=admin, dependencies=dependencies.operations
     )
+
+
+@router.get("/api/admin/system-settings/mcp_server_questions")
+async def get_mcp_server_questions_settings(
+    request: Request,
+    *,
+    dependencies: SystemSettingsDependencies = Depends(
+        get_system_settings_dependencies
+    ),
+) -> dict[str, Any]:
+    """Return the default for MCP server questions (decline or accept).
+    Admin-only. Absent row is reported as decline."""
+    await dependencies.require_admin(request)
+    return await system_settings.get_mcp_server_questions_settings(
+        dependencies=dependencies.operations
+    )
+
+
+@router.put("/api/admin/system-settings/mcp_server_questions")
+async def put_mcp_server_questions_settings(
+    body: dict[str, Any],
+    request: Request,
+    *,
+    dependencies: SystemSettingsDependencies = Depends(
+        get_system_settings_dependencies
+    ),
+) -> dict[str, Any]:
+    """Set what an MCP connector without its own choice does when its server
+    asks a yes/no question mid-call. Admin-only; applies at the next
+    dispatch."""
+    admin = await dependencies.require_admin(request)
+    return await system_settings.put_mcp_server_questions_settings(
+        body=body, admin=admin, dependencies=dependencies.operations
+    )

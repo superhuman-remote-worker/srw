@@ -40,6 +40,16 @@ import {
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
 import { parseMarkedToolResultState, parseToolResultState } from '../models/tool-result-state.model';
+import {
+  McpQuestion,
+  McpQuestionAnswer,
+  McpQuestionUiState,
+  questionDecisionBody,
+  questionErrorDetail,
+  questionOutcome,
+  toMcpQuestion,
+  toMcpQuestions,
+} from '../models/mcp-question.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
@@ -708,6 +718,9 @@ interface SessionStateSnapshot extends Record<string, unknown> {
    */
   running_tools?: RunningToolInfo[] | null;
   pending_permissions: unknown[];
+  /** Open MCP server questions (same shape as `question.request` data).
+   *  Omitted by peers that predate them. */
+  pending_questions?: unknown[];
   /** Present on task-aware servers; omitted by older rolling-deploy peers. */
   tasks?: SessionTask[];
   /** Last known token telemetry, aggregated from the journal at
@@ -1264,6 +1277,19 @@ export class PersistentChatService {
    *  knowledge-base/knowledge/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
   readonly pendingPermissions = signal<PermissionRequest[]>([]);
   private readonly permissionResolutionFailures = new Set<string>();
+
+  // --- MCP server questions ---
+  /** Questions an MCP server asked mid-call, still waiting on the user
+   *  (knowledge-base/knowledge/features/mcp_client_2026_07_28_elicitation.md).
+   *  Ack-driven like approvals: a card leaves on `question.resolved` (or a
+   *  snapshot that no longer lists it), never on the POST alone. */
+  readonly pendingQuestions = signal<McpQuestion[]>([]);
+  /** Each card's send state, by request id. */
+  readonly questionUi = signal<Record<string, McpQuestionUiState>>({});
+  /** The server each announced question named, by request id and tool
+   *  call: `question.resolved` carries neither, and a reload's snapshot has
+   *  already dropped the card its transcript line needs the name from. */
+  private readonly questionServers = new Map<string, string>();
 
   // --- Running-command snapshot ---
   // Set from the session.state welcome frame on (re)attach when the loop is
@@ -2378,6 +2404,7 @@ export class PersistentChatService {
     this._clearDurableControlOutbox();
     this.pendingPermissions.set([]);
     this.permissionResolutionFailures.clear();
+    this._clearQuestions();
     this.workspaceUpgradeInProgress.set(null);
     this.workspaceUpgradeSeenOnServer = false;
     this.workspaceUpgradeEndedByFrame = false;
@@ -5532,6 +5559,7 @@ export class PersistentChatService {
     // swallow. Only a genuine thread switch (connect() cold path) clears it.
     this.pendingPermissions.set([]);
     this.permissionResolutionFailures.clear();
+    this._clearQuestions();
     this.compaction.set(null);
     // The workspace-upgrade signals are per-thread and must not bleed across
     // a switch. workspaceUpgradeInProgress especially: disconnect() closes
@@ -6925,6 +6953,120 @@ export class PersistentChatService {
     }
   }
 
+  // ── MCP server questions ───────────────────────────────────────────
+
+  /**
+   * Answer an MCP server's question: Accept or Submit (`approve`, with the
+   * form's content, and `alwaysAccept` for "Always accept in this
+   * session"), Decline (`deny`) or Dismiss (`cancel`). The card stays until
+   * `question.resolved` retires it. A 404/409 means it is already gone or
+   * decided; a 422 means the answer does not fit the form, and its detail
+   * shows on the card, which stays open. Never rejects.
+   */
+  answerQuestion(question: McpQuestion, answer: McpQuestionAnswer): Promise<void> {
+    const threadId = this.threadId();
+    if (!threadId) return Promise.resolve();
+    const key = question.approvalId;
+    if (this.questionUi()[key]?.busy) return Promise.resolve();
+    this._setQuestionUi(key, {busy: true, sent: false, error: null});
+    const url = `${environment.apiUrl}/persistent/threads/${threadId}/approve/${key}`;
+    return new Promise<void>((resolve) => {
+      this.http.post(url, questionDecisionBody(answer)).subscribe({
+        next: () => {
+          if (this.threadId() === threadId) this._setQuestionUi(key, {sent: true});
+        },
+        complete: () => resolve(),
+        error: (err: unknown) => {
+          resolve();
+          if (this.threadId() !== threadId) return;
+          const status = (err as {status?: number})?.status;
+          if (status === 404 || status === 409) {
+            this._systemMessage(
+              this.transloco.translate(
+                status === 409 ? 'chat.question.alreadyAnswered' : 'chat.question.gone',
+              ),
+            );
+            this._setPendingQuestions(
+              this.pendingQuestions().filter((q) => q.approvalId !== key),
+            );
+            return;
+          }
+          // Still open: a card a question.resolved already retired stays gone.
+          if (!this.pendingQuestions().some((q) => q.approvalId === key)) return;
+          const detail =
+            status === 422 ? questionErrorDetail((err as {error?: unknown})?.error) : null;
+          this._setQuestionUi(key, {
+            error:
+              detail ??
+              this.transloco.translate(
+                status === 422 ? 'chat.question.invalidAnswer' : 'chat.question.sendFailed',
+                {server: question.server},
+              ),
+          });
+        },
+      });
+    });
+  }
+
+  /** Replace the open questions, dropping the send state of any that left. */
+  private _setPendingQuestions(questions: McpQuestion[]): void {
+    this.pendingQuestions.set(questions);
+    const open = new Set(questions.map((q) => q.approvalId));
+    const ui = this.questionUi();
+    if (Object.keys(ui).some((key) => !open.has(key))) {
+      this.questionUi.set(
+        Object.fromEntries(Object.entries(ui).filter(([key]) => open.has(key))),
+      );
+    }
+  }
+
+  private _setQuestionUi(key: string, state: McpQuestionUiState): void {
+    this.questionUi.update((ui) => ({...ui, [key]: state}));
+  }
+
+  private _rememberQuestionServer(question: McpQuestion): void {
+    if (!question.server) return;
+    this.questionServers.set(question.approvalId, question.server);
+    this.questionServers.set(`call:${question.id}`, question.server);
+  }
+
+  private _clearQuestions(): void {
+    this.pendingQuestions.set([]);
+    this.questionUi.set({});
+    this.questionServers.clear();
+  }
+
+  /** One transcript line for a settled question: under its tool call's
+   *  card, or as a system line when no card holds that call (a turn that
+   *  REST history has not replayed). */
+  private _recordQuestionOutcome(
+    toolUseId: string,
+    server: string,
+    outcome: ReturnType<typeof questionOutcome>,
+    timestamp: number,
+  ): void {
+    if (!toolUseId) return;
+    const held = this.conversation().turns.some(
+      (turn) =>
+        turn.kind === 'assistant' &&
+        turn.events.some((e) => e.kind === 'tool_call' && e.id === toolUseId),
+    );
+    if (held) {
+      this.dispatch({type: 'question_decision', toolUseId, server, outcome, timestamp});
+      return;
+    }
+    this.dispatch({
+      type: 'system_message',
+      // Stable per call, so a replayed resolution replaces its line.
+      id: `question:${toolUseId}`,
+      content: this.transloco.translate(
+        `chat.question.${server ? 'outcome' : 'outcomeGeneric'}.${outcome}`,
+        {server},
+      ),
+      timestamp,
+    });
+  }
+
   /** Interrupt the current turn — REST POST. */
   async interrupt(): Promise<void> {
     if (this.isInterrupting()) return;
@@ -7934,6 +8076,15 @@ export class PersistentChatService {
             }
           }
         }
+        // Open MCP server questions, beside (never inside) the pending
+        // approvals. Same discipline: presence is authoritative, an
+        // explicit [] included, and an older peer that omits the key
+        // leaves the live list alone.
+        if ('pending_questions' in params) {
+          const questions = toMcpQuestions(params['pending_questions']);
+          for (const question of questions) this._rememberQuestionServer(question);
+          this._setPendingQuestions(questions);
+        }
         // Tasks are durable state, not replay state: a task update may
         // predate replay_cursor. Presence is authoritative (including
         // []), while an older pinned/rolling-deploy welcome frame that
@@ -8168,6 +8319,53 @@ export class PersistentChatService {
             timestamp: now,
           });
         }
+        break;
+      }
+
+      case 'question.request': {
+        // An MCP server asks the user something while one of its calls
+        // runs. The card lists it; the tool call keeps running (it is
+        // waiting on the server), so the transcript is not touched until
+        // the question settles.
+        const question = toMcpQuestion(params);
+        if (!question) break;
+        this._rememberQuestionServer(question);
+        if (!coveredBySnapshot) {
+          // A call holds one open question: a re-announced one (a new
+          // request id for the same call) replaces the card, the way a
+          // re-announced approval converges on its newest id.
+          this._setPendingQuestions([
+            ...this.pendingQuestions().filter(
+              (q) => q.id !== question.id && q.approvalId !== question.approvalId,
+            ),
+            question,
+          ]);
+        }
+        break;
+      }
+
+      case 'question.resolved': {
+        const resolvedId = (params['id'] as string) || '';
+        const approvalId = (params['approval_id'] as string) || '';
+        const card = this.pendingQuestions().find((q) =>
+          approvalId ? q.approvalId === approvalId : q.id === resolvedId,
+        );
+        if (!coveredBySnapshot && (approvalId || resolvedId)) {
+          // Only the settled request leaves: a later question on the same
+          // call has an id of its own.
+          this._setPendingQuestions(
+            this.pendingQuestions().filter((q) =>
+              approvalId ? q.approvalId !== approvalId : q.id !== resolvedId,
+            ),
+          );
+        }
+        // '' when no frame named it: the line then says "the MCP server".
+        const server =
+          card?.server ||
+          (approvalId && this.questionServers.get(approvalId)) ||
+          (resolvedId && this.questionServers.get(`call:${resolvedId}`)) ||
+          '';
+        this._recordQuestionOutcome(resolvedId, server, questionOutcome(params['decision']), now);
         break;
       }
 

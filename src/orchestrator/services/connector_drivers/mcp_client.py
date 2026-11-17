@@ -26,6 +26,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from orchestrator.services.connector_drivers.base import (
+    BindContext,
     CheckContext,
     ConnectorDraft,
     DatasourceDriver,
@@ -34,6 +35,9 @@ from orchestrator.services.connector_drivers.base import (
     NormalizedConnector,
     SecretLeaf,
     ValidationContext,
+    payload_entry,
+    server_questions_config,
+    server_questions_fields,
     string_leaves,
     top_level_leaves,
 )
@@ -41,7 +45,19 @@ from shared.connectors.builtin import MCP_SPEC, MCP_STDIO_RETIRED, mcp_spec_for
 from shared.connectors.contract import DriverSpec
 from shared.connectors.envelope import unsupported_check
 
-_CONFIG_REFUSED = "Connector config is not supported for MCP connectors"
+_CONFIG_REFUSED = (
+    "An MCP connector's config holds only server_questions (decline or accept)"
+)
+
+
+def _mcp_config(config: Any) -> dict[str, Any]:
+    """The one setting an MCP connector's config holds: what a question the
+    server asks mid-call gets by itself (``shared.mcp_questions``)."""
+    if not config:
+        return {}
+    if not isinstance(config, Mapping) or set(config) - {"server_questions"}:
+        raise HTTPException(status_code=400, detail=_CONFIG_REFUSED)
+    return server_questions_config(config)
 
 
 class McpDriver(DatasourceDriver):
@@ -71,15 +87,13 @@ class McpDriver(DatasourceDriver):
         if existing is None:
             # prevalidate already checked the URL and credentials (and
             # refused a stdio server).
-            if draft.config:
-                raise HTTPException(status_code=400, detail=_CONFIG_REFUSED)
+            config = _mcp_config(draft.config)
             return NormalizedConnector(
-                draft.connection_url, {}, self.stored_credentials(draft, existing)
+                draft.connection_url, config, self.stored_credentials(draft, existing)
             )
 
         credentials = self.stored_credentials(draft, existing)
-        if draft.config:
-            raise HTTPException(status_code=400, detail=_CONFIG_REFUSED)
+        config = _mcp_config(draft.config) if draft.config is not None else None
         # Validate the connector as it will be after the edit: a stored stdio
         # server is refused unless the edit moves it to a remote transport.
         effective_credentials = (
@@ -103,7 +117,7 @@ class McpDriver(DatasourceDriver):
             draft.connection_url if url_was_supplied else existing.get("connection_url")
         )
         ctx.environment.validate_mcp_datasource(effective_url, effective_credentials)
-        return NormalizedConnector(draft.connection_url, draft.config, credentials)
+        return NormalizedConnector(draft.connection_url, config, credentials)
 
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
@@ -117,6 +131,21 @@ class McpDriver(DatasourceDriver):
 
     def effective_access(self, row: Mapping[str, Any]) -> str | None:
         return "ReadWrite"
+
+    def bind(
+        self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
+    ) -> dict[str, Any] | None:
+        """The server and its auth, the connector's id (a Session's "Always
+        accept" is kept by it) and the server-questions setting it runs with."""
+        return payload_entry(
+            row,
+            credentials=credentials,
+            read_only=row.get("project_read_only", False),
+            fields={
+                "datasource_id": str(row["id"]) if row.get("id") else None,
+                **server_questions_fields(row),
+            },
+        )
 
     def runtime_allowed(self, row: Mapping[str, Any], gates: DeploymentGates) -> bool:
         """Apply the deployment gate without exposing secrets; a stored

@@ -53788,6 +53788,32 @@ class PostgresDB:
                     )
             ds["_owner_can_autonomous_send"] = allowed
 
+    async def _stamp_mcp_server_questions_default(
+        self, datasources: List[Dict[str, Any]]
+    ) -> None:
+        """Stamp the installation's default for MCP server questions on each
+        row (``shared.mcp_questions``), so the (sync) dispatch payload builder
+        resolves a connector without its own choice. One read per
+        resolution (a registered MCP driver's type is not known here, so
+        every row is stamped); an unreadable setting leaves the factory
+        default (decline)."""
+        from shared.mcp_questions import SYSTEM_SETTING_KEY, setting_or_none
+
+        if not datasources:
+            return
+        default = None
+        try:
+            row = await self.get_system_setting(SYSTEM_SETTING_KEY)
+            value = (row or {}).get("value")
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                default = setting_or_none(value.get("default"))
+        except Exception:
+            logger.exception("MCP server-questions default unreadable; declining")
+        for ds in datasources:
+            ds["_server_questions_default"] = default
+
     async def resolve_datasources_for_job(
         self, job_id: str, project_id: str | None = None
     ) -> List[Dict[str, Any]]:
@@ -53838,6 +53864,7 @@ class PostgresDB:
 
         resolved = [_datasource_row_to_dict(row) for row in rows]
         await self._stamp_email_autonomous_send(resolved)
+        await self._stamp_mcp_server_questions_default(resolved)
         return resolved
 
     async def resolve_datasources_for_thread(
@@ -53922,6 +53949,7 @@ class PostgresDB:
 
         resolved = [_datasource_row_to_dict(row) for row in rows]
         await self._stamp_email_autonomous_send(resolved)
+        await self._stamp_mcp_server_questions_default(resolved)
         return resolved
 
     # -- Job ↔ Datasource junction (N:M) --------------------------------------

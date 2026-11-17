@@ -74,6 +74,9 @@ async def pg_pool(pg_dsn):
                 decided_at timestamptz,
                 decided_by text,
                 accepted_lease_token bigint,
+                kind text NOT NULL DEFAULT 'tool',
+                request jsonb,
+                response jsonb,
                 UNIQUE (id, thread_id),
                 CHECK (accepted_lease_token IS NULL OR accepted_lease_token > 0)
             );

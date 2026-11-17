@@ -33,7 +33,7 @@ class FakeManager:
         self.statuses = {"fake": "connected"}
         self.image_checks = []
 
-    def get_langchain_tools(self, sees_images=None):
+    def get_langchain_tools(self, sees_images=None, save_file=None):
         self.image_checks.append(sees_images)
         return self._tools
 

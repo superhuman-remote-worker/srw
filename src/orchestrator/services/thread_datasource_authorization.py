@@ -36,6 +36,8 @@ import would bind past.
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -332,7 +334,31 @@ async def resolve_authorized_thread_datasources(
     rows = require_exact_datasource_resolution(selected, policy_revisions, resolved)
     if dependencies.connector_credentials is not None:
         await dependencies.connector_credentials(rows, authorized=selected)
+    stamp_session_server_questions(thread, rows)
     return rows
+
+
+def stamp_session_server_questions(
+    thread: dict[str, Any], rows: list[dict[str, Any]]
+) -> None:
+    """Stamp a Session's own "Always accept in this session" on its MCP
+    connectors (``threads.metadata.mcp_server_questions``, by connector id),
+    which the dispatch payload prefers over the connector's setting."""
+    from shared.mcp_questions import SESSION_METADATA_KEY, setting_or_none
+
+    metadata = thread.get("metadata") if isinstance(thread, dict) else None
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = None
+    chosen = metadata.get(SESSION_METADATA_KEY) if isinstance(metadata, dict) else None
+    if not isinstance(chosen, dict):
+        return
+    for row in rows:
+        value = setting_or_none(chosen.get(str(row.get("id"))))
+        if value is not None:
+            row["_session_server_questions"] = value
 
 
 __all__ = [
@@ -342,5 +368,6 @@ __all__ = [
     "authorize_thread_datasource_selection",
     "resolve_authorized_thread_datasources",
     "revalidate_thread_datasource_selection",
+    "stamp_session_server_questions",
     "strip_still_denied_ack",
 ]

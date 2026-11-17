@@ -868,6 +868,9 @@ async def load_delegation_manifest(
               FROM thread_permission_requests
              WHERE thread_id = $1
                AND tool_call_id = ANY($2::text[])
+               -- A server's question shares its call's id; only the tool's
+               -- own approval says whether the delegation ran.
+               AND kind = 'tool'
              ORDER BY tool_call_id, requested_at DESC, id DESC
             """,
             parent_thread_id,

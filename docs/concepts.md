@@ -54,6 +54,18 @@ connector's system only while that connector is attached. When SRW has no
 connector type for a credential, you can [build a connector
 driver](connector-drivers.md).
 
+An MCP server's tools become the agent's tools. The agent can also read a
+resource the server offers, such as a generated file one of its tools links
+to (`read_mcp_resource`), or save one into the workspace
+(`save_mcp_resource`). A server may ask a question while a call runs, such as
+"Spend 12 Buzz to run this?". Each MCP connector says what such a question
+gets on its own: **Decline**, the default, or **Accept** for yes/no
+confirmations. An admin sets the default for connectors that don't choose.
+A job and an Autonomous session apply the setting. A Read-only or Auto-accept
+session that would decline shows you the question instead, with **Always
+accept in this session**. A question that needs typed input or a link to open
+always comes to you in such a session, and is declined anywhere else.
+
 ### The runtime
 
 The runtime is everything that turns those bricks into running work: the

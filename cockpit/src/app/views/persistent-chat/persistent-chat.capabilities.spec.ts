@@ -42,7 +42,8 @@ function sessionState() {
     'rewindPreviewLoading', 'rewindModeAvailable', 'summarizeAvailable', 'outboxStalled',
     'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable', 'cloudFoldersAgentOutdated',
     'cloudFoldersProtected', 'workspaceUpgradeFailed']) state[key] = signal(false);
-  for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions', 'tasks',
+  for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions',
+    'pendingQuestions', 'tasks',
     'outbox', 'outboxIds', 'draftDatasourceIds', 'runningTools', 'cloudFolderProblems',
     'cloudFolders']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'pendingWorkspaceOffer',
@@ -52,6 +53,7 @@ function sessionState() {
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
     modelName: signal('Test model'), permissionMode: signal('read_only'), narrationMode: signal('off'),
+    questionUi: signal({}),
     workspaceUpgradeFailureText: () => '',
     startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()), citationFocus: signal(null),
     awaitingElapsedMs: signal(0), reconnectAttempt: signal(0), agentSilenceSeconds: signal(0), cloudChangesCount: signal(0),

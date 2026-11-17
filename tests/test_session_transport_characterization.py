@@ -369,6 +369,9 @@ def rt(pa, monkeypatch):
     runtime.pending = runtime.patch(
         "_pending_permission_requests", AsyncMock(return_value=[])
     )
+    runtime.questions = runtime.patch(
+        "_pending_question_requests", AsyncMock(return_value=[])
+    )
     runtime.thread_status = runtime.patch("_safe_set_thread_status", AsyncMock())
     runtime.resolve = runtime.patch(
         "_resolve_pending_permission", AsyncMock(return_value=None)
@@ -930,6 +933,8 @@ class TestWelcomeFrame:
         rt.set("_turn_event_open", True)
         pending = [{"approval_id": "approval-1", "tool": "run_command"}]
         rt.pending.return_value = pending
+        questions = [{"approval_id": "question-1", "server": "Civitai"}]
+        rt.questions.return_value = questions
 
         with _session_ws(client, ws_path) as ws:
             welcome = ws.welcome
@@ -948,6 +953,7 @@ class TestWelcomeFrame:
                 "running_tool": None,
                 "running_tools": [],
                 "pending_permissions": pending,
+                "pending_questions": questions,
                 "tasks": [{"id": "task-1", "status": "running"}],
             },
         }
@@ -959,6 +965,7 @@ class TestWelcomeFrame:
         assert params["running_tool"] is None
         assert params["running_tools"] == []
         assert params["pending_permissions"] == []
+        assert params["pending_questions"] == []
         assert params["tasks"] == []
         assert params["message_count"] == 0
 

@@ -472,6 +472,11 @@ async def thread_permission_notify_sweeper(
                     "FROM thread_permission_requests r "
                     "JOIN threads t ON t.id = r.thread_id "
                     "WHERE r.status = 'pending' "
+                    # The emailed approve/deny links name a tool and its
+                    # arguments: an MCP server's question is answered in the
+                    # Cockpit (knowledge-base/knowledge/features/
+                    # mcp_client_2026_07_28_elicitation.md, follow-up E).
+                    "  AND r.kind = 'tool' "
                     "  AND r.requested_at < now() - ($1::int * interval '1 second') "
                     "  AND NOT EXISTS ("
                     "    SELECT 1 FROM notifications n "

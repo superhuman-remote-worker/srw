@@ -1070,6 +1070,15 @@
     "since": "Seit"
   },
   "admin": {
+    "mcpQuestions": {
+      "title": "Voreinstellung für Fragen von MCP-Servern",
+      "hint": "Was ein Konnektor ohne eigene Wahl tut, wenn ein MCP-Server eine Ja/Nein-Frage stellt.",
+      "decline": "Ablehnen",
+      "accept": "Annehmen",
+      "saveFailed": "Die Voreinstellung konnte nicht gespeichert werden. Versuchen Sie es erneut.",
+      "lastChanged": "Zuletzt geändert am {{when}} von {{who}}",
+      "unknownAdmin": "unbekannt"
+    },
     "helm": {
       "badge": "Helm",
       "badgeDrift": "Helm · überschrieben",
@@ -2427,6 +2436,55 @@
       "childRunsUnattended": "Der Subagent führt danach seine eigenen Werkzeuge ohne Rückfrage aus, auch Befehle und Aktionen nach außen.",
       "stop": "Stoppen"
     },
+    "question": {
+      "label": "Frage eines Konnektors",
+      "asking": "{{server}} fragt",
+      "askingDuring": "{{server}} fragt während {{tool}}",
+      "secretWarning": "Geben Sie hier niemals Passwörter oder Schlüssel ein.",
+      "accept": "Annehmen",
+      "alwaysAccept": "In dieser Session immer annehmen",
+      "alwaysAcceptHint": "Nimmt diese Frage an und alle weiteren Ja/Nein-Fragen von {{server}} in dieser Session, ohne Sie zu fragen.",
+      "decline": "Ablehnen",
+      "dismiss": "Schließen",
+      "dismissHint": "Schließt die Frage, ohne sie zu beantworten.",
+      "submit": "Senden",
+      "done": "Fertig",
+      "doneHint": "Teilt {{server}} mit, dass Sie auf der Seite fertig sind.",
+      "openLink": "Link öffnen",
+      "lookAlike": "Diese Adresse enthält ähnlich aussehende Zeichen: Prüfen Sie den hervorgehobenen Host, bevor Sie sie öffnen.",
+      "unopenableLink": "Dieser Link ist keine Webadresse und kann hier nicht geöffnet werden.",
+      "optional": "optional",
+      "choose": "Auswählen…",
+      "sent": "Antwort gesendet. Warte auf {{server}} …",
+      "sendFailed": "Ihre Antwort konnte nicht gesendet werden. Die Frage ist weiter offen; versuchen Sie es erneut.",
+      "invalidAnswer": "{{server}} hat diese Antwort nicht angenommen. Prüfen Sie die Felder und versuchen Sie es erneut.",
+      "alreadyAnswered": "Diese Frage wurde bereits beantwortet.",
+      "gone": "Diese Frage ist nicht mehr verfügbar.",
+      "outcome": {
+        "accepted": "Sie haben die Anfrage von {{server}} angenommen.",
+        "declined": "Sie haben die Anfrage von {{server}} abgelehnt.",
+        "unanswered": "Die Anfrage von {{server}} wurde nicht beantwortet."
+      },
+      "outcomeGeneric": {
+        "accepted": "Sie haben die Anfrage des MCP-Servers angenommen.",
+        "declined": "Sie haben die Anfrage des MCP-Servers abgelehnt.",
+        "unanswered": "Die Anfrage des MCP-Servers wurde nicht beantwortet."
+      },
+      "error": {
+        "required": "Pflichtfeld.",
+        "minLength": "Mindestens {{min}} Zeichen.",
+        "maxLength": "Höchstens {{max}} Zeichen.",
+        "email": "Geben Sie eine E-Mail-Adresse ein.",
+        "url": "Geben Sie eine Adresse wie https://example.com ein.",
+        "date": "Geben Sie ein gültiges Datum ein.",
+        "number": "Geben Sie eine Zahl ein.",
+        "integer": "Geben Sie eine ganze Zahl ein.",
+        "minimum": "Mindestens {{min}}.",
+        "maximum": "Höchstens {{max}}.",
+        "minItems": "Wählen Sie mindestens {{min}} aus.",
+        "maxItems": "Wählen Sie höchstens {{max}} aus."
+      }
+    },
     "control": {
       "backpressure": "Zu viele Änderungen an den Sitzungseinstellungen warten. Versuche es gleich erneut.",
       "admissionFailed": "Die Sitzungseinstellung konnte nicht geändert werden. Versuche es erneut.",
@@ -3302,6 +3360,13 @@
       "accessReadWriteOnlyHint": "Für diesen Konnektortyp hat SRW keinen Nur-Lese-Modus: Agenten erhalten alle Werkzeuge, die er anbietet. Was erlaubt ist, entscheiden seine Zugangsdaten, für alle, die den Konnektor nutzen.",
       "accessKbHint": "Wissensdatenbanken sind für alle, die sie nutzen, immer nur lesbar: SRW indexiert das Repository, und Agenten erhalten Suchwerkzeuge, aber nie seine Zugangsdaten.",
       "accessGithubAppHint": "Nur Lesen heißt: SRW gibt Agenten für diesen Konnektor keine Schreibwerkzeuge, für alle, die ihn nutzen. Bei einem GitHub-App-Konnektor erzeugt SRW das Token jeder Ausführung zusätzlich mit contents: read, sodass GitHub Pushes mit diesem Token ablehnt.",
+      "serverQuestionsLabel": "Wenn der Server während eines Aufrufs eine Frage stellt",
+      "serverQuestionsInherit": "Der Voreinstellung der Installation folgen",
+      "serverQuestionsInheritDecline": "Der Voreinstellung folgen (Ablehnen)",
+      "serverQuestionsInheritAccept": "Der Voreinstellung folgen (Annehmen)",
+      "serverQuestionsDecline": "Ablehnen",
+      "serverQuestionsAccept": "Ja/Nein-Bestätigungen annehmen",
+      "serverQuestionsHint": "Fragen, die eine Eingabe oder einen Link brauchen, gehen in einer interaktiven Session immer an eine Person und werden in Jobs abgelehnt.",
       "availabilityTitle": "Verfügbarkeit",
       "scopeEverywhere": "Überall in meiner Arbeit",
       "scopeEverywhereHint": "In allen Projekten und eigenständiger Arbeit verfügbar, vorbehaltlich Freigabe- und öffentlicher Zugriffsregeln.",

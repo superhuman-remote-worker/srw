@@ -93,6 +93,7 @@ import {CitationsPanelComponent} from './citations-panel/citations-panel.compone
 import {CloudReviewDialogComponent} from '../job-diff-review/cloud-review-dialog.component';
 import {CloudReviewBannerComponent} from './cloud-review-banner/cloud-review-banner.component';
 import {CloudFoldersNoticeComponent} from './cloud-folders-notice/cloud-folders-notice.component';
+import {McpQuestionCardComponent} from './mcp-question-card/mcp-question-card.component';
 import {SshConnectPanelComponent} from './ssh-connect-panel/ssh-connect-panel.component';
 import {ChatEmptyStateComponent, type DisplayedSuggestion} from './chat-empty-state/chat-empty-state.component';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
@@ -1023,6 +1024,7 @@ export function clearDraft(threadId: string | null): void {
         CloudReviewDialogComponent,
         CloudReviewBannerComponent,
     CloudFoldersNoticeComponent,
+        McpQuestionCardComponent,
         SshConnectPanelComponent,
         ChatEmptyStateComponent,
     ],
@@ -1374,6 +1376,13 @@ export function clearDraft(threadId: string | null): void {
             <app-tool-card [view]="toolView(tc)" (actionRequested)="canvasRequested.emit()"
                            [citationScope]="turn ? citationScopeFor(turn) : null"
                            (jobDiffRequested)="openJobDiff($event)" />
+            @if (tc.question; as asked) {
+              <!-- The call's MCP server asked the user something; what came of it. -->
+              <div class="question-trail" data-testid="question-trail" [attr.data-outcome]="asked.outcome">
+                <app-icon size="sm" class="question-trail-icon">{{ asked.outcome === 'accepted' ? 'check_circle' : asked.outcome === 'declined' ? 'block' : 'help' }}</app-icon>
+                {{ 'chat.question.' + (asked.server ? 'outcome' : 'outcomeGeneric') + '.' + asked.outcome | transloco: {server: asked.server} }}
+              </div>
+            }
           }
         </div>
       </ng-template>
@@ -1805,7 +1814,7 @@ export function clearDraft(threadId: string | null): void {
                     }
 
                     <!-- Streaming pulse while the turn is in flight with nothing yet. -->
-                    @if (streaming && turn.events.length === 0 && chat.pendingPermissions().length === 0) {
+                    @if (streaming && turn.events.length === 0 && chat.pendingPermissions().length === 0 && chat.pendingQuestions().length === 0) {
                       <div class="thinking">
                         <span class="thinking-dot"></span>
                         <span class="thinking-dot"></span>
@@ -2012,6 +2021,15 @@ export function clearDraft(threadId: string | null): void {
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
           </div>
+        }
+
+        <!-- MCP server questions: a server asks the user something while one
+             of its calls runs. Beside the approval card, never inside it:
+             a question is answered, not approved. -->
+        @for (question of chat.pendingQuestions(); track question.approvalId) {
+          <app-mcp-question-card [question]="question"
+                                 [state]="chat.questionUi()[question.approvalId]"
+                                 (answered)="chat.answerQuestion(question, $event)" />
         }
 
         <!-- Running-command cards — shown on (re)attach when the agent is

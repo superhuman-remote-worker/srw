@@ -1,0 +1,141 @@
+@use '../../../../styles/variables' as v;
+
+// The host carries the approval card's mile-marker frame, so a question
+// reads as the same kind of thing: the session waits on you.
+:host {
+  display: block;
+  align-self: flex-start;
+  margin: 10px 0 10px 40px;
+  width: min(720px, calc(100% - 40px));
+  padding: 14px 16px;
+  background: var(--surface-0);
+  border: 1px solid var(--border-color, var(--surface-0));
+  border-left: 3px solid var(--accent-color);
+  border-radius: var(--radius-surface);
+  box-sizing: border-box;
+}
+
+.mqc {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mqc__label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--accent-color);
+}
+
+.mqc__title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+// The server's own words, line breaks kept, never HTML.
+.mqc__message {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: v.$font-size-sm;
+  line-height: v.$line-height-base;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+// The whole address, host highlighted: what opens is what is read.
+.mqc__url {
+  padding: 6px 8px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.mqc__url-host {
+  color: var(--text-primary);
+  font-weight: 700;
+  background: var(--warning-tint);
+  border-radius: var(--radius-tag);
+  padding: 0 2px;
+}
+
+.mqc__caution {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--warning-tint);
+  border-radius: var(--radius-control);
+  font-size: 12px;
+  color: var(--text-primary);
+
+  app-icon {
+    flex-shrink: 0;
+    color: var(--warning);
+  }
+}
+
+.mqc__fields {
+  display: flex;
+  flex-direction: column;
+  gap: v.$space-sm;
+  margin: 4px 0;
+}
+
+.mqc__choices {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mqc__secret {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+
+  app-icon {
+    flex-shrink: 0;
+    color: var(--text-muted);
+  }
+}
+
+.mqc__error {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--danger-tint);
+  border-radius: var(--radius-control);
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.mqc__sent {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mqc__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+@media (max-width: v.$breakpoint-md) {
+  :host {
+    margin-left: 0;
+    width: 100%;
+  }
+}

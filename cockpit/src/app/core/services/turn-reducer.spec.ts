@@ -1186,3 +1186,58 @@ describe('turn-reducer — add_compaction', () => {
         expect(turn.events.map((e) => e.kind)).toEqual(['thought', 'compaction', 'thought']);
     });
 });
+
+describe('turn-reducer — question_decision (an MCP server asked the user)', () => {
+    const started: ReducerAction[] = [
+        {type: 'turn_started', turnId: 't1', startedAt: 1},
+        {type: 'tool_started', toolUseId: 'c1', tool: 'mcp__civitai__generate', args: {}, timestamp: 2},
+    ];
+
+    it.each([
+        ['accepted', 'accepted'],
+        ['declined', 'declined'],
+        ['unanswered', 'unanswered'],
+    ] as const)('marks the call %s without touching its own status', (outcome) => {
+        const state = play([
+            ...started,
+            {type: 'question_decision', toolUseId: 'c1', server: 'Civitai', outcome, timestamp: 3},
+        ]);
+        const call = activeTurn(state).events.find(isToolCall)!;
+        expect(call.question).toEqual({server: 'Civitai', outcome});
+        // The call is still waiting on its server: a declined question is
+        // not a denied tool call.
+        expect(call.status).toBe('running');
+        expect(call.decision).toBeUndefined();
+    });
+
+    it('reaches a call whose turn already closed (a replay)', () => {
+        const state = play([
+            ...started,
+            {type: 'tool_completed', toolUseId: 'c1', result: 'done', timestamp: 4},
+            {type: 'turn_completed', turnId: 't1', finishedAt: 5},
+            {type: 'question_decision', toolUseId: 'c1', server: 'Civitai', outcome: 'declined', timestamp: 3},
+        ]);
+        const call = activeTurn(state).events.find(isToolCall)!;
+        expect(call.question?.outcome).toBe('declined');
+        expect(call.status).toBe('completed');
+    });
+
+    it('keeps the latest outcome when a call is asked twice, and is a no-op without the call', () => {
+        const twice = play([
+            ...started,
+            {type: 'question_decision', toolUseId: 'c1', server: 'Civitai', outcome: 'unanswered', timestamp: 3},
+            {type: 'question_decision', toolUseId: 'c1', server: 'Civitai', outcome: 'accepted', timestamp: 4},
+        ]);
+        expect(activeTurn(twice).events.find(isToolCall)!.question?.outcome).toBe('accepted');
+
+        const before = play(started);
+        const after = reduce(before, {
+            type: 'question_decision',
+            toolUseId: 'missing',
+            server: 'Civitai',
+            outcome: 'accepted',
+            timestamp: 5,
+        });
+        expect(after).toBe(before);
+    });
+});

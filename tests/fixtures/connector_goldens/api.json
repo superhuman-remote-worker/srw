@@ -4815,7 +4815,109 @@
     },
     "status": 400,
     "body": {
-      "detail": "Connector config is not supported for MCP connectors"
+      "detail": "An MCP connector's config holds only server_questions (decline or accept)"
+    },
+    "calls": []
+  },
+  "create/mcp/server_questions_accept": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Docs MCP",
+        "type": "mcp",
+        "connection_url": "https://mcp.example.test/mcp",
+        "credentials": {
+          "transport": "http",
+          "auth": {
+            "type": "bearer",
+            "token": "mcp-secret"
+          }
+        },
+        "config": {
+          "server_questions": "accept"
+        }
+      }
+    },
+    "status": 200,
+    "body": {
+      "id": "00000000-0000-0000-0000-0000000000d1",
+      "name": "Docs MCP",
+      "description": null,
+      "type": "mcp",
+      "connection_url": "https://mcp.example.test/mcp",
+      "config": {
+        "server_questions": "accept"
+      },
+      "job_id": null,
+      "cli_hint": null,
+      "default_branch": null,
+      "created_by": "00000000-0000-0000-0000-0000000000c1",
+      "is_global": false,
+      "read_only": null,
+      "scope_mode": "all",
+      "auto_attach": false,
+      "policy_revision": 1,
+      "created_at": "2026-01-02T03:04:05Z",
+      "updated_at": "2026-01-02T03:04:05Z",
+      "project_ids": []
+    },
+    "calls": [
+      {
+        "call": "create_datasource",
+        "kwargs": {
+          "name": "Docs MCP",
+          "ds_type": "mcp",
+          "connection_url": "https://mcp.example.test/mcp",
+          "description": null,
+          "credentials": {
+            "transport": "http",
+            "auth": {
+              "type": "bearer",
+              "token": "mcp-secret"
+            }
+          },
+          "job_id": null,
+          "cli_hint": null,
+          "default_branch": null,
+          "config": {
+            "server_questions": "accept"
+          },
+          "created_by": "00000000-0000-0000-0000-0000000000c1",
+          "is_global": false,
+          "read_only": null,
+          "scope_mode": "all",
+          "auto_attach": false,
+          "project_ids": [],
+          "authority_user_id": "00000000-0000-0000-0000-0000000000c1",
+          "authority_is_admin": false
+        }
+      }
+    ]
+  },
+  "create/mcp/server_questions_invalid": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Docs MCP",
+        "type": "mcp",
+        "connection_url": "https://mcp.example.test/mcp",
+        "credentials": {
+          "transport": "http",
+          "auth": {
+            "type": "bearer",
+            "token": "mcp-secret"
+          }
+        },
+        "config": {
+          "server_questions": "always"
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "config server_questions must be one of decline, accept"
     },
     "calls": []
   },
@@ -8216,9 +8318,63 @@
     },
     "status": 400,
     "body": {
-      "detail": "Connector config is not supported for MCP connectors"
+      "detail": "An MCP connector's config holds only server_questions (decline or accept)"
     },
     "calls": []
+  },
+  "update/mcp/server_questions_decline": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d500000f-0000-0000-0000-00000000000f",
+      "body": {
+        "config": {
+          "server_questions": "decline"
+        }
+      }
+    },
+    "status": 200,
+    "body": {
+      "id": "d500000f-0000-0000-0000-00000000000f",
+      "name": "Docs MCP",
+      "description": "Documentation search",
+      "type": "mcp",
+      "connection_url": "https://mcp.example.test/mcp",
+      "config": {
+        "server_questions": "decline"
+      },
+      "cli_hint": null,
+      "default_branch": null,
+      "read_only": null,
+      "created_by": "00000000-0000-0000-0000-0000000000c1",
+      "is_global": false,
+      "scope_mode": "all",
+      "auto_attach": false,
+      "policy_revision": 1,
+      "created_at": "2026-01-02T03:04:05Z",
+      "updated_at": "2026-01-02T03:04:05Z",
+      "project_ids": []
+    },
+    "calls": [
+      {
+        "call": "update_datasource",
+        "args": [
+          "d500000f-0000-0000-0000-00000000000f"
+        ],
+        "kwargs": {
+          "name": null,
+          "description": null,
+          "connection_url": null,
+          "credentials": null,
+          "cli_hint": null,
+          "default_branch": null,
+          "config": {
+            "server_questions": "decline"
+          },
+          "is_global": null,
+          "read_only": null
+        }
+      }
+    ]
   },
   "delete/postgresql": {
     "request": {

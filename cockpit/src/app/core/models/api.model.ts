@@ -416,6 +416,10 @@ export interface DatasourceConfig {
   /** GitHub App repository (C5): the App and its installation, and a GitHub
    *  Enterprise Server's API base. Set through the API; the form keeps it. */
   github_app?: {app_id: string; installation_id: string; api_base?: string};
+  /** MCP connectors (remote and managed): what a yes/no question the
+   *  server asks mid-call gets by itself. Absent follows the installation
+   *  default (`McpServerQuestionsSetting`). */
+  server_questions?: McpServerQuestionsChoice;
   /** Kubeconfig (C5): TokenRequest minting for one ServiceAccount. Set
    *  through the API; the form never sends a kubeconfig's config. */
   token_request?: {
@@ -761,6 +765,17 @@ export interface User {
  */
 export interface VmWorkspacesSetting {
   enabled: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+/** What an MCP connector without its own `config.server_questions` does
+ *  when its server asks a yes/no question mid-call (system setting
+ *  `mcp.server_questions_default`). */
+export type McpServerQuestionsChoice = 'decline' | 'accept';
+
+export interface McpServerQuestionsSetting {
+  default: McpServerQuestionsChoice;
   updated_at: string | null;
   updated_by: string | null;
 }

@@ -33836,7 +33836,11 @@ CREATE TABLE public.thread_permission_requests (
     decided_by text,
     expires_at timestamp with time zone DEFAULT (now() + '00:05:00'::interval) NOT NULL,
     accepted_lease_token bigint,
+    kind text DEFAULT 'tool'::text NOT NULL,
+    request jsonb,
+    response jsonb,
     CONSTRAINT thread_permission_accepted_lease_positive CHECK (((accepted_lease_token IS NULL) OR (accepted_lease_token > 0))),
+    CONSTRAINT thread_permission_requests_kind_check CHECK ((kind = ANY (ARRAY['tool'::text, 'question'::text]))),
     CONSTRAINT thread_permission_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'denied'::text, 'expired'::text])))
 );
 
@@ -33867,6 +33871,27 @@ COMMENT ON COLUMN public.thread_permission_requests.decided_by IS 'User id, MCP 
 --
 
 COMMENT ON COLUMN public.thread_permission_requests.accepted_lease_token IS 'Immutable exact stateless session_turn lease captured while admission holds the threads -> run_queue locks. NULL identifies pinned or legacy rows and is never guessed by a generic expiry sweep. For rolling compatibility, a NULL row may be expired only at a proven writer-exclusive stateless owner-loss or terminal boundary.';
+
+
+--
+-- Name: COLUMN thread_permission_requests.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_permission_requests.kind IS 'tool: approve a tool call before it runs. question: an MCP server''s question during a running call (elicitation).';
+
+
+--
+-- Name: COLUMN thread_permission_requests.request; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_permission_requests.request IS 'A question: {server, server_slug, datasource_id, tool, mode, message, schema, url, confirmation}. NULL for a tool approval.';
+
+
+--
+-- Name: COLUMN thread_permission_requests.response; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_permission_requests.response IS 'A decided question: {content, always_accept}. The content goes to the server; it is never shown to the model.';
 
 
 --

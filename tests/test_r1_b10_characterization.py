@@ -60,6 +60,13 @@ class _Conn:
             raise self._fail
         return self._fetch.pop(0) if self._fetch else []
 
+    async def execute(self, query, *args):
+        self.calls.append(("execute", query, args))
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        yield self
+
 
 class _Store:
     def __init__(self, conn: _Conn):
@@ -259,7 +266,8 @@ def test_owner_approve_decides_once_and_resolves_the_notification(monkeypatch):
     }
     lookup, update = conn.calls
     assert lookup[2] == (APPROVAL_ID, THREAD_ID)
-    assert update[2] == (APPROVAL_ID, "approved", OWNER["id"])
+    # A tool approval stores no response (an MCP server's question does).
+    assert update[2] == (APPROVAL_ID, "approved", OWNER["id"], None)
     assert "status = 'pending'" in update[1]
     notifier.resolve_source.assert_awaited_once_with(
         "permission_request", APPROVAL_ID, resolved_by=f"user:{OWNER['id']}"
@@ -269,7 +277,7 @@ def test_owner_approve_decides_once_and_resolves_the_notification(monkeypatch):
 @pytest.mark.parametrize(
     ("rows", "decision", "status", "detail"),
     [
-        ([], "maybe", 400, "decision must be 'approve' or 'deny'"),
+        ([], "maybe", 400, "decision must be 'approve', 'deny' or 'cancel'"),
         ([], "approve", 404, "Permission request not found for this thread"),
         (
             [{"id": APPROVAL_ID, "status": "denied", "tool_call_id": "c"}],

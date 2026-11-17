@@ -1070,6 +1070,15 @@
     "since": "Since"
   },
   "admin": {
+    "mcpQuestions": {
+      "title": "MCP server questions default",
+      "hint": "What a connector without its own choice does when an MCP server asks a yes/no question.",
+      "decline": "Decline",
+      "accept": "Accept",
+      "saveFailed": "The default could not be saved. Try again.",
+      "lastChanged": "Last changed {{when}} by {{who}}",
+      "unknownAdmin": "unknown"
+    },
     "helm": {
       "badge": "Helm",
       "badgeDrift": "Helm · overridden",
@@ -2427,6 +2436,55 @@
       "childRunsUnattended": "The subagent then runs its own tools without asking, including commands and outbound actions.",
       "stop": "Stop"
     },
+    "question": {
+      "label": "Connector question",
+      "asking": "{{server}} is asking",
+      "askingDuring": "{{server}} is asking during {{tool}}",
+      "secretWarning": "Never enter passwords or keys here.",
+      "accept": "Accept",
+      "alwaysAccept": "Always accept in this session",
+      "alwaysAcceptHint": "Accepts this question, and every later yes/no question {{server}} asks in this session, without asking you.",
+      "decline": "Decline",
+      "dismiss": "Dismiss",
+      "dismissHint": "Closes the question without answering it.",
+      "submit": "Submit",
+      "done": "Done",
+      "doneHint": "Tells {{server}} you finished on its page.",
+      "openLink": "Open link",
+      "lookAlike": "This address uses look-alike characters: check the highlighted host before you open it.",
+      "unopenableLink": "This link is not a web address and cannot be opened from here.",
+      "optional": "optional",
+      "choose": "Choose…",
+      "sent": "Answer sent. Waiting for {{server}}…",
+      "sendFailed": "Your answer could not be sent. The question is still open; try again.",
+      "invalidAnswer": "{{server}} did not accept this answer. Check the fields and try again.",
+      "alreadyAnswered": "This question was already answered.",
+      "gone": "This question is no longer available.",
+      "outcome": {
+        "accepted": "You accepted {{server}}'s request.",
+        "declined": "You declined {{server}}'s request.",
+        "unanswered": "{{server}}'s request was not answered."
+      },
+      "outcomeGeneric": {
+        "accepted": "You accepted the MCP server's request.",
+        "declined": "You declined the MCP server's request.",
+        "unanswered": "The MCP server's request was not answered."
+      },
+      "error": {
+        "required": "Required.",
+        "minLength": "At least {{min}} characters.",
+        "maxLength": "At most {{max}} characters.",
+        "email": "Enter an email address.",
+        "url": "Enter an address such as https://example.com.",
+        "date": "Enter a valid date.",
+        "number": "Enter a number.",
+        "integer": "Enter a whole number.",
+        "minimum": "At least {{min}}.",
+        "maximum": "At most {{max}}.",
+        "minItems": "Choose at least {{min}}.",
+        "maxItems": "Choose at most {{max}}."
+      }
+    },
     "control": {
       "backpressure": "Too many session setting changes are waiting. Try again shortly.",
       "admissionFailed": "The session setting could not be changed. Try again.",
@@ -3302,6 +3360,13 @@
       "accessReadWriteOnlyHint": "SRW has no read-only mode for this connector type: agents get every tool it offers. Its credential decides what is allowed, for everyone who uses the connector.",
       "accessKbHint": "Knowledge bases are always read-only, for everyone who uses them: SRW indexes the repository, and agents get search tools but never its credentials.",
       "accessGithubAppHint": "Read-only means SRW gives agents no write tools for this connector, for everyone who uses it. For a GitHub App connector SRW also mints each run's token with contents: read, so pushes made with that token are refused by GitHub.",
+      "serverQuestionsLabel": "When the server asks a question mid-call",
+      "serverQuestionsInherit": "Follow the installation default",
+      "serverQuestionsInheritDecline": "Follow the default (Decline)",
+      "serverQuestionsInheritAccept": "Follow the default (Accept)",
+      "serverQuestionsDecline": "Decline",
+      "serverQuestionsAccept": "Accept yes/no confirmations",
+      "serverQuestionsHint": "Questions that need typed input or a link always go to a person in an interactive Session and are declined in jobs.",
       "availabilityTitle": "Availability",
       "scopeEverywhere": "Everywhere in my work",
       "scopeEverywhereHint": "Available in all projects and standalone work, subject to sharing and public-access rules.",

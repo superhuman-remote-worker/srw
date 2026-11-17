@@ -7,6 +7,8 @@ import {Datasource, DatasourceIndexStatus} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {UserService} from '../../core/services/user.service';
+import {AdminUsersService} from '../../core/services/admin-users.service';
+import {McpServerQuestionsSetting} from '../../core/models/api.model';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ActivatedRoute} from '@angular/router';
 import {DatasourceListComponent} from './datasource-list.component';
@@ -97,9 +99,14 @@ function createComponent(
     generateSshKey: vi.fn().mockReturnValue(of(null)),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
+  const adminSettings = {
+    mcpServerQuestions: signal<McpServerQuestionsSetting | null>(null),
+    loadMcpServerQuestions: vi.fn(),
+  };
   const injector = Injector.create({
     providers: [
       {provide: ApiService, useValue: api},
+      {provide: AdminUsersService, useValue: adminSettings},
       {
         provide: TranslocoService,
         useValue: {
@@ -139,7 +146,7 @@ function createComponent(
     injector,
     () => new DatasourceListComponent(),
   );
-  return {api, component, currentUser, ds};
+  return {api, component, currentUser, ds, adminSettings};
 }
 
 describe('DatasourceListComponent OKF Knowledge Base support', () => {
@@ -502,6 +509,167 @@ describe('DatasourceListComponent MCP support', () => {
     const update = api.updateDatasource.mock.calls[0][1];
     expect(update.connection_url).toBe('https://new.example.com/mcp');
     expect(update.credentials).toBeUndefined();
+  });
+});
+
+describe('DatasourceListComponent MCP server questions', () => {
+  const INSTALLED = [...BUILTIN_DRIVERS, ...MANAGED_DRIVERS];
+
+  const remote = (config: Datasource['config'] = {}): Datasource => ({
+    ...kbDatasource(),
+    id: 'mcp-1',
+    name: 'Civitai',
+    type: 'mcp',
+    connection_url: 'https://mcp.civitai.com/mcp',
+    config,
+  });
+
+  const managed = (config: Datasource['config']): Datasource => ({
+    ...kbDatasource(),
+    id: 'gitea-1',
+    name: 'Forge',
+    type: 'gitea_mcp' as Datasource['type'],
+    connection_url: null,
+    config,
+  });
+
+  function createRemote(choice?: 'inherit' | 'decline' | 'accept') {
+    const created = createComponent(false, null, INSTALLED);
+    const {component} = created;
+    component.openCreateForm();
+    component.formData.name = 'Civitai';
+    component.onTypeSelect('mcp');
+    component.formData.connection_url = 'https://mcp.civitai.com/mcp';
+    if (choice) component.formData.serverQuestions = choice;
+    return created;
+  }
+
+  it('offers the choice on remote and managed MCP connectors, and no other', () => {
+    const {component} = createComponent(false, null, INSTALLED);
+    component.openCreateForm();
+    component.onTypeSelect('mcp');
+    expect(component.isMcpForm()).toBe(true);
+    component.onTypeSelect('gitea_mcp' as Datasource['type']);
+    expect(component.isMcpForm()).toBe(true);
+    component.onTypeSelect('postgresql');
+    expect(component.isMcpForm()).toBe(false);
+    component.onTypeSelect('repository');
+    expect(component.isMcpForm()).toBe(false);
+  });
+
+  it('sends no config for a remote server that follows the default', () => {
+    const {api, component} = createRemote();
+    expect(component.formData.serverQuestions).toBe('inherit');
+    component.saveForm();
+    expect(api.createDatasource.mock.calls[0][0].config).toBeUndefined();
+  });
+
+  it.each(['decline', 'accept'] as const)('sends config.server_questions = %s when chosen', (choice) => {
+    const {api, component} = createRemote(choice);
+    component.saveForm();
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({server_questions: choice});
+  });
+
+  it("prefills the stored choice on edit and keeps it", () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote({server_questions: 'accept'}));
+    expect(component.formData.serverQuestions).toBe('accept');
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].config).toEqual({server_questions: 'accept'});
+  });
+
+  it('clears a stored choice when the edit goes back to the default', () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote({server_questions: 'decline'}));
+    component.formData.serverQuestions = 'inherit';
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].config).toEqual({});
+  });
+
+  it('leaves an edited remote server without a choice untouched', () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote({}));
+    expect(component.formData.serverQuestions).toBe('inherit');
+    component.formData.description = 'Image generation';
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].config).toBeUndefined();
+  });
+
+  it("merges the choice into a managed server's own config, and leaves it out for the default", () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openCreateForm();
+    component.formData.name = 'Forge';
+    component.onTypeSelect('gitea_mcp' as Datasource['type']);
+    component.formData.serverQuestions = 'accept';
+    component.genericFormValue.set({
+      config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+      credentials: {token: 'gitea-token'},
+      problems: [],
+    });
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({
+      url: 'https://gitea.example.com',
+      access: 'ReadOnly',
+      server_questions: 'accept',
+    });
+
+    const edit = createComponent(false, null, INSTALLED);
+    edit.component.openEditForm(
+      managed({url: 'https://gitea.example.com', access: 'ReadOnly', server_questions: 'accept'}),
+    );
+    expect(edit.component.formData.serverQuestions).toBe('accept');
+    edit.component.formData.serverQuestions = 'inherit';
+    edit.component.genericFormValue.set({
+      config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+      problems: [],
+    });
+    edit.component.saveForm();
+    expect(edit.api.updateDatasource.mock.calls[0][1].config).toEqual({
+      url: 'https://gitea.example.com',
+      access: 'ReadOnly',
+    });
+  });
+
+  it("names the installation default for an admin, and reads it only once", () => {
+    const {component, currentUser, adminSettings} = createComponent(false, null, INSTALLED);
+    currentUser.set({id: 'user-1', is_admin: true});
+    component.openEditForm(remote());
+    component.onTypeSelect('mcp');
+    expect(adminSettings.loadMcpServerQuestions).toHaveBeenCalledTimes(1);
+    expect(component.serverQuestionsInheritKey()).toBe('datasources.form.serverQuestionsInherit');
+    adminSettings.mcpServerQuestions.set({default: 'accept', updated_at: null, updated_by: null});
+    expect(component.serverQuestionsInheritKey()).toBe(
+      'datasources.form.serverQuestionsInheritAccept',
+    );
+    adminSettings.mcpServerQuestions.set({default: 'decline', updated_at: null, updated_by: null});
+    expect(component.serverQuestionsInheritKey()).toBe(
+      'datasources.form.serverQuestionsInheritDecline',
+    );
+  });
+
+  it('does not ask for the admin-only default for anyone else', () => {
+    const {component, adminSettings} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote());
+    expect(adminSettings.loadMcpServerQuestions).not.toHaveBeenCalled();
+    expect(component.serverQuestionsInheritKey()).toBe('datasources.form.serverQuestionsInherit');
+  });
+
+  it('labels the choice in both languages', () => {
+    const keys = [
+      'serverQuestionsLabel',
+      'serverQuestionsInherit',
+      'serverQuestionsInheritDecline',
+      'serverQuestionsInheritAccept',
+      'serverQuestionsDecline',
+      'serverQuestionsAccept',
+      'serverQuestionsHint',
+    ];
+    const enForm = en.datasources.form as Record<string, string>;
+    const deForm = de.datasources.form as Record<string, string>;
+    for (const key of keys) {
+      expect(enForm[key], key).toBeTruthy();
+      expect(deForm[key], key).toBeTruthy();
+    }
   });
 });
 

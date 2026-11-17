@@ -79,6 +79,8 @@ POST   /api/admin/system-settings/main_cloud/backfill-instance-authority        
 POST   /api/admin/system-settings/main_cloud/reload                                     pat=admin           admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/repair-thread-mounts                       pat=admin           admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/test                                       pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/mcp_server_questions                                  pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/mcp_server_questions                                  pat=admin           admin:_require_admin
 GET    /api/admin/system-settings/tts_library                                           pat=admin           admin:_require_admin
 PUT    /api/admin/system-settings/tts_library                                           pat=admin           admin:_require_admin
 GET    /api/admin/system-settings/user_experts                                          pat=admin           admin:_require_admin

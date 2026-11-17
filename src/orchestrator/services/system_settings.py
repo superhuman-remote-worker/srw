@@ -1,4 +1,5 @@
-"""Simple boolean system settings: the VM-workspaces and TTS-library switches.
+"""Simple admin system settings: the VM-workspaces and TTS-library switches,
+and the default for MCP server questions.
 
 Two admin toggles that share a shape — a ``system_settings`` row whose ``value``
 JSONB carries a single ``enabled`` flag — but deliberately *not* a default.
@@ -147,3 +148,59 @@ async def put_tts_library_settings(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return tts_library_response(row)
+
+
+def mcp_server_questions_response(row: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Shape the MCP server-questions default for API responses. Absent row
+    → ``decline`` (``shared.mcp_questions.FACTORY_DEFAULT``)."""
+    from shared.mcp_questions import FACTORY_DEFAULT, setting_or_none
+
+    value = (row or {}).get("value") or {}
+    default = setting_or_none(value.get("default")) if isinstance(value, dict) else None
+    updated_at = (row or {}).get("updated_at")
+    return {
+        "default": default or FACTORY_DEFAULT,
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
+        "updated_by": (row or {}).get("updated_by"),
+    }
+
+
+async def get_mcp_server_questions_settings(
+    *, dependencies: SystemSettingsDependencies
+) -> dict[str, Any]:
+    """What an MCP connector without its own choice does when its server asks
+    a yes/no question mid-call: ``decline`` (the default) or ``accept``."""
+    from shared.mcp_questions import SYSTEM_SETTING_KEY
+
+    try:
+        row = await dependencies.store.get_system_setting(SYSTEM_SETTING_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return mcp_server_questions_response(row)
+
+
+async def put_mcp_server_questions_settings(
+    *,
+    body: Mapping[str, Any],
+    admin: Mapping[str, Any],
+    dependencies: SystemSettingsDependencies,
+) -> dict[str, Any]:
+    """Set the installation's default for MCP server questions. It applies at
+    the next dispatch of every connector that has no setting of its own."""
+    from shared.mcp_questions import SETTINGS, SYSTEM_SETTING_KEY
+
+    default = body.get("default")
+    if default not in SETTINGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"`default` must be one of {', '.join(SETTINGS)}",
+        )
+    try:
+        row = await dependencies.store.upsert_system_setting(
+            SYSTEM_SETTING_KEY,
+            {"default": default},
+            updated_by=_actor(admin),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return mcp_server_questions_response(row)

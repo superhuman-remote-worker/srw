@@ -774,6 +774,14 @@ CASES: dict[str, ApiCase] = {
         )
     ),
     "create/mcp/config_refused_after_auth": _create(_with(MCP_REMOTE, config={"a": 1})),
+    # The one key an MCP connector's config holds: what its server's questions
+    # get by themselves (shared.mcp_questions, owner decision 2026-11-17).
+    "create/mcp/server_questions_accept": _create(
+        _with(MCP_REMOTE, config={"server_questions": "accept"})
+    ),
+    "create/mcp/server_questions_invalid": _create(
+        _with(MCP_REMOTE, config={"server_questions": "always"})
+    ),
     # A stdio server no longer runs in the agent pod (connector drivers D5b):
     # every stdio create is refused with the way forward.
     "create/mcp/stdio_refused": _create(MCP_STDIO),
@@ -1150,6 +1158,9 @@ CASES.update(
         ),
         "update/mcp/config_refused": _update(
             _stored("mcp_remote"), {"config": {"a": 1}}
+        ),
+        "update/mcp/server_questions_decline": _update(
+            _stored("mcp_remote"), {"config": {"server_questions": "decline"}}
         ),
         # ---- delete ----------------------------------------------------------
         "delete/postgresql": ApiCase("delete", existing=_stored("postgresql")),

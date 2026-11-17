@@ -28,23 +28,51 @@ model in the server's words. A call the server answered is never re-run: only
 a dead session reconnects
 (knowledge-base/knowledge/features/mcp_client_2026_07_28_elicitation.md,
 Phase A).
+
+Two more tools serve every remote server that offers resources (Phase D):
+:data:`READ_RESOURCE_TOOL` reads a resource by its URI, a ``resource_link``
+in a tool's result, say, through the same converter, and
+:data:`SAVE_RESOURCE_TOOL` writes one into the workspace without passing it
+through the model's context. They take the server as an argument, as Claude
+Code's resource tools do, because nearly every server declares resources
+whether or not it has any.
+
+A server may ask a question mid-call (elicitation, Phase C): "Spend 12 Buzz?"
+The connector's ``server_questions`` setting (:mod:`shared.mcp_questions`)
+and the runtime's question handler decide the answer. A yes/no is accepted
+by itself under ``accept``; otherwise a handler that can ask a person (an
+interactive Session) does, and without one the question is declined. The
+call's timeout stops while a person is being asked, and the model reads
+one line about each question with the server's result.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import re
 import time
 from collections import deque
-from collections.abc import Callable
-from contextlib import AsyncExitStack
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import AsyncExitStack, contextmanager
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
 from agent.tools.mcp.naming import mcp_server_slug, namespace_mcp_tool
+from shared.mcp_questions import (
+    ACCEPT,
+    FACTORY_DEFAULT,
+    SERVER_QUESTIONS_KEY,
+    confirmation_content,
+    content_problem,
+    form_schema_problem,
+    setting_or_none,
+)
 from shared.mcp_sdk import (
     REMOTE_TRANSPORTS,
     ensure_mcp_sdk,
@@ -93,6 +121,115 @@ _VISIBLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image
 _BASE64 = re.compile(r"[A-Za-z0-9+/=\s]+")
 #: Pages of tools/list read from one server before giving up on the rest.
 _MAX_TOOL_PAGES = 50
+#: The tools that read and save a server's resources (Phase D).
+READ_RESOURCE_TOOL = "read_mcp_resource"
+SAVE_RESOURCE_TOOL = "save_mcp_resource"
+#: The most text of one resource the model is shown; the rest is saved.
+MCP_RESOURCE_TEXT_LIMIT = 100_000
+#: The largest resource saved into the workspace (decoded bytes).
+MCP_RESOURCE_SAVE_LIMIT = 200 * 1024 * 1024
+#: What a call does on the server: call a tool, or read a resource to show
+#: it or to save it.
+_CALL_TOOL = "tool"
+_READ_RESOURCE = "read_resource"
+_SAVE_RESOURCE = "save_resource"
+
+
+#: The tool call a runtime is running, ``(tool name, tool call id)``. A
+#: runtime that can show a question sets it right before it runs a tool, so
+#: the question names the call it belongs to.
+RUNNING_TOOL_CALL: ContextVar[tuple[str, str] | None] = ContextVar(
+    "mcp_running_tool_call", default=None
+)
+#: The most of a server's question the model is shown.
+_QUESTION_TEXT_LIMIT = 300
+
+
+@dataclass
+class ServerQuestion:
+    """One question an MCP server asks while a tool call runs."""
+
+    #: The connector's name, and its slug in the agent's tool names.
+    server: str
+    server_slug: str
+    #: The agent's tool and its call, when the question could be matched.
+    tool: str | None
+    tool_call_id: str | None
+    #: ``form`` (fields to fill in) or ``url`` (a link to open).
+    mode: str
+    message: str
+    requested_schema: dict[str, Any] | None
+    url: str | None
+    #: What accepting sends when the form is a yes/no, else ``None``.
+    confirmation: dict[str, Any] | None
+    #: The connector's setting: ``decline`` or ``accept``.
+    setting: str
+    #: The connector's id, which keeps a Session's "Always accept".
+    datasource_id: str | None = None
+
+
+@dataclass
+class QuestionAnswer:
+    """The answer to a server's question: ``accept`` (with the form's
+    content), ``decline`` (a refusal), or ``cancel`` (nobody decided)."""
+
+    action: str
+    content: dict[str, Any] | None = None
+    #: One line for the model about what happened.
+    note: str = ""
+    #: The person chose "Always accept in this session".
+    always_accept: bool = False
+
+
+#: A runtime's way to ask a person; ``None`` means nobody can be asked.
+QuestionHandler = Callable[[ServerQuestion], Awaitable[QuestionAnswer | None]]
+
+
+@dataclass(eq=False)
+class _CallState:
+    """One call in flight on a server: what a question during it belongs
+    to, the time a person spent answering, and the notes for the model."""
+
+    tool_name: str
+    agent_tool: str | None
+    tool_call_id: str | None
+    started: float = field(default_factory=time.monotonic)
+    paused_total: float = 0.0
+    paused_since: float | None = None
+    pauses: int = 0
+    notes: list[str] = field(default_factory=list)
+    #: The calling tool's context. A handshake-era question arrives on the
+    #: session's own task; the runtime's handler runs in this one instead,
+    #: with the turn's lease and identity.
+    context: Context = field(default_factory=copy_context)
+
+    @property
+    def paused(self) -> bool:
+        return self.pauses > 0
+
+    def pause(self) -> None:
+        if self.pauses == 0:
+            self.paused_since = time.monotonic()
+        self.pauses += 1
+
+    def resume(self) -> None:
+        self.pauses = max(0, self.pauses - 1)
+        if self.pauses == 0 and self.paused_since is not None:
+            self.paused_total += time.monotonic() - self.paused_since
+            self.paused_since = None
+
+    def active_seconds(self) -> float:
+        """Seconds the call has run, not counting a person's answer."""
+        now = time.monotonic()
+        paused = self.paused_total
+        if self.paused_since is not None:
+            paused += now - self.paused_since
+        return now - self.started - paused
+
+
+_ACTIVE_CALL: ContextVar[_CallState | None] = ContextVar(
+    "mcp_active_call", default=None
+)
 
 
 @dataclass
@@ -244,6 +381,18 @@ class _ServerHandle:
     #: The headers (its bearer) a managed server's front refused as a dead
     #: lease; ``None`` while none was refused.
     refused_lease: dict[str, str] | None = None
+    #: Whether the server declares resources the agent can read. A managed
+    #: server's front forwards tool calls only.
+    offers_resources: bool = False
+    #: What a question the server asks gets by itself (``server_questions``,
+    #: resolved by the orchestrator): ``decline`` or ``accept``.
+    server_questions: str = FACTORY_DEFAULT
+    #: Whether ``accept`` is the Session's own "Always accept in this
+    #: session", not the connector's setting.
+    accepted_by_session: bool = False
+    #: The calls in flight, for a question that arrives outside its call's
+    #: task (a handshake-era server asks on the session's own stream).
+    calls: list[_CallState] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -263,9 +412,14 @@ class _ServerHandle:
 class MCPManager:
     """Own all MCP connections and discovered tools for one agent runtime."""
 
-    def __init__(self, ds_configs: list[dict[str, Any]]):
+    def __init__(
+        self,
+        ds_configs: list[dict[str, Any]],
+        questions: QuestionHandler | None = None,
+    ):
         self._handles: list[_ServerHandle] = []
         self._closing = False
+        self._questions = questions
         taken_slugs: set[str] = set()
 
         for ds in ds_configs:
@@ -283,7 +437,29 @@ class MCPManager:
                 handle.ready.set()
                 self._handles.append(handle)
                 continue
-            self._handles.append(_ServerHandle(ds=ds, config=config, slug=slug))
+            self._handles.append(
+                _ServerHandle(
+                    ds=ds,
+                    config=config,
+                    slug=slug,
+                    server_questions=setting_or_none(ds.get(SERVER_QUESTIONS_KEY))
+                    or FACTORY_DEFAULT,
+                    accepted_by_session=ds.get("server_questions_by_session") is True,
+                )
+            )
+
+    def set_question_handler(self, questions: QuestionHandler | None) -> None:
+        """How this runtime asks a person a server's question (a Session's
+        card); ``None`` when nobody can be asked (a job)."""
+        self._questions = questions
+
+    def accept_questions_from(self, server_slug: str) -> None:
+        """ "Always accept in this session": the server's yes/no questions are
+        accepted from now on, in this runtime."""
+        for handle in self._handles:
+            if handle.slug == server_slug:
+                handle.server_questions = ACCEPT
+                handle.accepted_by_session = True
 
     @staticmethod
     def _unique_slug(name: Any, taken: set[str]) -> str:
@@ -387,6 +563,7 @@ class MCPManager:
                     url=config.url,
                     transport=config.transport,
                     headers=config.headers,
+                    elicitation_callback=self._elicitation_callback(handle),
                 )
                 handle.session = client
 
@@ -396,6 +573,9 @@ class MCPManager:
                     handle.name,
                     client.protocol_version,
                     len(listed),
+                )
+                handle.offers_resources = not config.managed and _offers_resources(
+                    client
                 )
                 handle.tools = self._wrap_tools(handle, listed)
                 handle.refused_lease = None
@@ -447,7 +627,9 @@ class MCPManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_langchain_tools(
-        self, sees_images: Callable[[], bool] | None = None
+        self,
+        sees_images: Callable[[], bool] | None = None,
+        save_file: Callable[[str, bytes, bool], str] | None = None,
     ) -> list[Any]:
         """Return tools backed by currently connected server handles.
 
@@ -456,6 +638,10 @@ class MCPManager:
         subagents share this manager) gets copies bound to its check, so
         an image only ever reaches a model that can take it. Without one,
         images are described in text.
+
+        ``save_file(path, data, overwrite)`` writes into the loading agent's
+        workspace and returns what the model is told. Without one, the
+        resource-saving tool says there is no workspace.
         """
         tools = [
             tool
@@ -463,21 +649,21 @@ class MCPManager:
             if handle.status == "connected"
             for tool in handle.tools
         ]
-        if sees_images is None:
-            return tools
-        handles = {handle.slug: handle for handle in self._handles}
-        return [
-            tool.model_copy(
-                update={
-                    "coroutine": self._guarded(
-                        handles[tool.metadata["mcp_server_slug"]],
-                        tool.metadata["mcp_tool_name"],
-                        sees_images,
-                    )
-                }
-            )
-            for tool in tools
-        ]
+        if sees_images is not None:
+            handles = {handle.slug: handle for handle in self._handles}
+            tools = [
+                tool.model_copy(
+                    update={
+                        "coroutine": self._guarded(
+                            handles[tool.metadata["mcp_server_slug"]],
+                            tool.metadata["mcp_tool_name"],
+                            sees_images,
+                        )
+                    }
+                )
+                for tool in tools
+            ]
+        return tools + self._resource_tools(sees_images, save_file)
 
     @property
     def statuses(self) -> dict[str, str]:
@@ -488,6 +674,144 @@ class MCPManager:
         for handle in self._handles:
             handle.ds["_mcp_status"] = handle.status
             handle.ds["_mcp_tools"] = [tool.name for tool in handle.tools]
+
+    def _resource_tools(
+        self,
+        sees_images: Callable[[], bool] | None,
+        save_file: Callable[[str, bytes, bool], str] | None,
+    ) -> list[Any]:
+        """The two resource tools, when a connected server offers resources."""
+        from langchain_core.tools import StructuredTool
+
+        from shared.permission_modes import READ, WRITE
+
+        offering = [
+            handle
+            for handle in self._handles
+            if handle.status == "connected" and handle.offers_resources
+        ]
+        if not offering:
+            return []
+        server = {
+            "type": "string",
+            "enum": [handle.slug for handle in offering],
+            "description": (
+                "The server, as its tools are named: mcp__<server>__<tool>."
+            ),
+        }
+        uri = {
+            "type": "string",
+            "description": (
+                "The resource's URI, for example from a [resource link] in one "
+                "of the server's tool results."
+            ),
+        }
+        read = StructuredTool(
+            name=READ_RESOURCE_TOOL,
+            description=(
+                "Read a resource from a connected MCP server by its URI, such "
+                "as a [resource link] one of its tools returned. Text comes back "
+                "as text and an image as an image. To keep a file, or for a "
+                f"large or binary one, use {SAVE_RESOURCE_TOOL} instead."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {"server": server, "uri": uri},
+                "required": ["server", "uri"],
+            },
+            coroutine=self._resource_call(_READ_RESOURCE, sees_images, None),
+            metadata={
+                "mcp_server": None,
+                "mcp_server_slug": None,
+                "mcp_tool_name": READ_RESOURCE_TOOL,
+                "effect": READ,
+            },
+        )
+        save = StructuredTool(
+            name=SAVE_RESOURCE_TOOL,
+            description=(
+                "Save a resource from a connected MCP server into the workspace, "
+                "by its URI (such as a [resource link] one of its tools "
+                "returned). The file goes straight to `path`, relative to the "
+                "workspace root, without passing through your context. An "
+                "existing file is replaced only with overwrite=true."
+            ),
+            args_schema={
+                "type": "object",
+                "properties": {
+                    "server": server,
+                    "uri": uri,
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Where to save it, relative to the workspace root "
+                            "(e.g. output/image.png)."
+                        ),
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Replace a file already at `path`.",
+                        "default": False,
+                    },
+                },
+                "required": ["server", "uri", "path"],
+            },
+            coroutine=self._resource_call(_SAVE_RESOURCE, sees_images, save_file),
+            metadata={
+                "mcp_server": None,
+                "mcp_server_slug": None,
+                "mcp_tool_name": SAVE_RESOURCE_TOOL,
+                "effect": WRITE,
+            },
+        )
+        return [read, save]
+
+    def _resource_call(
+        self,
+        operation: str,
+        sees_images: Callable[[], bool] | None,
+        save_file: Callable[[str, bytes, bool], str] | None,
+    ):
+        label = (
+            READ_RESOURCE_TOOL if operation == _READ_RESOURCE else SAVE_RESOURCE_TOOL
+        )
+
+        async def _call(**kwargs):
+            wanted = str(kwargs.get("server") or "")
+            handle = next(
+                (
+                    handle
+                    for handle in self._handles
+                    if handle.offers_resources and wanted in (handle.slug, handle.name)
+                ),
+                None,
+            )
+            if handle is None:
+                offering = ", ".join(
+                    handle.slug for handle in self._handles if handle.offers_resources
+                )
+                return (
+                    f"Error: {label} failed: no connected MCP server {wanted!r} "
+                    f"offers resources (servers that do: {offering or 'none'})."
+                )
+            uri = kwargs.get("uri")
+            if not isinstance(uri, str) or not uri.strip():
+                return f"Error: {label} failed: `uri` must be the resource's URI."
+            arguments: dict[str, Any] = {"uri": uri.strip()}
+            if operation == _SAVE_RESOURCE:
+                path = kwargs.get("path")
+                if not isinstance(path, str) or not path.strip():
+                    return (
+                        f"Error: {label} failed: `path` must be where to save "
+                        "the file, relative to the workspace root."
+                    )
+                arguments["path"] = path.strip()
+                arguments["overwrite"] = kwargs.get("overwrite") is True
+            return await self._guarded(
+                handle, label, sees_images, operation=operation, save_file=save_file
+            )(**arguments)
+
+        return _call
 
     def _wrap_tools(self, handle: _ServerHandle, listed: list[Any]) -> list[Any]:
         """One LangChain tool per MCP tool, each calling through this manager.
@@ -616,25 +940,195 @@ class MCPManager:
         tool_name: str,
         arguments: dict[str, Any],
         sees_images: Callable[[], bool] | None = None,
+        *,
+        operation: str = _CALL_TOOL,
+        save_file: Callable[[str, bytes, bool], str] | None = None,
     ) -> str:
-        """Call a tool on the server's current session, within the call
-        timeout, and render what it answered."""
+        """Send one request on the server's current session, within the call
+        timeout, and render what it answered: a tool's result, or a resource
+        shown or saved."""
         session = handle.session
         if session is None:
             raise ConnectionError("the server's session ended")
+        running = RUNNING_TOOL_CALL.get()
+        state = _CallState(
+            tool_name=tool_name,
+            agent_tool=running[0] if running else None,
+            tool_call_id=running[1] if running else None,
+        )
+        handle.calls.append(state)
+        token = _ACTIVE_CALL.set(state)
         try:
-            result = await asyncio.wait_for(
-                self._raced(handle, _send_tool_call(session, tool_name, arguments)),
-                timeout=MCP_CALL_TIMEOUT,
+            if operation == _CALL_TOOL:
+                request = _send_tool_call(session, tool_name, arguments)
+            else:
+                request = session.read_resource(arguments["uri"])
+            try:
+                result = await _within_call_timeout(state, self._raced(handle, request))
+            except TimeoutError:
+                return _with_notes(
+                    state.notes,
+                    _tool_error(
+                        handle,
+                        tool_name,
+                        f"no answer within {int(MCP_CALL_TIMEOUT)}s. The call may "
+                        "still have run on the server; check before calling it again",
+                    ),
+                )
+            except Exception as exc:
+                # The server's own failure (or a refused question) is
+                # reported with what was asked during the call.
+                _attach_notes(exc, state.notes)
+                raise
+        finally:
+            _ACTIVE_CALL.reset(token)
+            handle.calls.remove(state)
+        if operation == _READ_RESOURCE:
+            text = _render_resource(result, _asks_yes(sees_images))
+        elif operation == _SAVE_RESOURCE:
+            text = await _save_resource(handle, tool_name, result, arguments, save_file)
+        else:
+            text = _render_result(handle, tool_name, result, _asks_yes(sees_images))
+        return _with_notes(state.notes, text)
+
+    def _elicitation_callback(self, handle: _ServerHandle):
+        """The SDK callback for this server's questions, in both protocol
+        eras: a 2026-07-28 server's "input required" answer and a
+        handshake-era server's ``elicitation/create``."""
+
+        async def callback(context: Any, params: Any) -> Any:
+            from mcp import types
+
+            state = _ACTIVE_CALL.get()
+            if state is None or state not in handle.calls:
+                # A handshake-era question arrives on the session's own
+                # stream, outside the call's task: it belongs to the one
+                # call in flight, if there is only one.
+                state = handle.calls[0] if len(handle.calls) == 1 else None
+            answer = await self._answer_question(handle, state, params)
+            if state is not None and answer.note:
+                state.notes.append(answer.note)
+            logger.info(
+                "MCP server %s asked a question (%s); answered %s",
+                handle.name,
+                getattr(params, "mode", None) or "form",
+                answer.action,
             )
-        except TimeoutError:
-            return _tool_error(
-                handle,
-                tool_name,
-                f"no answer within {int(MCP_CALL_TIMEOUT)}s. The call may still "
-                "have run on the server; check before calling it again",
+            return types.ElicitResult(
+                action=answer.action,
+                content=answer.content if answer.action == "accept" else None,
             )
-        return _render_result(handle, tool_name, result, _asks_yes(sees_images))
+
+        return callback
+
+    async def _answer_question(
+        self, handle: _ServerHandle, state: _CallState | None, params: Any
+    ) -> QuestionAnswer:
+        """Decide a server's question: by the connector's setting, by a
+        person through the runtime's handler, or by declining."""
+        mode = "url" if getattr(params, "mode", None) == "url" else "form"
+        message = str(getattr(params, "message", "") or "")
+        asked = f"[server question] {handle.name} asked {_quoted(message)}"
+        schema = _schema_dict(getattr(params, "requested_schema", None))
+        url = str(getattr(params, "url", "") or "") or None
+        if mode == "form":
+            problem = form_schema_problem(schema)
+            if problem is not None:
+                logger.warning(
+                    "MCP server %s asked with a form SRW cannot show (%s)",
+                    handle.name,
+                    problem,
+                )
+                return QuestionAnswer(
+                    "decline",
+                    note=f"{asked}, with a form SRW cannot show ({problem}). "
+                    "SRW declined it.",
+                )
+        confirmation = confirmation_content(schema) if mode == "form" else None
+        if confirmation is not None and handle.server_questions == ACCEPT:
+            because = (
+                "the user chose to always accept this server's yes/no questions "
+                "in this session"
+                if handle.accepted_by_session
+                else "this connector's setting for server questions is accept"
+            )
+            return QuestionAnswer(
+                "accept", confirmation, note=f"{asked}. SRW accepted it: {because}."
+            )
+        if self._questions is not None:
+            question = ServerQuestion(
+                server=handle.name,
+                server_slug=handle.slug,
+                tool=state.agent_tool if state else None,
+                tool_call_id=state.tool_call_id if state else None,
+                mode=mode,
+                message=message,
+                requested_schema=schema if mode == "form" else None,
+                url=url,
+                confirmation=confirmation,
+                setting=handle.server_questions,
+                datasource_id=str(handle.ds.get("datasource_id") or "") or None,
+            )
+            with _paused(state, handle):
+                asking = self._questions(question)
+                if state is not None:
+                    asking = asyncio.create_task(asking, context=state.context)
+                answer = await asking
+            if answer is not None:
+                return self._checked(handle, answer, schema, mode, asked)
+        if mode == "url":
+            reason = "it asks to open a link, which only a person can do"
+        elif confirmation is None:
+            reason = "it needs typed input, which only a person can give"
+        else:
+            reason = (
+                "this connector's setting for server questions is decline. "
+                "The user can change it to accept in the connector's settings"
+            )
+        return QuestionAnswer("decline", note=f"{asked}. SRW declined it: {reason}.")
+
+    @staticmethod
+    def _checked(
+        handle: _ServerHandle,
+        answer: QuestionAnswer,
+        schema: dict[str, Any] | None,
+        mode: str,
+        asked: str,
+    ) -> QuestionAnswer:
+        """A person's answer, as it goes to the server. An accepted form
+        must fit the form; a misfit is sent as no answer at all."""
+        if answer.action not in ("accept", "decline", "cancel"):
+            answer = QuestionAnswer("cancel", note=answer.note)
+        if answer.action == "accept" and mode == "form":
+            content = dict(answer.content or {})
+            problem = content_problem(schema, content)
+            if problem is not None:
+                logger.warning(
+                    "An answer to MCP server %s's question did not fit its form (%s)",
+                    handle.name,
+                    problem,
+                )
+                return QuestionAnswer(
+                    "cancel",
+                    note=f"{asked}. The answer did not fit the server's form "
+                    f"({problem}), so SRW sent none.",
+                )
+            answer.content = content
+        else:
+            # A declined or dismissed question carries no content, and
+            # neither does an accepted link: it only says the user agreed.
+            answer.content = None
+        if answer.always_accept:
+            handle.server_questions = ACCEPT
+            handle.accepted_by_session = True
+        if not answer.note:
+            outcome = {
+                "accept": "The user accepted it.",
+                "decline": "The user declined it.",
+                "cancel": "Nobody answered it, so SRW sent no answer.",
+            }[answer.action]
+            answer.note = f"{asked}. {outcome}"
+        return answer
 
     @staticmethod
     async def _raced(handle: _ServerHandle, call: Any) -> Any:
@@ -669,6 +1163,9 @@ class MCPManager:
         handle: _ServerHandle,
         tool_name: str,
         sees_images: Callable[[], bool] | None = None,
+        *,
+        operation: str = _CALL_TOOL,
+        save_file: Callable[[str, bytes, bool], str] | None = None,
     ):
         """Bound calls, reconnect a dead session, and return string errors.
 
@@ -676,6 +1173,22 @@ class MCPManager:
         that answered, even with an error, keeps its session, and the call is
         never sent again: it reached the tool, which may have acted.
         """
+
+        async def call_session(kwargs: dict[str, Any]) -> str:
+            return await self._call_session(
+                handle,
+                tool_name,
+                kwargs,
+                sees_images,
+                operation=operation,
+                save_file=save_file,
+            )
+
+        def failed(exc: BaseException) -> str:
+            return _with_notes(
+                _notes_of(exc),
+                _tool_error(handle, tool_name, _mark_failed(handle, exc)),
+            )
 
         async def _call(**kwargs):
             if not self._is_live(handle):
@@ -687,16 +1200,14 @@ class MCPManager:
                     )
                     return _tool_error(handle, tool_name, detail)
                 try:
-                    return await self._call_session(
-                        handle, tool_name, kwargs, sees_images
-                    )
+                    return await call_session(kwargs)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return _tool_error(handle, tool_name, _mark_failed(handle, exc))
+                    return failed(exc)
 
             try:
-                return await self._call_session(handle, tool_name, kwargs, sees_images)
+                return await call_session(kwargs)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -707,25 +1218,91 @@ class MCPManager:
                     # The front refused the lease (a reconnect would be
                     # refused too), or the server answered with an error (the
                     # session is alive and the call reached it).
-                    return _tool_error(handle, tool_name, _mark_failed(handle, exc))
+                    return failed(exc)
                 handle.status = f"unavailable: {type(exc).__name__}"
                 if await self._restart_server(handle, force=True):
                     try:
-                        return await self._call_session(
-                            handle, tool_name, kwargs, sees_images
-                        )
+                        return await call_session(kwargs)
                     except asyncio.CancelledError:
                         raise
                     except Exception as retry_exc:
-                        return _tool_error(
-                            handle, tool_name, _mark_failed(handle, retry_exc)
-                        )
+                        return failed(retry_exc)
                 if handle.refused_lease is not None:
                     # The reconnect was refused the lease.
                     return _tool_error(handle, tool_name, LEASE_REFUSED)
                 return _tool_error(handle, tool_name, type(exc).__name__)
 
         return _call
+
+
+async def _within_call_timeout(state: _CallState, awaitable: Any) -> Any:
+    """Await a call within :data:`MCP_CALL_TIMEOUT` of its own running time.
+
+    The time a person spends answering one of the server's questions does
+    not count: a slow click must not time out the call it belongs to.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            remaining = MCP_CALL_TIMEOUT - state.active_seconds()
+            if remaining <= 0 and not state.paused:
+                raise TimeoutError
+            done, _ = await asyncio.wait(
+                {task}, timeout=1.0 if state.paused else max(remaining, 0.01)
+            )
+            if task in done:
+                return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@contextmanager
+def _paused(state: _CallState | None, handle: _ServerHandle) -> Iterator[None]:
+    """Stop the clock of the call a question belongs to, or of every call
+    on the server when the question could not be matched to one."""
+    states = [state] if state is not None else list(handle.calls)
+    for current in states:
+        current.pause()
+    try:
+        yield
+    finally:
+        for current in states:
+            current.resume()
+
+
+def _schema_dict(schema: Any) -> dict[str, Any] | None:
+    if schema is None:
+        return None
+    if hasattr(schema, "model_dump"):
+        schema = schema.model_dump(by_alias=True, exclude_none=True)
+    return dict(schema) if isinstance(schema, dict) else None
+
+
+def _quoted(message: str) -> str:
+    text = " ".join(message.split())
+    if len(text) > _QUESTION_TEXT_LIMIT:
+        text = text[:_QUESTION_TEXT_LIMIT].rstrip() + " […]"
+    return f"\u201c{text}\u201d"
+
+
+def _with_notes(notes: list[str], text: str) -> str:
+    """The model's view of a call: what the server asked first, then what
+    it answered."""
+    return "\n".join([*notes, text]) if notes else text
+
+
+def _attach_notes(exc: BaseException, notes: list[str]) -> None:
+    if notes:
+        try:
+            exc._mcp_question_notes = list(notes)  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+
+
+def _notes_of(exc: BaseException) -> list[str]:
+    return list(getattr(exc, "_mcp_question_notes", None) or [])
 
 
 def _asks_yes(probe: Callable[[], bool] | None) -> bool:
@@ -966,6 +1543,101 @@ async def _send_tool_call(client: Any, name: str, arguments: dict[str, Any]) -> 
     return result
 
 
+def _offers_resources(client: Any) -> bool:
+    """Whether the server declares resources (a missing or odd answer is no)."""
+    try:
+        return getattr(client.server_capabilities, "resources", None) is not None
+    except Exception:
+        return False
+
+
+def _render_resource(result: Any, sees_images: bool) -> str:
+    """What the model reads for a resource: its text, bounded, an image as
+    an image, and anything else described with how to save it."""
+    contents = list(getattr(result, "contents", None) or [])
+    if not contents:
+        return "(the resource is empty)"
+    parts = []
+    for item in contents:
+        uri = str(getattr(item, "uri", "") or "")
+        mime = str(getattr(item, "mime_type", "") or "")
+        text = getattr(item, "text", None)
+        if text is not None:
+            header = f"[resource {uri}" + (f" ({mime})" if mime else "") + "]"
+            if len(text) > MCP_RESOURCE_TEXT_LIMIT:
+                text = (
+                    text[:MCP_RESOURCE_TEXT_LIMIT]
+                    + f"\n[… {len(text) - MCP_RESOURCE_TEXT_LIMIT:,} more characters "
+                    f"not shown: save the whole resource with {SAVE_RESOURCE_TOOL}]"
+                )
+            parts.append(f"{header}\n{text}")
+            continue
+        blob = str(getattr(item, "blob", "") or "")
+        if mime.startswith("image/"):
+            parts.append(_render_image(blob, mime, sees_images, f"resource {uri}"))
+        else:
+            parts.append(
+                f"[resource {uri}: {mime or 'binary'}, {_decoded_size(blob):,} "
+                f"bytes, not shown: save it into the workspace with "
+                f"{SAVE_RESOURCE_TOOL}]"
+            )
+    return "\n".join(parts)
+
+
+async def _save_resource(
+    handle: _ServerHandle,
+    tool_name: str,
+    result: Any,
+    arguments: dict[str, Any],
+    save_file: Callable[[str, bytes, bool], str] | None,
+) -> str:
+    """Write a resource the server returned into the workspace."""
+    if save_file is None:
+        return _tool_error(
+            handle, tool_name, "this agent has no workspace to save the file into"
+        )
+    uri = arguments["uri"]
+    contents = list(getattr(result, "contents", None) or [])
+    chosen = [item for item in contents if str(getattr(item, "uri", "")) == uri]
+    if not chosen and len(contents) == 1:
+        chosen = contents
+    if len(chosen) != 1:
+        parts = ", ".join(str(getattr(item, "uri", "")) for item in contents[:10])
+        return _tool_error(
+            handle,
+            tool_name,
+            f"the resource came back as {len(contents)} parts ({parts or 'none'}); "
+            "save one part by its own URI",
+        )
+    item = chosen[0]
+    text = getattr(item, "text", None)
+    if text is not None:
+        data = text.encode("utf-8")
+    else:
+        blob = str(getattr(item, "blob", "") or "")
+        if _decoded_size(blob) > MCP_RESOURCE_SAVE_LIMIT:
+            return _tool_error(
+                handle,
+                tool_name,
+                f"the resource is larger than {MCP_RESOURCE_SAVE_LIMIT:,} bytes",
+            )
+        try:
+            data = base64.b64decode(blob, validate=True)
+        except (binascii.Error, ValueError):
+            return _tool_error(
+                handle, tool_name, "the server sent malformed resource data"
+            )
+    if len(data) > MCP_RESOURCE_SAVE_LIMIT:
+        return _tool_error(
+            handle,
+            tool_name,
+            f"the resource is larger than {MCP_RESOURCE_SAVE_LIMIT:,} bytes",
+        )
+    return await asyncio.to_thread(
+        save_file, arguments["path"], data, bool(arguments.get("overwrite"))
+    )
+
+
 def _render_result(
     handle: _ServerHandle, tool_name: str, result: Any, sees_images: bool
 ) -> str:
@@ -1057,7 +1729,10 @@ def _render_image(data: str, mime: str, sees_images: bool, label: str) -> str:
 
 
 def _decoded_size(data: str) -> int:
-    return len(data) * 3 // 4
+    """The decoded size of base64 data: four characters are three bytes,
+    less the padding."""
+    data = "".join(data.split())
+    return len(data) * 3 // 4 - (len(data) - len(data.rstrip("=")))
 
 
 def _json(value: Any) -> str:

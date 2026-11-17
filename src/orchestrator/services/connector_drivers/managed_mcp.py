@@ -36,6 +36,8 @@ from orchestrator.services.connector_drivers.base import (
     ValidationContext,
     payload_entry,
     top_level_leaves,
+    server_questions_config,
+    server_questions_fields,
 )
 from shared.connectors.contract import DriverSpec, effective_access
 from shared.connectors.envelope import unsupported_check
@@ -88,11 +90,15 @@ class ManagedMcpDriver(DatasourceDriver):
 
         schema = self.spec.config_schema
         properties = schema.get("properties") or {}
+        # The server-questions setting is SRW's own, beside the driver's
+        # config: checked here, never against the driver's schema.
+        questions = server_questions_config(config)
         # Mirrors are SRW's to write: a draft's value for one is replaced.
         draft = {
             key: value
             for key, value in config.items()
             if not (properties.get(key) or {}).get("readOnly")
+            and key != "server_questions"
         }
         validator = Draft202012Validator(schema)
         # The draft as sent first (a URL with a path is refused, never cut),
@@ -100,7 +106,7 @@ class ManagedMcpDriver(DatasourceDriver):
         self._refuse_invalid(validator, draft)
         derived = self.derived_config(draft)
         self._refuse_invalid(validator, derived)
-        return derived
+        return {**derived, **questions}
 
     def _refuse_invalid(self, validator: Any, config: Mapping[str, Any]) -> None:
         errors = sorted(validator.iter_errors(config), key=lambda e: list(e.path))
@@ -182,6 +188,7 @@ class ManagedMcpDriver(DatasourceDriver):
             fields={
                 "datasource_id": str(row["id"]),
                 "config": dict(config) if isinstance(config, Mapping) else {},
+                **server_questions_fields(row),
             },
         )
 

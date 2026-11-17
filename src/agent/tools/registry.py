@@ -669,10 +669,20 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             try:
                 manager = context.connection_for("mcp")
                 requested = set(tools_by_category["mcp"])
+                save_file = None
+                if context.has_workspace():
+                    from agent.tools.workspace.files import save_workspace_file
+
+                    def save_file(path: str, data: bytes, overwrite: bool) -> str:
+                        return save_workspace_file(
+                            context, path, data, overwrite=overwrite
+                        )
+
                 # Bound to this context's model: an image a server returns
-                # reaches only a model that takes images.
+                # reaches only a model that takes images. A resource is saved
+                # into this context's workspace.
                 for tool in manager.get_langchain_tools(
-                    sees_images=context.get_phase_multimodal
+                    sees_images=context.get_phase_multimodal, save_file=save_file
                 ):
                     if tool.name in requested:
                         all_tools.append(tool)

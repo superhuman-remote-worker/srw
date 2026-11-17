@@ -294,6 +294,51 @@ def payload_entry(
     return entry
 
 
+def server_questions_config(config: Any) -> dict[str, Any]:
+    """A draft's ``server_questions`` (``shared.mcp_questions``), checked:
+    ``{}`` when the connector follows the installation default."""
+    from shared.mcp_questions import SERVER_QUESTIONS_KEY, SETTINGS
+
+    if not isinstance(config, Mapping) or SERVER_QUESTIONS_KEY not in config:
+        return {}
+    value = config[SERVER_QUESTIONS_KEY]
+    if value is None:
+        return {}
+    if value not in SETTINGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"config {SERVER_QUESTIONS_KEY} must be one of {', '.join(SETTINGS)}",
+        )
+    return {SERVER_QUESTIONS_KEY: value}
+
+
+def server_questions_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The payload fields of an MCP connector's server-questions setting: the
+    setting, and ``server_questions_by_session`` when the Session's own
+    "Always accept" decided it (so the model is told why)."""
+    from shared.mcp_questions import ACCEPT, setting_or_none
+
+    fields: dict[str, Any] = {"server_questions": delivered_server_questions(row)}
+    if setting_or_none(row.get("_session_server_questions")) == ACCEPT:
+        fields["server_questions_by_session"] = True
+    return fields
+
+
+def delivered_server_questions(row: Mapping[str, Any]) -> str:
+    """The setting an MCP connector runs with: a Session's own "Always
+    accept", else the connector's, else the installation default the
+    resolver stamped on the row."""
+    from shared.mcp_questions import SERVER_QUESTIONS_KEY, resolve_setting
+
+    config = row.get("config")
+    own = config.get(SERVER_QUESTIONS_KEY) if isinstance(config, Mapping) else None
+    return resolve_setting(
+        own,
+        row.get("_server_questions_default"),
+        row.get("_session_server_questions"),
+    )
+
+
 class DatasourceDriver:
     """A driver for one stored ``datasources.type``.
 

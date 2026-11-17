@@ -257,6 +257,44 @@ def _describe_zip_archive(local_path: Path, display_name: str, size: int) -> str
     return "\n".join(lines)
 
 
+def save_workspace_file(
+    context: ToolContext, path: str, data: bytes, *, overwrite: bool = False
+) -> str:
+    """Write a file another tool fetched (bytes, any type) into the workspace.
+
+    The same path rules as ``write_file``: relative to the workspace root,
+    refused while a cloud folder is over its cache or overlay quota, and
+    undo-snapshotted. An existing file is replaced only with ``overwrite``,
+    since the bytes never passed through the agent's own reading. Returns
+    what the model is told; a failure starts with ``Error:``.
+    """
+    if not context.has_workspace():
+        return "Error: this agent has no workspace to save the file into."
+    workspace = context.workspace_manager
+    for guard in (_cloud_cache_guard_for_path, _cloud_upperdir_guard_for_path):
+        refusal = guard(context, path)
+        if refusal:
+            return refusal
+    try:
+        if not overwrite and workspace.exists(path):
+            return (
+                f"Error: {_absolute(workspace, path)} already exists; nothing was "
+                "written. Choose another path, or pass overwrite=true to replace it."
+            )
+        if context._snapshot_callback:
+            context._snapshot_callback(path)
+        workspace.write_file(path, data)
+        context.invalidate_recent_read(path)
+    except ValueError as e:
+        return f"Error: {e}"
+    except WorkspaceUnavailableError:
+        raise
+    except Exception as e:
+        logger.error("save_workspace_file error for %s: %s", path, type(e).__name__)
+        return f"Error writing file: {type(e).__name__}"
+    return f"Saved: {_absolute(workspace, path)} ({len(data):,} bytes)"
+
+
 def create_file_tools(context: ToolContext) -> List[Any]:
     """Create file operation tools with injected context.
 

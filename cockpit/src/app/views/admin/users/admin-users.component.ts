@@ -2,15 +2,16 @@ import {ChangeDetectionStrategy, Component, computed, effect, inject, OnInit, si
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AdminUsersService} from '../../../core/services/admin-users.service';
 import {NotificationService} from '../../../core/services/notification.service';
-import {User} from '../../../core/models/api.model';
+import {McpServerQuestionsChoice, User} from '../../../core/models/api.model';
 import {AppCheckboxComponent} from '../../../ui/checkbox';
 import {AppBadgeComponent} from '../../../ui/badge';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 @Component({
   selector: 'app-admin-users',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [SidebarToggleComponent, AppCheckboxComponent, AppBadgeComponent],
+  imports: [SidebarToggleComponent, AppCheckboxComponent, AppBadgeComponent, TranslocoPipe],
   template: `
     <div class="admin-page">
       <div class="admin-container">
@@ -44,6 +45,49 @@ import {AppBadgeComponent} from '../../../ui/badge';
             <p class="muted small">
               Last changed {{ formatDate(admin.vmWorkspaces().updated_at) }}
               by {{ admin.vmWorkspaces().updated_by || 'unknown' }}
+            </p>
+          }
+        </section>
+
+        <!-- What an MCP connector without its own choice does when its
+             server asks a yes/no question mid-call. -->
+        <section class="admin-section" data-testid="mcp-questions-default">
+          <h2 class="section-title">{{ 'admin.mcpQuestions.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'admin.mcpQuestions.hint' | transloco }}</p>
+          <div
+            class="choice-row"
+            role="radiogroup"
+            [attr.aria-label]="'admin.mcpQuestions.title' | transloco"
+          >
+            <label class="choice" data-choice="decline">
+              <input
+                type="radio"
+                name="mcp-questions-default"
+                [checked]="mcpQuestionsDefault() === 'decline'"
+                [disabled]="mcpQuestionsDefault() === null"
+                (change)="setMcpQuestionsDefault('decline')"
+              >
+              {{ 'admin.mcpQuestions.decline' | transloco }}
+            </label>
+            <label class="choice" data-choice="accept">
+              <input
+                type="radio"
+                name="mcp-questions-default"
+                [checked]="mcpQuestionsDefault() === 'accept'"
+                [disabled]="mcpQuestionsDefault() === null"
+                (change)="setMcpQuestionsDefault('accept')"
+              >
+              {{ 'admin.mcpQuestions.accept' | transloco }}
+            </label>
+          </div>
+          @if (mcpQuestionsFailed()) {
+            <p class="small error" role="alert">{{ 'admin.mcpQuestions.saveFailed' | transloco }}</p>
+          } @else if (admin.mcpServerQuestions()?.updated_at) {
+            <p class="muted small">
+              {{ 'admin.mcpQuestions.lastChanged' | transloco: {
+                when: formatDate(admin.mcpServerQuestions()?.updated_at ?? null),
+                who: admin.mcpServerQuestions()?.updated_by || ('admin.mcpQuestions.unknownAdmin' | transloco)
+              } }}
             </p>
           }
         </section>
@@ -205,6 +249,22 @@ import {AppBadgeComponent} from '../../../ui/badge';
       font-size: 13px;
       color: var(--text-muted);
       margin-bottom: 20px;
+    }
+    .choice-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 20px;
+      font-size: 13px;
+      color: var(--text-primary);
+    }
+    .choice {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .error {
+      color: var(--danger);
     }
     .toggle-label {
       display: inline-flex;
@@ -402,10 +462,18 @@ export class AdminUsersComponent implements OnInit {
       : rows;
   });
   readonly selectedCount = computed(() => this.selectedIds().size);
+  /** The choice being saved; shown until the server answers, then the
+   *  stored one again (a refused save springs back). */
+  private readonly mcpQuestionsPending = signal<McpServerQuestionsChoice | null>(null);
+  readonly mcpQuestionsFailed = signal(false);
+  readonly mcpQuestionsDefault = computed<McpServerQuestionsChoice | null>(
+    () => this.mcpQuestionsPending() ?? this.admin.mcpServerQuestions()?.default ?? null,
+  );
 
   ngOnInit(): void {
     this.admin.loadUsers();
     this.admin.loadVmWorkspaces();
+    this.admin.loadMcpServerQuestions();
   }
 
   isSelected(u: User): boolean {
@@ -440,6 +508,19 @@ export class AdminUsersComponent implements OnInit {
   setKillSwitch(enabled: boolean): void {
     this.admin.setVmWorkspacesEnabled(enabled).subscribe({
       error: () => this.admin.loadVmWorkspaces(),
+    });
+  }
+
+  setMcpQuestionsDefault(value: McpServerQuestionsChoice): void {
+    this.mcpQuestionsPending.set(value);
+    this.mcpQuestionsFailed.set(false);
+    this.admin.setMcpServerQuestionsDefault(value).subscribe({
+      next: () => this.mcpQuestionsPending.set(null),
+      error: () => {
+        this.mcpQuestionsPending.set(null);
+        this.mcpQuestionsFailed.set(true);
+        this.admin.loadMcpServerQuestions();
+      },
     });
   }
 

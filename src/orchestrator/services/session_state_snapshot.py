@@ -27,6 +27,7 @@ import json
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
+from shared.mcp_questions import question_card
 from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from shared.thread_controls import applied_control_scalar
 
@@ -55,6 +56,14 @@ _TOOL_CLEAR_KINDS = (*_TURN_TERMINAL_KINDS, "turn.started")
 # widest parallel batch is bounded by the per-turn delegation maximum (at most
 # 64 calls, ``shared.runtime.core.delegation_settings``); the newest win.
 _RUNNING_TOOLS_LIMIT = 64
+
+
+def _row_value(row: Any, key: str) -> Any:
+    """A column a test double's row may lack (rows from before 0568)."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -301,7 +310,7 @@ async def build_session_state_snapshot(
             )
             permission_rows = await conn.fetch(
                 """
-                SELECT id, tool_call_id, tool_name, tool_args
+                SELECT id, tool_call_id, tool_name, tool_args, kind, request
                 FROM thread_permission_requests
                 WHERE thread_id = $1 AND status = 'pending'
                 ORDER BY requested_at ASC, id ASC
@@ -434,7 +443,18 @@ async def build_session_state_snapshot(
     running_tool: dict[str, Any] | None = running_tools[-1] if running_tools else None
 
     pending_permissions: list[dict[str, Any]] = []
+    pending_questions: list[dict[str, Any]] = []
     for row in permission_rows:
+        if _row_value(row, "kind") == "question":
+            # An MCP server's question: its own card, never a tool approval.
+            pending_questions.append(
+                question_card(
+                    row["tool_call_id"],
+                    row["id"],
+                    _json_object(_row_value(row, "request")),
+                )
+            )
+            continue
         pending_permissions.append(
             {
                 "id": str(row["tool_call_id"] or ""),
@@ -509,6 +529,7 @@ async def build_session_state_snapshot(
         "running_tool": running_tool,
         "running_tools": running_tools,
         "pending_permissions": pending_permissions,
+        "pending_questions": pending_questions,
         "tasks": [_session_task(row) for row in task_rows],
         # Presence-authoritative, including an explicit null: a thread that has
         # never reported usage actively clears whatever the panel was showing,

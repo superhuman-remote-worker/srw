@@ -17,6 +17,7 @@ import {
     DatasourceScopeMode,
     EmailAccessTier,
     LinkableDatasourceProject,
+    McpServerQuestionsChoice,
     RepositoryForge,
 } from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
@@ -36,6 +37,7 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
+import {AdminUsersService} from '../../core/services/admin-users.service';
 import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {connectorTypeIcon} from '../../core/models/connector-icons';
@@ -68,6 +70,15 @@ type McpTransport = 'http' | 'sse';
 /** The catalog's two views. */
 export type CatalogView = 'yours' | 'managed';
 type KeyValueRow = {key: string; value: string};
+
+/** A stored MCP connector's server-questions choice; anything else follows
+ *  the installation default. */
+export function storedServerQuestions(
+  config: DatasourceConfig | null | undefined,
+): 'inherit' | McpServerQuestionsChoice {
+  const value = config?.server_questions;
+  return value === 'decline' || value === 'accept' ? value : 'inherit';
+}
 
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
@@ -1426,6 +1437,44 @@ type KeyValueRow = {key: string; value: string};
                 </app-form-field>
               </div>
             }
+
+            <!-- MCP connectors (remote and managed): what a question the
+                 server asks mid-call gets by itself. "Follow the default"
+                 stores nothing, so a change of the installation default
+                 moves this connector too. -->
+            @if (isMcpForm()) {
+              <div class="form-row">
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.serverQuestionsLabel' | transloco"
+                  [hint]="'datasources.form.serverQuestionsHint' | transloco"
+                >
+                  <div class="access-radio server-questions-radio" data-testid="server-questions">
+                    <label data-server-questions="inherit">
+                      <input type="radio" name="ds-server-questions"
+                        [checked]="formData.serverQuestions === 'inherit'"
+                        (change)="formData.serverQuestions = 'inherit'"
+                        [disabled]="isSaving()">
+                      {{ serverQuestionsInheritKey() | transloco }}
+                    </label>
+                    <label data-server-questions="decline">
+                      <input type="radio" name="ds-server-questions"
+                        [checked]="formData.serverQuestions === 'decline'"
+                        (change)="formData.serverQuestions = 'decline'"
+                        [disabled]="isSaving()">
+                      {{ 'datasources.form.serverQuestionsDecline' | transloco }}
+                    </label>
+                    <label data-server-questions="accept">
+                      <input type="radio" name="ds-server-questions"
+                        [checked]="formData.serverQuestions === 'accept'"
+                        (change)="formData.serverQuestions = 'accept'"
+                        [disabled]="isSaving()">
+                      {{ 'datasources.form.serverQuestionsAccept' | transloco }}
+                    </label>
+                  </div>
+                </app-form-field>
+              </div>
+            }
           </div>
 
           <div class="form-footer-bar">
@@ -2321,6 +2370,12 @@ type KeyValueRow = {key: string; value: string};
         gap: 20px;
       }
 
+      /* Three choices with longer labels: they wrap on a narrow screen. */
+      .server-questions-radio {
+        flex-wrap: wrap;
+        row-gap: 8px;
+      }
+
       .generic-preview-toggle {
         display: flex;
         align-items: flex-start;
@@ -2901,6 +2956,10 @@ export class DatasourceListComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly transloco = inject(TranslocoService);
   private readonly userService = inject(UserService);
+  /** The installation default for MCP server questions, read for an admin
+   *  (the endpoint is admin-only) to name it on "Follow the default". */
+  private readonly adminSettings = inject(AdminUsersService);
+  private serverQuestionsDefaultRequested = false;
   private readonly route = inject(ActivatedRoute, {optional: true});
   protected readonly viewport = inject(ViewportService);
   protected readonly capabilities = inject(CapabilitiesService);
@@ -3326,6 +3385,8 @@ export class DatasourceListComponent implements OnInit {
     mcpTransport: McpTransport;
     mcpToken: string;
     mcpHeaders: KeyValueRow[];
+    /** MCP connectors: `config.server_questions`; 'inherit' stores none. */
+    serverQuestions: 'inherit' | McpServerQuestionsChoice;
     is_global: boolean;
     /** The creator's read-only tag; null until chosen (see formReadOnly). */
     read_only: boolean | null;
@@ -3344,6 +3405,7 @@ export class DatasourceListComponent implements OnInit {
     mcpTransport: 'http',
     mcpToken: '',
     mcpHeaders: [],
+    serverQuestions: 'inherit',
     is_global: false,
     read_only: null,
     scope_mode: null,
@@ -3838,6 +3900,7 @@ export class DatasourceListComponent implements OnInit {
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
+      serverQuestions: storedServerQuestions(ds.config),
       is_global: ds.is_global ?? false,
       read_only: ds.read_only ?? null,
       scope_mode: ds.scope_mode ?? 'all',
@@ -3845,6 +3908,7 @@ export class DatasourceListComponent implements OnInit {
       policy_revision: ds.policy_revision ?? 1,
     };
     this.connectionUrlDirty = false;
+    this.ensureServerQuestionsDefault();
     this.formProjectIds.set(new Set(ds.project_ids ?? []));
     this.scopeSelectionInitialized = (ds.project_ids?.length ?? 0) > 0;
     // F3 (knowledge-base/knowledge/multi_tenancy.md): credentials never come back from the
@@ -4190,7 +4254,55 @@ export class DatasourceListComponent implements OnInit {
       // Mailboxes are private-only; the server rejects is_global for email.
       if (value === 'email') this.formData.is_global = false;
       this.onTypeChange();
+      this.ensureServerQuestionsDefault();
     }
+  }
+
+  /** Whether the form edits an MCP connector: the remote type, or a driver
+   *  (managed or registered) whose tools are an MCP server's. */
+  isMcpForm(): boolean {
+    return this.formData.type === 'mcp' || this.formDriver()?.tool_category === 'mcp';
+  }
+
+  /** "Follow the default", naming the default when this user may read it. */
+  serverQuestionsInheritKey(): string {
+    switch (this.adminSettings.mcpServerQuestions()?.default) {
+      case 'decline':
+        return 'datasources.form.serverQuestionsInheritDecline';
+      case 'accept':
+        return 'datasources.form.serverQuestionsInheritAccept';
+      default:
+        return 'datasources.form.serverQuestionsInherit';
+    }
+  }
+
+  /** Read the installation default once, for an admin opening an MCP form. */
+  private ensureServerQuestionsDefault(): void {
+    if (this.serverQuestionsDefaultRequested || !this.isMcpForm()) return;
+    if (!this.userService.currentUser()?.is_admin) return;
+    if (this.adminSettings.mcpServerQuestions()) return;
+    this.serverQuestionsDefaultRequested = true;
+    this.adminSettings.loadMcpServerQuestions();
+  }
+
+  /**
+   * An MCP connector's config with its server-questions choice: the key
+   * beside the driver's own config (a managed server's url and access),
+   * left out when the connector follows the default. A remote server has
+   * no other config, so it sends one only for a choice, or to clear a
+   * stored one on edit.
+   */
+  private withServerQuestions(config: DatasourceConfig | undefined): DatasourceConfig | undefined {
+    // The generic form has not reported yet: leave the column untouched
+    // rather than replace a managed server's config with this key alone.
+    if (config === undefined && this.useGenericForm()) return undefined;
+    const base: DatasourceConfig = {...(config ?? {})};
+    delete base.server_questions;
+    const chosen = this.formData.serverQuestions;
+    if (chosen !== 'inherit') return {...base, server_questions: chosen};
+    if (config !== undefined) return base;
+    const stored = this.editingId() !== null ? this.editingOriginal?.config : null;
+    return stored?.server_questions ? base : undefined;
   }
 
   onMcpTransportSelect(value: string | null): void {
@@ -4819,6 +4931,12 @@ export class DatasourceListComponent implements OnInit {
   /** Non-secret, type-specific config for the create/update/test payloads.
    *  `undefined` for types without config so the column stays untouched. */
   private buildTypeConfig(): DatasourceConfig | undefined {
+    const config = this.buildDriverConfig();
+    return this.isMcpForm() ? this.withServerQuestions(config) : config;
+  }
+
+  /** The driver's own config, as its form holds it. */
+  private buildDriverConfig(): DatasourceConfig | undefined {
     if (this.useGenericForm()) {
       return this.genericFormValue()?.config as DatasourceConfig | undefined;
     }
@@ -5038,6 +5156,7 @@ export class DatasourceListComponent implements OnInit {
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
+      serverQuestions: 'inherit',
       is_global: false,
       read_only: null,
       scope_mode: null,

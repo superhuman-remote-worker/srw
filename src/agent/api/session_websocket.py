@@ -85,6 +85,9 @@ class SessionWelcomePorts:
     #: the Cockpit's ``parseRunningTools``; ``running_tool`` stays for older
     #: Cockpits. Unset: the list holds ``running_tool`` alone.
     running_tools: Optional[Callable[[Any], list[dict[str, Any]]]] = None
+    #: MCP servers' questions still waiting on the user, shaped like the
+    #: ``question.request`` broadcast. Unset: none.
+    pending_questions: Optional[Callable[[], Awaitable[list[dict[str, Any]]]]] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +256,11 @@ async def serve_session_websocket(ws: WebSocket, ports: SessionSocketPorts) -> N
         await _reject_preloop_identity_change()
         return
     pending_permissions = await ports.welcome.pending_permissions()
+    pending_questions = (
+        await ports.welcome.pending_questions()
+        if ports.welcome.pending_questions is not None
+        else []
+    )
     if not _identity_current():
         await _reject_preloop_identity_change()
         return
@@ -277,6 +285,7 @@ async def serve_session_websocket(ws: WebSocket, ports: SessionSocketPorts) -> N
             "running_tool": running_tool,
             "running_tools": running_tools,
             "pending_permissions": pending_permissions,
+            "pending_questions": pending_questions,
             "tasks": session_tasks,
         },
     )

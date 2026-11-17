@@ -105,9 +105,12 @@ async def test_full_job_path_slice(tmp_path):
         assert datasource["_mcp_status"] == "connected"
 
         names = expand_tool_wildcards(["*"])
-        assert names == ["mcp__echo__echo"]
+        # The server's tool, and the two resource tools every server that
+        # offers resources shares (the test server declares resources).
+        assert names == ["mcp__echo__echo", "read_mcp_resource", "save_mcp_resource"]
 
         tools = load_tools(names, ToolContext(datasources={"mcp": manager}))
+        assert [tool.name for tool in tools] == names
         result = await tools[0].coroutine(text="hi")
         assert "echo: hi" in str(result)
     finally:
