@@ -106,6 +106,9 @@ func (a *App) readManifests(arguments []string, format string) ([]manifestFile, 
 		if !utf8.Valid(data) {
 			return nil, exit.Usagef("%s is not valid UTF-8", name)
 		}
+		if strings.TrimSpace(string(data)) == "" {
+			return nil, exit.Usagef("%s is empty", name)
+		}
 		chosen := format
 		if chosen == "" {
 			chosen = "yaml"

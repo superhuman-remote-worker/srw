@@ -364,8 +364,12 @@ func (a *App) whoami(ctx context.Context) error {
 	}
 	if credential := who.Credential; credential != nil && credential.ExpiresAt != nil {
 		if left := credential.ExpiresAt.Sub(a.Now()); left < expiryWarning {
-			fmt.Fprintf(a.Err, "warning: this token expires in %s; create a new one under %s and run `srw login` again\n",
-				strings.TrimPrefix(remaining(left), "in "), tokenMenu)
+			next := "run `srw login` again"
+			if to.Mode == remote.Environment {
+				next = "put it where this one comes from (" + to.TokenSource + ")"
+			}
+			fmt.Fprintf(a.Err, "warning: this token expires in %s; create a new one under %s and %s\n",
+				strings.TrimPrefix(remaining(left), "in "), tokenMenu, next)
 		}
 	}
 	return nil

@@ -109,6 +109,10 @@ func TestWaitExitsByTheOutcome(t *testing.T) {
 			if *polls != len(test.statuses) {
 				t.Errorf("polls: %d, want %d", *polls, len(test.statuses))
 			}
+			// The status that ends the wait is printed in one place.
+			if strings.Contains(errOut, strings.TrimSpace(out)+"\n") {
+				t.Errorf("the last status is on stderr too: %q", errOut)
+			}
 		})
 	}
 }
@@ -207,6 +211,49 @@ func TestRunSendsWhatWasAskedAndNothingElse(t *testing.T) {
 	}
 }
 
+func TestRunNamesAStoredExpertByTheNameItWasAppliedUnder(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	// The server lists an expert stored from a manifest as "<name>-<uid>".
+	experts := h.record("GET /api/experts", 200, []any{
+		map[string]any{"id": "scholar", "name": "scholar", "display_name": "Scholar", "manifest_uid": "17f941d4-6fd9-437f-a44d-c1211c060af1"},
+		map[string]any{"id": "c282e3f4-0000-4000-8000-000000000001", "name": "reviewer-fc05181c152241e0b3e6749fd1a92d40", "display_name": "Code reviewer", "manifest_uid": "fc05181c-1522-41e0-b3e6-749fd1a92d40"},
+	})
+	created := h.record("POST /api/jobs", 200, map[string]any{"id": jobID})
+	for typed, sent := range map[string]string{
+		"reviewer":      "c282e3f4-0000-4000-8000-000000000001",
+		"Code reviewer": "c282e3f4-0000-4000-8000-000000000001",
+		"scholar":       "scholar",
+		// Unknown here: sent as typed, the server decides.
+		"brand-new": "brand-new",
+	} {
+		h.run("", "run", "Task", "--expert", typed)
+		if got := (*created)[len(*created)-1]["expert"]; got != sent {
+			t.Errorf("--expert %s sent %v, want %s", typed, got, sent)
+		}
+	}
+	// An id needs no lookup, for the expert or for the project.
+	before := len(*experts)
+	h.run("", "run", "Task", "--expert", "c282e3f4-0000-4000-8000-000000000001", "-p", "BBBBBBBB-0000-4000-8000-000000000001")
+	sent := (*created)[len(*created)-1]
+	if len(*experts) != before || sent["project_id"] != "bbbbbbbb-0000-4000-8000-000000000001" {
+		t.Errorf("ids were looked up: %v", sent)
+	}
+	// The table shows the name a person can type, and the lookup takes it.
+	out, _, _ := h.run("", "get", "experts", "--no-headers")
+	if !strings.Contains(out, "reviewer ") || strings.Contains(out, "fc05181c152241e0") {
+		t.Errorf("table:\n%s", out)
+	}
+	if out, _, _ := h.run("", "get", "expert", "reviewer", "-o", "name"); out != "expert/c282e3f4-0000-4000-8000-000000000001\n" {
+		t.Errorf("by its applied name: %q", out)
+	}
+	h.record("GET /api/resources/fc05181c-1522-41e0-b3e6-749fd1a92d40", 200, storedView("fc05181c-1522-41e0-b3e6-749fd1a92d40", "Expert", "reviewer", false, nil))
+	h.record("POST /api/manifests/export", 200, map[string]any{"source": "kind: Expert\n"})
+	if out, _, code := h.run("", "export", "expert", "reviewer"); code != 0 || out != "kind: Expert\n" {
+		t.Errorf("export by its applied name: %d %q", code, out)
+	}
+}
+
 func TestRunWaitExitsByTheOutcomeAndPrintsTheIdFirst(t *testing.T) {
 	h := newHarness(t)
 	h.login()
@@ -297,7 +344,7 @@ func TestGetJobs(t *testing.T) {
 	h.handle("GET /api/jobs", func(w http.ResponseWriter, r *http.Request) {
 		queries = append(queries, r.URL.RawQuery)
 		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Query().Get("offset") == "0" {
+		if offset := r.URL.Query().Get("offset"); offset == "0" || offset == "" {
 			json.NewEncoder(w).Encode(map[string]any{"has_more": true, "jobs": []any{
 				jobRow(jobID, "completed", "", true), jobRow(otherJob, "failed", "A child", false)}})
 			return
@@ -328,9 +375,18 @@ func TestGetJobs(t *testing.T) {
 		t.Errorf("on a terminal:\n%s", out)
 	}
 	h.stdoutTerminal = false
-	h.record("GET /api/jobs/"+jobID, 200, jobRow(jobID, "completed", "One job", true))
-	if out, _, _ := h.run("", "get", "job", jobID, "-o", "json"); !strings.Contains(out, `"title": "One job"`) {
+	// One job: the server's object as JSON; in the table the names come
+	// from the list row, because the detail has neither.
+	detail := jobRow(jobID, "completed", "One job", true)
+	delete(detail, "expert_display_name")
+	delete(detail, "project_name")
+	detail["config_name"] = "worker_base"
+	h.record("GET /api/jobs/"+jobID, 200, detail)
+	if out, _, _ := h.run("", "get", "job", jobID, "-o", "json"); !strings.Contains(out, `"title": "One job"`) || strings.Contains(out, "Scholar") {
 		t.Errorf("one job: %s", out)
+	}
+	if out, _, _ := h.run("", "get", "job", jobID, "--no-headers"); strings.Join(strings.Fields(out), " ") != jobID+" completed Scholar website 2026-11-17T09:00:00Z The task" {
+		t.Errorf("one job as a row: %q", out)
 	}
 	for _, refused := range [][]string{{"get", "jobs", "--limit", "0"}, {"get", "jobs", "--catalog"}, {"get", "jobs", "--stored"}, {"get", "sessions", "x"}} {
 		if _, _, code := h.run("", refused...); code != exit.Usage {
@@ -359,9 +415,20 @@ func TestDescribeJob(t *testing.T) {
 	}
 	want(t, out, "Job:              "+jobID, "Title:            Summary", "Status:           paused", "State:            waiting: paused by control plane",
 		"Held by:          operator", "Plans in phases:  no", "Expert:           scholar", "Task:\n  Summarise\n  the issues",
-		"[completed] Read the issues", "[pending] Write the summary", "Finished phases: 1", "summary: Half done", `deliverables: ["output/summary.md"]`)
+		"[completed] Read the issues", "[pending] Write the summary", "Archived to-do lists: 1", "summary: Half done", `deliverables: ["output/summary.md"]`)
 	if strings.Contains(out, "Completion report") {
 		t.Errorf("a missing report was printed:\n%s", out)
+	}
+	// The detail names neither the expert nor the project; the list row
+	// does. And a finished job's report repeats what it handed over, so that
+	// is printed once.
+	h.record("GET /api/jobs", 200, map[string]any{"has_more": false, "jobs": []any{map[string]any{"id": jobID, "expert_display_name": "Scholar", "project_name": "website"}}})
+	h.record("GET /api/jobs/"+jobID, 200, map[string]any{"id": jobID, "config_name": "scholar", "project_id": "bbbbbbbb-0000-4000-8000-000000000001"})
+	h.record("GET "+jobRoute("/completion-report"), 200, map[string]any{"report": map[string]any{"summary": "All done"}})
+	out, _, _ = h.run("", "describe", "job", jobID)
+	want(t, out, "Expert:   Scholar", "Project:  website (bbbbbbbb-0000-4000-8000-000000000001)", "Completion report:\n  summary: All done")
+	if strings.Contains(out, "Handed over") {
+		t.Errorf("the hand-over was printed beside the report:\n%s", out)
 	}
 	if out, _, _ := h.run("", "describe", "job/"+jobID, "-o", "name"); out != "job/"+jobID+"\n" {
 		t.Errorf("-o name: %q", out)

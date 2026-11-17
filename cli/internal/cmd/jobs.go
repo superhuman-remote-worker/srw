@@ -181,18 +181,18 @@ func (a *App) run(command *cobra.Command, args []string, flags runFlags) error {
 	}
 	body := map[string]any{"description": task}
 	if flags.expert != "" {
-		body["expert"] = flags.expert
+		body["expert"] = a.expertReference(ctx, client, flags.expert)
 	}
 	project := flags.project
 	if project == "" {
 		project = to.Project
 	}
 	if project != "" {
-		found, err := a.resolveProject(ctx, client, project)
+		id, err := a.projectID(ctx, client, project)
 		if err != nil {
 			return err
 		}
-		body["project_id"] = found.ID
+		body["project_id"] = id
 	}
 	if changed("priority") {
 		body["priority"] = flags.priority
@@ -260,6 +260,26 @@ func (a *App) run(command *cobra.Command, args []string, flags runFlags) error {
 		return nil
 	}
 	return a.wait(ctx, client, created.ID, waitFlags{timeout: flags.timeout, interval: flags.interval}, format != output.Default)
+}
+
+// expertReference turns what was typed after --expert into what the server
+// takes: a built-in expert's name, or the id of a stored one. A stored
+// expert is found by the name it was applied under or by its display name.
+// When the list cannot be read (a token without jobs:read) or holds no
+// match, the typed value is sent as it is and the server decides.
+func (a *App) expertReference(ctx context.Context, client *api.Client, typed string) string {
+	if isUUID(typed) {
+		return typed
+	}
+	rows, err := a.listExperts(ctx, client)
+	if err != nil {
+		return typed
+	}
+	found := match(rows, typed, "id", portableName, "name", "display_name")
+	if len(found) != 1 || found[0].text("id") == "" {
+		return typed
+	}
+	return found[0].text("id")
 }
 
 // readTask takes the task from the argument, a file, or standard input.
@@ -402,13 +422,8 @@ func (a *App) wait(ctx context.Context, client *api.Client, id string, flags wai
 			}
 			return err
 		}
-		if seen.Status != last {
-			// Progress goes to stderr; the last line goes to stdout.
-			if last != "" || !finalStatus(seen.Status) {
-				fmt.Fprintf(a.Err, "job/%s %s\n", id, seen.Status)
-			}
-			last = seen.Status
-		}
+		changed := seen.Status != last
+		last = seen.Status
 		done := func(code int, note string) error {
 			if !quiet {
 				line := fmt.Sprintf("job/%s %s", id, seen.Status)
@@ -433,6 +448,11 @@ func (a *App) wait(ctx context.Context, client *api.Client, id string, flags wai
 			return done(exit.WaitFailed, "the job ended "+seen.Status)
 		case len(flags.statuses) == 0 && seen.needsPerson():
 			return done(exit.WaitNeedsPerson, waitingFor(id, seen))
+		}
+		// Progress goes to stderr. The line that ends the wait went to
+		// stdout above, so a status is printed in one place only.
+		if changed {
+			fmt.Fprintf(a.Err, "job/%s %s\n", id, seen.Status)
 		}
 		if flags.timeout > 0 && a.Now().Sub(started) >= flags.timeout {
 			return exit.New(exit.WaitTimeout, "the job did not end within %s; it is %s and keeps running", flags.timeout, seen.Status).
@@ -541,7 +561,8 @@ func (a *App) lifecycleCommands() []*cobra.Command {
 			"Pause a job that is running. It stays paused until someone resumes it.", routes.JobPause, "", "", ""),
 		a.lifecycleCommand("resume", "Continue a job, optionally with feedback",
 			"Continue a paused or failed job. On a job that stopped for review, resume\n"+
-				"sends it back to work; say what to change with --feedback.",
+				"sends it back to work; say what to change with --feedback. On a job that is\n"+
+				"running, resume interrupts it and queues it again.",
 			routes.JobResume, "feedback", "feedback", "What the job should do differently"),
 		a.lifecycleCommand("approve", "Approve a job that stopped for review",
 			"Approve a job that stopped for a person. A job that stopped at the end of its\n"+
@@ -601,6 +622,13 @@ func (a *App) getJobs(ctx context.Context, client *api.Client, to string, format
 			return err
 		}
 		rows := decodeRows([]json.RawMessage{response.Body})
+		if format == output.Default {
+			// The detail names neither the expert nor the project; the
+			// list row does.
+			if listed := a.jobListRow(ctx, client, id); listed != nil {
+				rows = []row{*listed}
+			}
+		}
 		a.presentJobs(rows)
 		return a.printRows(format, "job", rows, columns, "id", true, flags)
 	}
@@ -622,11 +650,11 @@ func (a *App) getJobs(ctx context.Context, client *api.Client, to string, format
 		project = to
 	}
 	if project != "" {
-		found, err := a.resolveProject(ctx, client, project)
+		id, err := a.projectID(ctx, client, project)
 		if err != nil {
 			return err
 		}
-		query.Set("project_id", found.ID)
+		query.Set("project_id", id)
 	}
 	var rows []row
 	more := false
@@ -662,6 +690,26 @@ func (a *App) getJobs(ctx context.Context, client *api.Client, to string, format
 	}
 	if more && format == output.Default {
 		fmt.Fprintf(a.Err, "There are more jobs; --all lists them, or narrow the list with --status, --project or --search.\n")
+	}
+	return nil
+}
+
+// jobListRow finds a job's row in the list, which carries the names the
+// detail lacks. Nil when it cannot be found; the caller then shows what the
+// detail has.
+func (a *App) jobListRow(ctx context.Context, client *api.Client, id string) *row {
+	query := url.Values{"search": {id}, "include_archived_projects": {"true"}, "limit": {"50"}, "include_total": {"false"}}
+	var page struct {
+		Jobs []json.RawMessage `json:"jobs"`
+	}
+	request := api.Request{Method: routes.JobList.Method, Path: routes.JobList.Path, Query: query, Known: true}
+	if client.JSON(ctx, request, &page) != nil {
+		return nil
+	}
+	for _, listed := range decodeRows(page.Jobs) {
+		if strings.EqualFold(listed.text("id"), id) {
+			return &listed
+		}
 	}
 	return nil
 }
@@ -819,9 +867,18 @@ func (a *App) describeJob(ctx context.Context, typed string) error {
 	if phases, known := job["phases"].(bool); known {
 		fmt.Fprintf(table, "Plans in phases:\t%s\n", map[bool]string{true: "yes", false: "no"}[phases])
 	}
-	for _, field := range [][2]string{{"Expert", "config_name"}, {"Lane", "execution_lane"}, {"Project", "project_id"}, {"Created", "created_at"}, {"Error", "error_message"}} {
-		if value := text(job, field[1]); value != "" {
-			fmt.Fprintf(table, "%s:\t%s\n", field[0], value)
+	expert, project := text(job, "config_name"), text(job, "project_id")
+	if listed := a.jobListRow(ctx, client, id); listed != nil {
+		if name := listed.text("expert_display_name"); name != "" {
+			expert = name
+		}
+		if name := listed.text("project_name"); name != "" {
+			project = name + " (" + project + ")"
+		}
+	}
+	for _, field := range [][2]string{{"Expert", expert}, {"Lane", text(job, "execution_lane")}, {"Project", project}, {"Created", text(job, "created_at")}, {"Error", text(job, "error_message")}} {
+		if field[1] != "" {
+			fmt.Fprintf(table, "%s:\t%s\n", field[0], field[1])
 		}
 	}
 	if err := table.Flush(); err != nil {
@@ -837,9 +894,10 @@ func (a *App) describeJob(ctx context.Context, typed string) error {
 		}
 	}
 	if archives, ok := todos["archives"].([]any); ok && len(archives) > 0 {
-		fmt.Fprintf(a.Out, "\nFinished phases: %d\n", len(archives))
+		fmt.Fprintf(a.Out, "\nArchived to-do lists: %d\n", len(archives))
 	}
-	if frozen != nil {
+	// A finished job's report repeats what it handed over; print it once.
+	if frozen != nil && (report == nil || report["report"] == nil) {
 		fmt.Fprintf(a.Out, "\nHanded over when it stopped:\n")
 		printFields(a.Out, frozen, "summary", "deliverables", "confidence", "notes", "type", "reason")
 	}

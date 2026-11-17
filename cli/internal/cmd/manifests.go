@@ -70,11 +70,11 @@ func (s *scopeFlags) resolve(ctx context.Context, a *App, client *api.Client) (m
 	case s.catalog:
 		return map[string]string{"kind": "Catalog", "name": "shared"}, nil
 	case s.project != "":
-		project, err := a.resolveProject(ctx, client, s.project)
+		id, err := a.projectID(ctx, client, s.project)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]string{"kind": "Project", "name": project.ID}, nil
+		return map[string]string{"kind": "Project", "name": id}, nil
 	}
 	if s.kind == "" || s.name == "" {
 		return nil, exit.Usagef("--scope-kind and --scope-name must be given together")

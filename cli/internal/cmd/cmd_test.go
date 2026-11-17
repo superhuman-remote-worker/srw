@@ -286,6 +286,11 @@ func TestEnvironmentModeIgnoresTheSavedLogin(t *testing.T) {
 		t.Fatalf("%d %s", code, errOut)
 	}
 	want(t, out, "Context:     none (server and token come from the environment)", "Token from:  SRW_TOKEN")
+	// A token that runs out soon: the advice fits where the token comes from.
+	h.identity["credential"].(map[string]any)["expires_at"] = "2026-11-19T12:00:00Z"
+	if _, errOut, _ := h.run("", "whoami"); !strings.Contains(errOut, "put it where this one comes from (SRW_TOKEN)") || strings.Contains(errOut, "srw login") {
+		t.Errorf("the expiry advice in environment mode: %q", errOut)
+	}
 	_, errOut, code = h.run("", "whoami", "--context", "dev")
 	if code != exit.Usage || !strings.Contains(errOut, "either the environment or a saved context") {
 		t.Errorf("--context in environment mode: %d %s", code, errOut)

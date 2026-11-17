@@ -141,6 +141,8 @@ func TestFileRules(t *testing.T) {
 		"the same file twice":        {"validate", "-f", good, "-f", good},
 		"more than 1 MiB":            {"validate", "-f", big},
 		"not UTF-8":                  {"validate", "-f", binary},
+		"an empty file":              {"validate", "-f", manifestFileIn(t, "empty.yaml", "  \n")},
+		"nothing on stdin":           {"validate", "-f", "-"},
 		"an unknown format":          {"validate", "-f", good, "--format", "toml"},
 		"an empty directory":         {"validate", "-f", t.TempDir()},
 		"half a scope":               {"preview", "-f", good, "--scope-kind", "Account"},

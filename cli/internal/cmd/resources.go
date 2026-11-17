@@ -194,23 +194,49 @@ func storedName(view row) (kindName, name, scope string) {
 	return kindName, name, scope
 }
 
-// match finds the rows a name or an id stands for: the id first, then the
-// name. The filter always runs here as well: a server that ignores a name
-// parameter returns the whole list, and trusting it would address the first
-// row.
-func match(rows []row, wanted string, idKey, nameKey string) []row {
-	var byID, byName []row
+// match finds the rows a name or an id stands for: the id first, then each
+// name field in the order given. The filter always runs here as well: a
+// server that ignores a name parameter returns the whole list, and trusting
+// it would address the first row.
+func match(rows []row, wanted string, idKey string, nameKeys ...string) []row {
+	var found []row
 	for _, candidate := range rows {
 		if strings.EqualFold(candidate.text(idKey), wanted) {
-			byID = append(byID, candidate)
-		} else if candidate.text(nameKey) == wanted {
-			byName = append(byName, candidate)
+			found = append(found, candidate)
 		}
 	}
-	if len(byID) > 0 {
-		return byID
+	for _, key := range nameKeys {
+		if len(found) > 0 {
+			break
+		}
+		for _, candidate := range rows {
+			if candidate.text(key) == wanted {
+				found = append(found, candidate)
+			}
+		}
 	}
-	return byName
+	return found
+}
+
+// portableName is the field that holds the name an expert was applied
+// under. The server lists an expert stored from a manifest as
+// "<name>-<uid>", so that two owners can use the same name; the name a
+// person wrote in the manifest is that without the UID.
+const portableName = "_name"
+
+func (a *App) listExperts(ctx context.Context, client *api.Client) ([]row, error) {
+	rows, err := a.listRows(ctx, client, routes.ExpertList)
+	if err != nil {
+		return nil, err
+	}
+	for _, expert := range rows {
+		name := expert.text("name")
+		if uid := strings.ReplaceAll(expert.text("manifest_uid"), "-", ""); uid != "" {
+			name = strings.TrimSuffix(name, "-"+uid)
+		}
+		expert.fields[portableName] = name
+	}
+	return rows, nil
 }
 
 // one returns the single match, or says why there is none or more than one.
@@ -234,6 +260,20 @@ func one(kindName, wanted string, found []row, idKey, nameKey string) (row, erro
 type projectRef struct {
 	ID          string
 	ManifestUID string
+}
+
+// projectID is the id of a project named by id or by name. An id is used
+// as it is, without a request; a token that may not list projects can then
+// still name one.
+func (a *App) projectID(ctx context.Context, client *api.Client, wanted string) (string, error) {
+	if isUUID(wanted) {
+		return strings.ToLower(wanted), nil
+	}
+	project, err := a.resolveProject(ctx, client, wanted)
+	if err != nil {
+		return "", err
+	}
+	return project.ID, nil
 }
 
 // resolveProject finds a project by name or id.
@@ -272,15 +312,15 @@ func (a *App) resourceUID(ctx context.Context, client *api.Client, args []string
 		return "", exit.Usagef("a scope is for stored lookups (workspacetemplate); a %s is looked up in the list you can see", kindName)
 	}
 	notStored := func(found row) error {
-		return exit.New(exit.Failed, "the %s %q is not a stored resource (it is built in, or it predates manifests)", kindName, found.text("name"))
+		return exit.New(exit.Failed, "the %s %q is not a stored resource (it predates manifests)", kindName, found.text("name"))
 	}
 	switch kindName {
 	case "expert":
-		rows, err := a.listRows(ctx, client, routes.ExpertList)
+		rows, err := a.listExperts(ctx, client)
 		if err != nil {
 			return "", err
 		}
-		found, err := one(kindName, name, match(rows, name, "id", "name"), "id", "name")
+		found, err := one(kindName, name, match(rows, name, "id", portableName, "name", "display_name"), "id", portableName)
 		if err != nil {
 			return "", err
 		}
@@ -464,8 +504,8 @@ func (a *App) get(ctx context.Context, args []string, flags getFlags, scope *sco
 	var columns []column
 	switch kindName {
 	case "expert":
-		rows, err = a.listRows(ctx, client, routes.ExpertList)
-		columns = []column{{"NAME", "name"}, {"TYPE", "expert_type"}, {"SOURCE", "source"}, {"ID", "id"}}
+		rows, err = a.listExperts(ctx, client)
+		columns = []column{{"NAME", portableName}, {"TYPE", "expert_type"}, {"SOURCE", "source"}, {"ID", "id"}}
 	case "project":
 		rows, err = a.listRows(ctx, client, routes.ProjectList)
 		columns = []column{{"NAME", "name"}, {"STATUS", "status"}, {"ID", "id"}}
@@ -482,7 +522,11 @@ func (a *App) get(ctx context.Context, args []string, flags getFlags, scope *sco
 	}
 	single := name != ""
 	if single {
-		found, err := one(kindName, name, match(rows, name, "id", "name"), "id", "name")
+		nameKeys := []string{"name"}
+		if kindName == "expert" {
+			nameKeys = []string{portableName, "name", "display_name"}
+		}
+		found, err := one(kindName, name, match(rows, name, "id", nameKeys...), "id", nameKeys[0])
 		if err != nil {
 			return err
 		}
