@@ -435,10 +435,19 @@ jobs:
         # GHSA-vfj7-8cjw-p6xm: Braces stack exhaustion from deeply nested globs.
         # No patched release; Stylelint uses the fixed, repository-controlled
         # src/**/*.scss pattern. Accept only dev-only Braces 3.0.3 below.
+        #
+        # GHSA-fc5q-39xc-vjpf: picomatch ReDoS on crafted extglob patterns.
+        # Every release up to 4.0.7 is affected and none is patched. Used only
+        # by the build, lint and test tools with repository-controlled patterns.
+        # Accepted below only while no newer picomatch is published and no
+        # unreviewed package depends on it.
+        #
         # Exposure, guards and removal criteria: policy/npm_audit_exceptions.md.
         run: |
+          PICOMATCH_LATEST=$(npm view picomatch version 2>/dev/null || true)
+          export PICOMATCH_LATEST
           npm audit --json | python3 -c "
-          import json, sys
+          import json, os, sys
           from pathlib import Path
           IGNORE_ADVISORIES = {
               'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh',
@@ -450,46 +459,83 @@ jobs:
               print('npm audit did not return a vulnerability report', file=sys.stderr)
               sys.exit(2)
 
-          lock = json.loads(Path('package-lock.json').read_text())
-          braces = [pkg for path, pkg in lock['packages'].items()
+          packages = json.loads(Path('package-lock.json').read_text())['packages']
+          braces = [pkg for path, pkg in packages.items()
                     if path == 'node_modules/braces' or path.endswith('/node_modules/braces')]
           if braces and all(pkg.get('version') == '3.0.3' and pkg.get('dev') is True
                             for pkg in braces):
               IGNORE_ADVISORIES.add('GHSA-vfj7-8cjw-p6xm')
 
-          # Mark packages whose only root-cause advisories are all ignored
-          ignored_pkgs = set()
+          # picomatch: accepted only while the newest published release is still
+          # inside the affected range (up to 4.0.7) and nothing but the reviewed
+          # build tools depends on picomatch outside the dev-only packages.
+          PICOMATCH = 'GHSA-fc5q-39xc-vjpf'
+          REVIEWED_DEPENDENTS = {'@angular-devkit/core', 'tinyglobby', 'fdir'}
+          parts = os.environ.get('PICOMATCH_LATEST', '').strip().split('.')
+          latest = None
+          if len(parts) == 3 and all(part.isdigit() for part in parts):
+              latest = tuple(int(part) for part in parts)
+          dependents = set()
+          for path, pkg in packages.items():
+              needs = set()
+              for kind in ('dependencies', 'optionalDependencies', 'peerDependencies'):
+                  needs.update(pkg.get(kind) or {})
+              if 'picomatch' in needs and pkg.get('dev') is not True:
+                  dependents.add(path.split('node_modules/')[-1] or 'the Cockpit itself')
+          picomatch_off = []
+          if latest is None:
+              picomatch_off.append('the newest published picomatch version is unknown')
+          elif latest > (4, 0, 7):
+              picomatch_off.append('picomatch ' + '.'.join(parts) + ' is published; update to it and remove the exception')
+          if dependents - REVIEWED_DEPENDENTS:
+              picomatch_off.append('not reviewed, depends on picomatch outside the dev-only packages: '
+                                   + ', '.join(sorted(dependents - REVIEWED_DEPENDENTS)))
+          if not picomatch_off:
+              IGNORE_ADVISORIES.add(PICOMATCH)
+
+          # The root advisories behind every package: its own, and those of the
+          # packages it is vulnerable through.
+          roots = {name: set() for name in vulns}
           changed = True
           while changed:
               changed = False
               for name, vuln in vulns.items():
-                  if name in ignored_pkgs:
-                      continue
-                  dominated = bool(vuln.get('via'))
-                  for v in vuln.get('via', []):
-                      if isinstance(v, dict):
-                          ghsa = v.get('url', '').split('/')[-1]
-                          if ghsa not in IGNORE_ADVISORIES:
-                              dominated = False
-                              break
-                      elif isinstance(v, str) and v not in ignored_pkgs:
-                          dominated = False
-                          break
-                  if dominated:
-                      ignored_pkgs.add(name)
+                  behind = set()
+                  for via in vuln.get('via') or []:
+                      if isinstance(via, dict):
+                          behind.add((via.get('url', '').split('/')[-1], via.get('severity')))
+                      elif isinstance(via, str) and via in vulns:
+                          behind |= roots[via]
+                      else:
+                          behind.add((None, None))
+                  if not behind <= roots[name]:
+                      roots[name] |= behind
                       changed = True
 
+          # npm rates a package by the worst advisory of any of its chains. A package
+          # npm rates high or critical blocks unless every advisory behind it that is
+          # not accepted is rated lower. An advisory without a rating, and a package
+          # without root advisories, keep npm's rating of the package.
+          LOWER = ('info', 'low', 'moderate')
           found = 0
           for name, vuln in vulns.items():
-              if name in ignored_pkgs:
+              own = vuln.get('severity')
+              if own not in ('high', 'critical'):
                   continue
-              if vuln.get('severity') in ('high', 'critical'):
+              unaccepted = [severity or own for ghsa, severity in roots[name]
+                            if ghsa not in IGNORE_ADVISORIES]
+              if not roots[name]:
+                  unaccepted = [own]
+              if any(severity not in LOWER for severity in unaccepted):
                   found += 1
-                  print(f'{name}: {vuln[\"severity\"]}')
+                  print(name + ': ' + own)
           if found:
-              print(f'{found} unignored high/critical vulnerabilities')
+              print(str(found) + ' unignored high/critical vulnerabilities')
+              if picomatch_off and any(ghsa == PICOMATCH for behind in roots.values() for ghsa, _ in behind):
+                  print('The picomatch exception (' + PICOMATCH + ') is off: ' + '; '.join(picomatch_off)
+                        + '. See policy/npm_audit_exceptions.md.')
               sys.exit(1)
-          print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
+          print('npm audit passed (ignored advisories: ' + ', '.join(sorted(IGNORE_ADVISORIES)) + ')')
           "
 
       # --- Third-party license policy gate (blocking) -----------------------
