@@ -531,6 +531,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # tests/test_srw_cli_wire.py builds the srw binary from cli/.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: cli/go.sum
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -2357,12 +2362,172 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
+  # srw, the command-line client (cli/). test-cli has no needs: it runs beside
+  # the other tests, also on a pull request. Its tests include the reference
+  # drift check (docs/cli-reference.md) and the route table against
+  # policy/endpoint_inventory.txt. The wire test against the real routes is a
+  # Python test and runs in test-python-shards.
+  # ---------------------------------------------------------------------------
+  test-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: cli/go.sum
+      - name: Verify modules, formatting and vet
+        working-directory: cli
+        run: |
+          go mod verify
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change: $unformatted"
+            exit 1
+          fi
+          go vet ./...
+          GOOS=windows go vet ./...
+          GOOS=darwin go vet ./...
+      - name: Test with the race detector
+        working-directory: cli
+        run: go test -count=1 -race -timeout 300s ./...
+      - name: Audit dependencies for known vulnerabilities
+        working-directory: cli
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Build every target and smoke-test what a release ships
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            scripts/release/build_cli.sh 0.0.0 "${GITHUB_SHA}" dist/cli
+          (cd dist/cli && sha256sum -c checksums.txt)
+          mkdir -p smoke/releases/latest/download smoke/home
+          cp dist/cli/* smoke/releases/latest/download/
+          # The installer against the archives just built, in an empty home.
+          env -i HOME="$PWD/smoke/home" PATH=/usr/bin:/bin \
+            SRW_INSTALL_REPOSITORY="file://$PWD/smoke" sh scripts/install-cli.sh
+          srw="$PWD/smoke/home/.local/bin/srw"
+          "$srw" version --client | grep -F "0.0.0 (commit ${GITHUB_SHA})"
+          "$srw" --help > /dev/null
+          "$srw" completion bash > /dev/null
+          # Nothing configured: a clear refusal, not a request to localhost.
+          set +e
+          env -i HOME="$PWD/smoke/home" "$srw" get jobs
+          code=$?
+          set -e
+          test "$code" -eq 2
+
+  # The release archives with their checksums and build provenance, and the
+  # srw-cli image. release-chart needs this job, so a broken client stops the
+  # chart, the tag and the release like every other component. The archives
+  # travel to github-release as an artifact.
+  build-cli:
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, test-cli, resolve-version]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      needs.test-cli.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      # Build provenance for the archives (actions/attest): the only job in
+      # this repository that asks for an OIDC token.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: cli/go.sum
+      - name: Build the archives
+        env:
+          # Empty on a validation run, which builds and publishes nothing.
+          RELEASE_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            scripts/release/build_cli.sh "${RELEASE_VERSION:-0.0.0}" "${GITHUB_SHA}" dist/cli
+          (cd dist/cli && sha256sum -c checksums.txt)
+          ls -l dist/cli
+      - name: Attest the archives' build provenance
+        if: needs.resolve-version.result == 'success'
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/cli/checksums.txt
+      - name: Keep the archives for the GitHub Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: srw-cli
+          path: dist/cli/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: needs.resolve-version.result == 'success'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cli
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.cli
+          # The build stage cross-compiles and the last stage runs nothing,
+          # so the second architecture needs no emulation.
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.resolve-version.result == 'success' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}/cli/
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
+            io.srw.component=cli
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cli:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cli:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
+  # ---------------------------------------------------------------------------
   # Package and publish Helm chart at the resolved release version.
   # Git tag goes LAST so a failed chart push doesn't leave dangling tags.
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-voice-gateway, build-asterisk, build-fuse-opener, build-agent-vm-base, chart-test, chart-schema-negative]
+    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-voice-gateway, build-asterisk, build-fuse-opener, build-cli, build-agent-vm-base, chart-test, chart-schema-negative]
     if: >-
       always() && !cancelled() &&
       github.ref == 'refs/heads/main' &&
@@ -2383,6 +2548,7 @@ jobs:
       needs.build-voice-gateway.result == 'success' &&
       needs.build-asterisk.result == 'success' &&
       needs.build-fuse-opener.result == 'success' &&
+      needs.build-cli.result == 'success' &&
       needs.chart-test.result == 'success' &&
       needs.chart-schema-negative.result == 'success'
     runs-on: ubuntu-latest
@@ -2501,6 +2667,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-notes
+      # The srw client's archives, checksums and installer from build-cli
+      # (release-chart needs that job, so they exist).
+      - uses: actions/download-artifact@v4
+        with:
+          name: srw-cli
+          path: dist/cli
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2508,9 +2680,33 @@ jobs:
           TAG: ${{ needs.resolve-version.outputs.tag }}
           TITLE: ${{ needs.resolve-version.outputs.title }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::GitHub Release $TAG already exists; leaving it untouched"
-            exit 0
-          fi
-          gh release create "$TAG" --verify-tag --latest \
-            --title "$TITLE" --notes-file release-notes.md
+          set -euo pipefail
+          assets=(dist/cli/srw_*.tar.gz dist/cli/srw_*.zip dist/cli/checksums.txt dist/cli/install.sh)
+          test "${#assets[@]}" -eq 8
+          # missing, or isDraft as true or false.
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          case "$state" in
+            missing)
+              # With files, gh drafts the release, uploads them and publishes
+              # it, so a published release always has every asset.
+              gh release create "$TAG" --verify-tag --latest \
+                --title "$TITLE" --notes-file release-notes.md "${assets[@]}"
+              ;;
+            true)
+              # A draft left by a run that failed while uploading: finish it.
+              gh release upload "$TAG" "${assets[@]}" --clobber
+              gh release edit "$TAG" --draft=false --latest
+              ;;
+            *)
+              # Published. Never changed; but a release without its assets
+              # breaks every install, so say so loudly.
+              have=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+              for asset in "${assets[@]}"; do
+                if ! grep -qxF "$(basename "$asset")" <<<"$have"; then
+                  echo "::error::GitHub Release $TAG exists without $(basename "$asset")"
+                  exit 1
+                fi
+              done
+              echo "::notice::GitHub Release $TAG already exists with every asset; leaving it untouched"
+              ;;
+          esac

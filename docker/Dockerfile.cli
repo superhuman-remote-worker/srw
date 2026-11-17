@@ -48,7 +48,9 @@ LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
 LABEL org.opencontainers.image.licenses="FSL-1.1-ALv2"
 LABEL io.srw.component="cli"
 
-RUN apk add --no-cache ca-certificates
+# Nothing runs in this stage, so the image builds for another architecture
+# without emulation. The base already carries the CA bundle
+# (ca-certificates-bundle, /etc/ssl/certs/ca-certificates.crt).
 COPY --from=build /out/srw /usr/local/bin/srw
 COPY LICENSE /usr/share/licenses/srw/LICENSE
 

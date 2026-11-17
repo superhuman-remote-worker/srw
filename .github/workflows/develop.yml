@@ -654,6 +654,7 @@ jobs:
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
       mcp-test-changed: ${{ steps.test-paths.outputs.mcp-test }}
       voice-test-changed: ${{ steps.test-paths.outputs.voice }}
+      cli-test-changed: ${{ steps.test-paths.outputs.cli }}
       # Space-separated test files for pytest, or `tests/` for the whole suite.
       pytest-target: ${{ steps.select.outputs.pytest-target }}
     steps:
@@ -741,6 +742,7 @@ jobs:
             echo "cockpit=true" >> "$GITHUB_OUTPUT"
             echo "mcp-test=true" >> "$GITHUB_OUTPUT"
             echo "voice=true" >> "$GITHUB_OUTPUT"
+            echo "cli=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -752,6 +754,7 @@ jobs:
 
           if git diff --name-only "$BASE" HEAD -- \
             'src/' 'tests/' 'config/' 'init.py' 'scripts/' 'policy/' '.github/workflows/' \
+            'cli/' \
             '.github/actions/' \
             'docker/prepare-tokenizer-cache.py' \
             'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
@@ -790,7 +793,18 @@ jobs:
             echo "voice=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Test path detection: $(grep -E '^(python|cockpit|mcp-test|voice)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
+          # The srw command-line client: its Go tests and what a release
+          # ships. The route inventory is an input too: the client's route
+          # table is checked against it.
+          if git diff --name-only "$BASE" HEAD -- 'cli/' 'policy/endpoint_inventory.txt' \
+            'scripts/release/build_cli.sh' 'scripts/install-cli.sh' 'docs/cli-reference.md' \
+            '.github/workflows/develop.yml' | grep -q .; then
+            echo "cli=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cli=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Test path detection: $(grep -E '^(python|cockpit|mcp-test|voice|cli)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
 
       - name: Select affected test files
         id: select
@@ -1155,6 +1169,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # tests/test_srw_cli_wire.py builds the srw binary from cli/.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: cli/go.sum
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -2467,6 +2486,64 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 -race ./...
+
+  # srw, the command-line client (cli/): the same checks as on main, when the
+  # client or one of its inputs changed. develop publishes no client; the
+  # archives and the image are built and released from main.
+  test-cli:
+    needs: [changes]
+    if: needs.changes.outputs.cli-test-changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache-dependency-path: cli/go.sum
+      - name: Verify modules, formatting and vet
+        working-directory: cli
+        run: |
+          go mod verify
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change: $unformatted"
+            exit 1
+          fi
+          go vet ./...
+          GOOS=windows go vet ./...
+          GOOS=darwin go vet ./...
+      - name: Test with the race detector
+        working-directory: cli
+        run: go test -count=1 -race -timeout 300s ./...
+      - name: Audit dependencies for known vulnerabilities
+        working-directory: cli
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Build every target and smoke-test what a release ships
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            scripts/release/build_cli.sh 0.0.0 "${GITHUB_SHA}" dist/cli
+          (cd dist/cli && sha256sum -c checksums.txt)
+          mkdir -p smoke/releases/latest/download smoke/home
+          cp dist/cli/* smoke/releases/latest/download/
+          # The installer against the archives just built, in an empty home.
+          env -i HOME="$PWD/smoke/home" PATH=/usr/bin:/bin \
+            SRW_INSTALL_REPOSITORY="file://$PWD/smoke" sh scripts/install-cli.sh
+          srw="$PWD/smoke/home/.local/bin/srw"
+          "$srw" version --client | grep -F "0.0.0 (commit ${GITHUB_SHA})"
+          "$srw" --help > /dev/null
+          "$srw" completion bash > /dev/null
+          # Nothing configured: a clear refusal, not a request to localhost.
+          set +e
+          env -i HOME="$PWD/smoke/home" "$srw" get jobs
+          code=$?
+          set -e
+          test "$code" -eq 2
 
   # The managed MCP front (D5a): the only exposed port of every managed MCP
   # driver pod. Vetted and tested with the toolchain the image builds with,
