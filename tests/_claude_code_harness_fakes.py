@@ -88,15 +88,14 @@ def fake_client_factory(clients, messages=(), **kwargs):
 async def call_tool(options, name, arguments):
     """Call one of the harness's tools the way the CLI does: through the SDK MCP
     server in the options."""
-    from mcp.types import CallToolRequest, CallToolRequestParams
+    from mcp.types import CallToolRequestParams
 
     server = options.mcp_servers["ws"]["instance"]
-    handler = server.request_handlers[CallToolRequest]
-    return await handler(
-        CallToolRequest(
-            method="tools/call",
-            params=CallToolRequestParams(name=name, arguments=arguments),
-        )
+    # mcp 2.x registers a handler per method name; it takes (context, params),
+    # and the SDK's tool server does not read the context.
+    entry = server.get_request_handler("tools/call")
+    return await entry.handler(
+        None, CallToolRequestParams(name=name, arguments=arguments)
     )
 
 
