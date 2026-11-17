@@ -55,6 +55,33 @@ automatically gets the matching access:
 - Repository and credential-file connectors prepare the workspace and
   credentials the agent needs.
 
+## MCP servers: questions and files
+
+An MCP server can ask a question while one of its tools runs, such as "Spend
+6 Buzz to run imageGen?". The MCP connector's setting **When the server asks a
+question mid-call** decides what such a question gets: **Decline**, or
+**Accept yes/no confirmations**. **Follow the installation default** uses the
+**MCP server questions default** an administrator sets under **Admin →
+Users**; without one, the question is declined.
+
+- A job and an **Autonomous** session apply the setting; nobody is asked.
+- A **Read-only** or **Auto-accept** session shows the question as a card when
+  the setting would decline it, with **Accept**, **Decline** and **Always
+  accept in this session**. The last accepts this question and every later
+  yes/no question from that server in the session.
+- A question that needs typed input or a link to open always comes to the user
+  as a card in a Read-only or Auto-accept session, and is declined in a job or
+  an Autonomous session.
+- When SRW answers a question on its own, the tool result says what it
+  answered and which setting decided, so the agent can tell the user what to
+  change.
+
+A server can also offer files, such as a picture one of its tools generated
+and links to. The agent reads one with `read_mcp_resource` (a model that takes
+images sees the picture) or saves it into the workspace with
+`save_mcp_resource`. The two tools are there while an attached remote MCP
+server offers files; a managed (stdio) MCP server does not pass them on yet.
+
 ## Read-only vs. read-write
 
 Managed database and WebDAV attachments can be marked **read-only**. Read-only

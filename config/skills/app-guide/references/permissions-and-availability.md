@@ -52,6 +52,11 @@ Read-only asks rather than refuses: approve a change and it runs. It is not the
 same as a connector's read-only access level, which binds no write tools at
 all. A delegated subagent runs unattended once its delegation is approved.
 
+A question an MCP server asks during a tool call, such as a cost
+confirmation, follows its connector's own setting. Read-only and Auto-accept
+show it to the user when that setting would decline it; Autonomous applies the
+setting. The `datasources` topic has the details.
+
 New session experts default to Read-only unless an account, expert, or
 per-session setting overrides it. Change the current session from its header
 **Settings** panel; change the account fallback under
