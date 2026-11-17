@@ -90,7 +90,17 @@ def test_only_hashes_reach_the_database():
     assert "NULL" in mcp and "'srw_gate'" in mcp
     revoke = gate.revoke_sql("clig-0123abcd")
     assert "name LIKE 'clig-0123abcd-%'" in revoke
-    assert "DELETE FROM experts WHERE name LIKE 'clig-0123abcd-helper-%'" in revoke
+    # Tokens are the only thing the gate writes by SQL. A row deleted under
+    # a stored resource leaves that resource where the API cannot reach it.
+    assert revoke.count(";") == 1 and revoke.startswith(
+        "UPDATE auth_tokens SET revoked_at"
+    )
+    source = _SCRIPT.read_text()
+    assert "DELETE FROM" not in source and "INSERT INTO auth_tokens" in source
+    assert source.count("INSERT INTO") == 1 and source.count("UPDATE ") == 1
+    left = gate.leftover_sql("clig-0123abcd")
+    assert "srw_resources" in left and "deleted_at IS NULL" in left
+    assert "'%(gate clig-0123abcd)%'" in left
 
 
 def test_a_runs_jobs_can_be_found_again_by_its_id():

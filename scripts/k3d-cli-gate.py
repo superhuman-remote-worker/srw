@@ -161,11 +161,20 @@ def mint_sql(gate_id: str, emails: dict[str, str], digests: dict[str, str]) -> s
 
 
 def revoke_sql(gate_id: str) -> str:
+    """Revoke the run's tokens. Nothing else is written by SQL: what the run
+    stored is removed through the API, as a user would remove it."""
     return (
         "UPDATE auth_tokens SET revoked_at = now() "
         f"WHERE name LIKE '{gate_id}-%' AND revoked_at IS NULL;\n"
-        # An expert's delete leaves its row as a tombstone; remove this run's.
-        f"DELETE FROM experts WHERE name LIKE '{gate_id}-helper-%';\n"
+    )
+
+
+def leftover_sql(gate_id: str) -> str:
+    """Counts what a finished run must not leave: stored resources and jobs."""
+    return (
+        "SELECT (SELECT count(*) FROM srw_resources "
+        f"WHERE name LIKE '{gate_id}-%' AND deleted_at IS NULL) + "
+        f"(SELECT count(*) FROM jobs WHERE description LIKE '%{job_tag(gate_id)}%');\n"
     )
 
 
@@ -610,6 +619,8 @@ class Gate:
             if code not in (0, 4):
                 self.failed.append(f"cleanup of {kind} {name}")
                 print(f"  FAIL  cleanup of {kind} {name} (exit {code})")
+        left = self.psql(leftover_sql(self.gate_id)).strip()
+        self.check("nothing of the run is left", (0 if left == "0" else 1, left, ""), 0)
 
 
 def verdict(got: int, text: str, code: int, needles: tuple[str, ...]) -> str:
