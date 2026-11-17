@@ -42,11 +42,15 @@ type harness struct {
 	routes map[string]http.HandlerFunc
 	// stdoutTerminal says a person reads the output.
 	stdoutTerminal bool
+	// clock is the time the command sees; a wait between two polls moves it
+	// on instead of sleeping.
+	clock  time.Time
+	sleeps []time.Duration
 }
 
 func newHarness(t *testing.T) *harness {
 	h := &harness{
-		t: t, home: t.TempDir(), env: map[string]string{}, version: "0.3.0",
+		t: t, home: t.TempDir(), env: map[string]string{}, version: "0.3.0", clock: now,
 		identity: map[string]any{
 			"user": map[string]any{
 				"id": "11111111-1111-1111-1111-111111111111", "display_name": "Alice",
@@ -113,7 +117,12 @@ func (h *harness) run(stdin string, args ...string) (stdout, stderr string, code
 	app := &App{
 		In: strings.NewReader(stdin), Out: &out, Err: &errOut,
 		Getenv: func(name string) string { return h.env[name] },
-		Home:   h.home, Now: func() time.Time { return now },
+		Home:   h.home, Now: func() time.Time { return h.clock },
+		Sleep: func(ctx context.Context, pause time.Duration) error {
+			h.sleeps = append(h.sleeps, pause)
+			h.clock = h.clock.Add(pause)
+			return ctx.Err()
+		},
 		StdinIsTerminal: h.terminal, StdoutIsTerminal: h.stdoutTerminal,
 		ReadSecret: func(string) (string, error) { return h.secret, nil },
 		Version:    h.version, Commit: "c0ffee1",

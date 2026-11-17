@@ -50,6 +50,8 @@ type App struct {
 	// between the tries of a GET (tests).
 	Transport http.RoundTripper
 	Pauses    []time.Duration
+	// Sleep replaces the wait between two polls (tests).
+	Sleep func(context.Context, time.Duration) error
 
 	flags struct {
 		server       string
@@ -156,7 +158,14 @@ func (a *App) Root() *cobra.Command {
 		a.exportCommand(),
 		a.deleteCommand(),
 		a.cacheCommand(),
+		a.runCommand(),
+		a.waitCommand(),
+		a.logsCommand(),
+		a.describeCommand(),
+		a.filesCommand(),
+		a.cpCommand(),
 	)
+	root.AddCommand(a.lifecycleCommands()...)
 	return root
 }
 

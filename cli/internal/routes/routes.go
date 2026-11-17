@@ -34,6 +34,24 @@ var (
 	ExpertList       = Route{"GET", "/api/experts", "jobs:read"}
 	ProjectList      = Route{"GET", "/api/projects", "jobs:read"}
 	ConnectorCatalog = Route{"GET", "/api/datasources/catalog", "jobs:read"}
+
+	JobList         = Route{"GET", "/api/jobs", "jobs:read"}
+	JobCreate       = Route{"POST", "/api/jobs", "jobs:write"}
+	JobGet          = Route{"GET", "/api/jobs/{job_id}", "jobs:read"}
+	JobDelete       = Route{"DELETE", "/api/jobs/{job_id}", "jobs:write"}
+	JobProgress     = Route{"GET", "/api/jobs/{job_id}/progress", "jobs:read"}
+	JobTodos        = Route{"GET", "/api/jobs/{job_id}/todos", "jobs:read"}
+	JobFrozen       = Route{"GET", "/api/jobs/{job_id}/frozen", "jobs:read"}
+	JobReport       = Route{"GET", "/api/jobs/{job_id}/completion-report", "jobs:read"}
+	JobAudit        = Route{"GET", "/api/jobs/{job_id}/audit", "jobs:read"}
+	JobCancel       = Route{"PUT", "/api/jobs/{job_id}/cancel", "jobs:write"}
+	JobPause        = Route{"PUT", "/api/jobs/{job_id}/pause", "jobs:write"}
+	JobResume       = Route{"POST", "/api/jobs/{job_id}/resume", "jobs:write"}
+	JobApprove      = Route{"POST", "/api/jobs/{job_id}/approve", "jobs:write"}
+	JobRepoContents = Route{"GET", "/api/jobs/{job_id}/repo/contents", "jobs:read"}
+	JobRepoFile     = Route{"GET", "/api/jobs/{job_id}/repo/file", "jobs:read"}
+
+	SessionList = Route{"GET", "/api/persistent/threads", "chat:read"}
 )
 
 // All is every route above.
@@ -43,4 +61,7 @@ var All = []Route{
 	ResourceList, ResourceGet, ResourceDelete,
 	CacheList, CacheDelete,
 	ExpertList, ProjectList, ConnectorCatalog,
+	JobList, JobCreate, JobGet, JobDelete, JobProgress, JobTodos, JobFrozen, JobReport, JobAudit,
+	JobCancel, JobPause, JobResume, JobApprove, JobRepoContents, JobRepoFile,
+	SessionList,
 }

@@ -26,10 +26,13 @@ type kind struct {
 }
 
 var kinds = []kind{
+	{"job", []string{"jobs"}, "Job"},
 	{"expert", []string{"experts"}, "Expert"},
 	{"project", []string{"projects"}, "Project"},
 	{"workspacetemplate", []string{"workspacetemplates", "wt"}, "WorkspaceTemplate"},
 	{"connector", []string{"connectors"}, "Connector"},
+	// Sessions can be listed. Working in one happens in the Cockpit.
+	{"session", []string{"sessions"}, ""},
 }
 
 // kindOf returns the canonical kind for what was typed, singular or plural,
@@ -262,6 +265,9 @@ func (a *App) resourceUID(ctx context.Context, client *api.Client, args []string
 	if name == "" {
 		return "", exit.Usagef("give the name or the id of the %s", kindName)
 	}
+	if kindName == "job" || kindName == "session" {
+		return "", exit.Usagef("a %s is not a stored resource; a stored Job definition is addressed by its UID", kindName)
+	}
 	if kindName != "workspacetemplate" && scope.given() {
 		return "", exit.Usagef("a scope is for stored lookups (workspacetemplate); a %s is looked up in the list you can see", kindName)
 	}
@@ -346,6 +352,7 @@ type getFlags struct {
 	stored    bool
 	noHeaders bool
 	noTrunc   bool
+	jobs      jobListFlags
 }
 
 func (a *App) getCommand() *cobra.Command {
@@ -361,7 +368,7 @@ func (a *App) getCommand() *cobra.Command {
 			"Two older forms print JSON: `srw get UID` reads one stored resource, and\n" +
 			"`srw get [--kind KIND]` without a kind argument lists the stored resources of\n" +
 			"a scope.",
-		Example: "  srw get experts\n  srw get project website -o yaml\n  srw get wt --project website\n  srw get 0b5c2f6e-…",
+		Example: "  srw get jobs --status failed\n  srw get experts\n  srw get project website -o yaml\n  srw get wt --project website\n  srw get 0b5c2f6e-…",
 		Args: func(command *cobra.Command, args []string) error {
 			if len(args) > 2 {
 				return exit.Usagef("%s takes a kind and at most one name, or a UID", command.CommandPath())
@@ -378,6 +385,12 @@ func (a *App) getCommand() *cobra.Command {
 	f.BoolVar(&flags.stored, "stored", false, "Show the manifest store's view of the chosen scope")
 	f.BoolVar(&flags.noHeaders, "no-headers", false, "Print the table without its header line")
 	f.BoolVar(&flags.noTrunc, "no-trunc", false, "Print full ids")
+	f.StringArrayVar(&flags.jobs.statuses, "status", nil, "Jobs: only this status (repeatable)")
+	f.StringArrayVar(&flags.jobs.origins, "origin", nil, "Jobs: only this origin, for example user or automation (repeatable)")
+	f.StringVar(&flags.jobs.search, "search", "", "Jobs: only those whose task, name or id matches")
+	f.IntVar(&flags.jobs.limit, "limit", 50, "Jobs: how many to read per request, 1 to 500")
+	f.BoolVar(&flags.jobs.all, "all", false, "Jobs: read every page, not only the first")
+	f.BoolVar(&flags.jobs.subjobs, "subjobs", false, "Jobs: also list the jobs that other jobs started")
 	return command
 }
 
@@ -386,7 +399,7 @@ func (a *App) get(ctx context.Context, args []string, flags getFlags, scope *sco
 	if err != nil {
 		return err
 	}
-	_, client, err := a.connect(true)
+	to, client, err := a.connect(true)
 	if err != nil {
 		return err
 	}
@@ -424,6 +437,22 @@ func (a *App) get(ctx context.Context, args []string, flags getFlags, scope *sco
 	kindName, name, err := splitTarget(args)
 	if err != nil {
 		return err
+	}
+	switch kindName {
+	case "job":
+		if flags.stored {
+			return exit.Usagef("jobs are listed as they run; the stored Job definitions are `srw get --kind Job`")
+		}
+		if scope.account || scope.catalog || scope.kind != "" || scope.name != "" {
+			return exit.Usagef("jobs are narrowed with --project, --status, --origin and --search")
+		}
+		flags.jobs.project = scope.project
+		return a.getJobs(ctx, client, to.Project, format, name, flags.jobs, flags)
+	case "session":
+		if name != "" || flags.stored || scope.given() {
+			return exit.Usagef("sessions can only be listed: srw get sessions")
+		}
+		return a.getSessions(ctx, client, format, flags)
 	}
 	if flags.stored || kindName == "workspacetemplate" {
 		return a.getStored(ctx, client, format, kindName, name, flags, scope)

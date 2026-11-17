@@ -712,6 +712,12 @@ func (a *App) delete(ctx context.Context, args []string, scope *scopeFlags, expe
 	if err != nil {
 		return err
 	}
+	if kindName, name, splitErr := splitTarget(args); splitErr == nil && kindName == "job" && !(len(args) == 1 && isUUID(args[0])) {
+		if versionGiven || scope.given() {
+			return exit.Usagef("a job has no version and no scope; srw delete job <id> [--yes]")
+		}
+		return a.deleteJob(ctx, client, name, yes)
+	}
 	byName := len(args) == 2 || !isUUID(args[0])
 	// A name can exist in two scopes. Without a person to confirm, a
 	// delete by name must say which scope it means.
