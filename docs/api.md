@@ -10,6 +10,9 @@ schedule on the **Automations** page is not enough: start a job when an email
 arrives, chain jobs together, or connect SRW to n8n, Zapier or your own
 scripts.
 
+From a terminal or a pipeline, the [srw CLI](cli.md) uses this same API, with
+commands for the common tasks and `srw api` for everything else.
+
 ## Before you start
 
 You need:

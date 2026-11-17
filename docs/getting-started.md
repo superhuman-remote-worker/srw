@@ -203,3 +203,17 @@ it **Completed**. To let a job complete on its own, set **Autonomy** to
 **Full** in the job's execution settings (your administrator may need to allow
 that level for you). [Concepts](concepts.md) explains statuses and autonomy
 levels.
+
+## From the terminal
+
+Everything above also works without the browser. `srw` is a command-line
+client for people and pipelines: it keeps experts and other configuration as
+files, starts jobs, waits for them and fetches their results.
+
+```bash
+curl -fsSL https://docs.superhuman-remote-worker.com/install.sh | sh
+srw login --server https://api.example.com
+srw run "Summarise the open issues in this project" --wait
+```
+
+[srw CLI](cli.md) covers installing, logging in and a first walkthrough.

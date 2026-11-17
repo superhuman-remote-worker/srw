@@ -335,12 +335,14 @@ references separately from authored configuration.
 
 ## Native CLI and MCP
 
-Install the command with `pip install -e '.[cli]'`. It also runs as
-`python -m orchestrator.operator_cli.manifest_resources` in the configured environment.
-Set `SRW_API_URL` to the public API and provide an approved user's PAT/OIDC bearer
-credential through `SRW_TOKEN`. `--token-stdin` reads a token from one stdin line;
-it cannot be combined with `-f -`. TLS uses the system trust store, with `--ca-file`
-for an explicit PEM trust bundle. CLI credentials never inherit internal MCP authority.
+`srw` is the command-line client; its guide is
+[srw CLI](https://docs.superhuman-remote-worker.com/cli/). Install it with
+`curl -fsSL https://docs.superhuman-remote-worker.com/install.sh | sh`. On your own
+machine run `srw login` once. In a pipeline, set `SRW_API_URL` to the public API and
+provide a personal access token through `SRW_TOKEN`. `--token-stdin` reads a token
+from one stdin line; it cannot be combined with `-f -`. TLS uses the system trust
+store, with `--ca-file` for an explicit PEM trust bundle. CLI credentials never
+inherit internal MCP authority.
 A personal access token needs `jobs:read` for `validate`, `preview`, `export` and
 `get`, and `resources:write` for `apply` and `delete`. A manifest with a Job also
 needs `jobs:write`. A manifest with a Project, and the delete of a Project, also need
@@ -352,21 +354,35 @@ export SRW_API_URL=https://api.localhost
 srw validate -f examples/manifests/inline-job.yaml
 srw preview -f examples/manifests/inline-job.yaml > plan.json
 srw apply -f examples/manifests/inline-job.yaml --plan plan.json --idempotency-key zero-example-1
+
+# By name, as the Cockpit lists them
+srw get experts
+srw export expert custom > custom.yaml
+srw delete expert custom
+
+# By UID, in the manifest store
 srw get --kind Job --scope-kind Account --scope-name me
 srw get RESOURCE_UUID
-srw export RESOURCE_UUID -o yaml
+srw export RESOURCE_UUID
 srw delete RESOURCE_UUID --expected-version 1
 ```
 
-Repeat `-f` to combine YAML/JSON files. Supply the same files and scope options to
-preview and apply when using `--plan`. Updating an existing resource also requires
-its observed version, for example
+Repeat `-f` to combine YAML/JSON files; each file is sent as it is, and an error
+names the file. `srw apply` asks for a stored preview first and applies with the
+versions that preview saw, so updating an existing resource needs no version from
+you; if something changed in between, nothing is applied and the exit code is 5. To
+apply exactly what you reviewed, supply the same files and scope options to preview
+and apply with `--plan`. Explicit versions still work:
 `--expected-version 'Expert/Account/ACCOUNT_UUID/custom=3'`, or
-`--expected-versions versions.json` containing that JSON map. Use canonical scopes
+`--expected-versions versions.json` containing that JSON map, with canonical scopes
 from the stored resource response. The CLI never retries a mutation automatically;
-after an unknown outcome, inspect current resources and reuse an idempotency key
-only with the identical apply request. Resource deletion can be blocked by active
-work or project ownership.
+after an unknown outcome (exit code 6), inspect current resources and reuse an
+idempotency key only with the identical apply request. Resource deletion can be
+blocked by active work or project ownership.
+
+The earlier Python command still runs as
+`python -m orchestrator.operator_cli.manifest_resources`, in an environment
+installed with the `cli` extra. It no longer installs a command named `srw`.
 
 The MCP exposes `manifest_validate`, `manifest_preview`, `manifest_apply`,
 `manifest_list`, `manifest_get`, `manifest_export`, and `manifest_delete` through
