@@ -85,7 +85,7 @@ def test_generation_sends_json_and_reads_b64_and_usage():
         "model": "gpt-image-2",
         "prompt": "a fox",
         "n": 2,
-        "size": "1536x1024",
+        "size": "1664x944",
         "quality": "low",
     }
     assert "response_format" not in seen["body"]
@@ -192,6 +192,12 @@ def test_size_words_map_to_the_images_api():
         ("512x512", "gpt-image-1.5", "1024x1024"),
         ("1920x1080", "gpt-image-1.5", "1536x1024"),
         ("1080x1920", None, "1024x1536"),
+        # A ratio gets its exact shape on 2.x (the k3d skill check: "16:9"
+        # came back 3:2 and the model had to generate again).
+        ("16:9", "gpt-image-2.6-flare", "1664x944"),
+        ("9:16", "gpt-image-2", "944x1664"),
+        ("square", "gpt-image-2", "1248x1248"),
+        ("16:9", "gpt-image-1.5", "1536x1024"),
     ],
 )
 def test_sizes_the_model_would_refuse_are_fitted(size, model, expected):

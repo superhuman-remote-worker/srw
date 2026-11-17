@@ -134,6 +134,9 @@ def _classify(status: int, text: str) -> str:
 _CUSTOM_MIN_PIXELS = 655_360
 _CUSTOM_MAX_PIXELS = 8_294_400
 _CUSTOM_MAX_EDGE = 3840
+#: 1536x1024: the pixel count a ratio is sized to on gpt-image-2.x.
+_STANDARD_PIXELS = 1536 * 1024
+_RATIO_WORDS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
 
 
 def _takes_custom_sizes(model: str | None) -> bool:
@@ -177,6 +180,20 @@ def openai_size(size: str | None, model: str | None = None) -> str | None:
     if not size:
         return None
     text = size.strip().lower()
+    if _takes_custom_sizes(model):
+        # A ratio gets its exact shape at about the standard pixel count
+        # (16:9 -> 1664x944), not the nearest standard size (1536x1024 is 3:2).
+        ratio = _RATIO_WORDS.get(text, text)
+        if ":" in ratio:
+            try:
+                rw, rh = (float(v) for v in ratio.split(":", 1))
+            except ValueError:
+                rw = rh = 0.0
+            if rw > 0 and rh > 0:
+                import math
+
+                height = math.sqrt(_STANDARD_PIXELS * rh / rw)
+                return _fit_custom_size(round(height * rw / rh), round(height))
     if text in _OPENAI_SIZES:
         return _OPENAI_SIZES[text]
     parts = text.replace("×", "x").split("x")
