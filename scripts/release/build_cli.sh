@@ -11,7 +11,8 @@
 #   checksums.txt            plain `sha256sum` output over the six archives
 #   install.sh               a copy of scripts/install-cli.sh
 #
-# Each archive holds one executable (srw, or srw.exe) and LICENSE. The names
+# Each archive holds one executable (srw, or srw.exe), LICENSE, and
+# THIRD_PARTY_NOTICES.md with the notices of what is linked in. The names
 # carry no version, so .../releases/latest/download/<name> and
 # .../releases/download/vX.Y.Z/<name> both work without an API call. These
 # names are public contract; do not change them.
@@ -56,6 +57,7 @@ for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 wi
             -o "$stage/$binary" .
     )
     cp "$root/LICENSE" "$stage/LICENSE"
+    cp "$root/cli/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
     if [ "$os" = windows ]; then
         name="srw_${os}_${arch}.zip"
         python3 - "$stage" "$out/$name" "$epoch" <<'PY'
@@ -75,7 +77,7 @@ PY
     else
         name="srw_${os}_${arch}.tar.gz"
         tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
-            -C "$stage" -cf - LICENSE srw | gzip -n -9 > "$out/$name"
+            -C "$stage" -cf - LICENSE THIRD_PARTY_NOTICES.md srw | gzip -n -9 > "$out/$name"
     fi
     names+=("$name")
 done

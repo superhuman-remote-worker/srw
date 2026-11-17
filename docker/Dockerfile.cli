@@ -52,6 +52,6 @@ LABEL io.srw.component="cli"
 # without emulation. The base already carries the CA bundle
 # (ca-certificates-bundle, /etc/ssl/certs/ca-certificates.crt).
 COPY --from=build /out/srw /usr/local/bin/srw
-COPY LICENSE /usr/share/licenses/srw/LICENSE
+COPY LICENSE cli/THIRD_PARTY_NOTICES.md /usr/share/licenses/srw/
 
 ENTRYPOINT ["srw"]

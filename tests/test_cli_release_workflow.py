@@ -196,6 +196,23 @@ def test_the_asset_names_are_the_public_contract(tmp_path):
     assert {path.name for path in tmp_path.iterdir()} == ASSETS
     listed = (tmp_path / "checksums.txt").read_text().split()
     assert set(listed[1::2]) == ASSETS - {"checksums.txt", "install.sh"}
+    # Every archive carries the program, the licence and the notices of what
+    # is linked into it.
+    import tarfile
+    import zipfile
+
+    with tarfile.open(tmp_path / "srw_linux_amd64.tar.gz") as archive:
+        assert sorted(archive.getnames()) == [
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "srw",
+        ]
+    with zipfile.ZipFile(tmp_path / "srw_windows_amd64.zip") as archive:
+        assert sorted(archive.namelist()) == [
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "srw.exe",
+        ]
     installer = (ROOT / "scripts/install-cli.sh").read_text()
     assert 'archive="srw_${os}_${arch}.tar.gz"' in installer
     # The whole installer is one function called on the last line, so a

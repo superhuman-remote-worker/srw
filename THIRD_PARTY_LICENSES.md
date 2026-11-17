@@ -23,6 +23,9 @@ Software. This file discharges that obligation for every bundled dependency.
   only and are not shipped).
 - **Voice path images** (`srw-asterisk`, `srw-voice-gateway`): their own
   hand-maintained section, [Voice path images](#voice-path-images-local-phone-lines).
+- **The `srw` command-line client** (`cli/`): the Go modules linked into the
+  program, in their own hand-maintained file; see
+  [Command-line client](#command-line-client-srw).
 
 **NOT covered, by design** — server software we deploy but do **not** redistribute:
 
@@ -205,6 +208,22 @@ its background noise is generated, and both are rendered into a gitignored
 cache; its licences are listed in that folder's README.
 
 ---
+
+## Command-line client (`srw`)
+
+`srw` (`cli/`) is a static Go program, released as archives on the GitHub
+Release and as the `srw-cli` image. What it links, with every licence text and
+the one NOTICE file among them (`go.yaml.in/yaml/v3`), is in
+[`cli/THIRD_PARTY_NOTICES.md`](cli/THIRD_PARTY_NOTICES.md). That file ships
+inside every archive and in the image under `/usr/share/licenses/srw/`.
+Hand-maintained: update it with `cli/go.mod`; a test in `cli/internal/notices`
+fails when a module is missing or listed at another version.
+
+| Component | License |
+|---|---|
+| `github.com/spf13/cobra`, `github.com/inconshreveable/mousetrap` (Windows only) | Apache-2.0 |
+| `github.com/spf13/pflag`, `golang.org/x/term`, `golang.org/x/sys`, the Go standard library | BSD-3-Clause |
+| `go.yaml.in/yaml/v3` | MIT and Apache-2.0 |
 
 ## Adapted prompt text
 
