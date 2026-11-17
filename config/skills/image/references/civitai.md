@@ -85,13 +85,18 @@ describe anything:
 
 ## 6. Keep the originals
 
-What a tool result shows you may be a preview. To keep a file:
+The resource link a run returns (`spine://blobs/<id>`) is a JPEG preview of
+at most 1024 px. The full-size file sits behind a signed `url` that you only
+ever see as `sig=[REDACTED]`, because its signature is a credential.
 
-- a resource link: `save_mcp_resource` with the link's URI and a workspace
-  path (it refuses a corrupt copy and says why);
-- a signed download URL in the result: download it in the shell
-  (`curl -fLo output/images/<name>.png "<url>"`) when the workspace has one.
-  The URL expires; save it right away.
+- Save with `save_mcp_resource` (the link's URI and a workspace path). When
+  the run's result named the full-size original, it saves that instead and
+  says "(the full-size original)"; the file name follows the real type (a
+  PNG asked for as `.jpg` is saved as `.png`). If the download fails it saves
+  the preview and says why.
+- Save right after the run (or after `get_workflow`, which signs the URLs
+  again): the signed URLs expire.
+- Never use a training set or a deliverable from previews.
 
 Write the recipe next to the file (`.provenance/<path>.json`: AIRs,
 strengths, prompt, negative prompt, seed, size, sampler, steps, CFG), and

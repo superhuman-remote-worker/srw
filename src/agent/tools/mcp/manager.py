@@ -396,6 +396,10 @@ class _ServerHandle:
     #: The calls in flight, for a question that arrives outside its call's
     #: task (a handshake-era server asks on the session's own stream).
     calls: list[_CallState] = field(default_factory=list)
+    #: Full-size originals the server's results pointed at: blob id -> its
+    #: signed URL. The model sees these URLs only redacted (their signature
+    #: is a credential), so save_mcp_resource fetches the original itself.
+    original_urls: dict[str, str] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -736,8 +740,10 @@ class MCPManager:
                 "Save a resource from a connected MCP server into the workspace, "
                 "by its URI (such as a [resource link] one of its tools "
                 "returned). The file goes straight to `path`, relative to the "
-                "workspace root, without passing through your context. An "
-                "existing file is replaced only with overwrite=true."
+                "workspace root, without passing through your context. When "
+                "the server's result named a full-size original for it (a "
+                "signed `url`), the original is saved instead of the preview. "
+                "An existing file is replaced only with overwrite=true."
             ),
             args_schema={
                 "type": "object",
@@ -994,6 +1000,7 @@ class MCPManager:
         elif operation == _SAVE_RESOURCE:
             text = await _save_resource(handle, tool_name, result, arguments, save_file)
         else:
+            _remember_originals(handle, result)
             text = _render_result(handle, tool_name, result, _asks_yes(sees_images))
         return _with_notes(state.notes, text)
 
@@ -1640,6 +1647,14 @@ async def _save_resource(
             "save one part by its own URI",
         )
     item = chosen[0]
+    original = await _save_original(handle, uri, arguments, save_file)
+    if original is not None and original[0] == "saved":
+        return original[1]
+    preview_note = (
+        f" (the preview: the full-size original could not be downloaded: {original[1]})"
+        if original is not None
+        else ""
+    )
     text = getattr(item, "text", None)
     mime = str(getattr(item, "mime_type", "") or "")
     if text is not None and not _is_textual_mime(mime):
@@ -1677,9 +1692,183 @@ async def _save_resource(
             tool_name,
             f"the resource is larger than {MCP_RESOURCE_SAVE_LIMIT:,} bytes",
         )
-    return await asyncio.to_thread(
+    saved = await asyncio.to_thread(
         save_file, arguments["path"], data, bool(arguments.get("overwrite"))
     )
+    if preview_note and not saved.startswith("Error"):
+        return saved + preview_note
+    return saved
+
+
+#: Originals remembered per server; the oldest are forgotten first.
+_MAX_REMEMBERED_ORIGINALS = 1000
+#: How long one original may take to download.
+_ORIGINAL_TIMEOUT = 120.0
+_MAX_REDIRECTS = 3
+#: Test seam: an ``httpx`` transport for the original downloads.
+_ORIGINAL_TRANSPORT: Any = None
+
+
+def _remember_originals(handle: _ServerHandle, result: Any) -> None:
+    """Note every ``{"id": …, "url": "https://…"}`` a result carries.
+
+    Civitai's run_step and get_workflow answer with image objects that hold
+    a signed ``url`` (the full-size file) next to a ``previewUrl``; the
+    resource link they return (``spine://blobs/<id>``) is the preview
+    (image_generation.md WP0.2/WP6). Both the structured content and JSON in
+    text blocks are read. Never raises.
+    """
+    found: dict[str, str] = {}
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        if isinstance(value, dict):
+            blob_id, url = value.get("id"), value.get("url")
+            if (
+                isinstance(blob_id, str)
+                and blob_id
+                and isinstance(url, str)
+                and url.startswith("https://")
+            ):
+                found[blob_id] = url
+            for child in value.values():
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value[:500]:
+                walk(child, depth + 1)
+
+    try:
+        walk(getattr(result, "structured_content", None))
+        for block in getattr(result, "content", None) or []:
+            text = (
+                getattr(block, "text", None)
+                if getattr(block, "type", None) == "text"
+                else None
+            )
+            if not text or len(text) > 2_000_000:
+                continue
+            # Prose and JSON mix in one block ("Workflow … Succeeded." then a
+            # JSON list): try each line that opens a JSON value.
+            starts = [0] + [n + 1 for n, ch in enumerate(text) if ch == "\n"]
+            for start in starts[:200]:
+                if text[start : start + 1] not in ("[", "{"):
+                    continue
+                try:
+                    value, _end = json.JSONDecoder().raw_decode(text, start)
+                except ValueError:
+                    continue
+                walk(value)
+    except Exception:  # noqa: BLE001 - remembering is best effort
+        logger.debug("MCP: could not scan a result for originals", exc_info=True)
+        return
+    for blob_id, url in found.items():
+        handle.original_urls.pop(blob_id, None)
+        handle.original_urls[blob_id] = url
+    while len(handle.original_urls) > _MAX_REMEMBERED_ORIGINALS:
+        handle.original_urls.pop(next(iter(handle.original_urls)))
+
+
+async def _fetch_original(url: str) -> bytes:
+    """GET a public https URL without credentials, re-checking every
+    redirect, within the save limit. Raises ``ValueError`` with the reason."""
+    import httpx
+
+    from shared.url_safety import UnsafeURLError, check_public_http_url
+
+    current = url
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(_ORIGINAL_TIMEOUT, connect=15.0),
+        follow_redirects=False,
+        trust_env=False,
+        transport=_ORIGINAL_TRANSPORT,
+    ) as client:
+        for _ in range(_MAX_REDIRECTS + 1):
+            if not current.startswith("https://"):
+                raise ValueError("the original is not on an https URL")
+            try:
+                await asyncio.to_thread(check_public_http_url, current)
+            except UnsafeURLError as exc:
+                raise ValueError(
+                    f"the original's address is not public ({exc})"
+                ) from None
+            except OSError:
+                raise ValueError("the original's host does not resolve") from None
+            async with client.stream("GET", current) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("a redirect without a location")
+                    current = str(response.url.join(location))
+                    continue
+                if response.status_code != 200:
+                    raise ValueError(
+                        f"the download answered HTTP {response.status_code}"
+                    )
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > MCP_RESOURCE_SAVE_LIMIT:
+                        raise ValueError(
+                            f"the original is larger than {MCP_RESOURCE_SAVE_LIMIT:,} bytes"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    raise ValueError("too many redirects")
+
+
+async def _save_original(
+    handle: _ServerHandle,
+    uri: str,
+    arguments: dict[str, Any],
+    save_file: Callable[[str, bytes, bool], str] | None,
+) -> tuple[str, str] | None:
+    """Save the full-size original of ``uri`` when a result named one.
+
+    ``None`` when no original is known (the caller saves the resource as it
+    is); ``("saved", text)`` with what the workspace answered, success or not
+    (an existing file is not a reason to save the preview instead); or
+    ``("fallback", reason)`` when the download failed, for the caller to save
+    the preview and say why.
+    """
+    if save_file is None:
+        return None
+    blob_id = uri.rstrip("/").rsplit("/", 1)[-1]
+    url = handle.original_urls.get(blob_id)
+    if not url:
+        return None
+    try:
+        data = await _fetch_original(url)
+    except ValueError as exc:
+        return ("fallback", str(exc))
+    except Exception as exc:  # noqa: BLE001 - any failure falls back to the preview
+        return ("fallback", f"the download failed ({type(exc).__name__})")
+    from agent.services.image_compose import sniff_mime
+
+    mime = sniff_mime(data)
+    if mime is None:
+        return ("fallback", "the original is not a PNG, JPEG, WebP or GIF image")
+    path = str(arguments["path"])
+    extension = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }[mime]
+    accepted = {extension, ".jpeg"} if extension == ".jpg" else {extension}
+    stem, dot, suffix = path.rpartition(".")
+    if dot and "/" not in suffix and f".{suffix.lower()}" not in accepted:
+        path = stem + extension
+    saved = await asyncio.to_thread(
+        save_file, path, data, bool(arguments.get("overwrite"))
+    )
+    if saved.startswith("Error"):
+        return ("saved", saved)
+    note = " (the full-size original"
+    if path != arguments["path"]:
+        note += f"; saved as {path}, since it is {mime.split('/')[1].upper()}"
+    return ("saved", saved + note + ")")
 
 
 def _render_result(

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import sys
 import textwrap
 from contextlib import asynccontextmanager
@@ -337,3 +339,191 @@ def test_a_long_text_is_cut_with_a_way_to_keep_all_of_it():
         f"[… 5 more characters not shown: save the whole resource with "
         f"{SAVE_RESOURCE_TOOL}]"
     )
+
+
+# --- full-size originals (image_generation WP0.2/WP6) ------------------------
+#
+# Civitai answers run_step/get_workflow with image objects holding a signed
+# `url` (the full-size file) and returns a resource link to a JPEG preview
+# of at most 1024 px. The model only ever sees the URL redacted (its `sig` is
+# a credential), so the manager remembers it and save_mcp_resource saves the
+# original itself.
+
+
+def _civitai_result(blob_id: str, url: str) -> SimpleNamespace:
+    text = "Workflow 5065068-20261117175527611-1r13 Succeeded.\n" + json.dumps(
+        [
+            {
+                "name": "$0",
+                "status": "succeeded",
+                "output": {
+                    "images": [
+                        {
+                            "id": blob_id,
+                            "width": 2048,
+                            "height": 2048,
+                            "previewUrl": url + "&preview=1",
+                            "url": url,
+                        }
+                    ]
+                },
+            }
+        ]
+    )
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=text)], structured_content=None
+    )
+
+
+def _png_bytes(size) -> bytes:
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", size, (10, 160, 90)).save(out, format="PNG")
+    return out.getvalue()
+
+
+def _preview_result(uri: str, preview: bytes) -> SimpleNamespace:
+    return SimpleNamespace(
+        contents=[
+            SimpleNamespace(
+                uri=uri,
+                mime_type="image/jpeg",
+                text=None,
+                blob=base64.b64encode(preview).decode(),
+            )
+        ]
+    )
+
+
+@pytest.fixture
+def originals(monkeypatch, tmp_path):
+    """A server handle, a workspace saver and a fake blob host."""
+    import httpx
+
+    served: dict[str, httpx.Response] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "authorization" not in request.headers  # no credentials go out
+        return served.get(str(request.url), httpx.Response(404))
+
+    monkeypatch.setattr(
+        manager_module, "_ORIGINAL_TRANSPORT", httpx.MockTransport(handler)
+    )
+    from shared import url_safety
+
+    def check(url, **_kwargs):
+        if "10.0.0.5" in url:
+            raise url_safety.UnsafeURLError("10.0.0.5 is a private address")
+        return url
+
+    monkeypatch.setattr(url_safety, "check_public_http_url", check)
+    workspace = _workspace(tmp_path)
+    handle = SimpleNamespace(ds={"name": "Civitai"}, name="Civitai", original_urls={})
+
+    def save_file(path, data, overwrite):
+        target = workspace.get_path(path)
+        if target.exists() and not overwrite:
+            return f"Error: {target} already exists; nothing was written."
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return f"Saved: {target} ({len(data):,} bytes)"
+
+    return SimpleNamespace(
+        handle=handle, served=served, workspace=workspace, save_file=save_file
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_full_size_original_is_saved_instead_of_the_preview(originals):
+    import httpx
+    from PIL import Image
+
+    url = "https://orchestration-new.civitai.com/v2/consumer/blobs/b-9.png?sig=abc123def456ghi789"
+    full = _png_bytes((2048, 2048))
+    originals.served[url] = httpx.Response(200, content=full)
+    manager_module._remember_originals(
+        originals.handle, _civitai_result("b-9.png", url)
+    )
+    assert originals.handle.original_urls == {"b-9.png": url}
+
+    preview = _png_bytes((1024, 1024))
+    result = await manager_module._save_resource(
+        originals.handle,
+        SAVE_RESOURCE_TOOL,
+        _preview_result("spine://blobs/b-9.png", preview),
+        {"uri": "spine://blobs/b-9.png", "path": "output/fox.jpg"},
+        originals.save_file,
+    )
+    assert "the full-size original; saved as output/fox.png, since it is PNG" in result
+    saved = originals.workspace.get_path("output/fox.png").read_bytes()
+    assert Image.open(io.BytesIO(saved)).size == (2048, 2048)
+    assert not originals.workspace.get_path("output/fox.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_to_a_private_address_falls_back_to_the_preview(originals):
+    import httpx
+
+    url = "https://blobs.example.com/b-1.png?sig=abc123def456ghi789"
+    originals.served[url] = httpx.Response(
+        302, headers={"location": "https://10.0.0.5/steal"}
+    )
+    originals.handle.original_urls["b-1.png"] = url
+    preview = _png_bytes((64, 64))
+    result = await manager_module._save_resource(
+        originals.handle,
+        SAVE_RESOURCE_TOOL,
+        _preview_result("spine://blobs/b-1.png", preview),
+        {"uri": "spine://blobs/b-1.png", "path": "output/p.png"},
+        originals.save_file,
+    )
+    assert "(the preview: the full-size original could not be downloaded:" in result
+    assert "not public" in result
+    assert originals.workspace.get_path("output/p.png").read_bytes() == preview
+
+
+@pytest.mark.asyncio
+async def test_an_existing_file_is_not_replaced_by_the_original_or_the_preview(
+    originals,
+):
+    import httpx
+
+    url = "https://blobs.example.com/b-2.png?sig=abc123def456ghi789"
+    originals.served[url] = httpx.Response(200, content=_png_bytes((32, 32)))
+    originals.handle.original_urls["b-2.png"] = url
+    originals.workspace.get_path("output").mkdir(parents=True, exist_ok=True)
+    originals.workspace.get_path("output/keep.png").write_bytes(b"mine")
+    result = await manager_module._save_resource(
+        originals.handle,
+        SAVE_RESOURCE_TOOL,
+        _preview_result("spine://blobs/b-2.png", _png_bytes((16, 16))),
+        {"uri": "spine://blobs/b-2.png", "path": "output/keep.png"},
+        originals.save_file,
+    )
+    assert result.startswith("Error:") and "already exists" in result
+    assert originals.workspace.get_path("output/keep.png").read_bytes() == b"mine"
+
+
+def test_only_https_ids_with_urls_are_remembered_and_the_list_is_bounded(monkeypatch):
+    handle = SimpleNamespace(original_urls={})
+    result = SimpleNamespace(
+        content=[
+            SimpleNamespace(
+                type="text",
+                text='[resource link] x\n{"id": "a", "url": "http://plain/a"}',
+            )
+        ],
+        structured_content={"images": [{"id": "b", "url": "https://h/b"}]},
+    )
+    manager_module._remember_originals(handle, result)
+    assert handle.original_urls == {"b": "https://h/b"}
+    monkeypatch.setattr(manager_module, "_MAX_REMEMBERED_ORIGINALS", 3)
+    for n in range(5):
+        manager_module._remember_originals(
+            handle,
+            SimpleNamespace(
+                content=[], structured_content={"id": f"i{n}", "url": f"https://h/{n}"}
+            ),
+        )
+    assert list(handle.original_urls) == ["i2", "i3", "i4"]
