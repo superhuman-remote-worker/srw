@@ -116,10 +116,92 @@ def check_budget_updates(path: Path) -> bool:
     return False
 
 
+def task_number(task: str) -> str:
+    """The task's id before its slug: "W1" for W1-restaurant-pdf-report.
+
+    Graders dispatch on this exact id; a prefix test would grade W10-W19 as
+    W1 (image_generation.md WP7).
+    """
+    return task.split("-", 1)[0].upper()
+
+
+def pdf_pages_with_images(
+    pdf: Path, min_edge: int
+) -> tuple[int, list[tuple[int, int]]]:
+    """How many pages carry an embedded raster image at least ``min_edge``
+    px on its short side, and the sizes found."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(pdf))
+    pages = 0
+    sizes: list[tuple[int, int]] = []
+    for page in reader.pages:
+        found = False
+        try:
+            images = list(page.images)
+        except Exception:  # noqa: BLE001 - a page pypdf cannot walk has none
+            images = []
+        for image in images:
+            try:
+                w, h = image.image.size
+            except Exception:  # noqa: BLE001
+                continue
+            sizes.append((w, h))
+            if min(w, h) >= min_edge:
+                found = True
+        pages += found
+    return pages, sizes
+
+
+def check_dataset_zip(
+    zip_path: Path, trigger: str, min_edge: int, notes: list[str]
+) -> dict:
+    """Hidden checks of a LoRA training set: flat, images that open, big
+    enough, one caption per image, the trigger first."""
+    import io
+    import zipfile
+
+    from PIL import Image
+
+    checks: dict[str, bool] = {}
+    with zipfile.ZipFile(zip_path) as archive:
+        names = [n for n in archive.namelist() if not n.endswith("/")]
+        checks["flat"] = bool(names) and all("/" not in n for n in names)
+        images = [
+            n for n in names if n.lower().rsplit(".", 1)[-1] in ("png", "jpg", "jpeg")
+        ]
+        captions = {n.rsplit(".", 1)[0]: n for n in names if n.lower().endswith(".txt")}
+        checks["10_to_40_images"] = 10 <= len(images) <= 40
+        opened, big_enough, captioned, trigger_first = 0, 0, 0, 0
+        for name in images:
+            try:
+                with Image.open(io.BytesIO(archive.read(name))) as image:
+                    image.load()
+                    size = image.size
+            except Exception:  # noqa: BLE001 - an unreadable image fails the check
+                continue
+            opened += 1
+            big_enough += min(size) >= min_edge
+            caption = captions.get(name.rsplit(".", 1)[0])
+            if caption:
+                captioned += 1
+                text = archive.read(caption).decode("utf-8", "replace").strip().lower()
+                trigger_first += text.startswith(trigger.lower())
+        checks["every_image_opens"] = bool(images) and opened == len(images)
+        checks[f"min_edge_{min_edge}"] = bool(images) and big_enough == len(images)
+        checks["one_caption_per_image"] = (
+            bool(images) and captioned == len(images) and len(captions) == len(images)
+        )
+        checks["trigger_first"] = bool(images) and trigger_first == len(images)
+        notes.append(f"{len(images)} images, {len(captions)} captions")
+    return checks
+
+
 def grade(task: str, out: Path) -> tuple[dict, list[str]]:
     checks: dict[str, bool] = {}
     notes: list[str] = []
-    if task.startswith("W1"):
+    number = task_number(task)
+    if number == "W1":
         pdf = out / "uferstube_overview.pdf"
         checks["pdf_exists"] = pdf.is_file()
         if pdf.is_file():
@@ -134,7 +216,7 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
             checks["has_spend_per_cover"] = bool(
                 re.search(r"per cover|pro gast|pro cover|spend", low)
             )
-    elif task.startswith("W2"):
+    elif number == "W2":
         png = out / "tickets.png"
         checks["png_exists"] = png.is_file()
         if png.is_file():
@@ -143,7 +225,7 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
             w, h = Image.open(png).size
             checks["at_least_600x300"] = w >= 600 and h >= 300
             notes.append(f"{w}x{h}")
-    elif task.startswith("W3"):
+    elif number == "W3":
         xlsx = out / "summer_party_budget.xlsx"
         checks["xlsx_exists"] = xlsx.is_file()
         if xlsx.is_file():
@@ -152,7 +234,7 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
             checks["total_12276"] = near(numbers, 12276.0)
             checks["per_guest_102_30"] = near(numbers, 102.3, 0.06)
             checks["updates_with_guests"] = check_budget_updates(xlsx)
-    elif task.startswith("W4"):
+    elif number == "W4":
         pdf = out / "q3_results.pdf"
         checks["pdf_exists"] = pdf.is_file()
         if pdf.is_file():
@@ -160,7 +242,7 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
             checks["six_to_eight_slides"] = 6 <= pages <= 8
             checks["landscape"] = landscape
             checks["mentions_nps_46"] = "46" in text
-    elif task.startswith("W5"):
+    elif number == "W5":
         md = out / "findings.md"
         checks["md_exists"] = md.is_file()
         if md.is_file():
@@ -169,7 +251,7 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
                 re.search(r"10-06|oct(ober)?\.? 6|6\.? oct|06\.10|6 october", low)
             )
             checks["names_checkout_step"] = "checkout" in low and "order" in low
-    elif task.startswith("W6"):
+    elif number == "W6":
         docx = out / "brief_lieferant.docx"
         checks["docx_exists"] = docx.is_file()
         if docx.is_file():
@@ -181,7 +263,7 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
             )
             checks["closing"] = "Mit freundlichen Grüßen" in text
             checks["facts"] = all(s in text for s in ("Kessler", "2026-1187", "214,80"))
-    elif task.startswith("W7"):
+    elif number == "W7":
         pptx = out / "onboarding.pptx"
         checks["pptx_exists"] = pptx.is_file()
         if pptx.is_file():
@@ -197,6 +279,42 @@ def grade(task: str, out: Path) -> tuple[dict, list[str]]:
             checks["five_to_seven_slides"] = 5 <= len(prs.slides) <= 7
             checks["names_head_chef"] = "Marta Lenz" in text
             checks["cold_chain_7"] = "7" in text
+    elif number == "W8":
+        pdf = out / "autumn_menu.pdf"
+        checks["pdf_exists"] = pdf.is_file()
+        if pdf.is_file():
+            text, pages, landscape = pdf_text_and_pages(pdf)
+            checks["five_to_seven_slides"] = 5 <= pages <= 7
+            checks["landscape"] = landscape
+            low = text.lower()
+            checks["names_the_dishes"] = all(
+                dish in low for dish in ("pumpkin", "mushroom", "plum")
+            )
+            with_pictures, sizes = pdf_pages_with_images(pdf, 400)
+            checks["pictures_on_3_slides"] = with_pictures >= 3
+            notes.append(f"{with_pictures} slides with pictures; images {sizes[:6]}")
+        pictures = sorted(
+            p
+            for p in out.rglob("*")
+            if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+            and "_pages" not in p.parts
+        )
+        checks["pictures_kept_as_files"] = len(pictures) >= 3
+    elif number == "W9":
+        dataset = out / "mira_dataset.zip"
+        checks["zip_exists"] = dataset.is_file()
+        if dataset.is_file():
+            checks.update(check_dataset_zip(dataset, "mrvl", 768, notes))
+        sheet = out / "contact_sheet.png"
+        checks["contact_sheet_exists"] = sheet.is_file()
+        if sheet.is_file():
+            from PIL import Image
+
+            with Image.open(sheet) as image:
+                w, h = image.size
+            # A grid of the set, not one image: wide enough for 3+ columns.
+            checks["contact_sheet_is_a_grid"] = w >= 1024 and h >= 512
+            notes.append(f"contact sheet {w}x{h}")
     else:
         raise SystemExit(f"not an office task: {task}")
     return checks, notes

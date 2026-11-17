@@ -843,3 +843,38 @@ tasks:
       allergen labels, cold chain at max 7 degrees), and where to find help
       (shift lead first, then Marta). Keep it friendly and easy to read.
     required_deliverables: [output/onboarding.pptx]
+
+  # W8/W9 (2026-11-18): work with generated images (image_generation.md WP7).
+  # Needs a pinned image_generation model (or an image key in a connector);
+  # arms: with and without the `image` skill. Hidden checks open every image.
+  - id: W8-deck-with-pictures-pdf
+    family: office
+    config_name: general-worker
+    description: |
+      Make a short presentation for our team about the new autumn menu at
+      the Uferstube (5 to 7 slides, as a PDF): `output/autumn_menu.pdf`. Give
+      at least three slides a fitting food photo you generate, all in one
+      consistent warm, rustic style, with the dish names on the slides and
+      not inside the pictures. Keep the pictures as files in `output/` too.
+
+      - Pumpkin soup with roasted seeds and chili oil, 7.50 EUR
+      - Wild mushroom risotto with parmesan, 16.90 EUR
+      - Braised beef cheek with celeriac puree, 22.50 EUR
+      - Plum crumble with vanilla ice cream, 6.90 EUR
+      - Available from 1 October, lunch and dinner
+    required_deliverables: [output/autumn_menu.pdf]
+
+  - id: W9-character-dataset-zip
+    family: office
+    config_name: general-worker
+    description: |
+      I want to train a LoRA of my comic character Mira, a 30-year-old
+      lighthouse keeper: short silver hair, a scar across her left eyebrow,
+      green eyes, a yellow raincoat over a navy knit sweater. Build me the
+      training set: first a reference sheet, then 15 to 20 varied images of
+      her (close-ups to full body, different angles, expressions and
+      places), each with a caption file that starts with the trigger word
+      `mrvl`. Pack the images and captions flat into `output/mira_dataset.zip`
+      and give me a numbered contact sheet of the set as
+      `output/contact_sheet.png` so I can review it.
+    required_deliverables: [output/mira_dataset.zip, output/contact_sheet.png]

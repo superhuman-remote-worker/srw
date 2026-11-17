@@ -104,7 +104,7 @@ arm B, each worker `memory_inject` audit row reports the skip in
 | D3, D4 | dev, frontend | engineer | single-phase implement + verify with a check the task supplies (D3 inline module with three bugs and a duplicated helper; D4 a static page against an inline checker) |
 | D5 | dev-repo | engineer | clone a pinned public repository, extend it in its own conventions, run its suite (network; excluded as `infra` if the clone fails) |
 | O1 | ops | engineer | install a CLI into the sandbox, run it, report verbatim (network for `pip`) |
-| W* | office | general-worker | the deliverables most users ask for: PDF report, chart PNG, budget workbook with live formulas, results deck, funnel analysis, German business letter (.docx), editable onboarding deck (.pptx). Hidden checks and page renders for a blind visual judge: `bench/grade_office.py TASK_ID OUTPUT_DIR --render`, run in the workspace image (it needs LibreOffice and poppler) |
+| W* | office | general-worker | the deliverables most users ask for: PDF report, chart PNG, budget workbook with live formulas, results deck, funnel analysis, German business letter (.docx), editable onboarding deck (.pptx), and two that work with generated images: a deck with pictures (W8) and a character training set with a contact sheet (W9; both need a pinned image model or an image key). Hidden checks and page renders for a blind visual judge: `bench/grade_office.py TASK_ID OUTPUT_DIR --render`, run in the workspace image (it needs LibreOffice and poppler) |
 
 All tasks are self-contained (inputs embedded in the description) so the
 task itself cannot drift between runs. Real-repo fix tasks are deliberately
