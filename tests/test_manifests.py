@@ -95,6 +95,33 @@ def test_all_public_examples_validate_and_resolve_without_mutating_input():
     assert documents == original
 
 
+def test_an_export_starts_with_api_version_kind_and_name():
+    # The store is JSONB, which hands a document back with its keys sorted by
+    # length: kind, spec, metadata, apiVersion. A person reads, and diffs, a
+    # manifest in the usual order.
+    stored = json.loads(
+        json.dumps(resource(spec={"runtime": {"adapter": "srw/v1", "config": {}}})),
+        object_pairs_hook=lambda pairs: dict(
+            sorted(pairs, key=lambda pair: (len(pair[0]), pair[0]))
+        ),
+    )
+    assert list(stored) == ["kind", "spec", "metadata", "apiVersion"]
+    stored["metadata"] = {"labels": {"team": "a"}, **stored["metadata"]}
+
+    text = export_documents([stored])
+    lines = text.splitlines()
+    assert lines[0].startswith("apiVersion: ") and lines[1] == "kind: Expert"
+    assert lines[2] == "metadata:" and lines[3].startswith("  name: ")
+    assert text.index("\nmetadata:") < text.index("\nspec:")
+    # Same content; only the order changed, and the input is left alone.
+    assert parse_documents(text) == [stored]
+    assert list(stored) == ["kind", "spec", "metadata", "apiVersion"]
+
+    exported = json.loads(export_documents([stored], format="json"))
+    assert list(exported)[:4] == ["apiVersion", "kind", "metadata", "spec"]
+    assert list(exported["metadata"])[0] == "name"
+
+
 def test_private_configuration_and_image_defaults_survive_every_operation():
     config = {
         "unknownTool": {"optional": None},

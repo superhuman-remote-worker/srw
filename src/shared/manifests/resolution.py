@@ -461,6 +461,29 @@ def preview_documents(
     return _Bundle(documents, default_scope).preview()
 
 
+_READING_ORDER = ("apiVersion", "kind", "metadata", "spec")
+
+
+def _in_reading_order(document: dict) -> dict:
+    """Put a document's top-level keys, and its name, where a reader expects them.
+
+    A stored document comes back from JSONB with its keys sorted by length
+    (kind, spec, metadata, apiVersion). The order inside ``spec`` was lost on
+    the way in and is left as it is.
+    """
+    ordered = {key: document[key] for key in _READING_ORDER if key in document}
+    ordered.update(
+        (key, value) for key, value in document.items() if key not in ordered
+    )
+    metadata = ordered.get("metadata")
+    if isinstance(metadata, dict) and "name" in metadata:
+        ordered["metadata"] = {
+            "name": metadata["name"],
+            **{key: value for key, value in metadata.items() if key != "name"},
+        }
+    return ordered
+
+
 def export_documents(
     documents: list[dict], *, default_scope: dict | None = None, format: str = "yaml"
 ) -> str:
@@ -469,7 +492,9 @@ def export_documents(
         fail("InvalidFormat", "Choose json or yaml.")
     # Export must also work for a referenced definition supplied in a different
     # installation. Resolve scope/identity, but do not require its dependencies.
-    authored = _Bundle(documents, default_scope).documents
+    authored = [
+        _in_reading_order(doc) for doc in _Bundle(documents, default_scope).documents
+    ]
     if format == "json":
         return (
             json.dumps(
