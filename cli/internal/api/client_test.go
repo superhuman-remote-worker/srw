@@ -369,4 +369,24 @@ func TestDeadlines(t *testing.T) {
 	if client.timeout("GET") != 30*time.Second || client.timeout("PUT") != 60*time.Second {
 		t.Errorf("reads get 30 s and mutations 60 s")
 	}
+	if TeardownTimeout <= MutationTimeout {
+		t.Errorf("cancelling and deleting a job get longer than other mutations")
+	}
+	// A request can carry its own deadline.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-r.Context().Done():
+		}
+		w.Write([]byte("{}"))
+	}))
+	defer slow.Close()
+	client = clientFor(t, slow.URL, Options{})
+	_, err := client.Do(context.Background(), Request{Method: "DELETE", Path: "/api/jobs/x", Timeout: 20 * time.Millisecond})
+	if failure := coded(t, err); failure.Code != exit.Unknown {
+		t.Errorf("a deadline of its own: %+v", failure)
+	}
+	if _, err := client.Do(context.Background(), Request{Method: "DELETE", Path: "/api/jobs/x"}); err != nil {
+		t.Errorf("the method's deadline: %v", err)
+	}
 }

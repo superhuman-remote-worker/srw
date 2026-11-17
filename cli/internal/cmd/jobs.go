@@ -590,9 +590,15 @@ func (a *App) lifecycleCommand(verb, short, long string, route routes.Route, tex
 			} else if route.Method == http.MethodPost {
 				request.Body = map[string]string{}
 			}
+			if verb == "cancel" {
+				request.Timeout = api.TeardownTimeout
+			}
 			response, err := client.Send(command.Context(), request)
 			if err != nil {
-				return err
+				if verb != "cancel" || !a.cancelledAnyway(command.Context(), client, id, err) {
+					return stillReleasing(err, verb, id)
+				}
+				response = &api.Response{Status: http.StatusOK, Body: []byte(`{"status":"cancelled"}`)}
 			}
 			switch format {
 			case output.JSON, output.YAML:
@@ -621,9 +627,42 @@ func (a *App) lifecycleCommand(verb, short, long string, route routes.Route, tex
 	return command
 }
 
+// cancelledAnyway looks at the job after a cancel that the server answered
+// with an error of its own, or did not answer. The server marks the job
+// cancelled first and releases its workspace after; when the release is not
+// finished in time it answers 503 for a cancel that did happen. The verb
+// asked for a cancelled job, so that is what the exit code reports.
+func (a *App) cancelledAnyway(ctx context.Context, client *api.Client, id string, failed error) bool {
+	var failure *exit.Error
+	if !errors.As(failed, &failure) || (failure.Status < 500 && failure.Code != exit.Unknown) {
+		return false
+	}
+	seen, err := a.progress(ctx, client, id, false)
+	if err != nil || seen.Status != "cancelled" {
+		return false
+	}
+	fmt.Fprintf(a.Err, "The server answered with an error (%s), but the job is cancelled. Its workspace may still be released in the background.\n", failure.Message)
+	return true
+}
+
+// stillReleasing adds what to do to the server's 503 for a job whose
+// workspace it has not finished releasing.
+func stillReleasing(err error, verb, id string) error {
+	var failure *exit.Error
+	if errors.As(err, &failure) && failure.Status == http.StatusServiceUnavailable && failure.Hint == "" {
+		failure.Hint = fmt.Sprintf("the server may still be releasing the job's workspace; look at `srw get job/%s`, then run `srw %s` again", id, verb)
+	}
+	return err
+}
+
 func (a *App) lifecycleCommands() []*cobra.Command {
 	return []*cobra.Command{
-		a.lifecycleCommand("cancel", "Cancel a job", "Cancel a job. It ends as cancelled.", routes.JobCancel, "", "", ""),
+		a.lifecycleCommand("cancel", "Cancel a job",
+			"Cancel a job. It ends as cancelled.\n\n"+
+				"The server releases the job's workspace before it answers, which can take a\n"+
+				"while. If it answers with an error although the job did end cancelled, srw\n"+
+				"says so and exits 0.",
+			routes.JobCancel, "", "", ""),
 		a.lifecycleCommand("pause", "Pause a running job",
 			"Pause a job that is running. It stays paused until someone resumes it.", routes.JobPause, "", "", ""),
 		a.lifecycleCommand("resume", "Continue a job, optionally with feedback",
@@ -659,9 +698,10 @@ func (a *App) deleteJob(ctx context.Context, client *api.Client, typed string, y
 			return err
 		}
 	}
-	response, err := client.Send(ctx, api.Request{Method: routes.JobDelete.Method, Path: jobPath(routes.JobDelete, id), Known: true})
+	// Deleting releases the workspace too; see api.TeardownTimeout.
+	response, err := client.Send(ctx, api.Request{Method: routes.JobDelete.Method, Path: jobPath(routes.JobDelete, id), Known: true, Timeout: api.TeardownTimeout})
 	if err != nil {
-		return err
+		return stillReleasing(err, "delete job/"+id, id)
 	}
 	return a.printJSONDocument(response.Body, func() []string { return []string{"job/" + id} })
 }

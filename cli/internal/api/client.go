@@ -29,6 +29,10 @@ import (
 const (
 	ReadTimeout     = 30 * time.Second
 	MutationTimeout = 60 * time.Second
+	// TeardownTimeout is for cancelling and deleting a job. The server
+	// releases the job's workspace before it answers, which has taken more
+	// than a minute on a busy cluster.
+	TeardownTimeout = 3 * time.Minute
 	// getAttempts is the total number of tries for a GET.
 	getAttempts = 3
 	maxBody     = 64 << 20
@@ -159,6 +163,8 @@ type Request struct {
 	Header      http.Header
 	// NoTimeout drops the per-request deadline (wait, logs -f).
 	NoTimeout bool
+	// Timeout replaces the method's deadline; 0 keeps it.
+	Timeout time.Duration
 	// Known marks a route from srw's own table. When the server does not
 	// have it, the server is probably older than this srw.
 	Known bool
@@ -208,7 +214,11 @@ func (c *Client) Do(ctx context.Context, request Request) (*Response, error) {
 func (c *Client) once(ctx context.Context, request Request, payload []byte, contentType string) (*Response, bool, error) {
 	if !request.NoTimeout {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.timeout(request.Method))
+		deadline := request.Timeout
+		if deadline == 0 {
+			deadline = c.timeout(request.Method)
+		}
+		ctx, cancel = context.WithTimeout(ctx, deadline)
 		defer cancel()
 	}
 	// A request that never left the machine cannot have had an effect.

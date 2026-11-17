@@ -169,6 +169,10 @@ srw cancel JOB
 
 ```text
 Cancel a job. It ends as cancelled.
+
+The server releases the job's workspace before it answers, which can take a
+while. If it answers with an error although the job did end cancelled, srw
+says so and exits 0.
 ```
 
 ## srw completion

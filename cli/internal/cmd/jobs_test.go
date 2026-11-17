@@ -416,6 +416,46 @@ func TestLifecycleVerbsPrintTheServersWord(t *testing.T) {
 	}
 }
 
+// The server marks a job cancelled and then releases its workspace. When the
+// release is not done in time it answers 503 for a cancel that did happen.
+func TestCancelReportsWhatHappenedToTheJob(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.record("PUT "+jobRoute("/cancel"), 503, map[string]any{"detail": "Workspace authority retirement is incomplete"})
+	polls := progressOf(h, "cancelled")
+	out, errOut, code := h.run("", "cancel", jobID)
+	if code != exit.OK || out != "job/"+jobID+" cancelled\n" {
+		t.Fatalf("%d %q %s", code, out, errOut)
+	}
+	want(t, errOut, "Workspace authority retirement is incomplete", "but the job is cancelled")
+	if out, _, code := h.run("", "cancel", jobID, "-o", "json"); code != exit.OK || !strings.Contains(out, `"status": "cancelled"`) {
+		t.Errorf("json: %d %q", code, out)
+	}
+
+	// Not cancelled: the server's error stands, with what to do next.
+	progressOf(h, "processing")
+	_, errOut, code = h.run("", "cancel", jobID)
+	if code != exit.Failed {
+		t.Fatalf("%d %s", code, errOut)
+	}
+	want(t, errOut, "Workspace authority retirement is incomplete", "srw get job/"+jobID, "srw cancel")
+
+	// A refusal of the API is not looked into: the job was not touched.
+	*polls = 0
+	polls = progressOf(h, "completed")
+	h.record("PUT "+jobRoute("/cancel"), 409, map[string]any{"detail": "Job is already completed"})
+	if _, errOut, code := h.run("", "cancel", jobID); code != exit.Conflict || *polls != 0 {
+		t.Errorf("a refused cancel: %d after %d polls: %s", code, *polls, errOut)
+	}
+
+	// The other verbs never report success for an error.
+	h.record("PUT "+jobRoute("/pause"), 503, map[string]any{"detail": "Workspace authority retirement is incomplete"})
+	progressOf(h, "paused")
+	if _, _, code := h.run("", "pause", jobID); code != exit.Failed {
+		t.Errorf("pause after a 503: %d", code)
+	}
+}
+
 func TestDeleteJobNeedsAnEndedJobAndAYes(t *testing.T) {
 	h := newHarness(t)
 	h.login()
@@ -434,6 +474,13 @@ func TestDeleteJobNeedsAnEndedJobAndAYes(t *testing.T) {
 	if _, _, code := h.run("", "delete", "job", jobID, "--expected-version", "2"); code != exit.Usage {
 		t.Errorf("a version for a job: %d", code)
 	}
+	// The server's 503 while it releases the workspace says what to do.
+	h.record("DELETE /api/jobs/"+jobID, 503, map[string]any{"detail": "Workspace authority retirement is incomplete"})
+	_, errOut, code := h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.Failed {
+		t.Fatalf("%d %s", code, errOut)
+	}
+	want(t, errOut, "Workspace authority retirement is incomplete", "srw get job/"+jobID, "srw delete job/"+jobID)
 }
 
 func jobRow(id, status, title string, root bool) map[string]any {
