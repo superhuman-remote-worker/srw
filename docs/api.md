@@ -54,13 +54,15 @@ The old token keeps working for 24 hours so you can switch your tool over.
 
 | Scope | Allows |
 |---|---|
-| `jobs:read` | Listing and reading jobs and automations; reading projects, experts, skills, connectors, models and manifests. |
+| `jobs:read` | Listing and reading jobs and automations; reading projects, experts, skills, connectors, models and manifests; validating, previewing and exporting manifests. |
 | `jobs:write` | Creating, renaming, pausing, resuming, cancelling, approving and deleting jobs; creating and changing automations. |
 | `chat:read` | Reading sessions and their message history. |
 | `chat:write` | Starting sessions and sending messages. |
 | `knowledge:read` | Searching knowledge, reading sources and citations. |
 | `knowledge:write` | Creating, changing and deleting knowledge notes and citations. |
-| `admin` | Everything above, plus creating, changing and deleting projects, experts, skills, connectors, models and manifests, and administration. Only an admin can create a token with it. |
+| `resources:write` | Applying manifests and deleting stored resources: the configuration of your own account and of projects you can edit. This changes what later jobs run. A manifest that contains a Job also needs `jobs:write`; one that contains a Project also needs `projects:write`. |
+| `projects:write` | Creating, changing and deleting projects through manifests, including what a project's officer may spend. Used together with `resources:write`. |
+| `admin` | Everything above, plus the direct routes that create, change and delete projects, experts, skills, connectors and models, changes to the shared catalog, and administration. Only an admin can create a token with it. |
 
 `write` does not include `read`: a tool that creates jobs and then checks on
 them needs `jobs:read` and `jobs:write`. A request whose token lacks the
@@ -68,10 +70,13 @@ scope gets `403` with `Insufficient token scope: requires …` naming the
 missing scope.
 
 A token without `admin` can use projects, experts, skills and connectors in
-the jobs it creates, but cannot create or change them. That includes
-`POST /api/manifests/…`, so the `srw` command line can validate, preview and
-apply manifests with a token only if the token has `admin`. Users who are not
-admins make those changes in the Cockpit.
+the jobs it creates. It can change them through manifests only. With
+`resources:write`, `POST /api/manifests/apply` and
+`DELETE /api/resources/{id}` change what you could change in the Cockpit: your
+own account, and projects where you are an editor or the owner. The shared
+catalog stays with admins. Creating, changing or deleting a project, expert,
+skill, connector or model through its own route (for example
+`PATCH /api/projects/{id}`) still needs `admin`.
 
 Tokens cannot create or change other tokens, SSH keys or MCP tokens, and they
 cannot open WebSocket connections.

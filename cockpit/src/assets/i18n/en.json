@@ -1433,12 +1433,14 @@
       "namePlaceholder": "Token name (e.g. n8n production)",
       "scopesLegend": "Scopes",
       "scopes": {
-        "jobsRead": "List and inspect jobs, projects, audit trail.",
+        "jobsRead": "List and inspect jobs, projects, audit trail; validate, preview and export manifests.",
         "jobsWrite": "Create, cancel, resume jobs; send messages; attach files.",
         "chatRead": "Read persistent threads and message history.",
         "chatWrite": "Create threads, send messages, run slash commands.",
         "knowledgeRead": "Search knowledge, list sources and citations.",
         "knowledgeWrite": "Create, update, delete knowledge notes and citations.",
+        "resourcesWrite": "Apply and delete manifests: change the configuration of your account and of projects you can edit. This changes what later jobs run.",
+        "projectsWrite": "With the scope above: create, change and delete your projects through manifests, including what a project's officer may spend.",
         "admin": "Sudo approvals, user/project admin, connector admin."
       },
       "expiryLabel": "Expiry",

@@ -156,6 +156,43 @@ def _build_app(store: _Store) -> FastAPI:
     async def list_vms(request: Request):
         return await _as_user(request)
 
+    # Manifests as desired state, and what sits beside them.
+    @app.post("/api/manifests/validate")
+    async def validate_manifests(request: Request):
+        return await _as_user(request)
+
+    @app.post("/api/manifests/preview")
+    async def preview_manifests(request: Request):
+        return await _as_user(request)
+
+    @app.post("/api/manifests/export")
+    async def export_manifests(request: Request):
+        return await _as_user(request)
+
+    @app.post("/api/manifests/apply")
+    async def apply_manifests(request: Request):
+        return await _as_user(request)
+
+    @app.get("/api/resources/{resource_id}")
+    async def get_resource(request: Request, resource_id: str):
+        return await _as_user(request)
+
+    @app.delete("/api/resources/{resource_id}")
+    async def delete_resource(request: Request, resource_id: str):
+        return await _as_user(request)
+
+    @app.post("/api/resources/{resource_id}/outcome")
+    async def report_outcome(request: Request, resource_id: str):
+        return await _as_user(request)
+
+    @app.put("/api/resource-secrets/{name}")
+    async def put_resource_secret(request: Request, name: str):
+        return await _as_user(request)
+
+    @app.delete("/api/workspace-cache/{artifact_id}")
+    async def delete_workspace_cache(request: Request, artifact_id: str):
+        return await _as_user(request)
+
     # Include-prefixed: newer FastAPI hands the resolver the router-local
     # route ("/{job_id}") and keeps the prefixed template elsewhere.
     jobs = APIRouter()
@@ -346,6 +383,73 @@ class TestRoutesWhoseMethodUndersellsThem:
         assert response.status_code == status, response.text
 
 
+VALIDATE = "/api/manifests/validate"
+PREVIEW = "/api/manifests/preview"
+EXPORT = "/api/manifests/export"
+APPLY = "/api/manifests/apply"
+RESOURCE = "/api/resources/r-1"
+OUTCOME = "/api/resources/r-1/outcome"
+SECRET = "/api/resource-secrets/github"
+CACHE = "/api/workspace-cache/a-1"
+
+
+class TestManifestsWithoutTheAdminScope:
+    """A token without ``admin`` may read manifests with ``jobs:read`` and
+    write them with ``resources:write``. What it may write is then decided by
+    role, as for a Cockpit session; the scopes a Job or a Project document
+    needs on top are checked in the service
+    (``tests/test_manifest_token_scopes.py``)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("scopes", "method", "path", "status"),
+        [
+            # Validate, preview and export change nothing: a job reader's.
+            (["jobs:read"], "POST", VALIDATE, 200),
+            (["jobs:read"], "POST", PREVIEW, 200),
+            (["jobs:read"], "POST", EXPORT, 200),
+            (["jobs:read"], "GET", RESOURCE, 200),
+            (["jobs:read"], "POST", APPLY, 403),
+            (["jobs:read"], "DELETE", RESOURCE, 403),
+            (["jobs:write"], "POST", APPLY, 403),
+            # The write scope reaches the two writes and nothing beside them.
+            (["resources:write"], "POST", APPLY, 200),
+            (["resources:write"], "DELETE", RESOURCE, 200),
+            (["resources:write"], "POST", VALIDATE, 403),
+            (["resources:write"], "GET", RESOURCE, 403),
+            (["resources:write"], "POST", OUTCOME, 403),
+            (["resources:write"], "PUT", SECRET, 403),
+            (["resources:write"], "DELETE", CACHE, 403),
+            (["resources:write"], "POST", JOBS, 403),
+            # The project scope opens no route by itself.
+            (["projects:write"], "POST", APPLY, 403),
+            (["projects:write"], "DELETE", RESOURCE, 403),
+            (["projects:write"], "GET", JOBS, 403),
+            (["admin"], "POST", APPLY, 200),
+            (["admin"], "DELETE", RESOURCE, 200),
+            (["admin"], "POST", OUTCOME, 200),
+            (["admin"], "PUT", SECRET, 200),
+            (["admin"], "DELETE", CACHE, 200),
+        ],
+    )
+    async def test_scope(self, store, client, scopes, method, path, status):
+        token = store.mint("api", scopes=scopes)
+        async with client:
+            response = await client.request(method, path, headers=_bearer(token))
+        assert response.status_code == status, response.text
+
+    @pytest.mark.asyncio
+    async def test_a_write_token_does_not_carry_the_owners_admin_reach(
+        self, store, client
+    ):
+        # The owner is an admin. Catalog writes are decided from this flag
+        # (manifest_authority), so a resources:write token must arrive without it.
+        token = store.mint("api", scopes=["resources:write", "projects:write"])
+        async with client:
+            response = await client.post(APPLY, headers=_bearer(token))
+        assert response.json() == {"is_admin": False, "real_is_admin": False}
+
+
 ALL_ROUTES = [
     ("GET", JOBS),
     ("POST", JOBS),
@@ -359,6 +463,10 @@ ALL_ROUTES = [
     ("GET", CONNECTION),
     ("POST", ATTACH),
     ("POST", VAULT),
+    ("POST", VALIDATE),
+    ("POST", APPLY),
+    ("DELETE", RESOURCE),
+    ("PUT", SECRET),
 ]
 
 

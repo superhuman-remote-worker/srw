@@ -47,6 +47,8 @@ const ALL_SCOPES: ScopeOption[] = [
   {value: 'chat:write', i18nKey: 'chatWrite'},
   {value: 'knowledge:read', i18nKey: 'knowledgeRead'},
   {value: 'knowledge:write', i18nKey: 'knowledgeWrite'},
+  {value: 'resources:write', i18nKey: 'resourcesWrite'},
+  {value: 'projects:write', i18nKey: 'projectsWrite'},
   {value: 'admin', i18nKey: 'admin', adminOnly: true},
 ];
 

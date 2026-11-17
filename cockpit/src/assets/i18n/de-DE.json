@@ -1433,12 +1433,14 @@
       "namePlaceholder": "Token-Name (z. B. n8n Produktion)",
       "scopesLegend": "Scopes",
       "scopes": {
-        "jobsRead": "Jobs, Projekte und Audit-Trail einsehen.",
+        "jobsRead": "Jobs, Projekte und Audit-Trail einsehen; Manifeste validieren, als Vorschau prüfen und exportieren.",
         "jobsWrite": "Jobs erstellen, abbrechen, fortsetzen; Nachrichten senden; Dateien anhängen.",
         "chatRead": "Persistente Threads und Nachrichtenverlauf lesen.",
         "chatWrite": "Threads erstellen, Nachrichten senden, Slash-Befehle ausführen.",
         "knowledgeRead": "Wissen durchsuchen, Quellen und Zitate auflisten.",
         "knowledgeWrite": "Wissensnotizen und Zitate erstellen, ändern, löschen.",
+        "resourcesWrite": "Manifeste anwenden und löschen: die Konfiguration deines Kontos und der Projekte ändern, die du bearbeiten darfst. Das ändert, was spätere Jobs ausführen.",
+        "projectsWrite": "Zusammen mit dem Scope darüber: deine Projekte über Manifeste erstellen, ändern und löschen, einschließlich dessen, was der Officer eines Projekts ausgeben darf.",
         "admin": "Sudo-Freigaben, Benutzer-/Projekt-Verwaltung, Konnektor-Verwaltung."
       },
       "expiryLabel": "Ablaufdatum",

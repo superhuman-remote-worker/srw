@@ -364,11 +364,11 @@ POST   /api/jobs/{job_id}/workspace-recovery/retry                              
 GET    /api/jobs/{job_id}/workspace-status                                              pat=refused         internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    pat=refused         internal:require_internal
 POST   /api/live/webhooks/{connector_id}                                                pat=refused         public:Standard Webhooks signature and timestamp verified inside the handler against the connector's webhook_secret.
-POST   /api/manifests/apply                                                             pat=admin           gated:require_approved_user
-POST   /api/manifests/export                                                            pat=admin           gated:require_approved_user
-POST   /api/manifests/preview                                                           pat=admin           gated:require_approved_user
+POST   /api/manifests/apply                                                             pat=resources:write gated:require_approved_user
+POST   /api/manifests/export                                                            pat=jobs:read       gated:require_approved_user
+POST   /api/manifests/preview                                                           pat=jobs:read       gated:require_approved_user
 GET    /api/manifests/schema                                                            pat=jobs:read       gated:require_approved_user
-POST   /api/manifests/validate                                                          pat=admin           gated:require_approved_user
+POST   /api/manifests/validate                                                          pat=jobs:read       gated:require_approved_user
 GET    /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
 POST   /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
 DELETE /api/mcp-tokens/{token_id}                                                       pat=refused         gated:require_approved_user
@@ -515,7 +515,7 @@ PUT    /api/projects/{project_id}/workspace-defaults                            
 GET    /api/requests/{doc_id}                                                           pat=jobs:read       gated:require_job_access
 PUT    /api/resource-secrets/{name}                                                     pat=admin           gated:require_approved_user
 GET    /api/resources                                                                   pat=jobs:read       gated:require_approved_user
-DELETE /api/resources/{resource_id}                                                     pat=admin           gated:require_approved_user
+DELETE /api/resources/{resource_id}                                                     pat=resources:write gated:require_approved_user
 GET    /api/resources/{resource_id}                                                     pat=jobs:read       gated:require_approved_user
 POST   /api/resources/{resource_id}/outcome                                             pat=admin           gated:require_approved_user
 POST   /api/runtime-actors/authorize                                                    pat=refused         internal:require_internal

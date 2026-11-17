@@ -328,9 +328,11 @@ Set `SRW_API_URL` to the public API and provide an approved user's PAT/OIDC bear
 credential through `SRW_TOKEN`. `--token-stdin` reads a token from one stdin line;
 it cannot be combined with `-f -`. TLS uses the system trust store, with `--ca-file`
 for an explicit PEM trust bundle. CLI credentials never inherit internal MCP authority.
-A personal access token needs the `admin` scope for `validate`, `preview`, `apply`,
-`export` and `delete`, which change or send manifests, and `jobs:read` for `get`.
-Only an administrator can create a token with `admin`.
+A personal access token needs `jobs:read` for `validate`, `preview`, `export` and
+`get`, and `resources:write` for `apply` and `delete`. A manifest with a Job also
+needs `jobs:write`. A manifest with a Project, and the delete of a Project, also need
+`projects:write`. Any approved user can create a token with these scopes. Writing the
+shared Catalog needs `admin`, which only an administrator can put on a token.
 
 ```bash
 export SRW_API_URL=https://api.localhost

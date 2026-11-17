@@ -27,6 +27,18 @@ Surfaces outside jobs/chat/knowledge need ``admin``, which is also a superset
 of every other scope. Internal agent routes, credential management (SRW API
 keys, MCP tokens, SSH keys — the short-lived SSH attach exchange aside),
 browser-only surfaces and WebSockets refuse PATs outright.
+
+Manifests are the one catalog surface a token without ``admin`` may write.
+Validating, previewing and exporting a manifest are POST-shaped reads
+(``jobs:read``). Applying one and deleting a stored resource need
+``resources:write``; what the caller may write is then decided by role
+(``services.manifest_authority``), as for a Cockpit session. Two effects of an
+apply are larger than "change configuration" and need a second scope, which
+the service checks because only the request's content shows them
+(:data:`CONTENT_SCOPES`, ``services.manifest_resources``): a ``kind: Job``
+document starts work (``jobs:write``), and a ``kind: Project`` document or the
+delete of a Project resource creates, changes or removes a project
+(``projects:write``).
 """
 
 from __future__ import annotations
@@ -67,8 +79,14 @@ _KNOWLEDGE = _Family("knowledge:read", "knowledge:write")
 _KNOWLEDGE_READ = _Family("knowledge:read", "knowledge:read")
 # What a job is created against (projects, experts, skills, models,
 # datasources, manifests): readable by a job reader, changed only as the
-# design's "user/project admin, datasource admin".
+# design's "user/project admin, datasource admin". The manifest rules below
+# carve the desired-state operations out of it.
 _CATALOG = _Family("jobs:read", ADMIN_SCOPE)
+# POST-shaped reads on manifests: validate and export compute from the request
+# alone, and a preview resolves against stored resources the caller may read.
+_MANIFEST_READ = _Family("jobs:read", "jobs:read")
+# Apply a manifest, delete a stored resource.
+_RESOURCES_WRITE = _Family("resources:write", "resources:write")
 _ADMIN = _Family(ADMIN_SCOPE, ADMIN_SCOPE)
 _ANY = _Family(ANY, ANY)
 _REFUSED = _Family(REFUSED, REFUSED)
@@ -149,6 +167,14 @@ READS_THAT_WRITE: dict[str, str] = {
     # and binds the workspace PVC row.
     "/api/vms/{job_id}": "jobs:write",
 }
+
+#: Scopes no route decides. A service checks them, because only the content of
+#: the request shows that they are needed. ``projects:write``: a manifest apply
+#: with a ``kind: Project`` document, and the delete of a Project resource
+#: (``services.manifest_resources``). The route needs ``resources:write``
+#: either way. ``jobs:write`` is checked the same way for a ``kind: Job``
+#: document; it is not listed because routes decide it too.
+CONTENT_SCOPES: frozenset[str] = frozenset({"projects:write"})
 
 # First match wins: exact and narrow rules precede the prefix they refine.
 _RULES: tuple[_Rule, ...] = (
@@ -249,6 +275,15 @@ _RULES: tuple[_Rule, ...] = (
     _prefix("/api/usage", _JOBS),
     _prefix("/api/requests", _JOBS),
     _prefix("/api/officers", _JOBS),
+    # -- Manifests: desired state as files ----------------------------------
+    # Exact and method-restricted. Anything else under these two prefixes
+    # (another method, a resource's outcome report) falls through to the
+    # catalog rule below and needs `admin`; a mismatch here fails closed.
+    _exact("/api/manifests/validate", _MANIFEST_READ, "POST"),
+    _exact("/api/manifests/preview", _MANIFEST_READ, "POST"),
+    _exact("/api/manifests/export", _MANIFEST_READ, "POST"),
+    _exact("/api/manifests/apply", _RESOURCES_WRITE, "POST"),
+    _exact("/api/resources/{resource_id}", _RESOURCES_WRITE, "DELETE"),
     # -- Catalog: read as a job reader, change as admin ---------------------
     _prefix(f"{_PROJECT}/api-keys", _ADMIN),
     _prefix(f"{_PROJECT}/contacts", _ADMIN),
@@ -402,6 +437,7 @@ def enforce_route_scopes(request: Any, user: dict[str, Any]) -> str:
 __all__ = [
     "ADMIN_SCOPE",
     "ANY",
+    "CONTENT_SCOPES",
     "INSUFFICIENT_SCOPE",
     "PAT_AUTH_METHOD",
     "READS_THAT_WRITE",

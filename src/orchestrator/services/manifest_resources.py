@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from orchestrator.security.access import require_token_scopes
 from orchestrator.security.config_redaction import redact_public_config_override
 from orchestrator.security.crypto import encrypt
 from orchestrator.services.connector_secrets import (
@@ -28,6 +29,13 @@ from orchestrator.services.manifest_store import (
 )
 from shared.manifests import API_VERSION, parse_documents
 from shared.manifests.resolution import content_revision
+
+#: What a personal access token needs, beside the route's ``resources:write``,
+#: for a document of this kind. A Job starts work; a Project creates or
+#: changes a project, down to what its officer may spend.
+#: Both kinds are top-level documents only: a Project's inline children are
+#: Experts, Connectors and templates.
+_CONTENT_SCOPES = {"Job": "jobs:write", "Project": "projects:write"}
 
 
 class ManifestResourceService:
@@ -130,6 +138,21 @@ class ManifestResourceService:
         idempotency_key=None,
     ):
         documents = parse_documents(source, format=format)
+        # Before the transaction, so an idempotent replay is checked as well.
+        # Never at job admission: that is the transaction's last step, and it
+        # can run with a user dict that no longer says how the caller
+        # authenticated, which would skip the check without a trace.
+        needed = sorted(
+            {
+                _CONTENT_SCOPES[doc["kind"]]
+                for doc in documents
+                if doc["kind"] in _CONTENT_SCOPES
+            }
+        )
+        if needed:
+            await require_token_scopes(
+                request, self.db, user, *needed, resource_type="manifest"
+            )
         expected_versions = expected_versions or {}
         request_revision = content_revision(
             {
@@ -509,6 +532,19 @@ class ManifestResourceService:
         await ManifestAuthority(self.db, user, request=request).resource(
             row, write=True, allow_deleting=bool(linked_project)
         )
+        if row["kind"] == "Project":
+            # After the role check, so a resource the caller cannot write
+            # answers as it always did. A stored Job needs no second scope
+            # here: its delete removes the definition only, and unfinished
+            # work blocks it.
+            await require_token_scopes(
+                request,
+                self.db,
+                user,
+                _CONTENT_SCOPES["Project"],
+                resource_type="manifest",
+                resource_id=str(row["id"]),
+            )
         if linked_project:
             role = await self.db.get_user_role_in_project(
                 str(row["linked_id"]), str(user["id"])
