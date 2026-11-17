@@ -8,3 +8,6 @@ src/generated/
 
 # starlight-links-validator JSON report (only written when enabled)
 .starlight-links-validator/
+
+# Written by scripts/copy-install-script.mjs before every build
+public/install.sh

@@ -1,0 +1,108 @@
+// Command gen-docs writes the command reference of srw, docs/cli-reference.md.
+//
+//	go run ./cmd/gen-docs > ../docs/cli-reference.md
+//
+// It is its own program so that nothing it needs is linked into srw. The page
+// is committed, and a test fails when it differs from what this prints, so a
+// changed flag cannot ship without its documentation.
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
+	"github.com/superhuman-remote-worker/srw/cli/internal/cmd"
+)
+
+func main() {
+	if err := write(os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+const header = `---
+title: srw CLI reference
+description: Every command, flag and example of srw, the command-line client of Superhuman Remote Worker.
+---
+
+# srw CLI reference
+
+This page lists every command of ` + "`srw`" + ` with its flags and examples. It is
+generated from the program's own help text, so it matches the version of the
+documentation you are reading. For installing, logging in and a first
+walkthrough, see [srw CLI](cli.md).
+
+`
+
+func write(w io.Writer) error {
+	root := cmd.Reference()
+	var page strings.Builder
+	page.WriteString(header)
+	page.WriteString("## Global flags\n\nThese work with every command.\n\n")
+	flags(&page, root.PersistentFlags())
+	for _, command := range root.Commands() {
+		section(&page, command)
+	}
+	_, err := io.WriteString(w, page.String())
+	return err
+}
+
+func section(page *strings.Builder, command *cobra.Command) {
+	if command.Hidden || command.Name() == "help" {
+		return
+	}
+	fmt.Fprintf(page, "## %s\n\n%s.\n\n", command.CommandPath(), literal(strings.TrimSuffix(command.Short, ".")))
+	if command.Runnable() {
+		fmt.Fprintf(page, "```text\n%s\n```\n\n", command.UseLine())
+	}
+	// The long text is the help as the program prints it: it holds aligned
+	// lists and placeholders in angle brackets, which Markdown would reflow
+	// or read as tags.
+	if long := strings.TrimSpace(command.Long); long != "" && long != command.Short {
+		fmt.Fprintf(page, "```text\n%s\n```\n\n", long)
+	}
+	if command.LocalNonPersistentFlags().HasAvailableFlags() {
+		flags(page, command.LocalNonPersistentFlags())
+	}
+	if example := strings.TrimRight(command.Example, "\n"); example != "" {
+		fmt.Fprintf(page, "Examples:\n\n```text\n%s\n```\n\n", example)
+	}
+	for _, child := range command.Commands() {
+		section(page, child)
+	}
+}
+
+// flags prints a flag set as a table.
+func flags(page *strings.Builder, set *pflag.FlagSet) {
+	page.WriteString("| Flag | Meaning |\n|---|---|\n")
+	set.VisitAll(func(flag *pflag.Flag) {
+		if flag.Hidden || flag.Name == "help" {
+			return
+		}
+		name := "--" + flag.Name
+		if flag.Shorthand != "" {
+			name = "-" + flag.Shorthand + ", " + name
+		}
+		value, usage := pflag.UnquoteUsage(flag)
+		if value != "" {
+			name += " " + value
+		}
+		if flag.DefValue != "" && flag.DefValue != "false" && flag.DefValue != "0" && flag.DefValue != "[]" && flag.DefValue != "0s" {
+			usage += " (default " + flag.DefValue + ")"
+		}
+		fmt.Fprintf(page, "| `%s` | %s |\n", name, literal(usage))
+	})
+	page.WriteString("\n")
+}
+
+// literal makes a help text safe as Markdown prose in a table cell: a pipe
+// would end the cell, and an angle bracket would start a tag.
+func literal(text string) string {
+	return strings.NewReplacer("|", "\\|", "<", "\\<", ">", "\\>").Replace(text)
+}

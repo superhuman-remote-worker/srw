@@ -284,3 +284,17 @@ func readSecret(prompt string) (string, error) {
 	}
 	return strings.TrimSpace(string(secret)), nil
 }
+
+// Reference returns the command tree as the generated reference describes
+// it: built without a process around it, so nothing in it can depend on the
+// machine that generates the page.
+func Reference() *cobra.Command {
+	app := &App{
+		In: strings.NewReader(""), Out: io.Discard, Err: io.Discard,
+		Getenv: func(string) string { return "" }, Now: time.Now,
+		Version: "dev", Commit: "unknown",
+	}
+	root := app.Root()
+	root.InitDefaultCompletionCmd()
+	return root
+}

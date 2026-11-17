@@ -4,7 +4,7 @@
   "type": "module",
   "version": "0.0.0",
   "scripts": {
-    "generate": "node scripts/generate-helm-reference.mjs",
+    "generate": "node scripts/generate-helm-reference.mjs && node scripts/copy-install-script.mjs",
     "predev": "npm run generate",
     "dev": "astro dev",
     "prebuild": "npm run generate",
