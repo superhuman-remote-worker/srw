@@ -1129,10 +1129,25 @@ and the [3.8 Flash model page](https://ai.google.dev/gemini-api/docs/models/gemi
 
 ## DeepSeek V4
 
-The `deepseek` family covers DeepSeek V4 Pro and Flash, on DeepSeek's own API
-(`https://api.deepseek.com/v1`, an OpenAI-compatible endpoint) or through
-OpenRouter. Thinking is on by default; the reasoning arrives beside the answer
-as `reasoning_content` and is kept on the assistant message.
+The `deepseek` family covers DeepSeek V4 Pro and the April and July V4 Flash
+checkpoints, on DeepSeek's own API (`https://api.deepseek.com/v1`, an
+OpenAI-compatible endpoint) or through OpenRouter. Thinking is on by default;
+the reasoning arrives beside the answer as `reasoning_content` and is kept on
+the assistant message.
+
+V4.1 Flash takes images, so it has its own family, `deepseek-v4.1-flash`: the
+`deepseek` entry with `multimodal: true`. DeepSeek's API serves it as
+`deepseek-flash`, OpenRouter as `deepseek/deepseek-v4.1-flash`; the retired
+`deepseek-v4-flash-vision-exp` routes to it. The legacy name
+`deepseek-v4-flash` stays text-only: DeepSeek routes it to V4.1 Flash for now,
+but on OpenRouter it is the April checkpoint, and an image sent to a text-only
+model fails the request. Measured on DeepSeek's API on 2026-11-17, an image
+costs 184 prompt tokens up to 512×512, 652 at 1024×1024 and about 1,000 from
+2048 pixels up; the family counts 1,024 per image.
+Sources: [DeepSeek's change log](https://api-docs.deepseek.com/updates/) and
+[OpenRouter's DeepSeek vision overview](https://openrouter.ai/blog/insights/deepseek-v4-vision/).
+
+Everything below applies to both families.
 
 The family sets `replay_reasoning_content: true`: every later request sends each
 assistant turn's `reasoning_content` back, unchanged. DeepSeek's

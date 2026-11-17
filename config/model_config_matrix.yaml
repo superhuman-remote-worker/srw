@@ -193,10 +193,12 @@ o-series:
     # into its own family + an openai_patches row (budget 1536, x1.72).
     image_tokens: { mode: openai_tiles, base: 75, per_tile: 150, tile_px: 512, flat: 1000 }
 
-# DeepSeek V4 family (released 2026-04-24). Covers BOTH variants — family_of()
-# maps `deepseek-v4-pro` (1.6T/49B) and `deepseek-v4-flash` (284B/13B) to this
-# single `deepseek` block; per-model differences (context window, reasoning
-# effort) ride on the catalog row, not here. Both are 1M-context HYBRID reasoning
+# DeepSeek V4 family (released 2026-04-24). Covers the text-only models —
+# family_of() maps `deepseek-v4-pro` (1.6T/49B) and the April/July
+# `deepseek-v4-flash` checkpoints (284B/13B) to this `deepseek` block; per-model
+# differences (context window, reasoning effort) ride on the catalog row, not
+# here. V4.1 Flash takes images and has its own entry, `deepseek-v4.1-flash`,
+# below. Both are 1M-context HYBRID reasoning
 # models with a thinking mode, served OpenAI-compatible via OpenRouter (LangChain
 # ChatOpenAI) — so tool calls use the standard parens-form serialization and
 # reasoning comes back out-of-band (DeepSeek `reasoning_content`, OpenRouter
@@ -215,8 +217,8 @@ o-series:
 # show a need.
 deepseek:
   # Served via OpenRouter → unified effort param (superset incl. xhigh→max upstream).
-  reasoning: { method: effort_enum, delivery: native, default: high, options: [none, minimal, low, medium, high, xhigh] }
-  prompts:
+  reasoning: &deepseek_reasoning { method: effort_enum, delivery: native, default: high, options: [none, minimal, low, medium, high, xhigh] }
+  prompts: &deepseek_prompts
     # Worker-path scaffold + identity
     systemprompt: systemprompt_deepseek.txt
     persona: persona_deepseek.txt
@@ -225,9 +227,9 @@ deepseek:
     # Auxiliary-path (memory + knowledge), loaded when V4 Flash is the aux model
     memory_extraction: memory_extraction_prompt_deepseek.txt
     curation: curation_prompt_deepseek.txt
-  guardrails:
+  guardrails: &deepseek_guardrails
     file: deepseek.yaml
-  settings:
+  settings: &deepseek_settings
     compaction: { strategy: native, recipe: deepseek }  # the model summarizes itself with DeepSeek Harness's instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     # In THINKING mode DeepSeek V4 ignores temperature/top_p/penalties — tune the
@@ -237,7 +239,7 @@ deepseek:
     # per-model via the catalog row's reasoningLevel, not here.
     temperature: 0.0
     top_p: 0.95
-    multimodal: false  # V4 Pro + Flash are text-only
+    multimodal: false  # V4 Pro and the April/July V4 Flash are text-only
     parallel_tool_calls: false  # DeepSeek parallel tool calls remain unreliable
     # Send each assistant turn's `reasoning_content` back on every later
     # request. DeepSeek's thinking-mode guide asks for it whenever the request
@@ -257,6 +259,28 @@ deepseek:
     send_max_tokens: true
     model_max_context_tokens: 1000000  # V4 Pro + Flash: 1M context (was 64K on V3/R1)
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+
+# DeepSeek V4.1 Flash (2026-09-10) takes images natively; everything else is
+# the `deepseek` entry above, expanded from its anchors (there is no family
+# inheritance). DeepSeek's own API serves it as `deepseek-flash`, OpenRouter as
+# `deepseek/deepseek-v4.1-flash`; the retired preview
+# `deepseek-v4-flash-vision-exp` routes to it. The legacy name
+# `deepseek-v4-flash` stays on `deepseek`: DeepSeek routes it to V4.1 for now,
+# but on OpenRouter it is the text-only April checkpoint, and an image sent to
+# a text-only model fails the request.
+# https://api-docs.deepseek.com/updates/
+# https://openrouter.ai/blog/insights/deepseek-v4-vision/
+deepseek-v4.1-flash:
+  reasoning: *deepseek_reasoning
+  prompts: *deepseek_prompts
+  guardrails: *deepseek_guardrails
+  settings:
+    <<: *deepseek_settings
+    multimodal: true
+    # Measured on DeepSeek's API 2026-11-17 (prompt tokens per PNG): 184 up to
+    # 512x512, 382 at 768x768, 652 at 1024x1024, about 1,000 from 2048 px up
+    # (it downscales). No public formula; the flat cap covers every size.
+    image_tokens: { mode: flat, flat: 1024 }
 
 # Zhipu GLM-5.2 (released 2026-06-13) — text-only hybrid reasoning model,
 # 744B-MoE / ~40B-active, with a usable 1M-token context window, served

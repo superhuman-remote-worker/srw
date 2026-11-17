@@ -313,6 +313,16 @@ def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
     _catalog_lookup = fn
 
 
+#: DeepSeek V4.1 Flash by any of its names, after an optional provider path:
+#: deepseek-flash (DeepSeek's API), deepseek-v4.1-flash (OpenRouter, Hugging
+#: Face) and the retired preview deepseek-v4-flash-vision-exp, which DeepSeek
+#: routes to it. ``family_matcher`` and Cockpit's detectModelFamily match the
+#: same names.
+_DEEPSEEK_V4_1_FLASH = (
+    r"(?:^|/)deepseek-(?:flash|v4\.1-flash|v4-flash-vision-exp)(?![\w.])"
+)
+
+
 def family_of(model_id: str, default: str = "default") -> str:
     """Return the family string for a model ID.
 
@@ -387,6 +397,13 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "gpt-4o"
     if name.startswith(("o1", "o3", "o4")):
         return "o-series"
+    # V4.1 Flash takes images; V4 Pro and the earlier V4 Flash checkpoints
+    # are text-only. DeepSeek's API names it deepseek-flash, OpenRouter
+    # deepseek-v4.1-flash. The legacy deepseek-v4-flash stays text-only: on
+    # OpenRouter it is the April checkpoint, and an image sent to a text-only
+    # model fails the request.
+    if re.search(_DEEPSEEK_V4_1_FLASH, name):
+        return "deepseek-v4.1-flash"
     if "deepseek" in name:
         return "deepseek"
     # Flash has vision; the flagship is text-only. Both have a narrower

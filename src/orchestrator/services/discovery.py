@@ -75,6 +75,10 @@ _MULTIMODAL_PATTERNS = (
     "claude-haiku",
     "claude-4",  # claude-4 family is multimodal
     "qwen2-vl",
+    # DeepSeek V4.1 Flash; V4 Pro and the older deepseek-v4-flash are text-only.
+    "deepseek-flash",
+    "deepseek-v4.1-flash",
+    "deepseek-v4-flash-vision-exp",
     "qwen2.5-vl",
     # Mistral 3 multimodal generalists (Large 3 / Medium 3.5 / Small 4) + Pixtral.
     # Codestral / Ministral stay text-only, so no entry for them.

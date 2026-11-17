@@ -396,11 +396,16 @@ def test_responses_api_payload_is_untouched():
 
 class TestFamilySetting:
     @pytest.mark.parametrize(
-        "model",
-        ["deepseek-flash", "deepseek-v4-pro", "deepseek/deepseek-v4-flash"],
+        "model,family",
+        [
+            # V4.1 Flash is the deepseek entry with vision.
+            ("deepseek-flash", "deepseek-v4.1-flash"),
+            ("deepseek-v4-pro", "deepseek"),
+            ("deepseek/deepseek-v4-flash", "deepseek"),
+        ],
     )
-    def test_deepseek_has_it(self, model):
-        assert family_of(model) == "deepseek"
+    def test_deepseek_has_it(self, model, family):
+        assert family_of(model) == family
         assert loader.resolve_model_settings(model)["replay_reasoning_content"] is True
         assert loader.replays_reasoning_content(model) is True
 

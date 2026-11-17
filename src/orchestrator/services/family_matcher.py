@@ -98,6 +98,14 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # (e.g. `MiniMax-M3`, `minimax/minimax-m3`) contain the `minimax` substring.
     (re.compile(r"minimax[-_]?m3", re.IGNORECASE), "minimax-m3"),
     (re.compile(r"minimax", re.IGNORECASE), "minimax"),
+    # V4.1 Flash takes images, so it has its own family; mirrors family_of().
+    (
+        re.compile(
+            r"(?:^|/)deepseek-(?:flash|v4\.1-flash|v4-flash-vision-exp)(?![\w.])",
+            re.IGNORECASE,
+        ),
+        "deepseek-v4.1-flash",
+    ),
     (re.compile(r"deepseek", re.IGNORECASE), "deepseek"),
     # Mistral 3 family + specialists (Codestral/Magistral/Ministral/Devstral/
     # Pixtral/Voxtral). Native api.mistral.ai serves bare ids; the openrouter

@@ -244,6 +244,8 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('gpt-5')) return 'gpt-5';
   if (name.startsWith('gpt-4o')) return 'gpt-4o';
   if (name.startsWith('o1') || name.startsWith('o3') || name.startsWith('o4')) return 'o-series';
+  // V4.1 Flash takes images; V4 Pro and older V4 Flash ids stay text-only — mirrors family_of().
+  if (/(?:^|\/)deepseek-(?:flash|v4\.1-flash|v4-flash-vision-exp)(?![\w.])/.test(name)) return 'deepseek-v4.1-flash';
   if (name.includes('deepseek')) return 'deepseek';
   if (name.includes('glm-5.3-flash')) return 'glm-5.3-flash';
   if (name.includes('glm-5.3')) return 'glm-5.3';
