@@ -505,6 +505,8 @@ async def inject_blob_credentials(
         co["env_keys"] = dict(agent["env_keys"])
     if isinstance(agent.get("research"), dict):
         co["research"] = copy.deepcopy(agent["research"])
+    if isinstance(agent.get("image"), dict):
+        co["image"] = copy.deepcopy(agent["image"])
     # The roster's model slots (U1): the roster-wide ``subagents.llm`` and
     # each entry's ``llm`` — ONLY the llm blocks, never the entries' full
     # configs, so the injector's input stays a config_override-shaped dict
@@ -581,6 +583,12 @@ async def inject_blob_credentials(
         agent["live_session"] = copy.deepcopy(co["live_session"])
     else:
         agent.pop("live_session", None)
+    # The image section (generate_image) is resolved per dispatch like
+    # research: replaced whole, removed when nothing is pinned.
+    if isinstance(co.get("image"), dict) and co["image"]:
+        agent["image"] = copy.deepcopy(co["image"])
+    else:
+        agent.pop("image", None)
     co_sub = co.get("subagents")
     if isinstance(co_sub, dict) and isinstance(agent.get("subagents"), dict):
         sub = agent["subagents"]

@@ -95,7 +95,8 @@ export type DefaultModelKind =
   | 'fetch'
   | 'search_fallback'
   | 'rerank'
-  | 'live_voice';
+  | 'live_voice'
+  | 'image_generation';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'chat',
@@ -104,6 +105,7 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'embedding',
   'rerank',
   'live_voice',
+  'image_generation',
   'vision',
   'auxiliary',
   'whisper',
@@ -127,6 +129,7 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   search_fallback: null,
   rerank: null,
   live_voice: null,
+  image_generation: null,
 };
 
 /**

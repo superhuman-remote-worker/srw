@@ -378,9 +378,15 @@ def _catalog_pricing_pairs(
         mid = m.get("model_id")
         if not mid:
             continue
-        if "live_voice" in (m.get("capabilities") or ()):
+        caps = m.get("capabilities") or ()
+        if "live_voice" in caps:
             # Billed per voice second (migration 0544), not per token:
             # OpenRouter has no price for it.
+            continue
+        if "image_generation" in caps:
+            # Metered per image by the audit materializer (unit 'image'),
+            # priced from the row's params or the built-in list prices;
+            # OpenRouter's chat token prices would misprice image tokens.
             continue
         params = m.get("params_json") or {}
         pairs.append((str(mid), params.get("pricing_id")))

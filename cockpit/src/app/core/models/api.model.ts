@@ -828,7 +828,8 @@ export type LlmModelCapability =
   | 'search'
   | 'fetch'
   | 'rerank'
-  | 'live_voice';
+  | 'live_voice'
+  | 'image_generation';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -964,14 +965,15 @@ export type CatalogCapability =
   | 'search'
   | 'fetch'
   | 'rerank'
-  | 'live_voice';
+  | 'live_voice'
+  | 'image_generation';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
-  'rerank', 'live_voice',
+  'rerank', 'live_voice', 'image_generation',
 ];
 
 /**

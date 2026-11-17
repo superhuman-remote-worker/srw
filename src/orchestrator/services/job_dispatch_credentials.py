@@ -76,6 +76,9 @@ class DispatchCredentialDependencies:
         [dict[str, Any], dict[str, Any] | None], str | None
     ]
     nested_model_slots: Callable[[dict[str, Any]], list[tuple[str, Any, str]]]
+    # Optional so older call sites and test doubles keep constructing the
+    # bundle; the application binds it (application/preparation.py).
+    inject_image_credentials: Callable[..., Awaitable[Any]] | None = None
 
 
 async def _usable_account_default(
@@ -631,6 +634,13 @@ async def inject_dispatch_credentials(
         user_id=user_id_str,
         resolved_keys=resolved_keys,
     )
+    if dependencies.inject_image_credentials is not None:
+        await dependencies.inject_image_credentials(
+            config_override,
+            user_settings=user_settings,
+            user_id=user_id_str,
+            resolved_keys=resolved_keys,
+        )
 
     if unavailable:
         if strict:

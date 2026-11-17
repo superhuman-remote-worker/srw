@@ -58173,9 +58173,13 @@ class PostgresDB:
                 out.append(c)
         if not out:
             raise ValueError("capabilities must be non-empty")
-        if "live_voice" in out and len(out) > 1:
-            # A live voice model is bound by a phone-line connector only.
-            raise ValueError("live_voice must be the only capability of a catalog row")
+        for exclusive in ("live_voice", "image_generation"):
+            if exclusive in out and len(out) > 1:
+                # A live voice model is bound by a phone-line connector only;
+                # an image model by the generate_image tool only.
+                raise ValueError(
+                    f"{exclusive} must be the only capability of a catalog row"
+                )
         return out
 
     async def list_models(
@@ -58687,8 +58691,16 @@ class PostgresDB:
             "fetch",
             "rerank",
             "live_voice",
+            "image_generation",
         }
     )
+
+    # Kinds whose slot stays empty without an explicit pin (no first-enabled
+    # fallback): an enabled image row spends money per call, so the agent's
+    # generate_image tool appears only after an admin or the user pins one
+    # (image_generation decision D1, 2026-11-17). Mirrors
+    # ``orchestrator.schemas.model_catalog.PIN_ONLY_CAPABILITIES``.
+    _PIN_ONLY_CAPABILITIES = frozenset({"image_generation"})
 
     async def resolve_default_for_capability(self, capability: str) -> str | None:
         """Resolve the effective default model ID for a capability.
@@ -58706,6 +58718,8 @@ class PostgresDB:
           forward compat.
         - Returns ``None`` only when no pin exists AND no enabled catalog
           row is available.
+        - A pin-only capability (``image_generation``) never falls back: no
+          valid pin means ``None``.
         """
         pinned = await self.get_default_llm_model(capability)
         if capability not in self._CATALOG_CAPABILITIES:
@@ -58716,6 +58730,8 @@ class PostgresDB:
             )
             if catalog_row is not None and catalog_row.get("enabled"):
                 return pinned
+        if capability in self._PIN_ONLY_CAPABILITIES:
+            return None
         candidates = await self.list_models_by_capability_alphabetical(capability)
         if candidates:
             return candidates[0]["model_id"]

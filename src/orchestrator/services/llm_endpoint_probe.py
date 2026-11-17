@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import re
 import httpx
 
 from shared.runtime.core.model_registry import family_of
@@ -49,6 +50,32 @@ def _is_live_voice_id(name: str) -> bool:
     """A live (full-duplex voice) model by its name: never a chat row, so it
     is classified before the chat fallback."""
     return "gpt-live" in name or "realtime" in name
+
+
+# Image-generation model ids (text-to-image / image edit). Anchored on
+# segment boundaries so a chat model that merely mentions images is not
+# swept up; video generators stay out (no SRW workflow for them).
+_IMAGE_GENERATION_PATTERNS = (
+    re.compile(r"gpt-image"),
+    re.compile(r"chatgpt-image"),
+    re.compile(r"dall-?e"),
+    re.compile(r"(?:^|[-_/])imagen(?:$|[-_.\d])"),
+    re.compile(r"nano-banana"),
+    re.compile(r"(?:^|[-_/])image(?:$|[-_.])"),
+)
+
+
+def is_image_generation_id(model_id: str) -> bool:
+    """A text-to-image model by its id: never a chat or vision row.
+
+    Classified before the multimodal-chat and vision heuristics, so
+    ``gemini-3-pro-image`` lands as ``image_generation`` and not as
+    chat+auxiliary+vision, and ``dall-e-3`` not as ``vision``.
+    """
+    name = model_id.lower()
+    if re.search(r"(?:^|[-_/])video(?:$|[-_.])", name):
+        return False
+    return any(p.search(name) for p in _IMAGE_GENERATION_PATTERNS)
 
 
 def declares_live_voice(item: Any) -> bool:
@@ -78,6 +105,8 @@ def _capability_hint(model_id: str) -> str:
     name = model_id.lower()
     if _is_live_voice_id(name):
         return "live_voice"
+    if is_image_generation_id(name):
+        return "image_generation"
     if "whisper" in name:
         return "whisper"
     if "tts" in name or name.endswith("-speech") or "text-to-speech" in name:

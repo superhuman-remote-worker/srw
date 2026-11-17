@@ -1272,7 +1272,8 @@
           "fetch": "Web-Abruf",
           "search_fallback": "Such-Fallback",
           "rerank": "Rerank (Sortierung der Memory-Treffer)",
-          "live_voice": "Live Voice"
+          "live_voice": "Live Voice",
+          "image_generation": "Bildgenerierung (Bild-Tool des Agenten)"
         }
       },
       "discovery": {
@@ -1291,6 +1292,11 @@
         "adapter": "Live-Voice-Adapter",
         "voice": "Stimme (optional)",
         "onlyCapability": "Live Voice muss die einzige Capability sein."
+      },
+      "imageGeneration": {
+        "adapter": "Bild-Adapter",
+        "hint": "Der Agent bekommt das Tool generate_image erst, wenn dieses Modell unter Standards festgelegt ist (oder von einem Benutzer). Jeder Aufruf kostet Geld oder Abo-Kontingent.",
+        "onlyCapability": "Bildgenerierung muss die einzige Capability sein."
       }
     }
   },

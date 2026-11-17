@@ -38,7 +38,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                   (changed)="setDefault(kind, $event ?? '')"
                 >
                   <option value="">
-                    {{ ((kind === 'search_fallback' || kind === 'live_voice')
+                    {{ ((kind === 'search_fallback' || kind === 'live_voice' || kind === 'image_generation')
                       ? 'admin.providers.defaults.none'
                       : 'admin.providers.defaults.unset') | transloco }}
                   </option>
@@ -48,6 +48,11 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     }
                   } @else if (kind === 'live_voice') {
                     @for (m of modelService.liveVoiceModels(); track m.id) {
+                      <option [value]="m.id">{{ m.label }}</option>
+                    }
+                  } @else if (kind === 'image_generation') {
+                    <!-- Pin-only: without a pin the agent has no image tool. -->
+                    @for (m of modelService.imageGenerationModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
                     }
                   } @else if (kind === 'rerank') {
@@ -175,7 +180,8 @@ export class AdminDefaultsComponent implements OnInit {
     this.modelService.searchModels().length === 0 &&
     this.modelService.fetchModels().length === 0 &&
     this.modelService.rerankModels().length === 0 &&
-    this.modelService.liveVoiceModels().length === 0,
+    this.modelService.liveVoiceModels().length === 0 &&
+    this.modelService.imageGenerationModels().length === 0,
   );
   readonly searchFallbackMatchesPrimary = computed(() => {
     const primary = this.admin.defaults().search;

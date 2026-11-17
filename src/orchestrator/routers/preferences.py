@@ -67,6 +67,9 @@ class UserSettingsUpdate(BaseModel):
     default_search_model: str | None = None
     default_fetch_model: str | None = None
     default_search_fallback_model: str | None = None
+    # The account's image model (``image_generation`` capability). Applies to
+    # jobs; Session dispatch does not read user helper pins yet.
+    default_image_generation_model: str | None = None
     default_tts_voice: str | None = None
     # NOTE: per-phase model defaults (default_strategic_model /
     # default_tactical_model) were removed — see Layer 1 in

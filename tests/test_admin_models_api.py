@@ -80,6 +80,7 @@ class TestCatalogConstants:
             "fetch",
             "rerank",
             "live_voice",
+            "image_generation",
         )
 
     def test_provider_kinds_locked(self):
@@ -541,6 +542,7 @@ class TestReadinessAccessors:
             "fetch": 0,
             "rerank": 0,
             "live_voice": 0,
+            "image_generation": 0,
         }
 
     @pytest.mark.asyncio

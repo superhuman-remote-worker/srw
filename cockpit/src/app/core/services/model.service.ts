@@ -64,6 +64,8 @@ interface ModelsResponse {
   /** Memory reranker rows (`rerank` capability). Optional for older backends. */
   rerank_models?: HelperModel[];
   live_voice_models?: HelperModel[];
+  /** Image generation rows (`image_generation` capability). Optional for older backends. */
+  image_generation_models?: HelperModel[];
   configured_providers: string[];
   reasoning_by_model?: Record<string, ReasoningCapability>;
 }
@@ -88,6 +90,7 @@ export class ModelService {
   readonly fetchModels = signal<HelperModel[]>([]);
   readonly rerankModels = signal<HelperModel[]>([]);
   readonly liveVoiceModels = signal<HelperModel[]>([]);
+  readonly imageGenerationModels = signal<HelperModel[]>([]);
   readonly providers = signal<string[]>([]);
   /** model_id → reasoning capability (family-derived); drives the reasoning UI. */
   readonly reasoningByModel = signal<Record<string, ReasoningCapability>>({});
@@ -118,6 +121,7 @@ export class ModelService {
         this.fetchModels.set(resp.fetch_models ?? []);
         this.rerankModels.set(resp.rerank_models ?? []);
         this.liveVoiceModels.set(resp.live_voice_models ?? []);
+        this.imageGenerationModels.set(resp.image_generation_models ?? []);
         this.providers.set(resp.configured_providers);
         this.reasoningByModel.set(resp.reasoning_by_model ?? {});
         this.loading.set(false);
@@ -138,6 +142,7 @@ export class ModelService {
         this.fetchModels.set([]);
         this.rerankModels.set([]);
         this.liveVoiceModels.set([]);
+        this.imageGenerationModels.set([]);
         this.providers.set([]);
         this.reasoningByModel.set({});
         this.loading.set(false);

@@ -378,7 +378,8 @@ class TestCredentialPrivacy:
                 include_kb_profile=True,
                 dependencies=_deps(),
             )
-        assert resolver.await_count == 3
+        # search, fetch, search fallback, and the image_generation slot.
+        assert resolver.await_count == 4
 
         found: dict[str, list[str]] = {s: [] for s in SECRETS}
 

@@ -30543,7 +30543,7 @@ CREATE TABLE public.models (
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     served_model_id text,
-    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text, 'live_voice'::text]))),
+    CONSTRAINT models_capabilities_check CHECK (((cardinality(capabilities) >= 1) AND (capabilities <@ ARRAY['chat'::text, 'auxiliary'::text, 'embedding'::text, 'vision'::text, 'whisper'::text, 'tts'::text, 'search'::text, 'fetch'::text, 'rerank'::text, 'live_voice'::text, 'image_generation'::text]))),
     CONSTRAINT models_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['system'::text, 'endpoint'::text]))),
     CONSTRAINT models_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
 );

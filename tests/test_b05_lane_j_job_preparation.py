@@ -236,6 +236,11 @@ def _dispatch_credential_deps() -> (
             preparation_composition.dispatch_credential_dependencies,
             main.app.state.resources,
         ),
+        inject_image_credentials=bound(
+            dispatch_credentials_module.inject_image_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
         inject_system_kb_embedding_profile=bound(
             dispatch_credentials_module.inject_system_kb_embedding_profile,
             preparation_composition.dispatch_credential_dependencies,
@@ -4395,6 +4400,13 @@ LATE_BINDING_TABLE = [
         "inject_search_credentials",
         _BOUND,
         (dispatch_credentials_module, "inject_search_credentials"),
+        _PREP.dispatch_credential_dependencies,
+    ),
+    (
+        _dispatch_credential_deps,
+        "inject_image_credentials",
+        _BOUND,
+        (dispatch_credentials_module, "inject_image_credentials"),
         _PREP.dispatch_credential_dependencies,
     ),
     (

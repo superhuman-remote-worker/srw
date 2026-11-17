@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0570_deepseek_v4_1_flash_family.sql"
+    / "src/orchestrator/database/migrations/app/0572_validate_image_generation_capability.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

@@ -24,6 +24,11 @@ class CapabilityCredentials:
     # The row's ``served_model_id``: the name the provider is sent when it
     # differs from the catalog id in ``model``.
     served_model: str | None = None
+    # The endpoint's ``transport_kind`` (``subscription-proxy`` for the
+    # subscription proxy) and the row's ``provider_ref``: read by callers
+    # that treat subscription traffic differently (image generation, D7/D10).
+    transport_kind: str | None = field(default=None, compare=False)
+    provider_ref: str | None = field(default=None, compare=False)
 
     @property
     def wire_model(self) -> str:
@@ -86,6 +91,8 @@ async def resolve_capability_credentials(
             params=params,
             catalog_id=str(row["catalog_id"]) if row.get("catalog_id") else None,
             served_model=row.get("served_model_id") or None,
+            transport_kind=row.get("endpoint_transport_kind") or None,
+            provider_ref=str(provider_ref) if provider_ref else None,
         )
 
     # Compatibility for a model resolved outside the DB catalog. The default

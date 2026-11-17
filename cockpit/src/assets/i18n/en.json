@@ -1272,7 +1272,8 @@
           "fetch": "Web fetch",
           "search_fallback": "Search fallback",
           "rerank": "Rerank (memory recall ordering)",
-          "live_voice": "Live voice"
+          "live_voice": "Live voice",
+          "image_generation": "Image generation (agent image tool)"
         }
       },
       "discovery": {
@@ -1291,6 +1292,11 @@
         "adapter": "Live voice adapter",
         "voice": "Voice (optional)",
         "onlyCapability": "Live voice must be the only capability."
+      },
+      "imageGeneration": {
+        "adapter": "Image adapter",
+        "hint": "The agent gets the generate_image tool only after this model is pinned in Defaults (or by a user). Each call spends money or subscription quota.",
+        "onlyCapability": "Image generation must be the only capability."
       }
     }
   },

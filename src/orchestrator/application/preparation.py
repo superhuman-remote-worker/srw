@@ -178,6 +178,11 @@ def job_dispatch_credential_dependencies(
             dispatch_credential_dependencies,
             resources,
         ),
+        inject_image_credentials=bound(
+            dispatch_credentials.inject_image_credentials,
+            dispatch_credential_dependencies,
+            resources,
+        ),
         inject_system_kb_embedding_profile=bound(
             dispatch_credentials.inject_system_kb_embedding_profile,
             dispatch_credential_dependencies,

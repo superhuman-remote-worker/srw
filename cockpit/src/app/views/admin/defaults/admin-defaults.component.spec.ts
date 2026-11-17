@@ -49,6 +49,7 @@ const modelService = {
   fetchModels: signal(helperModels.slice(0, 1)),
   rerankModels: signal([]),
   liveVoiceModels: signal([{id: 'gpt-live-1', label: 'GPT-Live', configured: true}]),
+  imageGenerationModels: signal([{id: 'gpt-image-2.6-flare', label: 'GPT Image 2.6 Flare', configured: true}]),
   load: vi.fn(),
 };
 
@@ -92,6 +93,22 @@ describe('AdminDefaultsComponent search providers', () => {
     expect(live?.querySelector('option[value="gpt-live-1"]')?.textContent?.trim()).toBe('GPT-Live');
     fixture.componentInstance.setDefault('live_voice', 'gpt-live-1');
     expect(setDefault).toHaveBeenCalledWith('live_voice', 'gpt-live-1');
+  });
+
+  it('offers a pin-only image generation default from its helper bucket', () => {
+    const fixture = TestBed.createComponent(AdminDefaultsComponent);
+    fixture.detectChanges();
+    const fields = Array.from((fixture.nativeElement as HTMLElement).querySelectorAll('app-form-field'));
+    const image = fields.find(
+      (field) => (field as unknown as {label: string}).label === 'Image generation (agent image tool)',
+    );
+    expect(image).toBeDefined();
+    // Pin-only: the empty choice means "no image tool", so it reads None.
+    expect(image?.querySelector('option[value=""]')?.textContent?.trim()).toBe('None');
+    expect(image?.querySelector('option[value="gpt-image-2.6-flare"]')?.textContent?.trim())
+      .toBe('GPT Image 2.6 Flare');
+    fixture.componentInstance.setDefault('image_generation', 'gpt-image-2.6-flare');
+    expect(setDefault).toHaveBeenCalledWith('image_generation', 'gpt-image-2.6-flare');
   });
 
   it('offers an explicit None fallback and round-trips clearing it', () => {

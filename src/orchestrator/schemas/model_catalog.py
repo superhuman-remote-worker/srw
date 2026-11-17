@@ -17,6 +17,7 @@ LLM_MODEL_CAPABILITIES = (
     "fetch",
     "rerank",
     "live_voice",
+    "image_generation",
 )
 
 
@@ -31,6 +32,12 @@ LLM_MODEL_CAPABILITIES = (
 # phone-line connector names it; it is never bound as a chat model, never
 # required by readiness and never injected at dispatch. It is the row's only
 # capability (see :func:`live_voice_capability_problem`).
+# ``image_generation`` is a text-to-image / image-edit model (gpt-image,
+# Gemini image, the subscription proxy's image routes; migration 0571). The
+# agent's ``generate_image`` tool calls it through the ``image`` dispatch
+# section. Like ``live_voice`` it is the row's only capability, is never
+# bound as a chat or vision model, never required by readiness, and never
+# picked by the first-enabled default fallback: it needs an explicit pin.
 VALID_CATALOG_CAPABILITIES = (
     "chat",
     "auxiliary",
@@ -42,7 +49,17 @@ VALID_CATALOG_CAPABILITIES = (
     "fetch",
     "rerank",
     "live_voice",
+    "image_generation",
 )
+
+#: Capabilities a catalog row must carry alone (a contradiction otherwise).
+EXCLUSIVE_CATALOG_CAPABILITIES = ("live_voice", "image_generation")
+
+#: Capabilities whose default never falls back to the first enabled row: the
+#: slot stays empty until an admin (or the user) pins a model, because an
+#: enabled row of this kind spends money per call (image_generation decision
+#: D1, 2026-11-17).
+PIN_ONLY_CAPABILITIES = ("image_generation",)
 
 
 VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
@@ -59,20 +76,28 @@ CatalogCapabilityLiteral = Literal[
     "fetch",
     "rerank",
     "live_voice",
+    "image_generation",
 ]
 
 
-def live_voice_capability_problem(capabilities: list[str] | None) -> str | None:
-    """Why a capability set that claims ``live_voice`` contradicts itself.
+def exclusive_capability_problem(capabilities: list[str] | None) -> str | None:
+    """Why a capability set that claims an exclusive capability contradicts itself.
 
-    A live voice model speaks to a caller over a transport; it cannot also
-    serve as a chat, embedding or any other slot, so ``live_voice`` is the
-    row's only capability.
+    A live voice model speaks to a caller over a transport, and an image
+    model returns pictures; neither can also serve as a chat, embedding or
+    any other slot, so each is the row's only capability.
     """
     caps = list(capabilities or [])
-    if "live_voice" in caps and len(set(caps)) > 1:
-        return "live_voice must be the only capability of a catalog row"
+    for cap in EXCLUSIVE_CATALOG_CAPABILITIES:
+        if cap in caps and len(set(caps)) > 1:
+            return f"{cap} must be the only capability of a catalog row"
     return None
+
+
+def live_voice_capability_problem(capabilities: list[str] | None) -> str | None:
+    """Kept name: the exclusive-capability check (``live_voice`` and
+    ``image_generation``)."""
+    return exclusive_capability_problem(capabilities)
 
 
 class CatalogModelCreate(BaseModel):

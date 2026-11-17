@@ -679,6 +679,104 @@ async def inject_search_credentials(
     return config_override
 
 
+#: Image adapters the agent's generate_image tool implements.
+IMAGE_ADAPTERS = ("openai-images", "gemini")
+#: Default image operations when a catalog row names none.
+DEFAULT_IMAGE_OPS = ("generate", "edit")
+#: Provider ids of system-anchored rows mapped to their image adapter.
+_IMAGE_ADAPTER_BY_PROVIDER = {
+    "openai": "openai-images",
+    "openai-images": "openai-images",
+    "google": "gemini",
+    "gemini": "gemini",
+}
+
+
+def image_adapter_for(provider: str | None) -> str | None:
+    """The generate_image adapter a catalog provider id maps to, or None."""
+    if not provider:
+        return None
+    return _IMAGE_ADAPTER_BY_PROVIDER.get(provider.strip().lower())
+
+
+async def inject_image_credentials(
+    config_override: dict[str, Any],
+    *,
+    user_settings: dict[str, Any],
+    user_id: str | None,
+    resolved_keys: dict[str, str],
+    dependencies: DispatchCredentialDependencies,
+) -> dict[str, Any]:
+    """Inject the pinned ``image_generation`` row as the top-level ``image`` section.
+
+    The agent's ``generate_image`` tool is built only when this section exists
+    (the ``research.*`` pattern). The capability is pin-only: without an admin
+    or user pin nothing resolves and the section is removed, so the tool never
+    appears by accident (image_generation decision D1, 2026-11-17). The key
+    stays in the per-dispatch override and is stripped before persistence by
+    ``redact_config_override`` (name-based: ``api_key``).
+    """
+
+    # Function-local on purpose: tests patch the resolver on its owner module.
+    from orchestrator.services.capability_credentials import (
+        resolve_capability_credentials,
+    )
+    from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
+
+    creds = await resolve_capability_credentials(
+        capability="image_generation",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=dependencies.store,
+    )
+    if creds is None:
+        config_override.pop("image", None)
+        return config_override
+    adapter = image_adapter_for(creds.provider)
+    if adapter is None:
+        config_override.pop("image", None)
+        dependencies.logger.warning(
+            "Dispatch: image model %r names no supported image adapter "
+            "(params_json.provider=%r; expected one of %s); generate_image is "
+            "disabled",
+            creds.model,
+            creds.provider,
+            ", ".join(IMAGE_ADAPTERS),
+        )
+        return config_override
+    ops_value = creds.params.get("ops")
+    ops = (
+        [str(op) for op in ops_value if isinstance(op, str)]
+        if isinstance(ops_value, list) and ops_value
+        else list(DEFAULT_IMAGE_OPS)
+    )
+    subscription = (
+        creds.transport_kind == SUBSCRIPTION_PROXY_TRANSPORT
+        or str(creds.params.get("billing") or "").lower() == "subscription"
+    )
+    section: dict[str, Any] = {
+        "provider": adapter,
+        "base_url": creds.base_url,
+        "api_key": creds.api_key,
+        "model": creds.wire_model,
+        "catalog_model": creds.model,
+        "ops": ops,
+        "billing": "subscription" if subscription else "api",
+    }
+    defaults = creds.params.get("image_defaults")
+    if isinstance(defaults, dict):
+        section["defaults"] = dict(defaults)
+    config_override["image"] = section
+    dependencies.logger.info(
+        "Dispatch: injected image provider %s (%s, %s)",
+        adapter,
+        creds.model,
+        section["billing"],
+    )
+    return config_override
+
+
 async def inject_system_kb_embedding_profile(
     env_keys: dict[str, Any],
     *,
@@ -1022,6 +1120,13 @@ async def inject_thread_dispatch_credentials(
         resolved_keys=resolved_keys,
         dependencies=dependencies,
     )
+    await inject_image_credentials(
+        config_override,
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        dependencies=dependencies,
+    )
 
     if unavailable:
         if strict:
@@ -1037,6 +1142,7 @@ __all__ = [
     "DispatchCredentialDependencies",
     "dispatch_llm_provider_fallback",
     "inject_env_key_credentials",
+    "inject_image_credentials",
     "inject_model_credentials",
     "inject_search_credentials",
     "inject_system_kb_embedding_profile",

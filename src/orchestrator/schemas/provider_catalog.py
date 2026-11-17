@@ -97,6 +97,7 @@ VALID_DEFAULT_MODEL_KINDS = {
     "search_fallback",
     "rerank",
     "live_voice",
+    "image_generation",
 }
 
 
