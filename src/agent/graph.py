@@ -70,6 +70,7 @@ from langgraph.prebuilt import ToolNode
 
 from agent.core.archiver import get_archiver, inflight_tool_calls
 from agent.core.bound_tools import binds_phase_tool, binds_todo_tool
+from agent.core.brief_pointer import brief_pointer_after_compaction
 from shared.runtime.llm.reasoning_chat import record_wire_attempts
 from agent.core.context import (
     ContextManager,
@@ -1026,9 +1027,19 @@ def create_execute_node(
         tool results, phase-start messages). When a summary evicted its
         latest rendering, the compacted history carries it once, seated
         right after the summary, until the next compaction.
+
+        The same holds for the brief: when the kickoff message was evicted,
+        the job is told once that the brief is unchanged in ``task_brief.md``
+        and has to be read again (``agent.core.brief_pointer``).
         """
+        restated: List[BaseMessage] = []
         text = todo_manager.list_restatement(retained)
-        return [HumanMessage(content=text)] if text else []
+        if text:
+            restated.append(HumanMessage(content=text))
+        pointer = brief_pointer_after_compaction(retained, tool_names)
+        if pointer:
+            restated.append(HumanMessage(content=pointer))
+        return restated
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""

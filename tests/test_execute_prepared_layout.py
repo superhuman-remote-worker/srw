@@ -997,6 +997,7 @@ class TestAppendOnlyLayout:
         assert [_kind(m) for m in state_messages] == [
             "summary",
             "HumanMessage",  # the restated todo list
+            "HumanMessage",  # the pointer back to the brief
             "HumanMessage",  # the kept window
             "HumanMessage",  # the memory entry
             "HumanMessage",  # the knowledge entry
@@ -1070,6 +1071,7 @@ class TestAppendOnlyLayout:
             "system",
             "summary",
             "HumanMessage",  # the restated todo list
+            "HumanMessage",  # the pointer back to the brief
             "HumanMessage",  # the kept reminder, carrying the entries again
         ]
         assert req2[-1].content.startswith(reminder.content)
