@@ -357,6 +357,13 @@ limit impact when individual assumptions fail:
   service readiness. Individual operations still authorize at execution time.
 - **Human gates** can require approval for tool calls, privileged commands,
   workspace upgrades, job completion, or file-effect application.
+- **An MCP server's questions** are declined unless its connector, or the
+  administrator's default, accepts them, and that setting answers only yes/no
+  confirmations. Typed input and links are answered only by a person in a
+  Read-only or Auto-accept session; a job declines them. The card tells the
+  user never to enter passwords or keys, a link opens only on click in a new
+  tab that cannot reach SRW's page, and the model learns only that the user
+  answered, not what they typed.
 - **NetworkPolicy tiers** constrain workspace egress and in-cluster reach. They
   work only when the cluster CNI or paired controller actually enforces
   Kubernetes NetworkPolicy.
