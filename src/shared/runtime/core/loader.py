@@ -1968,13 +1968,13 @@ class InstructionMatrixResolver(MatrixResolver):
         "live_tactical_todos": "live_tactical_todos.yaml",
         "live_post_session_todos": "live_post_session_todos.yaml",
         "workspace_template": "workspace_template.md",
-        # Agent-mode jobs (shared.job_mode): the one to-do at the start and
-        # after a resume, and the standing instructions for an expert that has
-        # no instructions file of its own. Frozen only for an agent-mode job,
+        # Jobs without phases (shared.job_phases): the one to-do at the start
+        # and after a resume, and the standing instructions for an expert that
+        # has no instructions file of its own. Frozen only for such a job,
         # under the keys the worker already reads (serialize_resolved_config).
-        "agent_todos_initial": "agent_todos_initial.yaml",
-        "agent_todos_resume": "agent_todos_resume.yaml",
-        "agent_instructions": "agent_instructions.md",
+        "direct_task_todos_initial": "direct_task_todos_initial.yaml",
+        "direct_task_todos_resume": "direct_task_todos_resume.yaml",
+        "direct_task_instructions": "direct_task_instructions.md",
     }
 
 
@@ -5952,23 +5952,24 @@ def ensure_phase_skill_bindings(
 
 
 # =============================================================================
-# Agent mode (shared.job_mode) — one task in one loop, written at admission
+# A job without phases (shared.job_phases) — one task, written at admission
 # =============================================================================
 #
-# An agent-mode job runs on the unchanged worker graph: it stays in strategic
-# phase 0, works through one predefined to-do and ends on one job_complete.
-# Everything that makes it do so is written into the frozen configuration by
-# the orchestrator's resolver (apply_agent_job_mode on the merged config,
-# serialize_resolved_config for the frozen texts); the worker never reads the
-# mode itself.
+# A job whose configuration does not ask for phases runs on the unchanged
+# worker graph: it stays in strategic phase 0, works through one predefined
+# to-do and ends on one job_complete. Everything that makes it do so is
+# written into the frozen configuration by the orchestrator's resolver
+# (apply_no_phases on the merged config, serialize_resolved_config for the
+# frozen texts); the worker never reads the setting itself.
 
-#: Instruction types that exist only for agent-mode jobs. They are frozen under
-#: the keys the worker already reads (``strategic_todos_*``, ``instructions``)
-#: and never under their own names, so a worker-mode blob does not change.
-AGENT_MODE_INSTRUCTION_TYPES: Tuple[str, ...] = (
-    "agent_todos_initial",
-    "agent_todos_resume",
-    "agent_instructions",
+#: Instruction types that exist only for jobs without phases. They are frozen
+#: under the keys the worker already reads (``strategic_todos_*``,
+#: ``instructions``) and never under their own names, so the blob of a job
+#: with phases does not change.
+DIRECT_TASK_INSTRUCTION_TYPES: Tuple[str, ...] = (
+    "direct_task_todos_initial",
+    "direct_task_todos_resume",
+    "direct_task_instructions",
 )
 
 
@@ -5991,8 +5992,8 @@ def _tactical_only_tool_names() -> List[str]:
     return names
 
 
-def apply_agent_job_mode(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the merged worker config ``data`` rewritten for an agent-mode job.
+def apply_no_phases(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the merged worker config ``data`` rewritten for a job without phases.
 
     * ``tools.core`` loses the phase-procedure tools and gains ``job_complete``
       when it is missing; the order of the remaining names is kept.
@@ -6001,16 +6002,16 @@ def apply_agent_job_mode(data: Dict[str, Any]) -> Dict[str, Any]:
       The remaining ``phase_start:tactical`` entries move to
       ``phase_start:strategic``, because the job never enters a tactical phase
       and an expert's domain guide bound there must still arrive. The
-      ``agent-mode`` skill is bound first, at ``phase_start:strategic``.
+      ``direct-task`` skill is bound first, at ``phase_start:strategic``.
     * ``phase_settings.strategic_tools`` gains every tactical-only tool of the
       catalog and ``job_complete``, so the per-call phase gate refuses none of
       the job's tools in its one strategic phase.
 
     Pure (``data`` is not modified) and idempotent. The caller decides whether
-    the job is in agent mode; subagent roster entries are not touched.
+    the job plans in phases; subagent roster entries are not touched.
     """
-    from shared.job_mode import (
-        AGENT_MODE_SKILL,
+    from shared.job_phases import (
+        DIRECT_TASK_SKILL,
         PHASE_PROCEDURE_SKILLS,
         PHASE_PROCEDURE_TOOLS,
     )
@@ -6027,9 +6028,9 @@ def apply_agent_job_mode(data: Dict[str, Any]) -> Dict[str, Any]:
         # practice; a policy shape (true, {only: ...}) is expanded first.
         from shared.runtime.core.tool_policy import normalize_tool_policy
 
-        core = normalize_tool_policy(
-            {"tools": {"core": core}}, source="agent-job-mode"
-        )["tools"]["core"]
+        core = normalize_tool_policy({"tools": {"core": core}}, source="job-phases")[
+            "tools"
+        ]["core"]
         if not isinstance(core, (list, tuple)):
             core = []
     kept_tools = [name for name in core if name not in PHASE_PROCEDURE_TOOLS]
@@ -6040,7 +6041,7 @@ def apply_agent_job_mode(data: Dict[str, Any]) -> Dict[str, Any]:
 
     bindings: List[Any] = [
         {
-            "skill": AGENT_MODE_SKILL,
+            "skill": DIRECT_TASK_SKILL,
             "trigger": "phase_start:strategic",
             "enforce": False,
         }
@@ -6051,7 +6052,7 @@ def apply_agent_job_mode(data: Dict[str, Any]) -> Dict[str, Any]:
             bindings.append(entry)
             continue
         skill = entry.get("skill")
-        if skill in PHASE_PROCEDURE_SKILLS or skill == AGENT_MODE_SKILL:
+        if skill in PHASE_PROCEDURE_SKILLS or skill == DIRECT_TASK_SKILL:
             continue
         kind, _, target = str(entry.get("trigger") or "").partition(":")
         if kind == "before_tool" and target in PHASE_PROCEDURE_TOOLS:
@@ -6085,7 +6086,7 @@ def _is_single_todo_template(
 ) -> bool:
     """True when ``content`` renders and parses to exactly one to-do.
 
-    An agent-mode job with more than one to-do can never end: ``job_complete``
+    A job without phases that has more than one to-do can never end: ``job_complete``
     closes the open to-do only when exactly one is pending. The template is
     rendered with the configured tool names, as the worker renders it with the
     loaded ones.
@@ -6099,17 +6100,17 @@ def _is_single_todo_template(
         return False
 
 
-def _freeze_agent_mode_instructions(
+def _freeze_direct_task_instructions(
     instructions: Dict[str, Any], config: "AgentConfig", model_family: str
 ) -> None:
-    """Write an agent-mode job's texts into ``instructions`` (the frozen map).
+    """Write the texts of a job without phases into ``instructions`` (the frozen map).
 
-    The one to-do (``agent_todos_initial``) is frozen under both
+    The one to-do (``direct_task_todos_initial``) is frozen under both
     ``strategic_todos_initial`` and ``strategic_todos_transition`` and the
-    resume to-do (``agent_todos_resume``) under ``strategic_todos_resume``:
+    resume to-do (``direct_task_todos_resume``) under ``strategic_todos_resume``:
     the keys the worker's three to-do getters read. Lookup is location-first,
     so an expert may ship its own files; one that does not parse to exactly
-    one to-do is replaced by the framework's. ``agent_instructions`` replaces
+    one to-do is replaced by the framework's. ``direct_task_instructions`` replaces
     ``instructions`` only when the job would otherwise get the framework's
     default file; an expert's own ``instructions.md`` stays.
     """
@@ -6138,10 +6139,10 @@ def _freeze_agent_mode_instructions(
         except FileNotFoundError:
             return None
 
-    initial = one_todo("agent_todos_initial")
+    initial = one_todo("direct_task_todos_initial")
     instructions["strategic_todos_initial"] = initial
     instructions["strategic_todos_transition"] = initial
-    instructions["strategic_todos_resume"] = one_todo("agent_todos_resume")
+    instructions["strategic_todos_resume"] = one_todo("direct_task_todos_resume")
 
     try:
         source = resolver._resolve_path("instructions").resolve()
@@ -6152,7 +6153,7 @@ def _freeze_agent_mode_instructions(
         framework_default = True
     if framework_default:
         try:
-            instructions["instructions"] = resolver.load("agent_instructions")
+            instructions["instructions"] = resolver.load("direct_task_instructions")
         except FileNotFoundError:
             pass
 
@@ -7929,28 +7930,28 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     instr_resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
     instructions = {}
     for it in InstructionMatrixResolver.HARDCODED_DEFAULTS:
-        if it in AGENT_MODE_INSTRUCTION_TYPES:
+        if it in DIRECT_TASK_INSTRUCTION_TYPES:
             continue
         try:
             instructions[it] = instr_resolver.load(it)
         except FileNotFoundError:
             instructions[it] = None
 
-    # An agent-mode job's to-dos and standing instructions replace the
+    # The to-dos and standing instructions of a job without phases replace the
     # procedure's under the keys the worker reads. Only a config the worker
-    # resolver rewrote for the mode gets them (apply_agent_job_mode binds the
-    # agent-mode skill at the strategic phase start): a session keeps every
-    # key it inherits, job_mode included, and the mode does nothing there.
-    # ``job_mode`` is no AgentConfig field, so it arrives in ``extra``.
-    from shared.job_mode import AGENT_MODE_SKILL, JOB_MODE_KEY, is_agent_mode
+    # resolver rewrote for such a job gets them (apply_no_phases binds the
+    # direct-task skill at the strategic phase start): a session never gets
+    # that binding, so the setting does nothing there. ``phases`` is no
+    # AgentConfig field, so it arrives in ``extra``.
+    from shared.job_phases import DIRECT_TASK_SKILL, PHASES_KEY, plans_in_phases
 
-    if is_agent_mode(
-        {JOB_MODE_KEY: getattr(config, JOB_MODE_KEY, config.extra.get(JOB_MODE_KEY))}
+    if not plans_in_phases(
+        {PHASES_KEY: getattr(config, PHASES_KEY, config.extra.get(PHASES_KEY))}
     ) and any(
-        entry.skill == AGENT_MODE_SKILL and entry.trigger == "phase_start:strategic"
+        entry.skill == DIRECT_TASK_SKILL and entry.trigger == "phase_start:strategic"
         for entry in config.instruction_files
     ):
-        _freeze_agent_mode_instructions(instructions, config, model_family)
+        _freeze_direct_task_instructions(instructions, config, model_family)
 
     # Also resolve custom instruction files from config.instruction_files
     # (e.g. research_guide.md) AND bound skills (skill:) — these aren't in the

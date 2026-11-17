@@ -17,13 +17,13 @@ import copy
 import logging
 from typing import Awaitable, Callable, Optional
 
-from shared.job_mode import is_agent_mode
+from shared.job_phases import PHASES_KEY, plans_in_phases
 from shared.runtime.core.loader import (
     INHERIT_MODEL,
     ROLE_ROOTS,
     ROOT_NAMES,
     _apply_settings_matrix,
-    apply_agent_job_mode,
+    apply_no_phases,
     authored_llm_keys,
     canonical_config_name,
     deep_merge,
@@ -327,18 +327,21 @@ def resolve_config(
     # its phase guidance silently. Restored here, before the capture and the
     # freeze, so the PDP view and the blob agree.
     #
-    # An agent-mode job (shared.job_mode) skips that floor: its tools, bindings
-    # and phase gate are rewritten for one task in one loop instead. This has
-    # to run before the capture too: the captured fragment is stored as the
-    # job's policy, whose `tools` section is merged back onto the frozen blob
-    # at every dispatch, so a tool removed after the capture would return.
-    # Roster entries are resolved below from their own layers and keep their
-    # tools.
+    # Only a job that plans in phases (shared.job_phases) gets that floor. A
+    # job without phases, the default, has its tools, bindings and phase gate
+    # rewritten for one task instead. This has to run before the capture too:
+    # the captured fragment is stored as the job's policy, whose `tools`
+    # section is merged back onto the frozen blob at every dispatch, so a tool
+    # removed after the capture would return. Roster entries are resolved
+    # below from their own layers and keep their tools. The effective value is
+    # written back, so the frozen blob always states it.
     if role == "worker":
-        if is_agent_mode(data):
-            data = apply_agent_job_mode(data)
-        else:
+        if plans_in_phases(data):
             data = ensure_worker_phase_skill_bindings(data)
+            data[PHASES_KEY] = True
+        else:
+            data = apply_no_phases(data)
+            data[PHASES_KEY] = False
 
     # Roster materialisation: every `subagents.roster` entry becomes its fully
     # merged subagent-role config (pruning point 3 of 3 runs per entry inside).

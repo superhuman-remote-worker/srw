@@ -135,12 +135,14 @@ class PublicJobListItem(BaseModel):
     )
     cloud_review_mode: str
     exported_folder_url: str | None
-    job_mode: str = Field(
+    phases: bool | None = Field(
         description=(
-            "How the job runs: 'worker' (the planned procedure in phases) or "
-            "'agent' (one task in one loop). Read from the job's requested "
-            "configuration; a mode that only an expert's default names shows "
-            "as 'worker' here, and the job detail shows the effective one."
+            "Whether the job plans in phases: true (the planned procedure in "
+            "phases, for long work) or false (the job works on its task "
+            "directly and ends with job_complete). Decided when the job was "
+            "created, from its own override, the project default or its "
+            "expert. Null for a job from before this setting and for one on a "
+            "custom harness."
         )
     )
 

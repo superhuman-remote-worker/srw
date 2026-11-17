@@ -161,7 +161,7 @@ def test_health_build_info_reports_digest_provenance_and_artifact_match(
 
     info = _build_info(artifact)
 
-    assert info["tool_schema_revision"] == "17"
+    assert info["tool_schema_revision"] == "18"
     assert info["tool_schema_digest"] == schema["digest"]
     assert info["schema_artifact_digest"] == schema["digest"]
     assert info["schema_artifact_status"] == "match"
@@ -193,7 +193,7 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         "context",
         "slot",
         "workspace",
-        "job_mode",
+        "phases",
     } <= set(job_fields)
     # project_id is deliberately model-visible on both lanes (explicit value
     # wins over the hidden lineage default); the rest of the lineage stays
@@ -216,15 +216,17 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         "context",
         "required_deliverables",
         "workspace",
-        "job_mode",
+        "phases",
     } <= set(project_job_fields)
-    # The mode is a closed vocabulary on both creation tools: the raw MCP
-    # schema names its two values, so a client sees them without prose.
+    # ``phases`` is an optional boolean on both creation tools: the raw MCP
+    # schema types it, so a client sees true/false without prose, and an
+    # omitted value (the expert's own setting) is the default.
     for fields in (job_fields, project_job_fields):
-        (choice,) = [
-            branch for branch in fields["job_mode"]["anyOf"] if "enum" in branch
-        ]
-        assert choice["enum"] == ["worker", "agent"]
+        assert {branch.get("type") for branch in fields["phases"]["anyOf"]} == {
+            "boolean",
+            "null",
+        }
+        assert fields["phases"].get("default") is None
     assert project_job_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in project_job_fields["datasource_ids"]
 

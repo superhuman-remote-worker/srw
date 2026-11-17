@@ -1,6 +1,6 @@
 ---
 name: delegate-a-job
-description: Use before creating a worker job that needs a specific model, a VM or lite workspace, different lifecycle passes, or agent mode for a small task — the config_override knobs and job_mode, and what each one costs.
+description: Use before creating a worker job that needs a specific model, a VM or lite workspace, different lifecycle passes, or the planned procedure in phases for long work — the config_override knobs and phases, and what each one costs.
 display_name: Delegate a Job
 icon: rocket_launch
 color: "#89b4fa"
@@ -63,12 +63,14 @@ leave the project's knowledge better than it found it.
 Lets the job run to completion without pausing for review. Capped by your
 `autonomy_ceiling` grant.
 
-**Job mode** — `job_mode="agent"` on `create_job`
+**Phases** — `phases=True` or `phases=False` on `create_job`
 
-Use it for a small task with an obvious end; the worker then skips the plan
-and the phases and does the task in one loop. Leave it out for anything long
-or open-ended. Any expert can run in either mode. An agent-mode job stops only
-at its end, so `partial`, `guided` and `dependent` autonomy act like `review`.
+Leave it out to use the expert's own setting. Pass `True` for long or
+open-ended work on an expert that does not plan in phases by itself: the
+worker then plans, works through todos in phases and reviews its result. Pass
+`False` to have an expert that plans in phases do a small task directly. A
+job without phases stops only at its end, so `partial`, `guided` and
+`dependent` autonomy act like `review`.
 
 **Memory** — `{"memory": {"required": true}}`
 

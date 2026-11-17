@@ -683,8 +683,14 @@ class TestJobCreateBoundary:
             JobCreate(description="d", config_override={"autonomy": "full"}),
         )
         persisted = job_db.create_job.await_args.kwargs["config_override"]
-        # No tools key appears; the workspace is the defaults chain's (Slice A2b).
-        assert persisted == {"autonomy": "full", "workspace": {"backend": "sandbox"}}
+        # No tools key appears; the workspace is the defaults chain's (Slice A2b),
+        # and admission states the effective ``phases`` setting: no expert, so
+        # the default.
+        assert persisted == {
+            "autonomy": "full",
+            "workspace": {"backend": "sandbox"},
+            "phases": False,
+        }
 
 
 # =============================================================================

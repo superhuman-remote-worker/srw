@@ -15,12 +15,13 @@ expert actually grants, and pin:
 - a frozen pre-U2 template keeps its phase swap for resume compatibility, while
   every newly resolved template is phase-agnostic.
 
-An agent-mode job binds none of the phase tools (it does one task in one loop
-and ends on ``job_complete``). Every template keeps the phased procedure inside
+A job without phases binds none of the phase tools (it does one task and
+ends on ``job_complete``). Every template keeps the phased procedure inside
 ``has_tool("next_phase_todos")`` blocks, so the same expert x family render with
-the agent-mode tool list must name none of it, must name ``job_complete``, and
-must not leave a gap where a block dropped out. Worker-mode renders are pinned
-byte for byte by ``test_worker_mode_prompts_unchanged.py``.
+the tool list of a job without phases must name none of it, must name
+``job_complete``, and must not leave a gap where a block dropped out. The
+renders of a job that plans in phases are pinned byte for byte by
+``test_phased_prompts_unchanged.py``.
 
 Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
 """
@@ -32,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from shared.job_mode import PHASE_PROCEDURE_TOOLS
+from shared.job_phases import PHASE_PROCEDURE_TOOLS
 from shared.runtime.core.loader import (
     PHASE_SKILLS,
     PromptMatrixResolver,
@@ -91,10 +92,11 @@ _PER_CALL_GATE_SENTENCE = (
     "calling one outside its phase returns an error for that call without "
     "affecting the other calls in the batch."
 )
-#: The tools of the phased procedure. An agent-mode job binds none of them and
-#: binds ``job_complete`` instead.
+#: The tools of the phased procedure. A job without phases binds none of them
+#: and binds ``job_complete`` instead.
 _PHASE_TOOLS = PHASE_PROCEDURE_TOOLS
-#: Text about the phased procedure that an agent-mode prompt must not carry.
+#: Text about the phased procedure that the prompt of a job without phases
+#: must not carry.
 _PHASE_PROCEDURE_TEXT = (
     "todo_complete",
     "next_phase_todos",
@@ -146,8 +148,8 @@ def _granted_tools(leaf: Path) -> list[str]:
     return sorted(names)
 
 
-def _agent_mode_tools(tools: list[str]) -> list[str]:
-    """An agent-mode job's tools: the phase tools removed, ``job_complete`` added."""
+def _no_phases_tools(tools: list[str]) -> list[str]:
+    """A job without phases: the phase tools removed, ``job_complete`` added."""
     return sorted((set(tools) - set(_PHASE_TOOLS)) | {"job_complete"})
 
 
@@ -249,20 +251,20 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
 
 
 # ---------------------------------------------------------------------------
-# The same system prompt for an agent-mode job (no phase tools)
+# The same system prompt for a job without phases (no phase tools)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("family", sorted(_FAMILY_MODELS))
 @pytest.mark.parametrize("name,leaf", _WORKERS, ids=_WORKER_IDS)
-def test_agent_mode_system_prompt_names_no_phase_procedure(name, leaf, family):
+def test_no_phases_system_prompt_names_no_phase_procedure(name, leaf, family):
     cfg = _config(leaf)
     worker_tools = _granted_tools(leaf)
-    tools = _agent_mode_tools(worker_tools)
+    tools = _no_phases_tools(worker_tools)
     model = _FAMILY_MODELS[family]
 
     prompt = get_system_prompt(cfg, model=model, tool_names=tools)
-    label = f"{name}/{family} agent-mode system prompt"
+    label = f"{name}/{family} system prompt without phases"
     _assert_clean(prompt, label)
     assert cfg.display_name in prompt, label
     # The persona is the expert's own prose, not the scaffold's; some personas
@@ -283,20 +285,20 @@ def test_agent_mode_system_prompt_names_no_phase_procedure(name, leaf, family):
     assert strategic == prompt, label
 
 
-#: Agent-mode tool lists that take each other condition of the templates
-#: (``kb_write``, ``memory_search``, ``delegate_agent``) both ways.
-_AGENT_MODE_TOOL_LISTS = {
-    "every_tool": _agent_mode_tools(sorted(TOOL_REGISTRY)),
+#: Tool lists of a job without phases that take each other condition of the
+#: templates (``kb_write``, ``memory_search``, ``delegate_agent``) both ways.
+_NO_PHASES_TOOL_LISTS = {
+    "every_tool": _no_phases_tools(sorted(TOOL_REGISTRY)),
     "job_complete_only": ["job_complete"],
 }
 
 
-@pytest.mark.parametrize("tool_list", sorted(_AGENT_MODE_TOOL_LISTS))
+@pytest.mark.parametrize("tool_list", sorted(_NO_PHASES_TOOL_LISTS))
 @pytest.mark.parametrize("template", _worker_templates(), ids=lambda p: p.name)
-def test_every_worker_template_renders_for_an_agent_mode_job(template, tool_list):
+def test_every_worker_template_renders_for_a_job_without_phases(template, tool_list):
     raw = template.read_text(encoding="utf-8")
     assert 'has_tool("next_phase_todos")' in raw, template.name
-    tools = _AGENT_MODE_TOOL_LISTS[tool_list]
+    tools = _NO_PHASES_TOOL_LISTS[tool_list]
     rendered = render_instruction_content(raw, tools)
     label = f"{template.name} ({tool_list})"
     assert rendered.strip(), label
@@ -306,11 +308,11 @@ def test_every_worker_template_renders_for_an_agent_mode_job(template, tool_list
     assert rendered != with_phase_tools, label
 
 
-@pytest.mark.parametrize("tool_list", sorted(_AGENT_MODE_TOOL_LISTS))
+@pytest.mark.parametrize("tool_list", sorted(_NO_PHASES_TOOL_LISTS))
 @pytest.mark.parametrize("expert", ["engineer", "designer"])
-def test_expert_instructions_name_no_phase_procedure_in_agent_mode(expert, tool_list):
+def test_expert_instructions_name_no_phase_procedure_without_phases(expert, tool_list):
     raw = (_CONFIG / "experts" / expert / "instructions.md").read_text(encoding="utf-8")
-    tools = _AGENT_MODE_TOOL_LISTS[tool_list]
+    tools = _NO_PHASES_TOOL_LISTS[tool_list]
     rendered = render_instruction_content(raw, tools)
     label = f"{expert} instructions ({tool_list})"
     assert rendered.strip(), label

@@ -200,16 +200,25 @@ class TestJobErrorFormatters:
             assert "Status: cancelled" not in rendered
 
     @pytest.mark.parametrize(
-        ("job_mode", "expected"),
-        [("agent", "Mode: agent"), ("worker", "Mode: worker"), (None, "Mode: worker")],
+        ("phases", "expected"),
+        [
+            (True, ["Plans in phases: yes"]),
+            (False, ["Plans in phases: no"]),
+            # A job from before the setting, or on a custom harness, states
+            # none: no line rather than a guess.
+            (None, []),
+            ("missing", []),
+        ],
     )
-    def test_job_detail_names_the_job_mode(self, job_mode, expected):
+    def test_job_detail_says_whether_the_job_plans_in_phases(self, phases, expected):
         job = {"id": "job1", "status": "processing", "config_name": "general-worker"}
-        if job_mode is not None:
-            job["job_mode"] = job_mode
+        if phases != "missing":
+            job["phases"] = phases
         lines = format_job_detail(job).splitlines()
-        # One line, worker for a job row that carries no mode.
-        assert [line for line in lines if line.startswith("Mode:")] == [expected]
+        assert [line for line in lines if line.startswith("Plans in phases:")] == (
+            expected
+        )
+        assert not any(line.startswith("Mode:") for line in lines)
 
     def test_operator_pause_hold_is_visible_in_job_detail(self):
         held = {

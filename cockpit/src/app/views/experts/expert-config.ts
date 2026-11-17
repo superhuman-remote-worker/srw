@@ -16,6 +16,7 @@ export const MANAGED_CONFIG_KEYS: ReadonlySet<string> = new Set([
   'autonomy',
   'scholar',
   'verification', // execution-group (worker)
+  'phases', // the editor's "Plans in phases" toggle (worker)
   'interactive', // execution-group (session) + advanced-accordion
   'memory',
   'limits',

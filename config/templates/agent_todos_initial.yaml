@@ -1,7 +1,0 @@
-# The one to-do of an agent-mode job (shared/job_mode.py), frozen at admission
-# as its start and transition to-do. An expert may ship its own copy; one that
-# does not hold exactly one to-do is replaced by this file.
-todos:
-  - id: 1
-    content: >-
-      Do the task in the brief. When it is done, call job_complete.

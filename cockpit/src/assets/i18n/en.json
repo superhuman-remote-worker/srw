@@ -584,8 +584,7 @@
       "project": "Project",
       "noProject": "No project",
       "projectPersonal": "(Personal)",
-      "projectFixed": "Set when the automation was created; it can't be changed.",
-      "jobMode": "Job mode"
+      "projectFixed": "Set when the automation was created; it can't be changed."
     },
     "preview": {
       "timezoneNote": "Times are shown in {{tz}}. The orchestrator stores schedules in UTC and applies DST automatically.",
@@ -794,6 +793,7 @@
     "noJobsHintFilter": "Try selecting a different filter",
     "noJobsHintEmpty": "Create a new job to get started",
     "snapshotsSummary": "{{count}} snapshots · {{size}}",
+    "phasesBadge": "Phases",
     "count": "{{start}}–{{end}} of {{total}} jobs",
     "colJob": "Job",
     "colProject": "Project",
@@ -914,6 +914,7 @@
       "moreActions": "More actions",
       "openCloudFolder": "Open this job's cloud folder in a new tab",
       "pauseJob": "Pause job",
+      "phasesBadge": "This job plans in phases",
       "promoteJob": "Promote to project",
       "retryRecovery": "Retry the paused workspace recovery",
       "resumeJob": "Resume from checkpoint",
@@ -993,19 +994,6 @@
       "removeFile": "Remove file",
       "settingsStillLoading": "The settings are still loading. Try again in a moment."
     },
-    "mode": {
-      "label": "Job mode",
-      "worker": {
-        "label": "Worker mode",
-        "option": "Worker mode (big tasks)",
-        "hint": "A coworker for big tasks: plans the work, works through todos in phases and reviews the result."
-      },
-      "agent": {
-        "label": "Agent mode",
-        "option": "Agent mode (small tasks)",
-        "hint": "An agent for small tasks: does the task in one loop, without a plan or phases."
-      }
-    },
     "detail": {
       "auditSteps": "Audit steps",
       "cost": "Cost",
@@ -1018,7 +1006,9 @@
       "costUnpriced": "Metered, but no rate card covers these models — tokens are exact, cost is unknown.",
       "duration": "Duration",
       "expert": "Expert",
-      "mode": "Job mode",
+      "phases": "Plans in phases",
+      "phasesNo": "No",
+      "phasesYes": "Yes",
       "heldForReview": "Held for review",
       "loading": "Loading details…",
       "model": "Model",
@@ -2885,6 +2875,8 @@
       "summarizationPlaceholder": "Framework default",
       "otherKeys": "Other config keys (JSON)",
       "otherKeysHint": "Config keys the controls above don't cover, such as instruction_files. Credential sections are rejected on save.",
+      "phases": "Plans in phases",
+      "phasesHint": "Off: a job on this expert gets its task, works on it with its tools and ends when it is done. On: the job plans, works through to-dos in phases and reviews its result. Turn it on for long, open-ended work that runs for hours. Applies to jobs, not to sessions.",
       "sections": {
         "persona": {
           "title": "Persona and instructions"
@@ -2918,6 +2910,7 @@
         "workspace": "{{value}} workspace",
         "scholar": "scholar on",
         "critic": "critic on",
+        "phases": "plans in phases",
         "advancedSet": "{{n}} set by this expert",
         "advancedDefaults": "Framework defaults"
       }
@@ -4348,8 +4341,7 @@
       "dependent": {
         "label": "Dependent",
         "description": "Freezes after every phase (strategic and tactical)"
-      },
-      "agentModeNote": "In agent mode a job stops once, at its end, so this level works like Review."
+      }
     },
     "permissionModes": {
       "read_only": {
@@ -4693,7 +4685,7 @@
       "noJobHint": "Todos will appear here",
       "noTodos": "No todos in this phase",
       "planningHint": "The agent may be in strategic planning",
-      "agentModeHint": "This job runs in agent mode and has no todo list to show.",
+      "directTaskHint": "This job does its task directly, without phases, and has no todo list to show.",
       "archiveHint": "This archive has no recorded todos"
     },
     "priorityHigh": "HIGH",

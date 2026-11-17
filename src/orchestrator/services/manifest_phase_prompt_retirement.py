@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import logging
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 from orchestrator.schemas.expert_catalog import RETIRED_EXPERT_PROMPT_KEYS
@@ -71,14 +71,23 @@ def strip_retired_prompts(value: Any) -> bool:
     return changed
 
 
-def _stripped(row: dict[str, Any]) -> tuple[dict, dict, str] | None:
-    """``(document, resolved, revision)`` without the keys, or None when the row
-    carries none. Raises :class:`_Skip` when the stored revision is not the
-    digest of the stored resolved spec."""
+#: Rewrites an Expert spec, or a Project spec with inline copies, in place and
+#: says whether it changed anything. ``expert_phases_backfill`` reuses this
+#: module's save machinery with its own.
+SpecTransform = Callable[[Any], bool]
+
+
+def _stripped(
+    row: dict[str, Any], transform: SpecTransform = strip_retired_prompts
+) -> tuple[dict, dict, str] | None:
+    """``(document, resolved, revision)`` after ``transform`` (by default:
+    without the retired keys), or None when it changes nothing in the row.
+    Raises :class:`_Skip` when the stored revision is not the digest of the
+    stored resolved spec."""
     document = deepcopy(row["document"])
     resolved = deepcopy(row["resolved"])
-    changed = strip_retired_prompts(document.get("spec"))
-    changed = strip_retired_prompts(resolved.get("spec")) or changed
+    changed = transform(document.get("spec"))
+    changed = transform(resolved.get("spec")) or changed
     if not changed:
         return None
     if content_revision(row["resolved"]["spec"]) != row["revision"]:
@@ -106,11 +115,16 @@ async def _save(store: ManifestStore, row, document, resolved, revision, deps):
     return saved
 
 
-async def _retire_project(db, store: ManifestStore, uid: UUID) -> bool:
+async def _retire_project(
+    db,
+    store: ManifestStore,
+    uid: UUID,
+    transform: SpecTransform = strip_retired_prompts,
+) -> bool:
     row = await store.by_id(uid)
     if row is None or row["kind"] != "Project":
         return False
-    own = _stripped(row)
+    own = _stripped(row, transform)
     children = [
         decoded(child)
         for child in await db.fetch(
@@ -121,7 +135,7 @@ async def _retire_project(db, store: ManifestStore, uid: UUID) -> bool:
     ]
     child_revisions: dict[str, str] = {}
     for child in children:
-        stripped = _stripped(child)
+        stripped = _stripped(child, transform)
         if stripped is None:
             continue
         document, resolved, revision = stripped
@@ -148,11 +162,16 @@ async def _retire_project(db, store: ManifestStore, uid: UUID) -> bool:
     return True
 
 
-async def _retire_expert(db, store: ManifestStore, uid: UUID) -> bool:
+async def _retire_expert(
+    db,
+    store: ManifestStore,
+    uid: UUID,
+    transform: SpecTransform = strip_retired_prompts,
+) -> bool:
     row = await store.by_id(uid)
     if row is None or row["kind"] != "Expert" or row.get("managed_by"):
         return False
-    stripped = _stripped(row)
+    stripped = _stripped(row, transform)
     if stripped is None:
         return False
     document, resolved, revision = stripped

@@ -8,7 +8,14 @@ command fields. Never use this projection to authorize submitted identity.
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, WithJsonSchema, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+    StrictBool,
+    WithJsonSchema,
+)
 
 from orchestrator.schemas.execution_selection import ExecutionSelection
 from orchestrator.schemas.inline_expert import (
@@ -219,18 +226,17 @@ class JobCreate(BaseModel):
             "execution.session; refused without one."
         ),
     )
-    job_mode: Literal["worker", "agent"] | None = Field(
+    phases: StrictBool | None = Field(
         None,
         description=(
-            "How the job runs. 'worker' (the default) is the planned "
-            "procedure for big tasks: it plans, works through to-dos in "
-            "phases and reviews its work. 'agent' does one small task with an "
-            "obvious end in one loop and ends it with job_complete. Any "
-            "expert can run in either mode. Omit to use the mode the "
-            "configuration names (the expert's or the project's default, "
-            "else 'worker'). Stored as config_override.job_mode; a different "
-            "value there is refused. Agent mode cannot be combined with "
-            "live_session."
+            "Whether the job plans in phases. Omit to use what the "
+            "configuration says: the project's default, else the expert's "
+            "setting, else false. false: the job gets a kickoff prompt, works "
+            "with its tools and ends with job_complete. true: the planned "
+            "procedure for long work: it plans, works through to-dos in "
+            "phases and reviews its work. Stored as config_override.phases; a "
+            "different value there is refused. A live-session job always "
+            "plans in phases, so false cannot be combined with live_session."
         ),
     )
 
@@ -287,7 +293,7 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "workspace",
     "execution_lane",
     "live_session",
-    "job_mode",
+    "phases",
 )
 
 

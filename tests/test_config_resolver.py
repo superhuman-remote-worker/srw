@@ -430,30 +430,93 @@ def test_no_per_model_window_falls_back_to_family_default():
 def test_worker_base_only_matches_load_agent_config():
     """Worker twin of the fidelity guard: the worker root is expert_base +
     the worker overlay, and the resolver's explicit-llm-key handling for that
-    pair must equal the agent's from_config path."""
+    pair must equal the agent's from_config path. The worker files describe
+    the phased procedure, so the comparison is made for a job that plans in
+    phases; the resolver states the setting in the blob, the file does not."""
+    path, dep = resolve_config_path("worker_base")
+    cfg = load_agent_config(path, dep)
+    expected = serialize_resolved_config(cfg, model=cfg.llm.model)
+
+    blob = resolve_config(
+        base_config_name="worker_base",
+        expert_type="worker",
+        request_override={"phases": True},
+    )
+
+    agent = dict(blob["agent"])
+    assert agent.pop("phases") is True
+    assert agent == expected["agent"]
+    assert blob["prompts"] == expected["prompts"]
+    assert blob["instructions"] == expected["instructions"]
+
+
+def test_worker_base_default_differs_from_load_agent_config_only_by_phases():
+    """Without ``phases`` a worker job does not plan in phases: the resolver
+    rewrites the tools, the skill bindings, the phase gate and the frozen
+    to-dos for one task, states ``phases: false``, and leaves the rest of the
+    blob as the agent's from_config path builds it."""
+    from shared.job_phases import (
+        DIRECT_TASK_SKILL,
+        PHASE_PROCEDURE_SKILLS,
+        PHASE_PROCEDURE_TOOLS,
+    )
+
     path, dep = resolve_config_path("worker_base")
     cfg = load_agent_config(path, dep)
     expected = serialize_resolved_config(cfg, model=cfg.llm.model)
 
     blob = resolve_config(base_config_name="worker_base", expert_type="worker")
 
-    assert blob["agent"] == expected["agent"]
+    agent = blob["agent"]
+    assert agent["phases"] is False
+    rewritten = {"phases", "tools", "instruction_files", "phase_settings"}
+    assert {k: v for k, v in agent.items() if k not in rewritten} == {
+        k: v for k, v in expected["agent"].items() if k not in rewritten
+    }
+    assert "job_complete" in agent["tools"]["core"]
+    assert not set(agent["tools"]["core"]) & set(PHASE_PROCEDURE_TOOLS)
+    skills = [e.get("skill") for e in agent["instruction_files"]]
+    assert skills[0] == DIRECT_TASK_SKILL
+    assert agent["instruction_files"][0]["trigger"] == "phase_start:strategic"
+    assert not set(skills) & set(PHASE_PROCEDURE_SKILLS)
+    assert "job_complete" in agent["phase_settings"]["strategic_tools"]
     assert blob["prompts"] == expected["prompts"]
-    assert blob["instructions"] == expected["instructions"]
+    assert "job_complete" in blob["instructions"]["strategic_todos_initial"]
+    assert "next_phase_todos" not in blob["instructions"]["strategic_todos_initial"]
 
 
 def test_session_expert_as_worker_gets_worker_keys():
     """A session expert (assistant extends session_base) dispatched as a
-    worker re-roots onto the worker overlay: it gains the phase loop's keys."""
+    worker re-roots onto the worker overlay: it gains the phase loop's keys
+    when the job plans in phases."""
+    cap: dict = {}
+    blob = resolve_config(
+        base_config_name="assistant",
+        expert_type="worker",
+        capture=cap,
+        request_override={"phases": True},
+    )
+    merged = cap["merged_fragment"]
+    assert blob["agent"]["agent_id"] == "assistant"
+    assert merged["phases"] is True
+    assert merged["phase_settings"]["min_todos"] == 2
+    assert merged["autonomy"] == "review"
+    assert "next_phase_todos" in merged["tools"]["core"]
+    assert merged["llm"]["max_retries"] == 0
+
+
+def test_session_expert_as_worker_without_phases_gets_no_phase_tools():
+    """The same re-rooted expert without ``phases`` keeps the worker keys but
+    not the phase procedure's tools: the default job has one task."""
     cap: dict = {}
     blob = resolve_config(
         base_config_name="assistant", expert_type="worker", capture=cap
     )
     merged = cap["merged_fragment"]
-    assert blob["agent"]["agent_id"] == "assistant"
-    assert merged["phase_settings"]["min_todos"] == 2
+    assert blob["agent"]["phases"] is False
+    assert merged["phases"] is False
     assert merged["autonomy"] == "review"
-    assert "next_phase_todos" in merged["tools"]["core"]
+    assert merged["tools"]["core"] == ["job_complete"]
     assert merged["llm"]["max_retries"] == 0
 
 
@@ -646,14 +709,18 @@ def _phase_bindings(entries):
 
 def test_worker_resolution_restores_the_phase_skill_bindings_an_expert_replaced():
     """``instruction_files`` replaces wholesale on merge; the assistant (a
-    session expert) authors its own list. Dispatched as a worker it must still
-    carry the two phase bindings — they replaced the unconditional system-prompt
-    swap — restored at the front, frozen in the blob, visible to the PDP."""
+    session expert) authors its own list. Dispatched as a worker job that
+    plans in phases it must still carry the two phase bindings — they replaced
+    the unconditional system-prompt swap — restored at the front, frozen in
+    the blob, visible to the PDP."""
     from shared.runtime.core.loader import load_config_from_resolved
 
     cap: dict = {}
     blob = resolve_config(
-        base_config_name="assistant", expert_type="worker", capture=cap
+        base_config_name="assistant",
+        expert_type="worker",
+        capture=cap,
+        request_override={"phases": True},
     )
     entries = blob["agent"]["instruction_files"]
     assert [e["skill"] for e in entries[:2]] == ["strategic-phase", "tactical-phase"]
@@ -676,22 +743,30 @@ def test_worker_resolution_restores_the_phase_skill_bindings_an_expert_replaced(
         "skills/strategic-phase/SKILL.md",
         "skills/tactical-phase/SKILL.md",
     }
-    # An expert that already carries them is left alone (no duplicates).
+    # An expert that already carries them is left alone (no duplicates); the
+    # developer plans in phases by its own file.
     dev = resolve_config(base_config_name="developer", expert_type="worker")
+    assert dev["agent"]["phases"] is True
     assert len(_phase_bindings(dev["agent"]["instruction_files"])) == 2
     # Sessions have no phase loop: no floor there.
     session = resolve_config(base_config_name="assistant", expert_type="session")
     assert _phase_bindings(session["agent"]["instruction_files"]) == []
+    # A worker job without phases gets no floor either.
+    plain = resolve_config(base_config_name="assistant", expert_type="worker")
+    assert _phase_bindings(plain["agent"]["instruction_files"]) == []
 
 
 def test_a_db_expert_forked_before_u2_gets_the_phase_bindings_back():
+    # The startup backfill (expert_phases_backfill) marks such a fork
+    # ``phases: true``, so it keeps the procedure it was made for.
     row = {
         "expert_type": "worker",
         "name": "old-fork",
         "config": {
+            "phases": True,
             "instruction_files": [
                 {"skill": "todo-guide", "trigger": "before_tool:next_phase_todos"}
-            ]
+            ],
         },
         "prompts": {"strategic": "FORK STRATEGIC ADDENDUM"},
     }
@@ -717,10 +792,11 @@ def test_retired_phase_mode_override_keys_are_ignored_and_floor_is_kept():
         base_config_name="assistant",
         expert_type="worker",
         request_override={
+            "phases": True,
             "phase_settings": {
                 "prompt_mode": "legacy",
                 "tool_binding_mode": "union",
-            }
+            },
         },
     )
     assert set(blob["agent"]["phase_settings"]) == {

@@ -32,10 +32,11 @@ those tools. The form includes:
 - **Project** — use a project when the work should share its goal, eligible
   connectors, repositories, knowledge, and (when enabled) project memory.
 - **Autonomy** — when the job stops for a person's review.
-- **Job mode** — **Worker mode** for big tasks (the default: plan, todos in
-  phases, review) or **Agent mode** for small tasks (one loop, no plan). Any
-  expert can run in either mode. A job in agent mode stops once, at its end, so
-  Partial, Guided and Dependent act like Review there.
+- **Plans in phases** — a setting of the expert, not of the form. Most experts
+  have it off: the job does its task directly and ends when it is done. An
+  expert meant for long work has it on: the job plans, works through todos in
+  phases and reviews its result. A job without phases stops once, at its end,
+  so Partial, Guided and Dependent act like Review there.
 - **Priority** — **Low (backfill)**, **Normal (default)**, or **High (preempts
   lower)**.
 - **Expert** — a worker expert; session experts are not eligible for jobs.
@@ -117,11 +118,11 @@ be reached — never present it as "no activity".
 
 ## Watch the work
 
-Workspace-backed worker jobs normally alternate strategic planning and
-tactical execution. A job in agent mode does not: it does its task in one
-loop, without `plan.md` or phases. With file tools, the workspace can
-contain `plan.md`, todos, archives, inputs, notes, and `output/`
-deliverables. The exact files depend on the expert and task.
+A job on an expert that plans in phases alternates strategic planning and
+tactical execution; with file tools its workspace can contain `plan.md`,
+todos, archives, inputs, notes, and `output/` deliverables. A job without
+phases does its task directly, without `plan.md` or todos, and leaves its
+deliverables in `output/`. The exact files depend on the expert and task.
 
 Use **View** for the durable job record. **Workspace** appears when a repository
 URL is available, and **IDE** appears only for eligible live, snapshotted, or

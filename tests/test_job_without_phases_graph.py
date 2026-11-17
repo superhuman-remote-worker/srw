@@ -1,9 +1,9 @@
-"""An agent-mode job on the unchanged worker graph.
+"""A job without phases on the unchanged worker graph.
 
-The resolver freezes an agent-mode job with one predefined to-do and a tool
-list without the phase tools; the worker reads nothing else. These tests run
-the compiled graph (``tests/_agent_mode_harness.py``: real nodes, real
-``job_complete`` and ``write_file``, a scripted model, an in-memory
+The resolver freezes a job without phases with one predefined to-do and a
+tool list without the phase tools; the worker reads nothing else. These tests
+run the compiled graph (``tests/_job_without_phases_harness.py``: real nodes,
+real ``job_complete`` and ``write_file``, a scripted model, an in-memory
 checkpoint) and pin what such a job does:
 
 * it ends out of strategic phase 0 on one accepted ``job_complete``, for
@@ -28,12 +28,12 @@ import pytest
 
 from agent.tools.core.job import _final_phase_data, _missing_deliverable_refused
 from shared.runtime.services.guardrails import format_nudge
-from tests._agent_mode_harness import (
+from tests._job_without_phases_harness import (
     PHASE_SKILL,
     PHASE_WORDS,
     RESUME_TODO_TEXT,
     TODO_TEXT,
-    WORKER_TOOLS,
+    PHASED_TOOLS,
     build_job,
     job_complete_call,
     plain_reply,
@@ -165,12 +165,12 @@ class TestRequestTexts:
 
     @pytest.mark.asyncio
     async def test_the_same_job_with_the_phase_tools_keeps_todays_texts(self, tmp_path):
-        """Worker mode: the same script on the phased tool list gets the
-        original kickoff, list header, footer and reminder."""
+        """A job that plans in phases: the same script on the phased tool
+        list gets the original kickoff, list header, footer and reminder."""
         job = build_job(
             tmp_path,
             [plain_reply("Thinking."), job_complete_call()],
-            tool_names=WORKER_TOOLS,
+            tool_names=PHASED_TOOLS,
             phase_skill_body="Plan first.",
         )
 
@@ -343,7 +343,7 @@ class TestMessageWhileRunning:
         job = build_job(
             tmp_path,
             [write_file_call("call_write"), job_complete_call()],
-            tool_names=WORKER_TOOLS,
+            tool_names=PHASED_TOOLS,
         )
 
         await job.start()

@@ -1,11 +1,10 @@
 ---
-name: agent-mode
-description: The instructions of a job that runs in agent mode — do the task in the brief directly and end the job with one job_complete. Delivered automatically at the start of the job; not a skill to invoke by hand.
-display_name: Agent Mode
+name: direct-task
+description: The instructions of a job that does not plan in phases — do the task in the brief directly and end the job with one job_complete. Delivered automatically at the start of the job; not a skill to invoke by hand.
+display_name: Direct Task
 icon: bolt
 color: "#f9e2af"
 tags:
-  - mode
   - worker
 catalog: hidden
 ---

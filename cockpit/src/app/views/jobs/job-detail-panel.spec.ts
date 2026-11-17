@@ -11,8 +11,8 @@ import {
   failureReason,
   heldForReviewReason,
   jobExpertLabel,
-  jobModeFactKey,
   jobModelLabel,
+  jobPhasesFactKey,
   liveSubjobCount,
   JobDetailPanelComponent,
   type JobDetailState,
@@ -521,21 +521,24 @@ describe('jobExpertLabel', () => {
   });
 });
 
-describe('jobModeFactKey', () => {
-  it('names the mode the server returned, preferring the loaded detail', () => {
-    expect(jobModeFactKey({job_mode: 'agent'}, null)).toBe('jobs.mode.agent.label');
-    expect(jobModeFactKey({job_mode: 'worker'}, null)).toBe('jobs.mode.worker.label');
-    expect(jobModeFactKey({job_mode: 'worker'}, {job_mode: 'agent'})).toBe('jobs.mode.agent.label');
+describe('jobPhasesFactKey', () => {
+  it('says Yes or No for the value the server returned, preferring the loaded detail', () => {
+    expect(jobPhasesFactKey({phases: true}, null)).toBe('jobs.detail.phasesYes');
+    expect(jobPhasesFactKey({phases: false}, null)).toBe('jobs.detail.phasesNo');
+    expect(jobPhasesFactKey({phases: false}, {phases: true})).toBe('jobs.detail.phasesYes');
+    expect(jobPhasesFactKey({phases: true}, {phases: null})).toBe('jobs.detail.phasesYes');
   });
 
-  it('reads a job without the field as a worker job', () => {
-    expect(jobModeFactKey({}, null)).toBe('jobs.mode.worker.label');
-    expect(jobModeFactKey(null, {})).toBe('jobs.mode.worker.label');
+  it('has no value for an unknown job: null, missing or not a boolean', () => {
+    expect(jobPhasesFactKey({phases: null}, null)).toBeNull();
+    expect(jobPhasesFactKey({} as JobSummary, null)).toBeNull();
+    expect(jobPhasesFactKey(null, {phases: null})).toBeNull();
+    expect(jobPhasesFactKey({phases: 'on'} as unknown as JobSummary, null)).toBeNull();
   });
 
-  it('never derives the mode from config_override', () => {
-    const detail = {config_override: {job_mode: 'agent'}} as unknown as Job;
-    expect(jobModeFactKey({}, detail)).toBe('jobs.mode.worker.label');
+  it('never derives the value from config_override', () => {
+    const detail = {config_override: {phases: true}} as unknown as Job;
+    expect(jobPhasesFactKey({phases: null}, detail)).toBeNull();
   });
 
   describe('rendered', () => {
@@ -544,7 +547,7 @@ describe('jobModeFactKey', () => {
     });
     afterEach(() => TestBed.resetTestingModule());
 
-    function facts(jobMode: string | undefined): {labels: string[]; mode: string | undefined} {
+    function facts(phases: boolean | null | undefined): {labels: string[]; value: string | undefined} {
       TestBed.configureTestingModule({
         imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
           langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
@@ -558,27 +561,34 @@ describe('jobModeFactKey', () => {
       Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
         id: 'job-4', description: 'Rename the heading', status: 'completed',
         created_at: '2026-11-16T08:00:00Z', config_name: 'developer',
-        ...(jobMode === undefined ? {} : {job_mode: jobMode}),
+        ...(phases === undefined ? {} : {phases}),
       } as JobSummary)});
       Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
       fixture.detectChanges();
       const root = fixture.nativeElement as HTMLElement;
       return {
         labels: [...root.querySelectorAll('.detail-grid .fact-label')].map((el) => el.textContent?.trim() ?? ''),
-        mode: root.querySelector('[data-testid="job-mode-fact"] .fact-value')?.textContent?.trim(),
+        value: root.querySelector('[data-testid="job-phases-fact"] .fact-value')?.textContent?.trim(),
       };
     }
 
-    it('shows "Agent mode" right after the Expert fact', () => {
-      const {labels, mode} = facts('agent');
-      expect(mode).toBe(en.jobs.mode.agent.label);
-      expect(labels.indexOf(en.jobs.detail.mode)).toBe(labels.indexOf(en.jobs.detail.expert) + 1);
+    it('shows "Plans in phases: Yes" right after the Expert fact', () => {
+      const {labels, value} = facts(true);
+      expect(value).toBe(en.jobs.detail.phasesYes);
+      expect(labels.indexOf(en.jobs.detail.phases)).toBe(labels.indexOf(en.jobs.detail.expert) + 1);
     });
 
-    it('shows "Worker mode" for a worker job and for a row without the field', () => {
-      expect(facts('worker').mode).toBe(en.jobs.mode.worker.label);
-      TestBed.resetTestingModule();
-      expect(facts(undefined).mode).toBe(en.jobs.mode.worker.label);
+    it('shows "No" for a job that does its task directly', () => {
+      expect(facts(false).value).toBe(en.jobs.detail.phasesNo);
+    });
+
+    it('shows no row when the value is unknown', () => {
+      for (const phases of [null, undefined]) {
+        const {labels} = facts(phases);
+        expect(labels).not.toContain(en.jobs.detail.phases);
+        expect(labels).toContain(en.jobs.detail.expert);
+        TestBed.resetTestingModule();
+      }
     });
   });
 });

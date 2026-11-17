@@ -736,13 +736,9 @@
           "description": "Start inside a live session (a phone call): the Job starts tactical with the session's voice as a subagent. Requires execution.session.",
           "type": "boolean"
         },
-        "jobMode": {
-          "description": "How SRW's worker runs the Job. worker (the default) plans, works through todos in phases and reviews the result, for big or open-ended tasks. agent does one small task in one loop and ends it with job_complete. An agent-mode Job cannot be a live-session Job. Only Jobs on SRW's own worker take it.",
-          "enum": [
-            "worker",
-            "agent"
-          ],
-          "default": "worker"
+        "phases": {
+          "description": "Whether SRW's worker plans the Job in phases. false: the Job gets a kickoff prompt, works with its tools and ends with job_complete. true: it plans, works through todos in phases and reviews the result, for long or open-ended work. Omit it to use the Expert's own setting (false when it has none). A Job with liveSession always plans in phases.",
+          "type": "boolean"
         }
       }
     },

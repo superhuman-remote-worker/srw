@@ -14,7 +14,7 @@ from typing import Any, Callable, Protocol
 
 from fastapi import HTTPException
 
-from orchestrator.services.job_projection import effective_job_mode
+from orchestrator.services.job_projection import effective_phases
 
 
 class JobReadConnection(Protocol):
@@ -58,11 +58,11 @@ async def read_job(
             job["audit_count"] = await dependencies.audit_reader.get_audit_count(job_id)
         else:
             job["audit_count"] = None
-        # Read from the unredacted row: the frozen configuration says how the
-        # job runs, the requested override is the fallback.
-        job_mode = effective_job_mode(job)
+        # Read from the unredacted row: the frozen configuration says whether
+        # the job plans in phases, the value admission wrote is the fallback.
+        phases = effective_phases(job)
         result = dependencies.with_cloud_review_mode(dependencies.redact_job(job))
-        result["job_mode"] = job_mode
+        result["phases"] = phases
         return result
     except HTTPException:
         raise
@@ -94,15 +94,15 @@ async def read_project_jobs(
         async with dependencies.store.acquire() as conn:
             # The review mode reads the diff, the baseline and the checkout's
             # level (job_projection.cloud_review_mode); the summary view has
-            # none of them. The job's mode is read from its requested config,
-            # as on the jobs list (shared.job_mode: anything else is worker).
+            # none of them. Whether the job plans in phases is read from the
+            # value admission wrote on it, as on the jobs list (NULL: unknown).
             query = (
                 "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
                 "jcr.delivery_sha, jcr.record_type AS change_record_type, "
                 "j.diff_status, j.cloud_diff_baseline_commit, j.title, "
                 "j.context->'cloud_checkout' AS cloud_checkout, "
-                "CASE WHEN j.config_override->>'job_mode' = 'agent' "
-                "THEN 'agent' ELSE 'worker' END AS job_mode "
+                "CASE j.config_override->>'phases' WHEN 'true' THEN true "
+                "WHEN 'false' THEN false END AS phases "
                 "FROM job_summary js "
                 "JOIN jobs j ON j.id = js.id "
                 "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "

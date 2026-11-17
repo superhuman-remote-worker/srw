@@ -2378,11 +2378,10 @@
       "default": "review",
       "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
     },
-    "job_mode": {
-      "type": "string",
-      "enum": ["worker", "agent"],
-      "default": "worker",
-      "description": "How a job runs. worker=the planned procedure in phases (plan, work through todos, review), for big tasks. agent=one small task in one loop: one predefined todo, no phase tools, and the job ends with job_complete. Frozen into the job's configuration when it is created."
+    "phases": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether a job plans in phases. false (the default): the job gets a kickoff prompt, works with its tools and ends with job_complete. true: the planned procedure in phases (plan, work through todos, review), for long work. An expert sets it; a project default or a job's override can change it. Frozen into the job's configuration when it is created."
     },
     "image_quality": {
       "type": "string",

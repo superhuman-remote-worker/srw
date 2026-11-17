@@ -7,9 +7,10 @@ request is recorded, and each answer is the next item of the script. The
 system prompt is patched to a fixed string, so these tests see only the texts
 the graph itself composes (the scaffolds are tested elsewhere).
 
-The configuration stands for a job whose frozen config has one predefined
-to-do and, by default, a tool list without the phase tools (``AGENT_TOOLS``):
-the worker reads nothing else to run it.
+The configuration stands for a job without phases: its frozen config has
+one predefined to-do and, by default, a tool list without the phase tools
+(``DIRECT_TASK_TOOLS``); the worker reads nothing else to run it.
+``PHASED_TOOLS`` adds the phase tools, for the same job planned in phases.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from shared.runtime.core.loader import (
 )
 from tests._fs_backend import FilesystemTestBackend
 
-JOB_ID = "agent-mode-job"
+JOB_ID = "job-without-phases"
 PHASE_SKILL = "test-mode-skill"
 SYSTEM_PROMPT = "FIXED SYSTEM PROMPT"
 TASK_BRIEF = "# Task Brief\n\n## Description\n\nWrite hello.txt with a greeting."
@@ -49,10 +50,10 @@ RESUME_TODO_TEXT = (
 ONE_TODO_YAML = f"todos:\n  - id: 1\n    content: {TODO_TEXT}\n"
 ONE_RESUME_TODO_YAML = f"todos:\n  - id: 1\n    content: {RESUME_TODO_TEXT}\n"
 
-#: An agent-mode job's lifecycle surface: no phase tools.
-AGENT_TOOLS = ("job_complete", "write_file")
-#: The phased procedure's tools on top.
-WORKER_TOOLS = AGENT_TOOLS + ("todo_complete", "next_phase_todos", "todo_list")
+#: The lifecycle surface of a job without phases: no phase tools.
+DIRECT_TASK_TOOLS = ("job_complete", "write_file")
+#: The phased procedure's tools on top, for a job that plans in phases.
+PHASED_TOOLS = DIRECT_TASK_TOOLS + ("todo_complete", "next_phase_todos", "todo_list")
 
 #: Words no request of a job without the phase tools may contain.
 PHASE_WORDS = ("todo_complete", "next_phase_todos", "strategic mode")
@@ -177,7 +178,7 @@ def build_job(
     script: Sequence[AIMessage],
     *,
     autonomy: str = "full",
-    tool_names: Sequence[str] = AGENT_TOOLS,
+    tool_names: Sequence[str] = DIRECT_TASK_TOOLS,
     limits: Optional[Dict[str, int]] = None,
     phase_skill_body: Optional[str] = None,
 ) -> Job:

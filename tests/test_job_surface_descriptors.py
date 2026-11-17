@@ -164,7 +164,6 @@ def test_shared_surface_imports_only_stdlib_httpx_and_shared_contracts() -> None
         "shared.worker_execution_hold",
         "shared.permission_modes",
         "shared.workspace_disk",
-        "shared.job_mode",
     )
     for path in SHARED_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -347,7 +346,10 @@ async def test_evidence_image_is_typed_for_mcp_and_base64_free_for_text_lane() -
     assert type(mcp_output[0]).__name__ == "TextContent"
     assert type(mcp_output[1]).__name__ == "ImageContent"
     assert mcp_output[1].data == encoded
-    assert mcp_output[1].mimeType == "image/png"
+    # mcp 2.x (pinned in requirements) names the field mime_type; mimeType
+    # is its wire alias.
+    assert mcp_output[1].mime_type == "image/png"
+    assert mcp_output[1].model_dump(by_alias=True)["mimeType"] == "image/png"
     assert encoded not in mcp_output[0].text
     assert isinstance(text_output, str)
     assert encoded not in text_output
@@ -501,9 +503,10 @@ async def test_create_job_forwards_ticket_and_category_to_the_funnel() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_job_sends_the_job_mode_as_the_typed_field() -> None:
-    """The descriptor forwards ``job_mode`` as the request's own field; it
-    does not write a ``config_override`` key. Omitted, nothing is sent."""
+async def test_create_job_sends_phases_as_the_typed_field() -> None:
+    """The descriptor forwards ``phases`` as the request's own field; it does
+    not write a ``config_override`` key. False is sent like True; omitted,
+    nothing is sent."""
     observed_bodies: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -527,21 +530,25 @@ async def test_create_job_sends_the_job_mode_as_the_typed_field() -> None:
         caller_provider=lambda: CallerCtx(kind="session", user_id="user-1"),
     )
     try:
-        await invoke(description="rename one heading", job_mode="agent")
-        await invoke(description="plan the release")
+        await invoke(description="rename one heading", phases=False)
+        await invoke(description="plan the release", phases=True)
+        await invoke(description="whatever the expert does")
     finally:
         await client.close()
 
-    agent_body, worker_body = observed_bodies
-    assert agent_body["job_mode"] == "agent"
-    assert "config_override" not in agent_body
-    assert "job_mode" not in worker_body
+    direct_body, phased_body, omitted_body = observed_bodies
+    assert direct_body["phases"] is False
+    assert phased_body["phases"] is True
+    assert "config_override" not in direct_body
+    assert "config_override" not in phased_body
+    assert "phases" not in omitted_body
 
     # The orchestrator's request model reads the field the tool sends.
     from orchestrator.schemas.job_create import JobCreate
 
-    assert JobCreate.model_validate(agent_body).job_mode == "agent"
-    assert JobCreate.model_validate(worker_body).job_mode is None
+    assert JobCreate.model_validate(direct_body).phases is False
+    assert JobCreate.model_validate(phased_body).phases is True
+    assert JobCreate.model_validate(omitted_body).phases is None
 
 
 @pytest.mark.asyncio

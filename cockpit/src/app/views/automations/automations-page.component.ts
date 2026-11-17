@@ -39,8 +39,7 @@ import {WorkspaceChoice, WorkspaceBinding} from '../../core/models/workspace-tem
 import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
 import {DatasourcesGroupComponent} from '../agent-settings/datasources-group.component';
 import {choiceRequestFields} from '../workspaces/workspace-template-utils';
-import {Expert, JobMode, Project, EligibleDatasource} from '../../core/models/api.model';
-import {JOB_MODES, jobModeFromOverride, jobModeOf, overrideRecord, withJobMode} from '../../core/util/job-mode';
+import {Expert, Project, EligibleDatasource} from '../../core/models/api.model';
 import {CronPreviewComponent} from './cron-preview.component';
 import {EscapeHatchPanelComponent} from './escape-hatch-panel.component';
 
@@ -70,11 +69,6 @@ interface EditorState {
   prompt: string;
   enabled: boolean;
   autonomy: Automation['autonomy'];
-  /** The mode each fire's job runs in; kept in `config_override.job_mode`. */
-  jobMode: JobMode;
-  /** The automation's stored `config_override` (empty for a new one). A save
-   *  writes the mode into it and keeps every other key. */
-  configOverride: Record<string, unknown>;
   priority: number;
   maxFiresPerDay: number;
   catchupWindowHours: number;
@@ -265,16 +259,6 @@ export class AutomationsPageComponent implements OnInit {
     {value: 'dependent', label: 'dependent'},
   ];
 
-  readonly jobModes = JOB_MODES;
-
-  jobModeHintKey(mode: JobMode): string {
-    return (JOB_MODES.find((m) => m.value === mode) ?? JOB_MODES[0]).hintKey;
-  }
-
-  onJobModeChange(value: unknown): void {
-    this.updateEditor('jobMode', jobModeOf(value));
-  }
-
   /** Pre-selected timezones. Falls back to the IANA browser default. */
   readonly timezoneOptions = computed<SelectOption[]>(() => {
     const browserTz = this._defaultTimezone();
@@ -402,8 +386,6 @@ export class AutomationsPageComponent implements OnInit {
         prompt: automation.prompt,
         enabled: automation.enabled,
         autonomy: automation.autonomy,
-        jobMode: jobModeFromOverride(automation.config_override),
-        configOverride: overrideRecord(automation.config_override),
         priority: automation.priority,
         maxFiresPerDay: automation.max_fires_per_day,
         catchupWindowHours: Math.round(automation.catchup_window_seconds / 3600),
@@ -429,8 +411,6 @@ export class AutomationsPageComponent implements OnInit {
         prompt: '',
         enabled: true,
         autonomy: 'review',
-        jobMode: 'worker',
-        configOverride: {},
         priority: 5,
         maxFiresPerDay: 100,
         catchupWindowHours: 24,
@@ -485,15 +465,9 @@ export class AutomationsPageComponent implements OnInit {
       enabled: e.enabled,
       max_fires_per_day: e.maxFiresPerDay,
     };
-    // The mode has no field of its own: it is the job_mode key of the
-    // automation's config_override. Sent only when the mode changes, and then
-    // as the whole stored override (a PATCH replaces it) with the key set for
-    // agent mode and removed for worker mode. A live trigger always runs in
-    // worker mode: its jobs start inside a live session.
-    const jobMode: JobMode = e.triggerType === 'live' ? 'worker' : e.jobMode;
-    if (jobMode !== jobModeFromOverride(e.configOverride)) {
-      body.config_override = withJobMode(e.configOverride, jobMode);
-    }
+    // No config_override: the editor offers none of its keys, and a PATCH
+    // replaces the stored one whole. Left out, every key an automation was
+    // given through the API (phases among them) stays as it is.
     if (e.triggerType === 'live') {
       if (this.connectorsLoading() || this.connectorsError() || !this.selectedLiveConnectors().some((c) => c.id === e.primaryConnectorId)) {
         this.errorMessage.set(this.transloco.translate('automations.editor.liveConnectorRequired'));

@@ -55,9 +55,10 @@ move the next scheduled run.
 ## What the schedule creates
 
 Each fire creates a normal job with the automation's current prompt, expert,
-autonomy, job mode, priority, and optional project. **Agent mode** suits one
-small step with an obvious end: the job does it in one loop, without a plan or
-phases. Keep **Worker mode**, the default, for open-ended work. Project scope
+autonomy, priority, and optional project. Whether the job plans in phases
+follows its expert: most experts do the task directly, without a plan or
+phases, which suits one step with an obvious end. An expert meant for long,
+open-ended work has **Plans in phases** on. Project scope
 supplies the project's context and knowledge, but automation-fired jobs do
 not attach connectors: there is no connector selector on an automation today.
 If recurring work needs a mailbox, database, MCP server, cloud folder, or

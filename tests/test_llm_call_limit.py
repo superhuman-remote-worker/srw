@@ -25,7 +25,7 @@ from shared.runtime.core.loader import (
     resolve_config_path,
     serialize_resolved_config,
 )
-from tests._agent_mode_harness import (
+from tests._job_without_phases_harness import (
     BATCH_REENTRY,
     batch_arm,
     build_job,

@@ -232,6 +232,23 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
             "Retired expert phase prompts were not removed from manifests; "
             "it retries at the next start"
         )
+    from orchestrator.services.expert_phases_backfill import (
+        backfill_existing_phases,
+    )
+
+    # Before the `phases` setting every job planned in phases. Once per
+    # installation, write `phases: true` on the stored Experts and automations
+    # that do not state it, so nothing an operator set up changes by itself.
+    # Never fatal: without its marker row the pass runs again at the next start.
+    try:
+        marked = await backfill_existing_phases(resources.postgres_db)
+        if marked is not None:
+            logger.info("Phases backfill: %s", marked)
+    except Exception:
+        logger.exception(
+            "Experts and automations from before the phases setting were not "
+            "marked; it retries at the next start"
+        )
     resources.postgres_db.manifests_ready = True
     logger.info(
         "Managed expert defaults ready: worker=%s session=%s",

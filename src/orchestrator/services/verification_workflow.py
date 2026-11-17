@@ -50,7 +50,7 @@ from orchestrator.services.verification_ledger import (
     validate_dispositions,
     validate_verdict_call,
 )
-from shared.job_mode import JOB_MODE_KEY, JOB_MODE_WORKER
+from shared.job_phases import PHASES_KEY
 from shared.run_queue import unpark_unit
 from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from shared.worker_queue import enqueue_worker_batch_wake, reset_worker_batch_attempts
@@ -617,14 +617,14 @@ def verification_gate_decision(
 def critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]:
     """Build the constrained configuration stamped on verification critics.
 
-    A critic always runs the phased procedure (``job_mode: worker``): its tool
+    A critic always runs the phased procedure (``phases: true``): its tool
     list is the phase tools and it ends with a verdict, not ``job_complete``,
-    so an agent-mode default of its expert or project must not reach it.
+    so the default (no phases) or a project default must not reach it.
     """
 
     override: dict[str, Any] = {
         "autonomy": "full",
-        JOB_MODE_KEY: JOB_MODE_WORKER,
+        PHASES_KEY: True,
         "tools": {
             "evaluation": ["approve_job_verdict", "return_job_with_feedback"],
             "job_inspection": True,

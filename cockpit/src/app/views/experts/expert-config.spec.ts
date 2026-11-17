@@ -15,6 +15,18 @@ describe('MANAGED_CONFIG_KEYS', () => {
     expect(MANAGED_CONFIG_KEYS.has('instruction_files')).toBe(false);
   });
 
+  it('owns phases, which the "Plans in phases" toggle edits', () => {
+    expect(MANAGED_CONFIG_KEYS.has('phases')).toBe(true);
+    const {managed, rawRemainderText} = splitExpertConfig({phases: true, instruction_files: []});
+    expect(managed).toEqual({phases: true});
+    expect(JSON.parse(rawRemainderText)).toEqual({instruction_files: []});
+    // Kept when the toggle emits nothing, replaced when it writes false,
+    // and a hand-written value in the JSON field still wins last.
+    expect(assembleExpertConfig({phases: true}, {}, {})).toEqual({phases: true});
+    expect(assembleExpertConfig({phases: true}, {phases: false}, {})).toEqual({phases: false});
+    expect(assembleExpertConfig({}, {}, {phases: true})).toEqual({phases: true});
+  });
+
   it('owns the subagents roster so it never leaks into the raw-JSON flap', () => {
     expect(MANAGED_CONFIG_KEYS.has('subagents')).toBe(true);
     expect(REPLACED_CONFIG_KEYS).toContain('subagents');

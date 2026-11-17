@@ -77,27 +77,31 @@ def test_both_creation_tools_take_the_one_expert_selector():
     assert "list_experts" in (ast.get_docstring(function) or "")
 
 
-def test_both_creation_tools_take_the_job_mode():
-    """Either creation tool chooses how the job runs: "worker" (the default)
-    or "agent". Both say so in the same words, so a caller of either tool
-    reads one rule."""
+def test_both_creation_tools_take_phases():
+    """Either creation tool says whether the job plans in phases. Omitted, the
+    expert's own setting applies. Both say so in the same words, so a caller
+    of either tool reads one rule."""
     descriptor = get_descriptor("create_job")
-    assert "job_mode" in descriptor.public_signature.parameters
+    assert "phases" in descriptor.public_signature.parameters
 
     tree = ast.parse(SERVER_PATH.read_text(encoding="utf-8"))
     function = _async_function(tree, "create_project_job")
-    assert "job_mode" in {argument.arg for argument in function.args.args}
+    assert "phases" in {argument.arg for argument in function.args.args}
 
     def flat(text: str) -> str:
         return " ".join(text.split())
 
-    sentence = (
-        '"agent" does the task in one loop and ends it with job_complete; '
-        "use it for a small task with an obvious end"
-    )
-    assert sentence in flat(descriptor.description)
-    assert sentence in flat(ast.get_docstring(function) or "")
-    assert "Omit it for worker mode." in flat(ast.get_docstring(function) or "")
+    docstring = flat(ast.get_docstring(function) or "")
+    for sentence in (
+        "phases: Whether the job plans in phases. Omit it to use the expert's "
+        "own setting",
+        "False: the job does the task directly and ends it with job_complete; "
+        "right for a task with an obvious end",
+        "True: the planned procedure (plan, work through todos in phases, "
+        "review the result)",
+    ):
+        assert sentence in flat(descriptor.description)
+        assert sentence in docstring
 
 
 def test_workspace_reader_promises_committed_gitea_state():

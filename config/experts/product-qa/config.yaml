@@ -41,6 +41,9 @@ spec:
 
         agent_id: product-qa
         display_name: Product QA Tester
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # Product QA's method lives in its own phase skills (skills/).
+        phases: true
         description: |
           Product-level QA auditor. Audits an application as a usable product, not just
           as code. Finds bugs, broken setup, missing glue, absent UI/API/CLI surfaces,

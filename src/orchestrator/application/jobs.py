@@ -646,7 +646,15 @@ def job_admission_dependencies(
         creation=functools.partial(job_admission_creation_dependencies, resources),
         redact_result=redact_job_config_override,
         live=functools.partial(_live_admission_dependencies, resources),
+        load_expert=functools.partial(_load_expert, resources),
     )
+
+
+async def _load_expert(
+    resources: ApplicationResources, expert_id: str
+) -> dict[str, Any] | None:
+    """A stored expert by id, read from the store at call time."""
+    return await resources.postgres_db.get_expert_by_id(expert_id)
 
 
 def _live_admission_dependencies(resources: ApplicationResources):

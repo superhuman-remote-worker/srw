@@ -235,7 +235,6 @@ def format_job_detail(job: dict[str, Any]) -> str:
     'Config: N/A' forever), and supervision needs lineage, owner, priority,
     agent, repo/branch, and the freeze type/reason/requires-review facts.
     """
-    from shared.job_mode import job_mode_of
     from shared.job_outcome import effective_job_status
 
     job_id = job.get("id", "unknown")
@@ -248,9 +247,10 @@ def format_job_detail(job: dict[str, Any]) -> str:
         lines.append(f"Description: {truncate_text(job.get('description'), limit=500)}")
     if job.get("config_name") or job.get("config"):
         lines.append(f"Config: {job.get('config_name') or job.get('config')}")
-    # The server returns the mode the job runs with; a job row from before
-    # job modes has none and ran in worker mode.
-    lines.append(f"Mode: {job_mode_of(job)}")
+    # The server returns whether the job plans in phases. A job from before
+    # the setting, or one on a custom harness, has no value and gets no line.
+    if isinstance(job.get("phases"), bool):
+        lines.append(f"Plans in phases: {'yes' if job['phases'] else 'no'}")
     workspace = job.get("workspace_contract")
     if isinstance(workspace, dict):
         lines.append(

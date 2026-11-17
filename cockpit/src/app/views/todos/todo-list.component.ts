@@ -2,7 +2,7 @@ import { Component, computed, inject, effect, OnInit } from '@angular/core';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { TodoService } from '../../core/services/todo.service';
 import { DataService } from '../../core/services/data.service';
-import { isAgentModeJob } from '../../core/util/job-mode';
+import { worksWithoutPhases } from '../../core/util/phases';
 import { TodoItem } from '../../core/models/todo.model';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconButtonComponent } from '../../ui/icon-button';
@@ -444,20 +444,20 @@ export class TodoListComponent implements OnInit {
   readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
 
-  /** The selected job runs in agent mode: it has no plan and no phases, so
-   *  its current todo list stays empty for the whole run. Read from the job
-   *  rows the workbench already holds; a row without the field is a worker job. */
-  readonly currentJobIsAgentMode = computed(() => {
+  /** The selected job does its task directly (`phases === false`): it has no
+   *  plan and no phases, so its current todo list may stay empty for the whole
+   *  run. Read from the job rows the workbench already holds; a job whose
+   *  value is unknown (null) keeps the planning hint. */
+  readonly currentJobWorksWithoutPhases = computed(() => {
     const id = this.data.currentJobId();
-    return !!id && isAgentModeJob(this.data.jobs().find((job) => job.id === id));
+    return !!id && worksWithoutPhases(this.data.jobs().find((job) => job.id === id));
   });
 
-  /** Why the list is empty: an agent-mode job (whose current list may not
-   *  exist at all), a worker job that is still planning, or an archive with
-   *  no todos. */
+  /** Why the list is empty: a job without phases (whose current list may not
+   *  exist at all), a job that is still planning, or an archive with no todos. */
   readonly emptyHintKey = computed(() => {
-    if (this.todo.selectedArchive() === null && this.currentJobIsAgentMode()) {
-      return 'todoList.empty.agentModeHint';
+    if (this.todo.selectedArchive() === null && this.currentJobWorksWithoutPhases()) {
+      return 'todoList.empty.directTaskHint';
     }
     return this.todo.isShowingCurrent() ? 'todoList.empty.planningHint' : 'todoList.empty.archiveHint';
   });

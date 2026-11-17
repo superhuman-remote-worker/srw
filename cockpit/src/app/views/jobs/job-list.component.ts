@@ -72,7 +72,7 @@ import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 import {newRequestId} from '../../core/util/request-id';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
 import {JOB_TITLE_MAX_LENGTH, jobDisplayName, jobNameSuggestion} from '../../core/util/job-name';
-import {isAgentModeJob} from '../../core/util/job-mode';
+import {plansInPhases} from '../../core/util/phases';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 
 /**
@@ -335,9 +335,14 @@ export type {JobCloudAction};
                       @if (row.isChild && row.job.config_name) {
                         <span class="config-badge">{{ row.job.config_name }}</span>
                       }
-                      <!-- Agent-mode rows only: worker mode is the default. -->
-                      @if (isAgentModeJob(row.job)) {
-                        <span class="config-badge mode-badge" data-testid="job-mode-badge">{{ 'jobs.mode.agent.label' | transloco }}</span>
+                      <!-- Jobs that plan in phases only: off is the default,
+                           and an unknown value (null) gets no badge either. -->
+                      @if (plansInPhases(row.job)) {
+                        <span
+                          class="config-badge phases-badge"
+                          data-testid="job-phases-badge"
+                          [title]="'jobs.tooltip.phasesBadge' | transloco"
+                        >{{ 'jobs.phasesBadge' | transloco }}</span>
                       }
                     </div>
                     @if (row.job.workspace_contract) {
@@ -897,7 +902,7 @@ export type {JobCloudAction};
         flex-shrink: 0;
       }
 
-      .config-badge.mode-badge {
+      .config-badge.phases-badge {
         background: color-mix(in srgb, var(--info) 15%, transparent);
         color: var(--info);
       }
@@ -1568,8 +1573,8 @@ export class JobListComponent implements OnInit, OnDestroy {
   readonly jobName = jobDisplayName;
   readonly jobNameSuggestion = jobNameSuggestion;
   readonly jobTitleMaxLength = JOB_TITLE_MAX_LENGTH;
-  /** Agent-mode rows carry a badge; a row without the field is a worker job. */
-  readonly isAgentModeJob = isAgentModeJob;
+  /** Rows of jobs that plan in phases carry a badge. */
+  readonly plansInPhases = plansInPhases;
 
   /** Rename from the row's pencil: shown at once, put back if the server refuses. */
   onRenameJob(job: JobSummary, title: string): void {

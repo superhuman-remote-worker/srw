@@ -41,7 +41,7 @@
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null,
-      "job_mode": "worker",
+      "phases": null,
       "workspace_lifecycle": null,
       "workspace_creation": null
     },
@@ -86,7 +86,7 @@
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null,
-      "job_mode": "worker",
+      "phases": null,
       "workspace_lifecycle": null,
       "workspace_creation": null
     }

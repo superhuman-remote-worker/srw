@@ -23,6 +23,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppIconComponent} from '../../ui/icon';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppExpanderComponent} from '../../ui/expander';
+import {AppSwitchComponent} from '../../ui/switch';
 import {EditorHeaderComponent} from '../../shell/editor-header/editor-header.component';
 import {ExecutionGroupComponent} from '../agent-settings/execution-group.component';
 import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
@@ -33,6 +34,7 @@ import {SubagentsEditorComponent} from './subagents-editor.component';
 import {isModelAllowed} from '../agent-settings/capability-gates';
 import {normalizePermissionMode} from '../../core/models/permission-mode';
 import {defaultModelOptionLabel} from '../agent-settings/agent-settings.types';
+import {expertPlansInPhases, phasesFragment} from '../../core/util/phases';
 
 /** Derive a valid expert slug (^[a-z][a-z0-9_-]*$) from a display name. */
 export function slugify(s: string): string {
@@ -316,6 +318,7 @@ interface EditorForm {
     AppSelectComponent,
     AppFormFieldComponent,
     AppIconComponent,
+    AppSwitchComponent,
     EditorHeaderComponent,
     ExecutionGroupComponent,
     ToolsGroupComponent,
@@ -651,6 +654,19 @@ interface EditorForm {
           <p class="hint">
             {{ (mode() === 'job' ? 'experts.editor.sections.defaults.hintJob' : 'experts.editor.sections.defaults.hintSession') | transloco }}
           </p>
+          <!-- The top-level phases key (core/util/phases.ts). Off when the
+               config has none. Job-only, like autonomy: a session expert's
+               stored value is kept as it is. -->
+          @if (mode() === 'job') {
+            <app-form-field class="phases-field" [hint]="'experts.editor.phasesHint' | transloco">
+              <app-switch
+                data-testid="expert-phases"
+                [checked]="phases()"
+                [disabled]="readOnly()"
+                (changed)="phases.set($event)"
+              >{{ 'experts.editor.phases' | transloco }}</app-switch>
+            </app-form-field>
+          }
           <app-execution-group
             [config]="baseForGroups()"
             [mode]="mode()"
@@ -1041,6 +1057,10 @@ export class ExpertEditorComponent implements OnInit {
    *  always among them. */
   readonly roleTags = signal<ExpertRole[]>(['worker']);
 
+  /** "Plans in phases": the config's top-level `phases`, off when absent.
+   *  Saved through `phasesFragment` (see save()). */
+  readonly phases = signal(false);
+
   // Capability grants → editor control-greying. undefined = loading; null = admin
   // (unrestricted, no gating). A resolved record gates per the deny-default PDP.
   capabilities = signal<Record<string, unknown> | null | undefined>(undefined);
@@ -1173,6 +1193,7 @@ export class ExpertEditorComponent implements OnInit {
     if (this.mode() === 'job') {
       const autonomy = exec.autonomy() ?? exec.resolvedAutonomy();
       parts.push(this.summary('autonomy', {value: this.transloco.translate(`agentSettings.autonomy.${autonomy}.label`)}));
+      if (this.phases()) parts.push(this.summary('phases'));
     } else {
       const permission = exec.permissionMode() ?? exec.resolvedPermissionMode();
       parts.push(
@@ -1281,6 +1302,7 @@ export class ExpertEditorComponent implements OnInit {
     // the same mapping the loader applies — so the controls prefill from
     // the single-model shape and the save writes it back that way.
     const cfg = liftLegacyTiers(b.config ?? {});
+    this.phases.set(expertPlansInPhases(cfg));
     // Raw flap shows only the keys the structured controls don't own.
     const {rawRemainderText} = splitExpertConfig(cfg);
     this.form.configText = rawRemainderText;
@@ -1345,6 +1367,7 @@ export class ExpertEditorComponent implements OnInit {
     this.execGroup()?.resetAll();
     this.toolsGroup()?.resetAll();
     this.advancedGroup()?.resetAll();
+    this.phases.set(expertPlansInPhases(this.rawFragment()));
     // The base changed, so the resolved toolset did too. Ordered after the
     // resets: they have just cleared the switches, so the incoming answer is
     // free to re-anchor them.
@@ -1430,6 +1453,9 @@ export class ExpertEditorComponent implements OnInit {
       this.toolsGroup()?.getOverrides() ?? {},
       this.advancedGroup()?.getOverrides() ?? {},
       buildModelFragment(this.form.model),
+      // Job-only: a session expert's stored phases rides along in the
+      // managed base untouched.
+      this.mode() === 'job' ? phasesFragment(this.phases(), this.rawFragment()) : {},
       {subagents: buildSubagentsFragment(roster?.getValue() ?? null, this.form.subagentModel)},
     ].reduce((acc, frag) => deepMergeConfig(acc, frag), {} as Record<string, unknown>);
 

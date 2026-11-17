@@ -1,29 +1,30 @@
-"""Golden renders of the worker-mode prompt texts.
+"""Golden renders of the prompt texts of a job that plans in phases.
 
-A job runs in worker mode (the phased procedure) or in agent mode (one task in
-one loop, without the phase tools). The 14 worker system-prompt scaffolds and
-the engineer and designer instruction files describe the phased procedure only
-inside ``{% if has_tool("next_phase_todos") %}`` blocks, so an agent-mode job
-is not told about tools it does not have. A job that binds the phase tools must
-get exactly the text it got before those blocks existed.
+A job plans in phases (the phased procedure) or runs without phases (one task,
+without the phase tools). The 14 worker system-prompt scaffolds and the
+engineer and designer instruction files describe the phased procedure only
+inside ``{% if has_tool("next_phase_todos") %}`` blocks, so a job without
+phases is not told about tools it does not have. A job that binds the phase
+tools must get exactly the text it got before those blocks existed.
 
 This module renders each of those files through ``render_instruction_content``
 (the Jinja step the worker runs on the scaffold in ``_render_worker_prompt``
 and on instruction files when it deploys them) with tool lists that contain the
 phase tools, and stores the result under
-``tests/fixtures/worker_mode_prompt_golden/``:
+``tests/fixtures/phased_prompt_golden/``:
 
 * ``manifest.json`` holds the tool lists (stored, so a later change to an
   expert's grants cannot move the golden) and, per tool list and file, the
   name of the fixture that holds the expected text;
 * one ``<file>__<sha256 prefix>.txt`` per distinct render.
 
-``tests/test_worker_mode_prompts_unchanged.py`` renders again and compares
-byte for byte. The fixtures were written from the files as they were before
-the agent-mode blocks were added. Regenerate only after a deliberate change to
-worker-mode text, and review the fixture diff::
+``tests/test_phased_prompts_unchanged.py`` renders again and compares byte
+for byte. The fixtures were written from the files as they were before the
+blocks for jobs without phases were added. Regenerate only after a deliberate
+change to the text of a job that plans in phases, and review the fixture
+diff::
 
-    .venv/bin/python -m tests._worker_mode_prompt_golden
+    .venv/bin/python -m tests._phased_prompt_golden
 """
 
 from __future__ import annotations
@@ -32,13 +33,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from shared.job_mode import PHASE_PROCEDURE_TOOLS
+from shared.job_phases import PHASE_PROCEDURE_TOOLS
 
 REPO = Path(__file__).resolve().parents[1]
-GOLDEN_DIR = Path(__file__).parent / "fixtures" / "worker_mode_prompt_golden"
+GOLDEN_DIR = Path(__file__).parent / "fixtures" / "phased_prompt_golden"
 MANIFEST = GOLDEN_DIR / "manifest.json"
 
-#: The tools of the phased procedure; an agent-mode job binds none of them.
+#: The tools of the phased procedure; a job without phases binds none of them.
 PHASE_TOOLS = PHASE_PROCEDURE_TOOLS
 
 #: Repository-relative paths of the rendered files: the 14 worker scaffolds
@@ -80,8 +81,9 @@ def render(source: str, tool_names: list[str]) -> str:
 
 
 def current_tool_lists() -> dict[str, list[str]]:
-    """Worker-mode tool lists: every registry tool, the phase tools alone, and
-    each bundled worker expert's grants (every one of them binds the phase tools).
+    """Tool lists of a job that plans in phases: every registry tool, the
+    phase tools alone, and each bundled worker expert's grants (every one of
+    them binds the phase tools).
 
     The first two take every ``has_tool`` condition both ways; the expert lists
     are the combinations real jobs run with.

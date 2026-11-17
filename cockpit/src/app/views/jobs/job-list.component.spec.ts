@@ -19,6 +19,7 @@ import {JobListComponent, jobCloudAction} from './job-list.component';
 // template asks for actually exist — a key missing from BOTH locales passes
 // the i18n parity gate and ships as the raw key string.
 import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
 
 @Pipe({name: 'transloco', standalone: true})
 class WorkspaceCreationTranslocoPipe implements PipeTransform {
@@ -172,17 +173,18 @@ describe('typed workspace creation on job rows', () => {
   });
 });
 
-describe('job mode badge on job rows', () => {
+describe('phases badge on job rows', () => {
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
   });
   afterEach(() => TestBed.resetTestingModule());
 
-  it('marks agent-mode rows only; worker rows and rows without the field carry no badge', async () => {
+  it('marks jobs that plan in phases only; direct and unknown jobs carry no badge', async () => {
     const {fixture} = mountLogic({rendered: true, api: {
       getJobsPage: vi.fn().mockReturnValue(of(page([
-        job('agent-job', {job_mode: 'agent'}),
-        job('worker-job', {job_mode: 'worker'}),
+        job('phased-job', {phases: true}),
+        job('direct-job', {phases: false}),
+        job('unknown-job', {phases: null}),
         job('older-job'),
       ]))),
     }});
@@ -194,14 +196,17 @@ describe('job mode badge on job rows', () => {
       .filter((row) => row.querySelector('.job-id'));
     const badgeFor = (id: string) => rows
       .find((row) => row.querySelector('.job-id')?.textContent?.includes(id))
-      ?.querySelector('[data-testid="job-mode-badge"]');
-    expect(rows).toHaveLength(3);
-    const badge = badgeFor('agent-job');
-    // The stub pipe renders the key; the real one renders en.jobs.mode.agent.label.
-    expect(badge?.textContent?.trim()).toBe('jobs.mode.agent.label');
-    expect(en.jobs.mode.agent.label).toBe('Agent mode');
+      ?.querySelector('[data-testid="job-phases-badge"]');
+    expect(rows).toHaveLength(4);
+    const badge = badgeFor('phased-job');
+    // The stub pipe renders the key; the real one renders en.jobs.phasesBadge.
+    expect(badge?.textContent?.trim()).toBe('jobs.phasesBadge');
+    expect(badge?.getAttribute('title')).toBe('jobs.tooltip.phasesBadge');
+    expect(en.jobs.phasesBadge).toBe('Phases');
+    expect(de.jobs.phasesBadge).toBe('Phasen');
     expect(badge?.classList.contains('config-badge')).toBe(true);
-    expect(badgeFor('worker-job')).toBeNull();
+    expect(badgeFor('direct-job')).toBeNull();
+    expect(badgeFor('unknown-job')).toBeNull();
     expect(badgeFor('older-job')).toBeNull();
   });
 });

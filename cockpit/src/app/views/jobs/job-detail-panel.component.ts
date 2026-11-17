@@ -28,7 +28,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
-import {jobModeLabelKey, jobModeOf} from '../../core/util/job-mode';
+import {jobPhases, phasesValueKey} from '../../core/util/phases';
 import {jobDisplayName} from '../../core/util/job-name';
 import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {LiveSession} from '../../core/models/live-session.model';
@@ -112,17 +112,18 @@ export function jobExpertLabel(
 }
 
 /**
- * The i18n key naming the job's mode: "Worker mode" or "Agent mode".
+ * The i18n key of the "Plans in phases" value ("Yes" / "No"), or null when
+ * the job's value is unknown and the row is left out.
  *
  * Read from what the server returns for the job (the loaded detail, else the
- * list row), never derived from `config_override`: a mode the job inherited is
- * not in its own override. A row without the field is a worker job.
+ * list row), never derived from `config_override`: a value the job got from
+ * its Expert or project is not in its own override.
  */
-export function jobModeFactKey(
-  job: Pick<JobSummary, 'job_mode'> | null,
-  detail: Pick<Job, 'job_mode'> | null,
-): string {
-  return jobModeLabelKey(jobModeOf(detail?.job_mode ?? job?.job_mode));
+export function jobPhasesFactKey(
+  job: Pick<JobSummary, 'phases'> | null,
+  detail: Pick<Job, 'phases'> | null,
+): string | null {
+  return phasesValueKey(jobPhases(detail) ?? jobPhases(job));
 }
 
 function safeParse(value: string): Record<string, unknown> | null {
@@ -339,10 +340,12 @@ export function failureReason(
           <span class="fact-label">{{ 'jobs.detail.expert' | transloco }}</span>
           <span class="fact-value">{{ expertLabel() || '—' }}</span>
         </div>
-        <div class="fact" data-testid="job-mode-fact">
-          <span class="fact-label">{{ 'jobs.detail.mode' | transloco }}</span>
-          <span class="fact-value">{{ jobModeKey() | transloco }}</span>
-        </div>
+        @if (phasesKey(); as key) {
+          <div class="fact" data-testid="job-phases-fact">
+            <span class="fact-label">{{ 'jobs.detail.phases' | transloco }}</span>
+            <span class="fact-value">{{ key | transloco }}</span>
+          </div>
+        }
         <div class="fact">
           <span class="fact-label">{{ 'jobs.detail.model' | transloco }}</span>
           <span class="fact-value" [class.muted]="!modelLabel()">
@@ -1130,7 +1133,7 @@ export class JobDetailPanelComponent {
   readonly subtreeJobCount = computed(() => this.data()?.usageSubtree?.job_count ?? 0);
   readonly modelLabel = computed(() => jobModelLabel(this.data()?.detail ?? null));
   readonly expertLabel = computed(() => jobExpertLabel(this.job()));
-  readonly jobModeKey = computed(() => jobModeFactKey(this.job(), this.data()?.detail ?? null));
+  readonly phasesKey = computed(() => jobPhasesFactKey(this.job(), this.data()?.detail ?? null));
 
   readonly durationLabel = computed(() =>
     formatDurationSeconds(this.data()?.progress?.elapsed_seconds),

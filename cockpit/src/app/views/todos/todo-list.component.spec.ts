@@ -9,9 +9,10 @@ import {TodoService} from '../../core/services/todo.service';
 import {TodoListComponent} from './todo-list.component';
 
 /**
- * The empty state of the to-do view. A job in agent mode has no plan and no
- * phases, so its current list stays empty (or absent) for the whole run; the
- * view says so instead of suggesting the agent is still planning.
+ * The empty state of the to-do view. A job that does not plan in phases
+ * (`phases: false`) has no plan, so its current list may stay empty (or
+ * absent) for the whole run; the view says so instead of suggesting the agent
+ * is still planning.
  *
  * The `ui/` children bind signal inputs, which this JIT pipeline cannot
  * property-bind (see job-list.component.spec.ts), so they render as plain
@@ -84,39 +85,40 @@ describe('TodoListComponent empty state', () => {
   });
   afterEach(() => TestBed.resetTestingModule());
 
-  it('an agent-mode job with an empty current list says it has no todo list', () => {
-    const {hint} = mount([job('job-1', {job_mode: 'agent'})]);
-    expect(hint()).toBe(en.todoList.empty.agentModeHint);
+  it('a job without phases and with an empty current list says it has no todo list', () => {
+    const {hint} = mount([job('job-1', {phases: false})]);
+    expect(hint()).toBe(en.todoList.empty.directTaskHint);
     expect(hint()).not.toBe(en.todoList.empty.planningHint);
   });
 
-  it('says the same when an agent-mode job has no current list at all', () => {
-    const {hint} = mount([job('job-1', {job_mode: 'agent'})], todoService({current: null}));
-    expect(hint()).toBe(en.todoList.empty.agentModeHint);
+  it('says the same when a job without phases has no current list at all', () => {
+    const {hint} = mount([job('job-1', {phases: false})], todoService({current: null}));
+    expect(hint()).toBe(en.todoList.empty.directTaskHint);
   });
 
-  it('a worker job keeps the planning hint', () => {
-    const {hint} = mount([job('job-1', {job_mode: 'worker'})]);
+  it('a job that plans in phases keeps the planning hint', () => {
+    const {hint} = mount([job('job-1', {phases: true})]);
     expect(hint()).toBe(en.todoList.empty.planningHint);
   });
 
-  it('a row without the field is a worker job', () => {
-    const {hint} = mount([job('job-1')]);
-    expect(hint()).toBe(en.todoList.empty.planningHint);
+  it('a job whose value is unknown keeps the planning hint', () => {
+    expect(mount([job('job-1', {phases: null})]).hint()).toBe(en.todoList.empty.planningHint);
+    TestBed.resetTestingModule();
+    expect(mount([job('job-1')]).hint()).toBe(en.todoList.empty.planningHint);
   });
 
-  it('reads the mode of the selected job, not of another row', () => {
-    const {component} = mount([job('job-1'), job('job-2', {job_mode: 'agent'})]);
-    expect(component.currentJobIsAgentMode()).toBe(false);
+  it('reads the value of the selected job, not of another row', () => {
+    const {component} = mount([job('job-1', {phases: true}), job('job-2', {phases: false})]);
+    expect(component.currentJobWorksWithoutPhases()).toBe(false);
   });
 
-  it('an empty archive keeps the archive hint, in either mode', () => {
-    const {hint} = mount([job('job-1', {job_mode: 'agent'})], todoService({selectedArchive: 'todos_phase_0.yaml'}));
+  it('an empty archive keeps the archive hint, with or without phases', () => {
+    const {hint} = mount([job('job-1', {phases: false})], todoService({selectedArchive: 'todos_phase_0.yaml'}));
     expect(hint()).toBe(en.todoList.empty.archiveHint);
   });
 
-  it('with no job selected it is not an agent-mode job', () => {
-    const {component} = mount([job('job-1', {job_mode: 'agent'})], todoService(), null);
-    expect(component.currentJobIsAgentMode()).toBe(false);
+  it('with no job selected nothing counts as a job without phases', () => {
+    const {component} = mount([job('job-1', {phases: false})], todoService(), null);
+    expect(component.currentJobWorksWithoutPhases()).toBe(false);
   });
 });

@@ -18,8 +18,7 @@ import {
 } from './agent-settings.types';
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
-import type {GrantCatalog, JobMode} from '../../core/models/api.model';
-import {PHASE_STOP_AUTONOMY_LEVELS} from '../../core/util/job-mode';
+import type {GrantCatalog} from '../../core/models/api.model';
 import {DEFAULT_PERMISSION_MODE, normalizePermissionMode} from '../../core/models/permission-mode';
 
 /** See ExecutionGroupComponent.section. */
@@ -62,9 +61,6 @@ export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspa
             }
           </div>
           <span class="field-hint">{{ effectiveAutonomyDesc() }}</span>
-          @if (showAgentModeNote()) {
-            <span class="field-hint" data-testid="autonomy-agent-mode-note">{{ 'agentSettings.autonomy.agentModeNote' | transloco }}</span>
-          }
         </div>
       } @else if (has('task')) {
         <div class="field-row" [class.modified]="permissionMode() !== null">
@@ -469,9 +465,6 @@ export class ExecutionGroupComponent {
   /** The "Execution" label above the fields. Off where the host already
    *  titles the block (the expert editor's own section heading). */
   showGroupLabel = input(true);
-  /** The job's mode, from the New Job form. Display only: it adds a note to
-   *  the autonomy hint and writes no override. */
-  jobMode = input<JobMode>('worker');
 
   /** True when this instance owns the given section's rows. */
   has(section: Exclude<ExecutionSection, 'all'>): boolean {
@@ -647,14 +640,6 @@ export class ExecutionGroupComponent {
     if (!known) return this.transloco.translate('agentSettings.execution.autonomyDefaultHint');
     return this.transloco.translate(`agentSettings.autonomy.${val}.description`);
   });
-
-  /** An agent-mode job has no phases: a level that stops at phase boundaries
-   *  stops once, at the end. Every level stays selectable; this only says so. */
-  readonly showAgentModeNote = computed(() =>
-    this.mode() === 'job' &&
-    this.jobMode() === 'agent' &&
-    PHASE_STOP_AUTONOMY_LEVELS.includes(this.autonomy() ?? this.resolvedAutonomy()),
-  );
 
   readonly effectivePermissionDesc = computed(() => {
     this.activeLang();

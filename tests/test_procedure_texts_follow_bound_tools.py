@@ -2,9 +2,9 @@
 
 Texts about to-dos depend on whether ``todo_complete`` is bound; texts about
 phases and plans on whether ``next_phase_todos`` is bound. A job that binds
-both (every worker-mode job) gets exactly today's bytes; the expected texts
-below are spelled out literally for that reason. A job without them gets the
-variant that names only ``job_complete``.
+both (every job that plans in phases) gets exactly today's bytes; the expected
+texts below are spelled out literally for that reason. A job without them (a
+job without phases) gets the variant that names only ``job_complete``.
 
 Covered here: the reminder after a reply without a tool call, the kickoff
 sentence, the to-do list header and footer, the feedback message, the
@@ -33,8 +33,8 @@ from shared.runtime.core.workspace_injection import create_phase_instruction_mes
 from shared.runtime.services.guardrails import format_nudge
 from tests._fs_backend import FilesystemTestBackend
 
-WORKER_TOOLS = ["read_file", "todo_complete", "next_phase_todos", "job_complete"]
-AGENT_TOOLS = ["read_file", "job_complete"]
+PHASED_TOOLS = ["read_file", "todo_complete", "next_phase_todos", "job_complete"]
+DIRECT_TASK_TOOLS = ["read_file", "job_complete"]
 BRIEF = "# Task Brief\n\n## Description\n\nWrite hello.txt."
 ONE_TODO_YAML = "todos:\n  - id: 1\n    content: Do the task in the brief.\n"
 
@@ -80,9 +80,9 @@ class TestBindsHelper:
         assert binds(names, "todo_complete") is True
 
     def test_a_known_list_decides(self):
-        assert binds_todo_tool(WORKER_TOOLS) and binds_phase_tool(WORKER_TOOLS)
-        assert not binds_todo_tool(AGENT_TOOLS)
-        assert not binds_phase_tool(AGENT_TOOLS)
+        assert binds_todo_tool(PHASED_TOOLS) and binds_phase_tool(PHASED_TOOLS)
+        assert not binds_todo_tool(DIRECT_TASK_TOOLS)
+        assert not binds_phase_tool(DIRECT_TASK_TOOLS)
 
 
 class TestReminder:
@@ -131,7 +131,7 @@ class TestKickoff:
         update = node({"job_id": "texts-job"})
         return update["messages"][0].content, todo
 
-    @pytest.mark.parametrize("tool_names", [None, WORKER_TOOLS])
+    @pytest.mark.parametrize("tool_names", [None, PHASED_TOOLS])
     def test_unchanged_with_next_phase_todos(self, workspace, config, tool_names):
         content, todo = self._first_message(workspace, config, tool_names)
 
@@ -141,7 +141,7 @@ class TestKickoff:
         assert "Current Tasks — Phase 0 (Strategic)" in content
 
     def test_without_next_phase_todos(self, workspace, config):
-        content, todo = self._first_message(workspace, config, AGENT_TOOLS)
+        content, todo = self._first_message(workspace, config, DIRECT_TASK_TOOLS)
 
         assert content == "\n\n".join(
             [
@@ -221,7 +221,7 @@ class TestFeedbackMessage:
         return update, update["messages"][-1].content
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("tool_names", [None, WORKER_TOOLS])
+    @pytest.mark.parametrize("tool_names", [None, PHASED_TOOLS])
     async def test_unchanged_with_next_phase_todos(self, workspace, config, tool_names):
         _, banner = await self._banner(workspace, config, tool_names)
 
@@ -234,7 +234,7 @@ class TestFeedbackMessage:
 
     @pytest.mark.asyncio
     async def test_without_next_phase_todos(self, workspace, config):
-        update, banner = await self._banner(workspace, config, AGENT_TOOLS)
+        update, banner = await self._banner(workspace, config, DIRECT_TASK_TOOLS)
 
         assert banner.startswith(
             "[FEEDBACK_RESUME] Returned by the reviewer.\n\n"
@@ -247,7 +247,7 @@ class TestFeedbackMessage:
 
     @pytest.mark.asyncio
     async def test_a_resume_starts_a_fresh_budget_and_streak(self, workspace, config):
-        update, _ = await self._banner(workspace, config, WORKER_TOOLS)
+        update, _ = await self._banner(workspace, config, PHASED_TOOLS)
 
         assert update["llm_call_baseline"] == 7
         assert update["plain_reply_streak"] == 0
@@ -315,7 +315,7 @@ class TestPhaseInstructionHeader:
 
     def test_whole_job(self):
         message = create_phase_instruction_message(
-            "skills/agent-mode/SKILL.md",
+            "skills/direct-task/SKILL.md",
             "BODY",
             "strategic",
             "0:strategic",
@@ -323,11 +323,11 @@ class TestPhaseInstructionHeader:
         )
 
         assert message.content == (
-            "Instructions (from skills/agent-mode/SKILL.md). They apply for the "
+            "Instructions (from skills/direct-task/SKILL.md). They apply for the "
             "whole job.\n\nBODY"
         )
         # Still the protected phase block, re-seated after a summary.
         default = create_phase_instruction_message(
-            "skills/agent-mode/SKILL.md", "BODY", "strategic", "0:strategic"
+            "skills/direct-task/SKILL.md", "BODY", "strategic", "0:strategic"
         )
         assert message.additional_kwargs == default.additional_kwargs

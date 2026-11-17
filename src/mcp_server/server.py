@@ -258,9 +258,9 @@ def _format_action_error(
 # release_officer (the Legate's lifecycle side of the officer post);
 # create_persistent_thread refuses config_name "centurion"; accept_job_diff and
 # reject_job_diff decide a job's pending project-folder diff (MCP + officer).
-# "17": create_job / create_project_job take `job_mode` ("worker", the default,
-# or "agent": one small task in one loop, without phases).
-MCP_TOOL_SCHEMA_REVISION = "17"
+# "18": create_job / create_project_job take `phases` (whether the job plans in
+# phases; omitted means the expert's own setting). "17" was never released.
+MCP_TOOL_SCHEMA_REVISION = "18"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -1601,7 +1601,7 @@ async def create_project_job(
     priority: int = 5,
     required_deliverables: list[str] | None = None,
     workspace: str | dict[str, Any] | None = None,
-    job_mode: Literal["worker", "agent"] | None = None,
+    phases: bool | None = None,
 ) -> str:
     """Create a job within a project context.
 
@@ -1640,13 +1640,14 @@ async def create_project_job(
             job with no workspace. A template name such as "container-minimal",
             or one listed by manifest_list kind=WorkspaceTemplate, is looked up
             in the project, then your own templates, then the shared catalog.
-        job_mode: How the job runs. "worker" (the default) follows the
-            planned procedure: it plans, works through todos in phases and
-            reviews the result; use it for big or open-ended tasks. "agent"
-            does the task in one loop and ends it with job_complete; use it
-            for a small task with an obvious end, such as one step of an
-            automation or one unit of a batch. Any expert can run in either
-            mode. Omit it for worker mode.
+        phases: Whether the job plans in phases. Omit it to use the expert's
+            own setting (or the project's default when it has one), which
+            is right for most jobs. False: the job does
+            the task directly and ends it with job_complete; right for a
+            task with an obvious end, such as one step of an automation or
+            one unit of a batch. True: the planned procedure (plan, work
+            through todos in phases, review the result); use it for long or
+            open-ended work that will outlive several context compactions.
 
     Returns:
         Created job summary with ID
@@ -1680,7 +1681,7 @@ async def create_project_job(
         required_deliverables=required_deliverables,
         workspace=workspace_binding,
         workspace_supplied=workspace_supplied,
-        job_mode=job_mode,
+        phases=phases,
     )
     return fmt.format_created_job(result, choice.config_name, expert=choice.reference)
 

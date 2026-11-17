@@ -51,6 +51,9 @@ spec:
 
         agent_id: receptionist
         display_name: Receptionist
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # A phone job starts in a tactical phase and finishes in a strategic one.
+        phases: true
         description: |
           A friendly receptionist for live conversations, such as calls on a
           phone line. It answers from the project knowledge base, looks up

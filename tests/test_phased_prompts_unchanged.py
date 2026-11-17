@@ -1,12 +1,12 @@
-"""A worker-mode job gets byte-identical prompt text.
+"""A job that plans in phases gets byte-identical prompt text.
 
 The worker scaffolds and the engineer and designer instruction files keep the
-phased procedure inside ``has_tool("next_phase_todos")`` blocks, for agent-mode
-jobs that do not bind the phase tools. With the phase tools bound, every file
-must render exactly as it did before those blocks were added: the fixtures in
-``tests/fixtures/worker_mode_prompt_golden/`` were written from the files as
-they were then (see ``tests/_worker_mode_prompt_golden.py``, which also says
-how to regenerate them after a deliberate change).
+phased procedure inside ``has_tool("next_phase_todos")`` blocks, for jobs
+without phases, which do not bind the phase tools. With the phase tools bound,
+every file must render exactly as it did before those blocks were added: the
+fixtures in ``tests/fixtures/phased_prompt_golden/`` were written from the
+files as they were then (see ``tests/_phased_prompt_golden.py``, which also
+says how to regenerate them after a deliberate change).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import difflib
 
 import pytest
 
-from tests._worker_mode_prompt_golden import (
+from tests._phased_prompt_golden import (
     PHASE_TOOLS,
     SOURCES,
     load_manifest,
@@ -48,7 +48,7 @@ def test_golden_covers_every_file_and_binds_the_phase_tools():
 @pytest.mark.parametrize(
     "profile,source", _CASES, ids=[f"{p}:{s.split('/')[-1]}" for p, s in _CASES]
 )
-def test_worker_mode_render_is_byte_identical(profile, source):
+def test_phased_render_is_byte_identical(profile, source):
     tools = _MANIFEST["tool_lists"][profile]
     expected = read_fixture(_MANIFEST["cases"][profile][source])
     actual = render(source, tools)
@@ -61,4 +61,4 @@ def test_worker_mode_render_is_byte_identical(profile, source):
                 tofile=f"rendered {source}",
             )
         )
-        pytest.fail(f"{source} changed for worker-mode tools ({profile}):\n{diff}")
+        pytest.fail(f"{source} changed for the phase tools ({profile}):\n{diff}")

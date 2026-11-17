@@ -1662,10 +1662,13 @@ class TestDualCallableEndpoints:
             # path already writes. See tests/test_unified_expert_selection.py.
             "expert_selection": {"source": "bundled", "expert": "critic"},
         }
-        # Slice A2b: every root Job binds the workspace defaults chain.
+        # Slice A2b: every root Job binds the workspace defaults chain, and
+        # admission states the effective ``phases`` setting (the critic plans
+        # in phases by its own file).
         assert kwargs["config_override"] == {
             "autonomy": "full",
             "workspace": {"backend": "sandbox"},
+            "phases": True,
         }
 
 

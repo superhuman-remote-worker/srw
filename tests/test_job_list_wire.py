@@ -75,7 +75,8 @@ def row(**fields):
         "is_display_root": True,
         "subjob_count": 1,
         "workspace_contract": {"state": "waiting"},
-        "job_mode": "worker",
+        # NULL in the list SQL when the job states no ``phases`` (shared.job_phases).
+        "phases": None,
         **fields,
     }
 
@@ -179,6 +180,15 @@ async def test_shared_cockpit_fixture_is_actual_serialized_list_json(wire):
         "offset": 2,
         "include_total": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phases", [True, False, None])
+async def test_list_item_carries_the_phases_column_as_json(wire, phases):
+    wire.result.jobs[0] = row(phases=phases)
+    response = await get(wire)
+    assert response.status_code == 200, response.text
+    assert response.json()["jobs"][0]["phases"] is phases
 
 
 @pytest.mark.asyncio

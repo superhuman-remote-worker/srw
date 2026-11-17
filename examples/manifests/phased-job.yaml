@@ -1,0 +1,27 @@
+# A long, open-ended task on an Expert that does not plan in phases by itself.
+# phases: true makes the worker plan, work through todos in phases and review
+# its result. Omit phases to use the Expert's own setting: most Experts do the
+# task directly and end it with job_complete. Only SRW's own worker takes
+# phases; a generic or custom image runs its own loop. A Job that starts inside
+# a live session always plans in phases.
+apiVersion: srw/v1alpha1
+kind: Job
+metadata:
+  name: migrate-billing-module
+  scope: {kind: Account, name: personal}
+spec:
+  task:
+    text: >-
+      Move the billing module in code/ from callbacks to async functions, keep
+      every test green, and write output/migration-notes.md with what changed.
+  phases: true
+  execution:
+    expert:
+      inline:
+        runtime:
+          adapter: srw/v1
+          config: {config_name: engineer}
+    connectors: {}
+  completion: {mode: Reported}
+  retry: {maxAttempts: 1}
+  timeoutSeconds: 14400

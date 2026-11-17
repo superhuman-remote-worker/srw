@@ -2634,17 +2634,13 @@ export interface Job {
   vm_creation?: VMCreationView | null;
   workspace_creation?: WorkspaceCreationView | null;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
-  /** How the job runs (see {@link JobMode}). Absent from older responses:
-   *  read a missing value as `worker`. */
-  job_mode?: JobMode;
+  /** Whether the job plans in phases (`core/util/phases.ts`): `true` plans,
+   *  works through to-dos in phases and reviews; `false` does its task
+   *  directly. `null` is unknown: a job from before the setting, or one on a
+   *  custom harness image. Decided at creation from the job's own override,
+   *  the project default or its Expert's `phases` key. */
+  phases: boolean | null;
 }
-
-/**
- * How a job runs. `worker` (the default) is the planned procedure: the agent
- * plans, works through todos in phases and reviews its result. `agent` does a
- * small task in one loop, without a plan or phases. Any expert runs in either.
- */
-export type JobMode = 'worker' | 'agent';
 
 /**
  * Public job-create projection owned by orchestrator.schemas.job_create.
@@ -2723,8 +2719,9 @@ export interface JobCreateRequest {
   execution_lane?: 'pinned' | 'stateless';
   /** Start inside a live session (needs execution.session; set by live automations). */
   live_session?: boolean;
-  /** Omitted means worker mode; the form sends it only for agent mode. */
-  job_mode?: JobMode;
+  /** Overrides the Expert's `phases` setting for this job. API callers only:
+   *  the Cockpit's form never sends it. */
+  phases?: boolean;
 }
 
 /**

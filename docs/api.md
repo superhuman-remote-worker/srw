@@ -101,7 +101,7 @@ The fields most integrations use:
 | `expert` | The expert that runs the job: a bundled expert name such as `scholar` or `developer`, or the ID of an expert from the Cockpit. `GET /api/experts` lists what you can use. Leave it out to use the installation's default worker expert. |
 | `project_id` | Run the job in a project. You need at least the editor role on it. |
 | `priority` | 0 to 10, default 5. |
-| `job_mode` | `worker` (default) or `agent`. Agent mode runs a small task in one loop without the planning phases. Leave it out to use the mode the expert or the project sets, which is worker mode unless one of them sets `job_mode`. A job that starts inside a live session (`live_session`) cannot run in agent mode. `GET /api/jobs` and `GET /api/jobs/{id}` return the mode each job runs in. |
+| `phases` | `true` or `false`: whether the job plans in phases. Without phases the job does its task directly and ends with `job_complete`; with phases it plans, works through todos in phases and reviews its result, for long work. Leave it out to use what the project default or the expert says, which is `false` unless one of them sets `phases`. A job that starts inside a live session (`live_session`) always plans in phases, so `false` is refused there. `GET /api/jobs` and `GET /api/jobs/{id}` return `phases` for each job (`null` for a job from before this setting and for one on a custom harness). |
 | `config_override` | Per-job settings. `{"autonomy": "review"}` stops the job for your review when it finishes; `"full"` completes it without stopping. |
 | `instructions` | Extra instructions for the agent. |
 
@@ -170,7 +170,7 @@ curl -sS -X POST "https://api.example.com/api/automations" \
 | `expert_id` | To use an expert you created in the Cockpit, set `expert` to `worker_base` and `expert_id` to its ID. Other combinations are refused with `422`. |
 | `prompt` | Required. What each job should do. |
 | `autonomy` | `full`, `review` (default), `partial`, `guided` or `dependent`. |
-| `config_override` | Settings for each job the automation starts. `{"job_mode": "agent"}` runs each job in agent mode, for a small task in one loop; `worker` is the default. An unknown mode is refused with `422`, and so is agent mode on an automation that answers live sessions (`trigger_type: live`). |
+| `config_override` | Settings for each job the automation starts. `{"phases": true}` makes each job plan in phases, for long work; without the key each job follows its expert. A value that is neither true nor false is refused with `422`, and so is `false` on an automation that answers live sessions (`trigger_type: live`). |
 | `project_id` | Runs the jobs in a project. You need at least the editor role on it. |
 | `enabled` | `false` creates the automation paused. |
 | `max_fires_per_day` | Upper limit on jobs per day. Default 100. |

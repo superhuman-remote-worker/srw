@@ -33,7 +33,7 @@ from orchestrator.services.manifest_harness_egress import (
 )
 from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_store import ManifestStore, decoded
-from shared.job_mode import JOB_MODE_KEY, normalize_job_mode
+from shared.job_phases import PHASES_KEY, normalize_phases
 from shared.manifests.resolution import content_revision
 
 logger = logging.getLogger(__name__)
@@ -163,16 +163,17 @@ class ManifestExecutionService:
                 "A live-session Job runs the SRW harness (its voice subagent is "
                 "SRW's); a generic or custom image cannot take a live session.",
             )
-        job_mode = spec.get("jobMode")
-        if job_mode is not None:
+        phases = spec.get("phases")
+        if phases is not None:
             if adapter != "srw/v1" or custom_image:
                 raise HTTPException(
                     422,
-                    "jobMode chooses how SRW's own worker runs a Job; a generic "
-                    "or custom image runs its own loop. Remove jobMode.",
+                    "phases says whether SRW's own worker plans a Job in "
+                    "phases; a generic or custom image runs its own loop. "
+                    "Remove phases.",
                 )
             try:
-                job_mode = normalize_job_mode(job_mode)
+                phases = normalize_phases(phases)
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from None
         live_connector_id = None
@@ -296,11 +297,25 @@ class ManifestExecutionService:
                     workspace, instance_recipe=instance_recipe
                 )
             }
-            if job_mode is not None:
-                # Frozen with the snapshot below and stored on the job, where
-                # the job's mode is read back. An omitted jobMode leaves the
-                # Expert's own setting (worker mode when it has none).
-                config_override[JOB_MODE_KEY] = job_mode
+            if phases is not None:
+                config_override[PHASES_KEY] = phases
+            # As in REST admission: the effective value is written on the
+            # override, frozen with the snapshot below and stored on the job,
+            # where it is read back. A live-session Job always plans in
+            # phases; one that states nothing follows its Expert. A custom
+            # image runs its own loop and gets no value.
+            expert_row = srw_expert_row(private, expert_type="worker")
+            if not custom_image:
+                from orchestrator.services.job_admission import (
+                    resolved_phases_override,
+                )
+
+                config_override = await resolved_phases_override(
+                    live_session=bool(spec.get("liveSession")),
+                    config_name=config_name,
+                    expert_row=expert_row,
+                    config_override=config_override,
+                )
             if (
                 spec["completion"]["mode"] != "Reported"
                 or spec["retry"]["maxAttempts"] != 1
@@ -317,7 +332,7 @@ class ManifestExecutionService:
                 project_ids=[project_id] if project_id else [],
                 config_name=config_name,
                 expert_id=None,
-                expert_row=srw_expert_row(private, expert_type="worker"),
+                expert_row=expert_row,
                 config_override=config_override,
                 description=spec.get("task", {}).get("text", ""),
                 datasource_ids=datasource_ids,

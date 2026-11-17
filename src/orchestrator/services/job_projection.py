@@ -457,19 +457,19 @@ def _json_mapping(value: Any) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
 
-def effective_job_mode(job: Mapping[str, Any]) -> str:
-    """The mode a job runs in, ``worker`` or ``agent`` (``shared.job_mode``).
+def effective_phases(job: Mapping[str, Any]) -> bool | None:
+    """Whether a job plans in phases (``shared.job_phases``), ``None`` when unknown.
 
-    The frozen configuration (``resolved_config.agent.job_mode``) is what the
-    job runs with, so it is read first; then the requested
-    ``config_override.job_mode``. A row without either is a ``worker`` job,
-    as is one whose value names no mode.
+    The frozen configuration (``resolved_config.agent.phases``) is what the
+    job runs with, so it is read first; then ``config_override.phases``, which
+    admission writes on every job of SRW's own worker. A row without either is
+    a job from before the setting or one on a custom harness: ``None``.
     """
-    from shared.job_mode import DEFAULT_JOB_MODE, JOB_MODE_KEY, job_mode_of
+    from shared.job_phases import PHASES_KEY, is_phases_value, plans_in_phases
 
     resolved = _json_mapping(job.get("resolved_config"))
     agent = _json_mapping(resolved.get("agent")) if resolved is not None else None
     for source in (agent, _json_mapping(job.get("config_override"))):
-        if source is not None and JOB_MODE_KEY in source:
-            return job_mode_of(source)
-    return DEFAULT_JOB_MODE
+        if source is not None and is_phases_value(source.get(PHASES_KEY)):
+            return plans_in_phases(source)
+    return None

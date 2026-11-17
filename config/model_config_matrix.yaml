@@ -60,9 +60,9 @@ default:
     live_tactical_todos: live_tactical_todos.yaml
     live_post_session_todos: live_post_session_todos.yaml
     workspace_template: workspace_template.md
-    agent_todos_initial: agent_todos_initial.yaml
-    agent_todos_resume: agent_todos_resume.yaml
-    agent_instructions: agent_instructions.md
+    direct_task_todos_initial: direct_task_todos_initial.yaml
+    direct_task_todos_resume: direct_task_todos_resume.yaml
+    direct_task_instructions: direct_task_instructions.md
   guardrails:
     file: default.yaml
   settings:

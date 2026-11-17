@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from shared.expert_reference import ExpertReferenceConflict, resolve_expert_selection
 from shared.orch_surface import formatters as fmt
@@ -256,7 +256,7 @@ async def create_job(
     ticket: str | None = None,
     work_category: str | None = None,
     workspace: str | dict[str, Any] | None = None,
-    job_mode: Literal["worker", "agent"] | None = None,
+    phases: bool | None = None,
 ) -> str:
     """Create a new job for agent execution.
 
@@ -321,13 +321,14 @@ async def create_job(
             or one listed by manifest_list kind=WorkspaceTemplate, is looked up
             in the project, then your own templates, then the shared catalog.
             A child job inherits its parent's workspace and can't set this.
-        job_mode: How the job runs. "worker" (the default) follows the
-            planned procedure: it plans, works through todos in phases and
-            reviews the result; use it for big or open-ended tasks. "agent"
-            does the task in one loop and ends it with job_complete; use it
-            for a small task with an obvious end, such as one step of an
-            automation or one unit of a batch. Any expert can run in either
-            mode. Omit it for worker mode.
+        phases: Whether the job plans in phases. Omit it to use the expert's
+            own setting (or the project's default when it has one), which
+            is right for most jobs. False: the job does
+            the task directly and ends it with job_complete; right for a
+            task with an obvious end, such as one step of an automation or
+            one unit of a batch. True: the planned procedure (plan, work
+            through todos in phases, review the result); use it for long or
+            open-ended work that will outlive several context compactions.
 
     Returns:
         Created job details with ID
@@ -399,7 +400,7 @@ async def create_job(
             work_category=work_category,
             workspace=workspace_binding,
             workspace_supplied=workspace_supplied,
-            job_mode=job_mode,
+            phases=phases,
         )
         return fmt.format_created_job(
             result, choice.config_name, expert=choice.reference

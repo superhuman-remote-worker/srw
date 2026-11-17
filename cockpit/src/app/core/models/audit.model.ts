@@ -1,4 +1,4 @@
-import type { JobMode, VMCreationView, WorkspaceContractProjection, WorkspaceCreationView, WorkspaceLifecycleView, WorkspaceRecoveryView } from './api.model';
+import type { VMCreationView, WorkspaceContractProjection, WorkspaceCreationView, WorkspaceLifecycleView, WorkspaceRecoveryView } from './api.model';
 
 /**
  * Audit step types from MongoDB agent_audit collection.
@@ -188,8 +188,8 @@ export interface JobSummary {
   workspace_lifecycle?: WorkspaceLifecycleView | null;
   vm_creation?: VMCreationView | null;
   workspace_creation?: WorkspaceCreationView | null;
-  /** How the job runs. Absent from older responses: read it as `worker`. */
-  job_mode?: JobMode;
+  /** Whether the job plans in phases; `null` when unknown (see `Job.phases`). */
+  phases: boolean | null;
 }
 
 /**

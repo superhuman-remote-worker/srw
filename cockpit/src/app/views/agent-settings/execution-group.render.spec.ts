@@ -24,7 +24,6 @@ function mount(options: {
   upgradeInProgress?: {tier: string; elapsed?: number} | null;
   showWorkspaceBackend?: boolean;
   workspaceBackendLabel?: string;
-  jobMode?: 'worker' | 'agent';
 } = {}) {
   TestBed.configureTestingModule({
     imports: [
@@ -52,7 +51,6 @@ function mount(options: {
   stub('upgradeInProgress', options.upgradeInProgress ?? null);
   if (options.showWorkspaceBackend !== undefined) stub('showWorkspaceBackend', options.showWorkspaceBackend);
   if (options.workspaceBackendLabel !== undefined) stub('workspaceBackendLabel', options.workspaceBackendLabel);
-  if (options.jobMode !== undefined) stub('jobMode', options.jobMode);
   fixture.detectChanges();
   return fixture;
 }
@@ -263,53 +261,5 @@ describe('ExecutionGroupComponent — live tier row', () => {
     const fixture = mount(LIVE);
     fixture.componentInstance.workspaceBackend.set('sandbox');
     expect(fixture.componentInstance.getOverrides()['workspace']).toBeUndefined();
-  });
-});
-
-/**
- * A job in agent mode has no phases, so a level that stops at phase
- * boundaries stops once, at the end. The autonomy row says so under its hint;
- * every level stays selectable and the overrides do not change.
- */
-describe('ExecutionGroupComponent — autonomy in agent mode', () => {
-  beforeAll(async () => {
-    await ɵresolveComponentResources(() => Promise.resolve(''));
-  });
-
-  function noteFor(jobMode: 'worker' | 'agent', autonomy: string | null, mode = 'job'): string | null {
-    const fixture = mount({mode, jobMode});
-    if (autonomy !== null) fixture.componentInstance.autonomy.set(autonomy);
-    fixture.detectChanges();
-    const note = (fixture.nativeElement as HTMLElement).querySelector('[data-testid="autonomy-agent-mode-note"]');
-    return note ? (note.textContent ?? '').trim() : null;
-  }
-
-  it.each(['partial', 'guided', 'dependent'])('adds the note for %s in agent mode', (level) => {
-    expect(noteFor('agent', level)).toBe(en.agentSettings.autonomy.agentModeNote);
-  });
-
-  it.each(['full', 'review'])('adds no note for %s, which already stops at most once', (level) => {
-    expect(noteFor('agent', level)).toBeNull();
-  });
-
-  it.each(['partial', 'guided', 'dependent'])('adds no note for %s in worker mode', (level) => {
-    expect(noteFor('worker', level)).toBeNull();
-  });
-
-  it('follows the inherited level when the user picked none', () => {
-    // No config: the inherited level is review.
-    expect(noteFor('agent', null)).toBeNull();
-  });
-
-  it('keeps every level selectable and writes no mode into the overrides', () => {
-    const fixture = mount({mode: 'job', jobMode: 'agent'});
-    fixture.componentInstance.autonomy.set('guided');
-    fixture.detectChanges();
-    expect(optionValues(fixture, 'Autonomy')).toEqual(['full', 'review', 'partial', 'guided', 'dependent']);
-    expect(fixture.componentInstance.getOverrides()).toEqual({autonomy: 'guided'});
-  });
-
-  it('never shows the note on a session', () => {
-    expect(noteFor('agent', null, 'session')).toBeNull();
   });
 });

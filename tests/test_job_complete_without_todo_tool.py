@@ -35,8 +35,9 @@ from tests._fs_backend import FilesystemTestBackend
 from tests._tool_invoke import invoke_tool
 
 JOB_ID = "job-without-todo-tool"
-AGENT_TOOLS = ["job_complete", "write_file", "read_file"]
-WORKER_TOOLS = AGENT_TOOLS + ["todo_complete", "next_phase_todos"]
+#: The tools of a job without phases, and of the same job planned in phases.
+DIRECT_TASK_TOOLS = ["job_complete", "write_file", "read_file"]
+PHASED_TOOLS = DIRECT_TASK_TOOLS + ["todo_complete", "next_phase_todos"]
 PHASE_WORDS = ("strategic phase", "remaining todo", "todo_complete")
 
 
@@ -91,7 +92,7 @@ class TestShortFile:
     @pytest.mark.asyncio
     async def test_accepted_and_recorded_without_todo_complete(self, workspace):
         workspace.write_file("output/note.md", "short")
-        job_complete, mgr = _job_complete(workspace, AGENT_TOOLS)
+        job_complete, mgr = _job_complete(workspace, DIRECT_TASK_TOOLS)
 
         result = await _call(job_complete, ["output/note.md"])
 
@@ -106,7 +107,7 @@ class TestShortFile:
     @pytest.mark.asyncio
     async def test_still_refused_with_todo_complete(self, workspace):
         workspace.write_file("output/note.md", "short")
-        job_complete, mgr = _job_complete(workspace, WORKER_TOOLS)
+        job_complete, mgr = _job_complete(workspace, PHASED_TOOLS)
 
         result = await _call(job_complete, ["output/note.md"])
 
@@ -124,7 +125,7 @@ class TestShortFile:
 class TestMissingPath:
     @pytest.mark.asyncio
     async def test_one_corrective_refusal_then_accepted(self, workspace):
-        job_complete, mgr = _job_complete(workspace, AGENT_TOOLS)
+        job_complete, mgr = _job_complete(workspace, DIRECT_TASK_TOOLS)
 
         first = await _call(job_complete, ["output/never_written.md"])
 
@@ -147,7 +148,7 @@ class TestMissingPath:
 
     @pytest.mark.asyncio
     async def test_low_confidence_gets_the_same_one_refusal(self, workspace):
-        job_complete, _ = _job_complete(workspace, AGENT_TOOLS)
+        job_complete, _ = _job_complete(workspace, DIRECT_TASK_TOOLS)
 
         first = await _call(job_complete, ["output/gone.md"], confidence=0.3)
         second = await _call(job_complete, ["output/gone.md"], confidence=0.3)
@@ -157,7 +158,7 @@ class TestMissingPath:
 
     @pytest.mark.asyncio
     async def test_an_empty_list_is_accepted_at_once(self, workspace):
-        job_complete, mgr = _job_complete(workspace, AGENT_TOOLS)
+        job_complete, mgr = _job_complete(workspace, DIRECT_TASK_TOOLS)
 
         result = await _call(job_complete, [])
 
@@ -172,7 +173,7 @@ class TestMissingPath:
 
     @pytest.mark.asyncio
     async def test_still_refused_every_time_with_todo_complete(self, workspace):
-        job_complete, _ = _job_complete(workspace, WORKER_TOOLS)
+        job_complete, _ = _job_complete(workspace, PHASED_TOOLS)
 
         for _ in range(2):
             result = await _call(job_complete, ["output/never_written.md"])
@@ -181,7 +182,7 @@ class TestMissingPath:
 
     @pytest.mark.asyncio
     async def test_low_confidence_is_still_accepted_with_todo_complete(self, workspace):
-        job_complete, _ = _job_complete(workspace, WORKER_TOOLS)
+        job_complete, _ = _job_complete(workspace, PHASED_TOOLS)
 
         result = await _call(job_complete, ["output/gone.md"], confidence=0.3)
 
@@ -201,7 +202,7 @@ class TestDescription:
     def test_rewritten_without_todo_complete(self):
         job_complete = self._tool()
 
-        (bound,) = apply_job_complete_description([job_complete], AGENT_TOOLS)
+        (bound,) = apply_job_complete_description([job_complete], DIRECT_TASK_TOOLS)
 
         assert bound.description == JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL
         assert bound is not job_complete
@@ -218,7 +219,7 @@ class TestDescription:
         other = MagicMock()
         other.name = "write_file"
 
-        bound = apply_job_complete_description([job_complete, other], WORKER_TOOLS)
+        bound = apply_job_complete_description([job_complete, other], PHASED_TOOLS)
 
         assert bound[0] is job_complete
         assert bound[1] is other
@@ -228,7 +229,7 @@ class TestDescription:
         other = MagicMock()
         other.name = "write_file"
 
-        bound = apply_job_complete_description([other, job_complete], AGENT_TOOLS)
+        bound = apply_job_complete_description([other, job_complete], DIRECT_TASK_TOOLS)
 
         assert bound[0] is other
         assert bound[1].description == JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL

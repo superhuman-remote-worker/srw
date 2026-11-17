@@ -584,8 +584,7 @@
       "project": "Projekt",
       "noProject": "Kein Projekt",
       "projectPersonal": "(Persönlich)",
-      "projectFixed": "Beim Anlegen der Automation festgelegt; lässt sich nicht ändern.",
-      "jobMode": "Job-Modus"
+      "projectFixed": "Beim Anlegen der Automation festgelegt; lässt sich nicht ändern."
     },
     "preview": {
       "timezoneNote": "Zeiten in {{tz}}. Der Orchestrator speichert intern in UTC und beachtet Sommerzeit automatisch.",
@@ -794,6 +793,7 @@
     "noJobsHintFilter": "Versuchen Sie einen anderen Filter",
     "noJobsHintEmpty": "Erstellen Sie einen neuen Auftrag, um zu beginnen",
     "snapshotsSummary": "{{count}} Snapshots · {{size}}",
+    "phasesBadge": "Phasen",
     "count": "{{start}}–{{end}} von {{total}} Aufträgen",
     "colJob": "Auftrag",
     "colProject": "Projekt",
@@ -914,6 +914,7 @@
       "moreActions": "Weitere Aktionen",
       "openCloudFolder": "Cloud-Ordner dieses Auftrags in einem neuen Tab öffnen",
       "pauseJob": "Auftrag pausieren",
+      "phasesBadge": "Dieser Job plant in Phasen",
       "promoteJob": "Zu Projekt heraufstufen",
       "retryRecovery": "Pausierte Wiederherstellung erneut versuchen",
       "resumeJob": "Vom Checkpoint fortsetzen",
@@ -993,19 +994,6 @@
       "removeFile": "Datei entfernen",
       "settingsStillLoading": "Die Einstellungen werden noch geladen. Versuchen Sie es gleich noch einmal."
     },
-    "mode": {
-      "label": "Job-Modus",
-      "worker": {
-        "label": "Worker-Modus",
-        "option": "Worker-Modus (große Aufgaben)",
-        "hint": "Wie ein Kollege für große Aufgaben: plant die Arbeit, arbeitet Aufgaben in Phasen ab und prüft das Ergebnis."
-      },
-      "agent": {
-        "label": "Agent-Modus",
-        "option": "Agent-Modus (kleine Aufgaben)",
-        "hint": "Wie ein Agent für kleine Aufgaben: erledigt die Aufgabe in einem Durchlauf, ohne Plan und ohne Phasen."
-      }
-    },
     "detail": {
       "auditSteps": "Audit-Schritte",
       "cost": "Kosten",
@@ -1018,7 +1006,9 @@
       "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
       "duration": "Dauer",
       "expert": "Experte",
-      "mode": "Job-Modus",
+      "phases": "Plant in Phasen",
+      "phasesNo": "Nein",
+      "phasesYes": "Ja",
       "heldForReview": "Zur Prüfung angehalten",
       "loading": "Details werden geladen…",
       "model": "Modell",
@@ -2885,6 +2875,8 @@
       "summarizationPlaceholder": "Framework-Standard",
       "otherKeys": "Weitere Config-Keys (JSON)",
       "otherKeysHint": "Config-Keys, die die Felder oben nicht abdecken, etwa instruction_files. Abschnitte mit Zugangsdaten werden beim Speichern abgelehnt.",
+      "phases": "Plant in Phasen",
+      "phasesHint": "Aus: Ein Job mit diesem Experten erhält seine Aufgabe, erledigt sie mit seinen Tools und endet, sobald sie fertig ist. An: Der Job plant, arbeitet Todos in Phasen ab und prüft sein Ergebnis. Für lange, offene Arbeit einschalten, die über Stunden läuft. Gilt für Jobs, nicht für Sessions.",
       "sections": {
         "persona": {
           "title": "Persona und Anweisungen"
@@ -2918,6 +2910,7 @@
         "workspace": "Workspace: {{value}}",
         "scholar": "Scholar aktiv",
         "critic": "Critic aktiv",
+        "phases": "plant in Phasen",
         "advancedSet": "{{n}} von diesem Experten gesetzt",
         "advancedDefaults": "Framework-Standards"
       }
@@ -4339,8 +4332,7 @@
       "dependent": {
         "label": "Abhängig",
         "description": "Stoppt nach jeder Phase (strategisch und taktisch)"
-      },
-      "agentModeNote": "Im Agent-Modus stoppt ein Job nur einmal, am Ende. Diese Stufe wirkt deshalb wie Review."
+      }
     },
     "permissionModes": {
       "read_only": {
@@ -4693,7 +4685,7 @@
       "noJobHint": "Aufgaben erscheinen hier",
       "noTodos": "Keine Aufgaben in dieser Phase",
       "planningHint": "Der Agent befindet sich möglicherweise in der strategischen Planung",
-      "agentModeHint": "Dieser Job läuft im Agent-Modus und hat keine Aufgabenliste.",
+      "directTaskHint": "Dieser Job erledigt seine Aufgabe direkt, ohne Phasen, und hat keine Aufgabenliste.",
       "archiveHint": "Für dieses Archiv sind keine Aufgaben erfasst"
     },
     "priorityHigh": "HOCH",

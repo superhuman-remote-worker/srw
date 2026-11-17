@@ -91,12 +91,13 @@ SRW runs work in two shapes.
   queues it, an agent picks it up and works through it, and you review the
   result. Jobs are the shape for unattended work.
 
-A job runs in one of two modes. **Worker mode**, the default, is for big
-tasks: the agent plans, works through todos in phases and reviews its result.
-**Agent mode** is for small tasks: the agent does the task in one loop and
-ends. Both keep the queue, the review, the deliverable checks and the record.
-Any expert can run in either mode; you choose the mode for each job. A job
-that starts inside a live session runs in worker mode.
+A job either plans in phases or it does not, and its expert decides. Most
+experts do not: the agent gets the task, works on it with its tools and ends.
+An expert meant for long work has **Plans in phases** on: the agent plans,
+works through todos in phases and reviews its result. Both kinds keep the
+queue, the review, the deliverable checks and the record. A job can override
+its expert through the API. A job that starts inside a live session always
+plans in phases.
 
 Both shapes use the same experts, workspaces and connectors.
 
@@ -133,7 +134,8 @@ and carries knowledge forward through workspace files, project knowledge and
 memory. This keeps long jobs inside the model's context window and gives
 review points between planning and execution. The phase number counts up from
 0, the first strategic phase. Sessions do not use phases; they run a
-continuous conversation loop. A job in agent mode has no phases.
+continuous conversation loop. A job whose expert does not plan in phases has
+none either.
 
 ## Autonomy levels
 
@@ -151,7 +153,7 @@ Approving a job stopped at a phase boundary lets it continue; approving a
 finished job completes it. Administrators can limit the highest autonomy level
 each user may choose.
 
-A job in agent mode stops once, at its end: `partial`, `guided` and
+A job without phases stops once, at its end: `partial`, `guided` and
 `dependent` then behave like `review`.
 
 A job at `full` also applies its own changes to the project's cloud folder when

@@ -1,8 +1,8 @@
-"""A ``kind: Job`` manifest that chooses its job mode (``spec.jobMode``).
+"""A ``kind: Job`` manifest that says whether it plans in phases (``spec.phases``).
 
-The schema takes ``worker`` or ``agent``; resolution keeps the value as
-authored, adds none when it is omitted, and refuses an agent-mode Job that is
-also a live-session Job. Admission writes the mode into the job's
+The schema takes a boolean; resolution keeps the value as authored, adds none
+when it is omitted, and refuses ``phases: false`` on a Job that is also a
+live-session Job. Admission writes the value into the job's
 ``config_override`` (so it is frozen in the execution snapshot and stored on
 the job) and refuses the key on a Job that does not run SRW's own worker.
 """
@@ -19,7 +19,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services.manifest_execution import ManifestExecutionService
-from shared.job_mode import JOB_MODE_KEY, JOB_MODES
+from shared.job_phases import PHASES_KEY
 from shared.manifests import (
     API_VERSION,
     ManifestError,
@@ -31,7 +31,8 @@ from shared.manifests import (
 
 ACCOUNT = {"kind": "Account", "name": "personal"}
 LINE = "00000000-0000-4000-8000-00000000a1e1"
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples/manifests/agent-mode-job.yaml"
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples/manifests/phased-job.yaml"
+VALUES = (True, False)
 
 
 def resource(kind: str, name: str, spec: dict) -> dict:
@@ -85,59 +86,81 @@ def error_code(code, operation, *args, **kwargs):
 
 
 class TestSchema:
-    @pytest.mark.parametrize("mode", JOB_MODES)
-    def test_both_modes_validate(self, mode):
-        document = job(jobMode=mode)
+    @pytest.mark.parametrize("value", VALUES)
+    def test_both_values_validate(self, value):
+        document = job(phases=value)
         assert validate_documents([document]) == [document]
 
-    def test_the_schema_names_the_shared_vocabulary(self):
-        prop = load_schema()["$defs"]["JobSpec"]["properties"]["jobMode"]
-        assert tuple(prop["enum"]) == JOB_MODES
-        assert prop["default"] == "worker"
+    def test_the_schema_takes_a_boolean_without_a_default(self):
+        prop = load_schema()["$defs"]["JobSpec"]["properties"]["phases"]
+        assert prop["type"] == "boolean"
+        # Omitted means the Expert's own setting, decided at admission.
+        assert "default" not in prop
 
-    @pytest.mark.parametrize("value", ["Agent", "light", "", True, None, ["agent"]])
+    @pytest.mark.parametrize("value", ["on", "true", "agent", "", 1, 0, None, ["true"]])
     def test_anything_else_is_refused(self, value):
         with pytest.raises(ManifestError):
-            validate_documents([job(jobMode=value)])
+            validate_documents([job(phases=value)])
 
-    def test_the_mode_is_not_an_execution_brick(self):
+    def test_the_setting_is_not_an_execution_brick(self):
         document = job()
-        document["spec"]["execution"]["jobMode"] = "agent"
+        document["spec"]["execution"]["phases"] = False
         with pytest.raises(ManifestError):
             validate_documents([document])
 
+    def test_phases_is_the_only_key_that_chooses_how_the_worker_runs(self):
+        job_spec = load_schema()["$defs"]["JobSpec"]
+        assert job_spec["additionalProperties"] is False
+        assert set(job_spec["properties"]) == {
+            "task",
+            "execution",
+            "completion",
+            "retry",
+            "timeoutSeconds",
+            "liveSession",
+            "phases",
+        }
+
 
 class TestResolution:
-    def test_an_agent_mode_job_keeps_its_mode(self):
-        result = preview_documents([job(jobMode="agent")])
-        assert result["resolved"][0]["spec"]["jobMode"] == "agent"
+    @pytest.mark.parametrize("value", VALUES)
+    def test_a_job_keeps_its_value(self, value):
+        result = preview_documents([job(phases=value)])
+        assert result["resolved"][0]["spec"]["phases"] is value
 
-    def test_an_omitted_mode_stays_omitted(self):
+    def test_an_omitted_value_stays_omitted(self):
         # Resolution writes no default: the Expert's own setting, and then
-        # worker mode, apply at admission.
+        # no phases, apply at admission.
         result = preview_documents([job()])
-        assert "jobMode" not in result["resolved"][0]["spec"]
+        assert "phases" not in result["resolved"][0]["spec"]
 
-    def test_agent_mode_with_a_live_session_is_refused(self):
+    def test_no_phases_with_a_live_session_is_refused(self):
         issue = error_code(
-            "AgentModeLiveSession", preview_documents, [live_job(jobMode="agent")]
+            "NoPhasesLiveSession", preview_documents, [live_job(phases=False)]
         )
-        assert issue.path.endswith("/jobMode")
+        assert issue.path.endswith("/phases")
 
-    def test_worker_mode_with_a_live_session_resolves(self):
-        result = preview_documents([live_job(jobMode="worker")])
+    def test_phases_with_a_live_session_resolves(self):
+        result = preview_documents([live_job(phases=True)])
         spec = result["resolved"][0]["spec"]
-        assert spec["jobMode"] == "worker" and spec["liveSession"] is True
+        assert spec["phases"] is True and spec["liveSession"] is True
 
-    def test_the_published_example_is_an_agent_mode_job(self):
+    def test_an_omitted_value_with_a_live_session_resolves(self):
+        result = preview_documents([live_job()])
+        spec = result["resolved"][0]["spec"]
+        assert "phases" not in spec and spec["liveSession"] is True
+
+    def test_the_published_example_is_a_phased_job(self):
         documents = parse_documents(EXAMPLE.read_text(encoding="utf-8"))
         result = preview_documents(documents)
         (resolved,) = result["resolved"]
         assert resolved["kind"] == "Job"
-        assert resolved["spec"]["jobMode"] == "agent"
+        assert resolved["spec"]["phases"] is True
         assert "liveSession" not in resolved["spec"]
         runtime = resolved["spec"]["execution"]["expert"]["inline"]["runtime"]
         assert runtime["adapter"] == "srw/v1"
+        # An Expert that does not plan in phases by itself: the Job turns it on.
+        assert runtime["config"]["config_name"] == "engineer"
 
 
 # =============================================================================
@@ -149,7 +172,9 @@ CUSTOM_SRW_IMAGE = "example/custom@sha256:" + "c" * 64
 GENERIC_IMAGE = "example/x@sha256:" + "d" * 64
 
 
-def _srw_job_service(image=None, *, job_mode=None, grant=True):
+def _srw_job_service(
+    image=None, *, phases=None, grant=True, live=False, config_name="general-worker"
+):
     user_id = str(uuid4())
     db = MagicMock()
     db.user_can_run_custom_harness_images = AsyncMock(return_value=grant)
@@ -162,10 +187,11 @@ def _srw_job_service(image=None, *, job_mode=None, grant=True):
         native_hosting_enabled=True,
         approved_images=[{"name": "cc", "image": CUSTOM_SRW_IMAGE}],
         connector_drivers=MagicMock(),
+        authorize_datasources=AsyncMock(return_value=([LINE], {})),
     )
     runtime: dict[str, Any] = {
         "adapter": "srw/v1",
-        "config": {"config_name": "general-worker"},
+        "config": {"config_name": config_name},
     }
     if image is not None:
         runtime["image"] = image
@@ -179,8 +205,12 @@ def _srw_job_service(image=None, *, job_mode=None, grant=True):
             "workspace": None,
         },
     }
-    if job_mode is not None:
-        spec["jobMode"] = job_mode
+    if phases is not None:
+        spec["phases"] = phases
+    if live:
+        spec["liveSession"] = True
+        spec["execution"]["connectors"] = live_job()["spec"]["execution"]["connectors"]
+        spec["execution"]["session"] = {"connector": "telefon", "id": "rtc_123"}
     prepared = {
         "document": {},
         "revision": "r",
@@ -213,45 +243,69 @@ def snapshot(monkeypatch):
     return prepare
 
 
+class _Stop(Exception):
+    pass
+
+
 class TestAdmit:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("mode", JOB_MODES)
-    async def test_the_mode_is_frozen_and_stored_with_the_job(self, snapshot, mode):
-        service, db, prepared, user = _srw_job_service(job_mode=mode)
+    @pytest.mark.parametrize("value", VALUES)
+    async def test_the_value_is_frozen_and_stored_with_the_job(self, snapshot, value):
+        service, db, prepared, user = _srw_job_service(phases=value)
         await service.admit(prepared, {}, user)
         frozen = snapshot.await_args.kwargs["config_override"]
         stored = db.create_job.call_args.kwargs["config_override"]
-        assert frozen[JOB_MODE_KEY] == mode
-        assert stored[JOB_MODE_KEY] == mode
+        assert frozen[PHASES_KEY] is value
+        assert stored[PHASES_KEY] is value
         # The workspace binding admission writes is still there.
         assert "workspace" in stored
 
     @pytest.mark.asyncio
-    async def test_an_omitted_mode_writes_no_key(self, snapshot):
-        service, db, prepared, user = _srw_job_service()
+    @pytest.mark.parametrize(
+        "config_name,expected", [("general-worker", False), ("developer", True)]
+    )
+    async def test_an_omitted_value_writes_the_experts_effective_value(
+        self, snapshot, config_name, expected
+    ):
+        # As in REST admission (job_admission.resolved_phases_override): every
+        # Job on SRW's own worker states its value, frozen and stored.
+        service, db, prepared, user = _srw_job_service(config_name=config_name)
         await service.admit(prepared, {}, user)
-        assert JOB_MODE_KEY not in snapshot.await_args.kwargs["config_override"]
-        assert JOB_MODE_KEY not in db.create_job.call_args.kwargs["config_override"]
+        assert snapshot.await_args.kwargs["config_override"][PHASES_KEY] is expected
+        stored = db.create_job.call_args.kwargs["config_override"]
+        assert stored[PHASES_KEY] is expected
+        assert "workspace" in stored
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("mode", JOB_MODES)
-    async def test_a_custom_srw_image_cannot_take_a_mode(self, snapshot, mode):
-        service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE, job_mode=mode)
+    @pytest.mark.parametrize("value", VALUES)
+    async def test_the_jobs_own_value_wins_over_the_experts(self, snapshot, value):
+        for config_name in ("general-worker", "developer"):
+            service, db, prepared, user = _srw_job_service(
+                phases=value, config_name=config_name
+            )
+            await service.admit(prepared, {}, user)
+            stored = db.create_job.call_args.kwargs["config_override"]
+            assert stored[PHASES_KEY] is value, config_name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", VALUES)
+    async def test_a_custom_srw_image_cannot_take_the_setting(self, snapshot, value):
+        service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE, phases=value)
         with pytest.raises(HTTPException) as error:
             await service.admit(prepared, {}, user)
         assert error.value.status_code == 422
-        assert "jobMode" in error.value.detail
+        assert "Remove phases" in error.value.detail
         db.create_job.assert_not_called()
         snapshot.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_custom_srw_image_without_a_mode_is_admitted(self, snapshot):
+    async def test_a_custom_srw_image_without_the_setting_is_admitted(self, snapshot):
         service, db, prepared, user = _srw_job_service(CUSTOM_SRW_IMAGE)
         await service.admit(prepared, {}, user)
         db.create_job.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_a_generic_image_cannot_take_a_mode(self):
+    async def test_a_generic_image_cannot_take_the_setting(self):
         user_id = str(uuid4())
         db = MagicMock()
         db.user_can_run_custom_harness_images = AsyncMock(return_value=True)
@@ -268,7 +322,7 @@ class TestAdmit:
             "resolved": {
                 "metadata": {"scope": {"kind": "Account", "name": user_id}},
                 "spec": {
-                    "jobMode": "agent",
+                    "phases": False,
                     "execution": {
                         "expert": {"inline": {"runtime": {"image": GENERIC_IMAGE}}},
                         "connectors": {},
@@ -281,3 +335,37 @@ class TestAdmit:
         assert error.value.status_code == 422
         assert "generic or custom image" in error.value.detail
         db.create_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_live_session_job_with_phases_carries_them(
+        self, snapshot, monkeypatch
+    ):
+        seen: dict = {}
+
+        async def live_session(self, *args, config_override, **kwargs):
+            seen["override"] = deepcopy(config_override)
+            raise _Stop
+
+        monkeypatch.setattr(ManifestExecutionService, "_live_session", live_session)
+        service, db, prepared, user = _srw_job_service(phases=True, live=True)
+        with pytest.raises(_Stop):
+            await service.admit(prepared, {}, user)
+        assert seen["override"][PHASES_KEY] is True
+        assert snapshot.await_args.kwargs["config_override"][PHASES_KEY] is True
+
+    @pytest.mark.asyncio
+    async def test_a_live_session_job_that_omits_the_setting_plans_in_phases(
+        self, snapshot, monkeypatch
+    ):
+        seen: dict = {}
+
+        async def live_session(self, *args, config_override, **kwargs):
+            seen["override"] = deepcopy(config_override)
+            raise _Stop
+
+        monkeypatch.setattr(ManifestExecutionService, "_live_session", live_session)
+        service, db, prepared, user = _srw_job_service(live=True)
+        with pytest.raises(_Stop):
+            await service.admit(prepared, {}, user)
+        assert snapshot.await_args.kwargs["config_override"].get(PHASES_KEY) is True
+        assert seen["override"].get(PHASES_KEY) is True
