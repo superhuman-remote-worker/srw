@@ -474,13 +474,52 @@ func TestDeleteJobNeedsAnEndedJobAndAYes(t *testing.T) {
 	if _, _, code := h.run("", "delete", "job", jobID, "--expected-version", "2"); code != exit.Usage {
 		t.Errorf("a version for a job: %d", code)
 	}
-	// The server's 503 while it releases the workspace says what to do.
-	h.record("DELETE /api/jobs/"+jobID, 503, map[string]any{"detail": "Workspace authority retirement is incomplete"})
-	_, errOut, code := h.run("", "delete", "job", jobID, "--yes")
-	if code != exit.Failed {
-		t.Fatalf("%d %s", code, errOut)
+}
+
+// A job that has just ended is often still being released. The server then
+// answers 503 and has deleted nothing, so asking again is safe.
+func TestDeleteJobAsksAgainWhileTheWorkspaceIsReleased(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	progressOf(h, "completed")
+	releasing := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		w.Write([]byte(`{"detail":"Workspace authority retirement is incomplete"}`))
+	}
+	asked := 0
+	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		if asked < 3 {
+			releasing(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"deleted"}`))
+	})
+	out, errOut, code := h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.OK || !strings.Contains(out, "deleted") || asked != 3 {
+		t.Fatalf("%d after %d requests: %q %s", code, asked, out, errOut)
+	}
+	if strings.Count(errOut, "still releasing the job's workspace") != 1 {
+		t.Errorf("said once:\n%s", errOut)
+	}
+
+	// It gives up after the time a delete may take, with what to do.
+	h.clock, asked = now, 0
+	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) { asked++; releasing(w) })
+	_, errOut, code = h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.Failed || asked < 10 || h.clock.Sub(now) > 4*time.Minute {
+		t.Fatalf("%d after %d requests and %s: %s", code, asked, h.clock.Sub(now), errOut)
 	}
 	want(t, errOut, "Workspace authority retirement is incomplete", "srw get job/"+jobID, "srw delete job/"+jobID)
+
+	// A proxy's 503 is an outage, not a release in progress: once.
+	asked = 0
+	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) { asked++; awayAnswer(w, "502") })
+	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.Unreachable || asked != 1 {
+		t.Errorf("a gateway status: %d after %d requests", code, asked)
+	}
 }
 
 func jobRow(id, status, title string, root bool) map[string]any {

@@ -288,7 +288,7 @@ the authority's PEM file at `srw login`; it is saved with the context. Plain
 | `the server's TLS certificate was not accepted` | Pass `--ca-file` with your certificate authority's file. |
 | `the API at … is not answering: … from something in front of it` | A proxy answered instead of the API. The server may be restarting; if it stays, the address is not the API's. |
 | `… redirects to …` | The server address is not the API's. Check `https`, the host and the path. |
-| `Workspace authority retirement is incomplete` | The server is still releasing the job's workspace. Look at the job with `srw get`, then run the command again. `srw cancel` checks by itself and exits 0 when the job is cancelled. |
+| `Workspace authority retirement is incomplete` | The server is still releasing the job's workspace. `srw delete job` asks again by itself for up to three minutes, and `srw cancel` exits 0 when the job is cancelled. If it stays, look at the job with `srw get` and run the command again. |
 
 Shell completion: `srw completion bash`, `zsh`, `fish` or `powershell` print
 the script and say how to load it. On macOS, bash completion needs

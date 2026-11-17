@@ -698,12 +698,29 @@ func (a *App) deleteJob(ctx context.Context, client *api.Client, typed string, y
 			return err
 		}
 	}
-	// Deleting releases the workspace too; see api.TeardownTimeout.
-	response, err := client.Send(ctx, api.Request{Method: routes.JobDelete.Method, Path: jobPath(routes.JobDelete, id), Known: true, Timeout: api.TeardownTimeout})
-	if err != nil {
-		return stillReleasing(err, "delete job/"+id, id)
+	// Deleting releases the workspace too; see api.TeardownTimeout. A job
+	// that has just ended is often still being released: the server then
+	// answers 503 and has deleted nothing, so the request is sent again.
+	request := api.Request{Method: routes.JobDelete.Method, Path: jobPath(routes.JobDelete, id), Known: true, Timeout: api.TeardownTimeout}
+	started, said := a.Now(), false
+	for {
+		response, err := client.Send(ctx, request)
+		if err == nil {
+			return a.printJSONDocument(response.Body, func() []string { return []string{"job/" + id} })
+		}
+		var failure *exit.Error
+		releasing := errors.As(err, &failure) && failure.Status == http.StatusServiceUnavailable && failure.Code == exit.Failed
+		if !releasing || a.Now().Sub(started) >= api.TeardownTimeout {
+			return stillReleasing(err, "delete job/"+id, id)
+		}
+		if !said {
+			said = true
+			fmt.Fprintf(a.Err, "The server is still releasing the job's workspace (%s). Trying again for up to %s.\n", failure.Message, api.TeardownTimeout)
+		}
+		if err := a.sleep(ctx, 5*time.Second); err != nil {
+			return err
+		}
 	}
-	return a.printJSONDocument(response.Body, func() []string { return []string{"job/" + id} })
 }
 
 type jobListFlags struct {
