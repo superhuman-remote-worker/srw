@@ -72,6 +72,8 @@ POST   /api/admin/run-queue/executor-pods/{pod_name}/attest-gone                
 POST   /api/admin/run-queue/{unit_id}/attest-claimant-gone                              pat=admin           admin:_require_admin
 POST   /api/admin/run-queue/{unit_id}/unpark                                            pat=admin           admin:_require_admin
 GET    /api/admin/security-events                                                       pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/image_generation                                      pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/image_generation                                      pat=admin           admin:_require_admin
 DELETE /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
 GET    /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
 PUT    /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
@@ -237,6 +239,7 @@ PATCH  /api/ide/{job_id}/proxy/{path:path}                                      
 POST   /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
 PUT    /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
 WS     /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+GET    /api/internal/image-generation/proxy-quota                                       pat=refused         internal:require_internal
 POST   /api/internal/infrastructure-metering/v1/snapshots/begin                         pat=refused         internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/infrastructure-metering/v1/snapshots/finalize                      pat=refused         internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/infrastructure-metering/v1/snapshots/items                         pat=refused         internal:_dispatch_infrastructure_ingestion

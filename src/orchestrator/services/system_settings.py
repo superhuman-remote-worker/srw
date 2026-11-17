@@ -204,3 +204,64 @@ async def put_mcp_server_questions_settings(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return mcp_server_questions_response(row)
+
+
+def image_generation_settings_response(
+    row: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Shape the image generation settings for API responses. Absent row →
+    the defaults (``shared.image_generation``)."""
+    from shared.image_generation import normalize_settings
+
+    updated_at = (row or {}).get("updated_at")
+    return {
+        **normalize_settings((row or {}).get("value")),
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
+        "updated_by": (row or {}).get("updated_by"),
+    }
+
+
+async def get_image_generation_settings(
+    *, dependencies: SystemSettingsDependencies
+) -> dict[str, Any]:
+    """The installation's image generation limits: the paid images one job or
+    Session may make (``max_paid_images``, 0 = no cap) and the subscription
+    quota share above which the proxy lane refuses new images
+    (``proxy_quota_threshold_percent``)."""
+    from shared.image_generation import SYSTEM_SETTING_KEY
+
+    try:
+        row = await dependencies.store.get_system_setting(SYSTEM_SETTING_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return image_generation_settings_response(row)
+
+
+async def put_image_generation_settings(
+    *,
+    body: Mapping[str, Any],
+    admin: Mapping[str, Any],
+    dependencies: SystemSettingsDependencies,
+) -> dict[str, Any]:
+    """Change the image generation limits. Fields left out keep their value;
+    applies at the next dispatch."""
+    from shared.image_generation import (
+        SYSTEM_SETTING_KEY,
+        normalize_settings,
+        settings_problem,
+    )
+
+    problem = settings_problem(body)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    try:
+        current = await dependencies.store.get_system_setting(SYSTEM_SETTING_KEY)
+        merged = {**normalize_settings((current or {}).get("value")), **dict(body)}
+        row = await dependencies.store.upsert_system_setting(
+            SYSTEM_SETTING_KEY,
+            normalize_settings(merged),
+            updated_by=_actor(admin),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return image_generation_settings_response(row)

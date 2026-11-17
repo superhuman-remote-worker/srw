@@ -123,6 +123,12 @@ tools:
     - download_paper
     - get_paper_info
     - research_topic
+  # Image generation (src/agent/tools/image_generation/): built only when an
+  # admin or the user pinned an image_generation model (owner decision D1,
+  # 2026-11-17); paid models are capped per job/Session, the subscription
+  # proxy by its quota threshold.
+  image_generation:
+    - generate_image
   # Direct browser control - step-by-step page interaction (src/agent/tools/research/browser_direct.py)
   browser_direct:
     - browser_navigate

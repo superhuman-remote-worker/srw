@@ -55,8 +55,10 @@ idempotency namespace.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Iterable, Optional
 
 import asyncpg
@@ -115,12 +117,84 @@ SELECT id, job_id, agent_type, call_type, model, timestamp,
                                                    AS um_reasoning,
        metadata->>'input_tokens'                    AS md_input,
        metadata->>'output_tokens'                   AS md_output,
-       metadata->>'cached_tokens'                   AS md_cached
+       metadata->>'cached_tokens'                   AS md_cached,
+       auxiliary_metadata->'image_generation'       AS image_meta
 FROM llm_requests
 WHERE timestamp > $1
 ORDER BY timestamp, id
 LIMIT $2
 """
+
+
+#: ``llm_requests.call_type`` of a ``generate_image`` call (image generation).
+IMAGE_GENERATION_CALL_TYPE = "image_generation"
+
+
+def _image_generation_event(
+    r: Any,
+    owners: dict[Any, tuple[Optional[str], Optional[str]]],
+    wire_names: dict[str, str],
+) -> Optional[UsageEvent]:
+    """One ``unit='image'`` row for a ``generate_image`` audit row.
+
+    Priced at list price from the provider's token usage
+    (``shared.image_generation.image_list_price_usd``); unpriced when the model
+    has no list price or the provider sent no usage, so a configured
+    ``usage_rates`` row (llm/<model>/image) prices it instead. Subscription
+    images are priced the same way and flagged ``billing: subscription``
+    (notional cost; owner decision D7, 2026-11-17).
+    """
+    from shared.image_generation import image_list_price_usd
+
+    raw = r["image_meta"]
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        count = int(raw.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        return None
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    recorded_model = str(r["model"])
+    resource = wire_names.get(recorded_model, recorded_model)
+    is_session = (r["agent_type"] or "") == _SESSION_AGENT_TYPE
+    user_id, project_id = owners.get(r["job_id"], (None, None))
+    cost = image_list_price_usd(recorded_model, usage)
+    details: dict[str, Any] = {
+        "model": recorded_model,
+        "llm_request_id": r["id"],
+        "agent_type": r["agent_type"],
+        "call_type": r["call_type"],
+        "billing": raw.get("billing") or "api",
+        "provider": raw.get("provider"),
+        "quality": raw.get("quality"),
+        "size": raw.get("size"),
+        "usage": usage,
+    }
+    if cost is not None:
+        details["priced_from"] = "list_price_tokens"
+    return UsageEvent(
+        category="llm",
+        resource=resource,
+        quantity=count,
+        unit="image",
+        source="audit",
+        source_id=str(r["id"]),
+        ts=r["timestamp"],
+        user_id=user_id,
+        project_id=project_id,
+        ref_kind="thread" if is_session else "job",
+        ref_id=str(r["job_id"]),
+        rate_usd=None if cost is None else Decimal(str(cost)) / count,
+        cost_usd=None if cost is None else Decimal(str(cost)),
+        details=details,
+    )
 
 
 def _first_int(*vals: Any) -> int:
@@ -308,6 +382,11 @@ async def materialize_llm_usage_from_audit(
     new_cursor = since_ts
     for r in aged:
         new_cursor = r["timestamp"]  # advance over every aged row, priced or not
+        if (r["call_type"] or "") == IMAGE_GENERATION_CALL_TYPE:
+            image_event = _image_generation_event(r, owners, wire_names)
+            if image_event is not None:
+                events.append(image_event)
+            continue
         prompt = _first_int(r["m_prompt"], r["m_input"], r["um_input"], r["md_input"])
         completion = _first_int(
             r["m_completion"], r["m_output"], r["um_output"], r["md_output"]

@@ -186,9 +186,12 @@ class TestPopulation:
         # (use_skill out of workspace, skills_tool_category.md): expert_base
         # grants it, the subagent overlay and the seven library entries restate
         # it, the receptionist restates it empty; 221 with the General
-        # Worker's shell group, 222 with the assistant's (both 2026-11-11).
-        assert len(_DECLARATIONS) == 222, (
-            f"expected 222 raw declarations, got {len(_DECLARATIONS)}"
+        # Worker's shell group, 222 with the assistant's (both 2026-11-11),
+        # 231 with the image_generation group (2026-11-17): expert_base
+        # grants it, the subagent overlay and the seven library entries
+        # restate it empty.
+        assert len(_DECLARATIONS) == 231, (
+            f"expected 231 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):

@@ -1534,6 +1534,60 @@
             }
           ]
         },
+        "image_generation": {
+          "description": "Image generation (src/agent/tools/image_generation/): generate_image, built only when an image_generation model is pinned. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "generate_image"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
         "session_task": {
           "description": "Lightweight session todo tools (src/agent/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/agent/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [

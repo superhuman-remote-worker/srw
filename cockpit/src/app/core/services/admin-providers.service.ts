@@ -6,6 +6,7 @@ import {
   ApiKeySetRequest,
   DiscoveryResponse,
   HelmProvenanceSource,
+  ImageGenerationSettings,
   LlmEndpoint,
   LlmEndpointCreateRequest,
   LlmEndpointDiscoveryResult,
@@ -178,6 +179,8 @@ export class AdminProvidersService {
   readonly defaults = signal<Record<DefaultModelKind, string | null>>({...EMPTY_DEFAULTS});
   /** Helm reconcile manifest + provenance; null until loaded or when unavailable. */
   readonly helmManaged = signal<HelmManagedOverview | null>(null);
+  /** Image generation cap + subscription threshold; null until loaded. */
+  readonly imageGenerationSettings = signal<ImageGenerationSettings | null>(null);
   readonly subscriptionAvailability = signal<SubscriptionAvailability>({
     ...EMPTY_SUBSCRIPTION_AVAILABILITY,
   });
@@ -341,6 +344,27 @@ export class AdminProvidersService {
           this.readiness.load();
         }),
       );
+  }
+
+  /** Read the image generation settings. A failed read leaves null, never a guess. */
+  loadImageGenerationSettings(): void {
+    this.http
+      .get<ImageGenerationSettings>(`${this.baseUrl}/admin/system-settings/image_generation`)
+      .pipe(catchError(() => of(null)))
+      .subscribe((row) => {
+        if (row) this.imageGenerationSettings.set(row);
+      });
+  }
+
+  saveImageGenerationSettings(
+    patch: Partial<Pick<ImageGenerationSettings, 'max_paid_images' | 'proxy_quota_threshold_percent'>>,
+  ): Observable<ImageGenerationSettings> {
+    return this.http
+      .put<ImageGenerationSettings>(
+        `${this.baseUrl}/admin/system-settings/image_generation`,
+        patch,
+      )
+      .pipe(tap((row) => this.imageGenerationSettings.set(row)));
   }
 
   /** Refresh which rows Helm reconciles (badges + drift on the Defaults page). */

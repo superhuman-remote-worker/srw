@@ -2351,6 +2351,7 @@ class ToolsConfig:
     skills: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
     research: List[str] = field(default_factory=list)
+    image_generation: List[str] = field(default_factory=list)
     browser_direct: List[str] = field(default_factory=list)
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
@@ -3621,6 +3622,7 @@ def load_agent_config(
         skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
+        image_generation=tools_data.get("image_generation", []),
         browser_direct=tools_data.get("browser_direct", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
@@ -3899,6 +3901,7 @@ def load_agent_config_from_dict(
         skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
+        image_generation=tools_data.get("image_generation", []),
         browser_direct=tools_data.get("browser_direct", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),

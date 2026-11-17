@@ -7,6 +7,7 @@ import {of} from 'rxjs';
 import en from '../../../../assets/i18n/en.json';
 import {AdminProvidersService, HelmManagedOverview} from '../../../core/services/admin-providers.service';
 import {ModelService} from '../../../core/services/model.service';
+import {ImageGenerationSettings} from '../../../core/models/api.model';
 import {AdminDefaultsComponent} from './admin-defaults.component';
 
 const defaults = signal<Record<string, string | null>>({
@@ -26,12 +27,22 @@ const defaults = signal<Record<string, string | null>>({
 const setDefault = vi.fn(() => of({kind: 'search_fallback', model: null}));
 
 const helmManaged = signal<HelmManagedOverview | null>(null);
+const imageGenerationSettings = signal<ImageGenerationSettings | null>({
+  max_paid_images: 20,
+  proxy_quota_threshold_percent: 80,
+  updated_at: null,
+  updated_by: null,
+});
+const saveImageGenerationSettings = vi.fn(() => of(imageGenerationSettings()!));
 const admin = {
   defaults,
   loadDefaults: vi.fn(),
   setDefault,
   helmManaged,
   loadHelmManaged: vi.fn(),
+  imageGenerationSettings,
+  loadImageGenerationSettings: vi.fn(),
+  saveImageGenerationSettings,
 };
 
 const helperModels = [
@@ -109,6 +120,38 @@ describe('AdminDefaultsComponent search providers', () => {
       .toBe('GPT Image 2.6 Flare');
     fixture.componentInstance.setDefault('image_generation', 'gpt-image-2.6-flare');
     expect(setDefault).toHaveBeenCalledWith('image_generation', 'gpt-image-2.6-flare');
+  });
+
+  it('shows the paid-image cap and the subscription threshold under the image pin', () => {
+    saveImageGenerationSettings.mockClear();
+    const fixture = TestBed.createComponent(AdminDefaultsComponent);
+    fixture.detectChanges();
+    const root = fixture.nativeElement as HTMLElement;
+    const block = root.querySelector('[data-testid="image-generation-settings"]');
+    expect(block).not.toBeNull();
+    const labels = Array.from(block!.querySelectorAll('app-form-field')).map(
+      (field) => (field as unknown as {label: string}).label,
+    );
+    expect(labels).toEqual(['Paid images per job or Session', 'Subscription threshold (%)']);
+    expect(admin.loadImageGenerationSettings).toHaveBeenCalled();
+
+    fixture.componentInstance.saveImageSetting('max_paid_images', '0', 0, 10000);
+    expect(saveImageGenerationSettings).toHaveBeenCalledWith({max_paid_images: 0});
+    fixture.componentInstance.saveImageSetting('proxy_quota_threshold_percent', '90', 1, 100);
+    expect(saveImageGenerationSettings).toHaveBeenCalledWith({proxy_quota_threshold_percent: 90});
+  });
+
+  it('refuses an image setting out of range without calling the server', () => {
+    saveImageGenerationSettings.mockClear();
+    const fixture = TestBed.createComponent(AdminDefaultsComponent);
+    fixture.detectChanges();
+    fixture.componentInstance.saveImageSetting('proxy_quota_threshold_percent', '0', 1, 100);
+    fixture.componentInstance.saveImageSetting('max_paid_images', '2.5', 0, 10000);
+    expect(saveImageGenerationSettings).not.toHaveBeenCalled();
+    fixture.detectChanges();
+    expect(
+      (fixture.nativeElement as HTMLElement).querySelector('[role="alert"]')?.textContent,
+    ).toContain('Enter a whole number in range.');
   });
 
   it('offers an explicit None fallback and round-trips clearing it', () => {

@@ -126,6 +126,9 @@ tools:
   communication: []
   # No memory of its own (memory.enabled: false below), so no memory_search.
   memory: []
+  # No paid image generation on the floor; an entry that makes images
+  # grants generate_image explicitly (it counts against the parent's cap).
+  image_generation: []
   webdav: []
   job_control: []
   job_inspection: []

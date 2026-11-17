@@ -1255,6 +1255,14 @@
         "unset": "— nicht gesetzt —",
         "none": "Keine",
         "sameSearchWarning": "Dies entspricht dem primären Suchanbieter; deshalb wird der Laufzeit-Fallback unterdrückt.",
+        "imageGeneration": {
+          "maxPaidImages": "Bezahlte Bilder pro Job oder Session",
+          "maxPaidImagesHint": "Bilder eines Modells mit API-Key zählen hierauf; 0 heißt keine Grenze. Bilder über das Abo zählen hier nicht.",
+          "threshold": "Abo-Schwelle (%)",
+          "thresholdHint": "Bildaufrufe über das Abo stoppen, sobald sein 5-Stunden- oder Wochenfenster diesen Anteil erreicht, damit der Chat den Rest behält.",
+          "invalid": "Gib eine ganze Zahl im gültigen Bereich ein.",
+          "saveFailed": "Die Bildeinstellungen konnten nicht gespeichert werden."
+        },
         "autoPinned": "Automatisch gewählt, weil kein Standard gesetzt war. Wähle ein anderes Modell, um ihn zu ändern.",
         "emptyCatalog": "Der Modellkatalog ist leer. Füge oben einen Anbieter-Key oder Endpunkt hinzu, danach einen Standard auswählen.",
         "auxiliaryGroup": "Hilfsmodelle",

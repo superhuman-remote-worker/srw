@@ -761,6 +761,18 @@ export interface User {
 }
 
 /**
+ * Response body from /api/admin/system-settings/image_generation (GET/PUT):
+ * the paid-image cap per job or Session (0 = no cap) and the share of the
+ * subscription window above which proxy image calls are refused.
+ */
+export interface ImageGenerationSettings {
+  max_paid_images: number;
+  proxy_quota_threshold_percent: number;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+/**
  * Response body from /api/admin/system-settings/vm_workspaces (GET/PUT).
  */
 export interface VmWorkspacesSetting {

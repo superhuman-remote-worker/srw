@@ -116,6 +116,10 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         # The two optional job limits, stated off (0 = the dataclass default).
         "limits.max_llm_calls_per_job",
         "limits.max_plain_replies_in_a_row",
+        # Image generation WP4 (2026-11-17, owner decision D1): the shared
+        # root grants generate_image in a new category, tools.image_generation
+        # (both roles; differs from the dataclass default []).
+        "tools.image_generation",
     ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
@@ -128,6 +132,7 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "tools.memory",
         "memory.pipeline.extensions",
         "memory.retrieval",
+        "tools.image_generation",
     ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was

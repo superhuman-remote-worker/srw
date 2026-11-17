@@ -699,6 +699,19 @@ def image_adapter_for(provider: str | None) -> str | None:
     return _IMAGE_ADAPTER_BY_PROVIDER.get(provider.strip().lower())
 
 
+async def _image_generation_settings(
+    dependencies: DispatchCredentialDependencies,
+) -> dict[str, int]:
+    """The installation's image settings; defaults when unreadable."""
+    from shared.image_generation import SYSTEM_SETTING_KEY, normalize_settings
+
+    try:
+        row = await dependencies.store.get_system_setting(SYSTEM_SETTING_KEY)
+    except Exception:
+        row = None
+    return normalize_settings(row.get("value") if isinstance(row, dict) else None)
+
+
 async def inject_image_credentials(
     config_override: dict[str, Any],
     *,
@@ -767,6 +780,11 @@ async def inject_image_credentials(
     defaults = creds.params.get("image_defaults")
     if isinstance(defaults, dict):
         section["defaults"] = dict(defaults)
+    # The installation's cap on paid images per job or Session (D1). The
+    # proxy lane is not counted; its quota is checked per call (D3).
+    section["max_paid_images"] = (await _image_generation_settings(dependencies))[
+        "max_paid_images"
+    ]
     config_override["image"] = section
     dependencies.logger.info(
         "Dispatch: injected image provider %s (%s, %s)",

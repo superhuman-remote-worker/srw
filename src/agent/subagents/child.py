@@ -88,6 +88,7 @@ WRITE_TOOLS = frozenset(
         "kb_write",
         "kb_update",
         "kb_delete",
+        "generate_image",
     }
 )
 #: Argument names that carry a workspace path on the write tools.

@@ -1418,6 +1418,25 @@ PAPER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 
 
 # research/web
+IMAGE_GENERATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    "generate_image": {
+        "module": "image_generation.tool",
+        "function": "generate_image",
+        "description": (
+            "Generate or edit images with the installation's pinned image model "
+            "and save them in the workspace (one image or a numbered contact "
+            "sheet comes back to look at)."
+        ),
+        "category": "image_generation",
+        "effect": "write",
+        "short_description": (
+            "Generate or edit images (pinned image model); saves them in the workspace."
+        ),
+        "phases": ["strategic", "tactical"],
+    },
+}
+
+
 RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "web_search": {
         "module": "research.web",

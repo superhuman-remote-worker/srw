@@ -260,6 +260,7 @@ def test_injects_the_pinned_proxy_row_as_a_subscription_image_section():
         "catalog_model": "gpt-image-2",
         "ops": ["generate", "edit"],
         "billing": "subscription",
+        "max_paid_images": 20,
     }
 
 
@@ -342,3 +343,22 @@ def test_the_section_survives_the_resolved_blob_seam_and_redaction():
     redacted = redact_config_override({"image": dict(section)})
     assert "api_key" not in redacted["image"]
     assert redacted["image"]["model"] == "gpt-image-2.6-flare"
+
+
+def test_the_cap_comes_from_the_admin_setting():
+    creds = CapabilityCredentials(
+        model="gpt-image-2.6-flare", provider="openai", api_key="k", params={}
+    )
+    store = Mock()
+    store.get_system_setting = AsyncMock(return_value={"value": {"max_paid_images": 5}})
+    deps = Mock(store=store, logger=Mock())
+    with patch(
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
+        AsyncMock(return_value=creds),
+    ):
+        out = asyncio.run(
+            dispatch_credentials.inject_image_credentials(
+                {}, user_settings={}, user_id="u", resolved_keys={}, dependencies=deps
+            )
+        )
+    assert out["image"]["max_paid_images"] == 5

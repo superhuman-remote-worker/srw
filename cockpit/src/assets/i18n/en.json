@@ -1255,6 +1255,14 @@
         "unset": "— not set —",
         "none": "None",
         "sameSearchWarning": "This matches the primary search provider, so runtime failover is suppressed.",
+        "imageGeneration": {
+          "maxPaidImages": "Paid images per job or Session",
+          "maxPaidImagesHint": "Images from an API-key model count against this; 0 means no cap. Subscription images are not counted here.",
+          "threshold": "Subscription threshold (%)",
+          "thresholdHint": "Image calls through the subscription stop when its 5-hour or weekly window reaches this share, so chat keeps the rest.",
+          "invalid": "Enter a whole number in range.",
+          "saveFailed": "Could not save the image settings."
+        },
         "autoPinned": "Picked automatically because no default was set. Choose another model to change it.",
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
         "auxiliaryGroup": "Auxiliary (helper)",
