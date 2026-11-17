@@ -33,6 +33,7 @@ from orchestrator.routers import (
     subscription_management as subscription_management_routes,
     system_settings as system_settings_routes,
     usage_reporting as usage_reporting_routes,
+    version as version_routes,
     user_administration as user_administration_routes,
     voice as voice_routes,
 )
@@ -281,6 +282,15 @@ def identity_dependencies(
     resources: ApplicationResources,
 ) -> identity_routes.IdentityDependencies:
     return identity_routes.IdentityDependencies(
+        store=resources.postgres_db,
+        get_current_user=auth.get_current_user,
+    )
+
+
+def version_dependencies(
+    resources: ApplicationResources,
+) -> version_routes.VersionDependencies:
+    return version_routes.VersionDependencies(
         store=resources.postgres_db,
         get_current_user=auth.get_current_user,
     )

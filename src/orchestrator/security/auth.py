@@ -528,6 +528,9 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     user["auth_method"] = token_scopes.PAT_AUTH_METHOD
     user["scopes"] = list(row.get("scopes") or [])
     user["token_id"] = str(row["id"])
+    # For the auth bootstrap's ``credential`` block (services.identity).
+    user["token_name"] = row.get("name")
+    user["token_expires_at"] = row.get("expires_at")
     if token_scopes.ADMIN_SCOPE not in user["scopes"]:
         user["is_admin"] = False
     try:
@@ -580,6 +583,8 @@ async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
     legacy_scope = row.get("scope") or ""
     user["scopes"] = [legacy_scope] if legacy_scope else []
     user["token_id"] = str(row["id"])
+    user["token_name"] = row.get("name")
+    user["token_expires_at"] = row.get("expires_at")
     return user
 
 

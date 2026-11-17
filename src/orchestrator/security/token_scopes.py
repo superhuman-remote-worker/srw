@@ -208,6 +208,7 @@ _RULES: tuple[_Rule, ...] = (
     # -- Identity and health ----------------------------------------------
     _exact("/api/auth/me", _ANY),
     _exact("/api/health", _ANY),
+    _exact("/api/version", _ANY, "GET"),
     _exact("/api/system/readiness", _ANY),
     # -- Admin-only routes outside /api/admin ------------------------------
     # The fleet view (``/api/admin/agents…``, routers/agent_registration.py)

@@ -49,6 +49,7 @@ from orchestrator.services import (
     connector_git_swap_delivery,
     connector_service_images,
 )
+from orchestrator.services import installation
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
@@ -327,7 +328,7 @@ def create_app(*, settings: DeploymentSettings | None = None) -> FastAPI:
             "Settings → API Keys). Guide: "
             "https://docs.superhuman-remote-worker.com/api/"
         ),
-        version="0.1.0",
+        version=installation.server_version()["release_version"],
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",

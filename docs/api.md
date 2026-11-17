@@ -46,6 +46,13 @@ Authorization: Bearer ak_<your-token>
 A token acts as the user who created it and can reach only what that user
 can reach. If the user is suspended, their tokens stop working.
 
+A tool can check its own token with `GET /api/auth/me`. Beside `user`, the
+answer carries `credential`: `method` (`pat` for a token), the token's
+`token_name`, its `scopes` and `expires_at`. `GET /api/version` returns the
+installation's `release_version`, `source_revision`, the
+`manifest_api_versions` it accepts and, when set, the Cockpit's address as
+`cockpit_url`. Both routes work with any token.
+
 **Rotate** creates a replacement token with the same name, scopes and expiry.
 The old token keeps working for 24 hours so you can switch your tool over.
 **Revoke** stops a token immediately.
@@ -122,7 +129,7 @@ then moves to `processing` and ends as `completed`, `failed`, `cancelled`, or
 |---|---|
 | `GET /api/jobs` | Lists the jobs you can see. Filter with `status`, `origin` or `project_id` (each can repeat); `search` matches the task text, the name and the start of the ID. |
 | `GET /api/jobs/{id}` | Returns one job, including its `status`. |
-| `GET /api/jobs/{id}/progress` | Returns the job's progress. |
+| `GET /api/jobs/{id}/progress` | Returns the job's progress and `status`. `held_by` is `null` unless the job waits for an explicit resume (for example after a pause); a `paused` job without it is picked up again by itself. |
 | `PATCH /api/jobs/{id}` | Renames the job. Body: `{"title": "…"}`, at most 200 characters; `{"title": null}` removes the name. The task text (`description`) does not change. |
 | `PUT /api/jobs/{id}/pause` | Pauses the job. It stays paused until you resume it. |
 | `POST /api/jobs/{id}/resume` | Resumes a paused or failed job. Optional body: `{"feedback": "…"}`. |

@@ -42,6 +42,7 @@ from typing import Any
 
 from shared.worker_execution_hold import (
     WORKER_EXECUTION_HOLD_KEY,
+    WORKER_EXECUTION_HOLD_REASON,
     worker_execution_held_sql,
 )
 
@@ -179,6 +180,26 @@ def operator_pause_hold_present(context: Any) -> bool:
         OPERATOR_PAUSE_HOLD_CONTEXT_KEY in current
         or WORKER_EXECUTION_HOLD_KEY in current
     )
+
+
+def explicit_resume_hold_source(context: Any) -> str | None:
+    """Who or what holds a job until an explicit resume; None when nothing does.
+
+    For a reader of the job. A ``paused`` job without a hold is picked up
+    again by the dispatcher, so only this value tells "waiting for a person"
+    from "waiting for capacity". The value is the hold's ``source``: the
+    public pause's own name, or the recovery fence that set it. A hold of an
+    unexpected shape still holds (presence alone does), and reads ``unknown``.
+    """
+
+    current = _context(context)
+    if OPERATOR_PAUSE_HOLD_CONTEXT_KEY in current:
+        marker = current[OPERATOR_PAUSE_HOLD_CONTEXT_KEY]
+        source = marker.get("source") if isinstance(marker, Mapping) else None
+        return source if isinstance(source, str) and source else "unknown"
+    if WORKER_EXECUTION_HOLD_KEY in current:
+        return WORKER_EXECUTION_HOLD_REASON
+    return None
 
 
 def operator_pause_lift_already_consumed(
