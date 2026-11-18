@@ -232,9 +232,11 @@ to read-only nor to one folder. Attach a project folder when you want less.
 - **Outbox.** A top-level Job a user starts, with their outbox attached, has
   its declared deliverables (or `output/`) copied into a cloud folder shared
   with them once it completes or reaches review. The review page says what
-  landed or why not, and whether it is shared yet: a fresh cloud account
-  must sign in to the cloud once, and the cloud limits how many shares SRW
-  may create at a time. **Re-sync**
+  landed or why not, and whether it is shared yet: SRW creates the user's
+  cloud account if it is missing, but a user it cannot create one for (for
+  example an account from before SRW recorded Keycloak usernames) gets the
+  share only after their first cloud sign-in, and the cloud limits how many
+  shares SRW may create at a time. **Re-sync**
   (`POST /api/jobs/<id>/export-to-shared-folder`) copies again from any
   finished Job.
 

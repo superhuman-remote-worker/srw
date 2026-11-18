@@ -761,28 +761,48 @@ class TestRemovedMemberLeavesTheCloudGroup:
 # =============================================================================
 
 
+MEMBER = {
+    "id": OWNER_ID,
+    "keycloak_sub": "sub-1",
+    "email": "alice@example.com",
+    "display_name": "alice",
+    "preferred_username": "alice",
+}
+
+
+def _identity_store(cached: str | None = None) -> MagicMock:
+    """A store holding the member's cached cloud identity, if any."""
+    store = MagicMock()
+    store.get_user_cloud_identity = AsyncMock(
+        return_value={"nextcloud": {"user_id": cached}} if cached else {}
+    )
+    store.merge_user_cloud_identity = AsyncMock()
+    return store
+
+
+def _cloud(**over: Any) -> SimpleNamespace:
+    backend = dict(
+        is_initialized=True,
+        backend_id="nextcloud",
+        ensure_user=AsyncMock(return_value="nc-alice"),
+        add_user_to_group=AsyncMock(return_value=None),
+    )
+    backend.update(over)
+    return SimpleNamespace(**backend)
+
+
 class TestMemberSyncDegradation:
     @pytest.mark.asyncio
     async def test_keycloak_being_down_still_writes_the_backend_group(self):
-        backend = SimpleNamespace(
-            is_initialized=True, add_user_to_group=AsyncMock(return_value=None)
+        backend = _cloud()
+        deps = _deps(
+            store=_identity_store("u-1"),
+            keycloak_groups=SimpleNamespace(is_initialized=False),
         )
-        deps = _deps(keycloak_groups=SimpleNamespace(is_initialized=False))
 
-        import orchestrator.services.project_provisioning as module
-
-        original = module.resolve_user_identity_cached
-        module.resolve_user_identity_cached = AsyncMock(return_value="u-1")
-        try:
-            await provisioning.sync_project_member_to_groups(
-                PROJECT_ID,
-                f"project-{PROJECT_ID}",
-                {"id": OWNER_ID, "keycloak_sub": "sub-1"},
-                backend,
-                dependencies=deps,
-            )
-        finally:
-            module.resolve_user_identity_cached = original
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID, f"project-{PROJECT_ID}", MEMBER, backend, dependencies=deps
+        )
 
         backend.add_user_to_group.assert_awaited_once_with(
             "u-1", f"project-{PROJECT_ID}"
@@ -790,33 +810,21 @@ class TestMemberSyncDegradation:
 
     @pytest.mark.asyncio
     async def test_a_failing_backend_add_is_logged_not_raised(self):
-        backend = SimpleNamespace(
-            is_initialized=True,
+        backend = _cloud(
             add_user_to_group=AsyncMock(side_effect=RuntimeError("libregraph 503")),
         )
         keycloak = SimpleNamespace(
             is_initialized=True, add_user_to_project_group=AsyncMock()
         )
-        deps = _deps(keycloak_groups=keycloak)
+        deps = _deps(store=_identity_store("u-1"), keycloak_groups=keycloak)
 
-        import orchestrator.services.project_provisioning as module
-
-        original = module.resolve_user_identity_cached
-        module.resolve_user_identity_cached = AsyncMock(return_value="u-1")
-        try:
-            await provisioning.sync_project_member_to_groups(
-                PROJECT_ID,
-                f"project-{PROJECT_ID}",
-                {"id": OWNER_ID, "keycloak_sub": "sub-1"},
-                backend,
-                dependencies=deps,
-            )
-        finally:
-            module.resolve_user_identity_cached = original
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID, f"project-{PROJECT_ID}", MEMBER, backend, dependencies=deps
+        )
 
         # The durable half still landed.
         keycloak.add_user_to_project_group.assert_awaited_once()
-        deps.logger.debug.assert_called_once()
+        deps.logger.warning.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_an_uninitialised_backend_skips_identity_resolution_entirely(self):
@@ -926,6 +934,162 @@ class TestMemberSyncDegradation:
 
         assert result is project
         deps.logger.debug.assert_called_once()
+
+
+# =============================================================================
+# A member who never signed in to the cloud gets an account, then the group
+# =============================================================================
+
+
+class TestMemberSyncCreatesAccounts:
+    """SRW alone writes project-group membership in the cloud, so a member
+    without a cloud account gets one up front instead of waiting for a login
+    that never puts them into the group."""
+
+    @pytest.mark.asyncio
+    async def test_a_member_without_an_account_gets_one_then_the_group(self):
+        backend = _cloud()
+        store = _identity_store()
+        deps = _deps(store=store)
+
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID, f"project-{PROJECT_ID}", MEMBER, backend, dependencies=deps
+        )
+
+        backend.ensure_user.assert_awaited_once_with(
+            sub="sub-1",
+            issuer="",
+            email="alice@example.com",
+            display_name="alice",
+            preferred_username="alice",
+        )
+        backend.add_user_to_group.assert_awaited_once_with(
+            "nc-alice", f"project-{PROJECT_ID}"
+        )
+        store.merge_user_cloud_identity.assert_awaited_once()
+        assert store.merge_user_cloud_identity.await_args.args[1:3] == (
+            "nextcloud",
+            {
+                "user_id": "nc-alice",
+                "resolved_at": store.merge_user_cloud_identity.await_args.args[2][
+                    "resolved_at"
+                ],
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_cached_account_goes_straight_into_the_group(self):
+        backend = _cloud(
+            ensure_user=AsyncMock(side_effect=AssertionError("looked up again"))
+        )
+
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID,
+            f"project-{PROJECT_ID}",
+            MEMBER,
+            backend,
+            dependencies=_deps(store=_identity_store("nc-alice")),
+        )
+
+        backend.add_user_to_group.assert_awaited_once_with(
+            "nc-alice", f"project-{PROJECT_ID}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_member_without_an_sso_identity_is_only_looked_up(self):
+        """An account is created for the identity a login will bring; a row
+        with no Keycloak subject has none to create it for."""
+        backend = _cloud(
+            ensure_user=AsyncMock(side_effect=AssertionError("created")),
+            resolve_user_identity=AsyncMock(return_value="nc-alice"),
+        )
+        member = {**MEMBER, "keycloak_sub": None}
+
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID,
+            f"project-{PROJECT_ID}",
+            member,
+            backend,
+            dependencies=_deps(store=_identity_store()),
+        )
+
+        backend.resolve_user_identity.assert_awaited_once_with(
+            "alice@example.com", "alice"
+        )
+        backend.add_user_to_group.assert_awaited_once_with(
+            "nc-alice", f"project-{PROJECT_ID}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_member_left_without_an_account_is_a_warning(self):
+        backend = _cloud(ensure_user=AsyncMock(return_value=None))
+        deps = _deps(store=_identity_store())
+
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID, f"project-{PROJECT_ID}", MEMBER, backend, dependencies=deps
+        )
+
+        backend.add_user_to_group.assert_not_awaited()
+        deps.logger.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_account_creation_never_fails_the_member_add(self):
+        from orchestrator.services.cloud import CloudBackendError, CloudBackendErrorKind
+
+        backend = _cloud(
+            ensure_user=AsyncMock(
+                side_effect=CloudBackendError(
+                    CloudBackendErrorKind.UNAVAILABLE,
+                    "user_oidc 500",
+                    backend="nextcloud",
+                )
+            )
+        )
+        keycloak = SimpleNamespace(
+            is_initialized=True, add_user_to_project_group=AsyncMock()
+        )
+        deps = _deps(store=_identity_store(), keycloak_groups=keycloak)
+
+        await provisioning.sync_project_member_to_groups(
+            PROJECT_ID, f"project-{PROJECT_ID}", MEMBER, backend, dependencies=deps
+        )
+
+        keycloak.add_user_to_project_group.assert_awaited_once()
+        backend.add_user_to_group.assert_not_awaited()
+        deps.logger.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_drift_repair_creates_the_missing_account(self):
+        """Members added before this change never got an account; the repair
+        a project page open fires must fix them without a re-add."""
+        backend = _cloud()
+        backend.backend_instance_id = str(uuid4())
+        store = _identity_store()
+        store.get_project = AsyncMock(side_effect=lambda _pid: {"id": PROJECT_ID})
+        store.get_project_members = AsyncMock(return_value=[{"user_id": OWNER_ID}])
+        store.get_user = AsyncMock(return_value=dict(MEMBER))
+        deps = _deps(
+            store=store,
+            main_cloud_router=SimpleNamespace(
+                for_project_optional=MagicMock(return_value=backend),
+                for_owner=MagicMock(return_value=backend),
+                active_instance_id=backend.backend_instance_id,
+            ),
+        )
+        project = {
+            "id": PROJECT_ID,
+            "name": "Has a folder",
+            "is_default": False,
+            "main_cloud_backend": "nextcloud",
+            "main_cloud_folder_handle": "nextcloud:7",
+        }
+
+        await provisioning.ensure_project_cloud_resources(project, dependencies=deps)
+
+        backend.ensure_user.assert_awaited_once()
+        backend.add_user_to_group.assert_awaited_once_with(
+            "nc-alice", f"project-{PROJECT_ID}"
+        )
 
 
 # =============================================================================

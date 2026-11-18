@@ -17,7 +17,8 @@ entity-encoded etags, server-absolute URL-encoded hrefs) so the shared
 
 from __future__ import annotations
 
-from urllib.parse import quote, unquote
+import hashlib
+from urllib.parse import parse_qsl, quote, unquote
 
 import httpx
 import pytest
@@ -501,6 +502,206 @@ class TestResolveUserIdentity:
             }
         )
         assert await be.resolve_user_identity("a@example.com", "x") == "a"
+
+
+USER_OIDC_CONFIG = "/ocs/v2.php/apps/provisioning_api/api/v1/config/apps/user_oidc"
+USER_OIDC_CREATE = "/ocs/v2.php/apps/user_oidc/api/v1/user"
+
+
+def _login_uid(provider_id: int, username: str) -> str:
+    """The uid user_oidc gives a login under unique uids (LocalIdService::getId)."""
+    return hashlib.sha256(f"{provider_id}_0_{username}".encode()).hexdigest()
+
+
+def _ocs(data: object, *, status: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status,
+        json={"ocs": {"meta": {"statuscode": status}, "data": data}},
+    )
+
+
+class FakeUserOidc:
+    """The admin endpoints ``ensure_user`` uses: the user search, user_oidc's
+    app config, the user record, and user_oidc's create-user API, which finds
+    or creates the account as ``UserMapper::getOrCreate`` does for a login."""
+
+    def __init__(self, config: dict[str, str] | None = None) -> None:
+        self.users: dict[str, dict] = {}
+        self.config = (
+            config
+            if config is not None
+            else {
+                "provider-3-mappingUid": "preferred_username",
+                "provider-3-uniqueUid": "1",
+                "provider-3-groupProvisioning": "0",
+            }
+        )
+        self.created: list[dict[str, str]] = []
+        self.create_status = 200
+        self.config_listings = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/ocs/v2.php/cloud/users/details":
+            search = request.url.params["search"].lower()
+            found = {
+                uid: rec
+                for uid, rec in self.users.items()
+                if search
+                in f"{uid} {rec.get('email') or ''} {rec.get('displayname') or ''}".lower()
+            }
+            return _ocs({"users": found})
+        if path == USER_OIDC_CONFIG:
+            self.config_listings += 1
+            return _ocs({"data": sorted(self.config)})
+        if path.startswith(USER_OIDC_CONFIG + "/"):
+            return _ocs({"data": self.config.get(path.rsplit("/", 1)[1], "")})
+        if path == USER_OIDC_CREATE and request.method == "POST":
+            form = dict(parse_qsl(request.content.decode()))
+            self.created.append(form)
+            if self.create_status != 200:
+                return _ocs([], status=self.create_status)
+            uid = _login_uid(int(form["providerId"]), form["userId"])
+            self.users.setdefault(
+                uid,
+                {"email": form.get("email"), "displayname": form.get("displayName")},
+            )
+            return _ocs({"user_id": uid})
+        if path.startswith("/ocs/v2.php/cloud/users/") and request.method == "GET":
+            uid = path.rsplit("/", 1)[1]
+            if uid in self.users:
+                return _ocs({"id": uid})
+            return _ocs([], status=404)
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    def backend(self) -> NextcloudBackend:
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(self.handler)
+        )
+        be._initialized = True
+        return be
+
+
+async def _ensure_alice(be: NextcloudBackend, **over: object):
+    args: dict[str, object] = dict(
+        sub="kc-sub-alice",
+        issuer="https://id.example.com/realms/srw",
+        email="alice@example.com",
+        display_name="Alice",
+        preferred_username="alice",
+    )
+    args.update(over)
+    return await be.ensure_user(**args)
+
+
+class TestEnsureUser:
+    """A project member who never signed in to Nextcloud gets the account
+    their first SSO login would create, so SRW can put them into the project
+    group at once."""
+
+    @pytest.mark.asyncio
+    async def test_an_account_the_search_finds_is_returned_and_none_created(self):
+        fake = FakeUserOidc()
+        fake.users["oidc-1"] = {"email": "alice@example.com", "displayname": "A"}
+
+        assert await _ensure_alice(fake.backend()) == "oidc-1"
+        assert fake.created == []
+
+    @pytest.mark.asyncio
+    async def test_a_member_without_an_account_gets_the_one_their_login_would(self):
+        fake = FakeUserOidc()
+
+        account = await _ensure_alice(fake.backend())
+
+        assert account == _login_uid(3, "alice")
+        assert fake.created == [
+            {
+                "providerId": "3",
+                "userId": "alice",
+                "displayName": "Alice",
+                "email": "alice@example.com",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_account_the_search_misses_is_never_created_again(self):
+        """Creating copies Nextcloud's skeleton files into the home again,
+        over the user's own copies, so an account that exists under the
+        login's uid is returned as it is."""
+        fake = FakeUserOidc()
+        fake.users[_login_uid(3, "alice")] = {"email": None, "displayname": None}
+
+        assert await _ensure_alice(fake.backend()) == _login_uid(3, "alice")
+        assert fake.created == []
+
+    @pytest.mark.asyncio
+    async def test_no_account_is_created_without_a_preferred_username(self, caplog):
+        fake = FakeUserOidc()
+
+        with caplog.at_level("WARNING"):
+            assert await _ensure_alice(fake.backend(), preferred_username=None) is None
+
+        assert fake.created == []
+        assert "preferred_username" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"provider-1-mappingUid": "sub"},
+            {},
+            {
+                "provider-1-mappingUid": "preferred_username",
+                "provider-2-mappingUid": "preferred_username",
+            },
+            {
+                "provider-1-mappingUid": "preferred_username",
+                "provider-1-uniqueUid": "0",
+            },
+        ],
+        ids=["uid-from-sub", "no-provider", "two-providers", "plain-uids"],
+    )
+    async def test_no_account_is_created_unless_one_provider_is_the_charts(
+        self, config, caplog
+    ):
+        """Only a provider that takes the uid from preferred_username and
+        hashes it, as the chart registers Keycloak, tells SRW which account
+        the user's login will find."""
+        fake = FakeUserOidc(config)
+
+        with caplog.at_level("WARNING"):
+            assert await _ensure_alice(fake.backend()) is None
+
+        assert fake.created == []
+        assert caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_provider_is_looked_up_once(self):
+        fake = FakeUserOidc()
+        be = fake.backend()
+
+        await _ensure_alice(be)
+        await _ensure_alice(
+            be,
+            sub="kc-sub-bob",
+            email="bob@example.com",
+            display_name="Bob",
+            preferred_username="bob",
+        )
+
+        assert fake.config_listings == 1
+        assert len(fake.created) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_refused_create_raises(self):
+        fake = FakeUserOidc()
+        fake.create_status = 500
+
+        with pytest.raises(CloudBackendError) as exc:
+            await _ensure_alice(fake.backend())
+
+        assert exc.value.kind == CloudBackendErrorKind.UNAVAILABLE
 
 
 class TestSharedClientSendsNoCookies:

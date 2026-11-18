@@ -34,7 +34,10 @@ from orchestrator.services.cloud import (
     CloudBackendErrorKind,
     FeatureNotAvailable,
 )
-from orchestrator.services.cloud.identity import resolve_user_identity_cached
+from orchestrator.services.cloud.identity import (
+    resolve_user_identity_cached,
+    with_cached_identity,
+)
 from orchestrator.services.datasource_config import (
     validate_kb_repository_auth,
     validate_kb_repository_url,
@@ -142,29 +145,67 @@ async def sync_project_member_to_groups(
     *,
     dependencies: ProjectProvisioningDependencies,
 ) -> None:
-    """Add one member to the Keycloak group and the LibreGraph group.
+    """Add one member to the Keycloak group and the main cloud's group.
 
     Both writes are needed: Keycloak carries the `groups` token claim (durable
     across OpenCloud re-logins), the direct backend add makes the Space visible
     in the user's currently-active OpenCloud session without waiting for them
-    to re-authenticate.
+    to re-authenticate. On Nextcloud the direct add is the only writer: its
+    logins no longer provision groups.
+
+    A member without a cloud account gets one first (``ensure_user``), so a
+    member who has never signed in to the cloud is in the group at once. A
+    cloud refusal is logged as a warning, never raised: the member add stands,
+    and the drift repair, which runs this again, retries.
     """
     if dependencies.keycloak_groups.is_initialized and user.get("keycloak_sub"):
         await dependencies.keycloak_groups.add_user_to_project_group(
             user["keycloak_sub"], project_id_str
         )
-    if backend.is_initialized:
-        try:
-            resolved = await resolve_user_identity_cached(
-                dependencies.store, user, backend
-            )
-            if resolved:
-                await backend.add_user_to_group(resolved, group_name)
-        except Exception as e:
-            dependencies.logger.debug(
-                f"Failed to add user {user.get('id')} to backend group "
-                f"{group_name}: {e}"
-            )
+    if not backend.is_initialized:
+        return
+
+    async def ensure_account() -> Any:
+        return await backend.ensure_user(
+            sub=user.get("keycloak_sub") or "",
+            issuer=getattr(backend, "_keycloak_issuer", "") or "",
+            email=user.get("email"),
+            display_name=user.get("display_name"),
+            preferred_username=user.get("preferred_username"),
+        )
+
+    async def add_to_group(account: Any) -> bool:
+        await backend.add_user_to_group(account, group_name)
+        return True
+
+    try:
+        # Only an SSO identity gets an account up front: it is what the
+        # member's login will bring. A row without one is only looked up.
+        added = await with_cached_identity(
+            dependencies.store,
+            user,
+            backend,
+            add_to_group,
+            lookup=ensure_account if user.get("keycloak_sub") else None,
+        )
+    except Exception:
+        dependencies.logger.warning(
+            "Project %s: member %s was not added to the cloud group %s; the "
+            "next drift repair retries",
+            project_id_str,
+            user.get("id"),
+            group_name,
+            exc_info=True,
+        )
+        return
+    if not added:
+        dependencies.logger.warning(
+            "Project %s: member %s is not in the cloud group %s: they have no "
+            "cloud account and none was created",
+            project_id_str,
+            user.get("id"),
+            group_name,
+        )
 
 
 async def remove_project_member_from_backend_group(
