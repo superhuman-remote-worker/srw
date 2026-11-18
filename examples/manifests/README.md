@@ -375,7 +375,7 @@ apply exactly what you reviewed, supply the same files and scope options to prev
 and apply with `--plan`. Explicit versions still work:
 `--expected-version 'Expert/Account/ACCOUNT_UUID/custom=3'`, or
 `--expected-versions versions.json` containing that JSON map, with canonical scopes
-from the stored resource response. The CLI never retries a mutation automatically;
+from the stored resource response. The CLI never sends an apply again by itself;
 after an unknown outcome (exit code 6), inspect current resources and reuse an
 idempotency key only with the identical apply request. Resource deletion can be
 blocked by active work or project ownership.

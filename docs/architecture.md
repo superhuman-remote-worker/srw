@@ -49,6 +49,7 @@ The boundary is explained in detail in the [security model](security-model.md).
 | **Agent runtime** | LangGraph-based harness that resolves an expert, calls models, selects tools, checkpoints work, and reports outcomes |
 | **Workspace backend** | Virtual files, a remote container, a remote VM, or no workspace; exposes only the capabilities of the selected tier |
 | **MCP server** | Optional external interface for inspecting and operating SRW through scoped tools |
+| **srw CLI** | Optional command-line client for people and pipelines; it calls the orchestrator's public API with a personal access token and holds no authority of its own |
 | **Application PostgreSQL** | Users, projects, jobs, sessions, configuration, and other authoritative application records |
 | **pgvector / memory services** | Embeddings, hybrid retrieval, citations, and project-scoped recalled memory |
 | **Audit PostgreSQL** | LLM, agent, chat, tool, and operational traces when the audit tier is enabled |

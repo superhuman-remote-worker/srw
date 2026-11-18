@@ -11,7 +11,8 @@ connectors, workspace templates, projects), and it runs work (start a job,
 wait for it, read what the agent did, fetch the result).
 
 It uses the same API as the Cockpit and can do what its token allows. Every
-command and flag is listed in the [srw CLI reference](cli-reference.md).
+command, flag and environment variable is listed in the
+[srw CLI reference](cli-reference.md).
 
 ## Install
 
@@ -161,6 +162,25 @@ The manifest format is described in the
 `files` and `cp` read what the job pushed last, not its live workspace. A
 running job's newest files appear after its next push.
 
+## Everything else
+
+`srw api PATH` sends a request with your token to any path of the API and
+prints the answer. Use it for a route that has no command of its own:
+
+```bash
+srw api /api/models
+srw api '/api/jobs?status=failed&limit=5'
+srw api -X POST /api/jobs --input job.json
+```
+
+The method is `GET` unless `-X` names another. The token goes only to the
+configured server; an address of another server is refused. The routes are
+described in the [API guide](api.md).
+
+`srw cache list` and `srw cache delete` show and remove the prepared
+workspace artifacts of an account, a project or the shared catalog. They
+need an installation that runs VM workspaces.
+
 ## Output and exit codes
 
 Tables are for people. For a script, add `-o json`, `-o yaml` or `-o name`
@@ -191,13 +211,14 @@ Errors go to standard error: one line for a person, or
 | Commands | Scopes the token needs |
 |---|---|
 | `whoami`, `version` | any |
-| `get`, `describe`, `logs`, `wait`, `files`, `cp`, `validate`, `preview`, `export` | `jobs:read` |
+| `get`, `describe`, `logs`, `wait`, `files`, `cp`, `validate`, `preview`, `export`, `cache list` | `jobs:read` |
 | `get sessions` | `chat:read` |
 | `run`, `cancel`, `pause`, `resume`, `approve`, `delete job` | `jobs:write`; also `jobs:read` for names, id prefixes and `delete job` |
 | `apply`, `delete` of a stored resource | `resources:write` |
 | `apply` with a Job document | also `jobs:write` |
 | `apply` or `delete` of a Project | also `projects:write` |
 | Changes to the shared catalog, `cache delete` | `admin` |
+| `api` | what the route needs; see the [scope table](api.md#scopes) |
 
 A token without the `admin` scope acts without admin rights even when its
 owner is an admin. `srw whoami` says so.
