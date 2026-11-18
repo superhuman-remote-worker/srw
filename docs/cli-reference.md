@@ -1,14 +1,15 @@
 ---
 title: srw CLI reference
-description: Every command, flag and example of srw, the command-line client of Superhuman Remote Worker.
+description: Every command, flag, example and environment variable of srw, the command-line client of Superhuman Remote Worker.
 ---
 
 # srw CLI reference
 
-This page lists every command of `srw` with its flags and examples. It is
-generated from the program's own help text, so it matches the version of the
-documentation you are reading. For installing, logging in and a first
-walkthrough, see [srw CLI](cli.md).
+This page lists every command of `srw` with its flags and examples, and the
+environment variables it reads. The commands are generated from the program's
+own help text, so they match the version of the documentation you are
+reading. For installing, logging in and a first walkthrough, see
+[srw CLI](cli.md).
 
 ## Global flags
 
@@ -22,6 +23,19 @@ These work with every command.
 | `-o, --output string` | Output format: json, yaml or name (also: SRW_OUTPUT) |
 | `--server string` | API address. Uses the environment, not a saved login (also: SRW_API_URL) |
 | `--token-stdin` | Read the token from the first line of standard input |
+
+## Environment variables
+
+| Variable | Meaning |
+|---|---|
+| `SRW_API_URL` | API address. Setting it uses the environment instead of a saved login, as --server does |
+| `COCKPIT_API_URL` | Older name of SRW_API_URL, read when that is not set |
+| `SRW_TOKEN` | Token for a server given by --server or SRW_API_URL. It is never sent to the server of a saved login. Without it, the first line of ~/.config/srw/token is used |
+| `SRW_CONTEXT` | Saved login to use instead of the current one, as --context does |
+| `SRW_OUTPUT` | Output format, as -o does: json, yaml or name |
+| `SRW_CONFIG` | Absolute path of the config file, in place of ~/.config/srw/config.yaml. credentials.yaml is read beside it |
+| `XDG_CONFIG_HOME` | When it is an absolute path, the config directory is $XDG_CONFIG_HOME/srw |
+| `HTTPS_PROXY` | Proxy for requests to the API. NO_PROXY lists the hosts that bypass it |
 
 ## srw api
 

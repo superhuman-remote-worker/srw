@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +42,41 @@ func TestThePageDoesNotDependOnTheMachine(t *testing.T) {
 	}
 	if !bytes.Equal(first.Bytes(), second.Bytes()) {
 		t.Error("the reference changes with the environment")
+	}
+}
+
+// A variable the program reads belongs on the page. This reads the sources
+// of srw for the names it asks the environment for.
+func TestEveryVariableTheProgramReadsIsListed(t *testing.T) {
+	name := regexp.MustCompile(`"((?:SRW|COCKPIT)_[A-Z_]+|XDG_CONFIG_HOME)"`)
+	read := map[string]string{}
+	root := filepath.Join("..", "..", "internal")
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		source, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, match := range name.FindAllSubmatch(source, -1) {
+			read[string(match[1])] = path
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read) < 5 {
+		t.Fatalf("found only %d variables under %s; the search no longer sees the sources", len(read), root)
+	}
+	listed := map[string]bool{}
+	for _, variable := range environment {
+		listed[variable.name] = true
+	}
+	for variable, path := range read {
+		if !listed[variable] {
+			t.Errorf("%s reads %s, which the reference does not list; add it to environment", path, variable)
+		}
 	}
 }
