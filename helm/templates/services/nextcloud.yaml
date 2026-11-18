@@ -186,8 +186,238 @@ apache-samesite-markers.conf: |
   Header always add Set-Cookie "nc_sameSiteCookiestrict=true; path=/cloud; httponly; secure; expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=strict" "expr=%{HTTP_COOKIE} !~ /nc_sameSiteCookiestrict=true/"
 {{- end }}
 {{- end -}}
+{{- /*
+The setup hook: the image runs it as a before-starting hook, i.e. only when
+the Nextcloud container starts, from a subPath mount that never updates in
+place. The Pod carries its checksum, so a release that changes what it sets
+restarts Nextcloud instead of leaving the running settings as they were.
+*/ -}}
+{{- define "srw.nextcloudSetupHook" -}}
+{{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson -}}
+#!/bin/bash
+# =============================================================================
+# Nextcloud auto-configuration (before-starting hook)
+# =============================================================================
+# Configures Nextcloud for the SRW platform on every container start.
+# Fully idempotent — safe to re-run. Non-fatal — failures won't block startup.
+#
+# What this does:
+#   0. Background jobs: pins trash/version retention and internal share
+#      expiry off, and sets the background-job mode; S3 primary storage
+#      skips its per-connection bucket check
+#   1. OIDC: Registers Keycloak as OpenID Connect provider
+#   2. OIDC: Keeps group provisioning off (SRW writes project groups)
+#   3. Group Folders: Installs, updates and enables the groupfolders app
+#   4. Service account: Creates srw-agents group and agent-service user
+#
+# Required environment variables:
+#   NEXTCLOUD_OIDC_CLIENT_SECRET   — OIDC client secret (from Keycloak realm)
+#   NEXTCLOUD_OIDC_DISCOVERY_URI   — Keycloak OIDC discovery endpoint (internal)
+#
+# Optional environment variables:
+#   NEXTCLOUD_AGENT_PASSWORD       — Password for agent-service user (default: random)
+# =============================================================================
+# Non-fatal: setup failure must not prevent Nextcloud from starting
+set +e
+
+CLIENT_ID="${NEXTCLOUD_OIDC_CLIENT_ID:-nextcloud}"
+CLIENT_SECRET="${NEXTCLOUD_OIDC_CLIENT_SECRET:-}"
+DISCOVERY_URI="${NEXTCLOUD_OIDC_DISCOVERY_URI:-}"
+PROVIDER_NAME="${NEXTCLOUD_OIDC_PROVIDER_NAME:-Keycloak}"
+AGENT_PASSWORD="${NEXTCLOUD_AGENT_PASSWORD:-}"
+
+# Helper: run occ (entrypoint already runs hooks as www-data via run_as)
+occ() {
+    php /var/www/html/occ "$@"
+}
+
+# Check if Nextcloud is installed (first-boot race: DB may not be ready yet)
+if ! occ status --output=json 2>/dev/null | grep -q '"installed":true'; then
+    echo "[nc-setup] Nextcloud not yet installed, skipping (will retry on next start)"
+    exit 0
+fi
+
+{{- if include "srw.singleOrigin" . }}
+# The image initializes trusted_domains only on first install. Reconcile
+# persisted config on every start, including PVCs from multi-host installs.
+# No forwarded client IP ranges are trusted by this evaluation preset.
+occ config:system:set trusted_domains --type=json --value='{{ list (printf "%s-nextcloud" (include "srw.fullname" .)) (urlParse (include "srw.publicOrigin" .)).host | toJson }}' || exit 1
+occ config:system:delete trusted_proxies || exit 1
+{{- end }}
+
+# =========================================================================
+# 0. Allow connections to cluster-internal services (SSRF protection override)
+#    Required because Keycloak runs as an internal K8s service.
+# =========================================================================
+occ config:system:set allow_local_remote_servers --value=true --type=boolean 2>&1 || true
+
+# =========================================================================
+# 0a. Background jobs: retention and share expiry pinned, then the mode.
+#     Background jobs expire trash and thin file versions, and new
+#     internal shares can get a default expiry date. Versions and trash
+#     are the only recovery floor (the object store keeps no history of
+#     its own) and SRW's session shares must never expire, so today's
+#     behaviour is pinned here, whichever mode runs the jobs. The
+#     Apache and cron containers also carry the two retention values as
+#     NC_* env, so the cron container's first run cannot race this hook.
+#     Groupfolders' trash and versions expire through the same two keys.
+# =========================================================================
+occ config:system:set trashbin_retention_obligation --value={{ include "srw.nextcloudTrashbinRetention" . }} 2>&1 || true
+occ config:system:set versions_retention_obligation --value={{ include "srw.nextcloudVersionsRetention" . }} 2>&1 || true
+occ config:app:set core shareapi_default_internal_expire_date --value=no 2>&1 || true
+occ config:app:set core shareapi_enforce_internal_expire_date --value=no 2>&1 || true
+{{- if .Values.nextcloud.cron.enabled }}
+# The cron container's first cron.php switches the mode itself; setting
+# it here keeps the admin view right until then.
+occ background:cron 2>&1 || true
+{{- else }}
+# No cron container, so jobs run from web requests (ajax). A mode an
+# earlier cron container left at "cron" would run no jobs at all.
+if [ "$(occ config:app:get core backgroundjobs_mode 2>/dev/null)" = "cron" ]; then
+    occ background:ajax 2>&1 || true
+fi
+{{- end }}
+{{- if .Values.nextcloud.objectStore.enabled }}
+
+# =========================================================================
+# 0b. S3 primary storage: no bucket-exists check on every connection.
+#     Nextcloud 31 creates a missing S3 bucket only through that check
+#     (it does not read OBJECTSTORE_S3_AUTOCREATE for S3), so it stays on
+#     until install has created the bucket; this hook only runs on an
+#     installed Nextcloud. Config files are deep-merged, so the key
+#     survives the image's s3.config.php. Set only on an existing
+#     objectstore entry, never creating a partial one.
+# =========================================================================
+if occ config:system:get objectstore class >/dev/null 2>&1; then
+    occ config:system:set objectstore arguments verify_bucket_exists --value=false --type=boolean 2>&1 || true
+fi
+{{- end }}
+
+# =========================================================================
+# 0c. Share-create rate limit (nextcloud.rateLimits.shareCreate).
+#     Nextcloud allows each user 20 new shares per 600 s. agent-service
+#     creates every session and job-export share, so that per-user limit
+#     is the installation's ceiling. The override is keyed by app,
+#     controller and method in lower case, as RateLimitingMiddleware
+#     builds it, not by the OCS route name. Settings persist in
+#     config.php, so unset values delete the override rather than
+#     leave the last one in place.
+# =========================================================================
+{{- if $shareRateLimit.override }}
+occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user limit --value={{ int $shareRateLimit.limit }} --type=integer 2>&1 || true
+occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user period --value={{ int $shareRateLimit.periodSeconds }} --type=integer 2>&1 || true
+{{- else }}
+occ config:system:delete ratelimit_overwrite files_sharing.shareapi.createshare 2>&1 || true
+{{- end }}
+{{- if not (include "srw.nextcloudRedisEnabled" .) }}
+
+# =========================================================================
+# 0d. Valkey off (nextcloud.redis.enabled=false): drop any Redis settings
+#     config.php still holds. Every config write dumps the merged config,
+#     redis.config.php's values included, into config.php, so removing
+#     REDIS_HOST alone leaves Nextcloud pointing at a server that is gone.
+# =========================================================================
+if occ config:system:get memcache.locking 2>/dev/null | grep -q 'Redis' \
+    || occ config:system:get memcache.distributed 2>/dev/null | grep -q 'Redis'; then
+    echo "[nc-setup] Valkey is off: removing the Redis settings from config.php"
+    occ config:system:delete memcache.distributed 2>&1 || true
+    occ config:system:delete memcache.locking 2>&1 || true
+    occ config:system:delete redis 2>&1 || true
+fi
+{{- end }}
+
+# Allow OIDC login over plain HTTP (local dev without TLS reverse proxy).
+# Only effective when OVERWRITEPROTOCOL != https (i.e. dev environments).
+if [ "$(occ config:system:get overwriteprotocol 2>/dev/null)" != "https" ]; then
+    echo "[nc-setup] Plain HTTP detected, enabling allow_insecure_http for OIDC..."
+    occ config:app:set user_oidc allow_insecure_http --value=1 2>&1 || true
+fi
+
+# =========================================================================
+# 1. OIDC provider registration
+# =========================================================================
+if [ -z "$CLIENT_SECRET" ] || [ -z "$DISCOVERY_URI" ]; then
+    echo "[nc-setup] NEXTCLOUD_OIDC_CLIENT_SECRET or DISCOVERY_URI not set, skipping OIDC"
+else
+    echo "[nc-setup] Ensuring user_oidc app is installed..."
+    occ app:install user_oidc 2>/dev/null || true
+    occ app:enable user_oidc 2>/dev/null || true
+
+    # The command updates an existing provider in place, preserving
+    # identity mappings when the discovery URL or secret changes.
+    echo "[nc-setup] Reconciling OIDC provider '$PROVIDER_NAME'..."
+    if occ user_oidc:provider "$PROVIDER_NAME" \
+        --clientid="$CLIENT_ID" \
+        --clientsecret="$CLIENT_SECRET" \
+        --discoveryuri="$DISCOVERY_URI" \
+        --unique-uid=1 \
+        --mapping-uid=preferred_username \
+        --mapping-display-name=name \
+        --check-bearer=1 \
+        --group-provisioning=0 2>&1; then
+        echo "[nc-setup] OIDC provider reconciled successfully"
+    else
+        echo "[nc-setup] WARNING: Failed to register OIDC provider (non-fatal)"
+    fi
+
+    {{- if include "srw.singleOrigin" . }}
+    occ config:app:set user_oidc allow_insecure_http --value=0 2>&1 || true
+    {{- end }}
+
+    # SRW alone writes project-group membership: it puts each project member
+    # into project-<id>, creating their account first if they have never
+    # signed in. Group provisioning stays off. With unique uids, user_oidc
+    # hashes the group ids in the token too, so each login put the user into
+    # a hashed copy of every project group, which owns no folder, and took
+    # them out of the real one. Repeated here so that it lands even when the
+    # reconcile above fails. A group whitelist regex the provider still
+    # stores has no effect while provisioning is off.
+    echo "[nc-setup] Keeping OIDC group provisioning off..."
+    occ user_oidc:provider "$PROVIDER_NAME" --group-provisioning=0 2>&1 || true
+fi
+
+# =========================================================================
+# 2. Group Folders app (required for project cloud folders)
+#    app:update matters: app:install is a no-op on an existing install,
+#    and the protected cloud feature refuses to engage RO mounts below
+#    groupfolders 20.1.2 (CVE floor GHSA-2vrq-fhmf-c49m, enforced by
+#    check_version_floors in src/orchestrator/services/cloud/ro_probe.py).
+# =========================================================================
+echo "[nc-setup] Ensuring groupfolders app is installed and current..."
+occ app:install groupfolders 2>/dev/null || true
+occ app:update groupfolders 2>&1 || true
+occ app:enable groupfolders 2>/dev/null || true
+
+# =========================================================================
+# 3. srw-agents group (agent service accounts are members of this group;
+#    granted access to every project's Group Folder at creation time)
+# =========================================================================
+if occ group:list --output=json 2>/dev/null | grep -q '"srw-agents"'; then
+    echo "[nc-setup] Group 'srw-agents' already exists"
+else
+    echo "[nc-setup] Creating group 'srw-agents'..."
+    occ group:add srw-agents 2>&1 || true
+fi
+
+# =========================================================================
+# 4. agent-service user (WebDAV service account for agent file operations)
+# =========================================================================
+if occ user:info agent-service --output=json 2>/dev/null | grep -q '"user_id"'; then
+    echo "[nc-setup] User 'agent-service' already exists"
+else
+    echo "[nc-setup] Creating user 'agent-service'..."
+    if [ -z "$AGENT_PASSWORD" ]; then
+        AGENT_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
+        echo "[nc-setup] Generated random password for agent-service (set NEXTCLOUD_AGENT_PASSWORD to fix it)"
+    fi
+    export OC_PASS="$AGENT_PASSWORD"
+    occ user:add --password-from-env --group=srw-agents --display-name="SRW Agent Service" agent-service 2>&1 || true
+fi
+
+echo "[nc-setup] Nextcloud configuration complete"
+exit 0
+{{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
-{{- $shareRateLimit := include "srw.nextcloudShareRateLimitJson" . | fromJson }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -210,225 +440,7 @@ data:
     {{ include "srw.nextcloudProtectedEffectConfigJson" . }}
   {{- end }}
   setup-nextcloud.sh: |
-    #!/bin/bash
-    # =============================================================================
-    # Nextcloud auto-configuration (before-starting hook)
-    # =============================================================================
-    # Configures Nextcloud for the SRW platform on every container start.
-    # Fully idempotent — safe to re-run. Non-fatal — failures won't block startup.
-    #
-    # What this does:
-    #   0. Background jobs: pins trash/version retention and internal share
-    #      expiry off, and sets the background-job mode; S3 primary storage
-    #      skips its per-connection bucket check
-    #   1. OIDC: Registers Keycloak as OpenID Connect provider
-    #   2. OIDC: Enables group provisioning with whitelist regex
-    #   3. Group Folders: Installs, updates and enables the groupfolders app
-    #   4. Service account: Creates srw-agents group and agent-service user
-    #
-    # Required environment variables:
-    #   NEXTCLOUD_OIDC_CLIENT_SECRET   — OIDC client secret (from Keycloak realm)
-    #   NEXTCLOUD_OIDC_DISCOVERY_URI   — Keycloak OIDC discovery endpoint (internal)
-    #
-    # Optional environment variables:
-    #   NEXTCLOUD_AGENT_PASSWORD       — Password for agent-service user (default: random)
-    # =============================================================================
-    # Non-fatal: setup failure must not prevent Nextcloud from starting
-    set +e
-
-    CLIENT_ID="${NEXTCLOUD_OIDC_CLIENT_ID:-nextcloud}"
-    CLIENT_SECRET="${NEXTCLOUD_OIDC_CLIENT_SECRET:-}"
-    DISCOVERY_URI="${NEXTCLOUD_OIDC_DISCOVERY_URI:-}"
-    PROVIDER_NAME="${NEXTCLOUD_OIDC_PROVIDER_NAME:-Keycloak}"
-    AGENT_PASSWORD="${NEXTCLOUD_AGENT_PASSWORD:-}"
-
-    # Helper: run occ (entrypoint already runs hooks as www-data via run_as)
-    occ() {
-        php /var/www/html/occ "$@"
-    }
-
-    # Check if Nextcloud is installed (first-boot race: DB may not be ready yet)
-    if ! occ status --output=json 2>/dev/null | grep -q '"installed":true'; then
-        echo "[nc-setup] Nextcloud not yet installed, skipping (will retry on next start)"
-        exit 0
-    fi
-
-    {{- if include "srw.singleOrigin" . }}
-    # The image initializes trusted_domains only on first install. Reconcile
-    # persisted config on every start, including PVCs from multi-host installs.
-    # No forwarded client IP ranges are trusted by this evaluation preset.
-    occ config:system:set trusted_domains --type=json --value='{{ list (printf "%s-nextcloud" (include "srw.fullname" .)) (urlParse (include "srw.publicOrigin" .)).host | toJson }}' || exit 1
-    occ config:system:delete trusted_proxies || exit 1
-    {{- end }}
-
-    # =========================================================================
-    # 0. Allow connections to cluster-internal services (SSRF protection override)
-    #    Required because Keycloak runs as an internal K8s service.
-    # =========================================================================
-    occ config:system:set allow_local_remote_servers --value=true --type=boolean 2>&1 || true
-
-    # =========================================================================
-    # 0a. Background jobs: retention and share expiry pinned, then the mode.
-    #     Background jobs expire trash and thin file versions, and new
-    #     internal shares can get a default expiry date. Versions and trash
-    #     are the only recovery floor (the object store keeps no history of
-    #     its own) and SRW's session shares must never expire, so today's
-    #     behaviour is pinned here, whichever mode runs the jobs. The
-    #     Apache and cron containers also carry the two retention values as
-    #     NC_* env, so the cron container's first run cannot race this hook.
-    #     Groupfolders' trash and versions expire through the same two keys.
-    # =========================================================================
-    occ config:system:set trashbin_retention_obligation --value={{ include "srw.nextcloudTrashbinRetention" . }} 2>&1 || true
-    occ config:system:set versions_retention_obligation --value={{ include "srw.nextcloudVersionsRetention" . }} 2>&1 || true
-    occ config:app:set core shareapi_default_internal_expire_date --value=no 2>&1 || true
-    occ config:app:set core shareapi_enforce_internal_expire_date --value=no 2>&1 || true
-    {{- if .Values.nextcloud.cron.enabled }}
-    # The cron container's first cron.php switches the mode itself; setting
-    # it here keeps the admin view right until then.
-    occ background:cron 2>&1 || true
-    {{- else }}
-    # No cron container, so jobs run from web requests (ajax). A mode an
-    # earlier cron container left at "cron" would run no jobs at all.
-    if [ "$(occ config:app:get core backgroundjobs_mode 2>/dev/null)" = "cron" ]; then
-        occ background:ajax 2>&1 || true
-    fi
-    {{- end }}
-    {{- if .Values.nextcloud.objectStore.enabled }}
-
-    # =========================================================================
-    # 0b. S3 primary storage: no bucket-exists check on every connection.
-    #     Nextcloud 31 creates a missing S3 bucket only through that check
-    #     (it does not read OBJECTSTORE_S3_AUTOCREATE for S3), so it stays on
-    #     until install has created the bucket; this hook only runs on an
-    #     installed Nextcloud. Config files are deep-merged, so the key
-    #     survives the image's s3.config.php. Set only on an existing
-    #     objectstore entry, never creating a partial one.
-    # =========================================================================
-    if occ config:system:get objectstore class >/dev/null 2>&1; then
-        occ config:system:set objectstore arguments verify_bucket_exists --value=false --type=boolean 2>&1 || true
-    fi
-    {{- end }}
-
-    # =========================================================================
-    # 0c. Share-create rate limit (nextcloud.rateLimits.shareCreate).
-    #     Nextcloud allows each user 20 new shares per 600 s. agent-service
-    #     creates every session and job-export share, so that per-user limit
-    #     is the installation's ceiling. The override is keyed by app,
-    #     controller and method in lower case, as RateLimitingMiddleware
-    #     builds it, not by the OCS route name. Settings persist in
-    #     config.php, so unset values delete the override rather than
-    #     leave the last one in place.
-    # =========================================================================
-    {{- if $shareRateLimit.override }}
-    occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user limit --value={{ int $shareRateLimit.limit }} --type=integer 2>&1 || true
-    occ config:system:set ratelimit_overwrite files_sharing.shareapi.createshare user period --value={{ int $shareRateLimit.periodSeconds }} --type=integer 2>&1 || true
-    {{- else }}
-    occ config:system:delete ratelimit_overwrite files_sharing.shareapi.createshare 2>&1 || true
-    {{- end }}
-    {{- if not (include "srw.nextcloudRedisEnabled" .) }}
-
-    # =========================================================================
-    # 0d. Valkey off (nextcloud.redis.enabled=false): drop any Redis settings
-    #     config.php still holds. Every config write dumps the merged config,
-    #     redis.config.php's values included, into config.php, so removing
-    #     REDIS_HOST alone leaves Nextcloud pointing at a server that is gone.
-    # =========================================================================
-    if occ config:system:get memcache.locking 2>/dev/null | grep -q 'Redis' \
-        || occ config:system:get memcache.distributed 2>/dev/null | grep -q 'Redis'; then
-        echo "[nc-setup] Valkey is off: removing the Redis settings from config.php"
-        occ config:system:delete memcache.distributed 2>&1 || true
-        occ config:system:delete memcache.locking 2>&1 || true
-        occ config:system:delete redis 2>&1 || true
-    fi
-    {{- end }}
-
-    # Allow OIDC login over plain HTTP (local dev without TLS reverse proxy).
-    # Only effective when OVERWRITEPROTOCOL != https (i.e. dev environments).
-    if [ "$(occ config:system:get overwriteprotocol 2>/dev/null)" != "https" ]; then
-        echo "[nc-setup] Plain HTTP detected, enabling allow_insecure_http for OIDC..."
-        occ config:app:set user_oidc allow_insecure_http --value=1 2>&1 || true
-    fi
-
-    # =========================================================================
-    # 1. OIDC provider registration
-    # =========================================================================
-    if [ -z "$CLIENT_SECRET" ] || [ -z "$DISCOVERY_URI" ]; then
-        echo "[nc-setup] NEXTCLOUD_OIDC_CLIENT_SECRET or DISCOVERY_URI not set, skipping OIDC"
-    else
-        echo "[nc-setup] Ensuring user_oidc app is installed..."
-        occ app:install user_oidc 2>/dev/null || true
-        occ app:enable user_oidc 2>/dev/null || true
-
-        # The command updates an existing provider in place, preserving
-        # identity mappings when the discovery URL or secret changes.
-        echo "[nc-setup] Reconciling OIDC provider '$PROVIDER_NAME'..."
-        if occ user_oidc:provider "$PROVIDER_NAME" \
-            --clientid="$CLIENT_ID" \
-            --clientsecret="$CLIENT_SECRET" \
-            --discoveryuri="$DISCOVERY_URI" \
-            --unique-uid=1 \
-            --mapping-uid=preferred_username \
-            --mapping-display-name=name \
-            --check-bearer=1 \
-            --group-provisioning=1 2>&1; then
-            echo "[nc-setup] OIDC provider reconciled successfully"
-        else
-            echo "[nc-setup] WARNING: Failed to register OIDC provider (non-fatal)"
-        fi
-
-        {{- if include "srw.singleOrigin" . }}
-        occ config:app:set user_oidc allow_insecure_http --value=0 2>&1 || true
-        {{- end }}
-
-        # Enable group provisioning with whitelist so only project-* groups are
-        # OIDC-managed. This protects srw-agents and other manually-managed groups
-        # from being purged when a user logs in via OIDC.
-        echo "[nc-setup] Configuring OIDC group provisioning whitelist..."
-        occ user_oidc:provider "$PROVIDER_NAME" \
-            --group-provisioning=1 \
-            --group-whitelist-regex='/^project-/' 2>&1 || true
-    fi
-
-    # =========================================================================
-    # 2. Group Folders app (required for project cloud folders)
-    #    app:update matters: app:install is a no-op on an existing install,
-    #    and the protected cloud feature refuses to engage RO mounts below
-    #    groupfolders 20.1.2 (CVE floor GHSA-2vrq-fhmf-c49m, enforced by
-    #    check_version_floors in src/orchestrator/services/cloud/ro_probe.py).
-    # =========================================================================
-    echo "[nc-setup] Ensuring groupfolders app is installed and current..."
-    occ app:install groupfolders 2>/dev/null || true
-    occ app:update groupfolders 2>&1 || true
-    occ app:enable groupfolders 2>/dev/null || true
-
-    # =========================================================================
-    # 3. srw-agents group (agent service accounts are members of this group;
-    #    granted access to every project's Group Folder at creation time)
-    # =========================================================================
-    if occ group:list --output=json 2>/dev/null | grep -q '"srw-agents"'; then
-        echo "[nc-setup] Group 'srw-agents' already exists"
-    else
-        echo "[nc-setup] Creating group 'srw-agents'..."
-        occ group:add srw-agents 2>&1 || true
-    fi
-
-    # =========================================================================
-    # 4. agent-service user (WebDAV service account for agent file operations)
-    # =========================================================================
-    if occ user:info agent-service --output=json 2>/dev/null | grep -q '"user_id"'; then
-        echo "[nc-setup] User 'agent-service' already exists"
-    else
-        echo "[nc-setup] Creating user 'agent-service'..."
-        if [ -z "$AGENT_PASSWORD" ]; then
-            AGENT_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
-            echo "[nc-setup] Generated random password for agent-service (set NEXTCLOUD_AGENT_PASSWORD to fix it)"
-        fi
-        export OC_PASS="$AGENT_PASSWORD"
-        occ user:add --password-from-env --group=srw-agents --display-name="SRW Agent Service" agent-service 2>&1 || true
-    fi
-
-    echo "[nc-setup] Nextcloud configuration complete"
-    exit 0
+{{ include "srw.nextcloudSetupHook" . | indent 4 }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -481,6 +493,9 @@ spec:
         checksum/server-config: {{ include "srw.nextcloudServerConfigData" . | sha256sum | quote }}
         # The setup hook applies the limit only when Nextcloud starts.
         checksum/share-rate-limit: {{ include "srw.nextcloudShareRateLimitJson" . | sha256sum | quote }}
+        # Covers every setting the hook makes (OIDC provider, groups, rate
+        # limit): the hook runs only when Nextcloud starts.
+        checksum/setup-hook: {{ include "srw.nextcloudSetupHook" . | sha256sum | quote }}
         {{- if (eq (include "srw.nextcloudProtectedEffectEnabled" .) "true") }}
         checksum/protected-effect-config: {{ include "srw.nextcloudProtectedEffectConfigSha256" . | quote }}
         {{- end }}
