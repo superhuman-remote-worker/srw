@@ -13,7 +13,7 @@
 # The build stage runs on the build platform and cross-compiles for the
 # target platform BuildKit names; without BuildKit, for the build platform.
 # =============================================================================
-FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine3.24@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS build
 
 ARG SRW_SOURCE_REVISION=""
 ARG SRW_RELEASE_VERSION=""

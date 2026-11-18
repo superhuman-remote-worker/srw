@@ -581,7 +581,7 @@ jobs:
       # tests/test_srw_cli_wire.py builds the srw binary from cli/.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache-dependency-path: cli/go.sum
       - uses: astral-sh/setup-uv@v6
         with:
@@ -1747,7 +1747,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-shim's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the shim
         working-directory: drivers/shim
@@ -1918,7 +1918,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-mcp-front's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the front
         working-directory: drivers/mcp-front
@@ -2014,7 +2014,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-git-swap's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the git swap driver
         working-directory: drivers/git-swap
@@ -2088,7 +2088,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-gpt-live-sip's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the phone-line driver
         working-directory: drivers/gpt-live-sip
@@ -2325,7 +2325,7 @@ jobs:
       # The same release as docker/Dockerfile.in-pod-mount's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the FUSE opener
         working-directory: drivers/fuse-opener
@@ -2426,7 +2426,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache-dependency-path: cli/go.sum
       - name: Verify modules, formatting and vet
         working-directory: cli
@@ -2498,7 +2498,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache-dependency-path: cli/go.sum
       - name: Build the archives
         env:

@@ -53,7 +53,7 @@ def step_using(job: dict, action: str) -> dict:
 def test_both_pipelines_check_the_client(branch):
     job = jobs(branch)["test-cli"]
     assert job["permissions"] == {"contents": "read"}
-    assert step_using(job, "actions/setup-go")["with"]["go-version"] == "1.26.8"
+    assert step_using(job, "actions/setup-go")["with"]["go-version"] == "1.26.11"
     run = script(job)
     for needed in (
         "go mod verify",
@@ -94,7 +94,7 @@ def test_main_checks_the_client_on_every_run_and_develop_when_it_changed():
 @pytest.mark.parametrize("branch", ["main", "develop"])
 def test_the_python_shards_can_build_the_client_for_the_wire_test(branch):
     shards = jobs(branch)["test-python-shards"]
-    assert step_using(shards, "actions/setup-go")["with"]["go-version"] == "1.26.8"
+    assert step_using(shards, "actions/setup-go")["with"]["go-version"] == "1.26.11"
 
 
 def test_a_client_change_runs_the_python_suite_on_develop():
