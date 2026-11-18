@@ -2604,8 +2604,8 @@
       "chooseFile": "Datei wählen",
       "takePhoto": "Foto aufnehmen",
       "capturePhoto": "Foto aufnehmen",
-      "recordVoice": "Sprachnachricht aufnehmen",
-      "recordingStop": "Aufnahme stoppen",
+      "recordVoice": "Diktieren",
+      "recordingStop": "Stoppen und transkribieren",
       "recordingCancel": "Aufnahme abbrechen",
       "recordingCapWarning": "Aufnahme endet bald",
       "remove": "Entfernen",
@@ -2618,6 +2618,10 @@
       "micError": "Aufnahme konnte nicht gestartet werden",
       "transcribing": "Audio wird transkribiert…",
       "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt",
+      "recordingLabel": "Spracheingabe wird aufgenommen",
+      "transcribeCancel": "Transkription abbrechen",
+      "noSpeech": "Keine Sprache erkannt — die Aufnahme wurde stattdessen angehängt",
+      "recordingTooShort": "Aufnahme zu kurz — nichts aufgenommen",
       "sttNotConfigured": "Spracheingabe ist noch nicht eingerichtet"
     },
     "tts": {

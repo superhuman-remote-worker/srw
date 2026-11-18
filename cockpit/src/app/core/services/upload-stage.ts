@@ -66,30 +66,60 @@ export function topLevelUploadTargets(names: readonly string[]): string[] {
     return [...targets];
 }
 
-/**
- * What the agent sees: the user's text plus a plain-language hint naming the
- * uploaded files. Kept identical to the pre-refactor string so existing
- * sessions and prompt expectations don't shift.
- */
-export function composeAgentContent(text: string, names: readonly string[]): string {
-    if (names.length === 0) return text;
-    const hint = `[Attached files in uploads/: ${names.join(', ')}]`;
-    return text ? `${text}\n\n${hint}` : hint;
-}
-
+const RECORDING_HINT_PREFIX = '[Transcribed from a voice recording; the original audio is in uploads/: ';
 const ATTACHMENT_HINT_RE = /(?:^|\n\n)\[Attached files in uploads\/: ([^\n]+)\]\s*$/;
+const RECORDING_HINT_RE =
+    /(?:^|\n\n)\[Transcribed from a voice recording; the original audio is in uploads\/: ([^\n]+)\]\s*$/;
+
+/**
+ * What the agent sees: the user's text plus plain-language hints naming the
+ * uploaded files. With no recordings the string is identical to the
+ * pre-refactor one, so existing sessions and prompt expectations don't shift.
+ *
+ * `recordings` are dictation clips: the text is their transcript, and the
+ * audio sits in `uploads/` without being shown as an attachment
+ * (dictation_composer_redesign.md D1). Their hint comes BEFORE the
+ * attachments hint, so {@link parseAttachmentHint}'s end-anchored match still
+ * finds the attachments one.
+ */
+export function composeAgentContent(
+    text: string,
+    names: readonly string[],
+    recordings: readonly string[] = [],
+): string {
+    const parts = [text];
+    if (recordings.length > 0) parts.push(`${RECORDING_HINT_PREFIX}${recordings.join(', ')}]`);
+    if (names.length > 0) parts.push(`[Attached files in uploads/: ${names.join(', ')}]`);
+    return parts.filter(Boolean).join('\n\n');
+}
 
 /**
  * The inverse of {@link composeAgentContent} for a message read back from
- * history: the user's text without the hint, and the file names it named.
- * Names are split on ", ", so a name that itself contains ", " comes back
- * split (structured attachments are a follow-up, image_generation.md §10).
+ * history: the user's text without the hints, the attached file names, and the
+ * dictation recordings (which the bubble does not show as chips). Names are
+ * split on ", ", so a name that itself contains ", " comes back split
+ * (structured attachments are a follow-up, image_generation.md §10).
  */
-export function parseAttachmentHint(content: string): {text: string; names: string[]} {
-    const match = ATTACHMENT_HINT_RE.exec(content);
-    if (!match) return {text: content, names: []};
-    const names = match[1].split(', ').map((name) => name.trim()).filter(Boolean);
-    return {text: content.slice(0, match.index), names};
+export function parseAttachmentHint(content: string): {
+    text: string;
+    names: string[];
+    recordings: string[];
+} {
+    const split = (list: string) => list.split(', ').map((name) => name.trim()).filter(Boolean);
+    let text = content;
+    let names: string[] = [];
+    let recordings: string[] = [];
+    const attached = ATTACHMENT_HINT_RE.exec(text);
+    if (attached) {
+        names = split(attached[1]);
+        text = text.slice(0, attached.index);
+    }
+    const recorded = RECORDING_HINT_RE.exec(text);
+    if (recorded) {
+        recordings = split(recorded[1]);
+        text = text.slice(0, recorded.index);
+    }
+    return {text, names, recordings};
 }
 
 const ATTACHMENT_TYPES: Readonly<Record<string, string>> = {

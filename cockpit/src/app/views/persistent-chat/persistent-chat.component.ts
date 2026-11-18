@@ -22,7 +22,7 @@ import {DatePipe, NgTemplateOutlet} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router} from '@angular/router';
-import {firstValueFrom, Subscription} from 'rxjs';
+import {firstValueFrom, Subject, Subscription, takeUntil} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {
@@ -81,7 +81,6 @@ import {DeviceCapabilitiesService} from '../../core/services/device-capabilities
 import {VoiceCapabilitiesService} from '../../core/services/voice-capabilities.service';
 import {VoiceRecordingService} from '../../core/services/voice-recording.service';
 import {FilePreview, FilePreviewResult, FileType, RejectedFile} from '../../core/models/file.model';
-import {RecordingConfig} from '../../core/models/recording.model';
 import {environment} from '../../core/environment';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -526,18 +525,30 @@ export function uploadStageFor(
 }
 
 /**
- * Empty-composer morph (messenger convention): the round action button offers
- * dictation while there is nothing to send yet, and flips to send on the
- * first keystroke or queued attachment. Suppressed while a turn is in flight
- * so the stop/spinner states keep the button.
+ * The attachments a chip row shows: a dictation recording is uploaded and named
+ * to the agent, but never shown (dictation_composer_redesign.md D1).
  */
-export function isMicMode(
-    hasAudioInput: boolean,
-    turnInFlight: boolean,
-    text: string,
-    attachmentCount: number,
-): boolean {
-    return hasAudioInput && !turnInFlight && text.trim().length === 0 && attachmentCount === 0;
+export function withoutDictation<T extends {dictation?: boolean}>(list: readonly T[] | null | undefined): T[] {
+    return (list ?? []).filter((item) => !item.dictation);
+}
+
+/** A short tap on supporting phones (Android); a no-op elsewhere (iOS has no Vibration API). */
+function haptic(): void {
+    try {
+        navigator.vibrate?.(12);
+    } catch {
+        // Some embedded browsers throw instead of ignoring it.
+    }
+}
+
+/** One transcription in flight and the composer it belongs to. */
+interface TranscriptionRun {
+    /** A thread id, or null for the landing draft. */
+    readonly owner: string | null;
+    /** Set by ✕ / Esc while transcribing; the result is then dropped. */
+    cancelled: boolean;
+    /** Aborts the HTTP request. */
+    readonly cancel$: Subject<void>;
 }
 
 /**
@@ -1554,9 +1565,10 @@ export function clearDraft(threadId: string | null): void {
                       <div class="user-text">{{ turn.content }}</div>
                     }
                   }
-                  @if (turn.attachments?.length) {
+                  @let shownAttachments = withoutDictation(turn.attachments);
+                  @if (shownAttachments.length) {
                     <div class="user-attachments">
-                      @for (att of turn.attachments; track att.id) {
+                      @for (att of shownAttachments; track att.id) {
                         @if (att.path && canThumbnail(att.path) && chat.threadId(); as tid) {
                           <app-attachment-thumb
                             [threadId]="tid"
@@ -2303,7 +2315,7 @@ export function clearDraft(threadId: string | null): void {
           class="composer"
           [class.focused]="inputFocused()"
           [class.disabled]="!canCompose()"
-          [class.recording]="isRecording()"
+          [class.recording]="voiceStripShown()"
         >
           <!-- Slash command autocomplete -->
           @if (showSlashMenu() && filteredCommands().length > 0) {
@@ -2323,9 +2335,9 @@ export function clearDraft(threadId: string | null): void {
           }
 
           <!-- Attachment preview chips -->
-          @if (chat.pendingAttachments().length > 0 && !isRecording()) {
+          @if (visibleComposerAttachments().length > 0 && !voiceStripShown()) {
             <div class="attachment-row">
-              @for (preview of chat.pendingAttachments(); track preview.id) {
+              @for (preview of visibleComposerAttachments(); track preview.id) {
                 <div class="attachment-chip" [class.is-image]="preview.type === 'image'">
                   @if (preview.type === 'image' && preview.preview) {
                     <button
@@ -2371,44 +2383,54 @@ export function clearDraft(threadId: string | null): void {
             </div>
           }
 
-          <!-- Transcribing indicator: brief, after a recording is confirmed -->
-          @if (isTranscribing()) {
-            <div class="transcribing-hint">
-              <span class="action-spinner-sm" aria-hidden="true"></span>
-              <span>{{ 'chat.composer.transcribing' | transloco }}</span>
-            </div>
-          }
-
-          <!-- Recording mode: waveform + duration + controls -->
-          @if (isRecording()) {
-            <div class="recording-strip">
+          <!-- Dictation strip. Replaces the text box and the controls row while
+               recording, and stays while the clip transcribes, with the waveform
+               frozen and dimmed so "listening" and "working" never look alike.
+               ✓ takes Send's far-right slot, ✕ sits far left, away from the thumb
+               (dictation_composer_redesign.md). -->
+          @if (voiceStripShown()) {
+            <div
+              class="recording-strip"
+              [class.transcribing]="isTranscribing()"
+              role="group"
+              [attr.aria-label]="(isTranscribing() ? 'chat.composer.transcribing' : 'chat.composer.recordingLabel') | transloco"
+            >
               <button
                 type="button"
                 class="recording-btn cancel"
-                (click)="cancelRecording()"
-                [attr.aria-label]="'chat.composer.recordingCancel' | transloco"
-                [title]="'chat.composer.recordingCancel' | transloco"
+                (click)="isTranscribing() ? cancelTranscription() : cancelRecording()"
+                [attr.aria-label]="(isTranscribing() ? 'chat.composer.transcribeCancel' : 'chat.composer.recordingCancel') | transloco"
+                [title]="(isTranscribing() ? 'chat.composer.transcribeCancel' : 'chat.composer.recordingCancel') | transloco"
               >
                 <app-icon size="sm">close</app-icon>
               </button>
-              <canvas #waveformCanvas class="recording-canvas" width="600" height="56"></canvas>
-              <span class="recording-time" [class.near-cap]="recordingNearCap()">
-                <span class="recording-dot"></span>
-                {{ recordingDurationLabel() }}
-              </span>
-              @if (recordingNearCap()) {
-                <span class="recording-cap-warning">{{ 'chat.composer.recordingCapWarning' | transloco }}</span>
+              <canvas #waveformCanvas class="recording-canvas" aria-hidden="true"></canvas>
+              @if (isTranscribing()) {
+                <span class="recording-status" aria-live="polite">{{ 'chat.composer.transcribing' | transloco }}</span>
+              } @else {
+                <span class="recording-time" [class.near-cap]="recordingNearCap()">
+                  <span class="recording-dot" aria-hidden="true"></span>
+                  {{ recordingDurationLabel() }}
+                </span>
               }
               <button
                 type="button"
                 class="recording-btn confirm"
+                [disabled]="isTranscribing()"
                 (click)="stopRecording()"
                 [attr.aria-label]="'chat.composer.recordingStop' | transloco"
                 [title]="'chat.composer.recordingStop' | transloco"
               >
-                <app-icon size="sm">check</app-icon>
+                @if (isTranscribing()) {
+                  <span class="action-spinner" aria-hidden="true"></span>
+                } @else {
+                  <app-icon size="sm">check</app-icon>
+                }
               </button>
             </div>
+            @if (recordingNearCap()) {
+              <div class="recording-cap-warning" role="status">{{ 'chat.composer.recordingCapWarning' | transloco }}</div>
+            }
           } @else {
             @if (chat.rewindOutcomeUnknown()) {
               <div class="queued-actions">
@@ -2444,7 +2466,7 @@ export function clearDraft(threadId: string | null): void {
             ></textarea>
           }
 
-          @if (!isRecording()) {
+          @if (!voiceStripShown()) {
           <div class="composer-row">
             <!-- Attach button + popover menu. Open whenever the composer is:
                  a chip rides the outbox with the text, so on the landing
@@ -2494,46 +2516,48 @@ export function clearDraft(threadId: string | null): void {
 
             <span class="spacer"></span>
 
-            <!-- Action button: mic while the composer is empty, send once there is
-                 something to send, stop/spinner while a turn is in flight.
-                 pointerdown.preventDefault keeps the textarea focused through the
-                 tap, so the on-screen keyboard doesn't reflow the whole column
-                 mid-tap; on mobile send() then blurs deliberately, dismissing the
-                 keyboard so the reply gets the reclaimed height. -->
-            @if (micMode()) {
+            <!-- Dictate: always next to Send, so a typed draft can be extended
+                 by voice and a follow-up dictated while a turn runs. Send keeps
+                 the far-right slot in every state; on touch devices Enter is a
+                 newline, so Send must always be a button (D2). -->
+            @if (hasAudioInput()) {
               <button
                 type="button"
-                class="send mic"
+                class="dictate"
                 [disabled]="!canCompose() || isTranscribing() || sttUnavailable()"
                 [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
-                (pointerdown)="$event.preventDefault()"
+                [attr.aria-label]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
                 (click)="startRecording()"
               >
                 <app-icon size="sm" class="action-icon">mic</app-icon>
               </button>
-            } @else {
-              <button
-                type="button"
-                class="send"
-                data-testid="chat-send"
-                [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
-                [class.interrupting]="chat.isInterrupting()"
-                [class.pending]="isPendingSend()"
-                [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
-                [attr.aria-label]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
-                (pointerdown)="$event.preventDefault()"
-                (click)="chat.isStreaming() ? chat.interrupt() : send()"
-                [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
-              >
-                @if (isPendingSend() || chat.isInterrupting() || chat.isAwaitingTurn()) {
-                  <span class="action-spinner"></span>
-                } @else if (chat.isStreaming()) {
-                  <app-icon size="sm" class="action-icon">stop</app-icon>
-                } @else {
-                  <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
-                }
-              </button>
             }
+            <!-- Send: stop/spinner while a turn is in flight.
+                 pointerdown.preventDefault keeps the textarea focused through the
+                 tap, so the on-screen keyboard doesn't reflow the whole column
+                 mid-tap; on mobile send() then blurs deliberately, dismissing the
+                 keyboard so the reply gets the reclaimed height. -->
+            <button
+              type="button"
+              class="send"
+              data-testid="chat-send"
+              [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
+              [class.interrupting]="chat.isInterrupting()"
+              [class.pending]="isPendingSend()"
+              [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
+              [attr.aria-label]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
+              (pointerdown)="$event.preventDefault()"
+              (click)="chat.isStreaming() ? chat.interrupt() : send()"
+              [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
+            >
+              @if (isPendingSend() || chat.isInterrupting() || chat.isAwaitingTurn()) {
+                <span class="action-spinner"></span>
+              } @else if (chat.isStreaming()) {
+                <app-icon size="sm" class="action-icon">stop</app-icon>
+              } @else {
+                <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
+              }
+            </button>
           </div>
           }
         </div>
@@ -2848,7 +2872,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
     @ViewChild(CloudReviewBannerComponent, {read: ElementRef}) cloudReviewBanner?: ElementRef<HTMLElement>;
     @ViewChild('cameraInput') cameraInput?: ElementRef<HTMLInputElement>;
-    @ViewChild('waveformCanvas') waveformCanvas?: ElementRef<HTMLCanvasElement>;
+    /** The strip renders the canvas only once recording has started, so the
+     *  service gets it here rather than from startRecording(). */
+    @ViewChild('waveformCanvas') set waveformCanvas(ref: ElementRef<HTMLCanvasElement> | undefined) {
+        if (ref) this.voiceRecording.attachVisualizer(ref.nativeElement);
+        else this.voiceRecording.detachVisualizer();
+    }
 
     inputText = '';
     private composerDraftRevision = 0;
@@ -2935,15 +2964,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly attachmentMenuOpen = signal(false);
     readonly isRecording = signal(false);
     readonly recordingDuration = signal(0);
-    /** The transcription in flight and the composer it belongs to: a thread
-     *  id, or null for the landing draft. */
-    private readonly transcription = signal<{owner: string | null} | null>(null);
+    /** The transcription in flight and the composer it belongs to. */
+    private readonly transcription = signal<TranscriptionRun | null>(null);
     /** Scoped to its composer. This component is reused across sessions, and
      *  another session's transcription must neither show here nor hold Send. */
     readonly isTranscribing = computed(() => {
         const run = this.transcription();
         return run !== null && run.owner === this.chat.threadId();
     });
+    /** The dictation strip is up: recording, or this composer's clip transcribing. */
+    readonly voiceStripShown = computed(() => this.isRecording() || this.isTranscribing());
+    /** The composer's chips: a dictation recording rides along unseen (D1). */
+    readonly visibleComposerAttachments = computed(() => withoutDictation(this.chat.pendingAttachments()));
+    /** For the bubble template. */
+    readonly withoutDictation = withoutDictation;
     /** Set on destroy: a transcription that resolves later has no composer. */
     private composerDestroyed = false;
     // Hard cap on a single dictation (20 min). Generous enough for the "10+ min
@@ -3557,24 +3591,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // would go out without it — and on the landing draft would create the
         // session and leave the composer the transcript was meant for.
         if (this.isTranscribing()) return false;
+        // A hidden recording alone is not a message: its text is the message.
         return canSendMessage(
             this.canCompose(),
             this.inputText,
-            this.chat.pendingAttachments().length,
-        );
-    }
-
-    /** Empty composer → the action button offers dictation (method, not
-     *  computed, for the same `inputText` reason as canSend). */
-    micMode(): boolean {
-        return isMicMode(
-            this.hasAudioInput(),
-            this.chat.isStreaming() ||
-                this.chat.isInterrupting() ||
-                this.isPendingSend() ||
-                this.chat.isAwaitingTurn(),
-            this.inputText,
-            this.chat.pendingAttachments().length,
+            this.visibleComposerAttachments().length,
         );
     }
 
@@ -3627,7 +3648,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.capabilitiesSub?.unsubscribe();
         this.recordingStateSub?.unsubscribe();
         this.composerDestroyed = true;
-        if (this.isRecording()) {
+        if (this.isRecording() || this.voiceRecording.isStarting()) {
             this.voiceRecording.cancelRecording();
         }
     }
@@ -3804,21 +3825,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.imagePreviewName.set('');
     }
 
-    /** Begin a voice recording (tap to start; the strip's ✓/✕ ends it). */
+    /** Begin dictation (tap to start; the strip's ✓/✕ ends it). */
     async startRecording(): Promise<void> {
-        if (this.isRecording()) return;
+        if (this.isRecording() || this.voiceRecording.isStarting()) return;
         this.capStopTriggered = false;
-        const config: RecordingConfig = {
-            isHoldToRecord: true,
-            maxDuration: this.maxRecordingSeconds,
-            audioConstraints: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-            },
-        };
+        this.chat.attachmentError.set(null);
+        haptic();
         try {
-            await this.voiceRecording.startRecording(config, this.waveformCanvas?.nativeElement);
+            await this.voiceRecording.startRecording({
+                audioConstraints: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                },
+            });
         } catch (e: any) {
             // Surface a permission/hardware error in the same banner used by uploads.
             const msg = e?.name === 'NotAllowedError'
@@ -3829,57 +3849,124 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
-     * Stop recording, transcribe the clip to editable composer text, and keep
-     * the audio attached.
+     * Stop recording and transcribe the clip into the composer text.
      *
-     * The transcript is appended into `inputText` (never clobbering a typed
-     * draft). Reactivity note: `inputText` is a plain field, so assigning it
-     * does not schedule change detection on its own — the `addAttachments`
-     * call below writes the `pendingAttachments` signal, which triggers the
-     * pass that re-syncs the textarea to show the transcript. Keep
-     * `addAttachments` as the last step.
+     * The transcript is appended to `inputText` (never clobbering a typed
+     * draft). With a transcript, the audio still uploads to `uploads/` with the
+     * message and the agent is told where it is, but it is no chip (D1). With
+     * no transcript (silence, music, an STT failure, no STT model) the audio is
+     * a visible chip, so the user sees what will be sent.
+     *
+     * Reactivity note: `inputText` is a plain field, so assigning it does not
+     * schedule change detection on its own — the `addAttachments` call below
+     * writes the `pendingAttachments` signal, which triggers the pass that
+     * re-syncs the textarea to show the transcript.
      */
     async stopRecording(): Promise<void> {
         if (!this.isRecording()) return;
         // The composer this clip belongs to: a session, or the landing draft
         // (null), which transcribes through the account route.
         const threadId = this.chat.threadId();
-        const result = await this.voiceRecording.stopRecording();
-        if (!result || result.duration < 1) return;
-        const preview = await this.fileHandling.createAudioFilePreview(result);
-
-        const run = {owner: threadId};
+        const run: TranscriptionRun = {owner: threadId, cancelled: false, cancel$: new Subject<void>()};
+        // Claim the strip before the recorder stops, so it goes straight from
+        // "recording" to "transcribing" without blinking back to the text box.
         this.transcription.set(run);
-        const res = await firstValueFrom(this.api.transcribeVoice(threadId, preview.file))
-            // Only clear our own: the user may have started another one since.
-            .finally(() => {
-                if (this.transcription() === run) this.transcription.set(null);
-            });
+        // Only clear our own: the user may have started another one since.
+        const finish = () => {
+            if (this.transcription() === run) this.transcription.set(null);
+        };
+        haptic();
+        const result = await this.voiceRecording.stopRecording();
+        if (!result || run.cancelled) return finish();
+        if (result.duration < 1) {
+            finish();
+            this.chat.attachmentError.set(this.transloco.translate('chat.composer.recordingTooShort'));
+            return;
+        }
+        const preview = await this.fileHandling.createAudioFilePreview(result);
+        if (run.cancelled) return finish();
+        const res = await firstValueFrom(
+            this.api.transcribeVoice(threadId, preview.file).pipe(takeUntil(run.cancel$)),
+            {defaultValue: 'cancelled' as const},
+        ).finally(finish);
+        if (res === 'cancelled' || run.cancelled) return;
         // A long clip can outlive its composer: the user switched sessions
         // (this component is reused) or left the draft (it is destroyed).
         // Drop the text AND the audio — composer chips never follow the user
         // to another thread, and a late chip would upload into the wrong one.
         if (this.composerDestroyed || this.chat.threadId() !== threadId) return;
 
-        if (res && res !== 'unavailable' && res.text.trim()) {
-            const transcript = res.text.trim();
+        const transcript = res && res !== 'unavailable' ? res.text.trim() : '';
+        if (transcript) {
             this.inputText = this.inputText.trim()
                 ? `${this.inputText.trim()}\n\n${transcript}`
                 : transcript;
-            queueMicrotask(() => this.autoResizeInput());
-        } else if (res === null) {
-            // Transport/server error — keep the audio, surface a notice.
-            this.chat.attachmentError.set(
-                this.transloco.translate('chat.composer.transcribeError'),
-            );
+        }
+        this.chat.addAttachments([transcript ? {...preview, dictation: true} : preview]);
+        // After addAttachments, which clears the banner.
+        if (res === null) {
+            // Transport/server error — the audio is attached, say why.
+            this.chat.attachmentError.set(this.transloco.translate('chat.composer.transcribeError'));
+        } else if (res !== 'unavailable' && !transcript) {
+            this.chat.attachmentError.set(this.transloco.translate('chat.composer.noSpeech'));
         }
         // 'unavailable' (no STT model configured) → attach audio silently.
-
-        this.chat.addAttachments([preview]);
+        //
+        // Resize after the render that swaps the strip back for the text box.
+        // Even then ngModel has not written the value yet (it does so in a
+        // promise after the pass), so the box would measure empty and stay one
+        // line tall with the transcript's second line cut off. Write the value
+        // first; ngModel writes the same one a moment later.
+        afterNextRender(() => {
+            const el = this.inputEl?.nativeElement;
+            if (!el) return;
+            if (el.value !== this.inputText) el.value = this.inputText;
+            this.autoResizeInput();
+            // Desktop: put the cursor at the end, ready to edit or press Enter.
+            // Phones keep the keyboard down until the user taps the text.
+            if (transcript && !this.isMobileDevice()) {
+                el.focus();
+                el.setSelectionRange(el.value.length, el.value.length);
+            }
+        }, {injector: this.injector});
     }
 
     cancelRecording(): void {
         this.voiceRecording.cancelRecording();
+    }
+
+    /** ✕ / Esc while transcribing: abort the request, nothing lands. */
+    cancelTranscription(): void {
+        const run = this.transcription();
+        if (!run) return;
+        run.cancelled = true;
+        run.cancel$.next();
+        this.transcription.set(null);
+    }
+
+    /** Esc cancels and Enter confirms while the dictation strip is up. A key
+     *  on one of the strip's own buttons keeps its native meaning. */
+    @HostListener('document:keydown', ['$event'])
+    onDictationKey(event: KeyboardEvent): void {
+        if (!this.voiceStripShown() || event.isComposing) return;
+        if ((event.target as HTMLElement | null)?.closest?.('.recording-strip button')) return;
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            if (this.isTranscribing()) this.cancelTranscription();
+            else this.cancelRecording();
+        } else if (event.key === 'Enter' && !event.shiftKey && this.isRecording()) {
+            event.preventDefault();
+            void this.stopRecording();
+        }
+    }
+
+    /** A recording belongs to the text it was transcribed into. Once the box
+     *  is cleared it has no message left, and as it has no chip, nothing else
+     *  would remove it. */
+    private dropOrphanedDictation(): void {
+        for (const p of this.chat.pendingAttachments()) {
+            if (p.dictation) this.chat.removeAttachment(p.id);
+        }
     }
 
     /** Desktop camera path: live MediaStream in a fullscreen overlay; capture to JPEG. */
@@ -4024,6 +4111,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     onInputChange(value: string): void {
         this.composerDraftRevision++;
+        if (!value.trim()) this.dropOrphanedDictation();
         const trimmed = value.trimStart();
         // Offer completions only while the command word itself is being
         // typed. Once an argument starts (`/compact the pricing`) the menu

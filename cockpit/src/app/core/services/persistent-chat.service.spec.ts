@@ -13734,6 +13734,7 @@ describe('PersistentChatComponent — pending VM IDE ownership', () => {
       idePollingTimer: null, pendingVmIdeOpen: null, vmIdeOpenDestroyed: false, startupTickInterval: null,
       compactionTimer: null, capabilitiesSub: null, recordingStateSub: null,
       isRecording: signal(false),
+      voiceRecording: {isStarting: () => false, cancelRecording: vi.fn()},
     });
   });
 

@@ -86,7 +86,12 @@ async function mountChat(chat: ReturnType<typeof sessionState>, api: Record<stri
     {provide: ViewportService, useValue: {isMobile: signal(false)}},
     {provide: ChatPreferencesService, useValue: {readingWidth: signal('comfortable'), textSize: signal('medium'), officerLensFolded: signal(false)}},
     {provide: DeviceCapabilitiesService, useValue: {getCapabilities: () => of({hasCamera: false, hasAudioInput: false, isMobile: false})}},
-    {provide: VoiceRecordingService, useValue: {getRecordingState: () => of({isRecording: false, duration: 0})}},
+    {provide: VoiceRecordingService, useValue: {
+      getRecordingState: () => of({isRecording: false, duration: 0}),
+      isStarting: () => false,
+      attachVisualizer: vi.fn(),
+      detachVisualizer: vi.fn(),
+    }},
     {provide: VoiceCapabilitiesService, useValue: {canTranscribe: signal(false)}},
     ...[FileHandlingService, Router, AppToastService, ErrorMessageService, SessionListService].map(provide => ({provide, useValue: {}})),
     CapabilitiesService,
@@ -453,7 +458,7 @@ describe('dictation follows the composer', () => {
   }
 
   const micButton = (fixture: {nativeElement: HTMLElement}) =>
-    fixture.nativeElement.querySelector<HTMLButtonElement>('button.send.mic')!;
+    fixture.nativeElement.querySelector<HTMLButtonElement>('button.dictate')!;
 
   it('records and transcribes on the landing draft through the account route', async () => {
     const chat = draftState();
@@ -467,8 +472,9 @@ describe('dictation follows the composer', () => {
 
       expect(api.transcribeVoice).toHaveBeenCalledExactlyOnceWith(null, clip);
       expect(component.inputText).toBe('plan my week');
-      // The clip rides the first send like any attachment.
-      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([preview]);
+      // The clip rides the first send, unseen: a recording with a transcript
+      // is no chip, but the agent is told where it is (D1).
+      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([{...preview, dictation: true}]);
     } finally {
       fixture.destroy();
       TestBed.resetTestingModule();
@@ -497,7 +503,8 @@ describe('dictation follows the composer', () => {
       const component = fixture.componentInstance;
       component.isRecording.set(true);
       const stopped = component.stopRecording();
-      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+      await vi.waitFor(() => expect(transcription.observed).toBe(true));
+      expect(component.isTranscribing()).toBe(true);
 
       component.inputText = 'typed meanwhile';
       expect(component.canSend()).toBe(false);
@@ -523,7 +530,8 @@ describe('dictation follows the composer', () => {
       const component = fixture.componentInstance;
       component.isRecording.set(true);
       const stopped = component.stopRecording();
-      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+      await vi.waitFor(() => expect(transcription.observed).toBe(true));
+      expect(component.isTranscribing()).toBe(true);
 
       // The reused component now shows another session: the first one's
       // transcription neither shows here nor holds this composer's Send.
@@ -554,12 +562,13 @@ describe('dictation follows the composer', () => {
       const component = fixture.componentInstance;
       component.isRecording.set(true);
       const firstStopped = component.stopRecording();
-      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+      await vi.waitFor(() => expect(first.observed).toBe(true));
 
       chat.threadId.set('another-session');
       component.isRecording.set(true);
       const secondStopped = component.stopRecording();
-      await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+      await vi.waitFor(() => expect(second.observed).toBe(true));
+      expect(component.isTranscribing()).toBe(true);
 
       first.next({text: 'late'});
       first.complete();
@@ -585,7 +594,7 @@ describe('dictation follows the composer', () => {
     const component = fixture.componentInstance;
     component.isRecording.set(true);
     const stopped = component.stopRecording();
-    await vi.waitFor(() => expect(component.isTranscribing()).toBe(true));
+    await vi.waitFor(() => expect(transcription.observed).toBe(true));
 
     fixture.destroy();
     transcription.next({text: 'too late'});
@@ -594,6 +603,154 @@ describe('dictation follows the composer', () => {
 
     expect(chat.addAttachments).not.toHaveBeenCalled();
     TestBed.resetTestingModule();
+  });
+
+  // dictation_composer_redesign.md
+  it('keeps the mic next to Send once the box has text', async () => {
+    const chat = sessionState() as any;
+    const {fixture} = await mountWithMic(chat, of({text: ''}));
+    try {
+      const box = fixture.nativeElement.querySelector('textarea.chat-input') as HTMLTextAreaElement;
+      box.value = 'already typed';
+      box.dispatchEvent(new Event('input'));
+      fixture.detectChanges();
+      expect(fixture.componentInstance.inputText).toBe('already typed');
+      expect(micButton(fixture).disabled).toBe(false);
+      const send = fixture.nativeElement.querySelector('button.send') as HTMLButtonElement;
+      expect(send).toBeTruthy();
+      // Send keeps the far-right slot: the mic comes before it.
+      expect(micButton(fixture).compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // Typing saved a per-thread draft; clear it so no later mount restores it.
+      box.value = '';
+      box.dispatchEvent(new Event('input'));
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('attaches the audio as a visible chip when nothing was transcribed, and says why', async () => {
+    const chat = sessionState() as any;
+    const {fixture} = await mountWithMic(chat, of({text: '  '}));
+    // The real service clears the banner on every add: a notice set before
+    // the add would never be seen.
+    chat.addAttachments = vi.fn(() => chat.attachmentError.set(null));
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      await component.stopRecording();
+      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([preview]);
+      expect(chat.attachmentError()).toBe('chat.composer.noSpeech');
+      expect(component.inputText).toBe('');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('keeps the transcription-failed notice visible after attaching the audio', async () => {
+    const chat = sessionState() as any;
+    const {fixture} = await mountWithMic(chat, of(null));
+    chat.addAttachments = vi.fn(() => chat.attachmentError.set(null));
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      await component.stopRecording();
+      expect(chat.addAttachments).toHaveBeenCalledExactlyOnceWith([preview]);
+      expect(chat.attachmentError()).toBe('chat.composer.transcribeError');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('cancels a transcription in flight: the request is dropped and nothing lands', async () => {
+    const chat = sessionState() as any;
+    const transcription = new Subject<unknown>();
+    const {fixture} = await mountWithMic(chat, transcription);
+    try {
+      const component = fixture.componentInstance;
+      component.inputText = 'draft';
+      component.isRecording.set(true);
+      const stopped = component.stopRecording();
+      await vi.waitFor(() => expect(transcription.observed).toBe(true));
+      // The recorder has stopped (the real service says so); the strip stays
+      // up for the transcription.
+      component.isRecording.set(false);
+      expect(component.voiceStripShown()).toBe(true);
+
+      component.cancelTranscription();
+      await stopped;
+      expect(transcription.observed).toBe(false);
+      expect(component.isTranscribing()).toBe(false);
+      expect(component.voiceStripShown()).toBe(false);
+      expect(component.inputText).toBe('draft');
+      expect(chat.addAttachments).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('a recording too short to transcribe says so instead of doing nothing', async () => {
+    const chat = sessionState() as any;
+    const {fixture, api} = await mountWithMic(chat, of({text: 'x'}));
+    Object.assign(TestBed.inject(VoiceRecordingService), {
+      stopRecording: vi.fn(async () => ({blob: clip, duration: 0, mimeType: 'audio/webm'})),
+    });
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      await component.stopRecording();
+      expect(api.transcribeVoice).not.toHaveBeenCalled();
+      expect(component.isTranscribing()).toBe(false);
+      expect(chat.attachmentError()).toBe('chat.composer.recordingTooShort');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('a hidden recording is no message alone, and leaves with the text it was transcribed into', async () => {
+    const chat = sessionState() as any;
+    chat.removeAttachment = vi.fn();
+    const {fixture} = await mountWithMic(chat, of({text: ''}));
+    try {
+      const component = fixture.componentInstance;
+      chat.pendingAttachments.set([{...preview, dictation: true}]);
+      component.inputText = '';
+      expect(component.visibleComposerAttachments()).toEqual([]);
+      expect(component.canSend()).toBe(false);
+
+      component.onInputChange('');
+      expect(chat.removeAttachment).toHaveBeenCalledExactlyOnceWith(preview.id);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('Esc cancels and Enter confirms while recording', async () => {
+    const chat = sessionState() as any;
+    const {fixture} = await mountWithMic(chat, of({text: 'x'}));
+    const recorder = TestBed.inject(VoiceRecordingService) as any;
+    try {
+      const component = fixture.componentInstance;
+      component.isRecording.set(true);
+      document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+      expect(recorder.cancelRecording).toHaveBeenCalledOnce();
+
+      const stop = vi.spyOn(component, 'stopRecording').mockResolvedValue();
+      document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}));
+      expect(stop).toHaveBeenCalledOnce();
+
+      component.isRecording.set(false);
+      document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+      expect(recorder.cancelRecording).toHaveBeenCalledOnce();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
   });
 });
 

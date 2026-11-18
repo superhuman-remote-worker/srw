@@ -2604,8 +2604,8 @@
       "chooseFile": "Choose file",
       "takePhoto": "Take photo",
       "capturePhoto": "Capture photo",
-      "recordVoice": "Record voice message",
-      "recordingStop": "Stop recording",
+      "recordVoice": "Dictate",
+      "recordingStop": "Stop and transcribe",
       "recordingCancel": "Cancel recording",
       "recordingCapWarning": "Recording stops soon",
       "remove": "Remove",
@@ -2618,6 +2618,10 @@
       "micError": "Could not start recording",
       "transcribing": "Transcribing audio…",
       "transcribeError": "Couldn't transcribe — audio attached as-is",
+      "recordingLabel": "Recording voice input",
+      "transcribeCancel": "Cancel transcription",
+      "noSpeech": "No speech detected — the recording is attached instead",
+      "recordingTooShort": "Recording too short — nothing was captured",
       "sttNotConfigured": "Voice input isn't set up yet"
     },
     "tts": {

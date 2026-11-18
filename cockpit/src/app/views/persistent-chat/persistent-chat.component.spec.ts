@@ -19,7 +19,7 @@ import {
     formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
     HEADER_LEFT_RESERVE_PX,
-    isMicMode,
+    withoutDictation,
     isNearBottom,
     formatQueueWait,
     queueWaitTier,
@@ -352,29 +352,15 @@ describe('uploadStageFor', () => {
     });
 });
 
-describe('isMicMode', () => {
-    it('offers the mic on an empty idle composer with audio input', () => {
-        expect(isMicMode(true, false, '', 0)).toBe(true);
+describe('withoutDictation', () => {
+    it('hides dictation recordings and keeps every other attachment', () => {
+        const pdf = {id: 'a', name: 'a.pdf'};
+        const voice = {id: 'v', name: 'voice.webm', dictation: true};
+        expect(withoutDictation([pdf, voice])).toEqual([pdf]);
     });
 
-    it('flips to send on the first real keystroke', () => {
-        expect(isMicMode(true, false, 'h', 0)).toBe(false);
-    });
-
-    it('treats whitespace-only text as still empty (nothing sendable)', () => {
-        expect(isMicMode(true, false, '  \n', 0)).toBe(true);
-    });
-
-    it('flips to send when an attachment is queued without text', () => {
-        expect(isMicMode(true, false, '', 1)).toBe(false);
-    });
-
-    it('yields to the stop/spinner states while a turn is in flight', () => {
-        expect(isMicMode(true, true, '', 0)).toBe(false);
-    });
-
-    it('never offers the mic without an audio input device', () => {
-        expect(isMicMode(false, false, '', 0)).toBe(false);
+    it('treats a missing list as empty', () => {
+        expect(withoutDictation(undefined)).toEqual([]);
     });
 });
 

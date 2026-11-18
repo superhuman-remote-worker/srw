@@ -249,6 +249,9 @@ export interface ChatAttachment {
   /** Workspace-relative path, e.g. "uploads/photo.jpg". Absent until the
    *  upload resolves. */
   path?: string;
+  /** A dictation recording: uploaded and named to the agent, never shown as
+   *  a chip (FilePreview.dictation). */
+  dictation?: boolean;
 }
 
 /**
@@ -5979,14 +5982,18 @@ export class PersistentChatService {
     // composer with no message and no error — the strand named in
     // knowledge-base/knowledge/features/session_attachment_send_flow.md §2. Refuse explicitly
     // instead, so no slash path can silently swallow queued files.
-    if (trimmed.startsWith('/') && queued.length > 0) {
+    if (trimmed.startsWith('/') && queued.some((p) => !p.dictation)) {
       this.attachmentError.set(this.transloco.translate('chat.upload.slashCommandWithAttachments'));
       return false;
     }
 
-    // Slash commands bypass attachment logic.
+    // Slash commands bypass attachment logic. A dictated command leaves only
+    // its recording behind, which no command uses and nobody can see: drop it.
     if (trimmed.startsWith('/')) {
-      if (this.handleSlashCommand(trimmed)) return true;
+      if (this.handleSlashCommand(trimmed)) {
+        for (const p of queued) this.removeAttachment(p.id);
+        return true;
+      }
     }
 
     if (!trimmed && queued.length === 0) return true;
@@ -6011,11 +6018,13 @@ export class PersistentChatService {
         total: p.size || null,
         status: 'queued' as const,
       }));
+    const dictated = new Set(queued.filter((p) => p.dictation).map((p) => p.id));
     const attachments: ChatAttachment[] = pendingFiles.map((f) => ({
       id: f.id,
       name: f.name,
       size: f.size,
       mimeType: f.mimeType,
+      ...(dictated.has(f.id) ? { dictation: true } : {}),
     }));
 
     // The user spoke, so they've resumed the agent themselves — drop any
@@ -6194,8 +6203,12 @@ export class PersistentChatService {
           this.error.set(this.transloco.translate('chat.rewind.staleOutbox'));
           return;
         }
-        const names = (item.attachments ?? []).filter((a) => a.path).map((a) => a.name);
-        const content = composeAgentContent(head.displayContent, names);
+        const uploaded = (item.attachments ?? []).filter((a) => a.path);
+        const content = composeAgentContent(
+          head.displayContent,
+          uploaded.filter((a) => !a.dictation).map((a) => a.name),
+          uploaded.filter((a) => a.dictation).map((a) => a.name),
+        );
         // Record what we're about to POST on the item itself, so the
         // queue can be inspected (and a retry compared) without
         // recomputing. Skipped when unchanged — a retry must not churn
@@ -6470,7 +6483,11 @@ export class PersistentChatService {
   ): void {
     const item = this.outboxItem(localId);
     if (!item) return; // drained under us (thread gone / switched)
-    const next = (item.attachments ?? []).flatMap((a) => (a.id === fileId ? resolved : [a]));
+    // The server's answer knows nothing of dictation: carry the flag over,
+    // or a recording would surface as a chip once its upload resolved.
+    const next = (item.attachments ?? []).flatMap((a) =>
+      a.id === fileId ? resolved.map((r) => (a.dictation ? { ...r, dictation: true } : r)) : [a],
+    );
     this.outbox.update((q) =>
       q.map((i) => (i.localId === localId ? { ...i, attachments: next } : i)),
     );
