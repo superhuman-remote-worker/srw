@@ -522,6 +522,70 @@ func TestDeleteJobAsksAgainWhileTheWorkspaceIsReleased(t *testing.T) {
 	}
 }
 
+func TestApproveAsksAgainWhileTheServerFinishesTheStop(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	progressOf(h, "pending_review")
+	refuse := func(w http.ResponseWriter, detail string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"detail": detail})
+	}
+	asked := 0
+	h.handle("POST "+jobRoute("/approve"), func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		switch asked {
+		case 1:
+			refuse(w, "completion finalizing")
+		case 2:
+			refuse(w, "job changed while control was being committed")
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"approved"}`))
+		}
+	})
+	out, errOut, code := h.run("", "approve", jobID)
+	if code != exit.OK || !strings.Contains(out, "approved") || asked != 3 {
+		t.Fatalf("%d after %d requests: %q %s", code, asked, out, errOut)
+	}
+	if strings.Count(errOut, "has not finished stopping the job for review") != 1 {
+		t.Errorf("said once:\n%s", errOut)
+	}
+	want(t, errOut, "completion finalizing")
+
+	// It gives up after its grace, with the server's own answer.
+	h.clock, asked = now, 0
+	h.handle("POST "+jobRoute("/approve"), func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		refuse(w, "pinned approval agent changed")
+	})
+	_, errOut, code = h.run("", "approve", jobID)
+	if code != exit.Conflict || asked < 5 || h.clock.Sub(now) > time.Minute {
+		t.Fatalf("%d after %d requests and %s: %s", code, asked, h.clock.Sub(now), errOut)
+	}
+	want(t, errOut, "pinned approval agent changed")
+
+	// A job that no longer waits for review: the conflict is a real one. Once.
+	asked = 0
+	progressOf(h, "completed")
+	if _, _, code := h.run("", "approve", jobID); code != exit.Conflict || asked != 1 {
+		t.Errorf("a job that is not in review: %d after %d requests", code, asked)
+	}
+
+	// Another refusal is never repeated.
+	asked = 0
+	progressOf(h, "pending_review")
+	h.handle("POST "+jobRoute("/approve"), func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(403)
+		w.Write([]byte(`{"detail":"Insufficient token scope: requires jobs:write"}`))
+	})
+	if _, _, code := h.run("", "approve", jobID); code != exit.Auth || asked != 1 {
+		t.Errorf("a refusal for another reason: %d after %d requests", code, asked)
+	}
+}
+
 func jobRow(id, status, title string, root bool) map[string]any {
 	return map[string]any{
 		"id": id, "status": status, "title": title, "description": "The task\nwith more", "expert_display_name": "Scholar",

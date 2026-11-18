@@ -160,35 +160,13 @@ def test_a_check_wants_the_exit_code_and_every_text(got, text, code, needles, ok
     assert (gate.verdict(got, text, code, needles) == "") is ok
 
 
-def test_approve_is_sent_again_only_for_a_conflict(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(gate.time, "sleep", lambda _: None)
-    run = gate.Gate(gate.parser().parse_args([]), tmp_path / "srw", tmp_path)
-
-    def answers(*codes):
-        left = list(codes)
-        calls = []
-
-        def srw(token, *argv, **_):
-            calls.append(argv)
-            return left.pop(0), "", ""
-
-        monkeypatch.setattr(run, "srw", srw)
-        return calls
-
-    calls = answers(5, 5, 0)
-    assert run.approve("u_full", "job-id")[0] == 0 and len(calls) == 3
-    assert (
-        "NOTE  approve answered a conflict 2 time(s) first" in capsys.readouterr().out
-    )
-    # Another failure is the answer; nothing is sent again.
-    calls = answers(3)
-    assert run.approve("u_full", "job-id")[0] == 3 and len(calls) == 1
-    # A conflict that stays is reported as one.
-    calls = answers(5, 5, 5, 5)
-    assert run.approve("u_full", "job-id")[0] == 5 and len(calls) == 4
-    calls = answers(0)
-    assert run.approve("u_full", "job-id")[0] == 0
-    assert "NOTE" not in capsys.readouterr().out.split("first")[-1]
+def test_the_gate_does_not_repeat_what_the_client_must_repeat():
+    # srw approve rides out the server's conflict by itself. A repeat in the
+    # gate would hide a client that stopped doing so.
+    source = Path(gate.__file__).read_text()
+    assert not hasattr(gate.Gate, "approve")
+    assert source.count('"approve"') == 1
+    assert '"--interval", "200ms"' in source
 
 
 def test_tokens_are_scrubbed_from_what_is_printed(tmp_path):

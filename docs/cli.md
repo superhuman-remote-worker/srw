@@ -242,6 +242,9 @@ srw run -f task.md --expert reviewer --autonomy full --wait --timeout 2h
 - `wait` and `logs -f` ride out a server that stops answering in the middle,
   for example during an upgrade: they ask again for up to ten minutes before
   they exit with code 7.
+- `srw wait JOB --for status=pending_review && srw approve JOB` works as
+  written: for a moment after a job stops for review the server still
+  refuses its approval, and `approve` sends it again for up to 20 seconds.
 - Starting a job with `run` cannot be repeated safely. If the answer is lost
   (code 6), look at `srw get jobs` before starting it again. A start that can
   be repeated is a Job manifest applied with
@@ -309,6 +312,7 @@ the authority's PEM file at `srw login`; it is saved with the context. Plain
 | `the server's TLS certificate was not accepted` | Pass `--ca-file` with your certificate authority's file. |
 | `the API at … is not answering: … from something in front of it` | A proxy answered instead of the API. The server may be restarting; if it stays, the address is not the API's. |
 | `… redirects to …` | The server address is not the API's. Check `https`, the host and the path. |
+| `completion finalizing`, `job changed while control was being committed` or `pinned approval agent changed` on `srw approve` | The job has only just stopped for review and the server has not finished stopping it. `srw approve` sends the approval again by itself for up to 20 seconds. If it stays, look at the job with `srw describe job` and approve again. |
 | `Workspace authority retirement is incomplete` | The server is still releasing the job's workspace. `srw delete job` asks again by itself for up to three minutes, and `srw cancel` exits 0 when the job is cancelled. If it stays, look at the job with `srw get` and run the command again. |
 
 Shell completion: `srw completion bash`, `zsh`, `fish` or `powershell` print

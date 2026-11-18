@@ -478,24 +478,6 @@ class Gate:
         self.jobs.append((token, found.group(0)))
         return found.group(0)
 
-    def approve(self, token: str, job: str, tries: int = 4, pause: float = 5.0):
-        """approve, again while the server answers a conflict.
-
-        A job that has just stopped for review can refuse its approval for a
-        moment: its agent is being deregistered (409, "pinned approval agent
-        changed"). A script is fast enough to meet that; a person is not.
-        The run says when it happened.
-        """
-        refused = 0
-        result = self.srw(token, "approve", job)
-        while result[0] == 5 and refused < tries - 1:
-            refused += 1
-            time.sleep(pause)
-            result = self.srw(token, "approve", job)
-        if refused:
-            print(f"  NOTE  approve answered a conflict {refused} time(s) first")
-        return result
-
     def job_admin(self) -> None:
         s, c, wait = self.srw, self.check, self.args.wait
         job = self.run_job(
@@ -538,13 +520,16 @@ class Gate:
             0,
             "write_file",
         )
+        # A short interval puts the approval inside the two and a half seconds
+        # in which the server still refuses it (409). srw approve sends it
+        # again by itself; the gate does not.
         c(
             "wait: stopped for review",
-            s("u_full", "wait", job, "--timeout", wait),
+            s("u_full", "wait", job, "--interval", "200ms", "--timeout", wait),
             10,
             "pending_review",
         )
-        c("approve", self.approve("u_full", job), 0)
+        c("approve, at once", s("u_full", "approve", job), 0, "approved")
         c(
             "wait: completed",
             s("u_full", "wait", job, "--timeout", wait),

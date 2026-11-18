@@ -594,6 +594,9 @@ func (a *App) lifecycleCommand(verb, short, long string, route routes.Route, tex
 				request.Timeout = api.TeardownTimeout
 			}
 			response, err := client.Send(command.Context(), request)
+			if verb == "approve" {
+				response, err = a.approveAgain(command.Context(), client, request, id, response, err)
+			}
 			if err != nil {
 				if verb != "cancel" || !a.cancelledAnyway(command.Context(), client, id, err) {
 					return stillReleasing(err, verb, id)
@@ -645,6 +648,43 @@ func (a *App) cancelledAnyway(ctx context.Context, client *api.Client, id string
 	return true
 }
 
+// approveGrace is how long approve keeps asking while the server refuses the
+// approval of a job that still waits for review.
+const approveGrace = 20 * time.Second
+
+// approveAgain sends an approval again while the server answers it with a
+// conflict and the job still waits for review. A job shows pending_review
+// about two and a half seconds before the server has finished stopping it
+// (measured on k3d; knowledge-base/knowledge/tests/approve_at_review_stop_409_check.md); an
+// approval in that time is refused with 409 "completion finalizing", "job
+// changed while control was being committed" or "pinned approval agent
+// changed". The refusal changed nothing, so the request can be repeated. A
+// person never meets it; `srw wait` followed by `srw approve` does.
+func (a *App) approveAgain(ctx context.Context, client *api.Client, request api.Request, id string, response *api.Response, err error) (*api.Response, error) {
+	started, said := a.Now(), false
+	for err != nil {
+		var failure *exit.Error
+		if !errors.As(err, &failure) || failure.Status != http.StatusConflict || a.Now().Sub(started) >= approveGrace {
+			return response, err
+		}
+		// Only for a job that still waits: any other status means the
+		// conflict is a real one (approved by someone else, cancelled).
+		seen, readErr := a.progress(ctx, client, id, false)
+		if readErr != nil || seen.Status != "pending_review" {
+			return response, err
+		}
+		if !said {
+			said = true
+			fmt.Fprintf(a.Err, "The server has not finished stopping the job for review (%s). Trying again for up to %s.\n", failure.Message, approveGrace)
+		}
+		if sleepErr := a.sleep(ctx, time.Second); sleepErr != nil {
+			return response, sleepErr
+		}
+		response, err = client.Send(ctx, request)
+	}
+	return response, err
+}
+
 // stillReleasing adds what to do to the server's 503 for a job whose
 // workspace it has not finished releasing.
 func stillReleasing(err error, verb, id string) error {
@@ -673,7 +713,10 @@ func (a *App) lifecycleCommands() []*cobra.Command {
 		a.lifecycleCommand("approve", "Approve a job that stopped for review",
 			"Approve a job that stopped for a person. A job that stopped at the end of its\n"+
 				"work completes. A job that stopped between two phases continues with the\n"+
-				"next phase.",
+				"next phase.\n\n"+
+				"A job shows that it stopped for review a moment before the server has\n"+
+				"finished stopping it. An approval in that moment is refused as a conflict;\n"+
+				"srw sends it again for up to 20 seconds while the job still waits for review.",
 			routes.JobApprove, "notes", "notes", "A note for the record (used when the job completes)"),
 	}
 }

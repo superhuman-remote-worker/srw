@@ -126,6 +126,10 @@ srw approve JOB [flags]
 Approve a job that stopped for a person. A job that stopped at the end of its
 work completes. A job that stopped between two phases continues with the
 next phase.
+
+A job shows that it stopped for review a moment before the server has
+finished stopping it. An approval in that moment is refused as a conflict;
+srw sends it again for up to 20 seconds while the job still waits for review.
 ```
 
 | Flag | Meaning |
