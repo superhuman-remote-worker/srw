@@ -3561,8 +3561,19 @@ export class DatasourceListComponent implements OnInit {
     );
   }
 
-  /** What Test must reach while editing: the endpoint as typed, unsaved. */
-  private sshTestEdits(): DatasourceTestEdits | undefined {
+  /** What Test must reach while editing: the form as typed, unsaved. An
+   *  SSH connector's endpoint; an MCP server's URL and credentials, so a
+   *  token typed and not yet saved is the one sent. Blank fields keep the
+   *  saved values, as they do on Save. */
+  private formTestEdits(): DatasourceTestEdits | undefined {
+    if (this.formData.type === 'mcp') {
+      const edits: DatasourceTestEdits = {};
+      const url = this.connectionUrlForPayload();
+      if (url) edits.connection_url = url;
+      const credentials = this.buildCredentials();
+      if (credentials) edits.credentials = credentials;
+      return Object.keys(edits).length > 0 ? edits : undefined;
+    }
     if (!this.isSshEndpointForm()) return undefined;
     if (this.formData.type === 'repository') {
       return {connection_url: this.connectionUrlForPayload(), config: this.buildTypeConfig()};
@@ -4620,15 +4631,18 @@ export class DatasourceListComponent implements OnInit {
   }
 
   testFromForm(): void {
-    // For forms we need to save first to test, or test an existing one
+    // An existing connector is tested as the form edits it (formTestEdits);
+    // a new one is saved first, then tested.
     const editId = this.editingId();
     if (editId) {
       this.isTesting.set(true);
       this.formTestResult.set(null);
-      this.api.testDatasource(editId, this.sshTestEdits()).subscribe({
+      this.api.testDatasource(editId, this.formTestEdits()).subscribe({
         next: (result) => {
           this.isTesting.set(false);
-          this.formTestResult.set(result);
+          this.formTestResult.set(
+            result ?? {status: 'error', message: this.transloco.translate('datasources.messages.testFailed')},
+          );
         },
         error: () => {
           this.isTesting.set(false);

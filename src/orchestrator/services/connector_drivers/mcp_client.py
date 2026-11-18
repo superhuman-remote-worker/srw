@@ -50,6 +50,24 @@ _CONFIG_REFUSED = (
 )
 
 
+def _without_pasted_scheme(credentials: Any) -> Any:
+    """``credentials`` with a bearer token's pasted ``Bearer`` scheme
+    removed; SRW adds the scheme when it sends the token."""
+    auth = credentials.get("auth") if isinstance(credentials, dict) else None
+    if (
+        isinstance(auth, Mapping)
+        and auth.get("type") == "bearer"
+        and isinstance(auth.get("token"), str)
+    ):
+        from shared.mcp_sdk import bare_bearer_token
+
+        return {
+            **credentials,
+            "auth": {**auth, "token": bare_bearer_token(auth["token"])},
+        }
+    return credentials
+
+
 def _mcp_config(config: Any) -> dict[str, Any]:
     """The one setting an MCP connector's config holds: what a question the
     server asks mid-call gets by itself (``shared.mcp_questions``)."""
@@ -138,20 +156,33 @@ class McpDriver(DatasourceDriver):
     ) -> dict[str, Any] | None:
         """The credentials to store, a bearer token without a pasted
         ``Bearer`` scheme (SRW adds it when it sends the token)."""
-        credentials = DatasourceDriver.stored_credentials(draft, existing)
-        auth = credentials.get("auth") if isinstance(credentials, dict) else None
-        if (
-            isinstance(auth, Mapping)
-            and auth.get("type") == "bearer"
-            and isinstance(auth.get("token"), str)
-        ):
-            from shared.mcp_sdk import bare_bearer_token
+        return _without_pasted_scheme(
+            DatasourceDriver.stored_credentials(draft, existing)
+        )
 
-            credentials = {
-                **credentials,
-                "auth": {**auth, "token": bare_bearer_token(auth["token"])},
-            }
-        return credentials
+    def apply_test_overrides(
+        self, row: Mapping[str, Any], overrides: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The row Test probes: the server and its auth as the connector form
+        edits them, so a token typed and not yet saved is the one sent.
+
+        Neither is stored. A field the form leaves out keeps its saved value;
+        the form leaves out a blank token, as it does on Save, and given
+        credentials replace the saved ones, as they do on Save. :meth:`check`
+        validates the result as an update would be validated.
+        """
+        probed = dict(row)
+        url = overrides.get("connection_url")
+        if isinstance(url, str) and url.strip():
+            probed["connection_url"] = url.strip()
+        credentials = overrides.get("credentials")
+        if credentials is not None:
+            if not isinstance(credentials, Mapping):
+                raise HTTPException(
+                    status_code=400, detail="MCP credentials must be an object"
+                )
+            probed["credentials"] = _without_pasted_scheme(dict(credentials))
+        return probed
 
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
@@ -286,6 +317,16 @@ async def test_mcp_datasource(
 
         status = http_status(exc)
         reason = f"HTTP {status}" if status is not None else _leaf_name(exc)
+        if status in (401, 403):
+            has_auth = (credentials.get("auth") or {}).get("type") in (
+                "bearer",
+                "headers",
+            )
+            reason += (
+                ": the server refused the credential"
+                if has_auth
+                else ": the server asks for a credential"
+            )
         return {"status": "error", "message": f"MCP connection failed ({reason})"}
 
 

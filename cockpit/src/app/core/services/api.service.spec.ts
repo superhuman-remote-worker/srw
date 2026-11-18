@@ -68,6 +68,63 @@ describe('ApiService.createJob public wire contract', () => {
   });
 });
 
+describe('ApiService.testDatasource', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {danger: vi.fn(), success: vi.fn()}},
+        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+        {
+          provide: ErrorMessageService,
+          useValue: {translate: (_e: unknown, key: string) => key},
+        },
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    httpMock.verify();
+    vi.restoreAllMocks();
+  });
+
+  it('sends what the form edits and reads a refused edit as an error with its reason', async () => {
+    const edits = {
+      connection_url: 'https://mcp.example.com/mcp',
+      credentials: {transport: 'http', auth: {type: 'bearer', token: 'typed-token'}},
+    };
+    const pending = firstValueFrom(api.testDatasource('mcp-1', edits));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/datasources/mcp-1/test'));
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual(edits);
+    request.flush(
+      {detail: 'Invalid MCP transport (expected http or sse)'},
+      {status: 400, statusText: 'Bad Request'},
+    );
+    await expect(pending).resolves.toEqual({
+      status: 'error',
+      message: 'Invalid MCP transport (expected http or sse)',
+    });
+  });
+
+  it('answers null for a failure the server does not explain', async () => {
+    const pending = firstValueFrom(api.testDatasource('mcp-1'));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/datasources/mcp-1/test'));
+    expect(request.request.body).toEqual({});
+    request.flush({detail: 'Connector test failed'}, {status: 500, statusText: 'Server Error'});
+    await expect(pending).resolves.toBeNull();
+  });
+});
+
 describe('ApiService.retryWorkspaceRecovery', () => {
   let api: ApiService;
   let httpMock: HttpTestingController;

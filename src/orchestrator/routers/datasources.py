@@ -471,8 +471,8 @@ async def test_datasource(
     The gate is bound rather than awaited here so it stays inside the
     operation's try/except: an unexpected (non-``HTTPException``) failure
     while resolving the connector must still surface as a 500 with its
-    message, exactly as it did in ``main``. ``body`` carries the SSH endpoint
-    a connector form is editing (see :class:`DatasourceTestRequest`).
+    message, exactly as it did in ``main``. ``body`` carries what a connector
+    form is editing (see :class:`DatasourceTestRequest`).
     """
 
     async def owned_datasource() -> tuple[dict[str, Any], dict[str, Any]]:

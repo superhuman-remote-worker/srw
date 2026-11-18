@@ -1173,9 +1173,10 @@ export class ApiService {
   }
 
   /**
-   * Test connectivity to a datasource. ``edits`` is the SSH endpoint the
-   * connector form is editing (``connection_url``/``config``): an SSH
-   * connector's Test reaches it instead of the saved one.
+   * Test connectivity to a datasource. ``edits`` is what the connector form
+   * is editing (an SSH endpoint, an MCP server's URL and credentials): Test
+   * reaches it instead of the saved one. A refusal the server explains (an
+   * edit that is not valid) comes back as an error result with its reason.
    */
   testDatasource(
     id: string,
@@ -1187,6 +1188,10 @@ export class ApiService {
     ).pipe(
       catchError((error) => {
         console.error(`Failed to test datasource ${id}:`, error);
+        const detail = error?.error?.detail;
+        if (error?.status === 400 && typeof detail === 'string' && detail) {
+          return of({status: 'error' as const, message: detail});
+        }
         return of(null);
       }),
     );

@@ -708,10 +708,12 @@ export interface ProjectDatasource extends Datasource {
 /**
  * Result from testing a datasource connection.
  */
-/** The SSH endpoint a connector form is editing; Test reaches it unsaved. */
+/** What a connector form is editing; Test reaches it unsaved. An SSH
+ *  connector's endpoint, or an MCP server's URL and credentials. */
 export interface DatasourceTestEdits {
   connection_url?: string | null;
   config?: DatasourceConfig;
+  credentials?: Record<string, unknown>;
 }
 
 export interface DatasourceTestResult {

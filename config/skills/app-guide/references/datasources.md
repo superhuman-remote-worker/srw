@@ -55,6 +55,15 @@ automatically gets the matching access:
 - Repository and credential-file connectors prepare the workspace and
   credentials the agent needs.
 
+## MCP servers: the token and Test Connection
+
+An MCP server's credential goes in **Bearer Token** (the token alone; SRW
+sends it as `Authorization: Bearer …`) or as **Custom Headers**. **Test
+Connection** tries the URL and credential as they are typed, before
+**Update**; a blank token tests the saved one. When Test fails with **HTTP
+401: the server asks for a credential**, none was sent; **…refused the
+credential** means the server rejected the one sent.
+
 ## MCP servers: questions and files
 
 An MCP server can ask a question while one of its tools runs, such as "Spend

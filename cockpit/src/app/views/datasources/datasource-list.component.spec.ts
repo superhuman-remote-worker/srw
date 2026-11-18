@@ -512,6 +512,73 @@ describe('DatasourceListComponent MCP support', () => {
   });
 });
 
+describe('DatasourceListComponent MCP Test before Save', () => {
+  // Test in an open form tested the saved connector: a token typed and not
+  // yet saved was never sent, and the server logged a request without one.
+  const saved = (over: Partial<Datasource> = {}): Datasource => ({
+    ...kbDatasource(),
+    id: 'mcp-1',
+    name: 'Own server',
+    type: 'mcp',
+    connection_url: 'https://mcp.example.com/mcp',
+    config: {},
+    ...over,
+  });
+
+  it('tests the token typed into the open form', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(saved());
+    component.formData.mcpToken = 'typed-token';
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenCalledWith('mcp-1', {
+      connection_url: 'https://mcp.example.com/mcp',
+      credentials: {transport: 'http', auth: {type: 'bearer', token: 'typed-token'}},
+    });
+    expect(api.updateDatasource).not.toHaveBeenCalled();
+  });
+
+  it('tests typed headers, and a typed URL with the saved token', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(saved());
+    component.formData.mcpHeaders = [{key: 'X-Api-Key', value: 'typed-key'}];
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenLastCalledWith('mcp-1', {
+      connection_url: 'https://mcp.example.com/mcp',
+      credentials: {transport: 'http', auth: {type: 'headers', headers: {'X-Api-Key': 'typed-key'}}},
+    });
+
+    const other = createComponent(false, null, BUILTIN_DRIVERS);
+    other.component.openEditForm(saved());
+    other.component.onConnectionUrlChange('https://new.example.com/mcp');
+    other.component.formData.connection_url = 'https://new.example.com/mcp';
+    other.component.testFromForm();
+    // No credentials: the token field is blank, so the saved token is tested.
+    expect(other.api.testDatasource).toHaveBeenCalledWith('mcp-1', {
+      connection_url: 'https://new.example.com/mcp',
+    });
+  });
+
+  it('leaves a redacted URL and a blank token to the saved connector', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(
+      saved({connection_url: null, connection_url_redacted: 'https://mcp.example.com/mcp?token=***'}),
+    );
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenCalledWith('mcp-1', undefined);
+  });
+
+  it('says the test failed when no result comes back', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    api.testDatasource.mockReturnValue(of(null));
+    component.openEditForm(saved());
+    component.testFromForm();
+    expect(component.formTestResult()).toEqual({
+      status: 'error',
+      message: 'datasources.messages.testFailed',
+    });
+  });
+});
+
 describe('DatasourceListComponent MCP server questions', () => {
   const INSTALLED = [...BUILTIN_DRIVERS, ...MANAGED_DRIVERS];
 

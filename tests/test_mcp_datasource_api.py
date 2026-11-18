@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 
 import orchestrator.main
@@ -495,3 +496,176 @@ class TestMcpConnectionTest:
         )
 
         assert result == {"status": "unsupported", "message": MCP_STDIO_RETIRED}
+
+
+#: A server that answers only ``Authorization: Bearer typed-token`` and
+#: refuses every other request with a plain 401, as a user's own server does.
+AUTH_SERVER = textwrap.dedent(
+    """
+    import sys
+    import uvicorn
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("guarded", log_level="ERROR")
+
+    @mcp.tool()
+    def ping() -> str:
+        \"\"\"Answer pong.\"\"\"
+        return "pong"
+
+    inner = mcp.streamable_http_app()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope["headers"])
+            if headers.get(b"authorization") != b"Bearer typed-token":
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"no token"})
+                return
+        await inner(scope, receive, send)
+
+    uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="error")
+    """
+)
+
+
+class TestMcpTestOfTheFormAsEdited:
+    """Test in a connector form reaches the server and token being typed.
+
+    The form tested the saved connector, so a token typed and not yet saved
+    was never sent: the server logged a request without one.
+    """
+
+    _ID = "11111111-2222-3333-4444-555555555555"
+
+    @pytest_asyncio.fixture
+    async def guarded_port(self, tmp_path):
+        script = tmp_path / "auth_server.py"
+        script.write_text(AUTH_SERVER)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        server = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script),
+            str(port),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await _wait_for_port(port)
+            yield port
+        finally:
+            server.terminate()
+            await server.wait()
+
+    async def _test(self, saved, body=None):
+        deps = _route_deps(
+            gates={"require_datasource_owner": AsyncMock(return_value=({}, saved))}
+        )
+        result = await probe_datasource_endpoint(
+            object(), self._ID, body, dependencies=deps
+        )
+        deps.store.update_datasource.assert_not_called()
+        return result
+
+    def _saved(self, url, credentials=None):
+        return {
+            "id": self._ID,
+            "type": "mcp",
+            "connection_url": url,
+            "credentials": credentials or {"transport": "http"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_typed_token_is_sent_before_it_is_saved(
+        self, guarded_port, monkeypatch
+    ):
+        from orchestrator.schemas.datasources import DatasourceTestRequest
+
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        saved = self._saved(f"http://127.0.0.1:{guarded_port}/mcp")
+
+        assert await self._test(saved) == {
+            "status": "error",
+            "message": "MCP connection failed (HTTP 401: the server asks for a credential)",
+        }
+        typed = DatasourceTestRequest(
+            credentials={
+                "transport": "http",
+                # Pasted with its scheme, as people paste the header value.
+                "auth": {"type": "bearer", "token": "Bearer typed-token"},
+            }
+        )
+        assert await self._test(saved, typed) == {
+            "status": "ok",
+            "message": "Connected: 1 tools (ping)",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_wrong_token_is_named_as_refused(self, guarded_port, monkeypatch):
+        from orchestrator.schemas.datasources import DatasourceTestRequest
+
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        saved = self._saved(f"http://127.0.0.1:{guarded_port}/mcp")
+        wrong = DatasourceTestRequest(
+            credentials={
+                "transport": "http",
+                "auth": {"type": "bearer", "token": "stale-token"},
+            }
+        )
+        result = await self._test(saved, wrong)
+        assert result == {
+            "status": "error",
+            "message": "MCP connection failed (HTTP 401: the server refused the credential)",
+        }
+        assert "stale-token" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_a_typed_url_is_tested_with_the_saved_token(
+        self, guarded_port, monkeypatch
+    ):
+        """A blank token keeps the saved one, as it does on Save."""
+        from orchestrator.schemas.datasources import DatasourceTestRequest
+
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        saved = self._saved(
+            "http://127.0.0.1:9/mcp",
+            {"transport": "http", "auth": {"type": "bearer", "token": "typed-token"}},
+        )
+        typed = DatasourceTestRequest(
+            connection_url=f" http://127.0.0.1:{guarded_port}/mcp "
+        )
+        assert (await self._test(saved, typed))["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_typed_credentials_are_validated_without_echoing_the_token(
+        self, monkeypatch
+    ):
+        from orchestrator.schemas.datasources import DatasourceTestRequest
+
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        saved = self._saved("http://127.0.0.1:9/mcp")
+        typed = DatasourceTestRequest(
+            credentials={
+                "transport": "http",
+                "auth": {"type": "bearer", "token": "typed-token"},
+                "command": "typed-token",
+            }
+        )
+        with pytest.raises(HTTPException) as refused:
+            await self._test(saved, typed)
+        assert refused.value.status_code == 400
+        assert "typed-token" not in str(refused.value.detail)
+
+    def test_only_an_object_is_taken_as_credentials(self):
+        from orchestrator.services.connector_drivers.mcp_client import McpDriver
+
+        row = self._saved("http://127.0.0.1:9/mcp")
+        with pytest.raises(HTTPException) as refused:
+            McpDriver().apply_test_overrides(row, {"credentials": "typed-token"})
+        assert refused.value.status_code == 400
+        assert "typed-token" not in str(refused.value.detail)
+        # Nothing typed: the saved connector, untouched.
+        assert McpDriver().apply_test_overrides(row, {"connection_url": " "}) == row
