@@ -649,6 +649,10 @@ async def handle_pod_workspace_recovery(
 
     A live probe retains the runtime under a no-cleanup attention hold; TCP
     liveness does not establish that an interrupted tool had no effects.
+
+    A runtime the lifecycle reconciler already retired (``status: deleted``
+    after an exact preserve cleanup) is held the same way without a probe:
+    the report lost the race to the automatic cleanup, not its workspace.
     See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1) and
     knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
 
@@ -788,21 +792,6 @@ async def handle_pod_workspace_recovery(
                 trigger_dispatch()
             return dict(stored_outcome)
 
-    disk_full = WorkspaceDiskFullReport.from_error(error)
-    if disk_full is not None:
-        return await _settle_full_workspace_disk(
-            job,
-            job_id,
-            error,
-            disk_full,
-            container_ctx=container_ctx,
-            db=db,
-            trigger_dispatch=trigger_dispatch,
-            grow_workspace_volume=grow_workspace_volume,
-            completion_command_id=completion_command_id,
-            completion_finalizing_by=completion_finalizing_by,
-        )
-
     same_command_attempt = completion_command_id is not None and (
         container_ctx.get("recovery_attempt_command_id") == completion_command_id
     )
@@ -811,7 +800,8 @@ async def handle_pod_workspace_recovery(
     )
     cap = int(os.environ.get("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3"))
     worker_exhausted = is_container_worker_workspace_exhaustion(job, error)
-    if attempts > cap or worker_exhausted:
+
+    async def _hold_exhausted_workspace() -> dict[str, Any]:
         outcome = await db.hold_exhausted_workspace_recovery(
             job_id,
             expected_workspace=container_ctx,
@@ -835,6 +825,56 @@ async def handle_pod_workspace_recovery(
                 "paused": False,
             }
         return outcome
+
+    if container_ctx.get("status") == "deleted":
+        # The lifecycle reconciler retired this failed runtime before the
+        # report arrived (an exact preserve cleanup; the volume stays). There
+        # is nothing to probe, grow or delete: hold it like the dead arm would.
+        # knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
+        if attempts > cap or worker_exhausted:
+            return await _hold_exhausted_workspace()
+        outcome = await db.hold_retired_workspace_recovery(
+            job_id,
+            expected_workspace=container_ctx,
+            expected_agent_id=job.get("assigned_agent_id"),
+            error_detail=error.get("message") or "workspace_unavailable",
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+        )
+        if outcome is None:
+            if (
+                completion_command_id is not None
+                or job.get("execution_lane") == "stateless"
+            ):
+                raise RuntimeError(
+                    "workspace recovery lost its retired-runtime disposition term"
+                )
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": "paused",
+                "paused": False,
+                "actions": [],
+            }
+        return outcome
+
+    disk_full = WorkspaceDiskFullReport.from_error(error)
+    if disk_full is not None:
+        return await _settle_full_workspace_disk(
+            job,
+            job_id,
+            error,
+            disk_full,
+            container_ctx=container_ctx,
+            db=db,
+            trigger_dispatch=trigger_dispatch,
+            grow_workspace_volume=grow_workspace_volume,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+        )
+
+    if attempts > cap or worker_exhausted:
+        return await _hold_exhausted_workspace()
 
     host = container_ctx.get("host")
     port = int(container_ctx.get("port") or 30022)

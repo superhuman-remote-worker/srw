@@ -7623,6 +7623,37 @@ class PostgresDB:
             interrupted_command=True,
         )
 
+    async def hold_retired_workspace_recovery(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        error_detail: str,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Hold an interrupted command whose runtime was already retired.
+
+        The lifecycle reconciler can retire a failed Pod before the worker's
+        report arrives. That retirement settled an exact ``preserve`` cleanup
+        of this runtime, so the report finds the row ``deleted`` instead of
+        ``ready``. The same hold as the unknown-outcome mode applies, proven by
+        the settled projection Resume already accepts; no cleanup is admitted.
+        knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
+        """
+        return await self._hold_workspace_recovery_attention(
+            job_id,
+            expected_workspace=expected_workspace,
+            expected_agent_id=expected_agent_id,
+            recovery_cap=0,
+            error_detail=error_detail,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            interrupted_command=True,
+            retired_runtime=True,
+        )
+
     async def hold_full_workspace_disk(
         self,
         job_id: str,
@@ -7673,6 +7704,7 @@ class PostgresDB:
         disk_full: WorkspaceDiskFullReport | None = None,
         disk_growth: WorkspaceVolumeGrowth | None = None,
         requeue: bool = False,
+        retired_runtime: bool = False,
     ) -> Dict[str, Any] | None:
         """Retain uncertain container work behind the existing explicit-resume fence.
 
@@ -7683,9 +7715,15 @@ class PostgresDB:
 
         ``requeue`` is the one exception to the hold: a full disk whose volume
         grew while no command was running resumes without an explicit Resume.
+
+        ``retired_runtime`` is the unknown-outcome mode for a runtime that an
+        exact ``preserve`` cleanup already retired: the row must be ``deleted``
+        and settled for its own runtime, with nothing else in flight.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
+        if retired_runtime and (not interrupted_command or disk_full is not None):
+            raise ValueError("a retired runtime holds only an interrupted command")
         if requeue and (
             disk_full is None
             or disk_full.command_in_flight
@@ -7742,7 +7780,11 @@ class PostgresDB:
                     or job["control_active"]
                     or OPERATOR_PAUSE_HOLD_CONTEXT_KEY in context
                     or workspace.get("provisioner") != "k8s"
-                    or (interrupted_command and workspace.get("status") != "ready")
+                    or (
+                        interrupted_command
+                        and workspace.get("status")
+                        != ("deleted" if retired_runtime else "ready")
+                    )
                     or workspace.get("_runtime_incarnation") != runtime_uid
                     or any(
                         workspace.get(key) != expected_workspace.get(key)
@@ -7833,6 +7875,28 @@ class PostgresDB:
                         or error.get("type") != "workspace_unavailable"
                     ):
                         return None
+                if retired_runtime and not await conn.fetchval(
+                    # The proof Resume relies on (container_retained_projection_sql):
+                    # an exact preserve cleanup of this very runtime settled the
+                    # row to ``deleted``, kept the claim, and no creator or other
+                    # cleanup of the owner is still in flight.
+                    "SELECT managed_repository_workspace_cleanup_projection_is_settled("
+                    "'job',$1,'workspace_container',$2::text,$2::text,'deleted') "
+                    "AND EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='workspace_container' "
+                    "AND runtime_incarnation::text=$2::text AND result_kind='settled' "
+                    "AND target_disposition='deleted' AND resource_policy='preserve') "
+                    "AND NOT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='workspace_container' "
+                    "AND (settled_at IS NULL OR (runtime_incarnation::text=$2::text "
+                    "AND resource_policy<>'preserve'))) "
+                    "AND NOT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='workspace_container' "
+                    "AND settled_at IS NULL)",
+                    job_uuid,
+                    runtime_uid,
+                ):
+                    return None
                 attempts = int(workspace.get("recovery_attempts") or 0) + (
                     0
                     if worker_queue_exhausted
@@ -7867,7 +7931,14 @@ class PostgresDB:
                             if worker_queue_exhausted
                             else f"workspace recovery exhausted after {recovery_cap} attempts; "
                         )
-                        + "workspace and checkpoints retained; explicit Resume required"
+                        # The retired Pod is gone; only its volume remains, as
+                        # after the dead-workspace arm's own cleanup.
+                        + (
+                            "workspace storage and checkpoints retained; "
+                            if retired_runtime
+                            else "workspace and checkpoints retained; "
+                        )
+                        + "explicit Resume required"
                     ],
                     **({"cleanup_pending": False} if interrupted_command else {}),
                 }

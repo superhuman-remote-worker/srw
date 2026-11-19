@@ -131,6 +131,118 @@ _ERROR = {"type": "workspace_unavailable", "message": "SSH command failed"}
 
 class TestHandlePodWorkspaceRecovery:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _ERROR,
+            # A disk-full report on a retired runtime has no volume to grow.
+            {
+                "type": "workspace_unavailable",
+                "reason": "workspace_disk_full",
+                "disk": {"size_bytes": 1, "used_bytes": 1, "available_bytes": 0},
+            },
+        ],
+    )
+    async def test_retired_runtime_holds_without_probe_or_cleanup(self, error):
+        """T8: the reconciler retired the Pod first; the report only holds."""
+
+        db, delete_workspace, trigger_dispatch, _ = _make_deps(pod_alive=False)
+        probe = AsyncMock(side_effect=AssertionError("a retired runtime is not probed"))
+        grow = AsyncMock(side_effect=AssertionError("a retired runtime is not grown"))
+        job = _job(attempts=1)
+        job["context"]["workspace_container"]["status"] = "deleted"
+        held = {"new_status": "paused", "held_for_resume": True, "paused": True}
+        db.hold_retired_workspace_recovery.return_value = held
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            error,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+            grow_workspace_volume=grow,
+            completion_command_id="44444444-4444-4444-8444-444444444444",
+            completion_finalizing_by="owner-a",
+        )
+
+        assert result == held
+        db.hold_retired_workspace_recovery.assert_awaited_once()
+        kwargs = db.hold_retired_workspace_recovery.await_args.kwargs
+        assert kwargs["expected_workspace"] is job["context"]["workspace_container"]
+        assert kwargs["completion_command_id"] == "44444444-4444-4444-8444-444444444444"
+        probe.assert_not_awaited()
+        grow.assert_not_awaited()
+        delete_workspace.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+        db.prepare_dead_workspace_recovery.assert_not_awaited()
+        db.hold_unavailable_workspace_recovery.assert_not_awaited()
+        db.hold_exhausted_workspace_recovery.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retired_runtime_past_the_cap_takes_the_exhausted_hold(self):
+        db, delete_workspace, trigger_dispatch, _ = _make_deps(pod_alive=False)
+        probe = AsyncMock(side_effect=AssertionError("a retired runtime is not probed"))
+        job = _job(attempts=3)
+        job["context"]["workspace_container"]["status"] = "deleted"
+        held = {"new_status": "paused", "held_for_resume": True, "paused": True}
+        db.hold_exhausted_workspace_recovery.return_value = held
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        assert result == held
+        db.hold_retired_workspace_recovery.assert_not_awaited()
+        probe.assert_not_awaited()
+        delete_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lane,command_id,raises",
+        [
+            ("stateless", "44444444-4444-4444-8444-444444444444", True),
+            ("pinned", "44444444-4444-4444-8444-444444444444", True),
+            ("pinned", None, False),
+        ],
+    )
+    async def test_refused_retired_hold_raises_for_owned_reports(
+        self, lane, command_id, raises
+    ):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        job = _job()
+        job["execution_lane"] = lane
+        job["context"]["workspace_container"]["status"] = "deleted"
+        db.hold_retired_workspace_recovery.return_value = None
+
+        call = handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+            completion_command_id=command_id,
+            completion_finalizing_by="owner-a" if command_id else None,
+        )
+        if raises:
+            with pytest.raises(RuntimeError, match="retired-runtime disposition"):
+                await call
+        else:
+            result = await call
+            assert result["paused"] is False
+        delete_workspace.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_live_pod_is_not_deleted(self):
         db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
         job = _job()
