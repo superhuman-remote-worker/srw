@@ -760,12 +760,12 @@ async def _parked_like_3677b309(db, monkeypatch):
     return stuck, owner, runtime, provisioner, resources, command_id
 
 
-async def _unpark_and_finalize(db, command_id, job_id, provisioner):
+async def _unpark_and_finalize(db, command_id, job_id, provisioner, settled=None):
     from orchestrator.services.completion_command_resolution import (
         CompletionCommandResolution,
     )
 
-    unparked = await CompletionCommandResolution(db).unpark(
+    unparked = await CompletionCommandResolution(db, settled=settled).unpark(
         command_id, actor="admin-proof"
     )
     assert unparked.state == "pending"
@@ -796,9 +796,67 @@ async def test_t5_unpark_settles_the_parked_report_into_the_hold(
         await controls.resume_job_internal(
             owner.id, user={"id": str(uuid4())}, job=stuck
         )
+    # WP4 (b): the refusal says the report is parked, not "finalizing".
     assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "completion_parked"
+    assert refused.value.detail["command_id"] == command_id
 
-    result = await _unpark_and_finalize(db, command_id, stuck["id"], provisioner)
+    # WP4 (a): the job says so first among its liveness reasons.
+    from orchestrator.services.job_liveness import compute_job_liveness
+
+    liveness = await compute_job_liveness(
+        stuck, db=db, completion_commands_enabled=True
+    )
+    assert liveness["reasons"][0].startswith(
+        f"completion report {command_id[:8]} is parked after 5 failed attempts "
+        "(RuntimeError)"
+    )
+    unflagged = await compute_job_liveness(stuck, db=db)
+    assert not unflagged["reasons"][0].startswith("completion report")
+
+    # WP4 (c): the sweep router's park alert reaches the owner's feed, and
+    # the unpark settles it.
+    from orchestrator.services.completion_runtime import (
+        CompletionAlertDependencies,
+        CompletionAlerts,
+    )
+    from orchestrator.services.completion_sweep_router import CompletionSweepRouter
+
+    owner_id = uuid4()
+    await db.execute(
+        "INSERT INTO users (id, display_name) VALUES ($1, 'job owner')",
+        owner_id,
+    )
+    await db.execute("UPDATE jobs SET user_id=$2 WHERE id=$1", stuck["id"], owner_id)
+    notifier = SimpleNamespace(record=AsyncMock(), resolve_source=AsyncMock())
+    fleet = AsyncMock()
+    alerts = CompletionAlerts(
+        CompletionAlertDependencies(
+            store=db,
+            notify_all_officers=fleet,
+            kick_officer_event_drain=Mock(),
+            notifier=notifier,
+        )
+    )
+    routed = await CompletionSweepRouter(
+        db,
+        SimpleNamespace(finalize_command=AsyncMock(side_effect=AssertionError)),
+        alert=AsyncMock(side_effect=AssertionError("the fleet-wide alert")),
+        park_alert=alerts.parked,
+    ).route_job(str(stuck["id"]), source="report-after-cleanup-proof")
+    assert routed.route == "alert_only"
+    record = notifier.record.await_args.kwargs
+    assert record["recipient_id"] == str(owner_id)
+    assert record["source_kind"] == "completion_command"
+    assert record["source_id"] == command_id
+    fleet.assert_not_awaited()
+
+    result = await _unpark_and_finalize(
+        db, command_id, stuck["id"], provisioner, settled=alerts.parked_settled
+    )
+    notifier.resolve_source.assert_awaited_once_with(
+        "completion_command", command_id, resolved_by="user:admin-proof"
+    )
 
     assert result.state == "done"
     assert (await _command(db, command_id))["state"] == "done"

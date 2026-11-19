@@ -667,6 +667,10 @@ func (a *App) approveAgain(ctx context.Context, client *api.Client, request api.
 		if !errors.As(err, &failure) || failure.Status != http.StatusConflict || a.Now().Sub(started) >= approveGrace {
 			return response, err
 		}
+		// A parked completion report waits for an administrator, not for time.
+		if failure.ErrCode == "completion_parked" {
+			return response, err
+		}
 		// Only for a job that still waits: any other status means the
 		// conflict is a real one (approved by someone else, cancelled).
 		seen, readErr := a.progress(ctx, client, id, false)

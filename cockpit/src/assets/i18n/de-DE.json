@@ -4745,7 +4745,8 @@
       "workspace_retirement_refused": "Der Arbeitsbereich, der nicht gestartet ist, konnte noch nicht ersetzt werden. Versuche „Fortsetzen“ in einer Minute noch einmal.",
       "workspace_retirement_unavailable": "Diese Installation kann den Arbeitsbereich des Jobs nicht ersetzen.",
       "staging_missing": "Der bereitgestellte Inhalt ist im Speicher nicht mehr vorhanden und kann daher nicht übernommen werden. Stelle die Änderungen erneut bereit und prüfe sie noch einmal.",
-      "invalid_epoch": "Diese Prüfung ist veraltet. Lade sie neu und entscheide erneut."
+      "invalid_epoch": "Diese Prüfung ist veraltet. Lade sie neu und entscheide erneut.",
+      "completion_parked": "Der letzte Bericht dieses Jobs konnte nicht verarbeitet werden und wartet auf einen Administrator. Der Job lässt sich fortsetzen, sobald ein Administrator den Bericht wieder freigibt oder auflöst."
     },
     "projects": {
       "loadFailed": "Projekte konnten nicht geladen werden.",

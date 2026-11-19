@@ -32,6 +32,12 @@ would itself be a manufactured fact.
 ``compute_job_elapsed_seconds`` answers the companion question, "how long
 has this job run?", from the same audit last-write: a job that stopped
 working stops its clock when its work did, not when the row was last touched.
+
+With completion commands on, a job whose completion report is parked says so
+first among its reasons; its state is unchanged. A parked command waits for
+an operator's unpark or force-resolve, and until then the job's controls
+answer 409, so this is the one line that tells why nothing moves.
+knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
 """
 
 from __future__ import annotations
@@ -205,6 +211,57 @@ def _freeze_reason(job: dict[str, Any]) -> Optional[str]:
     return f"freeze type '{freeze_type}'" if freeze_type else None
 
 
+PARKED_COMPLETION_REASON_PREFIX = "completion report "
+
+
+def parked_completion_reason(parked: dict[str, Any]) -> str:
+    """The liveness line for a job whose completion report is parked."""
+    command = str(parked.get("command_id") or "")[:8]
+    attempts = parked.get("attempts")
+    error_code = parked.get("error_code")
+    detail = f" after {attempts} failed attempts" if attempts else ""
+    if error_code:
+        detail += f" ({error_code})"
+    return (
+        f"{PARKED_COMPLETION_REASON_PREFIX}{command} is parked{detail}; "
+        "an administrator must unpark or force-resolve it"
+    )
+
+
+def names_parked_completion(reasons: Any) -> bool:
+    """Whether a verdict's reasons lead with a parked completion report."""
+    return bool(
+        reasons
+        and isinstance(reasons[0], str)
+        and reasons[0].startswith(PARKED_COMPLETION_REASON_PREFIX)
+        and " is parked" in reasons[0]
+    )
+
+
+async def _parked_completion(db: Any, job_id: str) -> Optional[dict[str, Any]]:
+    reader = getattr(db, "parked_completion_commands_for_jobs", None)
+    if reader is None or not job_id:
+        return None
+    try:
+        return (await reader([job_id])).get(job_id)
+    except Exception:  # noqa: BLE001 — a liveness read never fails the caller
+        logger.warning(
+            "liveness: parked completion lookup failed for %s", job_id, exc_info=True
+        )
+        return None
+
+
+async def _parked_completions(db: Any, job_ids: list[str]) -> dict[str, Any]:
+    reader = getattr(db, "parked_completion_commands_for_jobs", None)
+    if reader is None or not job_ids:
+        return {}
+    try:
+        return dict(await reader(job_ids))
+    except Exception:  # noqa: BLE001
+        logger.warning("liveness: parked completion lookup failed", exc_info=True)
+        return {}
+
+
 def _workspace_recovery(job: dict[str, Any]) -> dict[str, Any]:
     value = job.get("_workspace_recovery", job.get("workspace_recovery"))
     return _parse_json_field(value)
@@ -312,11 +369,15 @@ async def compute_job_liveness(
     threshold_minutes: int | None = None,
     policy: JobLivenessPolicy | None = None,
     now: datetime | None = None,
+    completion_commands_enabled: bool = False,
     _agent_cache: dict[str, Any] | None = None,
+    _parked_completions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute the liveness verdict for one job row.
 
     Returns ``{state, observed_at, reasons, last_activity_at, threshold_minutes}``.
+    ``completion_commands_enabled`` is the deployment flag: off, nothing here
+    reads the completion-command relations.
     """
     now = now or _now()
     effective_policy = policy or get_liveness_policy(
@@ -334,12 +395,21 @@ async def compute_job_liveness(
     sources: list[dict[str, Any]] = [
         {"name": "control_db", "status": "fresh", "as_of": now.isoformat()}
     ]
+    parked: Optional[dict[str, Any]] = None
+    if completion_commands_enabled:
+        parked = (
+            _parked_completions.get(job_id)
+            if _parked_completions is not None
+            else await _parked_completion(db, job_id)
+        )
 
     def verdict(state: str) -> dict[str, Any]:
         return {
             "state": state,
             "observed_at": now.isoformat(),
-            "reasons": reasons,
+            "reasons": (
+                [parked_completion_reason(parked), *reasons] if parked else reasons
+            ),
             "last_activity_at": _iso(last_activity),
             "threshold_minutes": threshold,
             "threshold_source": effective_policy.stall.source,
@@ -494,11 +564,13 @@ async def compute_jobs_liveness(
     threshold_minutes: int | None = None,
     policy: JobLivenessPolicy | None = None,
     now: datetime | None = None,
+    completion_commands_enabled: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Batch variant keyed by job id — one agent lookup per distinct agent.
 
     Project-scoped batches (SITREP, backlog stale-claim sweeps) call this so
-    every surface shares one computation and one threshold.
+    every surface shares one computation and one threshold. Parked completion
+    commands are read once for the whole batch.
     """
     now = now or _now()
     effective_policy = policy or get_liveness_policy(
@@ -507,6 +579,13 @@ async def compute_jobs_liveness(
     if policy is not None and threshold_minutes is not None:
         effective_policy = policy.with_stall_override(threshold_minutes)
     agent_cache: dict[str, Any] = {}
+    parked = (
+        await _parked_completions(
+            db, [str(job.get("id")) for job in jobs if job.get("id")]
+        )
+        if completion_commands_enabled
+        else None
+    )
     results: dict[str, dict[str, Any]] = {}
     for job in jobs:
         job_id = str(job.get("id") or "")
@@ -518,7 +597,9 @@ async def compute_jobs_liveness(
             db=db,
             policy=effective_policy,
             now=now,
+            completion_commands_enabled=completion_commands_enabled,
             _agent_cache=agent_cache,
+            _parked_completions=parked,
         )
     return results
 
@@ -535,4 +616,6 @@ __all__ = [
     "compute_job_liveness",
     "compute_jobs_liveness",
     "get_liveness_policy",
+    "names_parked_completion",
+    "parked_completion_reason",
 ]

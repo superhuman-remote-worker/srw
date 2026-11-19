@@ -85,6 +85,7 @@ class UsageReportingDependencies:
     infrastructure_usage_rollup: Any | None = None
     visible_project_ids: Callable[[dict[str, Any]], Awaitable[Any]] | None = None
     scope_project_id: Callable[[dict[str, Any]], Any] | None = None
+    completion_commands_enabled: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +366,7 @@ async def stuck_jobs(
             audit_reader=dependencies.audit_reader,
             db=dependencies.store,
             policy=policy,
+            completion_commands_enabled=dependencies.completion_commands_enabled,
         )
         stuck: list[dict[str, Any]] = []
         for job in processing:

@@ -36439,6 +36439,55 @@ class PostgresDB:
             *args,
         )
 
+    async def parked_completion_commands_for_jobs(
+        self, job_ids: Any
+    ) -> Dict[str, Dict[str, Any]]:
+        """Each job whose oldest unfinished completion command is parked.
+
+        Route ``alert_only`` of the routing view: the command waits for an
+        operator's unpark or force-resolve and nothing automatic moves it.
+        Keyed by job id; jobs without such a command are absent. Callers ask
+        only with completion commands enabled.
+        """
+        ids: list[UUID] = []
+        for job_id in job_ids or ():
+            try:
+                ids.append(UUID(str(job_id)))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT route.job_id, route.command_id, route.command_attempts, "
+                "command.error_code, command.reported_at "
+                "FROM job_completion_sweep_exclusions AS route "
+                "JOIN job_completion_commands AS command ON command.id=route.command_id "
+                "WHERE route.job_id=ANY($1::uuid[]) AND route.route='alert_only'",
+                ids,
+            )
+        return {
+            str(row["job_id"]): {
+                "command_id": str(row["command_id"]),
+                "attempts": int(row["command_attempts"]),
+                "error_code": row["error_code"],
+                "reported_at": row["reported_at"],
+            }
+            for row in rows
+        }
+
+    async def completion_command_state(self, command_id: str) -> str | None:
+        """The current state of one completion command, or None if unknown."""
+        try:
+            command_uuid = UUID(str(command_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT state FROM job_completion_commands WHERE id=$1",
+                command_uuid,
+            )
+
     async def _completion_resume_blocked_on_conn(
         self,
         conn,

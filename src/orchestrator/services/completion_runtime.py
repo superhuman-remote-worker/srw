@@ -34,6 +34,8 @@ class CompletionAlertDependencies:
     store: Any
     notify_all_officers: Callable[..., Awaitable[Any]]
     kick_officer_event_drain: Callable[[Any], None]
+    # The notification feed; parked-command incidents for job owners.
+    notifier: Any | None = None
 
 
 class CompletionAlerts:
@@ -52,6 +54,134 @@ class CompletionAlerts:
             payload={"summary": message[:1000]},
         )
         self.dependencies.kick_officer_event_drain(self.dependencies.store)
+
+    async def parked(self, alert: Any) -> None:
+        """A completion command parked: tell the job's owner and its officer.
+
+        A parked command waits for an administrator's unpark or force-resolve
+        and blocks the job's controls until then. The owner gets an incident
+        in their feed (one per command, settled when an operator moves it on);
+        the officer commanding the job's project gets one wake per command
+        attempt. Every other officer hears nothing, as for the monitor.
+        knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
+        """
+        store = self.dependencies.store
+        job_id = str(alert.job_id)
+        try:
+            parked = (await store.parked_completion_commands_for_jobs([job_id])).get(
+                job_id
+            )
+            job = await store.get_job(job_id) if parked else None
+        except Exception:
+            logger.warning("completion park alert: lookup failed", exc_info=True)
+            return
+        if not parked or parked.get("command_id") != str(alert.command_id) or not job:
+            # A park_alert route whose finalizer finished the command after
+            # all, or a job that is gone: nothing waits for a person.
+            return
+        await self._tell_owner_parked(job, parked)
+        await self._tell_officer_parked(job, alert, parked)
+
+    async def _tell_owner_parked(
+        self, job: Mapping[str, Any], parked: Mapping[str, Any]
+    ) -> None:
+        from orchestrator.services.job_liveness import TERMINAL_STATUSES
+        from shared.content_redaction import sanitize_text
+
+        notifier = self.dependencies.notifier
+        status = str(job.get("status") or "")
+        user_id = job.get("user_id")
+        if notifier is None or not user_id or status in TERMINAL_STATUSES:
+            return
+        job_id = str(job["id"])
+        command_id = str(parked["command_id"])
+        short_id = job_id[:8]
+        attempts = parked.get("attempts")
+        error_code = parked.get("error_code")
+        failed = f" after {attempts} attempts" if attempts else ""
+        if error_code:
+            failed += f" (`{sanitize_text(str(error_code))[:80]}`)"
+        description = sanitize_text(str(job.get("description") or ""))[:100]
+        try:
+            await notifier.record(
+                recipient_id=str(user_id),
+                category="incident",
+                dedup_key=f"completion_parked:{command_id}",
+                subject=(
+                    f"Job {short_id} is stuck: its completion report waits "
+                    "for an administrator"
+                ),
+                body=(
+                    f"**Job `{short_id}`** sent a report the server could not "
+                    f"process{failed}. The report is parked, so the job stays "
+                    f"`{status}` and Resume is refused until an administrator "
+                    f"unparks or force-resolves completion command "
+                    f"`{command_id[:8]}`.\n\n**Description:** {description}"
+                ),
+                source_kind="completion_command",
+                source_id=command_id,
+                action_params={"job_id": job_id},
+                payload={
+                    "job_id": job_id,
+                    "command_id": command_id,
+                    "attempts": attempts,
+                    "error_code": error_code,
+                    "job_status": status,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "completion park alert: owner incident for job %s failed",
+                job_id,
+                exc_info=True,
+            )
+
+    async def _tell_officer_parked(
+        self, job: Mapping[str, Any], alert: Any, parked: Mapping[str, Any]
+    ) -> None:
+        store = self.dependencies.store
+        job_id = str(job["id"])
+        project_id = job.get("project_id")
+        officer = None
+        if project_id:
+            try:
+                officer = await store.get_officer_thread_for_project(str(project_id))
+            except Exception:
+                logger.warning(
+                    "completion park alert: officer lookup failed", exc_info=True
+                )
+        if not officer:
+            logger.warning(
+                "completion park alert not routed to an officer (job %s): %s",
+                job_id,
+                str(getattr(alert, "message", ""))[:300],
+            )
+            return
+        await store.enqueue_session_wake_event(
+            str(officer["id"]),
+            source="completion_sweep",
+            dedup_key=f"completion_sweep:{alert.command_id}:{alert.command_attempt}",
+            project_id=str(project_id),
+            payload={
+                "kind": "completion_parked",
+                "summary": str(getattr(alert, "message", ""))[:1000],
+                "job_id": job_id,
+                "command_id": str(alert.command_id),
+                "route": str(alert.route),
+                "attempts": parked.get("attempts"),
+                "error_code": parked.get("error_code"),
+            },
+        )
+        self.dependencies.kick_officer_event_drain(store)
+
+    async def parked_settled(self, command_id: str, actor: str) -> None:
+        """An operator unparked or force-resolved a command: settle its incident."""
+        notifier = self.dependencies.notifier
+        if notifier is None:
+            return
+        await notifier.resolve_source(
+            "completion_command", str(command_id), resolved_by=f"user:{actor}"
+        )
 
     async def resolution(self, incident: Any) -> None:
         await self.dependencies.notify_all_officers(
@@ -149,6 +279,10 @@ class CompletionRuntimeDependencies:
     monitor_alert: Callable[[Any], Awaitable[None]]
     max_queued_session_age_seconds: Callable[[], float]
     logger: logging.Logger
+    # A command parked: tell the job's owner and its project's officer. And
+    # an operator moved a parked command on: settle what they were told.
+    park_alert: Callable[[Any], Awaitable[None]] | None = None
+    parked_settled: Callable[[str, str], Awaitable[None]] | None = None
 
 
 class CompletionRuntime:
@@ -190,6 +324,7 @@ class CompletionRuntime:
             self._command_resolution = CompletionCommandResolution(
                 self.dependencies.store,
                 alert=self.dependencies.resolution_alert,
+                settled=self.dependencies.parked_settled,
             )
         return self._command_resolution
 
@@ -221,6 +356,7 @@ class CompletionRuntime:
                 self.dependencies.store,
                 self.finalizer(),
                 alert=self.dependencies.sweep_alert,
+                park_alert=self.dependencies.park_alert,
                 safety_net=(
                     self.command_resolution()
                     if self.dependencies.status_reorder_enabled()
@@ -271,6 +407,15 @@ class CompletionControlBoundary:
             return
         decision = await self.runtime.control().guard_job(job_id, source=source)
         if decision.blocked:
+            if decision.route == "alert_only":
+                from orchestrator.services.completion_control import (
+                    completion_parked_detail,
+                )
+
+                raise HTTPException(
+                    status_code=409,
+                    detail=completion_parked_detail(decision.command_id),
+                )
             raise HTTPException(status_code=409, detail="completion finalizing")
 
     async def claim(

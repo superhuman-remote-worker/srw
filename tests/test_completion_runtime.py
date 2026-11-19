@@ -51,7 +51,11 @@ async def test_disabled_boundary_never_constructs_durable_control() -> None:
 async def test_boundary_reuses_one_control_and_preserves_refusal_detail() -> None:
     runtime = _runtime(enabled=True)
     control = SimpleNamespace(
-        guard_job=AsyncMock(return_value=SimpleNamespace(blocked=True)),
+        guard_job=AsyncMock(
+            return_value=SimpleNamespace(
+                blocked=True, route="resume_finalizer", command_id="command"
+            )
+        ),
         claim_job=AsyncMock(
             side_effect=CompletionControlClaimConflict("completion finalizing")
         ),
@@ -78,6 +82,42 @@ async def test_boundary_reuses_one_control_and_preserves_refusal_detail() -> Non
         expected_status="processing",
         expected_lane="pinned",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route,typed",
+    [
+        ("alert_only", True),
+        ("resume_finalizer", False),
+        ("park_alert", False),
+        ("stand_down", False),
+    ],
+)
+async def test_guard_types_the_refusal_of_a_parked_command(route, typed) -> None:
+    """A parked command waits for an operator; every other route passes."""
+
+    runtime = _runtime(enabled=True)
+    command_id = "03dc2497-cad4-4481-8af0-d94fccf04ec2"
+    runtime._control = SimpleNamespace(
+        guard_job=AsyncMock(
+            return_value=SimpleNamespace(
+                blocked=True, route=route, command_id=command_id
+            )
+        )
+    )
+
+    with pytest.raises(HTTPException) as guarded:
+        await CompletionControlBoundary(runtime).guard("job", source="resume")
+
+    assert guarded.value.status_code == 409
+    if typed:
+        assert guarded.value.detail["code"] == "completion_parked"
+        assert guarded.value.detail["command_id"] == command_id
+        assert "(command 03dc2497)" in guarded.value.detail["message"]
+        assert "administrator" in guarded.value.detail["message"]
+    else:
+        assert guarded.value.detail == "completion finalizing"
 
 
 def test_guard_kwargs_preserve_flag_on_storage_contract() -> None:

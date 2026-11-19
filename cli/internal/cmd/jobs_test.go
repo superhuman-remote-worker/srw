@@ -584,6 +584,28 @@ func TestApproveAsksAgainWhileTheServerFinishesTheStop(t *testing.T) {
 	if _, _, code := h.run("", "approve", jobID); code != exit.Auth || asked != 1 {
 		t.Errorf("a refusal for another reason: %d after %d requests", code, asked)
 	}
+
+	// A parked completion report waits for an administrator: once, with the
+	// server's message.
+	asked = 0
+	h.handle("POST "+jobRoute("/approve"), func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]any{"detail": map[string]string{
+			"code":       "completion_parked",
+			"message":    "This job's last completion report could not be processed and is parked (command 03dc2497).",
+			"command_id": "03dc2497-cad4-4481-8af0-d94fccf04ec2",
+		}})
+	})
+	_, errOut, code = h.run("", "approve", jobID)
+	if code != exit.Conflict || asked != 1 {
+		t.Errorf("a parked completion: %d after %d requests", code, asked)
+	}
+	want(t, errOut, "is parked (command 03dc2497)")
+	if strings.Contains(errOut, "has not finished stopping the job") {
+		t.Errorf("a parked completion is not a stop in progress:\n%s", errOut)
+	}
 }
 
 func jobRow(id, status, title string, root bool) map[string]any {

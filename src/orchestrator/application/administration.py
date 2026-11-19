@@ -232,6 +232,7 @@ def usage_reporting_dependencies(
                 actor, store
             ),
             scope_project_id=access.mcp_scope_project_id,
+            completion_commands_enabled=resources.settings.completion_commands_enabled,
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),
         metering_settings=resources.metering.infrastructure_metering_settings,

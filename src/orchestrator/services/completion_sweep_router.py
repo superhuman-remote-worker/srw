@@ -71,6 +71,24 @@ class CompletionSweepResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CompletionParkAlert:
+    """One routed alert for a command that parked or is about to park.
+
+    The structured form lets the receiver find the job's owner and its
+    project's officer; ``message`` is the line the plain alert logs.
+    """
+
+    job_id: str
+    command_id: str
+    command_attempt: int
+    route: CompletionSweepRoute
+    message: str
+
+
+ParkAlertCallback = Callable[[CompletionParkAlert], Any]
+
+
+@dataclass(frozen=True, slots=True)
 class CompletionSweepBatchResult:
     """Outcomes from one bounded background routing scan."""
 
@@ -176,6 +194,7 @@ class CompletionSweepRouter:
         claimant_id: str | None = None,
         action_lease_seconds: float = 120,
         poll_seconds: float = 1,
+        park_alert: ParkAlertCallback | None = None,
     ) -> None:
         if float(action_lease_seconds) <= 0:
             raise ValueError("action_lease_seconds must be positive")
@@ -186,6 +205,9 @@ class CompletionSweepRouter:
         self.db = db
         self.finalizer = finalizer
         self.alert = alert
+        # Park routes go here instead of ``alert`` when set: the receiver
+        # tells the job's owner and its project's officer, not every officer.
+        self.park_alert = park_alert
         self.safety_net = safety_net
         self.claimant_id = (
             str(claimant_id).strip()
@@ -415,11 +437,26 @@ class CompletionSweepRouter:
                 effective_route = "park_alert"
                 result["route"] = effective_route
         if effective_route in {"park_alert", "alert_only"}:
-            await self._alert(
+            message = (
                 "completion sweep routed "
                 f"job={action.job_id} command={action.command_id} "
                 f"attempt={action.command_attempt} route={effective_route}"
             )
+            if self.park_alert is None:
+                await self._alert(message)
+            else:
+                logger.error(message)
+                value = self.park_alert(
+                    CompletionParkAlert(
+                        job_id=action.job_id,
+                        command_id=action.command_id,
+                        command_attempt=action.command_attempt,
+                        route=effective_route,
+                        message=message,
+                    )
+                )
+                if isinstance(value, Awaitable):
+                    await value
             result["alerted"] = True
         return effective_route, result
 
@@ -913,6 +950,7 @@ class CompletionSweepRouter:
 
 __all__ = [
     "ACTION_RESULT_LIMIT_BYTES",
+    "CompletionParkAlert",
     "CompletionSweepBatchResult",
     "CompletionSweepResult",
     "CompletionSweepRouter",

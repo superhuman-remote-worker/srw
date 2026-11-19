@@ -4745,7 +4745,8 @@
       "workspace_retirement_refused": "The workspace that did not start could not be replaced yet. Try Resume again in a minute.",
       "workspace_retirement_unavailable": "This deployment cannot replace the job's workspace.",
       "staging_missing": "The staged content is no longer available in storage, so it cannot be applied. Re-stage the changes and review them again.",
-      "invalid_epoch": "This review is out of date. Reload it and decide again."
+      "invalid_epoch": "This review is out of date. Reload it and decide again.",
+      "completion_parked": "This job's last report could not be processed and is waiting for an administrator. It can be resumed once an administrator unparks or resolves the report."
     },
     "projects": {
       "loadFailed": "Couldn't load your projects.",

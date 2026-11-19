@@ -200,6 +200,7 @@ class CompletionCommandResolution:
         command_deadline_seconds: float = DEFAULT_COMMAND_DEADLINE_SECONDS,
         safety_net_grace_seconds: float = DEFAULT_SAFETY_NET_GRACE_SECONDS,
         alert: ResolutionAlert | None = None,
+        settled: Callable[[str, str], Any] | None = None,
     ) -> None:
         if float(command_deadline_seconds) <= 0:
             raise ValueError("command_deadline_seconds must be positive")
@@ -209,6 +210,9 @@ class CompletionCommandResolution:
         self.command_deadline_seconds = float(command_deadline_seconds)
         self.safety_net_grace_seconds = float(safety_net_grace_seconds)
         self.alert = alert
+        # Told (command id, actor) after an operator moved a parked command
+        # on, so whoever was told it parked is told it no longer waits.
+        self.settled = settled
 
     async def _emit(self, incident: CompletionResolutionIncident) -> None:
         logger.critical(
@@ -233,6 +237,19 @@ class CompletionCommandResolution:
             logger.exception(
                 "completion resolution incident delivery failed for %s",
                 incident.command_id,
+            )
+
+    async def _settle_parked(self, command_id: str, actor: str) -> None:
+        if self.settled is None:
+            return
+        try:
+            result = self.settled(command_id, actor)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # The transition already committed; a stale feed row is the cost.
+            logger.exception(
+                "completion parked-settlement delivery failed for %s", command_id
             )
 
     @staticmethod
@@ -814,6 +831,7 @@ class CompletionCommandResolution:
         logger.warning(
             "completion command %s unparked by %s", command_uuid, bounded_actor
         )
+        await self._settle_parked(str(command_uuid), bounded_actor)
         return result
 
     async def force_resolve(
@@ -993,6 +1011,7 @@ class CompletionCommandResolution:
                 terminal_status=terminal,
             )
         )
+        await self._settle_parked(str(command_uuid), bounded_actor)
         return result
 
 

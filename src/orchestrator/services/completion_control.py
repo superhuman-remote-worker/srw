@@ -23,6 +23,27 @@ from shared.operator_pause_hold import (
 
 
 COMPLETION_FINALIZING_DETAIL = "completion finalizing"
+COMPLETION_PARKED_CODE = "completion_parked"
+
+
+def completion_parked_detail(command_id: str | None) -> dict[str, str]:
+    """The typed 409 for a control refused by a parked completion command.
+
+    ``completion finalizing`` passes by itself; a parked command waits for an
+    operator. The message says so, so neither the owner nor a client retries.
+    """
+    command = str(command_id or "")
+    return {
+        "code": COMPLETION_PARKED_CODE,
+        "message": (
+            "This job's last completion report could not be processed and is "
+            f"parked (command {command[:8]}). An administrator has to unpark or "
+            "force-resolve it before the job can be resumed or changed."
+        ),
+        "command_id": command,
+    }
+
+
 COMPLETION_CONTROL_CLAIM_KEY = "_completion_control_claim"
 COMPLETION_CONTROL_CLAIM_VERSION = 1
 COMPLETION_DELIVERY_CONTROL_SOURCE = "completion_delivery"
@@ -782,6 +803,8 @@ class CompletionControl:
 
 __all__ = [
     "COMPLETION_FINALIZING_DETAIL",
+    "COMPLETION_PARKED_CODE",
+    "completion_parked_detail",
     "COMPLETION_CONTROL_CLAIM_KEY",
     "CompletionControlClaim",
     "CompletionControlClaimConflict",

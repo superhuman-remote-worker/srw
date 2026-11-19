@@ -700,6 +700,7 @@ async def bind_services(resources: ApplicationResources) -> None:
             audit_reader=resources.audit_reader,
             usage_ledger=resources.usage_ledger,
             vector_db=resources.vector_db,
+            completion_commands_enabled=resources.settings.completion_commands_enabled,
         )
     )
     # Unified feed: bind (category, action) handlers and source loaders.

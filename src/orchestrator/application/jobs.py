@@ -258,6 +258,7 @@ def job_inspection_dependencies(
             user_visible_project_ids=access.user_visible_project_ids,
             mcp_scope_project_id=access.mcp_scope_project_id,
             active_job_statuses=job_inspection_operations.ME_ACTIVE_JOB_STATUSES,
+            completion_commands_enabled=resources.settings.completion_commands_enabled,
         ),
         require_approved_user=auth.require_approved_user,
         require_job_access=access.require_job_access,
