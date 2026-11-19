@@ -189,6 +189,28 @@ def _recover(db, job, runner, provisioner, *, probe, dispatch):
     )
 
 
+def _job_controls(db, tmp_path, provider):
+    """The public job controls with completion commands on."""
+
+    operations = _operations(tmp_path, store=db, completion_commands_enabled=True)
+    runtime_boundary = SimpleNamespace(
+        dependencies=SimpleNamespace(
+            commands_enabled=lambda: True, logger=operations.dependencies.logger
+        ),
+        control=lambda: CompletionControl(db, AsyncMock()),
+    )
+    return replace(
+        operations,
+        dependencies=replace(
+            operations.dependencies,
+            completion_control=CompletionControlBoundary(runtime_boundary),
+            get_container_context=lambda job: job["context"]["workspace_container"],
+            validate_workspace_recovery_storage=provider.validate_workspace_recovery_storage,
+            resume_missing_workspace=lambda job: "container",
+        ),
+    )
+
+
 async def _resume_on_a_new_pod(db, monkeypatch, tmp_path, owner, held, pvc):
     """Public Resume, then the dispatcher's creator, on a cluster that works."""
 
@@ -217,23 +239,7 @@ async def _resume_on_a_new_pod(db, monkeypatch, tmp_path, owner, held, pvc):
     cluster = ReadyCluster()
     cluster.objects["pvc"] = pvc
     provider = creator_cases._provisioner(monkeypatch, db, cluster)
-    operations = _operations(tmp_path, store=db, completion_commands_enabled=True)
-    runtime_boundary = SimpleNamespace(
-        dependencies=SimpleNamespace(
-            commands_enabled=lambda: True, logger=operations.dependencies.logger
-        ),
-        control=lambda: CompletionControl(db, AsyncMock()),
-    )
-    operations = replace(
-        operations,
-        dependencies=replace(
-            operations.dependencies,
-            completion_control=CompletionControlBoundary(runtime_boundary),
-            get_container_context=lambda job: job["context"]["workspace_container"],
-            validate_workspace_recovery_storage=provider.validate_workspace_recovery_storage,
-            resume_missing_workspace=lambda job: "container",
-        ),
-    )
+    operations = _job_controls(db, tmp_path, provider)
     await operations.resume_job_internal(owner.id, user={"id": str(uuid4())}, job=held)
     queued = await current_job(db, held["id"])
     assert "_operator_pause_hold" not in queued["context"]
@@ -614,3 +620,258 @@ async def test_pinned_lane_report_after_automatic_cleanup_holds(
     assert held["context"]["workspace_container"]["recovery_attempts"] == 1
     assert len(await _intents(db, original["id"])) == 1
     assert "pvc" in resources
+
+
+OLD_ARM_ERROR = "workspace recovery lost its cleanup disposition term"
+
+
+async def _old_arm(runner):
+    """The recovery effect as it failed before the fix (T1's RuntimeError)."""
+
+    async def effect():
+        raise RuntimeError(OLD_ARM_ERROR)
+
+    return await runner.run(
+        name="pod_workspace_recovery", group="recovery", callback=effect
+    )
+
+
+def _fixed_arm(db, job_id, provisioner):
+    """The same effect, now running the real recovery arm."""
+
+    async def workflow(runner):
+        job = await current_job(db, job_id)
+
+        async def effect():
+            return await handle_pod_workspace_recovery(
+                job,
+                str(job_id),
+                REPORT,
+                db=db,
+                delete_workspace=AsyncMock(side_effect=AssertionError("no deletion")),
+                cleanup_service=provisioner,
+                trigger_dispatch=Mock(),
+                probe=AsyncMock(side_effect=AssertionError("no probe")),
+                completion_command_id=runner.command_id,
+                completion_finalizing_by=runner.owner,
+            )
+
+        return await runner.run(
+            name="pod_workspace_recovery", group="recovery", callback=effect
+        )
+
+    return workflow
+
+
+async def _command(db, command_id):
+    return await db.fetchrow(
+        "SELECT state, attempts, error_code, deadline_at < now() AS past_deadline, "
+        "outcome FROM job_completion_commands WHERE id=$1",
+        UUID(command_id),
+    )
+
+
+async def _effect(db, command_id):
+    return await db.fetchrow(
+        "SELECT state, attempts, error_code FROM completion_effects "
+        "WHERE producer_kind='job_completion' AND producer_id=$1 "
+        "AND effect_name='pod_workspace_recovery'",
+        UUID(command_id),
+    )
+
+
+async def _parked_like_3677b309(db, monkeypatch):
+    """The stuck job's shape: retired by the reconciler, report parked 5/5.
+
+    The seed runs the real finalizer five times over the effect as it failed
+    before the fix, then lets the command's deadline pass, as on dev.
+    """
+
+    job, owner, runtime, provisioner, resources = await _stateless_job(db, monkeypatch)
+    assert (await _reconciler(db, provisioner).tick())["workspace"]["unhealthy"] == 1
+    accepted = await accept_completion_command(
+        db._pool,
+        job_id=str(job["id"]),
+        payload={
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": REPORT,
+            "freeze_data": None,
+        },
+        lease_token=await db.fetchval(
+            "SELECT lease_token FROM run_queue WHERE unit_id=$1", job["id"]
+        ),
+        agent_id=None,
+        client_report_id=str(uuid4()),
+        requested_by="parked-shape-proof",
+    )
+    command_id = accepted.command_id
+    finalizer = CompletionFinalizer(db, workflow=_old_arm, random_source=lambda: 1.0)
+    for attempt in range(1, 6):
+        result = await finalizer.finalize_command(command_id, inline=attempt == 1)
+        if attempt < 5:
+            assert result.disposition == "retry"
+            await db.execute(
+                "UPDATE job_completion_commands SET run_after=now()-interval '1 second' "
+                "WHERE id=$1",
+                UUID(command_id),
+            )
+            await db.execute(
+                "UPDATE completion_effects SET complete_by=now()-interval '1 second' "
+                "WHERE producer_kind='job_completion' AND producer_id=$1",
+                UUID(command_id),
+            )
+    assert result.disposition == "parked"
+    # Age the seed: on dev the command had been parked for days, so its
+    # deadline and the last effect's complete_by window had long passed.
+    # (Within that 90 s window unpark answers 409 effect_owner_live.)
+    await db.execute(
+        "UPDATE job_completion_commands SET deadline_at=now()-interval '1 hour' "
+        "WHERE id=$1",
+        UUID(command_id),
+    )
+    await db.execute(
+        "UPDATE completion_effects SET complete_by=now()-interval '1 hour' "
+        "WHERE producer_kind='job_completion' AND producer_id=$1",
+        UUID(command_id),
+    )
+
+    command = await _command(db, command_id)
+    assert (command["state"], command["attempts"], command["error_code"]) == (
+        "parked",
+        5,
+        "RuntimeError",
+    )
+    assert command["past_deadline"] is True
+    effect = await _effect(db, command_id)
+    assert (effect["state"], effect["attempts"]) == ("pending", 5)
+    stuck = await current_job(db, job["id"])
+    assert stuck["status"] == "processing"
+    assert stuck["context"]["workspace_container"]["status"] == "deleted"
+    assert (
+        await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", job["id"])
+        == "done"
+    )
+    (automatic,) = await _intents(db, job["id"])
+    assert (automatic["admission_source"], automatic["result_kind"]) == (
+        "automatic",
+        "settled",
+    )
+    return stuck, owner, runtime, provisioner, resources, command_id
+
+
+async def _unpark_and_finalize(db, command_id, job_id, provisioner):
+    from orchestrator.services.completion_command_resolution import (
+        CompletionCommandResolution,
+    )
+
+    unparked = await CompletionCommandResolution(db).unpark(
+        command_id, actor="admin-proof"
+    )
+    assert unparked.state == "pending"
+    assert unparked.reset_effects == ("pod_workspace_recovery",)
+    return await CompletionFinalizer(
+        db, workflow=_fixed_arm(db, job_id, provisioner)
+    ).finalize_command(command_id, inline=False)
+
+
+@pytest.mark.asyncio
+async def test_t5_unpark_settles_the_parked_report_into_the_hold(
+    db, monkeypatch, tmp_path
+):
+    """T5: after the fix, one unpark turns the parked shape into the hold."""
+
+    from fastapi import HTTPException
+
+    (
+        stuck,
+        owner,
+        runtime,
+        provisioner,
+        resources,
+        command_id,
+    ) = await _parked_like_3677b309(db, monkeypatch)
+    controls = _job_controls(db, tmp_path, provisioner)
+    with pytest.raises(HTTPException) as refused:
+        await controls.resume_job_internal(
+            owner.id, user={"id": str(uuid4())}, job=stuck
+        )
+    assert refused.value.status_code == 409
+
+    result = await _unpark_and_finalize(db, command_id, stuck["id"], provisioner)
+
+    assert result.state == "done"
+    assert (await _command(db, command_id))["state"] == "done"
+    assert (await _effect(db, command_id))["state"] == "done"
+    held = await current_job(db, stuck["id"])
+    assert held["status"] == "paused"
+    assert held["assigned_agent_id"] is None
+    assert held["error_message"] == DEAD_ARM_ACTION
+    assert held["context"]["_operator_pause_hold"]["source"] == (
+        "workspace_recovery_unavailable"
+    )
+    assert held["context"]["workspace_container"]["recovery_attempts"] == 1
+    assert len(await _intents(db, stuck["id"])) == 1
+    assert "pod" not in resources and "pvc" in resources
+
+    successor, cluster = await _resume_on_a_new_pod(
+        db, monkeypatch, tmp_path, owner, held, resources["pvc"]
+    )
+    assert successor["context"]["workspace_container"]["status"] == "ready"
+    assert successor["context"]["workspace_container"]["_runtime_incarnation"] != (
+        runtime
+    )
+    assert cluster.objects["pvc"] is resources["pvc"]
+
+
+@pytest.mark.asyncio
+async def test_t13_pause_then_unpark(db, monkeypatch, tmp_path):
+    """T13: the owner pressed Pause on the parked job first (as on 11-15)."""
+
+    (
+        stuck,
+        owner,
+        runtime,
+        provisioner,
+        resources,
+        command_id,
+    ) = await _parked_like_3677b309(db, monkeypatch)
+    # Pause is not blocked by the parked command: the stateless store path
+    # the public Pause uses is fenced by the control-claim marker only.
+    assert await db.pause_stateless_job(
+        str(stuck["id"]),
+        operator_hold=True,
+        paused_by=str(uuid4()),
+        completion_commands_enabled=True,
+    )
+    paused = await current_job(db, stuck["id"])
+    assert paused["status"] == "paused"
+    assert paused["context"]["_operator_pause_hold"]["source"] == "public_pause"
+    assert (await _command(db, command_id))["state"] == "parked"
+
+    result = await _unpark_and_finalize(db, command_id, stuck["id"], provisioner)
+
+    command = await _command(db, command_id)
+    assert result.state == command["state"] == "superseded"
+    assert command["error_code"] == "entry_status_superseded"
+    outcome = json.loads(command["outcome"])
+    assert outcome["observed_status"] == "paused"
+    assert outcome["abandoned_effects"] == ["pod_workspace_recovery"]
+    after = await current_job(db, stuck["id"])
+    # The pause hold stays as the owner left it; the arm never ran.
+    assert after["status"] == "paused"
+    assert (
+        after["context"]["_operator_pause_hold"]
+        == paused["context"]["_operator_pause_hold"]
+    )
+    assert (
+        after["context"]["workspace_container"]
+        == paused["context"]["workspace_container"]
+    )
+    assert len(await _intents(db, stuck["id"])) == 1
+
+    successor, cluster = await _resume_on_a_new_pod(
+        db, monkeypatch, tmp_path, owner, after, resources["pvc"]
+    )
+    assert successor["context"]["workspace_container"]["status"] == "ready"
+    assert cluster.objects["pvc"] is resources["pvc"]
