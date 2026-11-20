@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -305,6 +306,14 @@ func TestStatusErrors(t *testing.T) {
 			"the API at https://api.example.com is not answering: GET /api/x got 502 Bad Gateway from something in front of it", "may be restarting", true},
 		{"a JSON value that is no object is not the API's", 504, `"timeout"`, exit.Unreachable,
 			"the API at https://api.example.com is not answering: GET /api/x got 504 Gateway Timeout from something in front of it", "", true},
+		// Cloudflare's own answers: a 52x in any shape, and its JSON errors,
+		// which carry a "detail" like the API's.
+		{"Cloudflare's 502 in JSON", 502, cloudflareError(502, "Error 502: Bad gateway"), exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 502 (Error 502: Bad gateway) from Cloudflare in front of it", "may be restarting", true},
+		{"Cloudflare's 522 as text", 522, "error code: 522", exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 522 from Cloudflare in front of it", "", true},
+		{"Cloudflare's 524 in JSON", 524, cloudflareError(524, "Error 524: A timeout occurred"), exit.Unreachable,
+			"the API at https://api.example.com is not answering: GET /api/x got 524 (Error 524: A timeout occurred) from Cloudflare in front of it", "", true},
 		// The API's own 503 keeps its message and its code; it passes too.
 		{"the API's own 503", 503, `{"detail":"Database unavailable"}`, exit.Failed, "Database unavailable", "", true},
 		{"a server error is not an outage", 500, `{"detail":"Internal server error"}`, exit.Failed, "Internal server error", "", false},
@@ -331,6 +340,56 @@ func TestStatusErrors(t *testing.T) {
 	client := clientFor(t, "https://api.example.com", Options{})
 	if err := client.StatusError(Request{}, &Response{Status: 204}); err != nil {
 		t.Errorf("a 204 is a success: %v", err)
+	}
+}
+
+// cloudflareError is the body Cloudflare sends for one of its own errors to a
+// client that asks for JSON, as its error-responses reference documents it
+// (RFC 9457 members plus Cloudflare's extensions).
+func cloudflareError(status int, title string) string {
+	body, _ := json.Marshal(map[string]any{
+		"type": "https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/", "title": title,
+		"status": status, "detail": "The origin web server returned an invalid or incomplete response to Cloudflare.",
+		"instance": "9f140b785e57c458", "error_code": status, "error_category": "origin", "ray_id": "9f140b785e57c458",
+		"cloudflare_error": true, "retryable": true, "retry_after": 60,
+	})
+	return string(body)
+}
+
+// A proxy's answer to a change: the change may have happened when the proxy
+// gave up after passing it on, and certainly did not when it had nowhere to
+// pass it.
+func TestAProxysAnswerToAChange(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		code   int
+		text   string
+	}{
+		{"a gateway's 502", 502, "<html>Bad Gateway</html>", exit.Unknown, "POST /api/jobs got 502 Bad Gateway from something in front of it; the request may have reached the API before that"},
+		{"a gateway's timeout", 504, "", exit.Unknown, "got 504 Gateway Timeout from something in front of it"},
+		{"Cloudflare's 502 in JSON", 502, cloudflareError(502, "Error 502: Bad gateway"), exit.Unknown, "got 502 (Error 502: Bad gateway) from Cloudflare in front of it"},
+		{"Cloudflare's timeout", 524, cloudflareError(524, "Error 524: A timeout occurred"), exit.Unknown, "got 524 (Error 524: A timeout occurred)"},
+		{"a proxy with no server behind it", 503, "no available server", exit.Unreachable, "is not answering: POST /api/jobs got 503 Service Unavailable"},
+		{"an ingress without a backend", 404, "404 page not found", exit.Unreachable, "is not answering"},
+		{"Cloudflare could not connect", 521, "error code: 521", exit.Unreachable, "got 521 from Cloudflare in front of it"},
+		{"Cloudflare's connect timeout in JSON", 522, cloudflareError(522, "Error 522: Connection timed out"), exit.Unreachable, "got 522 (Error 522: Connection timed out)"},
+		{"the API's own 503 is the API's answer", 503, `{"detail":"Workspace authority retirement is incomplete"}`, exit.Failed, "Workspace authority retirement is incomplete"},
+		{"the API's own 502 is the API's answer", 502, `{"detail":"Upstream refused"}`, exit.Failed, "Upstream refused"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			client := clientFor(t, "https://api.example.com", Options{})
+			request := Request{Method: "POST", Path: "/api/jobs"}
+			failure := coded(t, client.StatusError(request, &Response{Status: test.status, Body: []byte(test.body)}))
+			if failure.Code != test.code || !strings.Contains(failure.Message, test.text) || failure.Status != test.status {
+				t.Errorf("%+v", failure)
+			}
+			if test.code == exit.Unknown && (failure.Away || !strings.Contains(failure.Hint, "check before sending it again")) {
+				t.Errorf("an unknown outcome is not an outage and says what to do: %+v", failure)
+			}
+		})
 	}
 }
 

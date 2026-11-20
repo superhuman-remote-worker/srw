@@ -60,6 +60,10 @@ func awayAnswer(w http.ResponseWriter, how string) {
 	case "page": // a web server that answers its app for any path
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte("<!doctype html><title>Cockpit</title>"))
+	case "cloudflare": // Cloudflare's own error, in JSON because srw asks for JSON
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(522)
+		w.Write([]byte(`{"title":"Error 522: Connection timed out","status":522,"detail":"Cloudflare timed out contacting the origin web server.","cloudflare_error":true,"retryable":true}`))
 	case "503": // the API itself, not ready yet
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(503)
@@ -73,7 +77,7 @@ func awayAnswer(w http.ResponseWriter, how string) {
 
 // An upgrade of the server must not end a wait that a pipeline sits in.
 func TestWaitAsksAgainWhileTheServerIsAway(t *testing.T) {
-	for _, how := range []string{"404", "502", "page", "503", "drop"} {
+	for _, how := range []string{"404", "502", "cloudflare", "page", "503", "drop"} {
 		t.Run(how, func(t *testing.T) {
 			h := newHarness(t)
 			h.login()
@@ -514,10 +518,12 @@ func TestDeleteJobAsksAgainWhileTheWorkspaceIsReleased(t *testing.T) {
 	}
 	want(t, errOut, "Workspace authority retirement is incomplete", "srw get job/"+jobID, "srw delete job/"+jobID)
 
-	// A proxy's 503 is an outage, not a release in progress: once.
+	// A gateway's 502 is not the API releasing the workspace: sent once. The
+	// delete may have reached the API before the gateway gave up, so the
+	// outcome is unknown.
 	asked = 0
 	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) { asked++; awayAnswer(w, "502") })
-	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.Unreachable || asked != 1 {
+	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.Unknown || asked != 1 {
 		t.Errorf("a gateway status: %d after %d requests", code, asked)
 	}
 }

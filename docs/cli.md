@@ -196,8 +196,8 @@ format never depends on whether the output goes to a terminal.
 | 3 | Not logged in, or the token may not do this |
 | 4 | Not found: the API says the object does not exist |
 | 5 | Conflict: something changed in between |
-| 6 | Outcome unknown: a change was sent and the answer was lost |
-| 7 | The API could not be reached, or its certificate was not accepted. Also an answer from a proxy in front of it |
+| 6 | Outcome unknown: a change was sent and the answer was lost, or a proxy in front of the API answered it after passing it on (a 502 or a timeout) |
+| 7 | The API could not be reached, or its certificate was not accepted. Also a proxy's answer in the API's place, such as Cloudflare's 52x, unless the request was a change that may have reached the API (then 6) |
 | 8 | `wait`: the job failed or was cancelled |
 | 9 | `wait`: timed out |
 | 10 | `wait`: the job stopped and needs a person |
@@ -310,7 +310,8 @@ the authority's PEM file at `srw login`; it is saved with the context. Plain
 | `Insufficient token scope: requires …` | Create a token that also has the named scope. |
 | `this server does not have …` | The server is older than your `srw`. Install the `srw` of the server's version. |
 | `the server's TLS certificate was not accepted` | Pass `--ca-file` with your certificate authority's file. |
-| `the API at … is not answering: … from something in front of it` | A proxy answered instead of the API. The server may be restarting; if it stays, the address is not the API's. |
+| `the API at … is not answering: … from something in front of it` (or `from Cloudflare in front of it`) | A proxy answered instead of the API. The server may be restarting; if it stays, the address is not the API's. |
+| `… got 502 … from something in front of it; the request may have reached the API before that` | A change got a proxy's answer instead of the API's (exit 6). Look at the object (`srw get`, `srw describe job`) before you send it again. |
 | `… redirects to …` | The server address is not the API's. Check `https`, the host and the path. |
 | `completion finalizing`, `job changed while control was being committed` or `pinned approval agent changed` on `srw approve` | The job has only just stopped for review and the server has not finished stopping it. `srw approve` sends the approval again by itself for up to 20 seconds. If it stays, look at the job with `srw describe job` and approve again. |
 | `This job's last completion report could not be processed and is parked …` | The server could not process the job's last report and stopped trying. Resume, approve and the other job controls answer this until an administrator unparks the report (`POST /api/admin/completion-commands/{id}/unpark`, the id is in the message) or force-resolves it. `srw approve` does not ask again for this one. |

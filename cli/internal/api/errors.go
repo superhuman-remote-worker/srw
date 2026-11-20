@@ -76,27 +76,71 @@ func (c *Client) StatusError(request Request, response *Response) error {
 	return failure
 }
 
-// notTheAPI recognises an answer that something in front of the API gave: a
-// 404 or a gateway status whose body is not a JSON object. The API answers
-// every error with one. Such an answer says nothing about the object asked
-// for, so it is "not reached" (exit 7), not "not found" (exit 4), and it
-// passes when the server is back.
+// notTheAPI recognises an answer that something in front of the API gave,
+// not the API:
+//
+//   - a 404 or a gateway status (502, 503, 504) whose body is not a JSON
+//     object; the API answers every error with one;
+//   - one of Cloudflare's own codes, 520 to 530, which the API never sends;
+//   - a Cloudflare error in JSON. Cloudflare answers a client that asks for
+//     JSON with an RFC 9457 object for its 500, 502, 504 and 52x, and marks
+//     it with "cloudflare_error": true. It has a "detail" like the API's.
+//
+// Such an answer says nothing about the object asked for. For a read, and
+// for a change that cannot have reached the API, it is "not reached" (exit
+// 7) and passes when the server is back. For a change that may have reached
+// the API before the proxy gave up, the outcome is unknown (exit 6), as when
+// an answer is lost: sending it again could do it twice.
 func (c *Client) notTheAPI(request Request, response *Response, failure *exit.Error) bool {
 	status := response.Status
 	gateway := status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
-	if !gateway && status != http.StatusNotFound {
-		return false
-	}
-	// The API's own 503 passes too, but it carries the API's message.
-	failure.Away = gateway
 	var object map[string]any
-	if json.Unmarshal(response.Body, &object) == nil && object != nil {
-		return false
+	isObject := json.Unmarshal(response.Body, &object) == nil && object != nil
+	flagged, _ := object["cloudflare_error"].(bool)
+	cloudflare := flagged || (status >= 520 && status <= 530)
+	if !cloudflare {
+		if !gateway && status != http.StatusNotFound {
+			return false
+		}
+		// The API's own 503 passes too, but it carries the API's message.
+		failure.Away = gateway
+		if isObject {
+			return false
+		}
+	}
+	answer := strings.TrimSpace(fmt.Sprintf("%d %s", status, http.StatusText(status)))
+	from := "something in front of it"
+	if cloudflare {
+		from = "Cloudflare in front of it"
+		if title, _ := object["title"].(string); title != "" {
+			answer = fmt.Sprintf("%d (%s)", status, c.Redact(title))
+		}
+	}
+	if !isRead(request.Method) && mayHaveReachedTheAPI(status) {
+		failure.Code, failure.Away = exit.Unknown, false
+		failure.Message = fmt.Sprintf("%s %s got %s from %s; the request may have reached the API before that",
+			request.Method, request.Path, answer, from)
+		failure.Hint = "the change may or may not have happened; check before sending it again"
+		return true
 	}
 	failure.Code, failure.Away = exit.Unreachable, true
-	failure.Message = fmt.Sprintf("the API at %s is not answering: %s %s got %d %s from something in front of it",
-		c.base, request.Method, request.Path, status, http.StatusText(status))
+	failure.Message = fmt.Sprintf("the API at %s is not answering: %s %s got %s from %s",
+		c.base, request.Method, request.Path, answer, from)
 	failure.Hint = "the server may be restarting; if this stays, check the server URL"
+	return true
+}
+
+// mayHaveReachedTheAPI says whether a proxy's answer leaves open that the
+// request got to the API. It did not when the proxy had no server to send it
+// to (404, 503), nor for Cloudflare's codes for an origin it could not reach:
+// 521 refused, 522 connection timed out, 523 unreachable, 525 and 526 TLS,
+// 530. Everything else, a 502, a 504 or a 524 above all, may have come after
+// the API started on the request.
+func mayHaveReachedTheAPI(status int) bool {
+	switch status {
+	case http.StatusNotFound, http.StatusServiceUnavailable, 521, 522, 523, 525, 526, 530:
+		return false
+	}
 	return true
 }
 
