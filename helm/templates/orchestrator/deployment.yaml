@@ -1567,6 +1567,12 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS
                   optional: true
+            - name: WORKSPACE_MEMORY_GROW_MAX
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_MEMORY_GROW_MAX
+                  optional: true
             - name: OPERATOR_HOME_ALLOWED_EMAIL
               valueFrom:
                 configMapKeyRef:

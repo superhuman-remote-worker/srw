@@ -40,9 +40,11 @@ from orchestrator.services.manifest_runtime_ownership import (
     uses_srw_runtime,
 )
 from shared.operator_pause_hold import (
+    OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
     operator_pause_lift_already_consumed,
     operator_pause_lift_token,
 )
+from shared.workspace_disk import workspace_hold_resume_reason
 from shared.worker_execution_hold import (
     WORKER_EXECUTION_HOLD_MESSAGE,
     worker_execution_held,
@@ -1368,12 +1370,20 @@ class JobControlOperations:
                 )
 
             # Honest [FEEDBACK_RESUME] banner cause for this explicit resume
-            # path, derived from the status the job is actually leaving.
+            # path, derived from the status the job is actually leaving. A
+            # workspace hold says why the job stopped and which files its new
+            # workspace still has (a memory kill names the limit).
+            # knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
             feedback_reason = (
                 "This job was frozen for review; a reviewer resumed it with the "
                 "feedback below."
                 if job["status"] in ("pending_review", "reviewing")
-                else "An operator explicitly resumed this job with the feedback below."
+                else workspace_hold_resume_reason(
+                    resume_context.get(OPERATOR_PAUSE_HOLD_CONTEXT_KEY)
+                    if isinstance(resume_context, dict)
+                    else None
+                )
+                or "An operator explicitly resumed this job with the feedback below."
             )
 
             if recovery_trip is not None:

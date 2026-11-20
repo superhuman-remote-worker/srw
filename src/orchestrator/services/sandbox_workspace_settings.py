@@ -8,7 +8,7 @@ call site can drop them. See the Slice A1 spec in the knowledge base
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import math
@@ -22,6 +22,8 @@ from orchestrator.services.manifest_execution_snapshot import (
     read_execution,
     srw_snapshot_config,
 )
+from shared.kubernetes_quantities import normalize_byte_quantity
+from shared.workspace_disk import byte_quantity, memory_growth_record
 from shared.workspace_upgrade import metadata_object
 
 DEFAULT_WORKSPACE_IMAGE = "ghcr.io/superhuman-remote-worker/srw-workspace:latest"
@@ -119,6 +121,53 @@ async def resolve_sandbox_settings(
         if upgrade:
             return SandboxSettings.from_policy({"workspace": {"sandbox": upgrade}})
     return settings
+
+
+async def resolve_memory_growth(
+    store: Any, owner_kind: str, owner_id: str
+) -> dict[str, Any] | None:
+    """A memory-killed Job's one larger limit, while it applies.
+
+    The hold for a recorded ``OOMKilled`` writes
+    ``workspace_container.memory_growth`` once per Job; every later Pod of
+    that Job runs with its limit on top of the frozen sizes. A growth the
+    cluster refused (``refused_at``) no longer applies. Sessions never grow.
+    knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+    """
+    if owner_kind != "job":
+        return None
+    try:
+        UUID(str(owner_id))
+    except ValueError:
+        return None
+    job = await store.get_job(str(owner_id))
+    context = (job or {}).get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return None
+    container = object_value(object_value(context).get("workspace_container"))
+    record = memory_growth_record(container.get("memory_growth"))
+    if record is None or record.get("refused_at"):
+        return None
+    return record
+
+
+def apply_memory_growth(
+    profile: "SandboxPodProfile", growth: dict[str, Any] | None
+) -> "SandboxPodProfile":
+    """Raise only the memory limit, never the request, and never lower it."""
+    if growth is None:
+        return profile
+    try:
+        current = normalize_byte_quantity(profile.memory_limit).normalized_value
+    except ValueError:
+        return profile
+    grown = int(growth["limit_bytes"])
+    if grown <= current:
+        return profile
+    return replace(profile, memory_limit=byte_quantity(grown))
 
 
 def image_repository(reference: str) -> str:

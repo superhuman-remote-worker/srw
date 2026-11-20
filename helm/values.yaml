@@ -3530,6 +3530,14 @@ workspace:
     # its container, and privileged is one step from root on the node. Enable
     # only when you trust everyone who can author workspace templates.
     privileged: false
+  memoryGrowth:
+    # -- The largest memory limit a Job may get after its workspace ran out of
+    # memory. When the workspace container is killed for memory, the hold says
+    # so and the Job's next Resume runs with twice the killed limit, once per
+    # Job and never above this value. Only the limit grows; the request (what
+    # the node reserves) stays. Empty switches the growth off: the hold then
+    # tells the person to start a new job on a template with more memory.
+    max: "16Gi"
   builtinTemplates:
     # -- Ship the built-in workspace templates in the shared Catalog: virtual,
     # container-minimal, container-full and, when VMs are on, vm-full. The

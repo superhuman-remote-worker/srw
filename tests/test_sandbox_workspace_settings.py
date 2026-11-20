@@ -263,3 +263,91 @@ def test_settings_read_requests_from_the_frozen_policy():
     assert SandboxSettings.from_policy({"workspace": {"sandbox": {"cpu": 2}}}) == (
         SandboxSettings(cpu=2)
     )
+
+
+# --- A memory-killed Job's one larger limit ---------------------------------
+# knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+
+JOB_ID = "4c5f7e0a-1b2c-4d3e-8f9a-0b1c2d3e4f50"
+RUNTIME = "6f0d6c9e-4c55-4a4b-9a43-0b1d7b0a1111"
+
+
+class _JobStore:
+    def __init__(self, workspace):
+        self.workspace = workspace
+
+    async def get_job(self, job_id):
+        assert job_id == JOB_ID
+        return {"id": job_id, "context": {"workspace_container": self.workspace}}
+
+
+def _growth(**changes):
+    record = {
+        "limit": "8Gi",
+        "limit_bytes": 8 << 30,
+        "from_bytes": 4 << 30,
+        "runtime_incarnation": RUNTIME,
+        "at": "2026-11-20T10:00:00+00:00",
+    }
+    record.update(changes)
+    return record
+
+
+def test_growth_raises_only_the_limit():
+    from orchestrator.services.sandbox_workspace_settings import apply_memory_growth
+
+    profile = apply_memory_growth(
+        sandbox_pod_profile(SandboxSettings(), policy()), _growth()
+    )
+    assert (profile.memory, profile.memory_limit) == ("1Gi", "8Gi")
+    # A template with only a memory value reserves it; growth keeps that.
+    templated = apply_memory_growth(
+        sandbox_pod_profile(SandboxSettings(memory="512Mi"), policy()),
+        _growth(limit="1Gi", limit_bytes=1 << 30, from_bytes=512 << 20),
+    )
+    assert (templated.memory, templated.memory_limit) == ("512Mi", "1Gi")
+
+
+def test_growth_never_lowers_a_limit():
+    from orchestrator.services.sandbox_workspace_settings import apply_memory_growth
+
+    profile = sandbox_pod_profile(SandboxSettings(memory="16Gi"), policy())
+    assert apply_memory_growth(profile, _growth()) == profile
+    assert apply_memory_growth(profile, None) == profile
+
+
+@pytest.mark.asyncio
+async def test_a_jobs_growth_record_applies_until_refused():
+    from orchestrator.services.sandbox_workspace_settings import resolve_memory_growth
+
+    store = _JobStore({"memory_growth": _growth()})
+    assert (await resolve_memory_growth(store, "job", JOB_ID))["limit_bytes"] == 8 << 30
+    store.workspace = {"memory_growth": _growth(refused_at="2026-11-20T10:01:00+00:00")}
+    assert await resolve_memory_growth(store, "job", JOB_ID) is None
+    store.workspace = {"memory_growth": {"limit_bytes": "8Gi"}}
+    assert await resolve_memory_growth(store, "job", JOB_ID) is None
+    store.workspace = {}
+    assert await resolve_memory_growth(store, "job", JOB_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_never_grow():
+    from orchestrator.services.sandbox_workspace_settings import resolve_memory_growth
+
+    store = _JobStore({"memory_growth": _growth()})
+    assert await resolve_memory_growth(store, "session", JOB_ID) is None
+    assert await resolve_memory_growth(store, "job", "not-a-uuid") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "cap"),
+    [(None, 16 << 30), ("8Gi", 8 << 30), ("", None), ("  ", None), ("lots", None)],
+)
+def test_growth_cap_setting(monkeypatch, value, cap):
+    from orchestrator.services.completion import workspace_memory_growth_cap_bytes
+
+    if value is None:
+        monkeypatch.delenv("WORKSPACE_MEMORY_GROW_MAX", raising=False)
+    else:
+        monkeypatch.setenv("WORKSPACE_MEMORY_GROW_MAX", value)
+    assert workspace_memory_growth_cap_bytes() == cap

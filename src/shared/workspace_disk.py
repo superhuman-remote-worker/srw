@@ -11,7 +11,11 @@ instead of a lost transport.
 knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
 
 It also owns the clause every workspace hold ends with: what was kept and
-what is gone (``workspace_kept_clause``).
+what is gone (``workspace_kept_clause``), and the hold for a workspace that
+ran out of memory: the termination record the orchestrator reads from the
+dead Pod, the strict classifier over it, the one-time larger memory limit and
+the wording (``WorkspaceTermination``, ``WorkspaceMemoryKill``).
+knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
 
 Stdlib-only: the agent and the orchestrator both import it.
 """
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 WORKSPACE_DISK_FULL_REASON = "workspace_disk_full"
@@ -358,4 +363,376 @@ def recorded_workspace_kept_clause(attention: Any) -> str:
     return workspace_kept_clause(
         runtime_replaced=attention.get("runtime_replaced"),
         volume_kept=attention.get("volume_kept"),
+    )
+
+
+# --- A workspace that ran out of memory -----------------------------------
+#
+# A process over the workspace container's memory limit gets every process in
+# the container killed (cgroup v2 group kill), sshd included, and the Pod ends
+# ``Failed``. The kubelet records ``OOMKilled`` on the container; nothing else
+# does. The orchestrator reads that record from the dead Pod during its
+# cleanup and keeps it on the job row (``workspace_container.last_termination``),
+# so a hold can name the cause. The cause is stated only on that evidence: a
+# bare exit 137 is also what a liveness kill or a lost runtime event leaves.
+# knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+
+WORKSPACE_OUT_OF_MEMORY_REASON = "workspace_out_of_memory"
+MORE_MEMORY_HINT = (
+    "To run it with more memory, start a new job on a workspace template with "
+    "more memory."
+)
+_MAX_RECORD_TEXT = 300
+
+TerminationCause = Literal["out_of_memory", "evicted", "not_recorded"]
+MemoryGrowthOutcome = Literal["granted", "used", "refused", "capped", "off"]
+_MEMORY_GROWTH_OUTCOMES = frozenset({"granted", "used", "refused", "capped", "off"})
+
+
+def _text(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:_MAX_RECORD_TEXT]
+
+
+def _exit_code(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if -(2**31) <= value < 2**31 else None
+
+
+def _instant(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceTermination:
+    """How a job's ``workspace`` container ended, read from its exact Pod.
+
+    ``pod_uid`` ties the record to one runtime incarnation: a reader uses it
+    only for the runtime it holds. ``deletion_timestamp`` is set when the Pod
+    was already being deleted at the read, so a container SRW stopped is never
+    taken for one that died on its own.
+    """
+
+    pod_uid: str
+    container_reason: str | None = None
+    exit_code: int | None = None
+    finished_at: str | None = None
+    pod_reason: str | None = None
+    pod_message: str | None = None
+    deletion_timestamp: str | None = None
+    memory_limit_bytes: int | None = None
+
+    @classmethod
+    def from_dict(cls, value: Any) -> WorkspaceTermination | None:
+        """Validate a stored record; anything malformed counts as absent."""
+        if not isinstance(value, Mapping):
+            return None
+        pod_uid = _text(value.get("pod_uid"))
+        if pod_uid is None:
+            return None
+        return cls(
+            pod_uid=pod_uid,
+            container_reason=_text(value.get("container_reason")),
+            exit_code=_exit_code(value.get("exit_code")),
+            finished_at=_text(value.get("finished_at")),
+            pod_reason=_text(value.get("pod_reason")),
+            pod_message=_text(value.get("pod_message")),
+            deletion_timestamp=_text(value.get("deletion_timestamp")),
+            memory_limit_bytes=_count(value.get("memory_limit_bytes")) or None,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "pod_uid": self.pod_uid,
+            "container_reason": self.container_reason,
+            "exit_code": self.exit_code,
+            "finished_at": self.finished_at,
+            "pod_reason": self.pod_reason,
+            "pod_message": self.pod_message,
+            "deletion_timestamp": self.deletion_timestamp,
+            "memory_limit_bytes": self.memory_limit_bytes,
+        }
+
+    def _finished_before_deletion(self) -> bool:
+        if self.deletion_timestamp is None:
+            return True
+        finished = _instant(self.finished_at)
+        deleted = _instant(self.deletion_timestamp)
+        return finished is not None and deleted is not None and finished < deleted
+
+    @property
+    def cause(self) -> TerminationCause:
+        """The strict classifier: a cause only on the kubelet's own record.
+
+        Out of memory only for ``OOMKilled`` on a container that stopped before
+        any deletion of its Pod. A Pod-level ``Evicted`` is its own cause.
+        ``Error``/137, ``ContainerStatusUnknown``, ``Unknown``/255 and the
+        rest are "not recorded"; the raw reason and exit code stay on the
+        record.
+        """
+        if self.pod_reason == "Evicted":
+            return "evicted"
+        if self.container_reason == "OOMKilled" and self._finished_before_deletion():
+            return "out_of_memory"
+        return "not_recorded"
+
+
+def recorded_termination(workspace: Any, runtime: Any) -> WorkspaceTermination | None:
+    """The job row's termination record, only for the runtime ``runtime``."""
+    if not isinstance(workspace, Mapping) or not isinstance(runtime, str):
+        return None
+    record = WorkspaceTermination.from_dict(workspace.get("last_termination"))
+    return record if record is not None and record.pod_uid == runtime else None
+
+
+def byte_quantity(value: int) -> str:
+    """A Kubernetes quantity for ``value`` bytes: ``8Gi``, ``768Mi`` or bytes."""
+    for suffix, scale in (("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)):
+        if value >= scale and value % scale == 0:
+            return f"{value // scale}{suffix}"
+    return str(value)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceMemoryGrowth:
+    """What the next Resume does to a memory-killed job's limit.
+
+    ``granted``: it runs with ``limit_bytes``, twice the killed limit or the
+    installation's cap. ``used``: the limit was already raised once, to
+    ``limit_bytes``. ``refused``: the cluster refused a Pod with the raised
+    limit ``limit_bytes``, so the job is back on its own limit. ``capped``:
+    the killed limit is at or above the cap.
+    ``off``: growth is switched off, or the killed limit is not known.
+    """
+
+    outcome: MemoryGrowthOutcome
+    limit_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome not in _MEMORY_GROWTH_OUTCOMES:
+            raise ValueError(f"unknown memory growth outcome {self.outcome!r}")
+
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {"outcome": self.outcome}
+        if self.limit_bytes is not None:
+            value["limit_bytes"] = self.limit_bytes
+        return value
+
+    @classmethod
+    def from_dict(cls, value: Any) -> WorkspaceMemoryGrowth:
+        if not isinstance(value, Mapping) or value.get("outcome") not in (
+            _MEMORY_GROWTH_OUTCOMES
+        ):
+            return cls("off")
+        return cls(value["outcome"], _count(value.get("limit_bytes")) or None)
+
+
+def memory_growth_record(value: Any) -> dict[str, Any] | None:
+    """The job row's ``workspace_container.memory_growth``, validated."""
+    if not isinstance(value, Mapping):
+        return None
+    limit = _count(value.get("limit_bytes"))
+    runtime = _text(value.get("runtime_incarnation"))
+    if not limit or runtime is None:
+        return None
+    return dict(value)
+
+
+def decide_memory_growth(
+    *,
+    limit_bytes: int | None,
+    previous: Any,
+    cap_bytes: int | None,
+    runtime_incarnation: str,
+) -> WorkspaceMemoryGrowth:
+    """Double the killed limit once per job, never above ``cap_bytes``.
+
+    ``previous`` is the job row's ``memory_growth``. A record from this same
+    runtime is this kill's own growth (a replay or a second writer), so it is
+    granted again; one from an earlier runtime means the job already ran with
+    the larger limit. A growth the cluster refused stays spent. ``cap_bytes``
+    None means growth is off.
+    """
+    record = memory_growth_record(previous)
+    if record is not None:
+        outcome: MemoryGrowthOutcome = (
+            "refused"
+            if record.get("refused_at")
+            else "granted"
+            if record["runtime_incarnation"] == runtime_incarnation
+            else "used"
+        )
+        return WorkspaceMemoryGrowth(outcome, int(record["limit_bytes"]))
+    if cap_bytes is None or not limit_bytes:
+        return WorkspaceMemoryGrowth("off")
+    grown = min(2 * limit_bytes, cap_bytes)
+    if grown <= limit_bytes:
+        return WorkspaceMemoryGrowth("capped")
+    return WorkspaceMemoryGrowth("granted", grown)
+
+
+def new_memory_growth_record(
+    growth: WorkspaceMemoryGrowth,
+    *,
+    from_bytes: int | None,
+    runtime_incarnation: str,
+    at: str,
+    previous: Any,
+) -> dict[str, Any] | None:
+    """The ``memory_growth`` record a hold writes, or None when it writes none.
+
+    Only a granted growth not already recorded for this runtime writes one.
+    The Pod creator reads ``limit`` from it on top of the frozen sizes.
+    """
+    if (
+        growth.outcome != "granted"
+        or growth.limit_bytes is None
+        or memory_growth_record(previous) is not None
+    ):
+        return None
+    return {
+        "limit": byte_quantity(growth.limit_bytes),
+        "limit_bytes": growth.limit_bytes,
+        "from_bytes": from_bytes,
+        "runtime_incarnation": runtime_incarnation,
+        "at": at,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceMemoryKill:
+    """A hold's out-of-memory facts: the killed limit and what Resume does."""
+
+    limit_bytes: int | None
+    growth: WorkspaceMemoryGrowth
+    exit_code: int | None = None
+    container_reason: str | None = None
+
+    @classmethod
+    def from_termination(
+        cls, termination: WorkspaceTermination, growth: WorkspaceMemoryGrowth
+    ) -> WorkspaceMemoryKill:
+        return cls(
+            limit_bytes=termination.memory_limit_bytes,
+            growth=growth,
+            exit_code=termination.exit_code,
+            container_reason=termination.container_reason,
+        )
+
+    @classmethod
+    def from_attention(cls, attention: Any) -> WorkspaceMemoryKill | None:
+        """Read a stored hold; None unless it recorded a memory kill."""
+        if (
+            not isinstance(attention, Mapping)
+            or attention.get("reason") != WORKSPACE_OUT_OF_MEMORY_REASON
+        ):
+            return None
+        memory = attention.get("memory")
+        if not isinstance(memory, Mapping):
+            memory = {}
+        return cls(
+            limit_bytes=_count(memory.get("limit_bytes")) or None,
+            growth=WorkspaceMemoryGrowth.from_dict(memory.get("growth")),
+            exit_code=_exit_code(memory.get("exit_code")),
+            container_reason=_text(memory.get("container_reason")),
+        )
+
+    def attention(self) -> dict[str, Any]:
+        """The ``attention.memory`` value a hold stores."""
+        return {
+            "limit_bytes": self.limit_bytes,
+            "exit_code": self.exit_code,
+            "container_reason": self.container_reason,
+            "growth": self.growth.as_dict(),
+        }
+
+    @property
+    def cause(self) -> str:
+        """``workspace ran out of memory (limit 4 GiB)``, with ``again`` after
+        a raised limit."""
+        again = self.growth.outcome == "used"
+        details = []
+        if self.limit_bytes is not None:
+            details.append(f"limit {format_bytes(self.limit_bytes)}")
+        if again:
+            details.append("already raised once")
+        detail = f" ({', '.join(details)})" if details else ""
+        return f"workspace ran out of memory{' again' if again else ''}{detail}"
+
+    def next_step(self, gate: str) -> str:
+        """What Resume will do, or the hint when it cannot give more memory."""
+        if (
+            gate == RESUME_REQUIRED
+            and self.growth.outcome == "granted"
+            and self.growth.limit_bytes is not None
+        ):
+            return (
+                "Resume raises the job's memory limit to "
+                f"{format_bytes(self.growth.limit_bytes)}."
+            )
+        return MORE_MEMORY_HINT
+
+    def action(self, gate: str) -> str:
+        """The hold's text before the kept clause; the action comes first so
+        a list's cut keeps it."""
+        return (
+            f"{self.cause} and was stopped; interrupted command outcome is unknown; "
+            f"{gate}. {self.next_step(gate)}"
+        )
+
+
+def workspace_memory_attention(kill: WorkspaceMemoryKill) -> dict[str, Any]:
+    """The keys an out-of-memory hold adds to its ``attention``."""
+    return {"reason": WORKSPACE_OUT_OF_MEMORY_REASON, "memory": kill.attention()}
+
+
+def workspace_hold_resume_reason(hold: Any) -> str | None:
+    """The ``[FEEDBACK_RESUME]`` cause for lifting a workspace hold.
+
+    Worded for the resumed agent, from the hold being lifted: why the job
+    stopped and which files a new workspace still has. None for any other
+    hold, which keeps the caller's own wording.
+    """
+    if not isinstance(hold, Mapping):
+        return None
+    source = hold.get("source")
+    attention = hold.get("attention")
+    kill = WorkspaceMemoryKill.from_attention(attention)
+    if source == "workspace_recovery_unavailable":
+        if kill is not None:
+            cause = (
+                f"This job's {kill.cause} and was stopped; the outcome of the "
+                "command that was running is unknown."
+            )
+            if kill.growth.limit_bytes is not None and kill.growth.outcome in {
+                "granted",
+                "used",
+            }:
+                cause += (
+                    f" Its memory limit is now {format_bytes(kill.growth.limit_bytes)}."
+                )
+            elif kill.limit_bytes is not None:
+                cause += f" Its memory limit stays {format_bytes(kill.limit_bytes)}."
+        else:
+            cause = (
+                "This job's workspace stopped answering; the outcome of the "
+                "command that was running is unknown."
+            )
+    elif source == "workspace_recovery_exhausted":
+        cause = "This job's workspace could not be recovered after repeated attempts."
+    elif source == "workspace_disk_full":
+        cause = "This job's workspace disk was full."
+    else:
+        return None
+    return (
+        f"{cause} {recorded_workspace_kept_clause(attention)} "
+        "An operator resumed it with the feedback below."
     )

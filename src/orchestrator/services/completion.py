@@ -25,7 +25,11 @@ from typing import Any, Callable
 
 from shared.worker_errors import worker_workspace_exhaustion_cause
 from shared.workspace_contract import WorkspaceContractError, resolve_workspace_contract
-from shared.workspace_disk import WorkspaceDiskFullReport, WorkspaceVolumeGrowth
+from shared.workspace_disk import (
+    WorkspaceDiskFullReport,
+    WorkspaceTermination,
+    WorkspaceVolumeGrowth,
+)
 from shared.job_freeze_types import (
     CONTINUE_AS_NEW_FREEZE_TYPES,
     ERROR_IMMUNE_FREEZE_TYPES,
@@ -624,6 +628,34 @@ async def _settle_full_workspace_disk(
     return outcome
 
 
+DEFAULT_WORKSPACE_MEMORY_GROW_MAX = "16Gi"
+
+
+def workspace_memory_growth_cap_bytes() -> int | None:
+    """The largest memory limit a memory-killed job's Resume may raise it to.
+
+    ``WORKSPACE_MEMORY_GROW_MAX`` (chart value
+    ``workspace.memoryGrowth.max``); empty switches the growth off. An
+    unreadable value also switches it off, and says so in the log.
+    knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+    """
+    from shared.kubernetes_quantities import normalize_byte_quantity
+
+    raw = os.environ.get("WORKSPACE_MEMORY_GROW_MAX", DEFAULT_WORKSPACE_MEMORY_GROW_MAX)
+    if not raw.strip():
+        return None
+    try:
+        cap = normalize_byte_quantity(raw.strip()).normalized_value
+    except ValueError:
+        logger.warning(
+            "WORKSPACE_MEMORY_GROW_MAX=%r is not a memory quantity; a "
+            "memory-killed job keeps its limit",
+            raw,
+        )
+        return None
+    return cap if cap > 0 else None
+
+
 async def handle_pod_workspace_recovery(
     job: dict[str, Any],
     job_id: str,
@@ -638,6 +670,8 @@ async def handle_pod_workspace_recovery(
     expected_status: str | None = None,
     cleanup_service: Any | None = None,
     grow_workspace_volume: Callable[[], Awaitable[WorkspaceVolumeGrowth]] | None = None,
+    read_termination: Callable[[], Awaitable[WorkspaceTermination | None]]
+    | None = None,
 ) -> dict[str, Any]:
     """G1 pod (sandbox/PVC) workspace recovery — the ``workspace_unavailable``
     arm of the completion endpoint, extracted for testability.
@@ -665,8 +699,16 @@ async def handle_pod_workspace_recovery(
     the volume once (``grow_workspace_volume``) and resumes when no command
     was running, or holds with a reason that names the full disk.
     knowledge-base/knowledge/issues/workspace_disk_full_pauses_job_as_transport_lost.md
+
+    A dead Pod is read once (``read_termination``) before its cleanup: a
+    recorded ``OOMKilled`` makes the hold say the workspace ran out of memory,
+    and the next Resume runs with a larger limit once
+    (``WORKSPACE_MEMORY_GROW_MAX``). The cleanup's own record upgrades the
+    text when the read came too early.
+    knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
     """
     container_ctx = _get_ctx(job)
+    memory_growth_cap = workspace_memory_growth_cap_bytes()
 
     async def _delete_for_recovery() -> None:
         if completion_command_id is not None and not container_ctx.get(
@@ -687,6 +729,14 @@ async def handle_pod_workspace_recovery(
             raise RuntimeError("durable workspace recovery delete did not complete")
 
     async def _hold_dead_workspace() -> dict[str, Any]:
+        termination: WorkspaceTermination | None = None
+        if read_termination is not None and "recovery_cleanup" not in container_ctx:
+            try:
+                termination = await read_termination()
+            except Exception:  # noqa: BLE001 - legibility only; the hold stands
+                logger.exception(
+                    "Job %s: reading the dead workspace's termination failed", job_id
+                )
         disposition = await db.prepare_dead_workspace_recovery(
             job_id,
             expected_workspace=container_ctx,
@@ -694,6 +744,8 @@ async def handle_pod_workspace_recovery(
             error_detail=error.get("message") or "workspace_unavailable",
             completion_command_id=completion_command_id,
             completion_finalizing_by=completion_finalizing_by,
+            termination=termination,
+            memory_growth_cap_bytes=memory_growth_cap,
         )
         if disposition is None:
             # A stateless flag-off report has no durable cleanup authority.
@@ -724,6 +776,7 @@ async def handle_pod_workspace_recovery(
         completed = await db.complete_workspace_recovery_cleanup(
             receipt,
             completion_finalizing_by=completion_finalizing_by,
+            memory_growth_cap_bytes=memory_growth_cap,
         )
         if completed is None:
             raise RuntimeError("workspace recovery cleanup is pending")
@@ -840,6 +893,7 @@ async def handle_pod_workspace_recovery(
             error_detail=error.get("message") or "workspace_unavailable",
             completion_command_id=completion_command_id,
             completion_finalizing_by=completion_finalizing_by,
+            memory_growth_cap_bytes=memory_growth_cap,
         )
         if outcome is None:
             if (
@@ -1249,47 +1303,6 @@ def _get_ctx(job: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(ctx, dict):
         return {}
     return ctx.get("workspace_container", {}) or {}
-
-
-def classify_workspace_death(
-    termination: dict[str, Any] | None,
-) -> tuple[str, bool]:
-    """Human cause + is-resource-kill flag from a workspace pod's terminated
-    state (the dict from ``ContainerProvisioner.get_last_termination``).
-
-    The bool is the escalation signal: a resource kill (OOM / node-pressure
-    eviction) means "retry bigger", not "re-dispatch into the same grave". We
-    only assert a resource kill on positive evidence — a pod already gone before
-    we could read it stays ``False`` (no evidence), so we never fabricate an OOM.
-    See knowledge-base/knowledge/features/workspace_resource_pressure_resilience.md.
-    """
-    if not termination:
-        return (
-            "workspace pod gone before its termination cause could be read",
-            False,
-        )
-    container_reason = termination.get("container_reason") or ""
-    pod_reason = termination.get("pod_reason") or ""
-    exit_code = termination.get("exit_code")
-    if container_reason == "OOMKilled":
-        return ("workspace ran out of memory (OOMKilled)", True)
-    if pod_reason == "Evicted":
-        return ("workspace evicted under node resource pressure", True)
-    if exit_code == 137:
-        # 137 = 128 + SIGKILL. A workspace pod has no liveness probe to SIGKILL
-        # it, so a bare 137 without an OOMKilled reason is still almost always
-        # memory pressure (the kernel can drop the reason when the node is under
-        # duress). Flag as a likely resource kill — hedged wording, not a claim.
-        return (
-            "workspace process killed (SIGKILL/137) — likely memory pressure",
-            True,
-        )
-    if container_reason:
-        detail = f"workspace container terminated: {container_reason}"
-        if exit_code is not None:
-            detail += f" (exit {exit_code})"
-        return (detail, False)
-    return ("workspace became unavailable (no terminated-container record)", False)
 
 
 def auto_continue_drain_update(

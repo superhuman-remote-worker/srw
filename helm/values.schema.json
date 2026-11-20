@@ -3184,6 +3184,13 @@
           "additionalProperties": false,
           "properties": {"privileged": {"type": "boolean"}}
         },
+        "memoryGrowth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max": {"type": "string", "pattern": "^$|^[1-9][0-9]*(Mi|Gi|Ti)$"}
+          }
+        },
         "builtinTemplates": {
           "type": "object",
           "additionalProperties": false,

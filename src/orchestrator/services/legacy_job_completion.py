@@ -34,7 +34,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
-from shared.workspace_disk import WorkspaceVolumeGrowth
+from shared.workspace_disk import WorkspaceTermination, WorkspaceVolumeGrowth
 
 
 CompletionCallback = Callable[..., Any]
@@ -982,6 +982,17 @@ async def complete_job_legacy(
                         expected_runtime_incarnation=str(runtime_incarnation),
                     )
 
+                async def _read_pod_termination() -> WorkspaceTermination | None:
+                    runtime_incarnation = _get_container_context(job).get(
+                        WORKSPACE_RUNTIME_INCARNATION_KEY
+                    )
+                    if not runtime_incarnation:
+                        return None
+                    return await container_provisioner.read_workspace_termination(
+                        WorkspaceOwner.job(job_id),
+                        expected_runtime_incarnation=str(runtime_incarnation),
+                    )
+
                 async def _recover_pod_workspace() -> dict[str, Any]:
                     return await handle_pod_workspace_recovery(
                         job,
@@ -991,6 +1002,7 @@ async def complete_job_legacy(
                         delete_workspace=_delete_pod,
                         cleanup_service=container_provisioner,
                         grow_workspace_volume=_grow_pod_volume,
+                        read_termination=_read_pod_termination,
                         trigger_dispatch=_trigger_dispatch,
                         completion_command_id=(
                             _effect_runner.command_id

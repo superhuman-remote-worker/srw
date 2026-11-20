@@ -346,7 +346,11 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
     detail = hold if isinstance(hold, dict) else {}
     kept = _workspace_hold_clause(job)
     if detail.get("source") == "workspace_recovery_unavailable":
-        from shared.workspace_disk import RESUME_REQUIRED, dead_workspace_resume_gate
+        from shared.workspace_disk import (
+            RESUME_REQUIRED,
+            WorkspaceMemoryKill,
+            dead_workspace_resume_gate,
+        )
 
         workspace = context.get("workspace_container") or {}
         receipt = (
@@ -366,6 +370,14 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
             and receipt.get("phase") != "settled"
             else f"; {resume}"
         )
+        memory = WorkspaceMemoryKill.from_attention(attention)
+        if memory is not None:
+            # A recorded memory kill: the cause, then what Resume does about it.
+            return [
+                f"Workspace recovery hold: {memory.cause} and was stopped; "
+                f"interrupted command outcome is unknown{gate}. "
+                f"{memory.next_step(resume)} {kept}"
+            ]
         return [
             "Workspace recovery hold: interrupted command outcome is unknown"
             f"{gate}. {kept}"

@@ -217,11 +217,17 @@ from shared.operator_pause_hold import (
 from shared.workspace_disk import (
     RESUME_REQUIRED,
     WorkspaceDiskFullReport,
+    WorkspaceMemoryKill,
+    WorkspaceTermination,
     WorkspaceVolumeGrowth,
     dead_workspace_resume_gate,
+    decide_memory_growth,
+    new_memory_growth_record,
+    recorded_termination,
     workspace_disk_full_action,
     workspace_hold_facts,
     workspace_kept_clause,
+    workspace_memory_attention,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
@@ -936,6 +942,49 @@ def _different_valid_k8s_runtime(
     except RuntimeError:
         return None
     return current_runtime if current_runtime != retired_runtime else None
+
+
+def _workspace_memory_kill(
+    workspace: Mapping[str, Any],
+    *,
+    runtime: str,
+    termination: WorkspaceTermination | None = None,
+    cap_bytes: int | None = None,
+) -> tuple[WorkspaceMemoryKill, dict[str, Any]] | None:
+    """The out-of-memory facts of a hold for ``runtime``, and its row updates.
+
+    ``termination`` is a fresh read of the dead Pod; without one, the job
+    row's settled record for the same runtime counts. Anything but a recorded
+    ``OOMKilled`` returns None and the hold keeps its usual wording. The
+    updates keep the record and, the first time, the one larger limit the
+    next Resume runs with (``memory_growth``, read by the Pod creator).
+    knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+    """
+    record = (
+        termination
+        if termination is not None and termination.pod_uid == runtime
+        else recorded_termination(workspace, runtime)
+    )
+    if record is None or record.cause != "out_of_memory":
+        return None
+    previous = workspace.get("memory_growth")
+    growth = decide_memory_growth(
+        limit_bytes=record.memory_limit_bytes,
+        previous=previous,
+        cap_bytes=cap_bytes,
+        runtime_incarnation=runtime,
+    )
+    updates: dict[str, Any] = {"last_termination": record.as_dict()}
+    grown = new_memory_growth_record(
+        growth,
+        from_bytes=record.memory_limit_bytes,
+        runtime_incarnation=runtime,
+        at=datetime.now(timezone.utc).isoformat(),
+        previous=previous,
+    )
+    if grown is not None:
+        updates["memory_growth"] = grown
+    return WorkspaceMemoryKill.from_termination(record, growth), updates
 
 
 def _json_object_or_empty(value: Any) -> dict[str, Any]:
@@ -7636,6 +7685,7 @@ class PostgresDB:
         error_detail: str,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
         """Hold an interrupted command whose runtime was already retired.
 
@@ -7656,6 +7706,7 @@ class PostgresDB:
             completion_finalizing_by=completion_finalizing_by,
             interrupted_command=True,
             retired_runtime=True,
+            memory_growth_cap_bytes=memory_growth_cap_bytes,
         )
 
     async def hold_full_workspace_disk(
@@ -7709,6 +7760,7 @@ class PostgresDB:
         disk_growth: WorkspaceVolumeGrowth | None = None,
         requeue: bool = False,
         retired_runtime: bool = False,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
         """Retain uncertain container work behind the existing explicit-resume fence.
 
@@ -7722,7 +7774,9 @@ class PostgresDB:
 
         ``retired_runtime`` is the unknown-outcome mode for a runtime that an
         exact ``preserve`` cleanup already retired: the row must be ``deleted``
-        and settled for its own runtime, with nothing else in flight.
+        and settled for its own runtime, with nothing else in flight. When that
+        cleanup recorded an ``OOMKilled`` for the runtime, the hold says the
+        workspace ran out of memory and what the next Resume does about it.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
@@ -7933,6 +7987,15 @@ class PostgresDB:
                     ),
                     binding=context.get("_workspace_binding"),
                 )
+                memory_kill = (
+                    _workspace_memory_kill(
+                        workspace,
+                        runtime=runtime_uid,
+                        cap_bytes=memory_growth_cap_bytes,
+                    )
+                    if retired_runtime
+                    else None
+                )
                 outcome = {
                     "status": "handled",
                     "job_id": job_id,
@@ -7944,6 +8007,10 @@ class PostgresDB:
                             disk_full, disk_growth, resumed=requeue
                         )
                         if disk_full is not None
+                        else memory_kill[0].action(RESUME_REQUIRED)
+                        + " "
+                        + workspace_kept_clause(**facts)
+                        if memory_kill is not None
                         else (
                             "workspace transport lost; interrupted command outcome is unknown; "
                             if interrupted_command
@@ -7958,6 +8025,8 @@ class PostgresDB:
                     **({"cleanup_pending": False} if interrupted_command else {}),
                 }
                 updates = {"recovery_attempts": attempts}
+                if memory_kill is not None:
+                    updates.update(memory_kill[1])
                 if disk_growth is not None and disk_growth.grown:
                     # The volume grows once per job; a later full disk holds.
                     updates["disk_growth"] = disk_growth.as_dict()
@@ -7978,6 +8047,11 @@ class PostgresDB:
                     **(
                         {"reason": "interrupted_command_outcome_unknown"}
                         if interrupted_command and disk_full is None
+                        else {}
+                    ),
+                    **(
+                        workspace_memory_attention(memory_kill[0])
+                        if memory_kill is not None
                         else {}
                     ),
                     **(
@@ -8051,12 +8125,19 @@ class PostgresDB:
         error_detail: str,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        termination: WorkspaceTermination | None = None,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
         """Atomically hold uncertain work and admit only exact preserve cleanup.
 
         A legacy report gets a restrictive hold, without a cleanup continuation.
         Durable reports retain a pending receipt until physical cleanup settles.
         This never infers process zero or permission to rerun an interrupted tool.
+
+        ``termination`` is the recovery arm's read of the dead Pod. An
+        ``OOMKilled`` there words the hold as a memory kill at once; otherwise
+        :meth:`complete_workspace_recovery_cleanup` upgrades the text from the
+        record the cleanup settled.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
@@ -8180,6 +8261,16 @@ class PostgresDB:
                     runtime_replaced=True if command_uuid is not None else None,
                     binding=context.get("_workspace_binding"),
                 )
+                gate = dead_workspace_resume_gate(
+                    recovery_cleanup=command_uuid is not None,
+                    volume_kept=facts["volume_kept"],
+                )
+                memory_kill = _workspace_memory_kill(
+                    workspace,
+                    runtime=runtime,
+                    termination=termination,
+                    cap_bytes=memory_growth_cap_bytes,
+                )
                 outcome = {
                     "status": "handled",
                     "job_id": job_id,
@@ -8188,16 +8279,19 @@ class PostgresDB:
                     "held_for_resume": True,
                     "cleanup_pending": command_uuid is not None,
                     "actions": [
-                        "workspace transport lost; interrupted command outcome is unknown; "
-                        + dead_workspace_resume_gate(
-                            recovery_cleanup=command_uuid is not None,
-                            volume_kept=facts["volume_kept"],
+                        (
+                            memory_kill[0].action(gate)
+                            if memory_kill is not None
+                            else "workspace transport lost; interrupted command "
+                            f"outcome is unknown; {gate}."
                         )
-                        + ". "
+                        + " "
                         + workspace_kept_clause(**facts)
                     ],
                 }
                 updates = {"recovery_attempts": attempts}
+                if memory_kill is not None:
+                    updates.update(memory_kill[1])
                 if command_uuid is not None:
                     # Do not let the general cleanup preparer cancel an open
                     # creator or classify somebody else's ambiguous intent.
@@ -8280,6 +8374,11 @@ class PostgresDB:
                             "reason": "interrupted_command_outcome_unknown",
                             **facts,
                             "detail": str(error_detail)[:1000],
+                            **(
+                                workspace_memory_attention(memory_kill[0])
+                                if memory_kill is not None
+                                else {}
+                            ),
                         }
                     ),
                     outcome["actions"][0],
@@ -8347,8 +8446,15 @@ class PostgresDB:
         value: Any,
         *,
         completion_finalizing_by: str,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
-        """Acknowledge physical preserve settlement without lifting its hold."""
+        """Acknowledge physical preserve settlement without lifting its hold.
+
+        The settled cleanup recorded how the retired runtime ended. When that
+        is an ``OOMKilled`` and the hold does not say so yet (the report came
+        before the kubelet published the Pod's end), the hold's text, its
+        attention and the job's error message say it now, in the same write.
+        """
         receipt = ContainerRecoveryCleanup.parse(value)
         if receipt is None:
             return None
@@ -8385,24 +8491,60 @@ class PostgresDB:
                 }
                 if workspace["recovery_cleanup"]["phase"] == "settled":
                     return outcome
+                hold = context.get(OPERATOR_PAUSE_HOLD_CONTEXT_KEY) or {}
+                attention = hold.get("attention") if isinstance(hold, dict) else None
+                attention = attention if isinstance(attention, dict) else {}
+                workspace_updates: dict[str, Any] = {
+                    "recovery_cleanup": {**receipt.as_dict(), "phase": "settled"},
+                }
+                attention_updates: dict[str, Any] = {}
+                memory_kill = (
+                    None
+                    if WorkspaceMemoryKill.from_attention(attention) is not None
+                    else _workspace_memory_kill(
+                        workspace,
+                        runtime=receipt.runtime_incarnation,
+                        cap_bytes=memory_growth_cap_bytes,
+                    )
+                )
+                if memory_kill is not None:
+                    action = (
+                        memory_kill[0].action(
+                            dead_workspace_resume_gate(
+                                recovery_cleanup=True,
+                                volume_kept=attention.get("volume_kept"),
+                            )
+                        )
+                        + " "
+                        + workspace_kept_clause(
+                            runtime_replaced=attention.get("runtime_replaced"),
+                            volume_kept=attention.get("volume_kept"),
+                        )
+                    )
+                    outcome["actions"] = [action]
+                    workspace_updates.update(memory_kill[1])
+                    attention_updates = workspace_memory_attention(memory_kill[0])
+                workspace_updates["recovery_completion_outcome"] = outcome
                 changed = await conn.fetchval(
-                    "UPDATE jobs SET context=jsonb_set(context,'{workspace_container}',"
-                    "context->'workspace_container'||$2::jsonb),updated_at=clock_timestamp() "
+                    "UPDATE jobs SET context=CASE WHEN $5::jsonb='{}'::jsonb THEN "
+                    "jsonb_set(context,'{workspace_container}',"
+                    "context->'workspace_container'||$2::jsonb) ELSE "
+                    "jsonb_set(jsonb_set(context,'{workspace_container}',"
+                    "context->'workspace_container'||$2::jsonb),"
+                    f"'{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY},attention}}',"
+                    f"COALESCE(context->'{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}'->'attention',"
+                    "'{}'::jsonb)||$5::jsonb) END,"
+                    "error_message=COALESCE($6::text,error_message),"
+                    "updated_at=clock_timestamp() "
                     "WHERE id=$1 AND EXISTS(SELECT 1 FROM job_completion_commands "
                     "WHERE id=$3 AND job_id=$1 AND state='finalizing' AND finalizing_by=$4 "
                     "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()) RETURNING id",
                     UUID(receipt.job_id),
-                    json.dumps(
-                        {
-                            "recovery_cleanup": {
-                                **receipt.as_dict(),
-                                "phase": "settled",
-                            },
-                            "recovery_completion_outcome": outcome,
-                        }
-                    ),
+                    json.dumps(workspace_updates),
                     UUID(receipt.command_id),
                     completion_finalizing_by,
+                    json.dumps(attention_updates),
+                    outcome["actions"][0] if memory_kill is not None else None,
                 )
                 return outcome if changed else None
 
@@ -23311,8 +23453,16 @@ class PostgresDB:
         claimant: str,
         claim_token: int,
         recovery_receipt: Dict[str, Any] | None = None,
+        termination: Dict[str, Any] | None = None,
     ) -> bool:
-        """Atomically publish cleanup-complete and the exact final projection."""
+        """Atomically publish cleanup-complete and the exact final projection.
+
+        ``termination`` is how the retired runtime's workspace container
+        ended, read from the exact Pod before its delete. A job keeps it as
+        ``workspace_container.last_termination`` for that runtime only, so a
+        hold can name a memory kill. It grants nothing.
+        knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+        """
 
         constrained = ContainerRecoveryCleanup.parse(recovery_receipt)
         if recovery_receipt is not None and constrained is None:
@@ -23566,6 +23716,26 @@ class PostgresDB:
                     )
                     if updated != "UPDATE 1":
                         raise RuntimeError("workspace cleanup projection was lost")
+                    recorded = WorkspaceTermination.from_dict(termination)
+                    if (
+                        owner_kind == "job"
+                        and scope == "workspace_container"
+                        and recorded is not None
+                        and recorded.pod_uid == expected_runtime
+                    ):
+                        # The cleanup projection must equal the exact settled
+                        # shape (managed_repo_workspace_cleanup_projection_
+                        # authorized_now), so the record follows it in the same
+                        # transaction. It is outside the authority envelope.
+                        await conn.execute(
+                            "UPDATE jobs SET context=jsonb_set(context,"
+                            "'{workspace_container,last_termination}',$2::jsonb) "
+                            "WHERE id=$1 AND context->'workspace_container'"
+                            "->>'_runtime_incarnation'=$3",
+                            owner_uuid,
+                            json.dumps(recorded.as_dict()),
+                            expected_runtime,
+                        )
                 return True
 
     async def restore_settled_thread_workspace_cleanup_projection(

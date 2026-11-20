@@ -24,7 +24,7 @@ import os
 import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from http.client import RemoteDisconnected
 from types import MappingProxyType
@@ -38,7 +38,11 @@ from urllib3.exceptions import (
 )
 from shared.container_recovery import ContainerRecoveryCleanup
 from shared.kubernetes_quantities import normalize_byte_quantity
-from shared.workspace_disk import WorkspaceVolumeGrowth, format_bytes
+from shared.workspace_disk import (
+    WorkspaceTermination,
+    WorkspaceVolumeGrowth,
+    format_bytes,
+)
 from shared.workspace_recovery import WorkspaceRecoveryCode
 from shared.tls_trust import TrustCaSource
 
@@ -104,10 +108,12 @@ from orchestrator.services.sandbox_workspace_settings import (
     SandboxImagePolicy,
     SandboxPodProfile,
     SandboxSettings,
+    apply_memory_growth,
     classify_image_pull,
     definite_admission_refusal_status,
     image_repository,
     pod_admission_rejection,
+    resolve_memory_growth,
     resolve_sandbox_settings,
     sandbox_pod_profile,
 )
@@ -277,6 +283,10 @@ def _canonical_manifest_digest(payload: dict[str, Any]) -> str:
 @dataclass(frozen=True)
 class RuntimeDeletionOutcome:
     state: Literal["current_deleted", "stale_target_settled", "refused"]
+    # How the deleted runtime's workspace container ended, when the delete's
+    # own read of the exact Pod found it stopped. Legibility only: settlement
+    # projects it onto the job row; it grants nothing.
+    termination: WorkspaceTermination | None = field(default=None, compare=False)
 
     @property
     def current_deleted(self) -> bool:
@@ -611,6 +621,65 @@ def _pod_has_exact_process_zero(pod: Any) -> bool:
     )
 
 
+def _iso_instant(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return (
+            value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        ).isoformat()
+    return value if isinstance(value, str) and value else None
+
+
+def workspace_termination_from_pod(pod: Any) -> WorkspaceTermination | None:
+    """How the ``workspace`` container of this exact Pod ended, or None.
+
+    Pure over a Pod object. Only a terminated ``state`` counts: under
+    ``restartPolicy: Never`` that is final for the container, even while the
+    sidecars are still stopping. The memory limit comes from the Pod's own
+    spec, so a raised limit is the one reported. The record keeps the Pod's
+    deletion timestamp; the classifier never calls a container SRW stopped a
+    memory kill.
+    knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+    """
+    metadata = getattr(pod, "metadata", None)
+    status = getattr(pod, "status", None)
+    pod_uid = getattr(metadata, "uid", None)
+    if not isinstance(pod_uid, str) or not pod_uid:
+        return None
+    terminated = None
+    for item in getattr(status, "container_statuses", None) or ():
+        if getattr(item, "name", None) == "workspace":
+            terminated = getattr(getattr(item, "state", None), "terminated", None)
+            break
+    if terminated is None:
+        return None
+    limit_bytes: int | None = None
+    for container in getattr(getattr(pod, "spec", None), "containers", None) or ():
+        if getattr(container, "name", None) != "workspace":
+            continue
+        limits = getattr(getattr(container, "resources", None), "limits", None)
+        raw = limits.get("memory") if isinstance(limits, dict) else None
+        if raw is not None:
+            try:
+                limit_bytes = normalize_byte_quantity(str(raw)).normalized_value
+            except ValueError:
+                limit_bytes = None
+        break
+    return WorkspaceTermination.from_dict(
+        {
+            "pod_uid": pod_uid,
+            "container_reason": getattr(terminated, "reason", None),
+            "exit_code": getattr(terminated, "exit_code", None),
+            "finished_at": _iso_instant(getattr(terminated, "finished_at", None)),
+            "pod_reason": getattr(status, "reason", None),
+            "pod_message": getattr(status, "message", None),
+            "deletion_timestamp": _iso_instant(
+                getattr(metadata, "deletion_timestamp", None)
+            ),
+            "memory_limit_bytes": limit_bytes,
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _WorkspaceContainerExit:
     """Exact proof that a scheduled ``restartPolicy: Never`` Pod's workspace
@@ -938,16 +1007,22 @@ class ContainerProvisioner:
         stateless generation of this owner computes the same profile.
         """
         settings = SandboxSettings()
+        growth: dict[str, Any] | None = None
         if self._db is not None and callable(getattr(type(self._db), "fetchrow", None)):
             settings = await resolve_sandbox_settings(self._db, owner.kind, owner.id)
-        return sandbox_pod_profile(
-            settings,
-            self._image_policy(),
-            cpu=cpu,
-            memory=memory,
-            cpu_limit=cpu_limit,
-            memory_limit=memory_limit,
-            image=image,
+            # A memory-killed Job's next Pods run with its one larger limit.
+            growth = await resolve_memory_growth(self._db, owner.kind, owner.id)
+        return apply_memory_growth(
+            sandbox_pod_profile(
+                settings,
+                self._image_policy(),
+                cpu=cpu,
+                memory=memory,
+                cpu_limit=cpu_limit,
+                memory_limit=memory_limit,
+                image=image,
+            ),
+            growth,
         )
 
     async def _cloud_mount_plan_for(
@@ -9120,6 +9195,14 @@ class ContainerProvisioner:
                 if _recovery_receipt is not None
                 else {}
             ),
+            # How the retired runtime ended, read before its delete.
+            **(
+                {"termination": deletion.termination.as_dict()}
+                if deletion.termination is not None
+                and owner.kind == "job"
+                and deletion.termination.pod_uid == str(expected_runtime_incarnation)
+                else {}
+            ),
         )
         if not settled:
             return _WORKSPACE_CLEANUP_RETRYABLE
@@ -10285,6 +10368,7 @@ class ContainerProvisioner:
         already_absent = False
         retained_for_process_zero = False
         observed_runtime_uid: str | None = None
+        termination: WorkspaceTermination | None = None
         try:
             observed_pod = await self._bounded_kubernetes_call(
                 self._core_api.read_namespaced_pod,
@@ -10300,6 +10384,8 @@ class ContainerProvisioner:
             retained_for_process_zero = self._has_stateless_process_zero_finalizer(
                 observed_pod
             )
+            if owner.kind == "job":
+                termination = workspace_termination_from_pod(observed_pod)
             if expected_runtime_incarnation is not None and observed_runtime_uid != str(
                 expected_runtime_incarnation
             ):
@@ -10642,6 +10728,8 @@ class ContainerProvisioner:
         # lifecycle-authorized release step. Keeping ``retiring_process_zero``
         # here lets migration 0197 fence every replacement bind until that step
         # has succeeded.
+        if termination is not None and termination.pod_uid == observed_runtime_uid:
+            return RuntimeDeletionOutcome("current_deleted", termination=termination)
         return _CURRENT_RUNTIME_DELETED
 
     async def delete_workspace(
@@ -12976,72 +13064,39 @@ class ContainerProvisioner:
             )
             return None
 
-    async def get_last_termination(self, owner: WorkspaceOwner) -> Optional[dict]:
-        """Read the workspace pod's terminated-container cause, for legibility.
+    async def read_workspace_termination(
+        self, owner: WorkspaceOwner, *, expected_runtime_incarnation: str
+    ) -> WorkspaceTermination | None:
+        """Read how this exact runtime's workspace container ended, or None.
 
-        Called on workspace loss BEFORE ``delete_workspace`` (while the Failed
-        pod tombstone still exists) so a resource kill surfaces its true cause
-        (``OOMKilled`` / ``Evicted``) instead of the opaque downstream SSH error
-        the agent happened to hit. Mirrors the agent-pod reap classifier in
-        ``agent_provisioner`` — the kill reason lives in ``state.terminated`` or,
-        if the container restarted, ``last_state.terminated``.
-
-        Returns ``{phase, pod_reason, container_reason, exit_code, signal}`` or
-        ``None`` when the pod is already gone (404) or K8s is unavailable.
+        The recovery arm calls it once after a failed probe, before the
+        cleanup deletes the Pod, so the hold can name a memory kill at once.
+        A missing Pod, another Pod under the same name, or a container that
+        has not stopped yet returns None; the cleanup's own read records the
+        termination later (``delete_workspace_with_outcome``).
         """
         if not self._k8s_available:
             return None
-        pod_name = owner.pod_name
         try:
             pod = await self._bounded_kubernetes_call(
                 self._core_api.read_namespaced_pod,
-                name=pod_name,
+                name=owner.pod_name,
                 namespace=self._namespace,
             )
-        except Exception as e:
-            if getattr(e, "status", None) == 404:
-                return None
-            logger.debug(
-                "Termination read failed for %s %s: %s", owner.kind, owner.id, e
-            )
-            return None
-        try:
-            self._require_workspace_pod_owner(
+            observed = self._require_workspace_pod_owner(
                 pod,
                 owner=owner,
                 allow_owner_unlabeled=False,
                 allow_terminating=True,
             )
-        except WorkspaceRuntimeAuthorityError:
+        except Exception as e:  # noqa: BLE001 - legibility only, never authority
+            logger.debug(
+                "Termination read failed for %s %s: %s", owner.kind, owner.id, e
+            )
             return None
-
-        status = pod.status
-        exit_code: Any = None
-        container_reason: Any = None
-        signal: Any = None
-        for cs in getattr(status, "container_statuses", None) or []:
-            if cs.name != "workspace":
-                continue
-            terminated = getattr(getattr(cs, "state", None), "terminated", None)
-            if terminated is None:
-                # Container restarted (e.g. OOMKilled then restarted): the kill
-                # reason lives in last_state.terminated, not state.
-                terminated = getattr(
-                    getattr(cs, "last_state", None), "terminated", None
-                )
-            if terminated is not None:
-                exit_code = getattr(terminated, "exit_code", None)
-                container_reason = getattr(terminated, "reason", None)
-                signal = getattr(terminated, "signal", None)
-            break
-        return {
-            "phase": getattr(status, "phase", None),
-            # pod-level status.reason is "Evicted" on node-pressure eviction
-            "pod_reason": getattr(status, "reason", None),
-            "container_reason": container_reason,
-            "exit_code": exit_code,
-            "signal": signal,
-        }
+        if observed != str(expected_runtime_incarnation):
+            return None
+        return workspace_termination_from_pod(pod)
 
     async def workspace_pod_live(
         self,
@@ -18777,6 +18832,36 @@ class ContainerProvisioner:
         if current:
             await self._set_context(owner, {"error": message})
 
+    async def _retire_refused_memory_growth(
+        self, owner: WorkspaceOwner, exc: BaseException
+    ) -> None:
+        """A cluster that refuses the larger limit gets the frozen one next time.
+
+        The refused Pod stored nothing. Marking the growth refused makes the
+        next creation use the Job's frozen limit, and a later memory kill's
+        hold point to a new job instead of promising more. Best effort.
+        """
+        try:
+            growth = await resolve_memory_growth(self._db, owner.kind, owner.id)
+            if growth is None:
+                return
+            await self._set_context(
+                owner,
+                {
+                    "memory_growth": {
+                        **growth,
+                        "refused_at": datetime.now(timezone.utc).isoformat(),
+                        "refusal": (pod_admission_rejection(exc) or str(exc))[:300],
+                    }
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Could not retire the refused memory growth of %s %s",
+                owner.kind,
+                owner.id,
+            )
+
     async def _record_refused_pod_create(
         self,
         owner: WorkspaceOwner,
@@ -18790,6 +18875,8 @@ class ContainerProvisioner:
         the creation's failure handler, so it never raises there.
         """
         status = definite_admission_refusal_status(exc)
+        if status is not None and owner.kind == "job":
+            await self._retire_refused_memory_growth(owner, exc)
         record = getattr(
             type(self._db), "record_refused_workspace_creation_pod_effect", None
         )
