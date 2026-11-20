@@ -594,8 +594,8 @@ func (a *App) lifecycleCommand(verb, short, long string, route routes.Route, tex
 				request.Timeout = api.TeardownTimeout
 			}
 			response, err := client.Send(command.Context(), request)
-			if verb == "approve" {
-				response, err = a.approveAgain(command.Context(), client, request, id, response, err)
+			if verb == "approve" || verb == "resume" {
+				response, err = a.reviewAgain(command.Context(), client, request, id, response, err)
 			}
 			if err != nil {
 				if verb != "cancel" || !a.cancelledAnyway(command.Context(), client, id, err) {
@@ -648,23 +648,25 @@ func (a *App) cancelledAnyway(ctx context.Context, client *api.Client, id string
 	return true
 }
 
-// approveGrace is how long approve keeps asking while the server refuses the
-// approval of a job that still waits for review.
-const approveGrace = 20 * time.Second
+// reviewGrace is how long approve and resume keep asking while the server
+// refuses to act on a job that still waits for review.
+const reviewGrace = 20 * time.Second
 
-// approveAgain sends an approval again while the server answers it with a
-// conflict and the job still waits for review. A job shows pending_review
-// about two and a half seconds before the server has finished stopping it
-// (measured on k3d; knowledge-base/knowledge/tests/approve_at_review_stop_409_check.md); an
-// approval in that time is refused with 409 "completion finalizing", "job
-// changed while control was being committed" or "pinned approval agent
-// changed". The refusal changed nothing, so the request can be repeated. A
-// person never meets it; `srw wait` followed by `srw approve` does.
-func (a *App) approveAgain(ctx context.Context, client *api.Client, request api.Request, id string, response *api.Response, err error) (*api.Response, error) {
+// reviewAgain sends an approval, or a resume, again while the server answers
+// it with a conflict and the job still waits for review. A job shows
+// pending_review a moment before the server has finished stopping it
+// (measured on k3d and dev, knowledge-base/knowledge/tests/approve_at_review_stop_409_check.md:
+// up to 2.5 s for approve on k3d's pinned lane, 11.5 s on dev's, about 1.3 s
+// on the stateless lane, 0.6 s for resume). A request in that time is refused
+// with 409 "completion finalizing", "job changed while control was being
+// committed" or "pinned approval agent changed". The refusal changed
+// nothing, so the request can be repeated. A person never meets it; `srw
+// wait` followed by `srw approve` or `srw resume --feedback` does.
+func (a *App) reviewAgain(ctx context.Context, client *api.Client, request api.Request, id string, response *api.Response, err error) (*api.Response, error) {
 	started, said := a.Now(), false
 	for err != nil {
 		var failure *exit.Error
-		if !errors.As(err, &failure) || failure.Status != http.StatusConflict || a.Now().Sub(started) >= approveGrace {
+		if !errors.As(err, &failure) || failure.Status != http.StatusConflict || a.Now().Sub(started) >= reviewGrace {
 			return response, err
 		}
 		// A parked completion report waits for an administrator, not for time.
@@ -679,7 +681,7 @@ func (a *App) approveAgain(ctx context.Context, client *api.Client, request api.
 		}
 		if !said {
 			said = true
-			fmt.Fprintf(a.Err, "The server has not finished stopping the job for review (%s). Trying again for up to %s.\n", failure.Message, approveGrace)
+			fmt.Fprintf(a.Err, "The server has not finished stopping the job for review (%s). Trying again for up to %s.\n", failure.Message, reviewGrace)
 		}
 		if sleepErr := a.sleep(ctx, time.Second); sleepErr != nil {
 			return response, sleepErr
@@ -712,7 +714,10 @@ func (a *App) lifecycleCommands() []*cobra.Command {
 		a.lifecycleCommand("resume", "Continue a job, optionally with feedback",
 			"Continue a paused or failed job. On a job that stopped for review, resume\n"+
 				"sends it back to work; say what to change with --feedback. On a job that is\n"+
-				"running, resume interrupts it and queues it again.",
+				"running, resume interrupts it and queues it again.\n\n"+
+				"A job shows that it stopped for review a moment before the server has\n"+
+				"finished stopping it. A resume in that moment is refused as a conflict; srw\n"+
+				"sends it again for up to 20 seconds while the job still waits for review.",
 			routes.JobResume, "feedback", "feedback", "What the job should do differently"),
 		a.lifecycleCommand("approve", "Approve a job that stopped for review",
 			"Approve a job that stopped for a person. A job that stopped at the end of its\n"+

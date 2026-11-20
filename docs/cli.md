@@ -243,8 +243,9 @@ srw run -f task.md --expert reviewer --autonomy full --wait --timeout 2h
   for example during an upgrade: they ask again for up to ten minutes before
   they exit with code 7.
 - `srw wait JOB --for status=pending_review && srw approve JOB` works as
-  written: for a moment after a job stops for review the server still
-  refuses its approval, and `approve` sends it again for up to 20 seconds.
+  written, and so does `srw resume JOB --feedback "…"`: for a moment after a
+  job stops for review the server still refuses both, and `approve` and
+  `resume` send the request again for up to 20 seconds.
 - Starting a job with `run` cannot be repeated safely. If the answer is lost
   (code 6), look at `srw get jobs` before starting it again. A start that can
   be repeated is a Job manifest applied with
@@ -313,7 +314,7 @@ the authority's PEM file at `srw login`; it is saved with the context. Plain
 | `the API at … is not answering: … from something in front of it` (or `from Cloudflare in front of it`) | A proxy answered instead of the API. The server may be restarting; if it stays, the address is not the API's. |
 | `… got 502 … from something in front of it; the request may have reached the API before that` | A change got a proxy's answer instead of the API's (exit 6). Look at the object (`srw get`, `srw describe job`) before you send it again. |
 | `… redirects to …` | The server address is not the API's. Check `https`, the host and the path. |
-| `completion finalizing`, `job changed while control was being committed` or `pinned approval agent changed` on `srw approve` | The job has only just stopped for review and the server has not finished stopping it. `srw approve` sends the approval again by itself for up to 20 seconds. If it stays, look at the job with `srw describe job` and approve again. |
+| `completion finalizing`, `job changed while control was being committed` or `pinned approval agent changed` on `srw approve` or `srw resume` | The job has only just stopped for review and the server has not finished stopping it. Both commands send the request again by themselves for up to 20 seconds. If it stays, look at the job with `srw describe job` and run the command again. |
 | `This job's last completion report could not be processed and is parked …` | The server could not process the job's last report and stopped trying. Resume, approve and the other job controls answer this until an administrator unparks the report (`POST /api/admin/completion-commands/{id}/unpark`, the id is in the message) or force-resolves it. `srw approve` does not ask again for this one. |
 | `Workspace authority retirement is incomplete` | The server is still releasing the job's workspace. `srw delete job` asks again by itself for up to three minutes, and `srw cancel` exits 0 when the job is cancelled. If it stays, look at the job with `srw get` and run the command again. |
 

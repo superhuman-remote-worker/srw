@@ -696,6 +696,10 @@ srw resume JOB [flags]
 Continue a paused or failed job. On a job that stopped for review, resume
 sends it back to work; say what to change with --feedback. On a job that is
 running, resume interrupts it and queues it again.
+
+A job shows that it stopped for review a moment before the server has
+finished stopping it. A resume in that moment is refused as a conflict; srw
+sends it again for up to 20 seconds while the job still waits for review.
 ```
 
 | Flag | Meaning |

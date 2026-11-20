@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -611,6 +612,47 @@ func TestApproveAsksAgainWhileTheServerFinishesTheStop(t *testing.T) {
 	want(t, errOut, "is parked (command 03dc2497)")
 	if strings.Contains(errOut, "has not finished stopping the job") {
 		t.Errorf("a parked completion is not a stop in progress:\n%s", errOut)
+	}
+}
+
+func TestResumeWithFeedbackAsksAgainWhileTheServerFinishesTheStop(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	progressOf(h, "pending_review")
+	asked := 0
+	var bodies []string
+	h.handle("POST "+jobRoute("/resume"), func(w http.ResponseWriter, r *http.Request) {
+		asked++
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		if asked == 1 {
+			w.WriteHeader(409)
+			w.Write([]byte(`{"detail":"completion finalizing"}`))
+			return
+		}
+		w.Write([]byte(`{"status":"processing"}`))
+	})
+	out, errOut, code := h.run("", "resume", jobID, "--feedback", "Also add a full stop.")
+	if code != exit.OK || asked != 2 || !strings.Contains(out, "processing") {
+		t.Fatalf("%d after %d requests: %q %s", code, asked, out, errOut)
+	}
+	if bodies[0] != bodies[1] || !strings.Contains(bodies[1], "Also add a full stop.") {
+		t.Errorf("the same request is sent again: %q", bodies)
+	}
+	want(t, errOut, "has not finished stopping the job for review", "completion finalizing")
+
+	// A paused job that refuses a resume: the conflict is a real one. Once.
+	asked = 0
+	progressOf(h, "paused")
+	h.handle("POST "+jobRoute("/resume"), func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(409)
+		w.Write([]byte(`{"detail":"Job is already resuming"}`))
+	})
+	if _, _, code := h.run("", "resume", jobID); code != exit.Conflict || asked != 1 {
+		t.Errorf("a paused job: %d after %d requests", code, asked)
 	}
 }
 
