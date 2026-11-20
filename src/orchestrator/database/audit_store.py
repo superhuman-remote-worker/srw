@@ -88,6 +88,24 @@ FilterCategory = Literal["all", "messages", "tools", "errors"]
 # Cypher tool names that produce graph deltas (current + legacy).
 GRAPH_TOOL_NAMES = ["cypher_query", "cypher_execute", "execute_cypher_query"]
 
+# A job's last activity: the newest timestamp among its newest pre rows by id,
+# never later than the database clock. The newest row by id is not always the
+# newest step: a stateless lease's ``claim_timing`` row is written when the
+# lease ends but stamped with the claim time, an ``audit_receipt`` row lands
+# at batch end, and rows replayed after an audit-store outage arrive late.
+# The window keeps the read on the ``(job_id, id)`` index; a whole-job maximum
+# would read every pre row. The cap absorbs an agent clock ahead of the
+# database (pre rows carry the agent's clock). No rows: no row, so NULL.
+_AUDIT_TAIL_ROWS = 50
+_LAST_ACTIVITY_SQL = f"""
+    SELECT LEAST(max(tail.timestamp), now()) FROM (
+        SELECT timestamp FROM agent_audit
+        WHERE job_id=$1::uuid AND event_phase='pre'
+        ORDER BY id DESC LIMIT {_AUDIT_TAIL_ROWS}
+    ) AS tail
+    HAVING count(*) > 0
+"""
+
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
     """Text JSONB codec: payload/request/response/metrics come back as dicts."""
@@ -485,6 +503,9 @@ class AuditStore:
         return result
 
     async def get_audit_time_range(self, job_id: str) -> Optional[Dict[str, str]]:
+        """``start`` is the first-inserted pre row's timestamp; ``end`` is the
+        job's last activity (``_LAST_ACTIVITY_SQL``). Liveness and elapsed time
+        read ``end`` only."""
         if not self._available or self._pool is None:
             return None
         try:
@@ -494,11 +515,7 @@ class AuditStore:
                     "AND event_phase='pre' ORDER BY id ASC LIMIT 1",
                     job_id,
                 )
-                last = await conn.fetchval(
-                    "SELECT timestamp FROM agent_audit WHERE job_id=$1::uuid "
-                    "AND event_phase='pre' ORDER BY id DESC LIMIT 1",
-                    job_id,
-                )
+                last = await conn.fetchval(_LAST_ACTIVITY_SQL, job_id)
             if first is None or last is None:
                 return None
             return {"start": _to_iso_utc(first), "end": _to_iso_utc(last)}
@@ -843,15 +860,14 @@ class AuditStore:
         try:
             async with self._pool.acquire() as conn:
                 r = await conn.fetchrow(
-                    """
+                    f"""
                     SELECT
                       count(*) FILTER (WHERE event_phase='pre') AS audit_count,
                       count(*) FILTER (
                           WHERE event_phase='pre' AND step_type='tool'
                           AND payload->'tool'->>'name' = ANY($2)) AS graph_count,
                       count(*) AS row_count,
-                      (SELECT timestamp FROM agent_audit WHERE job_id=$1::uuid
-                        AND event_phase='pre' ORDER BY id DESC LIMIT 1) AS last_ts,
+                      ({_LAST_ACTIVITY_SQL}) AS last_ts,
                       (SELECT count(*) FROM chat_history
                         WHERE job_id=$1::uuid) AS chat_count
                     FROM agent_audit WHERE job_id = $1::uuid

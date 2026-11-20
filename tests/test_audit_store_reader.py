@@ -378,6 +378,79 @@ async def test_version_counts_logical(seeded):
         await s.disconnect()
 
 
+def _pre_row(job_id: str, step_type: str, timestamp: datetime) -> dict:
+    return {
+        "job_id": job_id,
+        "agent_type": "worker",
+        "iteration": 1,
+        "step_type": step_type,
+        "node_name": "n",
+        "timestamp": timestamp,
+        "payload": {},
+    }
+
+
+async def test_last_activity_is_newest_timestamp_not_newest_row(seeded):
+    """Job 3677b309: a lease's ``claim_timing`` row is inserted when the lease
+    ends but stamped with its claim time, so the newest row by id is not the
+    newest step. ``end`` (and the version's ``lastUpdate``) must be the newest
+    step; ``start`` stays the first-inserted row."""
+    job_id = str(uuid4())
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    first_step = now - timedelta(minutes=5)
+    last_step = now - timedelta(seconds=20)
+    writer = SyncAuditWriter(seeded["dsn"])
+    try:
+        writer.insert_audit_pre(_pre_row(job_id, "llm", first_step))
+        writer.insert_audit_pre(_pre_row(job_id, "tool", now - timedelta(minutes=2)))
+        writer.insert_audit_pre(_pre_row(job_id, "tool", last_step))
+        # Record-keeping rows inserted last, stamped earlier.
+        writer.insert_audit_pre(
+            _pre_row(job_id, "audit_receipt", now - timedelta(minutes=1))
+        )
+        writer.insert_audit_pre(
+            _pre_row(job_id, "claim_timing", now - timedelta(minutes=4))
+        )
+    finally:
+        writer.close()
+
+    store = await _store(seeded["dsn"])
+    try:
+        time_range = await store.get_audit_time_range(job_id)
+        version = await store.get_job_version(job_id)
+        assert await store.get_audit_time_range(str(uuid4())) is None
+    finally:
+        await store.disconnect()
+
+    def _iso(value: datetime) -> str:
+        return value.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    assert time_range == {"start": _iso(first_step), "end": _iso(last_step)}
+    assert version["lastUpdate"] == _iso(last_step)
+
+
+async def test_last_activity_never_later_than_database_clock(seeded):
+    """Pre rows carry the agent's clock; one running ahead must not report
+    activity in the future."""
+    job_id = str(uuid4())
+    before = datetime.now(timezone.utc)
+    writer = SyncAuditWriter(seeded["dsn"])
+    try:
+        writer.insert_audit_pre(_pre_row(job_id, "tool", before + timedelta(hours=1)))
+    finally:
+        writer.close()
+
+    store = await _store(seeded["dsn"])
+    try:
+        time_range = await store.get_audit_time_range(job_id)
+    finally:
+        await store.disconnect()
+    after = datetime.now(timezone.utc)
+
+    end = datetime.fromisoformat(time_range["end"].replace("Z", "+00:00"))
+    assert before <= end <= after
+
+
 async def test_list_llm_requests_token_usage_and_status(seeded):
     s = await _store(seeded["dsn"])
     try:
