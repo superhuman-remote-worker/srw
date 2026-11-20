@@ -4389,6 +4389,33 @@ class UniversalAgent:
 
         return updated_metadata
 
+    def _workspace_home_is_persistent(self) -> bool:
+        """Whether the README tells this job which paths survive a restart.
+
+        Only a home on a persistent volume (a ``k8s-pvc:`` binding in the job
+        context) and only with a shell tool bound. The context reaches a start
+        and every stateless lease; a pinned resume carries none, so it gets no
+        line rather than a guess.
+        knowledge-base/knowledge/issues/workspace_loss_pause_text_and_liveness_time_mislead.md
+        """
+        from agent.tools.registry import expand_tool_wildcards, filter_tools_by_backend
+        from shared.runtime.core.loader import _has_shell_tools
+        from shared.workspace_disk import volume_kept_from_backing
+
+        binding = (self._job_metadata or {}).get("_workspace_binding")
+        if not isinstance(binding, dict) or (
+            volume_kept_from_backing(binding.get("backing_id")) is not True
+        ):
+            return False
+        try:
+            tool_names = filter_tools_by_backend(
+                expand_tool_wildcards(get_all_tool_names(self.config)),
+                self._workspace_manager.backend,
+            )
+        except Exception:
+            return False
+        return _has_shell_tools(set(tool_names))
+
     async def _setup_job_tools(self) -> None:
         """Set up tools for the current job.
 
@@ -4475,6 +4502,7 @@ class UniversalAgent:
                 ssh_identity_status=getattr(
                     self, "_workspace_ssh_identity_status", None
                 ),
+                persistent_home=self._workspace_home_is_persistent(),
             )
             if readme:
                 self._agent_seed_files["README.md"] = readme

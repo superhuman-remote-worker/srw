@@ -22,6 +22,7 @@ from shared.datasource_policy import (
     datasource_tool_categories as datasource_tool_categories,
     resolve_repo_clone_names as resolve_repo_clone_names,
 )
+from shared.workspace_disk import WORKSPACE_HOME
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,15 @@ def _has_dir(workspace_manager: Any, relative_path: str) -> bool:
         return False
 
 
+PERSISTENT_HOME_FACT = (
+    f"`{WORKSPACE_HOME}` (this workspace included) is on a persistent volume of "
+    "limited size and survives a workspace restart. Running processes and other "
+    "paths such as `/tmp` do not. This workspace is the job's repository: keep "
+    "large files you can re-create (downloads, virtualenvs, model weights) under "
+    f"`{WORKSPACE_HOME}` outside it."
+)
+
+
 def render_workspace_facts(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
@@ -116,6 +126,7 @@ def render_workspace_facts(
     project_name: Optional[str] = None,
     expert: Optional[str] = None,
     ssh_identity_status: Optional[Dict[str, str]] = None,
+    persistent_home: bool = False,
 ) -> str:
     """Render the marker-delimited workspace-facts block for README.md.
 
@@ -124,6 +135,10 @@ def render_workspace_facts(
     Never the job id, description, kickoff, or todos — those stay in the
     virtual ``task_brief.md``. Subjobs share their parent's workspace and
     connector set, so the block is safe on shared workspaces.
+
+    ``persistent_home``: the home directory is on a persistent volume and the
+    agent has a shell, so it is told which paths survive a workspace restart.
+    The caller decides; other backends keep different paths and get no line.
     """
     lines: List[str] = [WORKSPACE_FACTS_START]
 
@@ -149,6 +164,9 @@ def render_workspace_facts(
     else:
         lines.append("_No input documents._")
     lines.append("")
+
+    if persistent_home:
+        lines += ["## Storage", "", PERSISTENT_HOME_FACT, ""]
 
     lines += ["## Layout", "", "- `output/` — deliverables"]
     if _has_dir(workspace_manager, "notes"):
@@ -199,6 +217,7 @@ def inject_workspace_facts(
     project_name: Optional[str] = None,
     expert: Optional[str] = None,
     ssh_identity_status: Optional[Dict[str, str]] = None,
+    persistent_home: bool = False,
 ) -> Optional[str]:
     """Write the workspace-facts block into the workspace's README.md.
 
@@ -228,6 +247,7 @@ def inject_workspace_facts(
             project_name=project_name,
             expert=expert,
             ssh_identity_status=ssh_identity_status,
+            persistent_home=persistent_home,
         )
         content = merge_workspace_facts(existing, block)
         workspace_manager.write_file("README.md", content)

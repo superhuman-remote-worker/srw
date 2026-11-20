@@ -571,6 +571,17 @@ class TestWorkspaceFactsReadme:
         assert self.DESCRIPTION not in content
         assert self.KICKOFF not in content
 
+    def test_storage_line_only_for_a_persistent_home(self, tmp_path):
+        from agent.core.datasource_setup import PERSISTENT_HOME_FACT
+
+        kept = self._inject(self._ws(tmp_path), persistent_home=True)
+        assert f"## Storage\n\n{PERSISTENT_HOME_FACT}\n\n## Layout" in kept
+        assert "`/home/agent-host` (this workspace included)" in PERSISTENT_HOME_FACT
+        assert "`/tmp`" in PERSISTENT_HOME_FACT
+        plain = self._inject(self._ws(tmp_path / "plain"))
+        assert "## Storage" not in plain
+        assert "/home/agent-host" not in plain
+
     def test_project_line_omitted_when_unknown(self, tmp_path):
         content = self._inject(self._ws(tmp_path), expert="Scholar")
         assert "**Project**" not in content
@@ -1131,3 +1142,42 @@ class TestFreshWorkspaceInit:
         agent, ws = self._agent("sandbox")
         agent._initialize_fresh_workspace({})
         ws.initialize.assert_called_once_with()
+
+
+class TestWorkspaceHomeIsPersistent:
+    """The worker names the surviving paths only for a home on a persistent
+    volume (``k8s-pvc:`` binding) and only with a shell tool bound."""
+
+    @staticmethod
+    def _decide(monkeypatch, binding, tools):
+        import agent.agent as agent_module
+        import agent.tools.registry as registry
+        from agent.agent import UniversalAgent
+
+        monkeypatch.setattr(agent_module, "get_all_tool_names", lambda config: tools)
+        monkeypatch.setattr(registry, "expand_tool_wildcards", lambda names: names)
+        monkeypatch.setattr(
+            registry, "filter_tools_by_backend", lambda names, backend: names
+        )
+        metadata = {} if binding is None else {"_workspace_binding": binding}
+        fake = SimpleNamespace(
+            _job_metadata=metadata,
+            config=object(),
+            _workspace_manager=SimpleNamespace(backend=object()),
+        )
+        return UniversalAgent._workspace_home_is_persistent(fake)
+
+    @pytest.mark.parametrize(
+        ("binding", "tools", "expected"),
+        [
+            ({"backing_id": "k8s-pvc:ns:uid"}, ["run_command", "read_file"], True),
+            ({"backing_id": "k8s-pod:ns:uid"}, ["run_command", "read_file"], False),
+            (None, ["run_command", "read_file"], False),
+            ({"backing_id": "k8s-pvc:ns:uid"}, ["read_file", "write_file"], False),
+            # A code-granted member of the shell category is not a shell.
+            ({"backing_id": "k8s-pvc:ns:uid"}, ["srw_cloud_status"], False),
+            ("not-a-dict", ["run_command"], False),
+        ],
+    )
+    def test_decision(self, monkeypatch, binding, tools, expected):
+        assert self._decide(monkeypatch, binding, tools) is expected
