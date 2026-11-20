@@ -390,7 +390,8 @@ class TestTheLoopKeepsItsPassTimes:
                 interval=scheduler.DISPATCH_INTERVAL_SECONDS,
             )
             assert stall is not None and stall.in_pass is True
-            assert stall.seconds == 240.0
+            # ``(started + 240.0) - started`` rounds by the clock's magnitude.
+            assert stall.seconds == pytest.approx(240.0)
             # The dispatcher's own "may I schedule" is what the watchdog asks.
             assert scheduler.may_schedule(state) is True
             leader.clear()
