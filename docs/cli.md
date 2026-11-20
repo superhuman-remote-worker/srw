@@ -316,7 +316,7 @@ the authority's PEM file at `srw login`; it is saved with the context. Plain
 | `… redirects to …` | The server address is not the API's. Check `https`, the host and the path. |
 | `completion finalizing`, `job changed while control was being committed` or `pinned approval agent changed` on `srw approve` or `srw resume` | The job has only just stopped for review and the server has not finished stopping it. Both commands send the request again by themselves for up to 20 seconds. If it stays, look at the job with `srw describe job` and run the command again. |
 | `This job's last completion report could not be processed and is parked …` | The server could not process the job's last report and stopped trying. Resume, approve and the other job controls answer this until an administrator unparks the report (`POST /api/admin/completion-commands/{id}/unpark`, the id is in the message) or force-resolves it. `srw approve` does not ask again for this one. |
-| `Workspace authority retirement is incomplete` | The server is still releasing the job's workspace. `srw delete job` asks again by itself for up to three minutes, and `srw cancel` exits 0 when the job is cancelled. If it stays, look at the job with `srw get` and run the command again. |
+| `Workspace authority retirement is incomplete`, or `strict checkpoint prune blocked by workspace recovery authority` | The server is still releasing the job's workspace. `srw delete job` asks again by itself for up to three minutes, and `srw cancel` exits 0 when the job is cancelled. If it stays, look at the job with `srw get` and run the command again. |
 
 Shell completion: `srw completion bash`, `zsh`, `fish` or `powershell` print
 the script and say how to load it. On macOS, bash completion needs

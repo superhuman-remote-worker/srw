@@ -761,7 +761,8 @@ func (a *App) deleteJob(ctx context.Context, client *api.Client, typed string, y
 			return a.printJSONDocument(response.Body, func() []string { return []string{"job/" + id} })
 		}
 		var failure *exit.Error
-		releasing := errors.As(err, &failure) && failure.Status == http.StatusServiceUnavailable && failure.Code == exit.Failed
+		releasing := errors.As(err, &failure) && failure.Code == exit.Failed &&
+			(failure.Status == http.StatusServiceUnavailable || stillPruning(failure))
 		if !releasing || a.Now().Sub(started) >= api.TeardownTimeout {
 			return stillReleasing(err, "delete job/"+id, id)
 		}
@@ -773,6 +774,17 @@ func (a *App) deleteJob(ctx context.Context, client *api.Client, typed string, y
 			return err
 		}
 	}
+}
+
+// stillPruning recognises the API's 500 for a stateless job whose workspace
+// recovery is not settled yet: "strict checkpoint prune blocked by workspace
+// recovery authority" (or "by legacy workspace recovery"). It comes for about
+// 15 seconds after such a job ends (measured on k3d), deletes nothing, and
+// passes by itself. The server should answer 503 for it, as it does for the
+// pinned lane; until it does, delete job treats it the same way.
+func stillPruning(failure *exit.Error) bool {
+	return failure.Status == http.StatusInternalServerError &&
+		strings.HasPrefix(failure.Message, "strict checkpoint prune blocked by")
 }
 
 type jobListFlags struct {

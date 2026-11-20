@@ -519,6 +519,33 @@ func TestDeleteJobAsksAgainWhileTheWorkspaceIsReleased(t *testing.T) {
 	}
 	want(t, errOut, "Workspace authority retirement is incomplete", "srw get job/"+jobID, "srw delete job/"+jobID)
 
+	// The stateless lane answers a 500 of its own in the same window.
+	h.clock, asked = now, 0
+	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		w.Header().Set("Content-Type", "application/json")
+		if asked < 3 {
+			w.WriteHeader(500)
+			w.Write([]byte(`{"detail":"strict checkpoint prune blocked by workspace recovery authority"}`))
+			return
+		}
+		w.Write([]byte(`{"status":"deleted"}`))
+	})
+	if _, errOut, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.OK || asked != 3 {
+		t.Errorf("the stateless lane's 500 while the workspace is released: %d after %d requests: %s", code, asked, errOut)
+	}
+	// Any other 500 is a failure, sent once.
+	asked = 0
+	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		w.Write([]byte(`{"detail":"Internal server error"}`))
+	})
+	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.Failed || asked != 1 {
+		t.Errorf("another 500: %d after %d requests", code, asked)
+	}
+
 	// A gateway's 502 is not the API releasing the workspace: sent once. The
 	// delete may have reached the API before the gateway gave up, so the
 	// outcome is unknown.
