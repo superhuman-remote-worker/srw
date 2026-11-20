@@ -289,9 +289,43 @@ def format_job_detail(job: dict[str, Any]) -> str:
     lines.extend(_freeze_lines(job))
     lines.extend(_operator_pause_hold_lines(job))
     error_message = job.get("error_message") or job.get("error")
+    clause = _workspace_hold_clause(job)
+    if clause and isinstance(error_message, str) and error_message.endswith(clause):
+        # The hold line above already says what was kept; say it once.
+        error_message = error_message.removesuffix(clause).rstrip()
     if error_message:
         lines.append(f"Error: {truncate_text(error_message, limit=300)}")
     return "\n".join(lines)
+
+
+_WORKSPACE_HOLD_SOURCES = frozenset(
+    {
+        "workspace_recovery_unavailable",
+        "workspace_recovery_exhausted",
+        "workspace_disk_full",
+    }
+)
+
+
+def _job_context(job: dict[str, Any]) -> dict[str, Any] | None:
+    context = job.get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return context if isinstance(context, dict) else None
+
+
+def _workspace_hold_clause(job: dict[str, Any]) -> str | None:
+    """What a workspace hold kept and what is gone, from its recorded facts."""
+    from shared.workspace_disk import recorded_workspace_kept_clause
+
+    context = _job_context(job)
+    hold = context.get("_operator_pause_hold") if context else None
+    if not isinstance(hold, dict) or hold.get("source") not in _WORKSPACE_HOLD_SOURCES:
+        return None
+    return recorded_workspace_kept_clause(hold.get("attention"))
 
 
 def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
@@ -301,36 +335,45 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
         WORKER_EXECUTION_HOLD_MESSAGE,
     )
 
-    context = job.get("context")
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (json.JSONDecodeError, ValueError):
-            return []
-    if isinstance(context, dict) and WORKER_EXECUTION_HOLD_KEY in context:
+    context = _job_context(job)
+    if context is None:
+        return []
+    if WORKER_EXECUTION_HOLD_KEY in context:
         return ["Worker execution hold: " + WORKER_EXECUTION_HOLD_MESSAGE]
-    hold = context.get("_operator_pause_hold") if isinstance(context, dict) else None
+    hold = context.get("_operator_pause_hold")
     if hold is None:
         return []
     detail = hold if isinstance(hold, dict) else {}
+    kept = _workspace_hold_clause(job)
     if detail.get("source") == "workspace_recovery_unavailable":
+        from shared.workspace_disk import RESUME_REQUIRED, dead_workspace_resume_gate
+
         workspace = context.get("workspace_container") or {}
         receipt = (
             workspace.get("recovery_cleanup") if isinstance(workspace, dict) else None
         )
+        attention = detail.get("attention")
+        resume = dead_workspace_resume_gate(
+            recovery_cleanup=isinstance(receipt, dict),
+            volume_kept=(
+                attention.get("volume_kept") if isinstance(attention, dict) else None
+            ),
+        )
         gate = (
             "; cleanup must settle before Resume"
-            if isinstance(receipt, dict) and receipt.get("phase") != "settled"
-            else "; explicit Resume required"
+            if resume == RESUME_REQUIRED
+            and isinstance(receipt, dict)
+            and receipt.get("phase") != "settled"
+            else f"; {resume}"
         )
         return [
-            "Workspace recovery hold: interrupted command outcome is unknown; "
-            "workspace storage and checkpoints retained" + gate
+            "Workspace recovery hold: interrupted command outcome is unknown"
+            f"{gate}. {kept}"
         ]
     if detail.get("source") == "workspace_recovery_exhausted":
         return [
-            "Workspace recovery hold: retries exhausted; workspace and checkpoints "
-            "retained until an explicit Resume or Cancel"
+            "Workspace recovery hold: retries exhausted; held until an explicit "
+            f"Resume or Cancel. {kept}"
         ]
     if detail.get("source") == "workspace_disk_full":
         from shared.workspace_disk import WorkspaceDiskUsage
@@ -341,8 +384,8 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
         )
         measured = f" ({usage.describe()})" if usage is not None else ""
         return [
-            f"Workspace disk full hold{measured}: workspace and checkpoints "
-            "retained until an explicit Resume or Cancel"
+            f"Workspace disk full hold{measured}: held until an explicit Resume "
+            f"or Cancel. {kept}"
         ]
     return [
         "Operator pause hold: held until an explicit resume "

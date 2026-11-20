@@ -46,7 +46,7 @@ from tests.test_vm_workspace_recovery_real_postgres import (
 db = recovery_db
 
 
-async def cleanup_job(db):
+async def cleanup_job(db, *, binding=None):
     job_id, runtime, creation, state = await _create_settled_authoritative_runtime(
         db,
         owner_kind="job",
@@ -55,6 +55,8 @@ async def cleanup_job(db):
     )
     owner = WorkspaceOwner.job(str(job_id))
     state["workspace_container"]["pod_name"] = owner.pod_name
+    if binding is not None:
+        state["_workspace_binding"] = binding
     await db.execute(
         'UPDATE jobs SET context=$2::jsonb,config_override=\'{"workspace":{"backend":"sandbox"}}\' WHERE id=$1',
         job_id,

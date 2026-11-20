@@ -215,9 +215,13 @@ from shared.operator_pause_hold import (
     operator_pause_hold_present_sql,
 )
 from shared.workspace_disk import (
+    RESUME_REQUIRED,
     WorkspaceDiskFullReport,
     WorkspaceVolumeGrowth,
+    dead_workspace_resume_gate,
     workspace_disk_full_action,
+    workspace_hold_facts,
+    workspace_kept_clause,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
@@ -7913,6 +7917,22 @@ class PostgresDB:
                     and attempts <= recovery_cap
                 ):
                     return None
+                # A full disk was measured through a live transport and an
+                # interrupted command passed the live probe: the Pod runs. A
+                # retired runtime, or an exhausted one the reconciler already
+                # retired, is gone. Otherwise this hold removed nothing and
+                # nobody checked the Pod.
+                facts = workspace_hold_facts(
+                    runtime_replaced=(
+                        True
+                        if retired_runtime
+                        or (disk_full is None and workspace.get("status") == "deleted")
+                        else False
+                        if disk_full is not None or interrupted_command
+                        else None
+                    ),
+                    binding=context.get("_workspace_binding"),
+                )
                 outcome = {
                     "status": "handled",
                     "job_id": job_id,
@@ -7931,14 +7951,9 @@ class PostgresDB:
                             if worker_queue_exhausted
                             else f"workspace recovery exhausted after {recovery_cap} attempts; "
                         )
-                        # The retired Pod is gone; only its volume remains, as
-                        # after the dead-workspace arm's own cleanup.
-                        + (
-                            "workspace storage and checkpoints retained; "
-                            if retired_runtime
-                            else "workspace and checkpoints retained; "
-                        )
-                        + "explicit Resume required"
+                        + RESUME_REQUIRED
+                        + ". "
+                        + workspace_kept_clause(**facts)
                     ],
                     **({"cleanup_pending": False} if interrupted_command else {}),
                 }
@@ -7954,6 +7969,7 @@ class PostgresDB:
                     )
                 freeze = {
                     "freeze_type": "workspace_recovery_attention",
+                    **facts,
                     "recovery_attempts": attempts,
                     "budget": "worker_queue"
                     if worker_queue_exhausted
@@ -8158,6 +8174,12 @@ class PostgresDB:
                     return None
                 hold_id = str(uuid4())
                 attempts = int(workspace.get("recovery_attempts") or 0) + 1
+                # A durable report's preserve cleanup deletes the dead Pod; a
+                # legacy report's hold removes nothing.
+                facts = workspace_hold_facts(
+                    runtime_replaced=True if command_uuid is not None else None,
+                    binding=context.get("_workspace_binding"),
+                )
                 outcome = {
                     "status": "handled",
                     "job_id": job_id,
@@ -8167,7 +8189,12 @@ class PostgresDB:
                     "cleanup_pending": command_uuid is not None,
                     "actions": [
                         "workspace transport lost; interrupted command outcome is unknown; "
-                        "workspace storage and checkpoints retained; explicit Resume required"
+                        + dead_workspace_resume_gate(
+                            recovery_cleanup=command_uuid is not None,
+                            volume_kept=facts["volume_kept"],
+                        )
+                        + ". "
+                        + workspace_kept_clause(**facts)
                     ],
                 }
                 updates = {"recovery_attempts": attempts}
@@ -8251,6 +8278,7 @@ class PostgresDB:
                     json.dumps(
                         {
                             "reason": "interrupted_command_outcome_unknown",
+                            **facts,
                             "detail": str(error_detail)[:1000],
                         }
                     ),

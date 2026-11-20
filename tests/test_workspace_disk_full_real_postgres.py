@@ -102,7 +102,8 @@ async def test_full_disk_without_growth_holds_with_its_usage(db):
     assert "transport" not in action and "outcome is unknown" not in action
     assert action.startswith(
         "workspace disk is full (9.3 GiB of 9.8 GiB used, 0 B free); "
-        "growing the volume failed: the cluster refused it"
+        "free space or grow the volume, then Resume; "
+        "growing the volume failed: the cluster refused it."
     )
     held = await retention.current_job(db, job_id)
     assert held["status"] == "paused"
@@ -111,6 +112,8 @@ async def test_full_disk_without_growth_holds_with_its_usage(db):
     assert hold["source"] == "workspace_disk_full"
     assert hold["attention"]["reason"] == "workspace_disk_full"
     assert hold["attention"]["disk"]["available_bytes"] == 0
+    # Measured through a live transport: the Pod still runs.
+    assert hold["attention"]["runtime_replaced"] is False
     workspace = held["context"]["workspace_container"]
     assert workspace["recovery_attempts"] == 2  # not a recovery attempt
     assert "disk_growth" not in workspace  # nothing grew, so nothing is spent
@@ -131,7 +134,8 @@ async def test_grown_volume_resumes_through_ordinary_admission(db):
 
     assert outcome["held_for_resume"] is False
     assert outcome["actions"][0].endswith(
-        "grew the volume to 20 GiB; workspace and checkpoints retained; the job resumes"
+        "grew the volume to 20 GiB; the job resumes. The workspace is still up and "
+        "nothing was removed; its processes and /tmp last until it is released."
     )
     dispatch.assert_called_once_with()
     resumed = await retention.current_job(db, job_id)

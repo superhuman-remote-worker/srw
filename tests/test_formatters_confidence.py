@@ -277,7 +277,12 @@ def test_workspace_recovery_hold_has_accurate_origin():
         }
     )
     assert "Workspace recovery hold" in detail
-    assert "workspace and checkpoints retained" in detail
+    # Written before the kept-and-gone facts: only what is always true.
+    assert (
+        "Workspace recovery hold: retries exhausted; held until an explicit Resume "
+        "or Cancel. The job's saved progress is kept."
+    ) in detail
+    assert "checkpoints" not in detail
     assert "Operator pause hold" not in detail
 
 

@@ -35,6 +35,7 @@ from orchestrator.services.lifecycle.reconciler import InstanceLifecycleReconcil
 from orchestrator.services.lifecycle.workspace_manager import WorkspaceInstanceManager
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from shared.operator_pause_hold import operator_pause_lift_token
+from shared.orch_surface.formatters import format_job_detail
 from shared.worker_queue import claim_worker_batch
 from tests import test_container_recovery_retention_real_postgres as retention
 from tests.test_completion_finalizer_real_postgres import _claimed_runner
@@ -57,8 +58,12 @@ REPORT = {
 }
 DEAD_ARM_ACTION = (
     "workspace transport lost; interrupted command outcome is unknown; "
-    "workspace storage and checkpoints retained; explicit Resume required"
+    "explicit Resume required. Files under /home/agent-host are kept; running "
+    "processes and other paths such as /tmp are gone. The job's saved progress "
+    "is kept."
 )
+# A job's workspace binding as Ready records it: the home is on a volume.
+PVC_BINDING = {"backing_id": "k8s-pvc:agent-workspaces:report-pvc"}
 
 
 def _failed_pod_cluster(db, monkeypatch, owner, runtime):
@@ -84,7 +89,7 @@ async def _drain_queue(db):
         assert cancelled
 
 
-async def _stateless_job(db, monkeypatch):
+async def _stateless_job(db, monkeypatch, *, binding=PVC_BINDING):
     """A processing stateless job on a settled Ready runtime, queue leased."""
 
     await _drain_queue(db)
@@ -93,6 +98,7 @@ async def _stateless_job(db, monkeypatch):
     )
     owner = WorkspaceOwner.job(str(job_id))
     state["workspace_container"]["pod_name"] = owner.pod_name
+    state["_workspace_binding"] = binding
     await db.execute(
         "UPDATE jobs SET context=$2::jsonb, execution_lane='stateless', "
         'config_override=\'{"workspace":{"backend":"sandbox"}}\' WHERE id=$1',
@@ -321,6 +327,8 @@ async def test_t1_report_after_automatic_cleanup_holds_and_resumes_on_the_volume
     hold = held["context"]["_operator_pause_hold"]
     assert hold["source"] == "workspace_recovery_unavailable"
     assert hold["attention"]["reason"] == "interrupted_command_outcome_unknown"
+    assert hold["attention"]["runtime_replaced"] is True
+    assert hold["attention"]["volume_kept"] is True
     held_workspace = held["context"]["workspace_container"]
     assert "recovery_cleanup" not in held_workspace
     assert held_workspace["recovery_attempts"] == 1
@@ -387,6 +395,21 @@ async def test_t2_report_before_cleanup_still_holds_through_the_dead_arm(
     )
     assert held["context"]["workspace_container"]["status"] == "deleted"
     assert held["context"]["workspace_container"]["recovery_attempts"] == 1
+    attention = held["context"]["_operator_pause_hold"]["attention"]
+    assert attention["runtime_replaced"] is True
+    assert attention["volume_kept"] is True
+    # get_job: the hold line says what was kept, the error line only the cause.
+    detail = format_job_detail(held).splitlines()
+    assert (
+        "Workspace recovery hold: interrupted command outcome is unknown; "
+        "explicit Resume required. Files under /home/agent-host are kept; running "
+        "processes and other paths such as /tmp are gone. The job's saved progress "
+        "is kept."
+    ) in detail
+    assert (
+        "Error: workspace transport lost; interrupted command outcome is unknown; "
+        "explicit Resume required."
+    ) in detail
     assert resources["pvc"] is pvc and "pod" not in resources
     (explicit,) = await _intents(db, original["id"])
     assert explicit["admission_source"] == "explicit"
@@ -396,6 +419,48 @@ async def test_t2_report_before_cleanup_still_holds_through_the_dead_arm(
     stats = await _reconciler(db, provisioner).tick()
     assert stats["workspace"]["listed"] == 0
     assert await current_job(db, original["id"]) == held
+
+
+@pytest.mark.asyncio
+async def test_dead_arm_without_a_volume_says_resume_cannot_continue(db, monkeypatch):
+    """An emptyDir home (``k8s-pod:`` backing) went with its Pod, and Resume
+    refuses a recovery cleanup that kept no volume: the hold says so instead
+    of asking for a Resume.
+    knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
+    """
+
+    original, owner, runtime, provisioner, resources = await _stateless_job(
+        db, monkeypatch, binding={"backing_id": "k8s-pod:agent-workspaces:pod-uid"}
+    )
+    runner = await _accept_report(db, original["id"])
+    outcome = await _recover(
+        db,
+        original,
+        runner,
+        provisioner,
+        probe=AsyncMock(return_value=False),
+        dispatch=Mock(),
+    )
+
+    action = (
+        "workspace transport lost; interrupted command outcome is unknown; "
+        "Resume cannot continue this job, so Cancel it. The workspace had no "
+        "persistent volume, so its files went with it; what was pushed to the job "
+        "repository and the job's saved progress are kept."
+    )
+    assert outcome["actions"] == [action]
+    await CompletionFinalizer(db)._finish(runner.command_id, runner.owner, outcome)
+    held = await current_job(db, original["id"])
+    assert held["error_message"] == action
+    attention = held["context"]["_operator_pause_hold"]["attention"]
+    assert attention["runtime_replaced"] is True
+    assert attention["volume_kept"] is False
+    assert (
+        "Workspace recovery hold: interrupted command outcome is unknown; Resume "
+        "cannot continue this job, so Cancel it. The workspace had no persistent "
+        "volume, so its files went with it; what was pushed to the job repository "
+        "and the job's saved progress are kept."
+    ) in format_job_detail(held).splitlines()
 
 
 async def _retired_report(db, monkeypatch, *, retire=True):
@@ -583,7 +648,7 @@ async def test_pinned_lane_report_after_automatic_cleanup_holds(
 
     from tests.test_container_recovery_cleanup_real_postgres import cleanup_job
 
-    original, owner, runtime = await cleanup_job(db)
+    original, owner, runtime = await cleanup_job(db, binding=PVC_BINDING)
     provisioner, resources = _failed_pod_cluster(db, monkeypatch, owner, runtime)
     stats = await _reconciler(db, provisioner).tick()
     assert stats["workspace"]["unhealthy"] == 1
