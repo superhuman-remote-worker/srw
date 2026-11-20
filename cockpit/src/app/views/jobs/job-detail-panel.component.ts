@@ -287,6 +287,21 @@ export function heldForReviewReason(
 }
 
 /**
+ * Why a Job is paused, when the server said so: a workspace hold records its
+ * cause as the row's `error_message` (e.g. the workspace ran out of memory,
+ * and what the next Resume does about it). Both lanes clear the message when
+ * a job runs again, so it is never a stale one. VM-creation and workspace
+ * recovery messages already render above.
+ */
+export function pausedReason(
+  job: Pick<JobSummary, 'status' | 'error_message' | 'vm_creation' | 'workspace_recovery'> | null,
+): string | null {
+  if (!job || job.status !== 'paused' || job.vm_creation || job.workspace_recovery) return null;
+  const reason = (job.error_message ?? '').trim();
+  return reason || null;
+}
+
+/**
  * Why a Job failed, when the server said so (e.g. its workspace image could
  * not be pulled). VM-creation messages already render above.
  */
@@ -419,6 +434,12 @@ export function failureReason(
         <section class="recovery-detail attention held-detail">
           <strong>{{ 'jobs.failureReason' | transloco }}</strong>
           <span>{{ failed }}</span>
+        </section>
+      }
+      @if (!workspaceCreation() && pausedReason(job()); as paused) {
+        <section class="recovery-detail attention held-detail">
+          <strong>{{ 'jobs.detail.pausedReason' | transloco }}</strong>
+          <span>{{ paused }}</span>
         </section>
       }
       @if (heldForReviewReason(job()); as held) {
@@ -1057,6 +1078,7 @@ export class JobDetailPanelComponent {
   protected readonly formatCount = formatCount;
   protected readonly heldForReviewReason = heldForReviewReason;
   protected readonly failureReason = failureReason;
+  protected readonly pausedReason = pausedReason;
   protected readonly formatUsd = formatUsd;
   protected readonly shortId = shortJobId;
   protected readonly isTerminal = isTerminalJobStatus;

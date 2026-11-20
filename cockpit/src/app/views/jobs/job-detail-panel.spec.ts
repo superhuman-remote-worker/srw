@@ -10,6 +10,7 @@ import {
   formatUsd,
   failureReason,
   heldForReviewReason,
+  pausedReason,
   jobExpertLabel,
   jobModelLabel,
   jobPhasesFactKey,
@@ -351,6 +352,83 @@ describe('held-for-review reason', () => {
       const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
       expect(text).toContain('Held for review');
       expect(text).toContain('output/report.md are not in the pushed revision');
+    });
+  });
+});
+
+describe('paused reason', () => {
+  const reason =
+    'workspace ran out of memory (limit 4 GiB) and was stopped; interrupted command outcome is ' +
+    "unknown; explicit Resume required. Resume raises the job's memory limit to 8 GiB. Files " +
+    'under /home/agent-host are kept; running processes and other paths such as /tmp are gone.';
+
+  it('names why a paused job waits, as a failed job names why it failed', () => {
+    expect(pausedReason({status: 'paused', error_message: reason})).toBe(reason);
+  });
+
+  it('stays silent without a reason and for other statuses', () => {
+    expect(pausedReason({status: 'paused', error_message: null})).toBeNull();
+    expect(pausedReason({status: 'paused', error_message: '  '})).toBeNull();
+    expect(pausedReason({status: 'failed', error_message: reason})).toBeNull();
+    expect(pausedReason({status: 'processing', error_message: reason})).toBeNull();
+    expect(pausedReason(null)).toBeNull();
+  });
+
+  it('defers to the VM-creation and workspace recovery blocks', () => {
+    expect(
+      pausedReason({
+        status: 'paused',
+        error_message: reason,
+        vm_creation: {state: 'attention', message: 'x'} as unknown as JobSummary['vm_creation'],
+      }),
+    ).toBeNull();
+    expect(
+      pausedReason({
+        status: 'paused',
+        error_message: reason,
+        workspace_recovery: {state: 'paused_attention'} as unknown as JobSummary['workspace_recovery'],
+      }),
+    ).toBeNull();
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    it('shows the cause and what Resume does on the panel', () => {
+      TestBed.configureTestingModule({
+        imports: [
+          JobDetailPanelComponent,
+          TranslocoTestingModule.forRoot({
+            langs: {en},
+            translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+          }),
+        ],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {
+        value: signal({
+          id: 'job-oom',
+          description: 'Transcribe the talk',
+          status: 'paused',
+          created_at: '2026-11-20T08:00:00Z',
+          error_message: reason,
+        } as unknown as JobSummary),
+      });
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+      fixture.detectChanges();
+
+      const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+      expect(text).toContain('Why it is paused');
+      expect(text).toContain('workspace ran out of memory (limit 4 GiB)');
+      expect(text).toContain("Resume raises the job's memory limit to 8 GiB.");
     });
   });
 });

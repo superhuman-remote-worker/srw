@@ -398,6 +398,11 @@ export type {JobCloudAction};
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
                       </div>
                     }
+                    @if (row.job.status === 'paused' && row.job.error_message && !row.job.vm_creation && !row.job.workspace_creation && !row.job.workspace_recovery) {
+                      <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
+                        {{ 'jobs.detail.pausedReason' | transloco }}: {{ row.job.error_message }}
+                      </div>
+                    }
                   </td>
                   <td class="project-cell">
                     <span

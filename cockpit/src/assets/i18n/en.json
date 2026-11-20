@@ -1010,6 +1010,7 @@
       "phasesNo": "No",
       "phasesYes": "Yes",
       "heldForReview": "Held for review",
+      "pausedReason": "Why it is paused",
       "loading": "Loading details…",
       "model": "Model",
       "modelDefault": "Expert default",

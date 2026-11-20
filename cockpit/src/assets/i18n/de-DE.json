@@ -1010,6 +1010,7 @@
       "phasesNo": "Nein",
       "phasesYes": "Ja",
       "heldForReview": "Zur Prüfung angehalten",
+      "pausedReason": "Warum er pausiert ist",
       "loading": "Details werden geladen…",
       "model": "Modell",
       "modelDefault": "Experten-Standard",
