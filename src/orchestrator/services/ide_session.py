@@ -2127,7 +2127,7 @@ class IdeSessionService:
             entrypoint_script = (
                 "mkdir -p /home/coder/workspace && "
                 f"exec code-server --bind-addr 0.0.0.0:{host_port} "
-                "--auth none /home/coder/workspace"
+                "--auth none --disable-proxy /home/coder/workspace"
             )
 
             cmd = [

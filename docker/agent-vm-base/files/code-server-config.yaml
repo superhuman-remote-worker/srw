@@ -16,6 +16,10 @@
 bind-addr: 127.0.0.1:8080
 auth: none
 cert: false
+# No /proxy/<port>/ or /absproxy/<port>/ routes: the IDE is reached through
+# /api/ide/<id>/proxy/, so a page served on a guest port would run on the
+# origin that serves /api, with the viewer's session.
+disable-proxy: true
 
 # Kept outside $HOME so the IDE file explorer stays clean (mirrors the
 # container workspace entrypoint). Created + chowned to agent-host in stage2.
