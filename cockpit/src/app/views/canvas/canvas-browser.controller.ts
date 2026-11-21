@@ -75,6 +75,14 @@ interface LastPresentation {
 }
 
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
+/**
+ * Longest a stream socket may stay in CONNECTING. The broker runs the
+ * workspace's `browser-exec stream_info` (which may start Chromium) before it
+ * accepts, so a healthy handshake can take seconds; one sent to an
+ * orchestrator pod that is going away can hang for minutes and never fail
+ * (WP1 k3d run, answer 8), and the backoff only runs after a close or error.
+ */
+export const BROWSER_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 /** Pane-local owner of one shared-browser socket and decoded bitmap pipeline. */
 @Injectable()
@@ -101,6 +109,7 @@ export class CanvasBrowserController {
   private decodeEpoch: number | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private terminalIdentity: string | null = null;
   private destroyed = false;
 
@@ -251,13 +260,23 @@ export class CanvasBrowserController {
       return;
     }
     this.socket = socket;
+    socket.onopen = () => {
+      if (this.isCurrent(epoch, socket)) this.clearHandshakeTimer();
+    };
     socket.onmessage = (event) => this.handleMessage(epoch, socket, event);
     socket.onclose = (event) => this.handleClose(epoch, socket, event);
     socket.onerror = () => this.handleSocketError(epoch, socket);
+    this.handshakeTimer = this.timeouts.set(() => {
+      this.handshakeTimer = null;
+      if (this.isCurrent(epoch, socket) && socket.readyState === 0) {
+        this.scheduleReconnect('browser_stream_handshake_timeout');
+      }
+    }, BROWSER_HANDSHAKE_TIMEOUT_MS);
   }
 
   private handleMessage(epoch: number, socket: WebSocket, event: MessageEvent<unknown>): void {
     if (!this.isCurrent(epoch, socket)) return;
+    this.clearHandshakeTimer();
     if (!(event.data instanceof ArrayBuffer)) {
       this.finishTerminal('error', 'invalid_browser_protocol');
       return;
@@ -460,7 +479,9 @@ export class CanvasBrowserController {
     const socket = this.socket;
     this.socket = null;
     this.epoch += 1;
+    this.clearHandshakeTimer();
     if (!socket) return;
+    socket.onopen = null;
     socket.onmessage = null;
     socket.onclose = null;
     socket.onerror = null;
@@ -476,6 +497,11 @@ export class CanvasBrowserController {
   private clearReconnectTimer(): void {
     if (this.reconnectTimer !== null) this.timeouts.clear(this.reconnectTimer);
     this.reconnectTimer = null;
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer !== null) this.timeouts.clear(this.handshakeTimer);
+    this.handshakeTimer = null;
   }
 
   private clearFrame(): void {

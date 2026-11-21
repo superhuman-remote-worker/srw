@@ -4,6 +4,7 @@ import { environment } from '../../core/environment';
 import { CanvasState } from '../../core/models/canvas.model';
 import { BROWSER_MESSAGE_TYPE, BrowserPageState } from './canvas-browser-protocol';
 import {
+  BROWSER_HANDSHAKE_TIMEOUT_MS,
   CANVAS_BROWSER_BITMAP_FACTORY,
   CANVAS_BROWSER_SOCKET_FACTORY,
   CANVAS_BROWSER_TIMEOUTS,
@@ -83,6 +84,7 @@ class FakeSocket {
   readonly closes: Array<{ code?: number; reason?: string }> = [];
   binaryType: BinaryType = 'blob';
   readyState = 0;
+  onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
@@ -91,6 +93,7 @@ class FakeSocket {
 
   open(): void {
     this.readyState = 1;
+    this.onopen?.(new Event('open'));
   }
 
   send(data: ArrayBuffer): void {
@@ -427,7 +430,7 @@ describe('Canvas shared-browser controller', () => {
 
     expect(controller.connectionStatus()).toBe('reconnecting');
     expect(controller.errorCode()).toBe('browser_stream_unavailable');
-    expect(timeouts.delays).toEqual([250]);
+    expect(timeouts.delays).toEqual([BROWSER_HANDSHAKE_TIMEOUT_MS, 250]);
 
     timeouts.runNext();
     expect(sockets).toHaveLength(2);
@@ -629,6 +632,41 @@ describe('Canvas shared-browser controller', () => {
     controller.retry();
     expect(sockets).toHaveLength(2);
     expect(controller.connectionStatus()).toBe('connecting');
+  });
+
+  it('gives up on a handshake that never completes and reconnects', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    const stuck = sockets[0];
+    expect(timeouts.delays).toEqual([BROWSER_HANDSHAKE_TIMEOUT_MS]);
+
+    timeouts.runNext();
+
+    expect(stuck.closes).toHaveLength(1);
+    expect(controller.connectionStatus()).toBe('reconnecting');
+    expect(controller.errorCode()).toBe('browser_stream_handshake_timeout');
+    expect(timeouts.delays.at(-1)).toBe(250);
+    stuck.open();
+    stuck.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    expect(controller.connectionStatus()).toBe('reconnecting');
+
+    timeouts.runNext();
+    expect(sockets).toHaveLength(2);
+    sockets[1].open();
+    expect(timeouts.pending).toBe(0);
+    sockets[1].message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    expect(controller.connectionStatus()).toBe('ready');
+  });
+
+  it('keeps a slow but opened handshake and a message-first socket alive', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    sockets[0].open();
+    expect(timeouts.pending).toBe(0);
+
+    controller.syncPresentation(true, 'thread-1', browserState(2));
+    expect(timeouts.pending).toBe(1);
+    sockets[1].message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    expect(timeouts.pending).toBe(0);
+    expect(sockets[1].closes).toHaveLength(0);
   });
 
   it('destroys with no live listener, timer, socket, or bitmap', async () => {
