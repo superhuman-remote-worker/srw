@@ -758,7 +758,9 @@ class WorkspaceBackend(ABC):
                 command.
 
         Returns:
-            Confirmation message.
+            ``SEND_CONFIRMATION_TEMPLATE`` (``shell_protocol``) when the input
+            was typed. Any other text is a refusal (a busy tab, a blocked
+            command): nothing was typed and the caller must show it.
         """
         raise NotImplementedError("Shell operations not supported by this backend")
 

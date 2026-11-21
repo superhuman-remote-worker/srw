@@ -43,6 +43,7 @@ from shared.runtime.core.shell_protocol import (
     INTERACTIVE_PROMPT_TEMPLATE,
     NO_CHANGE_TIMEOUT_SECONDS,
     NONINTERACTIVE_ENV_EXPORT,
+    SEND_CONFIRMATION_TEMPLATE,
     SESSION_ENDED_MESSAGE,
     STILL_RUNNING_HARDCAP_TEMPLATE,
     STILL_RUNNING_TEMPLATE,
@@ -114,6 +115,12 @@ _SHELL_WAIT_RESUMES = 3
 # shell_cancel: seconds to wait after a Ctrl+C before re-checking whether the
 # tab returned to a prompt. Two attempts, then fall back to a tab reset.
 _CANCEL_SETTLE_SECONDS = 0.5
+
+# shell_send: after a keys-mode Ctrl+C on a tab whose command still holds the
+# guard, how long to wait for that command to leave the terminal before the
+# tab is freed, and how often to look (_release_guard_after_interrupt).
+_INTERRUPT_SETTLE_SECONDS = 3.0
+_INTERRUPT_POLL_SECONDS = 0.25
 
 # Transport-level keepalive + SFTP channel timeout: without these, a
 # blackholed connection (network partition, silently-dead VM) hangs SFTP
@@ -3734,6 +3741,110 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             )
         tab.pending_sentinel = sentinel
 
+    @staticmethod
+    def _shell_foreground_check_command(pane: str) -> str:
+        """Read-only check: is the pane's shell alone in the foreground?
+
+        Prints ``shell`` when the terminal's foreground process group is the
+        pane shell's own and holds no other process: the shell reads the next
+        line typed. Prints ``busy`` while another program owns the terminal (a
+        REPL, ssh, a server still shutting down, the child shell of a
+        multi-line command; its name can be ``bash`` too, so the pane's
+        current-command name proves nothing), and ``unknown`` when the pane
+        or ``/proc`` cannot be read. It always exits 0, so a failed look never
+        invalidates the tab.
+        """
+        script = (
+            f"pid=$(tmux display-message -p -t {pane} '#{{pane_pid}}' 2>/dev/null)\n"
+            'case "$pid" in ""|*[!0-9]*) echo unknown; exit 0 ;; esac\n'
+            '{ read -r stat < "/proc/$pid/stat"; } 2>/dev/null '
+            "|| { echo unknown; exit 0; }\n"
+            # The fields after the ")" that closes the command name are:
+            # state ppid pgrp session tty_nr tpgid.
+            'set -- ${stat##*") "}\n'
+            '[ "$3" = "$pid" ] && [ "$6" = "$pid" ] || { echo busy; exit 0; }\n'
+            # Without job control a child stays in the shell's group.
+            "for file in /proc/[0-9]*/stat; do\n"
+            '  { read -r line < "$file"; } 2>/dev/null || continue\n'
+            '  set -- ${line##*") "}\n'
+            "  other=${file#/proc/}\n"
+            '  if [ "$3" = "$pid" ] && [ "${other%/stat}" != "$pid" ]; then\n'
+            "    echo busy; exit 0\n"
+            "  fi\n"
+            "done\n"
+            "echo shell"
+        )
+        return f"sh -c {shlex.quote(script)}"
+
+    def _shell_alone_in_foreground(self, tab_name: str) -> bool:
+        """Whether the tab's own shell, and nothing else, has the terminal."""
+        tab = self._tabs[tab_name]
+        assert tab.pane_id is not None
+        output = self._tmux_exec_checked(
+            self._shell_foreground_check_command(self._tmux_pane_target(tab_name)),
+            operation=f"check foreground of {tab_name}",
+            pane_context=(tab_name, tab.pane_id),
+        )
+        return output.strip() == "shell"
+
+    def _release_guard_after_interrupt(self, tab_name: str) -> None:
+        """Free a shell tab whose interrupted command cannot report completion.
+
+        Ctrl-C flushes the terminal's typeahead, which holds the completion
+        line of a command started with a ``working_dir``, and an interactive
+        shell drops the rest of a command line whose foreground child died of
+        SIGINT. The completion record of an interrupted command therefore
+        never prints, and its guard would refuse every later command on the
+        tab. Once the tab's shell is alone in the foreground again, the cancel
+        probe that ``shell_cancel`` uses (CAS on this guard, Ctrl-C, exact
+        completion record) proves it reads commands and frees the tab. While
+        anything else keeps the terminal (a REPL, an ssh session, a server
+        that ignores SIGINT or is still shutting down) the guard stays and
+        nothing is typed; unlike ``shell_cancel`` this never resets the tab.
+        Called with the tab lock held.
+        """
+        tab = self._tabs.get(tab_name)
+        if tab is None or tab.tab_type != "shell" or tab.pending_sentinel is None:
+            return
+        pending = tab.pending_sentinel
+        deadline = time.monotonic() + _INTERRUPT_SETTLE_SECONDS
+        while not self._shell_alone_in_foreground(tab_name):
+            if time.monotonic() >= deadline:
+                logger.info(
+                    "Ctrl+C left tab %r busy after %.1fs: keeping its guard "
+                    "(session=%s)",
+                    tab_name,
+                    _INTERRUPT_SETTLE_SECONDS,
+                    self._session_name,
+                )
+                return
+            time.sleep(_INTERRUPT_POLL_SECONDS)
+        if pending != _INHERITED_BUSY_SENTINEL and any(
+            _parse_shell_completion_record(line, pending) is not None
+            for line in self._tmux_capture(tab_name)
+        ):
+            # The command handled SIGINT and its own record printed.
+            self._clear_tab_pending_if_current(tab_name, pending)
+            return
+        probe = f"__DONE_{uuid.uuid4().hex[:12]}__"
+        self._cancel_and_probe_shell_command(
+            tab_name,
+            expected=pending,
+            sentinel=probe,
+        )
+        time.sleep(_CANCEL_SETTLE_SECONDS)
+        # A probe record that prints later frees the tab at its next command.
+        if any(
+            _parse_shell_completion_record(line, probe) is not None
+            for line in self._tmux_capture(tab_name)
+        ):
+            self._clear_tab_pending_if_current(tab_name, probe)
+            logger.info(
+                "Ctrl+C freed tab %r: its shell is back at the prompt (session=%s)",
+                tab_name,
+                self._session_name,
+            )
+
     def _stateless_tmux_create_shell(self, token: str, generation: str) -> str:
         """Return the locked shell fragment that creates one fenced session."""
         session = self._tmux_target()
@@ -5171,8 +5282,11 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         "working_dir requires an idle shell command target"
                     )
                 self._tmux_send_keys(tab_name, text, enter=enter)
+                if not enter and text == "C-c":
+                    # The interrupted command cannot report completion.
+                    self._release_guard_after_interrupt(tab_name)
             tab.last_activity = datetime.now(timezone.utc)
-        return f"Sent to '{tab_name}'"
+        return SEND_CONFIRMATION_TEMPLATE.format(tab=tab_name)
 
     @_rebuilds_ended_session
     def shell_cancel(self, tab_name: str = "default") -> str:

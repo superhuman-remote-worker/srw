@@ -34,6 +34,7 @@ from agent.services.cloud_mount.guardrails import (
     format_cloud_scan_guard_message,
 )
 
+from shared.runtime.core.shell_protocol import is_send_confirmation
 from shared.tool_catalog.definitions import (
     SHELL_TOOLS_METADATA as SHELL_TOOLS_METADATA,
 )
@@ -583,7 +584,8 @@ def create_shell_tools(
               ONLY for long-running background processes (dev servers, builds,
               VPN connections). Use shell_read() later to check progress. When
               `working_dir` is set, the command is anchored there and the tab
-              returns to the workspace root after the command exits.
+              returns to the workspace root after the command exits on its
+              own (after a "C-c" it stays in `working_dir`).
 
         SSH workflow (use sync mode, not is_async):
           1. shell_execute(command="ssh user@host", name="srv")
@@ -624,6 +626,15 @@ def create_shell_tools(
             _shell_execute(command, name, tail, is_async, keys, timeout, working_dir),
         )
 
+    def _refusal(result: str) -> str:
+        # A refusal quotes the tab's terminal state: bound it like tab output.
+        return _truncate_output(
+            result,
+            max_output_chars,
+            "shell output",
+            secrets=workspace_secrets(context),
+        )
+
     def _shell_execute(
         command: str,
         name: str,
@@ -653,6 +664,8 @@ def create_shell_tools(
                 freeze_msg = _check_sudo_freeze(result, command, context)
                 if freeze_msg:
                     return freeze_msg
+                if not is_send_confirmation(result):
+                    return f"{tab_header}\n{_refusal(result)}"
                 time.sleep(0.5)
                 text, metadata = sm.read_with_offset(name, lines=tail)
                 text = _truncate_output(
@@ -693,6 +706,10 @@ def create_shell_tools(
                 freeze_msg = _check_sudo_freeze(result, command, context)
                 if freeze_msg:
                     return freeze_msg
+                # A busy tab or a blocked command typed nothing: say so, or
+                # the tab's unchanged output reads as if the command started.
+                if not is_send_confirmation(result):
+                    return f"{tab_header}\n{_refusal(result)}"
                 time.sleep(0.5)
                 text, metadata = sm.read(name, since_cursor=True)
                 text = _truncate_output(

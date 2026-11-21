@@ -5633,6 +5633,290 @@ class TestRemoteBackendShellSend:
             )
 
 
+class _FakeClock:
+    """Stands in for the remote module's ``time``: sleeping advances it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class TestRemoteBackendCtrlCReleasesGuard:
+    """A keys-mode Ctrl+C frees the tab once its shell has the terminal again.
+
+    Ctrl+C flushes the typeahead that holds the completion line of an async
+    command, so the guard of an interrupted command never clears by itself
+    and every later command on the tab is refused (k3d, 2026-11-21: a dev
+    server stopped with C-c could not be started again on its tab).
+    """
+
+    PENDING = "__DONE_aaaaaaaaaaaa__"
+    PROBE = "__DONE_bbbbbbbbbbbb__"
+
+    @classmethod
+    def _busy_tab(cls, remote_backend, pending=PENDING):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        tab = _RemoteTab("api", pane_id="%1")
+        tab.pending_sentinel = pending
+        backend._tabs["api"] = tab
+        return backend, tab
+
+    @staticmethod
+    def _clear(tab):
+        def clear(_name, expected):
+            assert tab.pending_sentinel == expected
+            tab.pending_sentinel = None
+
+        return clear
+
+    def test_shell_back_in_foreground_frees_tab_for_next_command(self, remote_backend):
+        backend, tab = self._busy_tab(remote_backend)
+
+        def install_probe(_name, *, expected, sentinel):
+            assert expected == self.PENDING
+            tab.pending_sentinel = sentinel
+
+        with (
+            patch("shared.runtime.core.backends.remote.time", _FakeClock()),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch.object(backend, "_tmux_send_keys") as send_keys,
+            patch.object(
+                backend, "_shell_alone_in_foreground", side_effect=[False, True]
+            ) as foreground,
+            patch.object(
+                backend,
+                "_cancel_and_probe_shell_command",
+                side_effect=install_probe,
+            ) as probe,
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[
+                    ["Serving on :8000", "^C", "$ "],
+                    [f"{self.PROBE} 130 /workspace/app", "$ "],
+                ],
+            ),
+            patch.object(
+                backend, "_clear_tab_pending", side_effect=self._clear(tab)
+            ) as clear,
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
+        ):
+            uuid4.return_value.hex = "b" * 32
+            result = backend.shell_send("api", "C-c", enter=False, allow_busy=True)
+
+            assert result == "Sent to 'api'"
+            send_keys.assert_called_once_with("api", "C-c", enter=False)
+            assert foreground.call_count == 2
+            probe.assert_called_once_with(
+                "api", expected=self.PENDING, sentinel=self.PROBE
+            )
+            clear.assert_called_once_with("api", self.PROBE)
+            assert tab.pending_sentinel is None
+
+            uuid4.return_value.hex = "c" * 32
+            again = backend.shell_send(
+                "api", "python -m uvicorn main:app", working_dir="app"
+            )
+
+        assert again == "Sent to 'api'"
+        reserve.assert_called_once()
+        assert reserve.call_args.kwargs["expected"] is None
+        assert "python -m uvicorn main:app" in reserve.call_args.kwargs["command"]
+
+    def test_program_still_holding_terminal_keeps_guard_and_types_nothing(
+        self, remote_backend
+    ):
+        """A REPL, ssh or a server that ignores SIGINT keeps its tab."""
+        backend, tab = self._busy_tab(remote_backend)
+        clock = _FakeClock()
+
+        with (
+            patch("shared.runtime.core.backends.remote.time", clock),
+            patch.object(backend, "_tmux_send_keys") as send_keys,
+            patch.object(
+                backend, "_shell_alone_in_foreground", return_value=False
+            ) as foreground,
+            patch.object(backend, "_cancel_and_probe_shell_command") as probe,
+            patch.object(
+                backend, "_tmux_capture", return_value=[">>> ", "KeyboardInterrupt"]
+            ) as capture,
+            patch.object(backend, "_clear_tab_pending") as clear,
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
+        ):
+            result = backend.shell_send("api", "C-c", enter=False, allow_busy=True)
+            assert result == "Sent to 'api'"
+            send_keys.assert_called_once_with("api", "C-c", enter=False)
+            # Looked until the settle window ran out, then left the tab alone.
+            assert foreground.call_count > 2
+            assert clock.now >= 3.0
+            probe.assert_not_called()
+            capture.assert_not_called()
+            clear.assert_not_called()
+            assert tab.pending_sentinel == self.PENDING
+
+            refused = backend.shell_send("api", "echo next")
+
+        assert "previous command still running" in refused
+        reserve.assert_not_called()
+
+    def test_command_that_printed_its_own_record_is_cleared_without_probe(
+        self, remote_backend
+    ):
+        backend, tab = self._busy_tab(remote_backend)
+
+        with (
+            patch("shared.runtime.core.backends.remote.time", _FakeClock()),
+            patch.object(backend, "_tmux_send_keys"),
+            patch.object(backend, "_shell_alone_in_foreground", return_value=True),
+            patch.object(backend, "_cancel_and_probe_shell_command") as probe,
+            patch.object(
+                backend,
+                "_tmux_capture",
+                return_value=["^C", f"{self.PENDING} 0 /workspace", "$ "],
+            ),
+            patch.object(
+                backend, "_clear_tab_pending", side_effect=self._clear(tab)
+            ) as clear,
+        ):
+            backend.shell_send("api", "C-c", enter=False, allow_busy=True)
+
+        probe.assert_not_called()
+        clear.assert_called_once_with("api", self.PENDING)
+        assert tab.pending_sentinel is None
+
+    def test_inherited_busy_guard_is_probed_too(self, remote_backend):
+        backend, tab = self._busy_tab(remote_backend, _INHERITED_BUSY_SENTINEL)
+
+        def install_probe(_name, *, expected, sentinel):
+            tab.pending_sentinel = sentinel
+
+        with (
+            patch("shared.runtime.core.backends.remote.time", _FakeClock()),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch.object(backend, "_tmux_send_keys"),
+            patch.object(backend, "_shell_alone_in_foreground", return_value=True),
+            patch.object(
+                backend,
+                "_cancel_and_probe_shell_command",
+                side_effect=install_probe,
+            ) as probe,
+            # An inherited guard has no record of its own to look for, so
+            # the only capture is the probe's.
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[[f"{self.PROBE} 130 /workspace"]],
+            ),
+            patch.object(backend, "_clear_tab_pending", side_effect=self._clear(tab)),
+        ):
+            uuid4.return_value.hex = "b" * 32
+            backend.shell_send("api", "C-c", enter=False, allow_busy=True)
+
+        probe.assert_called_once_with(
+            "api", expected=_INHERITED_BUSY_SENTINEL, sentinel=self.PROBE
+        )
+        assert tab.pending_sentinel is None
+
+    def test_probe_record_not_yet_printed_leaves_probe_guard(self, remote_backend):
+        """The next command's pre-flight consumes a late probe record."""
+        backend, tab = self._busy_tab(remote_backend)
+
+        def install_probe(_name, *, expected, sentinel):
+            tab.pending_sentinel = sentinel
+
+        with (
+            patch("shared.runtime.core.backends.remote.time", _FakeClock()),
+            patch("shared.runtime.core.backends.remote.uuid.uuid4") as uuid4,
+            patch.object(backend, "_tmux_send_keys"),
+            patch.object(backend, "_shell_alone_in_foreground", return_value=True),
+            patch.object(
+                backend,
+                "_cancel_and_probe_shell_command",
+                side_effect=install_probe,
+            ),
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[
+                    ["$ "],
+                    ["$ "],
+                    [f"{self.PROBE} 130 /workspace", "$ "],
+                ],
+            ),
+            patch.object(
+                backend, "_clear_tab_pending", side_effect=self._clear(tab)
+            ) as clear,
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
+        ):
+            uuid4.return_value.hex = "b" * 32
+            backend.shell_send("api", "C-c", enter=False, allow_busy=True)
+            assert tab.pending_sentinel == self.PROBE
+            clear.assert_not_called()
+
+            uuid4.return_value.hex = "c" * 32
+            assert backend.shell_send("api", "echo next") == "Sent to 'api'"
+
+        clear.assert_called_once_with("api", self.PROBE)
+        reserve.assert_called_once()
+
+    @pytest.mark.parametrize("keys", ["Up", "C-d", "C-z", "q"])
+    def test_other_keys_never_look_or_probe(self, remote_backend, keys):
+        backend, tab = self._busy_tab(remote_backend)
+        with (
+            patch.object(backend, "_tmux_send_keys"),
+            patch.object(backend, "_shell_alone_in_foreground") as foreground,
+            patch.object(backend, "_cancel_and_probe_shell_command") as probe,
+        ):
+            backend.shell_send("api", keys, enter=False, allow_busy=True)
+        foreground.assert_not_called()
+        probe.assert_not_called()
+        assert tab.pending_sentinel == self.PENDING
+
+    def test_idle_or_non_shell_tab_is_not_looked_at(self, remote_backend):
+        backend, tab = self._busy_tab(remote_backend, pending=None)
+        repl = _RemoteTab("py", tab_type="repl", pane_id="%2")
+        repl.pending_sentinel = _INHERITED_BUSY_SENTINEL
+        backend._tabs["py"] = repl
+        with (
+            patch.object(backend, "_tmux_send_keys"),
+            patch.object(backend, "_shell_alone_in_foreground") as foreground,
+            patch.object(backend, "_cancel_and_probe_shell_command") as probe,
+        ):
+            backend.shell_send("api", "C-c", enter=False, allow_busy=True)
+            backend.shell_send("py", "C-c", enter=False, allow_busy=True)
+        foreground.assert_not_called()
+        probe.assert_not_called()
+        assert repl.pending_sentinel == _INHERITED_BUSY_SENTINEL
+
+    @pytest.mark.parametrize(
+        ("printed", "alone"),
+        [("shell\n", True), ("busy\n", False), ("unknown\n", False), ("", False)],
+    )
+    def test_foreground_check_is_a_read_only_pane_look(
+        self, remote_backend, printed, alone
+    ):
+        backend, _ = self._busy_tab(remote_backend)
+        with (
+            patch.object(
+                backend, "_tmux_exec_checked", return_value=printed
+            ) as execute,
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+        ):
+            assert backend._shell_alone_in_foreground("api") is alone
+        mutate.assert_not_called()
+        command = execute.call_args.args[0]
+        assert command.startswith("sh -c ")
+        assert "display-message -p -t %1" in command
+        assert "#{pane_pid}" in command
+        assert execute.call_args.kwargs["pane_context"] == ("api", "%1")
+
+
 class TestRemoteBackendShellCancel:
     """Cancellation is released only by its exact completion probe."""
 
