@@ -28,6 +28,10 @@ from orchestrator.services.canvas_ssh import (
     resolve_canvas_workspace_target,
     vm_canvas_route_available,
 )
+from orchestrator.services.shared_browser_vm import (
+    VMViewerAccess,
+    vm_idle_release_enabled,
+)
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
@@ -42,6 +46,8 @@ STREAM_INFO_MAX_OUTPUT = 64 * 1024
 # opened on. A WebSocket outlives the proof that admitted it; the IDE relay
 # (ide_proxy_gateway._IDE_WS_LIFECYCLE_RECHECK_S) uses the same interval.
 STREAM_WORKSPACE_RECHECK_S = 15.0
+# A VM viewer's access lease expires two minutes after its last renewal.
+VM_VIEWER_ACCESS_RENEW_S = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +543,7 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     protocol_closed = False
     target: RemoteWorkspaceTarget | None = None
     workspace_verdict: VMAttestationVerdict | None = None
+    viewer_access: VMViewerAccess | None = None
     try:
         try:
 
@@ -629,6 +636,14 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
 
         await ws.accept()
         accepted = True
+        if target.vm_runtime is not None and vm_idle_release_enabled():
+            # The VM mirror of touch_activity below: an open viewer holds a VM
+            # access lease, so the idle lifecycle does not put the VM to sleep
+            # under it. Best effort, like the activity mark.
+            viewer_access = VMViewerAccess(
+                db, thread_id, str(current_user.get("id") or "")
+            )
+            await viewer_access.acquire()
         async with _open_loopback(
             target=target,
             destination_port=current_config.stream_port,
@@ -688,6 +703,12 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                         )
                     await asyncio.sleep(current_config.activity_interval_seconds)
 
+            async def keep_vm_awake() -> None:
+                while True:
+                    await asyncio.sleep(VM_VIEWER_ACCESS_RENEW_S)
+                    if viewer_access is not None:
+                        await viewer_access.renew()
+
             async def supervise_workspace() -> None:
                 # Ends the relay once its workspace is suspended, restored,
                 # replaced (a VM taking over from the container, or the
@@ -711,6 +732,8 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                 asyncio.create_task(touch_activity()),
                 asyncio.create_task(supervise_workspace()),
             ]
+            if viewer_access is not None:
+                tasks.append(asyncio.create_task(keep_vm_awake()))
             done: set[asyncio.Task] = set()
             try:
                 done, _ = await asyncio.wait(
@@ -737,6 +760,8 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     finally:
         if reserved:
             _release_viewer(thread_id)
+        if viewer_access is not None:
+            await viewer_access.close()
         if (
             accepted
             and not protocol_closed

@@ -361,8 +361,8 @@ def test_ready_but_unauthenticated_vm_is_unattested(same_cluster, monkeypatch, v
     assert capability.reason == "workspace_unattested"
 
 
-@pytest.mark.parametrize("status", ["provisioning", "suspending", "suspended"])
-def test_vm_that_is_not_ready_is_unattested_on_the_same_cluster(
+@pytest.mark.parametrize("status", ["provisioning", "starting", "ssh_pending"])
+def test_vm_coming_up_is_openable_like_a_cold_container(
     same_cluster, monkeypatch, status
 ):
     _no_network(monkeypatch)
@@ -371,10 +371,72 @@ def test_vm_that_is_not_ready_is_unattested_on_the_same_cluster(
 
     assert capability.model_dump(mode="json") == {
         "feature_enabled": True,
-        "can_open_browser": False,
+        "can_open_browser": True,
         "workspace_ready": False,
-        "reason": "workspace_unattested",
+        "reason": None,
     }
+
+
+@pytest.mark.parametrize("status", ["suspending", "suspended"])
+def test_vm_asleep_is_openable_only_under_idle_release(
+    same_cluster, monkeypatch, status
+):
+    _no_network(monkeypatch)
+    thread = vm_thread(vm_context(status=status, rootdisk="kept"))
+    thread["status"] = "suspended"
+
+    monkeypatch.delenv("WORKSPACE_IDLE_RELEASE_ENABLED", raising=False)
+    without = browser_canvas.browser_capability(thread)
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    with_release = browser_canvas.browser_capability(thread)
+
+    # No idle release: nothing would wake the VM for the browser.
+    assert (without.can_open_browser, without.reason) == (
+        False,
+        "workspace_unattested",
+    )
+    assert with_release.model_dump(mode="json") == {
+        "feature_enabled": True,
+        "can_open_browser": True,
+        "workspace_ready": False,
+        "reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("thread_status", "vm_status"),
+    [
+        ("active", "failed"),
+        ("active", "deleted"),
+        ("ended", "provisioning"),
+        ("ended", "suspended"),
+    ],
+)
+def test_vm_nothing_will_bring_up_is_unattested(
+    same_cluster, monkeypatch, thread_status, vm_status
+):
+    _no_network(monkeypatch)
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    thread = vm_thread(vm_context(status=vm_status))
+    thread["status"] = thread_status
+
+    capability = browser_canvas.browser_capability(thread)
+
+    assert capability.can_open_browser is False
+    assert capability.reason == "workspace_unattested"
+
+
+def test_cold_vm_without_transport_is_transport_unavailable(same_cluster, monkeypatch):
+    monkeypatch.setattr(browser_canvas, "resolve_ssh_key_path", lambda: "")
+
+    capability = browser_canvas.browser_capability(
+        vm_thread(vm_context(status="provisioning"))
+    )
+
+    assert (capability.can_open_browser, capability.reason) == (
+        False,
+        "transport_unavailable",
+    )
 
 
 @pytest.mark.parametrize(
@@ -477,3 +539,83 @@ def test_open_on_a_suspended_vm_does_not_provision(monkeypatch, same_cluster):
 
     assert opened.status_code == 409
     assert opened.json()["detail"]["code"] == "workspace_unattested"
+
+
+class _Wakes:
+    """Records request_thread_wake calls and answers a scripted wake."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls: list[tuple] = []
+
+    def install(self, monkeypatch):
+        from orchestrator.services import vm_idle_lifecycle
+
+        wakes = self
+
+        class Store:
+            def __init__(self, db):
+                self.db = db
+
+            async def request_thread_wake(self, thread_id, **kwargs):
+                wakes.calls.append((self.db, thread_id, kwargs))
+                return wakes.answer
+
+        monkeypatch.setattr(vm_idle_lifecycle, "VMIdleLifecycleStore", Store)
+        return self
+
+
+def _asleep_thread() -> dict:
+    thread = vm_thread(vm_context(status="suspended", rootdisk="kept"))
+    thread["status"] = "suspended"
+    return thread
+
+
+def test_open_wakes_a_sleeping_vm_through_the_access_only_wake(
+    monkeypatch, same_cluster
+):
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    wakes = _Wakes({"wake_id": "w1"}).install(monkeypatch)
+    client = _vm_route_client(monkeypatch, _asleep_thread())
+
+    first = client.post(f"/api/persistent/threads/{_THREAD_ID}/browser/open", json={})
+    again = client.post(f"/api/persistent/threads/{_THREAD_ID}/browser/open", json={})
+
+    assert first.status_code == again.status_code == 202
+    assert first.json() == {"status": "provisioning"}
+    assert first.headers["retry-after"] == "3"
+    # One stable claimant: the Cockpit's retries renew one lease on one wake.
+    assert [call[1:] for call in wakes.calls] == [
+        (
+            _THREAD_ID,
+            {
+                "execution_requested": False,
+                "access_kind": "ssh",
+                "access_claimant": "user-1:shared-browser",
+            },
+        )
+    ] * 2
+
+
+def test_open_on_a_sleeping_vm_that_cannot_wake_is_refused(monkeypatch, same_cluster):
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    _Wakes(None).install(monkeypatch)
+    client = _vm_route_client(monkeypatch, _asleep_thread())
+
+    opened = client.post(f"/api/persistent/threads/{_THREAD_ID}/browser/open", json={})
+
+    assert opened.status_code == 409
+    assert opened.json()["detail"]["code"] == "workspace_unattested"
+
+
+def test_open_on_a_vm_coming_up_waits_without_a_wake(monkeypatch, same_cluster):
+    wakes = _Wakes(None).install(monkeypatch)
+    client = _vm_route_client(monkeypatch, vm_thread(vm_context(status="provisioning")))
+
+    opened = client.post(f"/api/persistent/threads/{_THREAD_ID}/browser/open", json={})
+
+    assert opened.status_code == 202
+    assert opened.headers["retry-after"] == "3"
+    # Joining an open wake (none here) is harmless; the container kick is not
+    # used for a VM (_vm_route_client fails the test if it is).
+    assert len(wakes.calls) == 1

@@ -1559,3 +1559,103 @@ class TestContainerRelayLifecycle:
             assert ws.closes == [(4502, "stream ended")]
 
         asyncio.run(run())
+
+
+class _FakeViewerAccess:
+    instances: list["_FakeViewerAccess"] = []
+
+    def __init__(self, db, thread_id, user_id):
+        self.args = (db, thread_id, user_id)
+        self.events: list[str] = []
+        type(self).instances.append(self)
+
+    async def acquire(self):
+        self.events.append("acquire")
+        return True
+
+    async def renew(self):
+        self.events.append("renew")
+        return True
+
+    async def close(self):
+        self.events.append("close")
+
+
+class TestVMViewerKeepsTheVMAwake:
+    def _relay(self, monkeypatch, thread, *, idle_release: bool):
+        relay = _VMRelay(monkeypatch, thread)
+        _FakeViewerAccess.instances = []
+        monkeypatch.setattr(broker, "VMViewerAccess", _FakeViewerAccess)
+        monkeypatch.setattr(broker, "VM_VIEWER_ACCESS_RENEW_S", 0.01)
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 3600)
+        if idle_release:
+            monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+        else:
+            monkeypatch.delenv("WORKSPACE_IDLE_RELEASE_ENABLED", raising=False)
+        return relay
+
+    def test_an_attached_viewer_holds_and_renews_a_vm_access_lease(self, monkeypatch):
+        relay = self._relay(monkeypatch, vm_thread(user_id="user-1"), idle_release=True)
+
+        async def run():
+            ws, task = await relay.connect()
+            assert ws.accepted is True
+            await asyncio.sleep(0.05)
+            ws._gone.set()
+            await _finish(task)
+
+        asyncio.run(run())
+
+        (access,) = _FakeViewerAccess.instances
+        assert access.args == (relay.db, VM_THREAD_ID, "user-1")
+        assert access.events[0] == "acquire"
+        assert "renew" in access.events
+        assert access.events[-1] == "close"
+
+    def test_the_lease_is_closed_when_the_vm_goes_away(self, monkeypatch):
+        relay = self._relay(monkeypatch, vm_thread(user_id="user-1"), idle_release=True)
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 0.01)
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.db.thread["metadata"]["vm"]["status"] = "suspending"
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+
+        asyncio.run(run())
+
+        assert _FakeViewerAccess.instances[0].events[-1] == "close"
+
+    def test_no_lease_without_idle_release(self, monkeypatch):
+        relay = self._relay(
+            monkeypatch, vm_thread(user_id="user-1"), idle_release=False
+        )
+
+        async def run():
+            ws, task = await relay.connect()
+            ws._gone.set()
+            await _finish(task)
+
+        asyncio.run(run())
+
+        assert _FakeViewerAccess.instances == []
+
+    def test_a_container_viewer_takes_no_vm_lease(self, monkeypatch):
+        thread = _bound_thread()
+        thread["id"] = VM_THREAD_ID
+        thread["user_id"] = "user-1"
+        relay = self._relay(monkeypatch, thread, idle_release=True)
+
+        async def forbidden(target):
+            raise AssertionError(target)
+
+        monkeypatch.setattr(broker, "attest_vm_workspace_target", forbidden)
+
+        async def run():
+            ws, task = await relay.connect()
+            ws._gone.set()
+            await _finish(task)
+
+        asyncio.run(run())
+
+        assert _FakeViewerAccess.instances == []

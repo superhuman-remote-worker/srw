@@ -19,7 +19,12 @@ from orchestrator.services.shared_browser_canvas import (
     commit_browser_canvas,
     prepare_browser_canvas,
     require_browser_capability,
+    wake_vm_workspace_for_browser,
 )
+from orchestrator.services.shared_browser_vm import thread_uses_vm_workspace
+
+# A VM boots or wakes in minutes, not seconds; poll it less often.
+_VM_OPEN_RETRY_AFTER_SECONDS = "3"
 
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/browser",
@@ -105,9 +110,23 @@ async def open_shared_browser(
     """Provision/reuse a browser and return ordinary redacted Canvas state."""
 
     db = _get_db(request)
-    _, thread = await require_thread_owner(request, db, thread_id)
+    user, thread = await require_thread_owner(request, db, thread_id)
     capability = browser_capability(thread)
     _require_openable(capability, require_ready=False)
+    if not capability.workspace_ready and thread_uses_vm_workspace(thread):
+        # The VM's own path: join or start the access-only wake the VM IDE
+        # uses (the Session's agent stays asleep), then wait like a container.
+        try:
+            await wake_vm_workspace_for_browser(
+                db, thread, user_id=str((user or {}).get("id") or "")
+            )
+        except BrowserCanvasError as exc:
+            _raise_browser_error(exc)
+        return JSONResponse(
+            status_code=202,
+            content={"status": "provisioning"},
+            headers={"Retry-After": _VM_OPEN_RETRY_AFTER_SECONDS},
+        )
     if not capability.workspace_ready:
         _kick_workspace_provisioning(request, thread_id, db)
         return JSONResponse(

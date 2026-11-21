@@ -34,16 +34,20 @@ from orchestrator.services.canvas_ssh import (
     attest_vm_workspace_target,
     bound_workspace_generation,
     canvas_workspace_generation,
-    remote_target_is_vm_backed,
     require_same_remote_workspace,
     resolve_canvas_workspace_target,
     resolve_remote_workspace_target,
     vm_canvas_identity,
     vm_canvas_route_available,
 )
+from orchestrator.services.shared_browser_vm import (
+    request_vm_browser_wake,
+    thread_uses_vm_workspace,
+    vm_browser_wake_state,
+)
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
 from orchestrator.services.workspace_binding import remote_canvas_presentation_available
-from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
+from shared.backend_kinds import LITE_BACKENDS
 from shared.workspace_contract import vm_mode_from_env
 
 BrowserCapabilityReason = Literal[
@@ -136,28 +140,53 @@ def _vm_browser_capability(
     The order is the answer a user should see first: a VM the orchestrator
     cannot route to (the tailnet, ``VM_MODE=external``) is ``unroutable``
     before anything else, so it never waits on an SSH timeout. On the same
-    cluster a VM that is not ready, or whose identity the controller has not
-    authenticated, is ``unattested`` (a browser open never starts a VM). The
-    positive answer still needs a fresh controller proof at every operation;
-    this gate only decides what to offer.
+    cluster a VM that is coming up, or asleep on its disk under idle release,
+    is openable but not ready, like a cold container: open waits for it (and
+    wakes a sleeping one, see shared_browser_vm). Any other VM that is not
+    ready, or whose identity the controller has not authenticated, is
+    ``unattested``. The positive answer still needs a fresh controller proof at
+    every operation; this gate only decides what to offer.
     """
 
     vm = _mapping(_mapping(thread.get("metadata")).get("vm"))
     ready = vm.get("status") == "ready"
     mode = vm_mode_from_env()
     if not ready:
+        if mode == "external":
+            # DEFERRED, not forgotten: tailnet VM routing for the Canvas and
+            # the shared browser (see canvas_ssh.vm_canvas_route_available).
+            return _capability(
+                feature_enabled=True,
+                can_open_browser=False,
+                workspace_ready=False,
+                reason="workspace_unroutable",
+            )
+        if mode == "same-cluster" and vm_browser_wake_state(thread) is not None:
+            if not transport_available:
+                return _capability(
+                    feature_enabled=True,
+                    can_open_browser=False,
+                    workspace_ready=False,
+                    reason="transport_unavailable",
+                )
+            return _capability(
+                feature_enabled=True,
+                can_open_browser=True,
+                workspace_ready=False,
+                reason=None,
+            )
         return _capability(
             feature_enabled=True,
             can_open_browser=False,
             workspace_ready=False,
-            reason="workspace_unroutable"
-            if mode == "external"
-            else "workspace_unattested",
+            reason="workspace_unattested",
         )
     host = vm.get("ssh_host")
     if not isinstance(host, str) or not vm_canvas_route_available(
         host, can_reach=orchestrator_can_reach
     ):
+        # A ready VM the orchestrator cannot reach: the tailnet. Routing it is
+        # DEFERRED, not forgotten (canvas_ssh.vm_canvas_route_available).
         return _capability(
             feature_enabled=True,
             can_open_browser=False,
@@ -193,6 +222,24 @@ def _vm_browser_capability(
         workspace_ready=True,
         reason=None,
     )
+
+
+async def wake_vm_workspace_for_browser(
+    db: Any, thread: dict[str, Any], *, user_id: str
+) -> None:
+    """Open browser on a VM that is not ready: join or start its wake.
+
+    The VM mirror of the container's cold open, which kicks provisioning and
+    answers 202. A VM that nothing will bring up answers
+    ``workspace_unattested`` instead of a wait that cannot end.
+    """
+
+    if not await request_vm_browser_wake(db, thread, user_id=user_id):
+        raise BrowserCanvasError(
+            409,
+            "workspace_unattested",
+            "The VM workspace cannot be started for the shared browser",
+        )
 
 
 async def _require_current_vm_target(
@@ -242,8 +289,9 @@ def browser_capability(thread: dict[str, Any]) -> BrowserCapabilityResponse:
     backend = _thread_backend(thread)
     # A ready VM is the workspace the Canvas resolver selects whatever the
     # declared backend says (an upgraded Session keeps declaring its old
-    # tier), so it is checked before the lite refusal.
-    if remote_target_is_vm_backed(thread) or backend in VM_BACKENDS:
+    # tier), so it is checked before the lite refusal; so is a VM asleep on
+    # its disk, which open wakes.
+    if thread_uses_vm_workspace(thread):
         return _vm_browser_capability(thread, transport_available)
     if backend in LITE_BACKENDS:
         return _capability(
@@ -493,4 +541,5 @@ __all__ = [
     "commit_browser_canvas",
     "prepare_browser_canvas",
     "require_browser_capability",
+    "wake_vm_workspace_for_browser",
 ]
