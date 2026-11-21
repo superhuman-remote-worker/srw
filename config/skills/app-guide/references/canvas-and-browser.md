@@ -138,12 +138,13 @@ the same cluster as SRW. Virtual and None cannot host the shared browser; a
 VM reached over a private network (tailnet) reports it as not available.
 
 Shared browser is on by default; an operator can turn it off. Use the web icon
-in the session header or **Open browser** in the Canvas empty state. While a VM
-is still starting, the button stays unavailable and enables itself once the
-VM is ready:
+in the session header or **Open browser** in the Canvas empty state:
 
-1. Choose **Open browser**. A cold Container session may first show
-   **Starting workspace…**, then **Starting browser…**, then **Connecting…**.
+1. Choose **Open browser**. A cold Container session, or a VM session whose VM
+   is still starting or has gone to sleep, may first show **Starting
+   workspace…**, then **Starting browser…**, then **Connecting…**. A sleeping
+   VM wakes for the browser alone; the agent stays asleep until you send a
+   message.
 2. Choose **Take control** when you need to navigate, dismiss a banner,
    complete a login, or handle a page the agent cannot.
 3. Browse in the Canvas toolbar. While you are driving, the agent's mutating
@@ -171,8 +172,10 @@ browser-level authentication dialogs, and the built-in PDF viewer are known
 gaps. Downloading a file is often the practical PDF fallback.
 
 Shared browser is a session surface. It is not available on the Jobs view.
-In a VM session, files on the Canvas are view-only, and an older VM image may
-show the page scaled to the pane without the size switch.
+In a VM session, editable files on the Canvas save as in a Container
+session; if the server does not run VM remote operations they show view-only.
+An older VM image may show the page scaled to the pane without the size
+switch.
 
 ## If Open browser is missing or disabled
 
