@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -546,14 +547,121 @@ func TestDeleteJobAsksAgainWhileTheWorkspaceIsReleased(t *testing.T) {
 		t.Errorf("another 500: %d after %d requests", code, asked)
 	}
 
-	// A gateway's 502 is not the API releasing the workspace: sent once. The
-	// delete may have reached the API before the gateway gave up, so the
-	// outcome is unknown.
-	asked = 0
+	// A gateway's 502 is not the API releasing the workspace, and the delete
+	// may have reached the API before the gateway gave up: the outcome is
+	// unknown, so srw looks at the job and, while it is there, asks again
+	// (TestDeleteJobSendsAgainWhenTheAnswerIsLost).
+	h.clock, asked = now, 0
 	h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) { asked++; awayAnswer(w, "502") })
-	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.Unknown || asked != 1 {
+	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.Unknown || asked < 2 {
 		t.Errorf("a gateway status: %d after %d requests", code, asked)
 	}
+}
+
+// A delete holds its request while the job's workspace is released, on dev
+// for up to 83 seconds; Cloudflare ends a request at 100. The server goes on
+// without its caller and may still end in a 503 that deleted nothing. So
+// after a lost answer srw looks at the job and sends the delete again while
+// the job is there.
+func TestDeleteJobSendsAgainWhenTheAnswerIsLost(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	// The job is there for the first `there` reads, then gone.
+	jobThere := func(there int) *int {
+		polls := 0
+		h.handle("GET "+jobRoute("/progress"), func(w http.ResponseWriter, _ *http.Request) {
+			polls++
+			w.Header().Set("Content-Type", "application/json")
+			if polls > there {
+				w.WriteHeader(404)
+				w.Write([]byte(`{"detail":"Job not found"}`))
+				return
+			}
+			w.Write([]byte(`{"status":"completed","state":"ended","reasons":[],"held_by":null}`))
+		})
+		return &polls
+	}
+	cutOff := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(524)
+		w.Write([]byte(`{"title":"Error 524: A timeout occurred","status":524,"detail":"The origin web server did not respond in time.","cloudflare_error":true,"retryable":true}`))
+	}
+	answer := func(w http.ResponseWriter, status int, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}
+	// A dropped connection lets the next request in before its handler
+	// returns, so the count is kept under a lock.
+	var mu sync.Mutex
+	count := 0
+	deletes := func(answers ...func(http.ResponseWriter)) {
+		mu.Lock()
+		count = 0
+		mu.Unlock()
+		h.handle("DELETE /api/jobs/"+jobID, func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			next := answers[min(count, len(answers)-1)]
+			count++
+			mu.Unlock()
+			next(w)
+		})
+	}
+	sent := func() int { mu.Lock(); defer mu.Unlock(); return count }
+	deleted := func(w http.ResponseWriter) { answer(w, 200, `{"status":"deleted"}`) }
+	releasing := func(w http.ResponseWriter) {
+		answer(w, 503, `{"detail":"Workspace authority retirement is incomplete"}`)
+	}
+	notFound := func(w http.ResponseWriter) { answer(w, 404, `{"detail":"Job 'x' not found"}`) }
+
+	// Cut off, and the job is gone when srw looks: the delete went through.
+	jobThere(1) // the read before the delete
+	deletes(cutOff)
+	out, errOut, code := h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.OK || !strings.Contains(out, "deleted") || sent() != 1 {
+		t.Fatalf("gone after the cut: %d after %d deletes: %q %s", code, sent(), out, errOut)
+	}
+	want(t, errOut, "did not arrive", "524", "the delete went through")
+
+	// Cut off, the job is still there, and the server's delete had ended in
+	// a 503 (dev, 2026-11-21): sent again, through the 503, until it is deleted.
+	jobThere(1 << 30)
+	deletes(cutOff, releasing, deleted)
+	out, errOut, code = h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.OK || !strings.Contains(out, "deleted") || sent() != 3 {
+		t.Fatalf("still there after the cut: %d after %d deletes: %q %s", code, sent(), out, errOut)
+	}
+	if strings.Count(errOut, "did not arrive") != 1 {
+		t.Errorf("said once:\n%s", errOut)
+	}
+
+	// The connection ends; the job is still there when srw looks, and the
+	// repeat finds it gone: the first delete went through after all.
+	jobThere(1 << 30)
+	deletes(func(w http.ResponseWriter) { awayAnswer(w, "drop") }, notFound)
+	out, errOut, code = h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.OK || !strings.Contains(out, "deleted") || sent() != 2 {
+		t.Fatalf("a 404 after a lost answer: %d after %d deletes: %q %s", code, sent(), out, errOut)
+	}
+	want(t, errOut, "the delete went through")
+
+	// A 404 without a lost answer before it is the API's own answer.
+	jobThere(1 << 30)
+	deletes(notFound)
+	if _, _, code := h.run("", "delete", "job", jobID, "--yes"); code != exit.NotFound || sent() != 1 {
+		t.Errorf("a plain 404: %d after %d deletes", code, sent())
+	}
+
+	// Never an answer, and the job stays: the outcome stays unknown after
+	// the time a delete may take.
+	h.clock = now
+	jobThere(1 << 30)
+	deletes(cutOff)
+	_, errOut, code = h.run("", "delete", "job", jobID, "--yes")
+	if code != exit.Unknown || sent() < 10 || h.clock.Sub(now) > 4*time.Minute {
+		t.Fatalf("%d after %d deletes and %s: %s", code, sent(), h.clock.Sub(now), errOut)
+	}
+	want(t, errOut, "did not see the job go", "srw get job/"+jobID, "srw delete job/"+jobID)
 }
 
 func TestApproveAsksAgainWhileTheServerFinishesTheStop(t *testing.T) {

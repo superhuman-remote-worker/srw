@@ -753,27 +753,65 @@ func (a *App) deleteJob(ctx context.Context, client *api.Client, typed string, y
 	// Deleting releases the workspace too; see api.TeardownTimeout. A job
 	// that has just ended is often still being released: the server then
 	// answers 503 and has deleted nothing, so the request is sent again.
+	//
+	// The server may also hold the request while the release finishes: up to
+	// 83 seconds on dev on 2026-11-21, and a proxy can give up first
+	// (Cloudflare ends a request at 100 seconds with 524). The server goes on
+	// with the delete without its caller, and it can still end in a 503 that
+	// deleted nothing. So after a lost answer srw looks at the job: gone means
+	// deleted; still there means the delete is sent again, which every step
+	// of the server's delete allows. A 404 to that repeat is the earlier
+	// delete that went through.
 	request := api.Request{Method: routes.JobDelete.Method, Path: jobPath(routes.JobDelete, id), Known: true, Timeout: api.TeardownTimeout}
-	started, said := a.Now(), false
+	names := func() []string { return []string{"job/" + id} }
+	deletedAfterAll := func() error {
+		fmt.Fprintln(a.Err, "The job is gone: the delete went through.")
+		return a.printJSONDocument([]byte(`{"status":"deleted"}`), names)
+	}
+	started, said, lost := a.Now(), false, false
 	for {
 		response, err := client.Send(ctx, request)
 		if err == nil {
-			return a.printJSONDocument(response.Body, func() []string { return []string{"job/" + id} })
+			return a.printJSONDocument(response.Body, names)
 		}
 		var failure *exit.Error
-		releasing := errors.As(err, &failure) && failure.Code == exit.Failed &&
-			(failure.Status == http.StatusServiceUnavailable || stillPruning(failure))
-		if !releasing || a.Now().Sub(started) >= api.TeardownTimeout {
+		if !errors.As(err, &failure) {
+			return err
+		}
+		switch {
+		case failure.Code == exit.Unknown:
+			if !lost {
+				lost = true
+				fmt.Fprintf(a.Err, "The answer to the delete did not arrive (%s). Trying again while the job is still there, for up to %s.\n", failure.Message, api.TeardownTimeout)
+			}
+			if _, readErr := a.progress(ctx, client, id, false); isNotFound(readErr) {
+				return deletedAfterAll()
+			}
+		case lost && failure.Code == exit.NotFound:
+			return deletedAfterAll()
+		case failure.Code == exit.Failed && (failure.Status == http.StatusServiceUnavailable || stillPruning(failure)):
+			if !said {
+				said = true
+				fmt.Fprintf(a.Err, "The server is still releasing the job's workspace (%s). Trying again for up to %s.\n", failure.Message, api.TeardownTimeout)
+			}
+		default:
 			return stillReleasing(err, "delete job/"+id, id)
 		}
-		if !said {
-			said = true
-			fmt.Fprintf(a.Err, "The server is still releasing the job's workspace (%s). Trying again for up to %s.\n", failure.Message, api.TeardownTimeout)
+		if a.Now().Sub(started) >= api.TeardownTimeout {
+			if failure.Code == exit.Unknown {
+				failure.Hint = fmt.Sprintf("srw did not see the job go; look at `srw get job/%s`, then run `srw delete job/%s` again", id, id)
+			}
+			return stillReleasing(err, "delete job/"+id, id)
 		}
 		if err := a.sleep(ctx, 5*time.Second); err != nil {
 			return err
 		}
 	}
+}
+
+func isNotFound(err error) bool {
+	var failure *exit.Error
+	return errors.As(err, &failure) && failure.Code == exit.NotFound
 }
 
 // stillPruning recognises the API's 500 for a stateless job whose workspace

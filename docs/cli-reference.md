@@ -423,6 +423,12 @@ Delete a resource. On a terminal srw asks first; elsewhere it needs --yes, or
 Deleting a project deletes the whole project: its repositories, its cloud
 folder and its group. The token needs resources:write, and projects:write for
 a project.
+
+Deleting a job also releases its workspace, which can take a minute or two
+after the job has ended. srw waits for it: it asks again while the server
+answers that it is still releasing the workspace. When the answer is lost on
+the way, srw looks at the job and sends the delete again while the job is
+still there.
 ```
 
 | Flag | Meaning |

@@ -684,7 +684,12 @@ func (a *App) deleteCommand() *cobra.Command {
 			"--expected-version for a stored resource addressed by its UID.\n\n" +
 			"Deleting a project deletes the whole project: its repositories, its cloud\n" +
 			"folder and its group. The token needs resources:write, and projects:write for\n" +
-			"a project.",
+			"a project.\n\n" +
+			"Deleting a job also releases its workspace, which can take a minute or two\n" +
+			"after the job has ended. srw waits for it: it asks again while the server\n" +
+			"answers that it is still releasing the workspace. When the answer is lost on\n" +
+			"the way, srw looks at the job and sends the delete again while the job is\n" +
+			"still there.",
 		Example: "  srw delete expert reviewer\n  srw delete 0b5c2f6e-… --expected-version 4",
 		Args: func(command *cobra.Command, args []string) error {
 			if len(args) < 1 || len(args) > 2 {
