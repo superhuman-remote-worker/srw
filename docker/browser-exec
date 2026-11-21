@@ -101,8 +101,18 @@ CHROMIUM_PATH = os.environ.get("BROWSER_EXEC_CHROMIUM", "/usr/local/bin/agent-ch
 # image surface. Set BROWSER_EXEC_HEADFUL=0 to go back to headless.
 HEADFUL = os.environ.get("BROWSER_EXEC_HEADFUL", "1").lower() not in ("0", "false", "no")
 DISPLAY_NAME = os.environ.get("BROWSER_EXEC_DISPLAY", ":99")
+# A 1920x1200 monitor (16:10, a common desktop size) with a 1920x1080 window on
+# it. The window is what the agent sees by default; the extra screen height is
+# room for a viewer's portrait tablet size (768x1024 plus Chromium's ~87 px tab
+# strip and toolbar) without a window larger than its screen.
 SCREEN_WIDTH = int(os.environ.get("BROWSER_EXEC_SCREEN_WIDTH", "1920"))
-SCREEN_HEIGHT = int(os.environ.get("BROWSER_EXEC_SCREEN_HEIGHT", "1080"))
+SCREEN_HEIGHT = int(os.environ.get("BROWSER_EXEC_SCREEN_HEIGHT", "1200"))
+WINDOW_WIDTH = min(
+    SCREEN_WIDTH, int(os.environ.get("BROWSER_EXEC_WINDOW_WIDTH", "1920"))
+)
+WINDOW_HEIGHT = min(
+    SCREEN_HEIGHT, int(os.environ.get("BROWSER_EXEC_WINDOW_HEIGHT", "1080"))
+)
 XVFB_START_TIMEOUT_S = float(os.environ.get("BROWSER_EXEC_XVFB_TIMEOUT", "10"))
 # Directory exposed to the browser when rendering a local file (see
 # LocalFileServer). Defaults to the agent's workspace; override only to widen or
@@ -139,9 +149,17 @@ VALID_ACTIONS = {
 # Loopback-only stream listener. Covered by sshd `PermitOpen 127.0.0.1:*`;
 # never reachable from the pod/VM network — same posture as live-app ports.
 STREAM_PORT = int(os.environ.get("BROWSER_EXEC_STREAM_PORT", "38801"))
-STREAM_QUALITY = int(os.environ.get("BROWSER_EXEC_STREAM_QUALITY", "60"))
-STREAM_MAX_WIDTH = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_WIDTH", "1280"))
-STREAM_MAX_HEIGHT = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_HEIGHT", "720"))
+STREAM_QUALITY = int(os.environ.get("BROWSER_EXEC_STREAM_QUALITY", "80"))
+# One page pixel per stream pixel: the viewport never exceeds the window and the
+# window never exceeds the screen, so a cap at the screen size never downscales.
+# A viewer sizes the page to its pane (set_viewport), which is what keeps the
+# frames small; a lower cap here would only blur them.
+STREAM_MAX_WIDTH = int(
+    os.environ.get("BROWSER_EXEC_STREAM_MAX_WIDTH", str(SCREEN_WIDTH))
+)
+STREAM_MAX_HEIGHT = int(
+    os.environ.get("BROWSER_EXEC_STREAM_MAX_HEIGHT", str(SCREEN_HEIGHT))
+)
 # Every compositor frame: superseding viewer queues (ViewerQueue.put_frame)
 # handle backpressure by replacement, so skipping frames at the source only
 # adds latency.
@@ -160,6 +178,22 @@ STREAM_START_URL = os.environ.get(
 # Framing: [4-byte BE length][1-byte type][payload]; length covers type+payload.
 T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
 MAX_STREAM_FRAME = 8 * 1024 * 1024
+
+# Viewer-sized page (CONTROL set_viewport). Sizes are CSS pixels of the page's
+# viewport; the daemon sizes the real window around them (WindowViewport).
+VIEWPORT_MIN = 320
+VIEWPORT_MAX = 8192
+# Window chrome (tab strip + toolbar) measured on headful Chromium under Xvfb;
+# used only when the page cannot be measured.
+DEFAULT_WINDOW_CHROME = (0, 87)
+VIEWPORT_SETTLE_S = 1.0
+VIEWPORT_POLL_S = 0.05
+VIEWPORT_MEASURE_TIMEOUT_S = 2.0
+# Opt-in protocol features. A viewer announces the ones it understands with
+# CONTROL {"op": "client_features", "features": [...]}; only then do its STATE
+# messages carry the matching keys. Cockpits parse STATE strictly, so a key an
+# older Cockpit does not know would end its stream as a protocol error.
+CLIENT_FEATURES = frozenset({"viewport_control"})
 
 
 def encode_stream_frame(ftype: int, payload: bytes) -> bytes:
@@ -368,11 +402,16 @@ class StreamHub:
         self.viewer_limit = None
         self._next_viewer_id = 0
         self._auto_release = None
+        self._viewer_features: dict = {}
         self.state_extra = {"url": None, "title": None, "loading": False}
+        # The page's real CSS viewport, including any scrollbar: the size of
+        # the screencast frames, which is what a viewer maps its input onto.
         self.viewport = {
-            "width": STREAM_MAX_WIDTH,
-            "height": STREAM_MAX_HEIGHT,
+            "width": WINDOW_WIDTH,
+            "height": WINDOW_HEIGHT - DEFAULT_WINDOW_CHROME[1],
         }
+        # Whether set_viewport can work: only a headful window can be sized.
+        self.viewport_control = False
         self.on_state_change = None
 
     def mint_generation(self, initial_baton=None) -> None:
@@ -386,13 +425,56 @@ class StreamHub:
         self.generation = None
         self.token = None
 
-    def state_payload(self) -> dict:
-        return {
+    def state_payload(self, features=frozenset()) -> dict:
+        payload = {
             "generation": self.generation,
             "baton": self.baton,
-            "viewport": self.viewport,
+            "viewport": dict(self.viewport),
             **self.state_extra,
         }
+        if "viewport_control" in features:
+            payload["viewport_control"] = bool(self.viewport_control)
+        return payload
+
+    def set_viewer_features(self, viewer_id, features) -> None:
+        """Record the opt-in features one viewer announced it understands."""
+        if viewer_id not in self.viewers:
+            return
+        self._viewer_features[viewer_id] = frozenset(
+            feature
+            for feature in features
+            if isinstance(feature, str) and feature in CLIENT_FEATURES
+        )
+
+    def state_frame(self, viewer_id=None) -> bytes:
+        """One encoded STATE, shaped for what this viewer opted into."""
+        features = self._viewer_features.get(viewer_id, frozenset())
+        return encode_stream_frame(
+            T_STATE, json.dumps(self.state_payload(features)).encode()
+        )
+
+    def broadcast_state(self) -> None:
+        """Fan the current STATE out, one encoding per feature set."""
+        encoded: dict = {}
+        for viewer_id, queue in self.viewers.items():
+            features = self._viewer_features.get(viewer_id, frozenset())
+            frame = encoded.get(features)
+            if frame is None:
+                frame = encoded[features] = self.state_frame(viewer_id)
+            _queue_stream_frame(queue, frame)
+
+    def update_viewport(self, width, height) -> None:
+        """Record the page's real viewport and broadcast only a change."""
+        size = {}
+        for key, value in (("width", width), ("height", height)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return
+            if not 0 < value < float("inf"):  # also rejects NaN
+                return
+            size[key] = max(1, min(VIEWPORT_MAX, int(round(value))))
+        if size != self.viewport:
+            self.viewport = size
+            self._notify()
 
     def update_page_state(
         self,
@@ -448,6 +530,7 @@ class StreamHub:
 
     def remove_viewer(self, viewer_id) -> None:
         self.viewers.pop(viewer_id, None)
+        self._viewer_features.pop(viewer_id, None)
         if not self.viewers:
             self.viewer_limit = None
         if not self.viewers and self.baton == "user":
@@ -661,6 +744,15 @@ class ScreencastCdp:
                 "h": metadata.get("deviceHeight"),
                 "ts": time.time(),
             }
+            # The frame's CSS size is the page's viewport including any
+            # scrollbar, which is what viewer input is mapped onto. Layout
+            # metrics (read at start) exclude the scrollbar, and a window
+            # resize changes the size without any other event, so the frames
+            # keep STATE honest. Queued before the frame: a viewer learns a new
+            # size no later than it sees it.
+            self._hub.update_viewport(
+                metadata.get("deviceWidth"), metadata.get("deviceHeight")
+            )
             self._hub.broadcast_frame(
                 encode_stream_frame(
                     T_FRAME, encode_frame_payload(header, jpeg)
@@ -761,6 +853,220 @@ class ScreencastCdp:
 def log(msg: str) -> None:
     """Diagnostics to stderr (never stdout — stdout is the JSON channel)."""
     print(f"[browser-exec] {msg}", file=sys.stderr, flush=True)
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+class WindowViewport:
+    """Size the real browser window so the page's viewport is a given size.
+
+    The shared browser runs headful with no device-metrics override, so the
+    window sizes the page and screen ≥ window ≥ viewport holds, as on real
+    hardware (see the HEADFUL block). A viewer's size request therefore moves
+    the window: the requested viewport plus the window's own chrome (tab strip
+    and toolbar, measured as window bounds minus innerWidth/innerHeight),
+    clamped so the window stays inside the screen.
+
+    One exception. Chromium will not make a window narrower than about 500 px,
+    so a phone-width page is emulated inside the narrowest window with
+    ``Emulation.setDeviceMetricsOverride``: the page then reports, say,
+    390 px inside a 500 px window on a 1920 px screen, which is still a
+    geometry real hardware has (a docked devtools panel). Size only: no mobile
+    flag, no touch, no user agent. The override lives on each target's CDP
+    session, so a tab the screencast moves to gets it too (follow_target).
+    """
+
+    MEASURE = "[innerWidth, innerHeight, screen.availWidth, screen.availHeight]"
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.chrome = None
+        self.narrowest = None
+        self.override = None
+        self.override_targets: set = set()
+
+    async def apply(self, page, width: int, height: int) -> tuple[int, int]:
+        """Size ``page``'s window for a width x height viewport.
+
+        Returns the viewport the page really has afterwards (clamped to the
+        screen and to VIEWPORT_MIN).
+        """
+        window_id, bounds = await self._window(page)
+        measured = await self._measure(page)
+        if measured is not None and self.override is None:
+            self.chrome = (
+                _clamp(int(bounds.get("width", 0)) - measured[0], 0, 400),
+                _clamp(int(bounds.get("height", 0)) - measured[1], 0, 400),
+            )
+        if measured is not None:
+            screen_w, screen_h = measured[2], measured[3]
+        else:
+            screen_w, screen_h = SCREEN_WIDTH, SCREEN_HEIGHT
+        chrome_w, chrome_h = self.chrome or DEFAULT_WINDOW_CHROME
+        width = _clamp(width, VIEWPORT_MIN, max(VIEWPORT_MIN, screen_w - chrome_w))
+        height = _clamp(height, VIEWPORT_MIN, max(VIEWPORT_MIN, screen_h - chrome_h))
+
+        narrow = self.narrowest is not None and width < self.narrowest
+        window_width = max(width, self.narrowest) if narrow else width
+        outer = (window_width + chrome_w, height + chrome_h)
+        await self._place(page, window_id, bounds, outer, (screen_w, screen_h))
+        if narrow:
+            await self._emulate(page, width, height)
+            return width, height
+        if self.override is not None:
+            await self._clear_emulation(page)
+
+        settled = await self._settle(page, (width, height), measured)
+        _, after = await self._window(page)
+        if int(after.get("width", outer[0])) > outer[0]:
+            # Chromium kept its minimum window width: emulate the rest.
+            self.narrowest = int(after["width"]) - chrome_w
+            if settled is not None:
+                height = min(height, settled[1])
+            await self._emulate(page, width, height)
+            return width, height
+        if settled is None:
+            return width, height
+        if settled[:2] != (width, height):
+            # The chrome changed since it was measured (an infobar came or
+            # went). Correct once by the difference, still inside the screen.
+            outer = (
+                _clamp(outer[0] + width - settled[0], 1, screen_w),
+                _clamp(outer[1] + height - settled[1], 1, screen_h),
+            )
+            await self._place(page, window_id, after, outer, (screen_w, screen_h))
+            settled = await self._settle(page, (width, height), settled) or settled
+            self.chrome = (
+                _clamp(outer[0] - settled[0], 0, 400),
+                _clamp(outer[1] - settled[1], 0, 400),
+            )
+        return settled[0], settled[1]
+
+    async def follow_target(self, page) -> None:
+        """Carry the narrow-page override to the tab the viewer now sees."""
+        if page is None:
+            return
+        target = page.target_id
+        if self.override is not None and target not in self.override_targets:
+            await self._send_override(page, *self.override)
+            self.override_targets.add(target)
+        elif self.override is None and target in self.override_targets:
+            await page.cdp_client.send.Emulation.clearDeviceMetricsOverride(
+                session_id=page.session_id
+            )
+            self.override_targets.discard(target)
+
+    async def _window(self, page):
+        client = page.cdp_client
+        found = await client.send.Browser.getWindowForTarget(
+            params={"targetId": page.target_id}
+        )
+        window_id = found["windowId"]
+        bounds = dict(found.get("bounds") or {})
+        if bounds.get("windowState") not in (None, "normal"):
+            # Size changes are refused on a maximized/minimized window.
+            await client.send.Browser.setWindowBounds(
+                params={"windowId": window_id, "bounds": {"windowState": "normal"}}
+            )
+            found = await client.send.Browser.getWindowForTarget(
+                params={"targetId": page.target_id}
+            )
+            bounds = dict(found.get("bounds") or {})
+        return window_id, bounds
+
+    async def _place(self, page, window_id, bounds, outer, screen) -> None:
+        width, height = outer
+        left = _clamp(int(bounds.get("left", 0)), 0, max(0, screen[0] - width))
+        top = _clamp(int(bounds.get("top", 0)), 0, max(0, screen[1] - height))
+        await page.cdp_client.send.Browser.setWindowBounds(
+            params={
+                "windowId": window_id,
+                "bounds": {
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                },
+            }
+        )
+
+    async def _measure(self, page):
+        """(innerWidth, innerHeight, screenWidth, screenHeight) or None.
+
+        Bounded: a page showing a JavaScript dialog never answers.
+        """
+        try:
+            result = await asyncio.wait_for(
+                page.cdp_client.send.Runtime.evaluate(
+                    params={"expression": self.MEASURE, "returnByValue": True},
+                    session_id=page.session_id,
+                ),
+                VIEWPORT_MEASURE_TIMEOUT_S,
+            )
+        except (Exception, asyncio.TimeoutError):
+            return None
+        value = ((result or {}).get("result") or {}).get("value")
+        if (
+            isinstance(value, list)
+            and len(value) == 4
+            and all(
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                and 0 < item <= VIEWPORT_MAX
+                for item in value
+            )
+        ):
+            return tuple(int(round(item)) for item in value)
+        return None
+
+    async def _settle(self, page, expected, before):
+        """Wait until the page reports ``expected`` or a new stable size."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + VIEWPORT_SETTLE_S
+        previous = None
+        while True:
+            current = await self._measure(page)
+            if current is not None:
+                if current[:2] == expected:
+                    return current
+                if (
+                    previous is not None
+                    and current[:2] == previous[:2]
+                    and (before is None or current[:2] != before[:2])
+                ):
+                    return current
+                previous = current
+            if loop.time() >= deadline:
+                return previous
+            await asyncio.sleep(VIEWPORT_POLL_S)
+
+    async def _send_override(self, page, width: int, height: int) -> None:
+        await page.cdp_client.send.Emulation.setDeviceMetricsOverride(
+            params={
+                "width": width,
+                "height": height,
+                # 0 keeps the real device scale factor and screen size.
+                "deviceScaleFactor": 0,
+                "mobile": False,
+            },
+            session_id=page.session_id,
+        )
+
+    async def _emulate(self, page, width: int, height: int) -> None:
+        await self._send_override(page, width, height)
+        self.override = (width, height)
+        self.override_targets.add(page.target_id)
+
+    async def _clear_emulation(self, page) -> None:
+        await page.cdp_client.send.Emulation.clearDeviceMetricsOverride(
+            session_id=page.session_id
+        )
+        self.override = None
+        self.override_targets.discard(page.target_id)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1035,6 +1341,9 @@ class BrowserDaemon:
         self.should_exit = False
         self._files = LocalFileServer()
         self.hub = StreamHub()
+        self._viewport = WindowViewport()
+        self._viewport_request = None
+        self._viewport_task = None
 
     async def _get_session(self):
         """Return a healthy BrowserSession, (re)starting Chromium if needed."""
@@ -1076,7 +1385,7 @@ class BrowserDaemon:
                 "--use-gl=angle",
                 "--use-angle=swiftshader",
                 "--enable-unsafe-swiftshader",
-                f"--window-size={SCREEN_WIDTH},{SCREEN_HEIGHT}",
+                f"--window-size={WINDOW_WIDTH},{WINDOW_HEIGHT}",
                 "--window-position=0,0",
             ]
         else:
@@ -1091,7 +1400,7 @@ class BrowserDaemon:
             {
                 "no_viewport": True,
                 "viewport": None,
-                "window_size": {"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
+                "window_size": {"width": WINDOW_WIDTH, "height": WINDOW_HEIGHT},
             }
             if headful
             else {}
@@ -1111,6 +1420,10 @@ class BrowserDaemon:
         )
         await session.start()
         self._session = session
+        self._viewport.reset()
+        # Only a real window can be sized; headless keeps browser-use's
+        # device-metrics viewport, which a window resize would not move.
+        self.hub.viewport_control = headful
         self._install_focus_handler(session)
         log(f"Chromium session started (headful={headful})")
         return session
@@ -1183,6 +1496,7 @@ class BrowserDaemon:
                         if self._screencast is None:
                             self._screencast = ScreencastCdp(session, self.hub)
                         await self._screencast.start(target_id=target_id)
+                        await self._follow_viewport_target()
                 if revision == self._focus_change_revision:
                     return
         except asyncio.CancelledError:
@@ -1201,6 +1515,13 @@ class BrowserDaemon:
             await asyncio.gather(focus_task, return_exceptions=True)
         self._focus_change_task = None
         self._focus_handler = None
+        viewport_task = self._viewport_task
+        if viewport_task is not None and viewport_task is not asyncio.current_task():
+            viewport_task.cancel()
+        self._viewport_task = None
+        self._viewport_request = None
+        self._viewport.reset()
+        self.hub.viewport_control = False
         if self._screencast is not None:
             try:
                 await self._screencast.stop()
@@ -1389,6 +1710,7 @@ class BrowserDaemon:
             await self._screencast.start(
                 target_id=session.agent_focus_target_id
             )
+            await self._follow_viewport_target()
 
     async def stop_screencast(self) -> None:
         async with self._screencast_lock:
@@ -1405,6 +1727,61 @@ class BrowserDaemon:
             screencast = self._screencast
             if screencast is not None and screencast._running:
                 await screencast.dispatch_input(event)
+
+    async def _follow_viewport_target(self) -> None:
+        """Keep a narrow-page override on the tab the screencast shows."""
+        page = getattr(self._screencast, "_cdp", None)
+        if page is None:
+            return
+        try:
+            await self._viewport.follow_target(page)
+        except Exception as exc:
+            log(f"viewport override follow failed: {exc}")
+
+    def request_viewport(self, width: int, height: int) -> None:
+        """Queue a viewer's page size; bursts collapse to the newest one.
+
+        Only the baton holder sizes the page: while the agent drives, the
+        window keeps its last size, so what the agent reads is what the viewer
+        last saw. Applied in the background so the viewer's input stream is
+        never held behind a window resize.
+        """
+        if self.hub.baton != "user" or not self.hub.viewport_control:
+            return
+        self._viewport_request = (width, height)
+        if self._viewport_task is None or self._viewport_task.done():
+            self._viewport_task = asyncio.create_task(self._viewport_worker())
+
+    async def _viewport_worker(self) -> None:
+        while self._viewport_request is not None:
+            width, height = self._viewport_request
+            self._viewport_request = None
+            try:
+                await self._apply_viewport(width, height)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log(f"viewport resize to {width}x{height} failed: {exc}")
+
+    async def _apply_viewport(self, width: int, height: int) -> None:
+        # screencast lock → action lock, the same order as a target switch, so
+        # the page being sized is the page being streamed.
+        async with self._screencast_lock:
+            async with self._lock:
+                if self.hub.baton != "user" or not self.hub.viewport_control:
+                    return
+                screencast = self._screencast
+                page = getattr(screencast, "_cdp", None)
+                if page is None or not getattr(screencast, "_running", False):
+                    return
+                real_width, real_height = await self._viewport.apply(
+                    page, width, height
+                )
+                self.hub.update_viewport(real_width, real_height)
+                log(
+                    f"viewport {width}x{height} requested, "
+                    f"{real_width}x{real_height} applied"
+                )
 
     async def take_user_baton(self) -> None:
         """Transfer control only after any in-flight agent action finishes."""
@@ -1583,6 +1960,14 @@ class BrowserDaemon:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _is_viewport_dimension(value) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= VIEWPORT_MAX
+    )
+
+
 async def _send_stream_error(writer, code: str, message: str) -> None:
     try:
         writer.write(
@@ -1676,6 +2061,18 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
                     await daemon.take_user_baton()
                 elif op == "release_baton":
                     await daemon.release_user_baton()
+                elif op == "client_features":
+                    features = message.get("features")
+                    if isinstance(features, list):
+                        hub.set_viewer_features(viewer_id, features)
+                        _queue_stream_frame(queue, hub.state_frame(viewer_id))
+                elif op == "set_viewport":
+                    width = message.get("width")
+                    height = message.get("height")
+                    if _is_viewport_dimension(width) and _is_viewport_dimension(
+                        height
+                    ):
+                        daemon.request_viewport(width, height)
                 elif op in ("navigate", "back", "reload"):
                     try:
                         await daemon.user_control_nav(
@@ -1694,6 +2091,9 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
                                 ).encode(),
                             ),
                         )
+                # Any other op is ignored without an ERROR: a Cockpit treats an
+                # unknown ERROR code as the end of the stream, and newer
+                # Cockpits rely on older daemons ignoring client_features.
 
         # Pumps first, THEN the screencast. The STATE above is already
         # queued, and pump_out is the only thing that can put it on the
@@ -1741,14 +2141,7 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
 async def start_stream_server(daemon):
     """Bind the loopback-only listener and wire STATE broadcasting."""
 
-    def broadcast_state():
-        daemon.hub.broadcast(
-            encode_stream_frame(
-                T_STATE, json.dumps(daemon.hub.state_payload()).encode()
-            )
-        )
-
-    daemon.hub.on_state_change = broadcast_state
+    daemon.hub.on_state_change = daemon.hub.broadcast_state
     server = await asyncio.start_server(
         lambda reader, writer: _handle_stream_conn(
             daemon, reader, writer

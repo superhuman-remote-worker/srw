@@ -272,6 +272,54 @@ class TestStreamHub:
             "loading",
         }
 
+    def test_state_carries_viewport_control_only_for_opted_in_viewers(self):
+        async def run():
+            hub = BE.StreamHub()
+            hub.mint_generation()
+            hub.viewport_control = True
+            plain_queue = asyncio.Queue()
+            opted_queue = asyncio.Queue()
+            plain = hub.add_viewer(plain_queue, 3)
+            opted = hub.add_viewer(opted_queue, 3)
+            hub.set_viewer_features(opted, ["viewport_control", "unknown", 7])
+
+            hub.broadcast_state()
+
+            def state(queue):
+                frame = queue.get_nowait()
+                assert frame[4] == BE.T_STATE
+                return json.loads(frame[5:].decode())
+
+            # An older Cockpit parses STATE strictly: no key it did not ask for.
+            assert "viewport_control" not in state(plain_queue)
+            assert state(opted_queue)["viewport_control"] is True
+            hub.remove_viewer(opted)
+            assert opted not in hub._viewer_features
+            assert plain in hub.viewers
+
+        asyncio.run(run())
+
+    def test_viewport_update_validates_and_notifies_only_on_change(self):
+        hub = BE.StreamHub()
+        notifications = []
+        hub.on_state_change = lambda: notifications.append(dict(hub.viewport))
+
+        hub.update_viewport(1919.0, 992.4)
+        hub.update_viewport(1919, 992)
+        for bad in ((None, 992), (True, 992), (0, 992), (float("nan"), 992)):
+            hub.update_viewport(*bad)
+
+        assert notifications == [{"width": 1919, "height": 992}]
+        assert hub.state_payload()["viewport"] == {"width": 1919, "height": 992}
+
+    def test_stream_defaults_send_page_pixels_one_to_one(self):
+        # The window opens at 1920x1080 (the agent's default page) on a
+        # 1920x1200 screen, and frames are never scaled below the viewport.
+        assert (BE.SCREEN_WIDTH, BE.SCREEN_HEIGHT) == (1920, 1200)
+        assert (BE.WINDOW_WIDTH, BE.WINDOW_HEIGHT) == (1920, 1080)
+        assert (BE.STREAM_MAX_WIDTH, BE.STREAM_MAX_HEIGHT) == (1920, 1200)
+        assert BE.STREAM_QUALITY == 80
+
     def test_page_state_change_notifies_viewers_once(self):
         hub = BE.StreamHub()
         notifications = []
@@ -457,6 +505,34 @@ class TestScreencastCdp:
 
         asyncio.run(run())
 
+    def test_frame_size_keeps_state_viewport_and_precedes_the_frame(self):
+        async def run():
+            adapter, _, hub = self._adapter()
+            hub.on_state_change = hub.broadcast_state
+            queue = BE.ViewerQueue(maxsize=8)
+            hub.add_viewer(queue, 3)
+            await adapter.start("A")
+            # Layout metrics (1024x640 in the fake) exclude the scrollbar.
+            assert hub.viewport == {"width": 1024, "height": 640}
+            while not queue.empty():
+                queue.get_nowait()
+
+            for sid in (1, 2):
+                await adapter._handle_frame(
+                    {
+                        "data": BE.base64.b64encode(b"\xff\xd8jpeg").decode(),
+                        "metadata": {"deviceWidth": 1039, "deviceHeight": 640},
+                        "sessionId": sid,
+                    },
+                    "session-A",
+                )
+
+            kinds = [queue.get_nowait()[4] for _ in range(queue.qsize())]
+            assert kinds == [BE.T_STATE, BE.T_FRAME]
+            assert hub.viewport == {"width": 1039, "height": 640}
+
+        asyncio.run(run())
+
     def test_callbacks_are_not_duplicated_across_stop_start_cycles(self):
         async def run():
             adapter, session, _ = self._adapter()
@@ -623,6 +699,312 @@ class TestActiveTargetLifecycle:
 
             assert len(dispatched) == 1
             assert dispatched[0].target_id == "B"
+
+        asyncio.run(run())
+
+
+class _FakeWindow:
+    """Headful Chromium on an Xvfb screen, as measured in the workspace image.
+
+    Window bounds include 87 px of tab strip and toolbar; Chromium keeps the
+    window at least 500 px wide but accepts any height and does not clamp to
+    the screen; a device-metrics override replaces innerWidth/innerHeight on
+    the session that set it.
+    """
+
+    def __init__(self, *, chrome=(0, 87), min_width=500, screen=(1920, 1200)):
+        self.chrome = chrome
+        self.min_width = min_width
+        self.screen = screen
+        self.bounds = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+        self.window_state = "normal"
+        self.overrides = {}
+        self.calls = []
+        self.measure_fails = False
+        self.chrome_after_first_resize = None
+
+    def page(self, target="A"):
+        window = self
+
+        class Browser:
+            async def getWindowForTarget(self, *, params):
+                window.calls.append(("getWindow", params["targetId"]))
+                return {
+                    "windowId": 7,
+                    "bounds": {**window.bounds, "windowState": window.window_state},
+                }
+
+            async def setWindowBounds(self, *, params):
+                bounds = params["bounds"]
+                window.calls.append(("setBounds", dict(bounds)))
+                if "windowState" in bounds:
+                    window.window_state = bounds["windowState"]
+                    return {}
+                assert window.window_state == "normal"
+                window.bounds = {
+                    "left": bounds["left"],
+                    "top": bounds["top"],
+                    "width": max(window.min_width, bounds["width"]),
+                    "height": bounds["height"],
+                }
+                if window.chrome_after_first_resize is not None:
+                    window.chrome = window.chrome_after_first_resize
+                    window.chrome_after_first_resize = None
+                return {}
+
+        class Runtime:
+            async def evaluate(self, *, params, session_id):
+                assert params["returnByValue"] is True
+                if window.measure_fails:
+                    raise RuntimeError("Execution context was destroyed")
+                inner = window.overrides.get(session_id) or (
+                    window.bounds["width"] - window.chrome[0],
+                    window.bounds["height"] - window.chrome[1],
+                )
+                return {"result": {"value": [*inner, *window.screen]}}
+
+        class Emulation:
+            async def setDeviceMetricsOverride(self, *, params, session_id):
+                assert params["mobile"] is False
+                assert params["deviceScaleFactor"] == 0
+                window.overrides[session_id] = (params["width"], params["height"])
+                window.calls.append(("override", session_id))
+
+            async def clearDeviceMetricsOverride(self, *, session_id):
+                window.overrides.pop(session_id, None)
+                window.calls.append(("clear", session_id))
+
+        client = SimpleNamespace(
+            send=SimpleNamespace(
+                Browser=Browser(), Runtime=Runtime(), Emulation=Emulation()
+            )
+        )
+        return SimpleNamespace(
+            target_id=target, session_id=f"session-{target}", cdp_client=client
+        )
+
+    def inner(self, target="A"):
+        return self.overrides.get(f"session-{target}") or (
+            self.bounds["width"] - self.chrome[0],
+            self.bounds["height"] - self.chrome[1],
+        )
+
+
+class TestWindowViewport:
+    def _apply(self, sizer, page, width, height):
+        return asyncio.run(sizer.apply(page, width, height))
+
+    def test_window_is_sized_so_the_page_gets_the_requested_viewport(self):
+        window = _FakeWindow()
+        sizer = BE.WindowViewport()
+
+        assert self._apply(sizer, window.page(), 1024, 700) == (1024, 700)
+        assert window.bounds == {"left": 0, "top": 0, "width": 1024, "height": 787}
+        assert window.inner() == (1024, 700)
+        assert window.overrides == {}
+        assert sizer.chrome == (0, 87)
+
+    def test_window_stays_inside_the_screen_and_above_the_minimum(self):
+        window = _FakeWindow()
+        sizer = BE.WindowViewport()
+
+        assert self._apply(sizer, window.page(), 5000, 5000) == (1920, 1113)
+        assert window.bounds["width"] == 1920
+        assert window.bounds["height"] == 1200
+        assert self._apply(sizer, window.page(), 800, 10) == (800, BE.VIEWPORT_MIN)
+
+    def test_window_moves_back_onto_the_screen_when_it_grows(self):
+        window = _FakeWindow()
+        window.bounds = {"left": 1500, "top": 600, "width": 400, "height": 500}
+        sizer = BE.WindowViewport()
+
+        self._apply(sizer, window.page(), 1440, 900)
+
+        assert window.bounds == {"left": 480, "top": 213, "width": 1440, "height": 987}
+
+    def test_phone_width_is_emulated_inside_the_narrowest_window(self):
+        window = _FakeWindow()
+        sizer = BE.WindowViewport()
+        page = window.page()
+
+        assert self._apply(sizer, page, 390, 844) == (390, 844)
+        assert window.bounds["width"] == 500
+        assert window.bounds["height"] == 931
+        assert window.inner() == (390, 844)
+        assert sizer.narrowest == 500
+        # Coherent geometry: inner <= outer <= screen.
+        assert window.inner()[0] < window.bounds["width"] < window.screen[0]
+
+        # Known floor: narrower sizes go straight to the override.
+        window.calls.clear()
+        assert self._apply(sizer, page, 430, 900) == (430, 900)
+        assert window.inner() == (430, 900)
+        assert window.bounds["height"] == 987
+        assert ("clear", "session-A") not in window.calls
+
+        # Wider again: the override goes and the window carries the size.
+        assert self._apply(sizer, page, 768, 1024) == (768, 1024)
+        assert window.overrides == {}
+        assert window.bounds["width"] == 768
+        assert window.bounds["height"] == 1111
+        assert sizer.override is None
+
+    def test_override_follows_the_streamed_tab_and_is_cleared_there_later(self):
+        window = _FakeWindow()
+        sizer = BE.WindowViewport()
+        tab_a, tab_b = window.page("A"), window.page("B")
+        self._apply(sizer, tab_a, 390, 844)
+
+        asyncio.run(sizer.follow_target(tab_b))
+        assert window.overrides["session-B"] == (390, 844)
+        asyncio.run(sizer.follow_target(tab_b))
+        assert window.calls.count(("override", "session-B")) == 1
+
+        self._apply(sizer, tab_a, 1280, 800)
+        asyncio.run(sizer.follow_target(tab_b))
+        assert window.overrides == {}
+        asyncio.run(sizer.follow_target(None))
+
+    def test_changed_window_chrome_is_corrected_once(self):
+        window = _FakeWindow()
+        # An infobar appears with the first resize: 40 px more chrome.
+        window.chrome_after_first_resize = (0, 127)
+        sizer = BE.WindowViewport()
+
+        assert self._apply(sizer, window.page(), 1024, 700) == (1024, 700)
+        assert window.bounds["height"] == 827
+        assert sizer.chrome == (0, 127)
+
+    def test_maximized_window_is_restored_before_sizing(self):
+        window = _FakeWindow()
+        window.window_state = "maximized"
+        sizer = BE.WindowViewport()
+
+        assert self._apply(sizer, window.page(), 1024, 700) == (1024, 700)
+        assert ("setBounds", {"windowState": "normal"}) in window.calls
+
+    def test_unmeasurable_page_uses_default_chrome_and_never_raises(self, monkeypatch):
+        monkeypatch.setattr(BE, "VIEWPORT_SETTLE_S", 0.05)
+        window = _FakeWindow()
+        window.measure_fails = True
+        sizer = BE.WindowViewport()
+
+        assert self._apply(sizer, window.page(), 1024, 700) == (1024, 700)
+        assert window.bounds["width"] == 1024
+        assert window.bounds["height"] == 700 + BE.DEFAULT_WINDOW_CHROME[1]
+
+
+class TestViewportRequests:
+    @staticmethod
+    def _daemon(window=None):
+        daemon = BE.BrowserDaemon()
+        daemon.hub.mint_generation("user")
+        daemon.hub.viewport_control = True
+        page = (window or _FakeWindow()).page()
+        daemon._screencast = SimpleNamespace(_cdp=page, _running=True)
+        return daemon
+
+    def test_applied_size_is_reported_in_state(self):
+        async def run():
+            window = _FakeWindow()
+            daemon = self._daemon(window)
+            notified = []
+            daemon.hub.on_state_change = lambda: notified.append(
+                daemon.hub.state_payload()["viewport"]
+            )
+
+            daemon.request_viewport(390, 844)
+            await daemon._viewport_task
+
+            assert notified == [{"width": 390, "height": 844}]
+            assert window.inner() == (390, 844)
+
+        asyncio.run(run())
+
+    def test_ignored_while_the_agent_drives_or_without_a_sizable_window(self):
+        async def run():
+            daemon = self._daemon()
+            daemon.hub.release_baton()
+            daemon.request_viewport(800, 600)
+            assert daemon._viewport_task is None
+
+            daemon.hub.take_baton()
+            daemon.hub.viewport_control = False
+            daemon.request_viewport(800, 600)
+            assert daemon._viewport_task is None
+
+        asyncio.run(run())
+
+    def test_baton_lost_before_the_resize_runs_keeps_the_window(self):
+        async def run():
+            window = _FakeWindow()
+            daemon = self._daemon(window)
+            daemon.request_viewport(800, 600)
+            daemon.hub.release_baton()
+            await daemon._viewport_task
+
+            assert window.bounds["width"] == 1920
+            assert not any(call[0] == "setBounds" for call in window.calls)
+
+        asyncio.run(run())
+
+    def test_bursts_collapse_to_the_newest_size(self):
+        async def run():
+            daemon = self._daemon()
+            applied = []
+            gate = asyncio.Event()
+
+            async def apply(width, height):
+                applied.append((width, height))
+                await gate.wait()
+
+            daemon._apply_viewport = apply
+            daemon.request_viewport(400, 400)
+            await asyncio.sleep(0)
+            for size in ((500, 500), (600, 600), (700, 700)):
+                daemon.request_viewport(*size)
+            gate.set()
+            await daemon._viewport_task
+
+            assert applied == [(400, 400), (700, 700)]
+
+        asyncio.run(run())
+
+    def test_session_close_cancels_and_forgets_viewport_state(self):
+        async def run():
+            daemon = self._daemon()
+            gate = asyncio.Event()
+
+            async def apply(width, height):
+                await gate.wait()
+
+            daemon._apply_viewport = apply
+            daemon._viewport.override = (390, 844)
+            daemon.request_viewport(400, 400)
+            await asyncio.sleep(0)
+            task = daemon._viewport_task
+            daemon._screencast = None
+
+            await daemon._close_session()
+            await asyncio.gather(task, return_exceptions=True)
+
+            assert task.cancelled()
+            assert daemon._viewport.override is None
+            assert daemon.hub.viewport_control is False
+
+        asyncio.run(run())
+
+    def test_screencast_target_switch_carries_the_override(self):
+        async def run():
+            window = _FakeWindow()
+            daemon = self._daemon(window)
+            daemon.request_viewport(390, 844)
+            await daemon._viewport_task
+            daemon._screencast = SimpleNamespace(_cdp=window.page("B"), _running=True)
+
+            await daemon._follow_viewport_target()
+
+            assert window.overrides["session-B"] == (390, 844)
 
         asyncio.run(run())
 
@@ -1116,6 +1498,86 @@ class TestStreamListener:
                 assert (frame_type, state["baton"]) == (BE.T_STATE, "agent")
                 response = await daemon.handle({"action": "bogus"})
                 assert "unknown action" in response["error"]
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
+
+    async def _hello(self, daemon, port):
+        reader, writer = await self._client(port)
+        await self._send(
+            writer,
+            BE.T_HELLO,
+            {"token": daemon.hub.token, "min_protocol": 1, "max_viewers": 3},
+        )
+        frame_type, state = await self._recv(reader)
+        assert frame_type == BE.T_STATE
+        return reader, writer, state
+
+    def test_viewport_control_is_advertised_only_after_opt_in(self, monkeypatch):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38894)
+            daemon.hub.viewport_control = True
+            server = await BE.start_stream_server(daemon)
+            try:
+                reader, writer, state = await self._hello(daemon, 38894)
+                old_reader, old_writer, old_state = await self._hello(daemon, 38894)
+                assert "viewport_control" not in state
+                assert "viewport_control" not in old_state
+
+                await self._send(
+                    writer,
+                    BE.T_CONTROL,
+                    {"op": "client_features", "features": ["viewport_control"]},
+                )
+                frame_type, state = await self._recv(reader)
+                assert (frame_type, state["viewport_control"]) == (BE.T_STATE, True)
+
+                # Later broadcasts keep the shape each viewer asked for.
+                await self._send(writer, BE.T_CONTROL, {"op": "release_baton"})
+                _, state = await self._recv(reader)
+                _, old_state = await self._recv(old_reader)
+                assert state["baton"] == old_state["baton"] == "agent"
+                assert state["viewport_control"] is True
+                assert "viewport_control" not in old_state
+                for open_writer in (writer, old_writer):
+                    open_writer.close()
+                    await open_writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
+
+    def test_set_viewport_passes_only_whole_sizes_and_unknown_ops_are_ignored(
+        self, monkeypatch
+    ):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38893)
+            requested = []
+            daemon.request_viewport = lambda w, h: requested.append((w, h))
+            server = await BE.start_stream_server(daemon)
+            try:
+                reader, writer, _ = await self._hello(daemon, 38893)
+                for message in (
+                    {"op": "set_viewport", "width": 390, "height": 844},
+                    {"op": "set_viewport", "width": True, "height": 844},
+                    {"op": "set_viewport", "width": 390.5, "height": 844},
+                    {"op": "set_viewport", "width": 9000, "height": 844},
+                    {"op": "set_viewport", "width": "390", "height": 844},
+                    {"op": "set_viewport", "width": 390},
+                    {"op": "some_future_op", "x": 1},
+                ):
+                    await self._send(writer, BE.T_CONTROL, message)
+                # The connection survives: the next control still answers,
+                # and nothing but that STATE came back (no ERROR).
+                await self._send(writer, BE.T_CONTROL, {"op": "release_baton"})
+                frame_type, state = await self._recv(reader)
+                assert (frame_type, state["baton"]) == (BE.T_STATE, "agent")
+                assert requested == [(390, 844)]
                 writer.close()
                 await writer.wait_closed()
             finally:
