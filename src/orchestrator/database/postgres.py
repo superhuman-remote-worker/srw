@@ -220,7 +220,6 @@ from shared.workspace_disk import (
     WorkspaceMemoryKill,
     WorkspaceTermination,
     WorkspaceVolumeGrowth,
-    dead_workspace_resume_gate,
     decide_memory_growth,
     new_memory_growth_record,
     recorded_termination,
@@ -8007,7 +8006,7 @@ class PostgresDB:
                             disk_full, disk_growth, resumed=requeue
                         )
                         if disk_full is not None
-                        else memory_kill[0].action(RESUME_REQUIRED)
+                        else memory_kill[0].action()
                         + " "
                         + workspace_kept_clause(**facts)
                         if memory_kill is not None
@@ -8261,10 +8260,6 @@ class PostgresDB:
                     runtime_replaced=True if command_uuid is not None else None,
                     binding=context.get("_workspace_binding"),
                 )
-                gate = dead_workspace_resume_gate(
-                    recovery_cleanup=command_uuid is not None,
-                    volume_kept=facts["volume_kept"],
-                )
                 memory_kill = _workspace_memory_kill(
                     workspace,
                     runtime=runtime,
@@ -8280,10 +8275,10 @@ class PostgresDB:
                     "cleanup_pending": command_uuid is not None,
                     "actions": [
                         (
-                            memory_kill[0].action(gate)
+                            memory_kill[0].action()
                             if memory_kill is not None
                             else "workspace transport lost; interrupted command "
-                            f"outcome is unknown; {gate}."
+                            f"outcome is unknown; {RESUME_REQUIRED}."
                         )
                         + " "
                         + workspace_kept_clause(**facts)
@@ -8509,12 +8504,7 @@ class PostgresDB:
                 )
                 if memory_kill is not None:
                     action = (
-                        memory_kill[0].action(
-                            dead_workspace_resume_gate(
-                                recovery_cleanup=True,
-                                volume_kept=attention.get("volume_kept"),
-                            )
-                        )
+                        memory_kill[0].action()
                         + " "
                         + workspace_kept_clause(
                             runtime_replaced=attention.get("runtime_replaced"),
@@ -8593,7 +8583,22 @@ class PostgresDB:
                 or intent["result_kind"] != "settled"
                 or intent["settled_at"] is None
                 or intent["resources_captured_at"] is None
-                or intent["pvc_uid"] is None
+            ):
+                return None
+            # No claim captured: retained storage only when the runtime never
+            # had one, as its own creation recorded (an emptyDir home). A
+            # claim lost since then is not that, and keeps Resume refused.
+            # knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
+            if intent["pvc_uid"] is None and not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE id::text=$1 AND owner_kind='job' AND owner_id=$2 "
+                "AND scope='workspace_container' AND runtime_incarnation=$3::uuid "
+                "AND claim_token::text=$4 AND result_kind='settled' "
+                "AND settled_at IS NOT NULL AND pvc_uid IS NULL)",
+                workspace.get("_creation_reservation_id"),
+                job_uuid,
+                receipt.runtime_incarnation,
+                workspace.get("_creation_claim_token"),
             ):
                 return None
             return dict(intent)

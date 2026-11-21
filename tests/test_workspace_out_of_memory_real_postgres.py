@@ -373,3 +373,74 @@ async def test_a_resume_with_feedback_tells_the_agent_why_and_its_new_limit(
         "outcome of the command that was running is unknown. Its memory limit is "
         f"now 8 GiB. {KEPT} An operator resumed it with the feedback below."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_pod_without_a_volume_resumes_with_the_raised_limit(
+    db, monkeypatch, tmp_path
+):
+    """An emptyDir home: the hold promises the larger limit, Resume starts a
+    new Pod without a volume that runs with it, and the resumed agent is told
+    its files are gone and the job repository was cloned again.
+    knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
+    """
+
+    from orchestrator.schemas.job_controls import JobResumeRequest
+
+    monkeypatch.delenv("WORKSPACE_MEMORY_GROW_MAX", raising=False)
+    original, owner, runtime, provisioner, resources = await cases._stateless_job(
+        db, monkeypatch, binding=cases.POD_BINDING
+    )
+    cases._without_a_volume(provisioner, resources)
+    _kill_pod(resources, memory="4Gi")
+    runner = await cases._accept_report(db, original["id"])
+
+    outcome = await _recover(db, original, runner, provisioner)
+
+    action = (
+        "workspace ran out of memory (limit 4 GiB) and was stopped; interrupted "
+        "command outcome is unknown; explicit Resume required. Resume raises the "
+        f"job's memory limit to 8 GiB. {cases.NO_VOLUME_KEPT}"
+    )
+    assert outcome["actions"] == [action]
+    await CompletionFinalizer(db)._finish(runner.command_id, runner.owner, outcome)
+    held = await current_job(db, original["id"])
+    assert held["error_message"] == action
+    attention = held["context"]["_operator_pause_hold"]["attention"]
+    assert attention["reason"] == WORKSPACE_OUT_OF_MEMORY_REASON
+    assert attention["volume_kept"] is False
+    assert held["context"]["workspace_container"]["memory_growth"]["limit"] == "8Gi"
+    assert (
+        "Workspace recovery hold: workspace ran out of memory (limit 4 GiB) and was "
+        "stopped; interrupted command outcome is unknown; explicit Resume required. "
+        f"Resume raises the job's memory limit to 8 GiB. {cases.NO_VOLUME_KEPT}"
+    ) in format_job_detail(held).splitlines()
+
+    successor, cluster = await cases._resume_on_a_new_pod(
+        db,
+        monkeypatch,
+        tmp_path,
+        owner,
+        held,
+        None,
+        request=JobResumeRequest(feedback="Go on with the small model."),
+    )
+    context = successor["context"]
+    assert context["queued_feedback_reason"] == (
+        "This job's workspace ran out of memory (limit 4 GiB) and was stopped; the "
+        "outcome of the command that was running is unknown. Its memory limit is "
+        f"now 8 GiB. {cases.NO_VOLUME_KEPT} An operator resumed it with the "
+        "feedback below."
+    )
+    assert context["workspace_container"]["status"] == "ready"
+    assert context["workspace_container"]["_runtime_incarnation"] != runtime
+    assert cluster.create_calls == ["pod"]
+    pod = cluster.objects["pod"]
+    (container,) = [c for c in pod.spec.containers if c.name == "workspace"]
+    resources_spec = container.resources
+    if not isinstance(resources_spec, dict):
+        resources_spec = resources_spec.to_dict()
+    assert resources_spec["limits"]["memory"] == "8Gi"
+    assert resources_spec["requests"]["memory"] == "1Gi"
+    (home,) = cases._workspace_data_volumes(pod)
+    assert cases._is_empty_dir(home)

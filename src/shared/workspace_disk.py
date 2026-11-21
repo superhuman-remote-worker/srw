@@ -258,19 +258,6 @@ def workspace_disk_full_action(
 WORKSPACE_HOME = "/home/agent-host"
 _SAVED_PROGRESS = "The job's saved progress is kept."
 RESUME_REQUIRED = "explicit Resume required"
-# A dead-Pod hold on a workspace without a persistent volume: Resume demands
-# the retained volume the recovery cleanup recorded, finds none and answers
-# 409 every time, so the job can only be cancelled.
-# knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
-RESUME_REFUSED_WITHOUT_VOLUME = "Resume cannot continue this job, so Cancel it"
-
-
-def dead_workspace_resume_gate(*, recovery_cleanup: bool, volume_kept: Any) -> str:
-    """What a dead-Pod hold asks for: an explicit Resume, unless its recovery
-    cleanup left no volume for that Resume to reattach."""
-    if recovery_cleanup and volume_kept is False:
-        return RESUME_REFUSED_WITHOUT_VOLUME
-    return RESUME_REQUIRED
 
 
 def volume_kept_from_backing(backing_id: Any) -> bool | None:
@@ -328,10 +315,14 @@ def workspace_kept_clause(
                 f"other paths such as /tmp are gone. {_SAVED_PROGRESS}"
             )
         if volume_kept is False:
+            # Resume starts a new Pod and the agent clones the job repository
+            # into it, as after any runtime that went without a volume.
+            # knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
             return (
-                "The workspace had no persistent volume, so its files went with "
-                "it; what was pushed to the job repository and the job's saved "
-                "progress are kept."
+                "The workspace had no persistent volume, so files that were not "
+                "pushed to the job repository are gone; Resume starts a new "
+                "workspace and clones the job repository into it again. "
+                + _SAVED_PROGRESS
             )
         return (
             "Running processes are gone, and so are files not on a persistent "
@@ -667,25 +658,21 @@ class WorkspaceMemoryKill:
         detail = f" ({', '.join(details)})" if details else ""
         return f"workspace ran out of memory{' again' if again else ''}{detail}"
 
-    def next_step(self, gate: str) -> str:
+    def next_step(self) -> str:
         """What Resume will do, or the hint when it cannot give more memory."""
-        if (
-            gate == RESUME_REQUIRED
-            and self.growth.outcome == "granted"
-            and self.growth.limit_bytes is not None
-        ):
+        if self.growth.outcome == "granted" and self.growth.limit_bytes is not None:
             return (
                 "Resume raises the job's memory limit to "
                 f"{format_bytes(self.growth.limit_bytes)}."
             )
         return MORE_MEMORY_HINT
 
-    def action(self, gate: str) -> str:
+    def action(self) -> str:
         """The hold's text before the kept clause; the action comes first so
         a list's cut keeps it."""
         return (
             f"{self.cause} and was stopped; interrupted command outcome is unknown; "
-            f"{gate}. {self.next_step(gate)}"
+            f"{RESUME_REQUIRED}. {self.next_step()}"
         )
 
 

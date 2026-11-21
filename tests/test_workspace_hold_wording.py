@@ -12,9 +12,7 @@ import pytest
 
 from shared.orch_surface.formatters import format_job_detail, format_jobs
 from shared.workspace_disk import (
-    RESUME_REFUSED_WITHOUT_VOLUME,
     RESUME_REQUIRED,
-    dead_workspace_resume_gate,
     recorded_workspace_kept_clause,
     volume_kept_from_backing,
     workspace_hold_facts,
@@ -57,10 +55,12 @@ class TestClause:
         )
 
     def test_pod_gone_no_volume(self):
+        # What is gone, and what a Resume gives back.
         assert workspace_kept_clause(runtime_replaced=True, volume_kept=False) == (
-            "The workspace had no persistent volume, so its files went with it; "
-            "what was pushed to the job repository and the job's saved progress "
-            "are kept."
+            "The workspace had no persistent volume, so files that were not pushed "
+            "to the job repository are gone; Resume starts a new workspace and "
+            "clones the job repository into it again. The job's saved progress is "
+            "kept."
         )
 
     def test_pod_still_running_claims_nothing_lost(self):
@@ -103,17 +103,6 @@ class TestClause:
         assert recorded_workspace_kept_clause(
             {"runtime_replaced": True, "volume_kept": True}
         ) == workspace_kept_clause(runtime_replaced=True, volume_kept=True)
-
-    def test_resume_is_refused_only_for_a_cleanup_that_kept_no_volume(self):
-        assert (
-            dead_workspace_resume_gate(recovery_cleanup=True, volume_kept=False)
-            == RESUME_REFUSED_WITHOUT_VOLUME
-        )
-        for cleanup, volume in ((True, True), (True, None), (False, False)):
-            assert (
-                dead_workspace_resume_gate(recovery_cleanup=cleanup, volume_kept=volume)
-                == RESUME_REQUIRED
-            )
 
 
 def _held(source, attention, error_message, **context):

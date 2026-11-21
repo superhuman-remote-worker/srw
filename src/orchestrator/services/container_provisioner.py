@@ -3368,14 +3368,18 @@ class ContainerProvisioner:
             previous_workspace = previous_context.get("workspace_container") or {}
             if "recovery_cleanup" in previous_workspace:
                 retained = await self._db.get_workspace_recovery_storage(owner.id)
+                # A runtime with a claim gets it back exactly; one that never
+                # had a claim (an emptyDir home) gets a new Pod without one.
                 if (
                     retained is None
                     or "_operator_pause_hold" in previous_context
-                    or not (_creation_plan.get("pvc") or {}).get("enabled")
+                    or bool((_creation_plan.get("pvc") or {}).get("enabled"))
+                    != (retained["pvc_uid"] is not None)
                     or not await self.validate_workspace_recovery_storage(owner.id)
                 ):
                     return False
-                expected_retained_pvc_uid = str(retained["pvc_uid"])
+                if retained["pvc_uid"] is not None:
+                    expected_retained_pvc_uid = str(retained["pvc_uid"])
             # Re-entry after publishing B retains its captured volume authority
             # in the exact reservation, even after A's receipt moved to history.
             captured_pvc = _creation_reservation.get("pvc_uid")
@@ -8878,6 +8882,11 @@ class ContainerProvisioner:
             location = json.loads(location)
         if location.get("namespace") != self._namespace:
             return False
+        if source["pvc_uid"] is None:
+            # The runtime never had a claim: its home went with its Pod, and
+            # so does the next one's. An install that now creates claims would
+            # hand this job a volume it never had, so it stays refused.
+            return not self._pvc_enabled
         owner = WorkspaceOwner.job(job_id)
         try:
             pvc = await self._bounded_kubernetes_call(

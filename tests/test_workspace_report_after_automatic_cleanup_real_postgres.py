@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from orchestrator.services.completion import handle_pod_workspace_recovery
 from orchestrator.services.completion_control import (
@@ -64,6 +65,13 @@ DEAD_ARM_ACTION = (
 )
 # A job's workspace binding as Ready records it: the home is on a volume.
 PVC_BINDING = {"backing_id": "k8s-pvc:agent-workspaces:report-pvc"}
+# The chart default (``workspace.pvcEnabled: false``): the home is an emptyDir.
+POD_BINDING = {"backing_id": "k8s-pod:agent-workspaces:report-pod"}
+NO_VOLUME_KEPT = (
+    "The workspace had no persistent volume, so files that were not pushed to "
+    "the job repository are gone; Resume starts a new workspace and clones the "
+    "job repository into it again. The job's saved progress is kept."
+)
 
 
 def _failed_pod_cluster(db, monkeypatch, owner, runtime):
@@ -77,6 +85,45 @@ def _failed_pod_cluster(db, monkeypatch, owner, runtime):
         items=[resources["pod"]] if "pod" in resources else []
     )
     return provisioner, resources
+
+
+def _without_a_volume(provisioner, resources):
+    """An install without persistent volumes: the dead Pod's ``workspace-data``
+    is an emptyDir, and the job has no claim and no stable Service (the
+    creator makes those only for a claim)."""
+
+    from kubernetes import client
+
+    provisioner._pvc_enabled = False
+    del resources["pvc"]
+    del resources["service"]
+    resources["pod"].spec.volumes = [
+        client.V1Volume(
+            name="workspace-data",
+            empty_dir=client.V1EmptyDirVolumeSource(size_limit="10Gi"),
+        )
+    ]
+
+
+def _field(value, snake, camel):
+    if isinstance(value, dict):
+        return value.get(camel, value.get(snake))
+    return getattr(value, snake, None)
+
+
+def _workspace_data_volumes(pod):
+    return [
+        volume
+        for volume in pod.spec.volumes
+        if _field(volume, "name", "name") == "workspace-data"
+    ]
+
+
+def _is_empty_dir(volume):
+    return (
+        _field(volume, "empty_dir", "emptyDir") is not None
+        and _field(volume, "persistent_volume_claim", "persistentVolumeClaim") is None
+    )
 
 
 async def _drain_queue(db):
@@ -217,8 +264,13 @@ def _job_controls(db, tmp_path, provider):
     )
 
 
-async def _resume_on_a_new_pod(db, monkeypatch, tmp_path, owner, held, pvc):
-    """Public Resume, then the dispatcher's creator, on a cluster that works."""
+async def _resume_on_a_new_pod(
+    db, monkeypatch, tmp_path, owner, held, pvc, *, request=None
+):
+    """Public Resume, then the dispatcher's creator, on a cluster that works.
+
+    ``pvc`` None: an install without persistent volumes and a job that had none.
+    """
 
     from tests import test_workspace_pull_failure_real_postgres as creator_cases
     from tests.test_active_workspace_creator_cancel_real_postgres import _make_ready
@@ -243,10 +295,14 @@ async def _resume_on_a_new_pod(db, monkeypatch, tmp_path, owner, held, pvc):
             return super().create_namespaced_service(**kwargs)
 
     cluster = ReadyCluster()
-    cluster.objects["pvc"] = pvc
+    if pvc is not None:
+        cluster.objects["pvc"] = pvc
     provider = creator_cases._provisioner(monkeypatch, db, cluster)
+    provider._pvc_enabled = pvc is not None
     operations = _job_controls(db, tmp_path, provider)
-    await operations.resume_job_internal(owner.id, user={"id": str(uuid4())}, job=held)
+    await operations.resume_job_internal(
+        owner.id, user={"id": str(uuid4())}, job=held, request=request
+    )
     queued = await current_job(db, held["id"])
     assert "_operator_pause_hold" not in queued["context"]
     assert await provider.create_workspace(owner)
@@ -421,46 +477,130 @@ async def test_t2_report_before_cleanup_still_holds_through_the_dead_arm(
     assert await current_job(db, original["id"]) == held
 
 
-@pytest.mark.asyncio
-async def test_dead_arm_without_a_volume_says_resume_cannot_continue(db, monkeypatch):
-    """An emptyDir home (``k8s-pod:`` backing) went with its Pod, and Resume
-    refuses a recovery cleanup that kept no volume: the hold says so instead
-    of asking for a Resume.
-    knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
-    """
+async def _held_without_a_volume(db, monkeypatch, *, order="report_first"):
+    """A stateless job on an emptyDir home whose Pod died, held for Resume."""
 
     original, owner, runtime, provisioner, resources = await _stateless_job(
-        db, monkeypatch, binding={"backing_id": "k8s-pod:agent-workspaces:pod-uid"}
+        db, monkeypatch, binding=POD_BINDING
     )
+    _without_a_volume(provisioner, resources)
+    job = original
+    if order == "reconciler_first":
+        stats = await _reconciler(db, provisioner).tick()
+        assert stats["workspace"]["unhealthy"] == 1
+        job = await current_job(db, original["id"])
     runner = await _accept_report(db, original["id"])
     outcome = await _recover(
         db,
-        original,
+        job,
         runner,
         provisioner,
         probe=AsyncMock(return_value=False),
         dispatch=Mock(),
     )
+    await CompletionFinalizer(db)._finish(runner.command_id, runner.owner, outcome)
+    held = await current_job(db, original["id"])
+    return held, outcome, owner, runtime, resources
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["report_first", "reconciler_first"])
+async def test_dead_arm_without_a_volume_resumes_on_a_new_pod(
+    db, monkeypatch, tmp_path, order
+):
+    """An emptyDir home (``k8s-pod:`` backing) went with its Pod. The hold
+    asks for a Resume, and Resume starts a new Pod without a volume, as after
+    a runtime the reconciler retired first. Report first, the arm's recovery
+    cleanup used to demand a retained volume and answer 409 every time.
+    knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
+    """
+
+    held, outcome, owner, runtime, resources = await _held_without_a_volume(
+        db, monkeypatch, order=order
+    )
 
     action = (
         "workspace transport lost; interrupted command outcome is unknown; "
-        "Resume cannot continue this job, so Cancel it. The workspace had no "
-        "persistent volume, so its files went with it; what was pushed to the job "
-        "repository and the job's saved progress are kept."
+        f"explicit Resume required. {NO_VOLUME_KEPT}"
     )
     assert outcome["actions"] == [action]
-    await CompletionFinalizer(db)._finish(runner.command_id, runner.owner, outcome)
-    held = await current_job(db, original["id"])
+    assert outcome["held_for_resume"] is True and outcome["cleanup_pending"] is False
+    assert held["status"] == "paused"
     assert held["error_message"] == action
     attention = held["context"]["_operator_pause_hold"]["attention"]
     assert attention["runtime_replaced"] is True
     assert attention["volume_kept"] is False
     assert (
-        "Workspace recovery hold: interrupted command outcome is unknown; Resume "
-        "cannot continue this job, so Cancel it. The workspace had no persistent "
-        "volume, so its files went with it; what was pushed to the job repository "
-        "and the job's saved progress are kept."
+        "Workspace recovery hold: interrupted command outcome is unknown; "
+        f"explicit Resume required. {NO_VOLUME_KEPT}"
     ) in format_job_detail(held).splitlines()
+    assert resources == {"checkpoint_bytes": b"retained source data"}
+    workspace = held["context"]["workspace_container"]
+    assert workspace["status"] == "deleted"
+    assert ("recovery_cleanup" in workspace) is (order == "report_first")
+    # The one cleanup (the arm's or the reconciler's) found no claim to keep.
+    (intent,) = await db.fetch(
+        "SELECT pvc_uid, resources_captured_at, result_kind "
+        "FROM managed_repository_workspace_cleanup_intents WHERE owner_id=$1",
+        held["id"],
+    )
+    assert intent["pvc_uid"] is None
+    assert intent["resources_captured_at"] is not None
+    assert intent["result_kind"] == "settled"
+
+    successor, cluster = await _resume_on_a_new_pod(
+        db, monkeypatch, tmp_path, owner, held, None
+    )
+    new_workspace = successor["context"]["workspace_container"]
+    assert new_workspace["status"] == "ready"
+    assert new_workspace["_runtime_incarnation"] != runtime
+    assert new_workspace["_runtime_incarnation"] == cluster.objects["pod"].metadata.uid
+    assert "recovery_cleanup" not in new_workspace
+    # A new Pod only: no claim is created or reattached, and no Service.
+    assert cluster.create_calls == ["pod"]
+    assert set(cluster.objects) == {"pod"}
+    (home,) = _workspace_data_volumes(cluster.objects["pod"])
+    assert _is_empty_dir(home)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["runtime_had_a_claim", "install_has_volumes"])
+async def test_resume_without_a_volume_never_hides_a_lost_one(
+    db, monkeypatch, tmp_path, case
+):
+    """The relaxed check is only for a runtime that never had a claim, on an
+    install whose next Pod gets none either. A runtime whose own creation
+    recorded a claim, or an install that now creates one, still gets 409: a
+    job never moves between kinds of storage behind the person's back."""
+
+    held, _, owner, runtime, _ = await _held_without_a_volume(db, monkeypatch)
+    if case == "runtime_had_a_claim":
+        await _raw(
+            db,
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET pvc_uid=$2 WHERE owner_id=$1 AND runtime_incarnation=$3::uuid",
+            held["id"],
+            uuid4(),
+            runtime,
+        )
+        # A claim lost since its creation is not "never had one".
+        assert await db.get_workspace_recovery_storage(owner.id) is None
+    else:
+        storage = await db.get_workspace_recovery_storage(owner.id)
+        assert storage is not None and storage["pvc_uid"] is None
+    from tests import test_workspace_pull_failure_real_postgres as creator_cases
+
+    cluster = creator_cases.NeverPullingCluster()
+    provider = creator_cases._provisioner(monkeypatch, db, cluster)
+    provider._pvc_enabled = case == "install_has_volumes"
+    operations = _job_controls(db, tmp_path, provider)
+    with pytest.raises(HTTPException) as refused:
+        await operations.resume_job_internal(
+            owner.id, user={"id": str(uuid4())}, job=held
+        )
+    assert refused.value.status_code == 409
+    assert await current_job(db, held["id"]) == held
+    assert cluster.objects == {}
 
 
 async def _retired_report(db, monkeypatch, *, retire=True):

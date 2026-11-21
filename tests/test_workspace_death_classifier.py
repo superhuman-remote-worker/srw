@@ -20,7 +20,6 @@ import pytest
 from orchestrator.services.container_provisioner import workspace_termination_from_pod
 from shared.workspace_disk import (
     MORE_MEMORY_HINT,
-    RESUME_REFUSED_WITHOUT_VOLUME,
     RESUME_REQUIRED,
     WORKSPACE_OUT_OF_MEMORY_REASON,
     WorkspaceMemoryGrowth,
@@ -312,14 +311,14 @@ def _kill(outcome, *, limit=4 * GIB, grown=8 * GIB):
 
 class TestWording:
     def test_first_kill_says_what_resume_does(self):
-        assert _kill("granted").action(RESUME_REQUIRED) == (
+        assert _kill("granted").action() == (
             "workspace ran out of memory (limit 4 GiB) and was stopped; interrupted "
             "command outcome is unknown; explicit Resume required. Resume raises the "
             "job's memory limit to 8 GiB."
         )
 
     def test_second_kill_gives_the_hint(self):
-        assert _kill("used", limit=8 * GIB).action(RESUME_REQUIRED) == (
+        assert _kill("used", limit=8 * GIB).action() == (
             "workspace ran out of memory again (limit 8 GiB, already raised once) and "
             "was stopped; interrupted command outcome is unknown; explicit Resume "
             "required. " + MORE_MEMORY_HINT
@@ -327,26 +326,21 @@ class TestWording:
 
     @pytest.mark.parametrize("outcome", ["capped", "off", "refused"])
     def test_no_growth_left_gives_the_hint(self, outcome):
-        text = _kill(outcome).action(RESUME_REQUIRED)
+        text = _kill(outcome).action()
         assert text.startswith("workspace ran out of memory (limit 4 GiB) and was")
         assert text.endswith(MORE_MEMORY_HINT)
         assert "raises" not in text
 
-    def test_a_refused_resume_never_promises_memory(self):
-        text = _kill("granted").action(RESUME_REFUSED_WITHOUT_VOLUME)
-        assert "raises" not in text
-        assert text.endswith(MORE_MEMORY_HINT)
-
     def test_an_unknown_limit_is_not_invented(self):
-        text = _kill("off", limit=None).action(RESUME_REQUIRED)
+        text = _kill("off", limit=None).action()
         assert text.startswith("workspace ran out of memory and was stopped;")
 
     def test_never_says_transport_lost(self):
         for outcome in ("granted", "used", "capped", "off", "refused"):
-            assert "transport" not in _kill(outcome).action(RESUME_REQUIRED)
+            assert "transport" not in _kill(outcome).action()
 
     def test_the_list_cut_keeps_the_action(self):
-        assert RESUME_REQUIRED in _kill("granted").action(RESUME_REQUIRED)[:180]
+        assert RESUME_REQUIRED in _kill("granted").action()[:180]
 
     def test_attention_round_trips(self):
         kill = _kill("granted")
@@ -403,7 +397,7 @@ class TestJobSurfaces:
         return kept, {
             "id": "11111111-2222-3333-4444-555555555555",
             "status": "paused",
-            "error_message": kill.action(RESUME_REQUIRED) + " " + kept,
+            "error_message": kill.action() + " " + kept,
             "context": {
                 "_operator_pause_hold": {
                     "source": "workspace_recovery_unavailable",
