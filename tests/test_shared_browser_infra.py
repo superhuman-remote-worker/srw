@@ -9,9 +9,9 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 
 
-def test_shared_browser_helm_gate_is_boolean_and_default_off():
+def test_shared_browser_helm_gate_is_boolean_and_default_on():
     values = yaml.safe_load((REPO / "helm/values.yaml").read_text())
-    assert values["canvas"]["sharedBrowser"]["enabled"] is False
+    assert values["canvas"]["sharedBrowser"]["enabled"] is True
 
     schema = json.loads((REPO / "helm/values.schema.json").read_text())
     shared = schema["properties"]["canvas"]["properties"]["sharedBrowser"]

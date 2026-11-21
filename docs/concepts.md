@@ -101,6 +101,25 @@ plans in phases.
 
 Both shapes use the same experts, workspaces and connectors.
 
+### The Canvas and the shared browser
+
+A session has a **Canvas** beside the chat. The agent puts things there for
+you to look at: a file from its workspace (Markdown, code, images, HTML pages,
+Office documents), and its **shared browser**.
+
+The shared browser is the browser in the session's workspace, shown live in
+the Canvas. The agent and you take turns: choose **Take control** to click and
+type yourself, **Release control** to hand it back. Because the browser runs
+inside the workspace, it reaches what the agent runs there. Ask the agent to
+build a web app and show it to you, and it starts the app, opens it in this
+browser and puts it on the Canvas for you to try, beside the chat where you
+ask for changes.
+
+The shared browser needs a session with a machine: a **Container** workspace.
+A session that starts on the default Virtual workspace asks to upgrade when
+the task needs one. Jobs have no Canvas. Operators can turn the shared browser
+off with the chart value `canvas.sharedBrowser.enabled: false`.
+
 ## Job statuses
 
 | Status | Meaning |

@@ -1345,10 +1345,13 @@ cockpit:
 # Dynamic Canvas
 # =============================================================================
 canvas:
-  # Shared browser: stream the workspace
-  # Chromium into the Canvas. Dark by default; the dev profile enables it.
+  # -- Shared browser: the workspace's Chromium, streamed into a Session's
+  # Canvas. The user and the agent take turns driving it, so the user can try
+  # a web app the agent built and runs in its workspace. Needs a Session with
+  # a machine (a Container); Virtual/None Sessions show the reason instead of
+  # the button. Jobs have no Canvas. Set false to hide it everywhere.
   sharedBrowser:
-    enabled: false
+    enabled: true
   livePreview:
     # -- Master capability gate for workspace-port live preview. The proxy,
     # isolated viewer origin, and browser acceptance gates must all fail closed

@@ -17,6 +17,12 @@ global:
 secrets:
   existingSecret: srw-secrets
 
+# Keeps the shared browser's off path rendered in CI now that the chart
+# default is on.
+canvas:
+  sharedBrowser:
+    enabled: false
+
 # External OIDC (e.g. Azure AD)
 keycloak:
   enabled: true
