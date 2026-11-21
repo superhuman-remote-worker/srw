@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -199,6 +200,49 @@ _NAV_K8S_INTERNAL_RE = re.compile(
 )
 
 
+_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
+_PORT_AFTER_COLON_RE = re.compile(r"^\d+(?:[/?#]|$)")
+
+
+def _typed_scheme(url: str) -> str:
+    """The scheme a person meant, or '' for a bare address.
+
+    ``urlparse`` reads ``localhost:4200`` and ``example.com:8080/x`` as the
+    schemes ``localhost`` and ``example.com``. A colon followed by a port
+    number is a host and port, as in a browser's address bar.
+    """
+    match = _SCHEME_RE.match(url)
+    if not match:
+        return ""
+    rest = url[match.end() :]
+    if not rest.startswith("//") and _PORT_AFTER_COLON_RE.match(rest):
+        return ""
+    return match.group(1).lower()
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    """True for addresses that only exist inside the workspace."""
+    host = hostname.lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
+
+
+def default_scheme_for(address: str) -> str:
+    """``http`` for a bare loopback address, else ``https``.
+
+    A dev server the agent starts in the workspace listens on plain HTTP, so
+    ``localhost:4200`` must not become ``https://localhost:4200``. The
+    Cockpit's address bar applies the same rule (normalizeBrowserAddress).
+    """
+    hostname = urlparse(f"//{address}").hostname or ""
+    return "http" if _is_loopback_host(hostname) else "https"
+
+
 def validate_user_nav(url: str, files) -> str:
     """Validate a viewer-typed URL.
 
@@ -208,14 +252,13 @@ def validate_user_nav(url: str, files) -> str:
     if not url or not url.strip():
         raise ValueError("URL cannot be empty")
     url = url.strip()
-    if urlparse(url).scheme == "file":
+    if _typed_scheme(url) == "file":
         url = files.url_for(url)
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
+    scheme = _typed_scheme(url)
     if not scheme:
-        url = f"https://{url}"
-        parsed = urlparse(url)
-        scheme = "https"
+        url = f"{default_scheme_for(url)}://{url}"
+        scheme = _typed_scheme(url)
+    parsed = urlparse(url)
     if scheme in {"javascript", "data", "file"}:
         raise ValueError(f"Blocked scheme: {scheme}://")
     if scheme not in ("http", "https"):

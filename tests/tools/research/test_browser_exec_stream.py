@@ -183,6 +183,42 @@ class TestValidateUserNav:
             BE.validate_user_nav("example.com", _StubFiles()) == "https://example.com"
         )
 
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
+            ("localhost:4200", "http://localhost:4200"),
+            ("localhost", "http://localhost"),
+            ("LOCALHOST:3000/path?q=1", "http://LOCALHOST:3000/path?q=1"),
+            ("127.0.0.1:8000", "http://127.0.0.1:8000"),
+            ("127.0.0.1", "http://127.0.0.1"),
+            ("[::1]:3000/x", "http://[::1]:3000/x"),
+            ("[::1]", "http://[::1]"),
+            ("0.0.0.0:5173", "http://0.0.0.0:5173"),
+            ("app.localhost:5173/", "http://app.localhost:5173/"),
+        ],
+    )
+    def test_schemeless_workspace_loopback_gets_http(self, typed, expected):
+        # A dev server the agent starts in the workspace speaks plain HTTP.
+        # Before: "localhost:4200" parsed as scheme "localhost" (rejected) and
+        # "127.0.0.1:8000" became https:// (TLS error).
+        assert BE.validate_user_nav(typed, _StubFiles()) == expected
+
+    def test_schemeless_host_with_port_gets_https(self):
+        assert (
+            BE.validate_user_nav("example.com:8080/x", _StubFiles())
+            == "https://example.com:8080/x"
+        )
+
+    def test_explicit_scheme_is_kept_for_loopback(self):
+        assert (
+            BE.validate_user_nav("https://localhost:8443/", _StubFiles())
+            == "https://localhost:8443/"
+        )
+
+    def test_non_web_scheme_still_rejected(self):
+        with pytest.raises(ValueError, match="Unsupported scheme"):
+            BE.validate_user_nav("mailto:someone@example.com", _StubFiles())
+
     def test_javascript_blocked(self):
         with pytest.raises(ValueError):
             BE.validate_user_nav("javascript:alert(1)", _StubFiles())
