@@ -35,6 +35,12 @@ export interface BrowserStateServerMessage {
   /** Protocol-private identity used by the controller to pin subsequent frames. */
   readonly generation: string;
   readonly state: BrowserPageState;
+  /**
+   * Whether the daemon sizes its page to `set_viewport`. Present only after
+   * this viewer opted in with `client_features`; false when absent, which is
+   * what an older daemon (one that ignores the opt-in) always looks like.
+   */
+  readonly viewportControl: boolean;
 }
 
 export interface BrowserFrameServerMessage {
@@ -58,9 +64,16 @@ export type BrowserServerMessage =
   | BrowserFrameServerMessage
   | BrowserErrorServerMessage;
 
+/** Opt-in protocol features this Cockpit understands (see `client_features`). */
+export const BROWSER_CLIENT_FEATURES = Object.freeze(['viewport_control'] as const);
+export type BrowserClientFeature = (typeof BROWSER_CLIENT_FEATURES)[number];
+
 export type BrowserControl =
   | { readonly op: 'take_baton' | 'release_baton' | 'back' | 'reload' }
-  | { readonly op: 'navigate'; readonly url: string };
+  | { readonly op: 'navigate'; readonly url: string }
+  /** CSS pixels of the page's viewport; honoured only from the baton holder. */
+  | { readonly op: 'set_viewport'; readonly width: number; readonly height: number }
+  | { readonly op: 'client_features'; readonly features: readonly BrowserClientFeature[] };
 
 export type BrowserInputParameter = string | number | boolean;
 
@@ -104,6 +117,25 @@ export function encodeBrowserControl(message: BrowserControl): ArrayBuffer {
       !isBoundedString(message['url'], 1, BROWSER_MAX_URL_CHARS)
     ) {
       throw new TypeError('Invalid browser navigation control');
+    }
+  } else if (op === 'set_viewport') {
+    if (
+      !hasExactKeys(message, ['op', 'width', 'height']) ||
+      !isViewportDimension(message['width']) ||
+      !isViewportDimension(message['height'])
+    ) {
+      throw new TypeError('Invalid browser viewport control');
+    }
+  } else if (op === 'client_features') {
+    const features = message['features'];
+    if (
+      !hasExactKeys(message, ['op', 'features']) ||
+      !Array.isArray(features) ||
+      features.length > BROWSER_CLIENT_FEATURES.length ||
+      !features.every((feature) =>
+        (BROWSER_CLIENT_FEATURES as readonly unknown[]).includes(feature))
+    ) {
+      throw new TypeError('Invalid browser client features');
     }
   } else if (
     !['take_baton', 'release_baton', 'back', 'reload'].includes(op) ||
@@ -240,7 +272,12 @@ function parseState(payload: Uint8Array): BrowserStateServerMessage | null {
   const value = parseJsonObject(payload);
   if (
     !value ||
-    !hasExactKeys(value, ['baton', 'generation', 'loading', 'title', 'url', 'viewport']) ||
+    !hasOnlyKeys(
+      value,
+      ['baton', 'generation', 'loading', 'title', 'url', 'viewport'],
+      ['viewport_control'],
+    ) ||
+    (value['viewport_control'] !== undefined && typeof value['viewport_control'] !== 'boolean') ||
     !isCanonicalCanvasUuid(value['generation']) ||
     (value['baton'] !== 'agent' && value['baton'] !== 'user') ||
     !isRecord(value['viewport']) ||
@@ -266,6 +303,7 @@ function parseState(payload: Uint8Array): BrowserStateServerMessage | null {
       title: value['title'],
       loading: value['loading'],
     },
+    viewportControl: value['viewport_control'] === true,
   };
 }
 

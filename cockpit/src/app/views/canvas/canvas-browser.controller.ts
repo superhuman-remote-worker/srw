@@ -1,6 +1,7 @@
 import { DestroyRef, Injectable, InjectionToken, inject, signal } from '@angular/core';
 import { CanvasState } from '../../core/models/canvas.model';
 import {
+  BROWSER_CLIENT_FEATURES,
   BrowserBaton,
   BrowserControl,
   BrowserInput,
@@ -84,6 +85,12 @@ const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
  */
 export const BROWSER_HANDSHAKE_TIMEOUT_MS = 10_000;
 
+/** CSS pixels. */
+export interface BrowserViewportSize {
+  readonly width: number;
+  readonly height: number;
+}
+
 /** Pane-local owner of one shared-browser socket and decoded bitmap pipeline. */
 @Injectable()
 export class CanvasBrowserController {
@@ -100,6 +107,14 @@ export class CanvasBrowserController {
   readonly errorMessage = signal<string | null>(null);
   /** Expected holder after a sent baton control; cleared only by authoritative STATE. */
   readonly pendingBaton = signal<BrowserBaton | null>(null);
+  /** The daemon sizes its page to `requestViewport`; false on older daemons. */
+  readonly viewportControl = signal(false);
+  /**
+   * CSS size of the page shown in `frame` (the FRAME header), set together
+   * with it: the exact space viewer input maps onto, even while a resize is
+   * on its way. Null when the daemon did not say.
+   */
+  readonly frameSize = signal<BrowserViewportSize | null>(null);
 
   private presentation: LastPresentation | null = null;
   private desired: DesiredBrowser | null = null;
@@ -174,6 +189,28 @@ export class CanvasBrowserController {
   sendInput(message: BrowserInput): boolean {
     if (this.pageState()?.baton !== 'user' || this.pendingBaton() !== null) return false;
     return this.send(encodeBrowserInput, message);
+  }
+
+  /**
+   * Ask the daemon to size its page's viewport (CSS pixels). Only while this
+   * viewer drives and the daemon advertised the capability; a size the page
+   * already has is not sent again. The daemon clamps and reports the real
+   * size in STATE.
+   */
+  requestViewport(width: number, height: number): boolean {
+    if (
+      !this.viewportControl() ||
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      width < 1 ||
+      height < 1
+    ) {
+      return false;
+    }
+    const state = this.pageState();
+    if (state?.baton !== 'user' || this.pendingBaton() !== null) return false;
+    if (state.viewport.width === width && state.viewport.height === height) return false;
+    return this.send(encodeBrowserControl, {op: 'set_viewport', width, height});
   }
 
   private evaluatePresentation(): void {
@@ -288,7 +325,8 @@ export class CanvasBrowserController {
     }
 
     if (message.type === 'state') {
-      if (this.expectedGeneration === null) {
+      const first = this.expectedGeneration === null;
+      if (first) {
         this.expectedGeneration = message.generation;
         this.reconnectAttempt = 0;
         this.connectionStatus.set('ready');
@@ -299,7 +337,17 @@ export class CanvasBrowserController {
         return;
       }
       this.pageState.set(message.state);
+      this.viewportControl.set(message.viewportControl);
       if (this.pendingBaton() === message.state.baton) this.pendingBaton.set(null);
+      // Opt in to the STATE keys this Cockpit understands. An older daemon
+      // ignores the op, so viewportControl stays false and the pane keeps
+      // scaling the page to fit.
+      if (first) {
+        this.send(encodeBrowserControl, {
+          op: 'client_features',
+          features: [...BROWSER_CLIENT_FEATURES],
+        });
+      }
       return;
     }
 
@@ -311,14 +359,14 @@ export class CanvasBrowserController {
       ) {
         return;
       }
-      this.decodeFrame(epoch, message.jpeg);
+      this.decodeFrame(epoch, message.jpeg, frameSizeOf(message.headerWidth, message.headerHeight));
       return;
     }
 
     this.handleServerError(message.code, message.message);
   }
 
-  private decodeFrame(epoch: number, jpeg: Uint8Array): void {
+  private decodeFrame(epoch: number, jpeg: Uint8Array, size: BrowserViewportSize | null): void {
     this.decodeEpoch = epoch;
     let decoded: Promise<ImageBitmap>;
     try {
@@ -337,6 +385,7 @@ export class CanvasBrowserController {
           return;
         }
         const previous = this.frame();
+        this.frameSize.set(sameSize(this.frameSize(), size) ? this.frameSize() : size);
         this.frame.set(bitmap);
         if (previous && previous !== bitmap) closeBitmap(previous);
         if (this.errorCode() === 'browser_frame_decode_failed') this.errorCode.set(null);
@@ -425,6 +474,7 @@ export class CanvasBrowserController {
     this.errorCode.set(code);
     this.errorMessage.set(null);
     this.pendingBaton.set(null);
+    this.viewportControl.set(false);
     this.connectionStatus.set('reconnecting');
     const desiredIdentity = this.desired.identity;
     const delay =
@@ -457,6 +507,7 @@ export class CanvasBrowserController {
     this.errorCode.set(code);
     this.errorMessage.set(message);
     this.pendingBaton.set(null);
+    this.viewportControl.set(false);
     this.terminalIdentity = identity;
   }
 
@@ -468,6 +519,7 @@ export class CanvasBrowserController {
     this.expectedGeneration = null;
     this.decodeEpoch = null;
     this.pendingBaton.set(null);
+    this.viewportControl.set(false);
     this.connectionStatus.set(status);
     if (status === 'idle') {
       this.errorCode.set(null);
@@ -507,6 +559,7 @@ export class CanvasBrowserController {
   private clearFrame(): void {
     const current = this.frame();
     this.frame.set(null);
+    this.frameSize.set(null);
     if (current) closeBitmap(current);
   }
 
@@ -536,6 +589,16 @@ export class CanvasBrowserController {
       return false;
     }
   }
+}
+
+function frameSizeOf(width: number | null, height: number | null): BrowserViewportSize | null {
+  if (width === null || height === null) return null;
+  const size = {width: Math.round(width), height: Math.round(height)};
+  return size.width >= 1 && size.height >= 1 ? size : null;
+}
+
+function sameSize(a: BrowserViewportSize | null, b: BrowserViewportSize | null): boolean {
+  return a === b || (!!a && !!b && a.width === b.width && a.height === b.height);
 }
 
 function closeBitmap(bitmap: ImageBitmap): void {

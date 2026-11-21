@@ -379,6 +379,13 @@
         "address": "Address",
         "navigationRejected": "Navigation blocked:"
       },
+      "size": {
+        "label": "Page size",
+        "fit": "Fit to pane",
+        "phone": "Phone ({{width}} × {{height}})",
+        "tablet": "Tablet ({{width}} × {{height}})",
+        "desktop": "Desktop ({{width}} × {{height}})"
+      },
       "open": {
         "action": "Open browser",
         "explanation": "Open a browser that you and the agent can use together.",

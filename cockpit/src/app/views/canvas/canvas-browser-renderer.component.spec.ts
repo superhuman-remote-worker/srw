@@ -4,6 +4,7 @@ import { TranslocoPipe, TranslocoTestingModule } from '@jsverse/transloco';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   Component,
+  Directive,
   EventEmitter,
   Input,
   Output,
@@ -14,10 +15,20 @@ import { BrowserPageState } from './canvas-browser-protocol';
 import { CanvasService } from '../../core/services/canvas.service';
 import { PersistentThreadTransportBridge } from '../../core/services/persistent-thread-transport-bridge.service';
 import {
+  BrowserViewportSize,
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
 } from './canvas-browser.controller';
-import { CanvasBrowserRendererComponent } from './canvas-browser-renderer.component';
+import {
+  BROWSER_VIEWPORT_DEBOUNCE_MS,
+  CanvasBrowserRendererComponent,
+  fitBrowserFrame,
+} from './canvas-browser-renderer.component';
+
+@Directive({selector: '[appTooltip]', standalone: true})
+class TooltipStubDirective {
+  @Input() appTooltip = '';
+}
 
 @Component({
   selector: 'app-icon-button',
@@ -75,6 +86,13 @@ const translations = {
         address: 'Address',
         navigationRejected: 'Navigation blocked:',
       },
+      size: {
+        label: 'Page size',
+        fit: 'Fit to pane',
+        phone: 'Phone ({{width}} × {{height}})',
+        tablet: 'Tablet ({{width}} × {{height}})',
+        desktop: 'Desktop ({{width}} × {{height}})',
+      },
       status: {
         connecting: 'Connecting',
         ready: 'Connected',
@@ -121,10 +139,15 @@ describe('Canvas shared-browser renderer', () => {
     errorCode: ReturnType<typeof signal<string | null>>;
     errorMessage: ReturnType<typeof signal<string | null>>;
     pendingBaton: ReturnType<typeof signal<'agent' | 'user' | null>>;
+    viewportControl: ReturnType<typeof signal<boolean>>;
+    frameSize: ReturnType<typeof signal<BrowserViewportSize | null>>;
     retry: ReturnType<typeof vi.fn>;
     sendControl: ReturnType<typeof vi.fn>;
     sendInput: ReturnType<typeof vi.fn>;
+    requestViewport: ReturnType<typeof vi.fn>;
   };
+  let resizeCallbacks: ResizeObserverCallback[];
+  let observed: Element[];
   let canvas: {
     browserCapability: ReturnType<typeof signal<{
       feature_enabled: boolean;
@@ -153,10 +176,26 @@ describe('Canvas shared-browser renderer', () => {
       errorCode: signal<string | null>(null),
       errorMessage: signal<string | null>(null),
       pendingBaton: signal<'agent' | 'user' | null>(null),
+      viewportControl: signal(false),
+      frameSize: signal<BrowserViewportSize | null>(null),
       retry: vi.fn(),
       sendControl: vi.fn(() => true),
       sendInput: vi.fn(() => true),
+      requestViewport: vi.fn(() => true),
     };
+    resizeCallbacks = [];
+    observed = [];
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(element: Element): void {
+        observed.push(element);
+      }
+      disconnect(): void {
+        observed = [];
+      }
+    });
     canvas = {
       browserCapability: signal({
         feature_enabled: true,
@@ -194,6 +233,7 @@ describe('Canvas shared-browser renderer', () => {
           IconButtonStubComponent,
           IconStubComponent,
           SpinnerStubComponent,
+          TooltipStubDirective,
           TranslocoPipe,
         ],
       },
@@ -253,7 +293,9 @@ describe('Canvas shared-browser renderer', () => {
     expect(getContext).toHaveBeenCalled();
     expect(surface.width).toBe(640);
     expect(surface.height).toBe(480);
-    expect(surface.style.aspectRatio).toBe('1280 / 720');
+    // Displayed at the page's CSS size (STATE viewport), not the bitmap's.
+    expect(surface.style.width).toBe('1280px');
+    expect(surface.style.height).toBe('720px');
     expect(context.drawImage).toHaveBeenLastCalledWith(decoded, 0, 0);
 
     controller.frame.set(null);
@@ -707,10 +749,157 @@ describe('Canvas shared-browser renderer', () => {
     });
   });
 
-  it('gives a typed loopback address http:// before navigating', () => {
-    controller.connectionStatus.set('ready');
-    controller.pageState.set(page({baton: 'user'}));
+  function resizeStage(width: number, height: number): void {
+    const entry = {contentRect: {width, height}} as unknown as ResizeObserverEntry;
+    for (const callback of resizeCallbacks) callback([entry], {} as ResizeObserver);
+    TestBed.flushEffects();
     fixture.detectChanges();
+  }
+
+  function drive(viewportControl = true): void {
+    controller.connectionStatus.set('ready');
+    controller.viewportControl.set(viewportControl);
+    controller.pageState.set(page({baton: 'user'}));
+    TestBed.flushEffects();
+    fixture.detectChanges();
+  }
+
+  it('places the page 1:1, scales it down only to fit, and centres it on whole pixels', () => {
+    expect(fitBrowserFrame({width: 585, height: 480}, {width: 585.6, height: 480.2})).toEqual({
+      width: 585, height: 480, left: 0, top: 0,
+    });
+    expect(fitBrowserFrame({width: 768, height: 1024}, {width: 585, height: 480})).toEqual({
+      width: 360, height: 480, left: 112, top: 0,
+    });
+    expect(fitBrowserFrame({width: 390, height: 844}, {width: 2001, height: 900})).toEqual({
+      width: 390, height: 844, left: 805, top: 28,
+    });
+    expect(fitBrowserFrame({width: 1919, height: 992}, null)).toEqual({
+      width: 1919, height: 992, left: 0, top: 0,
+    });
+    expect(fitBrowserFrame({width: 1919, height: 992}, {width: 0, height: 0}).width).toBe(1919);
+
+    expect(observed).toEqual([fixture.nativeElement.querySelector('.browser-stage')]);
+    controller.frameSize.set({width: 768, height: 1024});
+    resizeStage(585, 480);
+    const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
+    expect([surface.style.width, surface.style.height, surface.style.left, surface.style.top])
+      .toEqual(['360px', '480px', '112px', '0px']);
+  });
+
+  it('hides the size switch when the daemon cannot size its page', () => {
+    drive(false);
+    resizeStage(585, 480);
+
+    expect(fixture.nativeElement.querySelector('.browser-size')).toBeNull();
+    expect(controller.requestViewport).not.toHaveBeenCalled();
+  });
+
+  it('sizes the page to the pane in Fit mode once the pane holds still', () => {
+    vi.useFakeTimers();
+    try {
+      resizeStage(585.6, 480.2);
+      drive();
+      expect(controller.requestViewport).toHaveBeenCalledExactlyOnceWith(585, 480);
+
+      resizeStage(700, 500);
+      resizeStage(720, 510);
+      expect(controller.requestViewport).toHaveBeenCalledOnce();
+      vi.advanceTimersByTime(BROWSER_VIEWPORT_DEBOUNCE_MS);
+      TestBed.flushEffects();
+      expect(controller.requestViewport).toHaveBeenCalledTimes(2);
+      expect(controller.requestViewport).toHaveBeenLastCalledWith(720, 510);
+
+      // STATE updates (title, URL, the viewport itself) never resend.
+      controller.pageState.set(page({baton: 'user', viewport: {width: 720, height: 510}}));
+      controller.pageState.set(page({baton: 'user', title: 'Other'}));
+      TestBed.flushEffects();
+      expect(controller.requestViewport).toHaveBeenCalledTimes(2);
+
+      // A hidden pane measures 0x0 and asks for nothing.
+      resizeStage(0, 0);
+      vi.advanceTimersByTime(BROWSER_VIEWPORT_DEBOUNCE_MS);
+      TestBed.flushEffects();
+      expect(controller.requestViewport).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends the size only while this viewer drives, and again when it takes the baton', () => {
+    resizeStage(585, 480);
+    controller.connectionStatus.set('ready');
+    controller.viewportControl.set(true);
+    TestBed.flushEffects();
+    fixture.detectChanges();
+    expect(controller.requestViewport).not.toHaveBeenCalled();
+    const fit = fixture.nativeElement.querySelector('[data-mode="fit"]') as HTMLButtonElement;
+    expect(fit.disabled).toBe(true);
+
+    controller.pendingBaton.set('user');
+    TestBed.flushEffects();
+    expect(controller.requestViewport).not.toHaveBeenCalled();
+    controller.pendingBaton.set(null);
+    controller.pageState.set(page({baton: 'user'}));
+    TestBed.flushEffects();
+    expect(controller.requestViewport).toHaveBeenCalledExactlyOnceWith(585, 480);
+  });
+
+  it('switches between Fit and the phone, tablet and desktop presets', () => {
+    resizeStage(585, 480);
+    drive();
+    const root = fixture.nativeElement as HTMLElement;
+    const group = root.querySelector('.browser-size') as HTMLElement;
+    const buttons = [...group.querySelectorAll<HTMLButtonElement>('button')];
+    expect(group.getAttribute('role')).toBe('group');
+    expect(group.getAttribute('aria-label')).toBe('Page size');
+    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
+      'Fit to pane',
+      'Phone (390 × 844)',
+      'Tablet (768 × 1024)',
+      'Desktop (1440 × 900)',
+    ]);
+    expect(buttons.map((button) => button.getAttribute('aria-pressed'))).toEqual([
+      'true', 'false', 'false', 'false',
+    ]);
+
+    for (const [index, size] of [[1, [390, 844]], [2, [768, 1024]], [3, [1440, 900]]] as const) {
+      buttons[index].click();
+      TestBed.flushEffects();
+      fixture.detectChanges();
+      expect(controller.requestViewport).toHaveBeenLastCalledWith(...size);
+      expect(buttons[index].getAttribute('aria-pressed')).toBe('true');
+    }
+    // A preset ignores pane resizes; Fit goes back to the pane.
+    const calls = controller.requestViewport.mock.calls.length;
+    resizeStage(600, 500);
+    expect(controller.requestViewport).toHaveBeenCalledTimes(calls);
+    buttons[0].click();
+    TestBed.flushEffects();
+    expect(controller.requestViewport).toHaveBeenLastCalledWith(585, 480);
+  });
+
+  it('maps input onto the CSS size of the frame on screen, scrollbar included', () => {
+    drive(false);
+    controller.pageState.set(page({baton: 'user', viewport: {width: 1904, height: 992}}));
+    controller.frameSize.set({width: 1919, height: 992});
+    fixture.detectChanges();
+    const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
+    vi.spyOn(surface, 'getBoundingClientRect').mockReturnValue(
+      {left: 0, top: 0, width: 1919, height: 992} as DOMRect,
+    );
+
+    fixture.componentInstance.onPointerDown(
+      {clientX: 1910, clientY: 5, button: 0, buttons: 1, detail: 1, isPrimary: true, pointerId: 1,
+       altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+       preventDefault: vi.fn()} as unknown as PointerEvent,
+    );
+
+    expect(controller.sendInput.mock.calls.at(-1)?.[0].params).toMatchObject({x: 1910, y: 5});
+  });
+
+  it('gives a typed loopback address http:// before navigating', () => {
+    drive(false);
     const component = fixture.componentInstance;
     component.urlValue.set('localhost:4200');
     component.navigate({preventDefault: vi.fn()} as unknown as Event);
@@ -721,6 +910,27 @@ describe('Canvas shared-browser renderer', () => {
       {op: 'navigate', url: 'http://localhost:4200'},
       {op: 'navigate', url: 'https://example.com'},
     ]);
+  });
+
+  it('keeps the full page title and URL available when the toolbar truncates them', () => {
+    drive(false);
+    controller.pageState.set(page({
+      baton: 'user',
+      title: 'A very long application title that does not fit',
+      url: 'http://127.0.0.1:8000/entries?sort=date',
+    }));
+    TestBed.flushEffects();
+    fixture.detectChanges();
+    const root = fixture.nativeElement as HTMLElement;
+
+    expect(root.querySelector('.browser-title')?.getAttribute('title')).toBe(
+      'A very long application title that does not fit',
+    );
+    expect(root.querySelector('input')?.getAttribute('title')).toBe(
+      'http://127.0.0.1:8000/entries?sort=date',
+    );
+    // Connected is the normal case; only other states take toolbar room.
+    expect(root.querySelector('.browser-connection')).toBeNull();
   });
 
   it('renders the bounded navigation rejection without detaching the stream', () => {
