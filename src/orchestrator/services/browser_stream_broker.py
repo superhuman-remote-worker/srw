@@ -20,8 +20,13 @@ from orchestrator.services.canvas_ssh import (
     PINNED_SSH_TRANSPORT_POOL,
     CanvasSSHError,
     GenerationResolver,
-    bound_workspace_generation,
-    resolve_remote_workspace_target,
+    RemoteWorkspaceTarget,
+    VMAttestationVerdict,
+    attest_vm_workspace_target,
+    canvas_workspace_generation,
+    require_same_remote_workspace,
+    resolve_canvas_workspace_target,
+    vm_canvas_route_available,
 )
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
 from orchestrator.services.stateless_workspace_gate import (
@@ -33,6 +38,10 @@ MAX_STREAM_FRAME = 8 * 1024 * 1024
 MAX_BROWSER_CLIENT_MESSAGE = 64 * 1024
 STREAM_INFO_TIMEOUT_S = 45.0
 STREAM_INFO_MAX_OUTPUT = 64 * 1024
+# How often an open stream re-checks that its workspace is still the one it
+# opened on. A WebSocket outlives the proof that admitted it; the IDE relay
+# (ide_proxy_gateway._IDE_WS_LIFECYCLE_RECHECK_S) uses the same interval.
+STREAM_WORKSPACE_RECHECK_S = 15.0
 
 logger = logging.getLogger(__name__)
 
@@ -83,18 +92,20 @@ def workspace_ready(thread: dict) -> bool:
     return _active_context(thread).get("status") == "ready"
 
 
-def _vm_workspace_active(thread: dict) -> bool:
-    """Whether the selected live browser endpoint is a VM.
+async def _vm_target_verdict(target: RemoteWorkspaceTarget) -> VMAttestationVerdict:
+    """Controller proof for a VM target; a container target has none to give."""
 
-    A Canvas binding/DB reread cannot continuously prove the signed VM,
-    launcher-Pod, and endpoint identity for a long-lived relay. Until the
-    browser protocol binds its token to that exact controller-attested tuple,
-    contain the VM path before SSH or browser startup. Kubernetes and explicit
-    local-container behavior remain unchanged.
-    """
+    if target.vm_runtime is None:
+        return "current"
+    return await attest_vm_workspace_target(target)
 
-    vm = _metadata(thread).get("vm") or {}
-    return bool(isinstance(vm, dict) and vm.get("status") == "ready")
+
+async def _require_current_vm(target: RemoteWorkspaceTarget, changed: str) -> None:
+    verdict = await _vm_target_verdict(target)
+    if verdict == "changed":
+        raise BrowserStreamUnavailable(409, changed)
+    if verdict != "current":
+        raise BrowserStreamUnavailable(503, "workspace runtime could not be verified")
 
 
 _STATELESS_BROWSER_START_STATUSES = frozenset(
@@ -167,12 +178,13 @@ async def exec_stream_info(
     initial_baton: str | None = None,
     generation_resolver: GenerationResolver,
 ) -> dict:
-    """Cold-start browser-exec through the pinned SSH transport."""
+    """Cold-start browser-exec through the pinned SSH transport.
 
-    if _vm_workspace_active(thread):
-        raise BrowserStreamUnavailable(
-            503, "VM browser streaming requires continuous runtime attestation"
-        )
+    A VM target is proved by the controller before the command runs and again
+    after it returns, so a browser identity minted on a runtime that was
+    replaced meanwhile is never handed out. The row checks of the pinned pool
+    run in between, as for a container.
+    """
 
     config = browser_stream_config()
     args: dict = {}
@@ -184,13 +196,11 @@ async def exec_stream_info(
     if process_tag is not None:
         remote = f"env SRW_WORKSPACE_PROCESS_TAG={shlex.quote(process_tag)} {remote}"
     try:
-        target = resolve_remote_workspace_target(
-            dict(thread),
-            bound_workspace_generation(thread),
-        )
-        if not orchestrator_can_reach(target.host):
+        target = _resolve_target(thread)
+        if not _target_routable(target):
             raise BrowserStreamUnavailable(503, "workspace route is unavailable")
         key_path = _resolve_key_path()
+        await _require_current_vm(target, "workspace runtime is not attested")
         result = await PINNED_SSH_TRANSPORT_POOL.run_command(
             target=target,
             command=remote,
@@ -198,6 +208,9 @@ async def exec_stream_info(
             generation_resolver=generation_resolver,
             timeout=STREAM_INFO_TIMEOUT_S,
             max_output_bytes=STREAM_INFO_MAX_OUTPUT,
+        )
+        await _require_current_vm(
+            target, "workspace changed while the browser was starting"
         )
     except BrowserStreamUnavailable:
         raise
@@ -318,22 +331,74 @@ async def _exec_stream_info_with_lifecycle(
         ) from exc
 
 
-def _resolve_target(thread: dict):
-    """Resolve the provisioner-attested target for the bound generation."""
+def _resolve_target(thread: dict) -> RemoteWorkspaceTarget:
+    """Resolve the attested target: the bound container or the ready VM."""
 
-    return resolve_remote_workspace_target(
+    return resolve_canvas_workspace_target(
         dict(thread),
-        bound_workspace_generation(thread),
+        canvas_workspace_generation(dict(thread)),
     )
 
 
-def _resolve_reachable_target(thread: dict):
+def _target_routable(target: RemoteWorkspaceTarget) -> bool:
+    """A container needs a route; a VM needs the same cluster (no tailnet)."""
+
+    if target.vm_runtime is not None:
+        return vm_canvas_route_available(target.host, can_reach=orchestrator_can_reach)
+    return orchestrator_can_reach(target.host)
+
+
+def _resolve_reachable_target(thread: dict) -> RemoteWorkspaceTarget:
     """Resolve the current attested workspace route, failing closed."""
 
     target = _resolve_target(thread)
-    if not orchestrator_can_reach(target.host):
+    if not _target_routable(target):
         raise BrowserStreamUnavailable(503, "workspace route is unavailable")
     return target
+
+
+async def _stream_target_verdict(
+    db, thread_id: str, target: RemoteWorkspaceTarget
+) -> VMAttestationVerdict:
+    """Whether an open relay still talks to the workspace it opened on.
+
+    The durable row answers first: a VM being suspended (``suspending``), a
+    restored VM (new runtime) or a VM that took over from the container all
+    show there. For a VM the controller then proves the live runtime, which
+    also catches a launcher replaced behind an unchanged row. A container has
+    no such proof, and an unreadable row never ends its stream; for a VM an
+    inconclusive answer does (the viewer reconnects and is admitted again).
+    """
+
+    try:
+        current = await db.get_thread(thread_id)
+    except Exception:
+        return "unknown" if target.vm_runtime is not None else "current"
+    if not current:
+        return "changed"
+    try:
+        require_same_remote_workspace(dict(current), target)
+    except CanvasSSHError:
+        return "changed"
+    return await _vm_target_verdict(target)
+
+
+async def _vm_stream_end_verdict(
+    db, thread_id: str, target: RemoteWorkspaceTarget
+) -> VMAttestationVerdict | None:
+    """Row-only reason a VM relay's channel ended; ``None`` keeps it transient."""
+
+    try:
+        current = await db.get_thread(thread_id)
+    except Exception:
+        return None
+    if not current:
+        return "changed"
+    try:
+        require_same_remote_workspace(dict(current), target)
+    except CanvasSSHError:
+        return "changed"
+    return None
 
 
 async def _get_canvas_record(db, thread_id: str):
@@ -452,10 +517,9 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     if not workspace_ready(thread):
         await _reject_ws(ws, 4503, "Workspace not ready")
         return
-    if _vm_workspace_active(thread):
-        await _reject_ws(ws, 4503, "VM browser streaming is unavailable")
-        return
     try:
+        # An unattested or unroutable (tailnet) VM fails here, before any
+        # browser start, exactly like an unattested container.
         _resolve_reachable_target(thread)
         _resolve_key_path()
     except Exception:
@@ -471,6 +535,8 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     accepted = False
     stream_failed = False
     protocol_closed = False
+    target: RemoteWorkspaceTarget | None = None
+    workspace_verdict: VMAttestationVerdict | None = None
     try:
         try:
 
@@ -550,6 +616,16 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
         if int(info["port"]) != current_config.stream_port:
             await _reject_ws(ws, 4502, "Browser unreachable")
             return
+        # A VM is proved by the controller once more at the last point before
+        # accepting: a runtime that changed is an ended browser, an
+        # inconclusive proof a transient failure the viewer retries.
+        admission = await _vm_target_verdict(target)
+        if admission == "changed":
+            await _reject_ws(ws, 4409, "Browser generation ended")
+            return
+        if admission != "current":
+            await _reject_ws(ws, 4502, "Browser unreachable")
+            return
 
         await ws.accept()
         accepted = True
@@ -612,10 +688,28 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                         )
                     await asyncio.sleep(current_config.activity_interval_seconds)
 
+            async def supervise_workspace() -> None:
+                # Ends the relay once its workspace is suspended, restored,
+                # replaced (a VM taking over from the container, or the
+                # reverse) or, for a VM, can no longer be proved.
+                nonlocal workspace_verdict
+                while True:
+                    await asyncio.sleep(STREAM_WORKSPACE_RECHECK_S)
+                    verdict = await _stream_target_verdict(db, thread_id, target)
+                    if verdict != "current":
+                        workspace_verdict = verdict
+                        logger.info(
+                            "Shared-browser stream for thread %s closing: workspace %s",
+                            thread_id,
+                            "changed" if verdict == "changed" else "unverified",
+                        )
+                        return
+
             tasks = [
                 asyncio.create_task(ws_to_tcp()),
                 asyncio.create_task(tcp_to_ws()),
                 asyncio.create_task(touch_activity()),
+                asyncio.create_task(supervise_workspace()),
             ]
             done: set[asyncio.Task] = set()
             try:
@@ -643,8 +737,23 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     finally:
         if reserved:
             _release_viewer(thread_id)
+        if (
+            accepted
+            and not protocol_closed
+            and stream_failed
+            and workspace_verdict is None
+            and target is not None
+            and target.vm_runtime is not None
+        ):
+            # A VM's channel usually dies because the VM went away (suspend,
+            # restore, replacement). Say so when the row already shows it, so
+            # the viewer offers a restart instead of reconnecting to nothing.
+            # One row read; no controller call on this path.
+            workspace_verdict = await _vm_stream_end_verdict(db, thread_id, target)
         if accepted and not protocol_closed:
-            if stream_failed:
+            if workspace_verdict == "changed":
+                await _close_ws(ws, 4409, "Browser generation ended")
+            elif workspace_verdict == "unknown" or stream_failed:
                 await _close_ws(ws, 4502, "stream ended")
             else:
                 await _close_ws(ws)

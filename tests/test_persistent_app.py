@@ -2843,10 +2843,32 @@ class TestPollWorkspaceReady:
         assert result["workspace_provisioner"] == "k8s"
         assert result["remote"]["host"] == "10.0.0.5"
         assert result["remote"]["port"] == 2222
+        # The orchestrator's VM Canvas grant passes through unchanged.
+        assert result["canvas_presentation_available"] is True
+        assert result["canvas_live_apps_available"] is True
+        assert result["canvas_shared_browser_available"] is True
+        assert result["workspace_ssh_host_key_fingerprint"] is None
+
+    @pytest.mark.asyncio
+    async def test_vm_without_canvas_grant_keeps_canvas_off(self):
+        """A VM payload without an explicit grant never advertises Canvas."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "vm_status": "ready",
+            "vm_ssh_host": "10.0.0.5",
+            "vm_ssh_port": 22,
+            "canvas_presentation_available": "true",
+        }
+
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
+
+        assert result is not None
+        assert result["backend"] == "vm"
         assert result["canvas_presentation_available"] is False
         assert result["canvas_live_apps_available"] is False
         assert result["canvas_shared_browser_available"] is False
-        assert result["workspace_ssh_host_key_fingerprint"] is None
 
     @pytest.mark.asyncio
     async def test_returns_container_config_when_ready(self):

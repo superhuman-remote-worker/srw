@@ -272,3 +272,102 @@ def test_file_and_port_requests_reject_browser_selector(route):
     assert file_response.status_code == 422
     assert port_response.status_code == 422
     assert route.prepare_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Same-cluster VM Sessions (WP7): the agent's set_canvas(browser) end to end
+# through the real capability, prepare and commit.
+# ---------------------------------------------------------------------------
+
+from orchestrator.services import shared_browser_canvas as browser_canvas  # noqa: E402
+from tests._canvas_vm_fixtures import vm_context, vm_thread  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("mode", "vm", "status", "code"),
+    [
+        ("same-cluster", vm_context(), 200, None),
+        ("external", vm_context(ssh_host="100.64.1.2"), 503, "workspace_unroutable"),
+        (
+            "same-cluster",
+            vm_context(identity_authenticated=False),
+            409,
+            "workspace_unattested",
+        ),
+    ],
+)
+def test_agent_presents_the_vm_browser(monkeypatch, mode, vm, status, code):
+    monkeypatch.setenv("VM_MODE", mode)
+    monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+    monkeypatch.setattr(browser_canvas, "resolve_ssh_key_path", lambda: "/tmp/key")
+    monkeypatch.setattr(browser_canvas, "asyncssh", object())
+    thread = vm_thread(vm, user_id=USER_ID, thread_id=THREAD_ID)
+    started: list = []
+    proofs: list = []
+    writes: list = []
+
+    class DB:
+        async def get_thread(self, thread_id):
+            assert thread_id == THREAD_ID
+            return dict(thread)
+
+    db = DB()
+
+    async def delegated_owner(request, received_db, thread_id):
+        del request, received_db, thread_id
+        return {"id": USER_ID}, dict(thread)
+
+    async def exec_info(received, *, initial_baton, generation_resolver):
+        started.append((received["id"], initial_baton))
+        assert (await generation_resolver())["id"] == THREAD_ID
+        return {
+            "generation": str(BROWSER_GENERATION),
+            "token": "private",
+            "port": 38801,
+            "baton": "agent",
+        }
+
+    async def attest(target):
+        proofs.append(target)
+        return "current"
+
+    class Service:
+        def __init__(self, received_db):
+            assert received_db is db
+
+        async def set_if_changed(
+            self, thread_id, presentation, *, expected_presentation_revision
+        ):
+            del expected_presentation_revision
+            writes.append((thread_id, presentation.source))
+            return CanvasMutation(changed=True, record=_record())
+
+    monkeypatch.setattr(canvases, "_require_delegated_owner", delegated_owner)
+    monkeypatch.setattr(browser_canvas, "exec_stream_info", exec_info)
+    monkeypatch.setattr(browser_canvas, "attest_vm_workspace_target", attest)
+    monkeypatch.setattr(browser_canvas, "CanvasService", Service)
+    app = FastAPI()
+    app.state.store = db
+    app.include_router(canvases.internal_router)
+
+    response = TestClient(app).post(
+        f"/api/internal/persistent/threads/{THREAD_ID}/canvases/main/set",
+        headers={"X-Internal-Key": "test", "X-MCP-User-Id": USER_ID},
+        json={"source_type": "browser", "browser_id": "current"},
+    )
+
+    assert response.status_code == status
+    if code is None:
+        assert started == [(THREAD_ID, "agent")]
+        assert len(proofs) == 1 and proofs[0].vm_runtime is not None
+        assert writes == [
+            (THREAD_ID, BrowserSource(browser_generation=BROWSER_GENERATION))
+        ]
+        body = response.json()
+        assert body["status"] == "ready"
+        assert body["capabilities"]["can_stream_browser"] is True
+        for private in ("10.42.1.23", "SHA256:", "private"):
+            assert private not in response.text
+    else:
+        assert response.json()["detail"]["code"] == code
+        assert started == [] and writes == []

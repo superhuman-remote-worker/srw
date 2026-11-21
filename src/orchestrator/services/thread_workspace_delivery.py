@@ -203,6 +203,28 @@ def agent_canvas_workspace_capabilities(
         and vm_context.get("status") == "ready"
         and vm_context.get("ssh_host")
     )
+    if vm_is_active:
+        # A ready VM is the workspace the agent attaches to. Its Canvas needs
+        # the controller-authenticated identity (re-proved on every Canvas
+        # operation) and a route from this cluster: a tailnet VM gets none.
+        # The live-app proxy has no VM path, so that bit stays off.
+        from orchestrator.services.canvas_ssh import (
+            vm_canvas_identity,
+            vm_canvas_route_available,
+        )
+
+        identity = vm_canvas_identity(vm_context)
+        vm_canvas_available = bool(
+            identity is not None and vm_canvas_route_available(identity.host)
+        )
+        vm_shared_browser_enabled = os.getenv(
+            "CANVAS_SHARED_BROWSER_ENABLED", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        return (
+            vm_canvas_available,
+            False,
+            vm_canvas_available and vm_shared_browser_enabled,
+        )
     canvas_presentation_available = bool(
         not vm_is_active
         and remote_canvas_presentation_available(metadata, workspace_context)

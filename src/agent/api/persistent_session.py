@@ -1092,8 +1092,9 @@ class PersistentSession:
                     workspace_backend.set_shell_owner_token(self.shell_owner_token)
                 # Only the internal attach API can attest that this exact SSH
                 # endpoint is paired to a Canvas generation and pinned host
-                # identity. Direct remote config, VMs, and legacy overrides all
-                # remain fail-closed even when the connection itself is usable.
+                # identity (a same-cluster VM: its controller-authenticated
+                # identity). Direct remote config and legacy overrides remain
+                # fail-closed even when the connection itself is usable.
                 workspace_backend.supports_canvas_presentation = (
                     workspace_override or {}
                 ).get("canvas_presentation_available") is True
