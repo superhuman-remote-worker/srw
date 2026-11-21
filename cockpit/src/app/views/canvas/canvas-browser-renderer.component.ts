@@ -30,7 +30,7 @@ import {
   browserWheelDeltas,
   mapBrowserPoint,
 } from './canvas-browser-input';
-import { BROWSER_MAX_INSERT_TEXT_CHARS } from './canvas-browser-protocol';
+import { BROWSER_MAX_INSERT_TEXT_CHARS, normalizeBrowserAddress } from './canvas-browser-protocol';
 import {
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
@@ -374,7 +374,7 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
 
   navigate(event: Event): void {
     event.preventDefault();
-    const url = this.urlValue().trim();
+    const url = normalizeBrowserAddress(this.urlValue());
     if (!this.canDrive() || !url) return;
     this.browser.sendControl({op: 'navigate', url});
   }

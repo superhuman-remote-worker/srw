@@ -11,6 +11,7 @@ import {
   browserStreamUrl,
   encodeBrowserControl,
   encodeBrowserInput,
+  normalizeBrowserAddress,
   parseBrowserServerMessage,
 } from './canvas-browser-protocol';
 
@@ -276,6 +277,29 @@ describe('shared-browser binary protocol', () => {
         url: 'x'.repeat(BROWSER_MAX_JSON_BYTES),
       }),
     ).toThrow();
+  });
+});
+
+describe('shared-browser address bar', () => {
+  it.each([
+    ['localhost:4200', 'http://localhost:4200'],
+    ['localhost', 'http://localhost'],
+    ['LOCALHOST:3000/path?q=1', 'http://LOCALHOST:3000/path?q=1'],
+    ['127.0.0.1:8000', 'http://127.0.0.1:8000'],
+    ['127.0.0.1', 'http://127.0.0.1'],
+    ['[::1]:3000/x', 'http://[::1]:3000/x'],
+    ['0.0.0.0:5173', 'http://0.0.0.0:5173'],
+    ['app.localhost:5173/', 'http://app.localhost:5173/'],
+    ['  localhost:4200  ', 'http://localhost:4200'],
+    ['example.com', 'https://example.com'],
+    ['example.com:8080/x', 'https://example.com:8080/x'],
+    ['localhost.example.com', 'https://localhost.example.com'],
+    ['https://localhost:8443/', 'https://localhost:8443/'],
+    ['http://example.com/', 'http://example.com/'],
+    ['javascript:alert(1)', 'javascript:alert(1)'],
+    ['', ''],
+  ])('gives %j the scheme the workspace daemon would', (typed, expected) => {
+    expect(normalizeBrowserAddress(typed)).toBe(expected);
   });
 });
 

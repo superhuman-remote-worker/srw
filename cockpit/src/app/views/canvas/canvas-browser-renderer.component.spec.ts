@@ -707,6 +707,22 @@ describe('Canvas shared-browser renderer', () => {
     });
   });
 
+  it('gives a typed loopback address http:// before navigating', () => {
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user'}));
+    fixture.detectChanges();
+    const component = fixture.componentInstance;
+    component.urlValue.set('localhost:4200');
+    component.navigate({preventDefault: vi.fn()} as unknown as Event);
+    component.urlValue.set('example.com');
+    component.navigate({preventDefault: vi.fn()} as unknown as Event);
+
+    expect(controller.sendControl.mock.calls.map((call) => call[0])).toEqual([
+      {op: 'navigate', url: 'http://localhost:4200'},
+      {op: 'navigate', url: 'https://example.com'},
+    ]);
+  });
+
   it('renders the bounded navigation rejection without detaching the stream', () => {
     controller.connectionStatus.set('ready');
     controller.pageState.set(page({baton: 'user'}));

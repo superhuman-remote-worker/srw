@@ -145,6 +145,44 @@ export function encodeBrowserInput(message: BrowserInput): ArrayBuffer {
   return encodeClientJson(BROWSER_MESSAGE_TYPE.INPUT, message);
 }
 
+const LOOPBACK_IPV4 = /^127(?:\.\d{1,3}){3}$/;
+
+function isWorkspaceLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, '');
+  return (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    LOOPBACK_IPV4.test(host) ||
+    host === '0.0.0.0' ||
+    host === '[::1]' ||
+    host === '::1' ||
+    host === '[::]'
+  );
+}
+
+/**
+ * Give a typed address a scheme the way the workspace daemon does
+ * (`validate_user_nav` in docker/browser-exec): a colon followed by a port is
+ * a host and port, not a scheme; a bare loopback address gets `http://`, as a
+ * dev server in the workspace speaks plain HTTP; anything else bare gets
+ * `https://`. Doing it here too keeps older daemons, which sent
+ * `localhost:4200` to https or rejected it, on the same rule.
+ */
+export function normalizeBrowserAddress(typed: string): string {
+  const address = typed.trim();
+  if (!address) return address;
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(address);
+  if (scheme) {
+    const rest = address.slice(scheme[0].length);
+    if (rest.startsWith('//') || !/^\d+(?:[/?#]|$)/.test(rest)) return address;
+  }
+  const authority = (/^[^/?#]*/.exec(address)?.[0] ?? '').replace(/^.*@/, '');
+  const hostname = authority.startsWith('[')
+    ? authority.slice(0, authority.indexOf(']') + 1)
+    : authority.replace(/:\d*$/, '');
+  return `${isWorkspaceLoopbackHost(hostname) ? 'http' : 'https'}://${address}`;
+}
+
 /**
  * Derive the cookie-authenticated stream endpoint from the configured API base.
  * No token, generation, query, or fragment is ever added.
