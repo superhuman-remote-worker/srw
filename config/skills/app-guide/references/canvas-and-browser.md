@@ -153,6 +153,14 @@ and VM support must not be promised. Use the web icon in the session header or
 4. Choose **Release control**, then tell the agent what to do next. Baton
    changes do not send the agent a separate takeover notification.
 
+To try a web app the agent built, ask it to run the app and show it to you.
+In a Container session it starts the app in its workspace, opens it in this
+browser, checks it and puts the browser on the Canvas. Choose **Take
+control** and use the app; ask in the chat for changes. The agent's turn takes
+the browser back while it works and returns it when the turn ends. An
+address on the workspace's `localhost` opens only in this browser, not in
+yours.
+
 This is one Chromium session. After handoff, the agent sees the same DOM,
 cookies, and authenticated state. Log out before releasing control if you do
 not want the agent to use that account. Closing the Canvas pane merely detaches
