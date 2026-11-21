@@ -60,6 +60,7 @@ from orchestrator.services.canvas_files import (
     ValidatedCanvasFile,
     acquire_canvas_response_lease,
     current_workspace_generation,
+    vm_canvas_write_authority,
 )
 from orchestrator.services.canvas_office import (
     CanvasOfficeError,
@@ -1698,14 +1699,17 @@ async def put_main_canvas_content(
         return result.source_version
 
     try:
-        mutation = await service.edit_file(
-            thread_id,
-            expected_presentation_revision=expected_revision,
-            expected_source_fingerprint=source_fingerprint,
-            expected_source_version=expected_source_version,
-            expected_thread_user_id=str(fresh_thread.get("user_id") or ""),
-            writer=write_locked,
-        )
+        # A VM save holds the durable VM write lease (a no-op for a container)
+        # outside the Canvas and thread row locks edit_file takes.
+        async with vm_canvas_write_authority(fresh_thread, store=db):
+            mutation = await service.edit_file(
+                thread_id,
+                expected_presentation_revision=expected_revision,
+                expected_source_fingerprint=source_fingerprint,
+                expected_source_version=expected_source_version,
+                expected_thread_user_id=str(fresh_thread.get("user_id") or ""),
+                writer=write_locked,
+            )
     except CanvasFileError as exc:
         _raise_file_error(exc)
     except CanvasEditError as exc:

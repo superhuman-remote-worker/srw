@@ -794,6 +794,8 @@ def test_vm_identity_is_the_complete_authenticated_tuple() -> None:
         {"_suspend_remote_io_closed": "lease-1"},
         {"identity_authenticated": False},
         {"identity_authenticated": "true"},
+        {"ssh_ready_source": "daemon"},
+        {"ssh_ready_source": None},
         {"identity_provision_generation": RESTORED_PROVISION_GENERATION},
         {"provision_generation": "not-a-uuid"},
         {"active_pod_uid": None},

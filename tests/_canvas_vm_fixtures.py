@@ -37,6 +37,7 @@ def vm_context(**overrides: Any) -> dict[str, Any]:
         "rootdisk_pvc_uid": VM_ROOTDISK,
         "active_pod_uid": VM_LAUNCHER,
         "ssh_registration_id": "registration-1",
+        "ssh_ready_source": "provisioner_probe",
         "ssh_host_key_fingerprint": VM_FINGERPRINT,
         "ssh_host": VM_HOST,
         "ssh_port": 22,

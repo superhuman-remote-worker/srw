@@ -276,23 +276,222 @@ async def test_virtual_label_with_a_ready_vm_reads_the_vm(vm_file_canvas) -> Non
     assert "checkout" in events
 
 
+class _FakeVMLease:
+    """Stands in for VMRemoteOperationLease: an identity and its CM edges."""
+
+    def __init__(self, vm: dict[str, Any], *, lost_on_exit: bool = False) -> None:
+        from types import SimpleNamespace
+
+        self.identity = SimpleNamespace(
+            owner_kind="thread",
+            owner_id=VM_THREAD_ID,
+            workspace_generation=vm["provision_generation"],
+            vm_uid=vm["vm_uid"],
+            launcher_pod_uid=vm["active_pod_uid"],
+            ssh_host=vm["ssh_host"],
+            ssh_port=int(vm["ssh_port"]),
+            ssh_host_key_fingerprint=vm["ssh_host_key_fingerprint"],
+        )
+        self.lost_on_exit = lost_on_exit
+        self.entered = 0
+        self.exits: list[Any] = []
+
+    async def __aenter__(self):
+        self.entered += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self.exits.append(exc_type)
+        if self.lost_on_exit and exc_type is None:
+            from orchestrator.services.vm_remote_operation import (
+                VMRemoteOperationLeaseLost,
+            )
+
+            raise VMRemoteOperationLeaseLost("lost before settlement")
+        return False
+
+
+@pytest.fixture()
+def vm_write(vm_file_canvas, monkeypatch):
+    """A VM file Canvas with the remote-operation protocol on and a fake claim."""
+
+    from orchestrator.services import vm_remote_operation
+
+    row, events, pool, provisioner, verdicts, gateway = vm_file_canvas
+    monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
+    claims: list[dict[str, Any]] = []
+    state: dict[str, Any] = {"bytes": BODY, "lease": None, "refuse": False}
+
+    async def claim(**kwargs):
+        claims.append(kwargs)
+        if state["refuse"]:
+            raise vm_remote_operation.VMRemoteOperationUnavailable("leased")
+        state["lease"] = _FakeVMLease(row.thread["metadata"]["vm"])
+        return state["lease"]
+
+    async def read_file(sftp, *, root, path, read_limit=None):
+        del sftp, read_limit
+        events.append(("read", root, path))
+        return RawWorkspaceFile(state["bytes"], NOW)
+
+    async def write_file(sftp, *, root, path, data):
+        del sftp
+        events.append(("write", root, path))
+        state["bytes"] = data
+
+    monkeypatch.setattr(vm_remote_operation, "claim_vm_remote_operation", claim)
+    monkeypatch.setattr(canvas_files, "_read_sftp_workspace_file", read_file)
+    monkeypatch.setattr(canvas_files, "_write_sftp_workspace_file", write_file)
+    return row, events, pool, claims, state, gateway
+
+
 @pytest.mark.asyncio
-async def test_vm_presentations_are_read_only(vm_file_canvas) -> None:
-    row, events, _pool, _provisioner, _verdicts, gateway = vm_file_canvas
+async def test_a_vm_presentation_is_edited_like_a_container_one(vm_write) -> None:
+    row, events, pool, claims, state, gateway = vm_write
     generation, validated = await gateway.validate_for_presentation(
         row.thread, "output/report.md"
     )
     record = _record(generation, validated.source_version)
+    assert gateway.supports_editing(row.thread, record) is True
     events.clear()
 
-    assert gateway.supports_editing(row.thread, record) is False
+    async with canvas_files.vm_canvas_write_authority(row.thread, store=object()):
+        saved = await gateway.replace_current(
+            row.thread,
+            record,
+            b"# Edited\n",
+            expected_source_version=record.source_version,
+        )
+
+    assert saved.data == b"# Edited\n"
+    assert state["bytes"] == b"# Edited\n"
+    assert claims == [
+        {
+            "db": claims[0]["db"],
+            "provisioner": claims[0]["provisioner"],
+            "owner_id": VM_THREAD_ID,
+            "owner_kind": "thread",
+            "operation_kind": "thread_upload",
+            "lease_seconds": canvas_files.CANVAS_VM_WRITE_LEASE_SECONDS,
+        }
+    ]
+    assert state["lease"].entered == 1 and state["lease"].exits == [None]
+    # Conditional read, then the write between two proofs, then the readback.
+    write_at = events.index(
+        ("write", canvas_files.REMOTE_WORKSPACE_ROOT, "output/report.md")
+    )
+    assert events[write_at - 2 : write_at] == ["attest", "checkout"]
+    assert events[write_at + 1] == "attest"
+    assert events[-1] == "attest"
+    assert pool.checkouts[-1]["fingerprint"] == VM_FINGERPRINT
+
+
+@pytest.mark.asyncio
+async def test_a_stale_vm_save_is_refused_before_any_write(vm_write) -> None:
+    row, events, _pool, _claims, state, gateway = vm_write
+    generation, validated = await gateway.validate_for_presentation(
+        row.thread, "output/report.md"
+    )
+    record = _record(generation, validated.source_version)
+    state["bytes"] = b"# Changed by the agent\n"
+
+    with pytest.raises(CanvasFileError) as error:
+        async with canvas_files.vm_canvas_write_authority(row.thread, store=object()):
+            await gateway.replace_current(
+                row.thread,
+                record,
+                b"# Edited\n",
+                expected_source_version=record.source_version,
+            )
+
+    assert error.value.code == "canvas_content_precondition_failed"
+    assert not any(isinstance(e, tuple) and e[0] == "write" for e in events)
+    # The lease is settled with the failure, never left open.
+    assert state["lease"].exits == [CanvasFileError]
+
+
+@pytest.mark.asyncio
+async def test_a_vm_write_without_the_lease_is_refused(vm_write) -> None:
+    row, events, _pool, _claims, _state, _gateway = vm_write
+    generation = canvas_ssh.canvas_workspace_generation(row.thread)
+    events.clear()
+
     with pytest.raises(CanvasFileError) as error:
         await canvas_files._write_remote_default(
             row.thread, "output/report.md", generation, b"# Edited\n"
         )
 
-    assert error.value.code == "canvas_not_editable"
+    assert error.value.code == "canvas_editing_unavailable"
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_a_lease_for_another_runtime_does_not_cover_the_write(vm_write) -> None:
+    row, events, _pool, _claims, state, _gateway = vm_write
+    generation = canvas_ssh.canvas_workspace_generation(row.thread)
+
+    async with canvas_files.vm_canvas_write_authority(row.thread, store=object()):
+        # The launcher was replaced after the claim (the database fence would
+        # refuse the replacement; this checks the write does not rely on it).
+        row.thread["metadata"]["vm"]["active_pod_uid"] = (
+            "13131313-1313-4313-8313-131313131313"
+        )
+        events.clear()
+        with pytest.raises(CanvasFileError) as error:
+            await canvas_files._write_remote_default(
+                row.thread, "output/report.md", generation, b"# Edited\n"
+            )
+
+    assert error.value.code == "canvas_editing_unavailable"
+    assert events == []
+    assert state["bytes"] == BODY
+
+
+@pytest.mark.asyncio
+async def test_vm_write_authority_refusals_are_typed(vm_write, monkeypatch) -> None:
+    row, _events, _pool, claims, state, _gateway = vm_write
+
+    state["refuse"] = True
+    with pytest.raises(CanvasFileError) as refused:
+        async with canvas_files.vm_canvas_write_authority(row.thread, store=object()):
+            raise AssertionError("must not run without the lease")
+    assert refused.value.code == "canvas_editing_unavailable"
+
+    state["refuse"] = False
+
+    async def lost_claim(**kwargs):
+        claims.append(kwargs)
+        state["lease"] = _FakeVMLease(row.thread["metadata"]["vm"], lost_on_exit=True)
+        return state["lease"]
+
+    from orchestrator.services import vm_remote_operation
+
+    monkeypatch.setattr(vm_remote_operation, "claim_vm_remote_operation", lost_claim)
+    with pytest.raises(CanvasFileError) as lost:
+        async with canvas_files.vm_canvas_write_authority(row.thread, store=object()):
+            assert canvas_files._VM_CANVAS_WRITE_AUTHORITY.get() is not None
+    assert lost.value.code == "canvas_write_failed"
+    assert canvas_files._VM_CANVAS_WRITE_AUTHORITY.get() is None
+
+
+@pytest.mark.asyncio
+async def test_container_saves_claim_no_vm_lease(vm_write) -> None:
+    _row, _events, _pool, claims, _state, _gateway = vm_write
+    container = {"id": VM_THREAD_ID, "metadata": {"workspace_container": {}}}
+
+    async with canvas_files.vm_canvas_write_authority(container, store=object()):
+        assert canvas_files._VM_CANVAS_WRITE_AUTHORITY.get() is None
+
+    assert claims == []
+
+
+def test_vm_editing_needs_the_remote_operation_protocol(vm_file_canvas, monkeypatch):
+    row, _events, _pool, _provisioner, _verdicts, gateway = vm_file_canvas
+    monkeypatch.delenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", raising=False)
+    assert gateway.supports_editing(row.thread) is False
+
+    monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
+    assert gateway.supports_editing(row.thread) is (canvas_files.asyncssh is not None)
 
 
 def test_container_editing_is_unchanged(monkeypatch) -> None:
@@ -420,3 +619,58 @@ async def test_vm_restore_needs_no_repin_on_the_kept_disk_and_repins_a_new_one(
         )
     ]
     assert "attest" in events and "checkout" in events
+
+
+def test_the_save_route_runs_the_vm_write_inside_the_lease(monkeypatch) -> None:
+    """Wiring: PUT content claims the VM lease around CanvasService.edit_file."""
+
+    from orchestrator.services import vm_remote_operation
+    from tests.test_canvas_slice1_backend import (
+        THREAD_ID as ROUTE_THREAD_ID,
+        USER_ID as ROUTE_USER_ID,
+        _record as _route_record,
+        _route_client,
+    )
+
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    client, service, gateway, db = _route_client(
+        monkeypatch, record=_route_record(editable=True)
+    )
+    db.thread = vm_thread(thread_id=ROUTE_THREAD_ID, user_id=ROUTE_USER_ID)
+    claims: list[dict[str, Any]] = []
+    seen_authority: list[Any] = []
+
+    async def claim(**kwargs):
+        claims.append(kwargs)
+        lease = _FakeVMLease(db.thread["metadata"]["vm"])
+        lease.identity.owner_id = ROUTE_THREAD_ID
+        return lease
+
+    original_replace = gateway.replace_current
+
+    async def replace_inside_lease(thread, record, data, *, expected_source_version):
+        seen_authority.append(canvas_files._VM_CANVAS_WRITE_AUTHORITY.get())
+        return await original_replace(
+            thread, record, data, expected_source_version=expected_source_version
+        )
+
+    monkeypatch.setattr(vm_remote_operation, "claim_vm_remote_operation", claim)
+    monkeypatch.setattr(gateway, "replace_current", replace_inside_lease)
+    state = client.get(f"/api/persistent/threads/{ROUTE_THREAD_ID}/canvases/main")
+
+    saved = client.put(
+        state.json()["content_url"],
+        content=b"# User edit\n",
+        headers={
+            "If-Match": f'"{service.record.source_version}"',
+            "X-Canvas-Presentation-Revision": str(service.record.presentation_revision),
+            "Content-Type": "text/markdown; charset=utf-8",
+        },
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["capabilities"]["can_edit"] is True
+    assert [c["operation_kind"] for c in claims] == ["thread_upload"]
+    assert claims[0]["db"] is db
+    assert len(seen_authority) == 1 and seen_authority[0] is not None
+    assert canvas_files._VM_CANVAS_WRITE_AUTHORITY.get() is None

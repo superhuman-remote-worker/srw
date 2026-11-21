@@ -344,8 +344,9 @@ def vm_canvas_identity(vm_context: Any) -> VMCanvasIdentity | None:
 
     The fields and their checks are the ones the VM remote-operation lease
     and the IDE transport require (``identity_authenticated`` for this exact
-    provision generation, VM UID, launcher Pod UID, rootdisk PVC UID, SSH
-    endpoint and admitted host-key pin). A VM whose suspension has closed
+    provision generation, provisioner-probed readiness, VM UID, launcher Pod
+    UID, rootdisk PVC UID, SSH endpoint and admitted host-key pin). A VM whose
+    suspension has closed
     remote I/O has none. This is a durable-row read only; callers that touch
     the guest must also hold a fresh controller proof
     (:func:`attest_vm_workspace_target`).
@@ -356,6 +357,12 @@ def vm_canvas_identity(vm_context: Any) -> VMCanvasIdentity | None:
     if vm_context.get("_suspend_remote_io_closed"):
         return None
     if vm_context.get("identity_authenticated") is not True:
+        return None
+    # On the same cluster the workspace contract treats a VM as an effective
+    # runtime only when the provisioner's own probe proved it ready
+    # (shared.workspace_contract._runtime_is_authoritative); a VM ready by a
+    # daemon registration alone is "vm_runtime_unattested" there, and so here.
+    if vm_context.get("ssh_ready_source") != "provisioner_probe":
         return None
     generation = _canonical_uuid(vm_context.get("provision_generation"))
     if (
@@ -495,6 +502,10 @@ def vm_canvas_route_available(
     """
 
     if vm_mode_from_env() != "same-cluster":
+        # DEFERRED, not forgotten: Canvas and the shared browser for a VM
+        # reached over the tailnet need an orchestrator route to the guest
+        # (a tailnet sidecar or a relay through the VM daemon). Until that
+        # exists the answer is workspace_unroutable, at once.
         return False
     if can_reach is None:
         from orchestrator.services import ssh_helpers

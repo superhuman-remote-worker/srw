@@ -20,6 +20,7 @@ import stat
 import threading
 import warnings
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -816,6 +817,94 @@ async def _write_sftp_workspace_file(
                 await sftp.remove(temporary)
 
 
+# The durable VM write authority of the Canvas save running in this task. Set
+# only by vm_canvas_write_authority around CanvasService.edit_file, read only
+# by _write_remote_default.
+_VM_CANVAS_WRITE_AUTHORITY: ContextVar[Any | None] = ContextVar(
+    "canvas_vm_write_authority", default=None
+)
+# The VM remote-operation kind a Canvas save is recorded under. A save is the
+# owner's bytes written into a workspace file over the pinned SFTP transport,
+# which is exactly what an upload is; the authority (one exclusive, renewable
+# claim per owner, bound to the exact VM, fencing replacement and suspension)
+# is the same, and reusing it needs no new database kind.
+CANVAS_VM_WRITE_OPERATION_KIND = "thread_upload"
+# Long enough that the lease heartbeat (a third of it) does not renew while
+# the save holds the thread row: a renewal waits on that row.
+CANVAS_VM_WRITE_LEASE_SECONDS = 180
+
+
+def _vm_write_authority_covers(identity: Any, remote: RemoteWorkspaceTarget) -> bool:
+    runtime = remote.vm_runtime
+    if runtime is None:
+        return False
+    try:
+        return bool(
+            str(identity.owner_kind) == "thread"
+            and str(identity.owner_id) == remote.thread_id
+            and str(identity.workspace_generation) == runtime[0]
+            and str(identity.vm_uid) == runtime[1]
+            and str(identity.launcher_pod_uid) == runtime[2]
+            and str(identity.ssh_host) == remote.host
+            and int(identity.ssh_port) == remote.port
+            and str(identity.ssh_host_key_fingerprint) == remote.fingerprint
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+@asynccontextmanager
+async def vm_canvas_write_authority(thread: dict[str, Any], *, store: Any):
+    """Hold the durable VM write lease across one Canvas save.
+
+    A no-op for a container. For a VM it claims the remote-operation lease an
+    upload uses, before the save takes its Canvas and thread row locks (a
+    claim, renewal and settlement each lock the thread row), and settles it
+    after they are released. A VM that cannot be claimed (another remote
+    operation running, the protocol off, the VM changing) refuses the save; a
+    lease lost during it fails the save.
+    """
+
+    if not remote_target_is_vm_backed(thread):
+        yield
+        return
+    from orchestrator.services import vm_provisioner as vm_provisioner_module
+    from orchestrator.services.vm_remote_operation import (
+        VMRemoteOperationLeaseLost,
+        VMRemoteOperationUnavailable,
+        claim_vm_remote_operation,
+    )
+
+    try:
+        lease = await claim_vm_remote_operation(
+            db=store,
+            provisioner=vm_provisioner_module.vm_provisioner,
+            owner_id=str(thread.get("id") or ""),
+            owner_kind="thread",
+            operation_kind=CANVAS_VM_WRITE_OPERATION_KIND,
+            lease_seconds=CANVAS_VM_WRITE_LEASE_SECONDS,
+        )
+    except VMRemoteOperationUnavailable as exc:
+        raise CanvasFileError(
+            409,
+            "canvas_editing_unavailable",
+            "This workspace is not currently writable through Canvas",
+        ) from exc
+    try:
+        async with lease:
+            token = _VM_CANVAS_WRITE_AUTHORITY.set(lease.identity)
+            try:
+                yield
+            finally:
+                _VM_CANVAS_WRITE_AUTHORITY.reset(token)
+    except VMRemoteOperationLeaseLost as exc:
+        raise CanvasFileError(
+            409,
+            "canvas_write_failed",
+            "The VM workspace changed during the save; reload before saving again",
+        ) from exc
+
+
 def _canvas_target(
     thread: dict[str, Any], expected_generation: UUID
 ) -> RemoteWorkspaceTarget:
@@ -999,16 +1088,18 @@ async def _write_remote_default(
             "workspace_generation_changed",
             "The selected workspace generation is no longer current",
         )
-    if _canvas_target(thread, expected_generation).vm_runtime is not None:
-        # A write into a VM needs a durable remote-operation lease (as an
-        # upload does); a point-in-time controller proof is not enough, and
-        # Canvas has no lease kind of its own. VM presentations are read-only.
-        raise CanvasFileError(
-            409,
-            "canvas_not_editable",
-            "Canvas editing is not available for VM workspaces",
-        )
-    target = _remote_workspace_target(thread, expected_generation)
+    remote = _canvas_target(thread, expected_generation)
+    if remote.vm_runtime is not None:
+        # A write into a VM runs only inside the durable VM write lease the
+        # save route holds (vm_canvas_write_authority), for this exact VM.
+        authority = _VM_CANVAS_WRITE_AUTHORITY.get()
+        if authority is None or not _vm_write_authority_covers(authority, remote):
+            raise CanvasFileError(
+                409,
+                "canvas_editing_unavailable",
+                "This workspace is not currently writable through Canvas",
+            )
+    target = (remote.host, remote.port, REMOTE_WORKSPACE_ROOT, remote.fingerprint)
     host, port, root, fingerprint = target
     key_path = resolve_ssh_key_path()
     if not key_path:
@@ -1018,6 +1109,10 @@ async def _write_remote_default(
 
     try:
         async with _materialization_slot(_REMOTE_SEMAPHORE), asyncio.timeout(45):
+            # The lease fences VM replacement in the database; the controller
+            # proofs (lock-free, unlike a lease renewal, which would wait on the
+            # thread row the Canvas save holds) bracket the bytes themselves.
+            await _require_attested_vm(remote)
             async with _SFTP_POOL.checkout(
                 thread_id=str(thread.get("id") or ""),
                 generation=expected_generation,
@@ -1032,7 +1127,7 @@ async def _write_remote_default(
                     else thread
                 )
                 _require_same_remote_workspace(
-                    authoritative, expected_generation, target
+                    authoritative, expected_generation, target, remote.vm_runtime
                 )
                 await _write_sftp_workspace_file(sftp, root=root, path=path, data=data)
                 authoritative = (
@@ -1041,8 +1136,9 @@ async def _write_remote_default(
                     else thread
                 )
                 _require_same_remote_workspace(
-                    authoritative, expected_generation, target
+                    authoritative, expected_generation, target, remote.vm_runtime
                 )
+            await _require_attested_vm(remote)
     except CanvasFileError:
         raise
     except Exception as exc:
@@ -1368,8 +1464,14 @@ class ThreadWorkspaceFileGateway:
                 and shutil.which("rclone") is not None
             )
         if remote_target_is_vm_backed(thread):
-            # See _write_remote_default: no durable write authority for a VM.
-            return False
+            # A VM save needs the durable VM remote-operation protocol (the
+            # one uploads use); without it the VM cannot be written safely.
+            from orchestrator.services.vm_remote_operation import (
+                vm_remote_operation_protocol_enabled,
+            )
+
+            if not vm_remote_operation_protocol_enabled():
+                return False
         if self._remote_writer is not None:
             return True
         try:
@@ -1675,4 +1777,5 @@ __all__ = [
     "canonical_workspace_path",
     "current_workspace_generation",
     "validate_canvas_bytes",
+    "vm_canvas_write_authority",
 ]

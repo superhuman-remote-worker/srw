@@ -916,3 +916,88 @@ async def test_exact_reclaim_races_workspace_tier_transition_atomically(db, owne
     if isinstance(config, str):
         config = json.loads(config)
     assert config["workspace"]["backend"] == ("sandbox" if transitioned else "vm")
+
+
+@pytest.mark.asyncio
+async def test_canvas_vm_save_is_one_owner_exclusive_operation(db, monkeypatch):
+    """A Canvas save into a VM holds the upload's exact lease for its duration.
+
+    It claims before the save's thread FOR SHARE lock, so neither the claim nor
+    the settlement (each a thread FOR UPDATE) waits on the save, and an upload
+    for the same owner is refused while it runs.
+    """
+
+    from types import SimpleNamespace
+
+    from orchestrator.services import canvas_files
+    from orchestrator.services import vm_provisioner as vm_provisioner_module
+
+    monkeypatch.setenv("VM_REMOTE_OPERATION_PROTOCOL_ENABLED", "true")
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    owner_id, vm, _ids = await _seed_owner(db, "thread")
+    # Same-cluster readiness as vm_readiness publishes it.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata = jsonb_set(metadata, "
+            "'{vm,ssh_ready_source}', '\"provisioner_probe\"') WHERE id=$1",
+            UUID(owner_id),
+        )
+    assert await db.activate_vm_remote_operation_protocol(
+        protocol_version=1,
+        activated_by="real-postgres-test",
+    )
+
+    class Provisioner:
+        async def attest_workspace_runtime(self, owner, *, entity_type):
+            assert (owner, entity_type) == (owner_id, "thread")
+            return SimpleNamespace(
+                workspace_generation=vm["provision_generation"],
+                runtime_incarnation=vm["active_pod_uid"],
+                launcher_pod_uid=vm["active_pod_uid"],
+                vm_uid=vm["vm_uid"],
+                host=vm["ssh_host"],
+                port=vm["ssh_port"],
+                ssh_host_key_fingerprint=vm["ssh_host_key_fingerprint"],
+            )
+
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", Provisioner())
+    thread = await db.get_thread(owner_id)
+
+    async with canvas_files.vm_canvas_write_authority(thread, store=db):
+        identity = canvas_files._VM_CANVAS_WRITE_AUTHORITY.get()
+        assert identity.workspace_generation == vm["provision_generation"]
+        # The save's own row lock, as CanvasService.edit_file takes it.
+        async with db.acquire() as conn, conn.transaction():
+            await conn.fetchrow(
+                "SELECT id FROM threads WHERE id=$1 FOR SHARE", UUID(owner_id)
+            )
+        # An upload for the same owner cannot start meanwhile.
+        refused = await db.claim_vm_remote_operation(
+            owner_id,
+            protocol_version=1,
+            owner_kind="thread",
+            operation_kind="thread_upload",
+            workspace_tier="vm",
+            workspace_contract_digest=identity.workspace_contract_digest,
+            workspace_generation=vm["provision_generation"],
+            vm_uid=vm["vm_uid"],
+            launcher_pod_uid=vm["active_pod_uid"],
+            ssh_host=vm["ssh_host"],
+            ssh_port=vm["ssh_port"],
+            ssh_host_key_fingerprint=vm["ssh_host_key_fingerprint"],
+            claimant="test:upload",
+            lease_seconds=60,
+        )
+        assert refused is None
+
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT operation_kind, result_kind, settled_at FROM "
+            "vm_remote_operation_leases WHERE owner_id=$1",
+            UUID(owner_id),
+        )
+    assert [(r["operation_kind"], r["result_kind"]) for r in rows] == [
+        ("thread_upload", "succeeded")
+    ]
+    assert rows[0]["settled_at"] is not None
+    assert canvas_files._VM_CANVAS_WRITE_AUTHORITY.get() is None

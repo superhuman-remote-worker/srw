@@ -51,6 +51,7 @@ def vm_delivery(monkeypatch):
         "rootdisk_pvc_uid": "99999999-9999-4999-8999-999999999999",
         "active_pod_uid": LAUNCHER,
         "ssh_registration_id": "registration-1",
+        "ssh_ready_source": "provisioner_probe",
         "ssh_host_key_fingerprint": FINGERPRINT,
         "ssh_host": "10.42.1.23",
         "ssh_port": 22,
