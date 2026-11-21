@@ -429,7 +429,8 @@ def test_canvas_guide_keeps_renderer_handoff_and_availability_boundaries():
     assert "same dom, cookies, and authenticated state" in body
     assert "closing the canvas pane merely detaches your viewer" in body
     assert "not available on the jobs view" in body
-    assert "do not promise vm support" in body
+    assert "same cluster as srw" in body and "tailnet" in body
+    assert "files on the canvas are view-only" in body
     assert "shared browser is off on this server" in body
     assert "intentionally hidden" in body
     assert "app guide itself grants neither" in body

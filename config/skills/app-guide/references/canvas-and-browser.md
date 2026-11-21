@@ -133,15 +133,14 @@ different workspace bytes under the old presentation.
 
 ## Share the browser with the agent
 
-**Required workspace:** start with a **Container workspace**.
-Virtual and None cannot host the shared browser, and VM support must not be
-promised.
+**Required workspace:** a **Container workspace**, or a **VM** that runs on
+the same cluster as SRW. Virtual and None cannot host the shared browser; a
+VM reached over a private network (tailnet) reports it as not available.
 
-Shared browser is default-off and deployment-dependent. If it is enabled for a
-compatible full workspace, the currently proven path is a **Container
-workspace**; Virtual and None do not provide the required browser workspace,
-and VM support must not be promised. Use the web icon in the session header or
-**Open browser** in the Canvas empty state:
+Shared browser is on by default; an operator can turn it off. Use the web icon
+in the session header or **Open browser** in the Canvas empty state. While a VM
+is still starting, the button stays unavailable and enables itself once the
+VM is ready:
 
 1. Choose **Open browser**. A cold Container session may first show
    **Starting workspace…**, then **Starting browser…**, then **Connecting…**.
@@ -171,9 +170,9 @@ dialogs. Native file pickers, print dialogs, certificate or WebAuthn prompts,
 browser-level authentication dialogs, and the built-in PDF viewer are known
 gaps. Downloading a file is often the practical PDF fallback.
 
-Shared browser is currently a persistent-session surface. It is not available
-on the Jobs view, and the proven deployment path is a Container workspace; do
-not promise VM support.
+Shared browser is a session surface. It is not available on the Jobs view.
+In a VM session, files on the Canvas are view-only, and an older VM image may
+show the page scaled to the pane without the size switch.
 
 ## If Open browser is missing or disabled
 

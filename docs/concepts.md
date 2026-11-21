@@ -115,9 +115,10 @@ build a web app and show it to you, and it starts the app, opens it in this
 browser and puts it on the Canvas for you to try, beside the chat where you
 ask for changes.
 
-The shared browser needs a session with a machine: a **Container** workspace.
-A session that starts on the default Virtual workspace asks to upgrade when
-the task needs one. Jobs have no Canvas. Operators can turn the shared browser
+The shared browser needs a session with a machine: a **Container**
+workspace, or a **VM** running on the same cluster as SRW. A session that
+starts on the default Virtual workspace asks to upgrade when the task needs
+one. Jobs have no Canvas. Operators can turn the shared browser
 off with the chart value `canvas.sharedBrowser.enabled: false`.
 
 ## Job statuses
