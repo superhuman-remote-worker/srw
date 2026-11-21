@@ -2501,14 +2501,16 @@ class LimitsConfig:
     # max_tool_calls_per_job; kept so an operator who deliberately wants a
     # per-phase guard can still set one.
     max_tool_calls_per_phase: int = 0
-    # Job-level tool-call ceiling — the real backstop, and the only automatic
-    # stop a runaway job has. Nothing else terminates: the progress nudge and
-    # act-ratio tripwire only inject reminders, loop detection only masks tools,
-    # and the orchestrator has no job-duration ceiling. Hitting it freezes with
-    # budget_exceeded, which is NOT in AUTO_REDISPATCH_FREEZE_TYPES, so it parks
-    # for a human instead of looping. 0 disables it entirely — only do that if
-    # something else is watching the spend.
-    max_tool_calls_per_job: int = 5000
+    # Optional job-level tool-call ceiling. DEFAULT 0 = OFF, like every limit
+    # on a job's own work: a job runs until it finishes unless its expert or
+    # the job itself sets one. Nothing else stops a job by itself: the progress
+    # nudge and act-ratio tripwire only inject reminders, loop detection only
+    # masks tools, and the orchestrator has no job-duration ceiling. Hitting
+    # it freezes with budget_exceeded, which is NOT in
+    # AUTO_REDISPATCH_FREEZE_TYPES, so the job waits for review instead of
+    # looping. The count lives in the worker process, so on the stateless lane
+    # it starts again with every lease.
+    max_tool_calls_per_job: int = 0
     # Act-ratio tripwire: consecutive tool actions touching ONLY process
     # artifacts (see process_artifact_patterns) before a "stop planning"
     # nudge is injected. 0 disables the tripwire.
@@ -3680,7 +3682,7 @@ def load_agent_config(
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
-        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 0),
         act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
         process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
         progress_push_interval_seconds=limits_data.get(
@@ -3959,7 +3961,7 @@ def load_agent_config_from_dict(
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
-        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 0),
         act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
         process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
         progress_push_interval_seconds=limits_data.get(

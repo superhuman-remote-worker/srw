@@ -5381,10 +5381,9 @@ def create_audited_tool_node(
     _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 30
     # Per-phase ceiling, now OFF by default (0). See LimitsConfig.
     _PHASE_CAP = config.limits.max_tool_calls_per_phase
-    # Job ceiling — the actual backstop. Counted across phases, never reset at a
-    # boundary, because bounding a *phase* stopped bounding a *job* the moment
-    # phases got large.
-    _JOB_CAP = getattr(config.limits, "max_tool_calls_per_job", 5000)
+    # Job ceiling, OFF by default (0) like the per-phase one. When an expert
+    # sets it, it is counted across phases and never reset at a boundary.
+    _JOB_CAP = getattr(config.limits, "max_tool_calls_per_job", 0)
 
     # Act-ratio tripwire: N consecutive executed tool actions touching ONLY
     # process artifacts (todos/plan/archive) get a one-line "stop planning"
@@ -5728,8 +5727,8 @@ def create_audited_tool_node(
             _category_failures.clear()
             _TOOL_TIMEOUT_RETRIES[0] = 0
 
-        # Budget check. The job ceiling is the real backstop; the per-phase one
-        # is an opt-in extra (0 = off) and no longer fires by default.
+        # Budget check. Both ceilings are opt-in (0 = off) and neither fires
+        # by default.
         _phase_tool_call_count[0] += len(tool_calls_info)
         _job_tool_call_count[0] += len(tool_calls_info)
         _over_job_cap = _JOB_CAP > 0 and _job_tool_call_count[0] > _JOB_CAP
@@ -6070,7 +6069,7 @@ def create_audited_tool_node(
                     break
 
         # Progress nudge: periodic reminders to write findings down.
-        # Never freezes the job — the job budget is the only stop.
+        # Never freezes the job; only a ceiling an expert set does that.
         if _calls_since_progress[0] >= _PROGRESS_THRESHOLD:
             calls = _calls_since_progress[0]
             nudge_count = (calls - _PROGRESS_THRESHOLD) // _PROGRESS_THRESHOLD + 1

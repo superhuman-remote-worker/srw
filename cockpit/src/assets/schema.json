@@ -2046,8 +2046,8 @@
         "max_tool_calls_per_job": {
           "type": "integer",
           "minimum": 0,
-          "default": 5000,
-          "description": "Job-wide tool-call ceiling — the only automatic stop for a runaway job. Exceeding it freezes with budget_exceeded for human review (0 disables)"
+          "default": 0,
+          "description": "Optional job-wide tool-call ceiling (0 = off). Exceeding it freezes with budget_exceeded and the job waits for review"
         },
         "max_llm_calls_per_job": {
           "type": "integer",

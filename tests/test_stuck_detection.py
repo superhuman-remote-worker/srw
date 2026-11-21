@@ -1074,11 +1074,24 @@ class TestBudgetCaps:
         assert result["freeze_data"]["budget_scope"] == "phase"
 
     @pytest.mark.asyncio
-    async def test_phase_cap_off_by_default(self):
-        """The default config must not stop a long single phase."""
+    async def test_tool_call_caps_off_by_default(self):
+        """The default config stops neither a long phase nor a long job."""
         cfg = FakeConfig(limits=LimitsConfig())
         assert cfg.limits.max_tool_calls_per_phase == 0
-        assert cfg.limits.max_tool_calls_per_job == 5000
+        assert cfg.limits.max_tool_calls_per_job == 0
+
+    def test_shipped_worker_arms_no_limit_on_a_jobs_own_work(self):
+        """The worker overlay states every such limit, and states it off."""
+        from shared.runtime.core.loader import load_role_base
+
+        limits = load_role_base("worker")["limits"]
+        for key in (
+            "max_tool_calls_per_phase",
+            "max_tool_calls_per_job",
+            "max_llm_calls_per_job",
+            "max_plain_replies_in_a_row",
+        ):
+            assert limits[key] == 0, key
 
 
 # =============================================================================

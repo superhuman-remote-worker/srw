@@ -186,7 +186,13 @@ _POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
     # Append-only context injection WP6 (D37): the worker's writer list lost
     # memory_assembler. WP6 (D36): the retriever recall_two_tier became
     # recall_hybrid (both roles).
-    "worker": ("memory.pipeline.writers", "memory.pipeline.retrievers"),
+    # Owner decision 2026-11-21: the per-job tool-call ceiling is off by
+    # default (5000 -> 0), like every limit on a job's own work.
+    "worker": (
+        "memory.pipeline.writers",
+        "memory.pipeline.retrievers",
+        "limits.max_tool_calls_per_job",
+    ),
     "session": (
         "browser.security.blocked_domains",
         "memory.pipeline.retrievers",
