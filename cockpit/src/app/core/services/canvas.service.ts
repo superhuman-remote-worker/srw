@@ -24,6 +24,8 @@ import {
 export const CANVAS_RECONCILE_STALE_MS = 30_000;
 export const CANVAS_BROADCAST_CHANNEL = 'srw.canvas.presentation.v1';
 export const BROWSER_OPEN_TIMEOUT_MS = 5 * 60_000;
+/** How often to ask again while a workspace is not yet attested (booting). */
+export const BROWSER_CAPABILITY_RECHECK_MS = 10_000;
 export const BROWSER_OPEN_RETRY_DEFAULT_MS = 1_000;
 export const BROWSER_OPEN_RETRY_MAX_MS = 10_000;
 
@@ -87,6 +89,8 @@ export class CanvasService {
   private browserOpenSubscription: Subscription | null = null;
   private browserOpenToken: symbol | null = null;
   private browserOpenTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Re-asks while the answer is `workspace_unattested`, which is transient. */
+  private browserCapabilityRecheckTimer: ReturnType<typeof setTimeout> | null = null;
   private browserOpenStartedAt = 0;
   private browserOpenTitle: string | undefined;
   private browserOpenExpectedPresentationRevision: number | undefined;
@@ -178,9 +182,21 @@ export class CanvasService {
     this.startBrowserCapabilityRequest(threadId);
   }
 
+  /**
+   * Ask again whether this thread can open its shared browser. The answer
+   * changes when the workspace does (an upgrade from Virtual, a VM that
+   * finished booting), which no Canvas frame announces.
+   */
+  refreshBrowserCapability(): void {
+    const threadId = this.threadId();
+    if (!threadId || this.browserOpenToken) return;
+    this.startBrowserCapabilityRequest(threadId);
+  }
+
   /** Force an authoritative reload, coalescing with a request already running. */
   reconcile(): void {
     if (!this.threadId()) return;
+    if (!this.browserCapability()?.can_open_browser) this.refreshBrowserCapability();
     if (this.activeRequestToken) {
       this.pendingForcedReconcile = true;
       return;
@@ -408,6 +424,9 @@ export class CanvasService {
         }
         this.browserCapability.set(value);
         this.browserCapabilityStatus.set('ready');
+        if (!value.can_open_browser && value.reason === 'workspace_unattested') {
+          this.scheduleBrowserCapabilityRecheck(threadId);
+        }
         settled?.(value, null);
       },
       error: (error: unknown) => {
@@ -784,6 +803,23 @@ export class CanvasService {
     this.browserCapabilityRequestToken = null;
     this.browserCapabilitySubscription?.unsubscribe();
     this.browserCapabilitySubscription = null;
+    this.clearBrowserCapabilityRecheck();
+  }
+
+  private scheduleBrowserCapabilityRecheck(threadId: string): void {
+    this.clearBrowserCapabilityRecheck();
+    this.browserCapabilityRecheckTimer = setTimeout(() => {
+      this.browserCapabilityRecheckTimer = null;
+      if (this.threadId() !== threadId || this.browserOpenToken) return;
+      this.startBrowserCapabilityRequest(threadId);
+    }, BROWSER_CAPABILITY_RECHECK_MS);
+  }
+
+  private clearBrowserCapabilityRecheck(): void {
+    if (this.browserCapabilityRecheckTimer !== null) {
+      clearTimeout(this.browserCapabilityRecheckTimer);
+    }
+    this.browserCapabilityRecheckTimer = null;
   }
 
   private clearBrowserOpenTimer(): void {

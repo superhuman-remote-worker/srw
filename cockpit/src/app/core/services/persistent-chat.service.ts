@@ -9435,6 +9435,8 @@ export class PersistentChatService {
         if (tier) this.workspaceTier.set(tier);
         this.workspaceUpgradeInProgress.set(null);
         this.pendingWorkspaceOffer.set(null);
+        // The new workspace may host the shared browser the old one could not.
+        this.canvas.refreshBrowserCapability();
         this._systemMessage(
           [
             this.transloco.translate('chat.workspaceUpgrade.ready'),

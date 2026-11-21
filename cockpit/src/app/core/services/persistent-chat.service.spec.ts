@@ -9678,6 +9678,21 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     expect(sysLines(service)).toContain('chat.workspaceUpgrade.ready');
     expect(sysLines(service).some((l) => l.includes('readySudo'))).toBe(false);
   });
+
+  it('workspace_upgrade.complete asks the Canvas again whether the browser can open', async () => {
+    const { service, es, canvas } = await setup();
+    const refresh = vi.spyOn(canvas, 'refreshBrowserCapability');
+    fireSseMessage(
+      es,
+      {
+        method: 'workspace_upgrade.complete',
+        params: { target_tier: 'sandbox' },
+      },
+      '1:1',
+    );
+    expect(sysLines(service)).toContain('chat.workspaceUpgrade.ready');
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('PersistentChatService — control frame delivery across a reconnect', () => {
