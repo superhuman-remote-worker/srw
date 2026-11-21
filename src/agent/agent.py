@@ -172,6 +172,27 @@ def _job_owns_its_workspace(metadata: Dict[str, Any], job_id: Any) -> bool:
     return not owner_id or str(owner_id) == str(job_id)
 
 
+def _backend_tool_names(config: Any, workspace_manager: Any) -> Optional[set]:
+    """The configured tools the workspace backend admits, before they load.
+
+    The README facts are written before ``load_tools`` runs, so the lines that
+    depend on a bound tool read the same expansion and backend filter the
+    loader applies. None when that cannot be worked out: the caller writes no
+    line rather than a guess.
+    """
+    from agent.tools.registry import expand_tool_wildcards, filter_tools_by_backend
+
+    try:
+        return set(
+            filter_tools_by_backend(
+                expand_tool_wildcards(get_all_tool_names(config)),
+                workspace_manager.backend,
+            )
+        )
+    except Exception:
+        return None
+
+
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
 # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
 # Injected as a user turn when the orchestrator has seen N byte-identical
@@ -4398,7 +4419,6 @@ class UniversalAgent:
         line rather than a guess.
         knowledge-base/knowledge/issues/workspace_loss_pause_text_and_liveness_time_mislead.md
         """
-        from agent.tools.registry import expand_tool_wildcards, filter_tools_by_backend
         from shared.runtime.core.loader import _has_shell_tools
         from shared.workspace_disk import volume_kept_from_backing
 
@@ -4407,14 +4427,27 @@ class UniversalAgent:
             volume_kept_from_backing(binding.get("backing_id")) is not True
         ):
             return False
-        try:
-            tool_names = filter_tools_by_backend(
-                expand_tool_wildcards(get_all_tool_names(self.config)),
-                self._workspace_manager.backend,
-            )
-        except Exception:
-            return False
-        return _has_shell_tools(set(tool_names))
+        tool_names = _backend_tool_names(self.config, self._workspace_manager)
+        return tool_names is not None and _has_shell_tools(tool_names)
+
+    def _readme_names_tool_only_files(self) -> bool:
+        """Whether the README tells this job its shell cannot read the virtual files.
+
+        ``instructions.md``, ``task_brief.md`` and ``tools/`` are served by the
+        file tools only. A worker with a shell is told so, and how to copy one
+        to disk; the line names ``copy_file``, so it needs that tool bound too.
+        Every worker registers both files, phased or not, so the gate is the
+        tools alone.
+        knowledge-base/knowledge/issues/blocked_worker_cycles_phases_instead_of_stopping.md
+        """
+        from shared.runtime.core.loader import _has_shell_tools
+
+        tool_names = _backend_tool_names(self.config, self._workspace_manager)
+        return (
+            tool_names is not None
+            and "copy_file" in tool_names
+            and _has_shell_tools(tool_names)
+        )
 
     async def _setup_job_tools(self) -> None:
         """Set up tools for the current job.
@@ -4503,6 +4536,7 @@ class UniversalAgent:
                     self, "_workspace_ssh_identity_status", None
                 ),
                 persistent_home=self._workspace_home_is_persistent(),
+                tool_only_files=self._readme_names_tool_only_files(),
             )
             if readme:
                 self._agent_seed_files["README.md"] = readme
