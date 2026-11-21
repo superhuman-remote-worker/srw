@@ -745,3 +745,321 @@ async def test_idle_and_generation_eviction_close_only_intended_entries(
     await thread_pool.evict_thread(THREAD_ID)
     assert active_connection.closed is True
     await active.__aexit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Same-cluster VM identity (WP7)
+# ---------------------------------------------------------------------------
+
+from tests._canvas_vm_fixtures import (  # noqa: E402
+    RESTORED_FINGERPRINT,
+    RESTORED_HOST,
+    RESTORED_LAUNCHER,
+    RESTORED_PROVISION_GENERATION,
+    VM_FINGERPRINT,
+    VM_HOST,
+    VM_LAUNCHER,
+    VM_PROVISION_GENERATION,
+    VM_ROOTDISK,
+    VM_THREAD_ID,
+    FakeVMProvisioner,
+    proof_for,
+    restored_vm_context,
+    vm_context,
+    vm_thread,
+)
+from orchestrator.services import vm_provisioner as vm_provisioner_module  # noqa: E402
+from shared.workspace_recovery import WorkspaceRecoveryCode  # noqa: E402
+
+
+def test_vm_identity_is_the_complete_authenticated_tuple() -> None:
+    identity = canvas_ssh.vm_canvas_identity(vm_context())
+
+    assert identity == canvas_ssh.VMCanvasIdentity(
+        provision_generation=VM_PROVISION_GENERATION,
+        vm_uid="vm-uid",
+        launcher_pod_uid=VM_LAUNCHER,
+        rootdisk_pvc_uid=VM_ROOTDISK,
+        host=VM_HOST,
+        port=22,
+        fingerprint=VM_FINGERPRINT,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"status": "suspending"},
+        {"status": "provisioning"},
+        {"_suspend_remote_io_closed": "lease-1"},
+        {"identity_authenticated": False},
+        {"identity_authenticated": "true"},
+        {"identity_provision_generation": RESTORED_PROVISION_GENERATION},
+        {"provision_generation": "not-a-uuid"},
+        {"active_pod_uid": None},
+        {"active_pod_uid": "launcher"},
+        {"vm_uid": ""},
+        {"vm_uid": "vm uid"},
+        {"rootdisk_pvc_uid": None},
+        {"ssh_host": None},
+        {"ssh_host": "10.42.1.23 "},
+        {"ssh_port": True},
+        {"ssh_port": 0},
+        {"ssh_port": 70000},
+        {"ssh_port": "22x"},
+        {"ssh_host_key_fingerprint": None},
+        {"ssh_host_key_fingerprint": "MD5:aa"},
+        {"ssh_host_key_fingerprint": "SHA256:a b"},
+    ],
+)
+def test_incomplete_vm_identity_resolves_to_nothing(overrides) -> None:
+    assert canvas_ssh.vm_canvas_identity(vm_context(**overrides)) is None
+    thread = vm_thread(vm_context(**overrides))
+    if canvas_ssh.remote_target_is_vm_backed(thread):
+        with pytest.raises(CanvasSSHError) as error:
+            canvas_ssh.canvas_workspace_generation(thread)
+        assert error.value.code == "workspace_unavailable"
+
+
+def test_vm_target_carries_the_runtime_and_pins_the_guest_key() -> None:
+    thread = vm_thread()
+    generation = canvas_ssh.canvas_workspace_generation(thread)
+
+    target = canvas_ssh.resolve_canvas_workspace_target(thread, generation)
+
+    assert generation == canvas_ssh.vm_canvas_generation(VM_THREAD_ID, VM_ROOTDISK)
+    assert target == RemoteWorkspaceTarget(
+        thread_id=VM_THREAD_ID,
+        generation=generation,
+        host=VM_HOST,
+        port=22,
+        fingerprint=VM_FINGERPRINT,
+        vm_runtime=(VM_PROVISION_GENERATION, "vm-uid", VM_LAUNCHER, VM_ROOTDISK),
+    )
+    # The pool keys by endpoint and pin only, like a container target.
+    assert target.pool_key == (
+        VM_THREAD_ID,
+        str(generation),
+        VM_HOST,
+        22,
+        VM_FINGERPRINT,
+    )
+
+
+def test_vm_generation_follows_the_disk_not_the_runtime() -> None:
+    before = canvas_ssh.canvas_workspace_generation(vm_thread())
+    restored = canvas_ssh.canvas_workspace_generation(vm_thread(restored_vm_context()))
+    new_disk = canvas_ssh.canvas_workspace_generation(
+        vm_thread(
+            restored_vm_context(rootdisk_pvc_uid="abababab-abab-4bab-8bab-abababababab")
+        )
+    )
+    other_thread = canvas_ssh.canvas_workspace_generation(
+        vm_thread(thread_id="b4444444-4444-4444-8444-444444444444")
+    )
+
+    # A restore onto the kept rootdisk is the same file namespace...
+    assert restored == before
+    # ...but the endpoint is not, so the target (and its proof) differ.
+    assert canvas_ssh.resolve_canvas_workspace_target(
+        vm_thread(restored_vm_context()), restored
+    ) != canvas_ssh.resolve_canvas_workspace_target(vm_thread(), before)
+    assert new_disk != before
+    assert other_thread != before
+
+
+def test_container_resolution_is_unchanged_and_never_sees_a_vm() -> None:
+    container = _thread()
+    assert canvas_ssh.canvas_workspace_generation(container) == GENERATION
+    assert canvas_ssh.resolve_canvas_workspace_target(
+        container, GENERATION
+    ) == canvas_ssh.resolve_remote_workspace_target(container, GENERATION)
+    assert (
+        canvas_ssh.resolve_canvas_workspace_target(container, GENERATION).vm_runtime
+        is None
+    )
+
+    # SSH access and first-use callers rely on the binding resolver never
+    # resolving a VM; that stays so.
+    vm = vm_thread()
+    with pytest.raises(CanvasSSHError):
+        canvas_ssh.resolve_remote_workspace_target(
+            vm, canvas_ssh.canvas_workspace_generation(vm)
+        )
+
+
+def test_vm_target_fails_its_row_check_on_every_lifecycle_change() -> None:
+    thread = vm_thread()
+    target = canvas_ssh.resolve_canvas_workspace_target(
+        thread, canvas_ssh.canvas_workspace_generation(thread)
+    )
+    canvas_ssh.require_same_remote_workspace(thread, target)
+
+    for changed in (
+        vm_thread(vm_context(status="suspending")),
+        vm_thread(vm_context(_suspend_remote_io_closed="lease-1")),
+        vm_thread(vm_context(active_pod_uid=RESTORED_LAUNCHER)),
+        vm_thread(restored_vm_context()),
+        vm_thread(vm_context(rootdisk_pvc_uid="abababab-abab-4bab-8bab-abababababab")),
+        {"id": VM_THREAD_ID, "metadata": {}},
+    ):
+        with pytest.raises(CanvasSSHError):
+            canvas_ssh.require_same_remote_workspace(changed, target)
+
+
+def test_container_target_fails_once_a_vm_takes_over() -> None:
+    container = _thread()
+    target = canvas_ssh.resolve_remote_workspace_target(container, GENERATION)
+    canvas_ssh.require_same_remote_workspace(container, target)
+
+    taken_over = _thread()
+    taken_over["metadata"]["vm"] = vm_context()
+    with pytest.raises(CanvasSSHError) as error:
+        canvas_ssh.require_same_remote_workspace(taken_over, target)
+    assert error.value.code == "workspace_generation_changed"
+
+
+@pytest.mark.parametrize(
+    ("mode", "reachable", "expected"),
+    [
+        ("same-cluster", True, True),
+        ("same-cluster", False, False),
+        ("external", True, False),
+        ("off", True, False),
+    ],
+)
+def test_vm_route_is_same_cluster_only(monkeypatch, mode, reachable, expected) -> None:
+    monkeypatch.setenv("VM_MODE", mode)
+
+    assert (
+        canvas_ssh.vm_canvas_route_available(VM_HOST, can_reach=lambda _h: reachable)
+        is expected
+    )
+
+
+def test_tailnet_vm_route_is_refused_without_network_io(monkeypatch) -> None:
+    monkeypatch.setenv("VM_MODE", "external")
+    monkeypatch.delenv("ORCHESTRATOR_HAS_TAILNET_ROUTE", raising=False)
+
+    def forbidden(host):
+        raise AssertionError(host)
+
+    assert (
+        canvas_ssh.vm_canvas_route_available("100.64.23.180", can_reach=forbidden)
+        is False
+    )
+
+
+def _vm_target(thread: dict | None = None) -> RemoteWorkspaceTarget:
+    thread = thread or vm_thread()
+    return canvas_ssh.resolve_canvas_workspace_target(
+        thread, canvas_ssh.canvas_workspace_generation(thread)
+    )
+
+
+@pytest.mark.asyncio
+async def test_vm_attestation_uses_the_provisioner_singleton_at_call_time(
+    monkeypatch,
+) -> None:
+    thread = vm_thread()
+    provisioner = FakeVMProvisioner(thread)
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", provisioner)
+
+    assert await canvas_ssh.attest_vm_workspace_target(_vm_target(thread)) == "current"
+    assert provisioner.calls == [(VM_THREAD_ID, "thread")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"workspace_generation": RESTORED_PROVISION_GENERATION},
+        {"vm_uid": "other-vm"},
+        {"launcher_pod_uid": RESTORED_LAUNCHER},
+        {"runtime_incarnation": RESTORED_LAUNCHER},
+        {"rootdisk_pvc_uid": "abababab-abab-4bab-8bab-abababababab"},
+        {"host": RESTORED_HOST},
+        {"port": 2222},
+        {"ssh_host_key_fingerprint": RESTORED_FINGERPRINT},
+    ],
+)
+async def test_vm_attestation_of_another_runtime_is_changed(
+    monkeypatch, overrides
+) -> None:
+    thread = vm_thread()
+    provisioner = FakeVMProvisioner(thread)
+    provisioner.proof_overrides = overrides
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", provisioner)
+
+    assert await canvas_ssh.attest_vm_workspace_target(_vm_target(thread)) == "changed"
+
+
+class _RecoveryRequired(Exception):
+    def __init__(self, code: WorkspaceRecoveryCode) -> None:
+        super().__init__(code.value)
+        self.recovery_code = code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (_RecoveryRequired(WorkspaceRecoveryCode.REPLACEMENT_OBSERVED), "changed"),
+        (_RecoveryRequired(WorkspaceRecoveryCode.RUNTIME_NOT_READY), "changed"),
+        (_RecoveryRequired(WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE), "unknown"),
+        (RuntimeError("VM controller status is unauthenticated"), "unknown"),
+        (OSError("controller down"), "unknown"),
+    ],
+)
+async def test_vm_attestation_failures_are_never_positive(
+    monkeypatch, error, expected
+) -> None:
+    thread = vm_thread()
+    provisioner = FakeVMProvisioner(thread)
+    provisioner.error = error
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", provisioner)
+
+    assert await canvas_ssh.attest_vm_workspace_target(_vm_target(thread)) == expected
+
+
+@pytest.mark.asyncio
+async def test_vm_attestation_without_disk_proof_or_attester_is_unknown(
+    monkeypatch,
+) -> None:
+    thread = vm_thread()
+    provisioner = FakeVMProvisioner(thread)
+    provisioner.proof_overrides = {"rootdisk_pvc_uid": None}
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", provisioner)
+    assert await canvas_ssh.attest_vm_workspace_target(_vm_target(thread)) == "unknown"
+
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", object())
+    assert await canvas_ssh.attest_vm_workspace_target(_vm_target(thread)) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_vm_attestation_is_bounded(monkeypatch) -> None:
+    class Hanging:
+        async def attest_workspace_runtime(self, owner_id, *, entity_type):
+            del owner_id, entity_type
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(vm_provisioner_module, "vm_provisioner", Hanging())
+    monkeypatch.setattr(canvas_ssh, "VM_ATTESTATION_TIMEOUT_SECONDS", 0.01)
+
+    assert await canvas_ssh.attest_vm_workspace_target(_vm_target()) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_a_container_target_has_no_controller_proof() -> None:
+    with pytest.raises(ValueError):
+        await canvas_ssh.attest_vm_workspace_target(_target())
+
+
+def test_proof_match_requires_the_exact_runtime() -> None:
+    target = _vm_target()
+    assert canvas_ssh.vm_runtime_proof_matches(target, proof_for(vm_context()))
+    assert not canvas_ssh.vm_runtime_proof_matches(target, None)
+    assert not canvas_ssh.vm_runtime_proof_matches(_target(), proof_for(vm_context()))
+    assert not canvas_ssh.vm_runtime_proof_matches(
+        target, proof_for(vm_context(), port="not-a-port")
+    )

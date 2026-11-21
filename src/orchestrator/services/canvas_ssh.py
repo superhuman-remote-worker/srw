@@ -3,6 +3,13 @@
 Canvas file materialization and live-app direct channels share one authenticated
 SSH transport pool.  The pool never creates a local TCP listener: callers open
 request-scoped ``direct-tcpip`` channels to the fixed workspace loopback host.
+
+Two kinds of workspace resolve here. A container is paired with a
+provisioner-minted ``_workspace_binding``. A same-cluster VM has no Canvas
+binding; its identity is the controller-authenticated tuple in
+``metadata.vm`` (the same fields the IDE transport and the upload lease
+prove), and every VM operation re-proves it with the VM provisioner's signed
+``attest_workspace_runtime`` before and after it touches the guest.
 """
 
 from __future__ import annotations
@@ -13,8 +20,8 @@ import logging
 import secrets
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
-from uuid import UUID
+from typing import Any, Awaitable, Callable, Literal
+from uuid import UUID, uuid5
 
 try:
     import asyncssh
@@ -22,6 +29,8 @@ except ImportError:  # pragma: no cover - deployment dependency guard
     asyncssh = None  # type: ignore[assignment]
 
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
+from shared.workspace_contract import vm_mode_from_env
+from shared.workspace_recovery import WorkspaceRecoveryCode
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +41,14 @@ DEFAULT_SSH_CLOSE_TIMEOUT_SECONDS = 5.0
 # consult the process user's default known_hosts file, which is not Canvas
 # authority for a workspace generation.
 EMPTY_KNOWN_HOSTS = ((), (), (), (), (), (), ())
+# One controller round trip; an attestation that takes longer than this is an
+# inconclusive answer, never a positive one.
+VM_ATTESTATION_TIMEOUT_SECONDS = 15.0
+# Fixed namespace for the VM Canvas generation (see vm_canvas_generation).
+VM_CANVAS_GENERATION_NAMESPACE = UUID("5a0f4c3e-9d1b-5e7a-8c42-6b1d0e9f3a27")
 
 GenerationResolver = Callable[[], Awaitable[dict[str, Any]]]
+VMAttestationVerdict = Literal["current", "changed", "unknown"]
 
 
 async def _bounded_wait_closed(resource: Any) -> None:
@@ -104,13 +119,22 @@ def bound_workspace_generation(thread: dict[str, Any]) -> UUID:
 
 @dataclass(frozen=True, slots=True)
 class RemoteWorkspaceTarget:
-    """One provisioner-attested SSH endpoint for a workspace generation."""
+    """One provisioner-attested SSH endpoint for a workspace generation.
+
+    ``vm_runtime`` is set only for a VM: the exact controller-authenticated
+    runtime the endpoint belongs to, as ``(provision_generation, vm_uid,
+    launcher_pod_uid, rootdisk_pvc_uid)``. It takes part in equality, so a
+    launcher replacement behind the same address and key is a different
+    target, but not in the pool key: the SSH transport is pinned by address
+    and host key alone.
+    """
 
     thread_id: str
     generation: UUID
     host: str
     port: int
     fingerprint: str
+    vm_runtime: tuple[str, str, str, str] | None = None
 
     @property
     def pool_key(self) -> tuple[str, str, str, int, str]:
@@ -232,15 +256,334 @@ def resolve_remote_workspace_target(
 def require_same_remote_workspace(
     thread: dict[str, Any], expected_target: RemoteWorkspaceTarget
 ) -> None:
-    """Fail when binding, endpoint, generation, or pinned identity changed."""
+    """Fail when binding, endpoint, generation, or pinned identity changed.
 
-    current = resolve_remote_workspace_target(thread, expected_target.generation)
+    A VM target is re-resolved from the VM's own identity, a container target
+    from its binding, so a VM that takes over from a container (or the
+    reverse) can never satisfy the other kind's check.
+    """
+
+    if expected_target.vm_runtime is not None:
+        current = resolve_vm_workspace_target(thread, expected_target.generation)
+    else:
+        current = resolve_remote_workspace_target(thread, expected_target.generation)
     if current != expected_target:
         raise CanvasSSHError(
             409,
             "workspace_generation_changed",
             "The active workspace endpoint changed during the Canvas operation",
         )
+
+
+# ---------------------------------------------------------------------------
+# Same-cluster VM workspaces
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class VMCanvasIdentity:
+    """The controller-authenticated VM tuple stored in ``metadata.vm``."""
+
+    provision_generation: str
+    vm_uid: str
+    launcher_pod_uid: str
+    rootdisk_pvc_uid: str
+    host: str
+    port: int
+    fingerprint: str
+
+
+def _canonical_uuid(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    canonical = str(parsed)
+    return canonical if canonical == value.lower() else None
+
+
+def _plain_token(value: Any, *, limit: int) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > limit
+        or any(char.isspace() or ord(char) < 33 or ord(char) == 127 for char in value)
+    ):
+        return None
+    return value
+
+
+def _pinned_fingerprint(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("SHA256:")
+        or len(value) > 128
+        or any(char.isspace() for char in value)
+    ):
+        return None
+    return value
+
+
+def _same_uid(left: Any, right: Any) -> bool:
+    """Compare two Kubernetes UIDs, tolerating only UUID letter case."""
+
+    if not isinstance(left, str) or not isinstance(right, str) or not left:
+        return False
+    canonical_left = _canonical_uuid(left)
+    canonical_right = _canonical_uuid(right)
+    if canonical_left is not None and canonical_right is not None:
+        return canonical_left == canonical_right
+    return left == right
+
+
+def vm_canvas_identity(vm_context: Any) -> VMCanvasIdentity | None:
+    """Return a ready VM's complete authenticated identity, or ``None``.
+
+    The fields and their checks are the ones the VM remote-operation lease
+    and the IDE transport require (``identity_authenticated`` for this exact
+    provision generation, VM UID, launcher Pod UID, rootdisk PVC UID, SSH
+    endpoint and admitted host-key pin). A VM whose suspension has closed
+    remote I/O has none. This is a durable-row read only; callers that touch
+    the guest must also hold a fresh controller proof
+    (:func:`attest_vm_workspace_target`).
+    """
+
+    if not isinstance(vm_context, dict) or vm_context.get("status") != "ready":
+        return None
+    if vm_context.get("_suspend_remote_io_closed"):
+        return None
+    if vm_context.get("identity_authenticated") is not True:
+        return None
+    generation = _canonical_uuid(vm_context.get("provision_generation"))
+    if (
+        generation is None
+        or _canonical_uuid(vm_context.get("identity_provision_generation"))
+        != generation
+    ):
+        return None
+    launcher_pod_uid = _canonical_uuid(vm_context.get("active_pod_uid"))
+    vm_uid = _plain_token(vm_context.get("vm_uid"), limit=256)
+    rootdisk_pvc_uid = _plain_token(vm_context.get("rootdisk_pvc_uid"), limit=256)
+    host = _plain_token(vm_context.get("ssh_host"), limit=512)
+    fingerprint = _pinned_fingerprint(vm_context.get("ssh_host_key_fingerprint"))
+    raw_port = vm_context.get("ssh_port")
+    if (
+        isinstance(raw_port, bool)
+        or not isinstance(raw_port, (int, str))
+        or not str(raw_port).isdigit()
+        or not 1 <= int(raw_port) <= 65535
+    ):
+        return None
+    if (
+        launcher_pod_uid is None
+        or vm_uid is None
+        or rootdisk_pvc_uid is None
+        or host is None
+        or fingerprint is None
+    ):
+        return None
+    return VMCanvasIdentity(
+        provision_generation=generation,
+        vm_uid=vm_uid,
+        launcher_pod_uid=launcher_pod_uid,
+        rootdisk_pvc_uid=rootdisk_pvc_uid,
+        host=host,
+        port=int(raw_port),
+        fingerprint=fingerprint,
+    )
+
+
+def vm_canvas_generation(thread_id: str, rootdisk_pvc_uid: str) -> UUID:
+    """The Canvas workspace generation of one VM disk.
+
+    A container's Canvas generation is its binding's, which stays the same
+    while the pod comes back on the same volume with the same host key. A VM
+    gets a new provision generation, launcher Pod and host key every time it
+    is created, including a restore onto a kept rootdisk, so none of those can
+    be the generation without making every presentation stale after a
+    suspend. The rootdisk PVC is what carries the files across, so the
+    generation is derived from it: the same disk is the same file namespace,
+    a new disk is a new generation. Transport authority never rests on this
+    value; it is pinned to the live endpoint's host key and re-proved by the
+    controller on every operation.
+    """
+
+    return uuid5(VM_CANVAS_GENERATION_NAMESPACE, f"{thread_id}\x00{rootdisk_pvc_uid}")
+
+
+def _thread_vm_identity(thread: dict[str, Any]) -> tuple[str, VMCanvasIdentity]:
+    identity = vm_canvas_identity(workspace_metadata(thread).get("vm"))
+    if identity is None:
+        raise CanvasSSHError(
+            409,
+            "workspace_unavailable",
+            "The VM workspace has no controller-authenticated identity",
+        )
+    thread_id = str(thread.get("id") or "")
+    if not thread_id:
+        raise CanvasSSHError(404, "workspace_unavailable", "Thread is unavailable")
+    return thread_id, identity
+
+
+def canvas_workspace_generation(thread: dict[str, Any]) -> UUID:
+    """The Canvas generation of the workspace the Canvas resolver selects.
+
+    A ready VM wins, exactly as in :func:`resolve_remote_workspace_target`;
+    otherwise this is the bound container/virtual generation, unchanged.
+    """
+
+    if remote_target_is_vm_backed(thread):
+        thread_id, identity = _thread_vm_identity(thread)
+        return vm_canvas_generation(thread_id, identity.rootdisk_pvc_uid)
+    return bound_workspace_generation(thread)
+
+
+def resolve_vm_workspace_target(
+    thread: dict[str, Any], expected_generation: UUID
+) -> RemoteWorkspaceTarget:
+    """Resolve the ready VM's endpoint from its authenticated identity."""
+
+    thread_id, identity = _thread_vm_identity(thread)
+    generation = vm_canvas_generation(thread_id, identity.rootdisk_pvc_uid)
+    if generation != expected_generation:
+        raise CanvasSSHError(
+            409,
+            "workspace_generation_changed",
+            "The selected workspace generation is no longer current",
+        )
+    return RemoteWorkspaceTarget(
+        thread_id=thread_id,
+        generation=generation,
+        host=identity.host,
+        port=identity.port,
+        fingerprint=identity.fingerprint,
+        vm_runtime=(
+            identity.provision_generation,
+            identity.vm_uid,
+            identity.launcher_pod_uid,
+            identity.rootdisk_pvc_uid,
+        ),
+    )
+
+
+def resolve_canvas_workspace_target(
+    thread: dict[str, Any], expected_generation: UUID
+) -> RemoteWorkspaceTarget:
+    """Canvas's resolver: a ready VM by its identity, else the bound container.
+
+    :func:`resolve_remote_workspace_target` is deliberately left as it is:
+    SSH access and first-use callers rely on it never resolving a VM.
+    """
+
+    if remote_target_is_vm_backed(thread):
+        return resolve_vm_workspace_target(thread, expected_generation)
+    return resolve_remote_workspace_target(thread, expected_generation)
+
+
+def vm_canvas_route_available(
+    host: str, *, can_reach: Callable[[str], bool] | None = None
+) -> bool:
+    """Whether the orchestrator has a route to a VM guest: same-cluster only.
+
+    A VM on the tailnet (``VM_MODE=external``) is never reachable from the
+    orchestrator pod, so Canvas answers it immediately instead of letting an
+    SSH connect time out. ``can_reach`` lets a caller pass its own imported
+    ``orchestrator_can_reach`` (and the tests that patch it).
+    """
+
+    if vm_mode_from_env() != "same-cluster":
+        return False
+    if can_reach is None:
+        from orchestrator.services import ssh_helpers
+
+        can_reach = ssh_helpers.orchestrator_can_reach
+    try:
+        return bool(can_reach(host))
+    except Exception:
+        return False
+
+
+def vm_runtime_proof_matches(target: RemoteWorkspaceTarget, proof: Any) -> bool:
+    """Whether a controller attestation proves exactly ``target``'s runtime."""
+
+    runtime = target.vm_runtime
+    if runtime is None or proof is None:
+        return False
+    generation, vm_uid, launcher_pod_uid, rootdisk_pvc_uid = runtime
+    try:
+        return bool(
+            _canonical_uuid(str(proof.workspace_generation)) == generation
+            and _same_uid(proof.vm_uid, vm_uid)
+            and _same_uid(proof.launcher_pod_uid, launcher_pod_uid)
+            and _same_uid(proof.runtime_incarnation, launcher_pod_uid)
+            and _same_uid(proof.rootdisk_pvc_uid, rootdisk_pvc_uid)
+            and proof.host == target.host
+            and int(proof.port) == target.port
+            and proof.ssh_host_key_fingerprint == target.fingerprint
+            and vm_canvas_generation(target.thread_id, rootdisk_pvc_uid)
+            == target.generation
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+_DEFINITIVE_RECOVERY_CODES = frozenset(
+    {
+        WorkspaceRecoveryCode.RUNTIME_NOT_READY.value,
+        WorkspaceRecoveryCode.REPLACEMENT_OBSERVED.value,
+    }
+)
+
+
+def _current_vm_provisioner() -> Any:
+    """Read the VM provisioner singleton from its owner module at call time."""
+
+    from orchestrator.services import vm_provisioner as vm_provisioner_module
+
+    return vm_provisioner_module.vm_provisioner
+
+
+async def attest_vm_workspace_target(
+    target: RemoteWorkspaceTarget,
+) -> VMAttestationVerdict:
+    """Freshly prove that a VM target is still the exact live runtime.
+
+    The proof is the VM provisioner's ``attest_workspace_runtime``: a signed
+    controller read of the VM, VMI and launcher Pod, paired with a re-read of
+    the durable row. It is the same proof the IDE transport and the upload
+    lease rely on. ``changed`` means the controller positively saw another
+    runtime (or none); ``unknown`` means no conclusive answer, which a caller
+    must never treat as ``current``.
+    """
+
+    if target.vm_runtime is None:
+        raise ValueError("only a VM target has a controller attestation")
+    attest = getattr(_current_vm_provisioner(), "attest_workspace_runtime", None)
+    if not callable(attest):
+        return "unknown"
+    try:
+        async with asyncio.timeout(VM_ATTESTATION_TIMEOUT_SECONDS):
+            proof = await attest(target.thread_id, entity_type="thread")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        code = getattr(exc, "recovery_code", None)
+        if str(getattr(code, "value", code)) in _DEFINITIVE_RECOVERY_CODES:
+            return "changed"
+        logger.debug(
+            "Canvas VM attestation was inconclusive for thread %s",
+            target.thread_id,
+            exc_info=True,
+        )
+        return "unknown"
+    if getattr(proof, "rootdisk_pvc_uid", None) is None:
+        # The controller did not observe the disk this time. That proves
+        # nothing either way (the IDE transport calls it "unproven").
+        return "unknown"
+    return "current" if vm_runtime_proof_matches(target, proof) else "changed"
 
 
 if asyncssh is not None:
@@ -818,10 +1161,21 @@ __all__ = [
     "PinnedSSHClient",
     "PinnedSSHTransportPool",
     "RemoteWorkspaceTarget",
+    "VMAttestationVerdict",
+    "VMCanvasIdentity",
+    "VM_ATTESTATION_TIMEOUT_SECONDS",
     "asyncssh",
+    "attest_vm_workspace_target",
     "bound_workspace_generation",
+    "canvas_workspace_generation",
     "remote_target_is_vm_backed",
     "require_same_remote_workspace",
+    "resolve_canvas_workspace_target",
     "resolve_remote_workspace_target",
+    "resolve_vm_workspace_target",
+    "vm_canvas_generation",
+    "vm_canvas_identity",
+    "vm_canvas_route_available",
+    "vm_runtime_proof_matches",
     "workspace_metadata",
 ]
