@@ -2049,6 +2049,7 @@
       "title": "Lost contact",
       "dropped": "Connection dropped. Reconnecting…",
       "retrying": "Retrying… (attempt {{attempt}} of {{max}})",
+      "retryingUnbounded": "Retrying… (attempt {{attempt}})",
       "gaveUp": "Couldn't reconnect after several attempts.",
       "retryNow": "Retry now",
       "reconnect": "Reconnect"

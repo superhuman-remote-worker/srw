@@ -39,6 +39,7 @@ import {
     pickWorkspaceOfferCard,
     PersistentChatComponent,
     readingWidthToCss,
+    reconnectRetryingKey,
     saveDraft,
     shouldFoldHeaderActions,
     shouldFoldToolRun,
@@ -52,6 +53,8 @@ import {
 } from './persistent-chat.component';
 import {cloudReviewBannerVisible} from './cloud-review-banner/cloud-review-banner.component';
 import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
+import de from '../../../assets/i18n/de-DE.json';
+import en from '../../../assets/i18n/en.json';
 
 /**
  * Build a minimal DataTransferItem stand-in. The real DataTransferItemList
@@ -109,6 +112,28 @@ describe('shouldShowReconnectBanner', () => {
         expect(shouldShowReconnectBanner('connected', 'active', true, 1, 3)).toBe(false);
         expect(shouldShowReconnectBanner('error', 'active', true, 0, 3)).toBe(false);
         expect(shouldShowReconnectBanner('disconnected', 'active', true, 0, 3)).toBe(true);
+    });
+});
+
+describe('reconnectRetryingKey', () => {
+    // The live run read "Retrying… (attempt 1 of -1)": the session stream
+    // retries without a limit and the banner printed the -1 sentinel.
+    const render = (dict: {chat: {disconnected: Record<string, string>}}, key: string) =>
+        dict.chat.disconnected[key.split('.').pop()!]
+            .replace('{{attempt}}', '3')
+            .replace('{{max}}', '-1');
+
+    it('names no limit when the retry loop has none', () => {
+        const key = reconnectRetryingKey(-1);
+        expect(key).toBe('chat.disconnected.retryingUnbounded');
+        expect(render(en, key)).toBe('Retrying… (attempt 3)');
+        expect(render(de, key)).toBe('Erneuter Versuch… (Versuch 3)');
+        expect(render(en, key)).not.toContain('-1');
+    });
+
+    it('keeps "attempt N of M" for a real limit', () => {
+        expect(reconnectRetryingKey(8)).toBe('chat.disconnected.retrying');
+        expect(reconnectRetryingKey(0)).toBe('chat.disconnected.retryingUnbounded');
     });
 });
 

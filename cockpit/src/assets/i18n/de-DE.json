@@ -2049,6 +2049,7 @@
       "title": "Verbindung verloren",
       "dropped": "Verbindung unterbrochen. Verbinde erneut…",
       "retrying": "Erneuter Versuch… (Versuch {{attempt}} von {{max}})",
+      "retryingUnbounded": "Erneuter Versuch… (Versuch {{attempt}})",
       "gaveUp": "Erneuter Verbindungsaufbau nach mehreren Versuchen fehlgeschlagen.",
       "retryNow": "Jetzt erneut versuchen",
       "reconnect": "Erneut verbinden"

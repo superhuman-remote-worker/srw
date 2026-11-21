@@ -355,6 +355,13 @@ export function shouldShowReconnectBanner(
         && (retryAttempt > 0 || (connection === 'disconnected' && status === 'active' && turnCount > 0));
 }
 
+/** The reconnect banner's retry line. The session stream retries without a
+ *  limit (`reconnectMaxAttempts` is -1), and "attempt 1 of -1" says nothing;
+ *  only a positive limit is worth naming. */
+export function reconnectRetryingKey(maxAttempts: number): string {
+    return maxAttempts > 0 ? 'chat.disconnected.retrying' : 'chat.disconnected.retryingUnbounded';
+}
+
 /** Queued-turn bubble escalation: NN/g's 10 s attention limit, then an
  *  elapsed counter from 60 s. Time-based only — never a queue position. */
 export const QUEUE_BUSY_AFTER_MS = 10_000;
@@ -2242,7 +2249,7 @@ export function clearDraft(threadId: string | null): void {
               @if (chat.reconnectGaveUp()) {
                 <span>{{ 'chat.disconnected.gaveUp' | transloco }}</span>
               } @else if (chat.reconnectAttempt() > 0) {
-                <span>{{ 'chat.disconnected.retrying' | transloco:{ attempt: chat.reconnectAttempt(), max: chat.reconnectMaxAttempts } }}</span>
+                <span>{{ reconnectRetryingKey(chat.reconnectMaxAttempts) | transloco:{ attempt: chat.reconnectAttempt(), max: chat.reconnectMaxAttempts } }}</span>
               } @else {
                 <span>{{ 'chat.disconnected.dropped' | transloco }}</span>
               }
@@ -3509,6 +3516,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chat.reconnectAttempt(),
         this.chat.turns().length,
     ));
+    protected readonly reconnectRetryingKey = reconnectRetryingKey;
 
     readonly scrolledAway = signal(false);
     readonly newMessageCount = signal(0);
