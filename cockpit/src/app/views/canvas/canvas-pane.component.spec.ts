@@ -1,3 +1,4 @@
+import {readFileSync} from 'node:fs';
 import {provideHttpClient} from '@angular/common/http';
 import {HttpTestingController, provideHttpClientTesting} from '@angular/common/http/testing';
 import {signal} from '@angular/core';
@@ -453,6 +454,7 @@ describe('Canvas pane durable presentation', () => {
   function paneWith(
     overrides: Partial<CanvasState>,
     renderer: CanvasState['renderer'] = 'markdown',
+    translate: (key: string) => string = (key) => key,
   ) {
     const state = signal<CanvasState | null>(canvasState(4, renderer, overrides));
     const canvas = {
@@ -518,7 +520,7 @@ describe('Canvas pane durable presentation', () => {
           errorCode: signal<string | null>(null),
         }},
         {provide: WorkspaceFileDownloadService, useValue: downloads},
-        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+        {provide: TranslocoService, useValue: {translate}},
         {provide: Router, useValue: {}},
       ],
     });
@@ -581,6 +583,38 @@ describe('Canvas pane durable presentation', () => {
     expect(pane.snapshotBacked()).toBe(false);
     expect(pane.snapshotCapturedAt()).toBeNull();
     expect(pane.rendererLabel()).toBe('canvas.renderer.markdown');
+  });
+
+  it('does not repeat the source badge as the renderer chip', () => {
+    const labels: Record<string, string> = {
+      'canvas.sourceKind.browser': 'Shared browser',
+      'canvas.renderer.browser': 'Shared browser',
+      'canvas.sourceKind.file': 'File',
+      'canvas.renderer.markdown': 'Markdown',
+    };
+    const translate = (key: string) => labels[key] ?? key;
+    const browserPane = paneWith(
+      {source: {type: 'browser'}, source_version: null},
+      'auto',
+      translate,
+    );
+    TestBed.flushEffects();
+    expect(browserPane.sourceKindLabel()).toBe('Shared browser');
+    expect(browserPane.showRendererLabel()).toBe(false);
+
+    TestBed.resetTestingModule();
+    const filePane = paneWith({}, 'markdown', translate);
+    TestBed.flushEffects();
+    expect(filePane.rendererLabel()).toBe('Markdown');
+    expect(filePane.showRendererLabel()).toBe(true);
+  });
+
+  it('follows the pane width, not the window, when the header gets narrow', () => {
+    const styles = readFileSync('src/app/views/canvas/canvas-pane.component.scss', 'utf8');
+
+    expect(styles).toContain('container-type: inline-size');
+    expect(styles).toContain('@container (width <= 760px)');
+    expect(styles).not.toMatch(/@media \(width <= 520px\)/);
   });
 
   it('still labels a genuinely unknown renderer as unsupported', () => {

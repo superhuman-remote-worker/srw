@@ -142,14 +142,16 @@ export function browserOpenErrorKey(code: string | null): string {
           }
           <app-icon class="canvas-mark" size="md">dashboard_customize</app-icon>
           <div class="canvas-title-group">
-            <h2>{{ title() }}</h2>
+            <h2 [title]="title()">{{ title() }}</h2>
             <div class="canvas-source" [title]="sourceSummary()">{{ sourceSummary() }}</div>
           </div>
         </div>
         <div class="canvas-trust">
           <app-badge tone="warning" size="xs">{{ 'canvas.untrusted' | transloco }}</app-badge>
           <app-badge tone="neutral" size="xs">{{ sourceKindLabel() }}</app-badge>
-          <span>{{ rendererLabel() }}</span>
+          @if (showRendererLabel()) {
+            <span>{{ rendererLabel() }}</span>
+          }
           @if (snapshotBacked()) {
             <app-badge tone="neutral" size="xs">{{ 'canvas.offline.badge' | transloco }}</app-badge>
           } @else if (lastSyncedAt(); as syncedAt) {
@@ -536,6 +538,11 @@ export class CanvasPaneComponent {
       : declared;
     return this.transloco.translate(`canvas.renderer.${renderer}`);
   });
+  /**
+   * A live app or the shared browser is drawn by a renderer of the same name;
+   * the chip would only repeat the source badge next to it.
+   */
+  readonly showRendererLabel = computed(() => this.rendererLabel() !== this.sourceKindLabel());
   readonly snapshotBacked = computed(() => this.state()?.content_origin === 'snapshot');
   readonly snapshotCapturedAt = computed(() => this.state()?.content_captured_at ?? null);
   readonly isLiveAppSource = computed(() => this.chromeState()?.source?.type === 'workspace_app');
