@@ -22,13 +22,16 @@ Two rules from the spike (vault spec ``endpoint-certificate-pinning-design``):
   ``ssl.create_default_context()``: the latter reads ``SSL_CERT_FILE`` and, on
   recent Pythons, sets ``VERIFY_X509_STRICT``.
 
-Pure stdlib, so the orchestrator, the agent and the provisioners share it.
+Shared by the orchestrator, the agent and the provisioners; the only
+third-party import is httpx. A pinned client gets an explicit transport, so
+httpx ignores environment proxies and the client's ``limits`` for it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import binascii
 import hashlib
 import os
@@ -164,6 +167,50 @@ class CertificateChangedError(httpx.ConnectError):
             request=request,
         )
 
+    def __reduce__(self):
+        return (
+            _rebuild_changed,
+            (self.host, self.port, self.pinned_sha256, self.presented_sha256),
+        )
+
+
+def _rebuild_changed(host, port, pinned, presented):
+    return CertificateChangedError(host, port, pinned, presented)
+
+
+class PinnedCertificateRejectedError(httpx.ConnectError):
+    """The server presents the pinned certificate but OpenSSL still refuses it."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        sha256: str,
+        reason: str,
+        *,
+        request: Optional[httpx.Request] = None,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.sha256 = sha256
+        self.reason = reason
+        super().__init__(
+            f"TLS handshake with {host}:{port} failed although the server "
+            f"presents the pinned certificate (SHA-256 {sha256}): {reason}. "
+            "SRW cannot use this certificate; the server needs a different one.",
+            request=request,
+        )
+
+    def __reduce__(self):
+        return (
+            _rebuild_rejected,
+            (self.host, self.port, self.sha256, self.reason),
+        )
+
+
+def _rebuild_rejected(host, port, sha256, reason):
+    return PinnedCertificateRejectedError(host, port, sha256, reason)
+
 
 def _lookup_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -184,7 +231,7 @@ def presented_certificate_sha256(
         with socket.create_connection((host, port), timeout=timeout) as raw:
             with _lookup_context().wrap_socket(raw, server_hostname=host) as tls:
                 der = tls.getpeercert(binary_form=True)
-    except (OSError, ssl.SSLError, ValueError):
+    except Exception:
         return None
     return fingerprint_sha256(der) if der else None
 
@@ -203,35 +250,41 @@ async def apresented_certificate_sha256(
         )
         ssl_object = writer.get_extra_info("ssl_object")
         der = ssl_object.getpeercert(binary_form=True) if ssl_object else None
-    except (OSError, ssl.SSLError, ValueError, asyncio.TimeoutError):
+    except Exception:
         return None
     finally:
         if writer is not None:
             writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
     return fingerprint_sha256(der) if der else None
 
 
-def _is_verification_failure(exc: BaseException) -> bool:
+def _verification_error(exc: BaseException) -> Optional[ssl.SSLCertVerificationError]:
     seen: set[int] = set()
     cur: Optional[BaseException] = exc
     while cur is not None and id(cur) not in seen:
         if isinstance(cur, ssl.SSLCertVerificationError):
-            return True
+            return cur
         seen.add(id(cur))
         cur = cur.__cause__ or cur.__context__
-    return False
+    return None
 
 
-def _changed(
-    exc: httpx.ConnectError, request: httpx.Request, pin: TlsPin, presented
-) -> CertificateChangedError:
-    return CertificateChangedError(
-        request.url.host,
-        request.url.port or 443,
-        pin.sha256,
-        presented,
-        request=request,
-    )
+def _pin_failure(
+    verification: ssl.SSLCertVerificationError,
+    request: httpx.Request,
+    pin: TlsPin,
+    host: str,
+    port: int,
+    presented: Optional[str],
+) -> httpx.ConnectError:
+    if presented == pin.sha256:
+        reason = getattr(verification, "verify_message", None) or str(verification)
+        return PinnedCertificateRejectedError(
+            host, port, pin.sha256, reason, request=request
+        )
+    return CertificateChangedError(host, port, pin.sha256, presented, request=request)
 
 
 class PinnedTransport(httpx.HTTPTransport):
@@ -245,12 +298,14 @@ class PinnedTransport(httpx.HTTPTransport):
         try:
             return super().handle_request(request)
         except httpx.ConnectError as exc:
-            if not _is_verification_failure(exc):
+            verification = _verification_error(exc)
+            if verification is None:
                 raise
-            presented = presented_certificate_sha256(
-                request.url.host, request.url.port or 443
-            )
-            raise _changed(exc, request, self._pin, presented) from exc
+            host, port = request.url.host, request.url.port or 443
+            presented = presented_certificate_sha256(host, port)
+            raise _pin_failure(
+                verification, request, self._pin, host, port, presented
+            ) from exc
 
 
 class AsyncPinnedTransport(httpx.AsyncHTTPTransport):
@@ -264,12 +319,14 @@ class AsyncPinnedTransport(httpx.AsyncHTTPTransport):
         try:
             return await super().handle_async_request(request)
         except httpx.ConnectError as exc:
-            if not _is_verification_failure(exc):
+            verification = _verification_error(exc)
+            if verification is None:
                 raise
-            presented = await apresented_certificate_sha256(
-                request.url.host, request.url.port or 443
-            )
-            raise _changed(exc, request, self._pin, presented) from exc
+            host, port = request.url.host, request.url.port or 443
+            presented = await apresented_certificate_sha256(host, port)
+            raise _pin_failure(
+                verification, request, self._pin, host, port, presented
+            ) from exc
 
 
 def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[str, Any]:

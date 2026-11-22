@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
+import shutil
 import socket
+import threading
 import ssl
 import subprocess
 
@@ -15,6 +19,7 @@ from langchain_openai import ChatOpenAI
 from shared.tls_pinning import (
     NO_CHECK_TIME,
     CertificateChangedError,
+    PinnedCertificateRejectedError,
     TlsPin,
     apresented_certificate_sha256,
     fingerprint_sha256,
@@ -284,3 +289,131 @@ def test_a_refused_connection_is_not_certificate_changed(tls_certs):
         with pytest.raises(httpx.ConnectError) as e:
             c.get(f"https://127.0.0.1:{port}/v1/models")
     assert not isinstance(e.value, CertificateChangedError)
+
+
+def test_a_pin_the_server_presents_but_openssl_rejects_is_not_reported_as_changed(
+    tmp_path,
+):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl CLI not available")
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:1024", "-nodes",
+            "-keyout", "weak.key", "-out", "weak.pem", "-days", "30",
+            "-subj", "/CN=127.0.0.1",
+        ],
+        cwd=tmp_path, check=True, capture_output=True,
+    )  # fmt: skip
+    pin = _pin(tmp_path / "weak.pem")
+    # The shared fixture server cannot load a weak key, so lower its level here.
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    sctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+    sctx.load_cert_chain(str(tmp_path / "weak.pem"), str(tmp_path / "weak.key"))
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(5)
+    port = listener.getsockname()[1]
+    completed: list[int] = []
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(5)
+                # The certificate lookup completes a handshake but sends nothing.
+                with sctx.wrap_socket(conn, server_side=True) as tls:
+                    data = tls.recv(1)
+                    if data:
+                        completed.append(data)
+            except (OSError, ssl.SSLError):
+                conn.close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
+            with pytest.raises(PinnedCertificateRejectedError) as e:
+                c.get(
+                    f"https://127.0.0.1:{port}/v1/models",
+                    headers={"Authorization": "Bearer S"},
+                )
+    finally:
+        listener.close()
+        th.join(timeout=5)
+    assert completed == []
+    assert not isinstance(e.value, CertificateChangedError)
+    assert e.value.sha256 == pin.sha256
+    assert e.value.port == port
+    assert "too weak" in e.value.reason
+    assert str(e.value) == (
+        f"TLS handshake with 127.0.0.1:{port} failed although the server "
+        f"presents the pinned certificate (SHA-256 {pin.sha256}): "
+        f"{e.value.reason}. SRW cannot use this certificate; the server needs "
+        "a different one."
+    )
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        CertificateChangedError("h", 443, "AA", "BB"),
+        CertificateChangedError("h", 443, "AA", None),
+        PinnedCertificateRejectedError("h", 443, "AA", "key too weak"),
+    ],
+)
+def test_errors_are_copyable_and_picklable(err):
+    for clone in (copy.copy(err), pickle.loads(pickle.dumps(err))):
+        assert type(clone) is type(err)
+        assert str(clone) == str(err)
+        assert vars(clone).keys() >= {"host", "port"}
+        for k in (
+            "host",
+            "port",
+            "pinned_sha256",
+            "presented_sha256",
+            "sha256",
+            "reason",
+        ):
+            assert getattr(clone, k, None) == getattr(err, k, None)
+
+
+@pytest.mark.asyncio
+async def test_an_async_refused_connection_is_not_certificate_changed(tls_certs):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    pin = _pin(tls_certs.leaf)
+    async with httpx.AsyncClient(**httpx_client_kwargs(pin, asynchronous=True)) as c:
+        with pytest.raises(httpx.ConnectError) as e:
+            await c.get(f"https://127.0.0.1:{port}/v1/models")
+    assert type(e.value) is httpx.ConnectError
+
+
+def test_a_non_verification_tls_failure_stays_a_plain_connect_error(tls_certs):
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        pin = _pin(tls_certs.leaf)
+        with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
+            with pytest.raises(httpx.ConnectError) as e:
+                c.get(f"https://127.0.0.1:{srv.server_port}/v1/models")
+        assert type(e.value) is httpx.ConnectError
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        th.join(timeout=5)
