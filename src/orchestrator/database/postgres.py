@@ -54,6 +54,7 @@ from shared.connectors.builtin import (
     legacy_types_with_config_key,
 )
 from shared.connectors.platform import (
+    connector_description_for_agent_sql,
     native_cloud_project_sql,
     native_project_sql,
     native_user_sql,
@@ -52656,6 +52657,12 @@ class PostgresDB:
         knowledge base, a user's cloud), False for the ones people created,
         None for both.
 
+        The first page (no ``cursor``) also carries ``type_counts``: how many
+        rows each type has under every filter but ``type``, so a type strip
+        can show its counts without narrowing to the type that is selected.
+        Each row carries ``native_project_name``: the name of the project a
+        connector SRW keeps belongs to (NULL for any other row).
+
         ``visible_project_ids`` must come from the caller's authenticated
         project memberships. ``restrict_to_projects`` is used by a
         ``project:<uuid>`` principal so creator ownership cannot escape its
@@ -52731,8 +52738,6 @@ class PostgresDB:
                 "OR COALESCE(d.description, '') ILIKE '%' || {param} || '%')",
                 q.strip(),
             )
-        if ds_type:
-            add_condition("d.type = {param}", ds_type)
         if filter_project_uuid:
             add_condition(
                 "EXISTS (SELECT 1 FROM project_datasources filter_pd "
@@ -52770,6 +52775,13 @@ class PostgresDB:
                 "SELECT 1 FROM project_datasources availability_pd "
                 "WHERE availability_pd.datasource_id = d.id)"
             )
+        # Every filter but the type: what the type counts are taken over.
+        # The type and the cursor come last, so these conditions use only
+        # the parameters before them.
+        facet_where = " AND ".join(conditions)
+        facet_values = list(values)
+        if ds_type:
+            add_condition("d.type = {param}", ds_type)
         if cursor_created_at is not None and cursor_id is not None:
             values.extend([cursor_created_at, cursor_id])
             conditions.append(
@@ -52803,7 +52815,11 @@ class PostgresDB:
                                    WHERE pd.datasource_id = d.id
                                      AND pd.project_id = ANY($2::uuid[])
                                ), ARRAY[]::uuid[])
-                       END AS project_ids
+                       END AS project_ids,
+                       (
+                           SELECT native_p.name FROM projects native_p
+                           WHERE native_p.id::text = {native_project_sql("d")}
+                       ) AS native_project_name
                 FROM datasources d
                 WHERE {where_clause}
                 ORDER BY d.created_at DESC, d.id DESC
@@ -52811,6 +52827,25 @@ class PostgresDB:
                 """,
                 *values,
             )
+            type_counts: dict[str, int] | None = None
+            if page is None:
+                # The one-row join names $1..$4, which the conditions may
+                # leave out (an administrator's have no owner test).
+                counted = await conn.fetch(
+                    f"""
+                    SELECT d.type, count(*)::int AS n
+                    FROM datasources d
+                    CROSS JOIN (
+                        SELECT $1::uuid AS owner_id, $2::uuid[] AS visible_ids,
+                               $3::boolean AS full_admin,
+                               $4::boolean AS restricted
+                    ) AS catalog_params
+                    WHERE {facet_where}
+                    GROUP BY d.type
+                    """,
+                    *facet_values,
+                )
+                type_counts = {str(row["type"]): int(row["n"]) for row in counted}
 
         has_more = len(rows) > safe_limit
         page_rows = rows[:safe_limit]
@@ -52821,7 +52856,10 @@ class PostgresDB:
             next_cursor = _encode_page_cursor(
                 {"created_at": last["created_at"], "id": last["id"]}
             )
-        return {"items": items, "next_cursor": next_cursor}
+        result: Dict[str, Any] = {"items": items, "next_cursor": next_cursor}
+        if type_counts is not None:
+            result["type_counts"] = type_counts
+        return result
 
     async def list_project_linkable_datasources(
         self,
@@ -54186,10 +54224,15 @@ class PostgresDB:
 
         project_uuid = UUID(project_id) if project_id else None
 
+        # What the agent is told about each connector (its README line): the
+        # project's note on the link, else the connector's own description,
+        # except for a connector SRW keeps, whose description is SRW's own
+        # wording of what its README entry already says.
+        description = connector_description_for_agent_sql("d", "pd.description")
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
-                SELECT DISTINCT d.id, d.name, d.description, d.type,
+                f"""
+                SELECT DISTINCT d.id, d.name, {description} AS description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
                     d.created_by, d.is_global, d.scope_mode, d.auto_attach,
@@ -54260,10 +54303,13 @@ class PostgresDB:
                 pass
 
         native_project = native_project_sql("d")
+        # The note the thread's projects agree on (one project, or several
+        # with the same note), as for the job path's README line.
+        description = connector_description_for_agent_sql("d", "project_policy.note")
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT d.id, d.name, d.description, d.type,
+                SELECT d.id, d.name, {description} AS description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
                     d.created_by, d.is_global, d.scope_mode, d.auto_attach,
@@ -54279,7 +54325,9 @@ class PostgresDB:
                 LEFT JOIN LATERAL (
                     SELECT BOOL_OR(pd.read_only) AS read_only,
                            CASE WHEN count(DISTINCT pd.access) = 1
-                                THEN min(pd.access) END AS access
+                                THEN min(pd.access) END AS access,
+                           CASE WHEN count(DISTINCT pd.description) = 1
+                                THEN min(pd.description) END AS note
                     FROM project_datasources pd
                     WHERE pd.datasource_id = d.id
                       AND pd.project_id = ANY($2::uuid[])

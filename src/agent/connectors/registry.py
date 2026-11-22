@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from agent.connectors.base import (
@@ -331,6 +331,7 @@ class ConnectorRegistry:
                         ],
                     )
                 )
+        _add_descriptions(collected, deliveries)
         lines: list[str] = []
         for section in FACTS_SECTIONS:
             items = sorted(
@@ -349,6 +350,49 @@ class ConnectorRegistry:
             # longer resolve.
             lines += ["_No connectors attached._", ""]
         return lines
+
+
+#: The longest description a README line carries; the rest is cut at a word.
+DESCRIPTION_LIMIT = 500
+
+
+def description_line(entry: Mapping[str, Any]) -> str | None:
+    """The README line under a connector that says what it is for, or None.
+
+    The orchestrator sends the project's note on the link, else the
+    connector's own description (none for a connector SRW keeps). It is
+    the connector owner's text: one line, whitespace collapsed, at most
+    :data:`DESCRIPTION_LIMIT` characters.
+    """
+    raw = entry.get("description")
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(raw.split())
+    if not text:
+        return None
+    if len(text) > DESCRIPTION_LIMIT:
+        cut = text[:DESCRIPTION_LIMIT].rsplit(" ", 1)[0] or text[:DESCRIPTION_LIMIT]
+        text = cut.rstrip(" ,.;:") + " …"
+    return f"  Description: {text}"
+
+
+def _add_descriptions(
+    collected: list[FactsLines], deliveries: Sequence[Delivery]
+) -> None:
+    """Put each connector's description under its first README line.
+
+    A connector can be described in more than one section; only its first
+    block gets the line, so it is said once.
+    """
+    first: dict[int, FactsLines] = {}
+    for item in collected:
+        if item.lines and item.index not in first:
+            first[item.index] = item
+    for delivery in deliveries:
+        line = description_line(delivery.entry)
+        block = first.get(delivery.index)
+        if line is not None and block is not None:
+            block.lines.insert(1, line)
 
 
 _REGISTRY: ConnectorRegistry | None = None

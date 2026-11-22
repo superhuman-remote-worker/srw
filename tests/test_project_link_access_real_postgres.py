@@ -151,3 +151,147 @@ async def test_a_link_stores_its_level(database):
     )
     [linked] = await database.list_project_datasources(project_id)
     assert (linked["project_access"], linked["project_read_only"]) == (None, True)
+
+
+@pytest.mark.asyncio
+async def test_an_agent_is_told_the_project_note_else_the_connector_description(
+    database,
+):
+    """What a session's README says under each connector (decision 3 of the
+    connectors UX pass): the project's note on the link wins; without one,
+    the connector's own description; a connector SRW keeps says nothing of
+    its own, since its README entry already explains it."""
+    owner = await _user(database, "Note writer", admin=True)
+    projects = []
+    for name in ("Hotel", "Spa"):
+        project_id = str(
+            await database.fetchval(
+                "INSERT INTO projects(name) VALUES($1) RETURNING id", name
+            )
+        )
+        await database.execute(
+            "INSERT INTO project_members(project_id,user_id,role) "
+            "VALUES($1,$2,'owner')",
+            UUID(project_id),
+            UUID(owner["id"]),
+        )
+        projects.append(project_id)
+    hotel, spa = projects
+    created = await database.create_datasource(
+        name="Bookings",
+        ds_type="postgresql",
+        connection_url="postgresql://db/bookings",
+        description="Guests and their bookings",
+        created_by=owner["id"],
+    )
+    row_id = str(created["id"])
+    for project_id in projects:
+        await database.link_datasource_to_project(
+            project_id, row_id, authority_user_id=owner["id"], authority_is_admin=True
+        )
+
+    async def told(project_ids: list[str]) -> str | None:
+        [row] = await database.resolve_datasources_for_thread([row_id], project_ids)
+        return row["description"]
+
+    # No note anywhere: the connector's own description.
+    assert await told([hotel]) == "Guests and their bookings"
+    # The project's note replaces it.
+    assert await database.update_project_datasource(
+        hotel, row_id, description="Read only here", authority_user_id=owner["id"]
+    )
+    assert await told([hotel]) == "Read only here"
+    # Two projects: the note they agree on; a second project without a note
+    # does not disagree.
+    assert await told([hotel, spa]) == "Read only here"
+    assert await database.update_project_datasource(
+        spa, row_id, description="Never delete rows", authority_user_id=owner["id"]
+    )
+    assert await told([hotel, spa]) == "Guests and their bookings"
+    # A blank note is no note.
+    assert await database.update_project_datasource(
+        hotel, row_id, description="   ", authority_user_id=owner["id"]
+    )
+    assert await told([hotel]) == "Guests and their bookings"
+
+    # SRW's own folder: nothing of its own, but the project's note if set.
+    _owner, folder_project, folder_id = await _folder(database)
+    [folder] = await database.resolve_datasources_for_thread(
+        [folder_id], [folder_project]
+    )
+    assert folder["description"] is None
+    assert await database.update_project_datasource(
+        folder_project,
+        folder_id,
+        description="Drafts go in Entwürfe",
+        authority_user_id=_owner["id"],
+    )
+    [folder] = await database.resolve_datasources_for_thread(
+        [folder_id], [folder_project]
+    )
+    assert folder["description"] == "Drafts go in Entwürfe"
+
+
+@pytest.mark.asyncio
+async def test_the_catalog_counts_types_and_names_a_kept_connector_s_project(
+    database,
+):
+    """The Customize list's type strip and its "Kept by SRW" groups: the
+    first page counts each type under every filter but the type, and a
+    connector SRW keeps names its project. Both the administrator's query
+    (no owner test) and a member's run, since they use different
+    parameters."""
+    owner, project_id, folder_id = await _folder(database)
+    await database.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'owner') "
+        "ON CONFLICT DO NOTHING",
+        UUID(project_id),
+        UUID(owner["id"]),
+    )
+    for name in ("Bookings", "Rooms"):
+        await database.create_datasource(
+            name=name,
+            ds_type="postgresql",
+            connection_url=f"postgresql://db/{name.lower()}",
+            created_by=owner["id"],
+        )
+
+    for is_admin in (True, False):
+        page = await database.list_datasource_catalog(
+            owner["id"], [project_id], is_admin=is_admin, managed=False
+        )
+        assert page["type_counts"] == {"postgresql": 2}
+        assert {row["native_project_name"] for row in page["items"]} == {None}
+
+        # A type narrows the rows, not the counts.
+        page = await database.list_datasource_catalog(
+            owner["id"],
+            [project_id],
+            is_admin=is_admin,
+            managed=False,
+            ds_type="kb",
+        )
+        assert page["items"] == []
+        assert page["type_counts"] == {"postgresql": 2}
+
+        kept = await database.list_datasource_catalog(
+            owner["id"], [project_id], is_admin=is_admin, managed=True
+        )
+        [folder] = [row for row in kept["items"] if str(row["id"]) == folder_id]
+        assert folder["native_project_name"] == "Linked"
+        assert kept["type_counts"].get("cloud_folder") == 1
+
+    # A later page carries no counts.
+    first = await database.list_datasource_catalog(
+        owner["id"], [project_id], is_admin=True, managed=False, limit=1
+    )
+    assert first["next_cursor"]
+    second = await database.list_datasource_catalog(
+        owner["id"],
+        [project_id],
+        is_admin=True,
+        managed=False,
+        limit=1,
+        cursor=first["next_cursor"],
+    )
+    assert "type_counts" not in second

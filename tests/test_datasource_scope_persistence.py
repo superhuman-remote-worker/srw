@@ -601,7 +601,8 @@ async def test_catalog_filters_authorization_before_cursor_limit():
         "id": UUID("77777777-7777-4777-8777-777777777777"),
         "created_at": "2026-08-04T10:00:00+00:00",
     }
-    conn.fetch.return_value = [first, second]
+    # The page, then the first page's type counts.
+    conn.fetch.side_effect = [[first, second], [{"type": "postgresql", "n": 2}]]
     db = _make_db(conn)
 
     page = await db.list_datasource_catalog(
@@ -614,9 +615,14 @@ async def test_catalog_filters_authorization_before_cursor_limit():
 
     assert len(page["items"]) == 1
     assert page["next_cursor"]
-    sql = conn.fetch.await_args.args[0]
+    assert page["type_counts"] == {"postgresql": 2}
+    sql = conn.fetch.await_args_list[0].args[0]
     assert sql.index("d.created_by = $1") < sql.index("LIMIT")
     assert "ILIKE" in sql
+    # The counts take every filter but the type, and no limit.
+    counts_sql = conn.fetch.await_args_list[1].args[0]
+    assert "ILIKE" in counts_sql and "d.created_by = $1" in counts_sql
+    assert "LIMIT" not in counts_sql and "GROUP BY d.type" in counts_sql
 
 
 @pytest.mark.asyncio
@@ -632,7 +638,7 @@ async def test_scoped_catalog_never_enriches_creator_with_hidden_links():
     )
 
     sql, owner_id, visible_ids, full_admin, restrict_scope, _ = (
-        conn.fetch.await_args.args
+        conn.fetch.await_args_list[0].args
     )
     assert owner_id == UUID(USER_ID)
     assert visible_ids == [UUID(PROJECT_A)]
@@ -655,7 +661,7 @@ async def test_catalog_splits_by_who_keeps_the_connector():
         conn = AsyncMock()
         conn.fetch.return_value = []
         await _make_db(conn).list_datasource_catalog(USER_ID, [PROJECT_A], **filters)
-        return conn.fetch.await_args.args[0]
+        return conn.fetch.await_args_list[0].args[0]
 
     both = await query()
     assert kept not in both
@@ -668,6 +674,60 @@ async def test_catalog_splits_by_who_keeps_the_connector():
     only_created = await query(managed=False)
     assert f"AND NOT {kept}" in only_created
     assert only_created.index(kept) < only_created.index("LIMIT")
+
+
+@pytest.mark.asyncio
+async def test_the_type_counts_ignore_the_type_and_only_the_first_page_has_them():
+    conn = AsyncMock()
+    conn.fetch.return_value = []
+    db = _make_db(conn)
+
+    await db.list_datasource_catalog(USER_ID, [PROJECT_A], ds_type="kb", managed=True)
+    page_sql = conn.fetch.await_args_list[0].args[0]
+    counts_sql, *counts_args = conn.fetch.await_args_list[1].args
+    assert "d.type = $5" in page_sql
+    assert "d.type = $" not in counts_sql
+    # The same filters, without the type's parameter.
+    assert len(counts_args) == 4
+    assert "CROSS JOIN" in counts_sql
+
+    conn.fetch.reset_mock()
+    cursor = _encode_page_cursor(
+        {"created_at": "2026-08-05T10:00:00+00:00", "id": DATASOURCE_ID}
+    )
+    await db.list_datasource_catalog(USER_ID, [PROJECT_A], cursor=cursor)
+    assert conn.fetch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_job_is_told_its_project_note_about_each_connector():
+    """The job path reads the description the same way as the session path
+    (tests/test_project_link_access_real_postgres.py runs that one on a real
+    database): the project's note, else the connector's own description."""
+    from shared.connectors.platform import connector_description_for_agent_sql
+
+    conn = AsyncMock()
+    conn.fetch.return_value = []
+    db = _make_db(conn)
+
+    await db.resolve_datasources_for_job(DATASOURCE_ID, PROJECT_A)
+
+    sql = conn.fetch.await_args.args[0]
+    expected = connector_description_for_agent_sql("d", "pd.description")
+    assert f"{expected} AS description" in sql
+    assert "LEFT JOIN project_datasources pd" in sql
+
+
+def test_the_description_expression_prefers_the_note_and_skips_srw_wording():
+    from shared.connectors.platform import (
+        connector_description_for_agent_sql,
+        platform_owned_sql,
+    )
+
+    sql = connector_description_for_agent_sql("d", "pd.description")
+    assert sql.startswith("CASE WHEN NULLIF(btrim(pd.description), '') IS NOT NULL")
+    assert f"WHEN {platform_owned_sql('d')} THEN NULL" in sql
+    assert sql.endswith("ELSE d.description END")
 
 
 @pytest.mark.asyncio
