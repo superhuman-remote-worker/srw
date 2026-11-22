@@ -27,14 +27,18 @@ Pure stdlib, so the orchestrator, the agent and the provisioners share it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import os
 import re
+import socket
 import ssl
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
+
+import httpx
 
 #: Env var suffix: the full name is ``{PREFIX}_TLS_PINNED_CERT``.
 TLS_PINNED_CERT_SUFFIX = "TLS_PINNED_CERT"
@@ -130,3 +134,147 @@ def pinned_ssl_context(pin: TlsPin) -> ssl.SSLContext:
     ctx.load_verify_locations(cadata=pin.pem)
     ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | NO_CHECK_TIME
     return ctx
+
+
+#: How long the lookup of the certificate a server presents may take.
+PRESENTED_LOOKUP_TIMEOUT = 5.0
+
+
+class CertificateChangedError(httpx.ConnectError):
+    """The server did not present the pinned certificate; no request was sent."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        pinned_sha256: str,
+        presented_sha256: Optional[str],
+        *,
+        request: Optional[httpx.Request] = None,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.pinned_sha256 = pinned_sha256
+        self.presented_sha256 = presented_sha256
+        presented = presented_sha256 if presented_sha256 else "a different certificate"
+        super().__init__(
+            f"TLS certificate changed for {host}:{port}: pinned SHA-256 "
+            f"{pinned_sha256}, server presents {presented}. "
+            "An admin must re-trust it in Admin \u2192 Models.",
+            request=request,
+        )
+
+
+def _lookup_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def presented_certificate_sha256(
+    host: str, port: int, *, timeout: float = PRESENTED_LOOKUP_TIMEOUT
+) -> Optional[str]:
+    """Fingerprint of the certificate ``host:port`` presents, or ``None``.
+
+    Handshake only, nothing is sent over the connection. Any failure gives
+    ``None``: this is diagnostics for an error message, never a trust decision.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with _lookup_context().wrap_socket(raw, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+    return fingerprint_sha256(der) if der else None
+
+
+async def apresented_certificate_sha256(
+    host: str, port: int, *, timeout: float = PRESENTED_LOOKUP_TIMEOUT
+) -> Optional[str]:
+    """Async twin of :func:`presented_certificate_sha256`."""
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host, port, ssl=_lookup_context(), server_hostname=host
+            ),
+            timeout,
+        )
+        ssl_object = writer.get_extra_info("ssl_object")
+        der = ssl_object.getpeercert(binary_form=True) if ssl_object else None
+    except (OSError, ssl.SSLError, ValueError, asyncio.TimeoutError):
+        return None
+    finally:
+        if writer is not None:
+            writer.close()
+    return fingerprint_sha256(der) if der else None
+
+
+def _is_verification_failure(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, ssl.SSLCertVerificationError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _changed(
+    exc: httpx.ConnectError, request: httpx.Request, pin: TlsPin, presented
+) -> CertificateChangedError:
+    return CertificateChangedError(
+        request.url.host,
+        request.url.port or 443,
+        pin.sha256,
+        presented,
+        request=request,
+    )
+
+
+class PinnedTransport(httpx.HTTPTransport):
+    """Sync transport trusting only ``pin``; a pin failure names the change."""
+
+    def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
+        self._pin = pin
+        super().__init__(verify=pinned_ssl_context(pin), **kwargs)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return super().handle_request(request)
+        except httpx.ConnectError as exc:
+            if not _is_verification_failure(exc):
+                raise
+            presented = presented_certificate_sha256(
+                request.url.host, request.url.port or 443
+            )
+            raise _changed(exc, request, self._pin, presented) from exc
+
+
+class AsyncPinnedTransport(httpx.AsyncHTTPTransport):
+    """Async transport trusting only ``pin``; a pin failure names the change."""
+
+    def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
+        self._pin = pin
+        super().__init__(verify=pinned_ssl_context(pin), **kwargs)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return await super().handle_async_request(request)
+        except httpx.ConnectError as exc:
+            if not _is_verification_failure(exc):
+                raise
+            presented = await apresented_certificate_sha256(
+                request.url.host, request.url.port or 443
+            )
+            raise _changed(exc, request, self._pin, presented) from exc
+
+
+def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[str, Any]:
+    """Keyword arguments for an httpx client: ``{}`` without a pin."""
+    if pin is None:
+        return {}
+    transport = AsyncPinnedTransport(pin) if asynchronous else PinnedTransport(pin)
+    return {"transport": transport}

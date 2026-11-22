@@ -7,13 +7,20 @@ import socket
 import ssl
 import subprocess
 
+import httpx
+import openai
 import pytest
+from langchain_openai import ChatOpenAI
 
 from shared.tls_pinning import (
     NO_CHECK_TIME,
+    CertificateChangedError,
     TlsPin,
+    apresented_certificate_sha256,
     fingerprint_sha256,
+    httpx_client_kwargs,
     pinned_ssl_context,
+    presented_certificate_sha256,
 )
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
@@ -130,3 +137,150 @@ def test_refused_handshake_leaves_no_request_and_server_survives(tls_certs):
         assert _handshake(_pin(tls_certs.leaf), server.port) is False
         assert server.requests == []
         assert _handshake(_pin(tls_certs.swap), server.port) is True
+
+
+@pytest.mark.asyncio
+async def test_async_transport_maps_a_swap_to_certificate_changed(tls_certs):
+    pin = _pin(tls_certs.leaf)
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        async with httpx.AsyncClient(
+            **httpx_client_kwargs(pin, asynchronous=True)
+        ) as c:
+            with pytest.raises(CertificateChangedError) as e:
+                await c.get(
+                    srv.url + "/models", headers={"Authorization": "Bearer SECRET"}
+                )
+        assert srv.requests == []
+    assert e.value.pinned_sha256 == pin.sha256
+    assert e.value.presented_sha256 == _pin(tls_certs.swap).sha256
+    assert e.value.host == "127.0.0.1"
+    assert e.value.port == srv.port
+    assert str(e.value) == (
+        f"TLS certificate changed for 127.0.0.1:{srv.port}: pinned SHA-256 "
+        f"{pin.sha256}, server presents {_pin(tls_certs.swap).sha256}. "
+        "An admin must re-trust it in Admin \u2192 Models."
+    )
+    assert isinstance(e.value.__cause__, httpx.ConnectError)
+
+
+def test_sync_transport_works_and_maps_too(tls_certs):
+    pin = _pin(tls_certs.leaf)
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
+            assert c.get(srv.url + "/models").status_code == 200
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
+            with pytest.raises(CertificateChangedError) as e:
+                c.get(srv.url + "/models", headers={"Authorization": "Bearer S"})
+        assert srv.requests == []
+    assert e.value.presented_sha256 == _pin(tls_certs.swap).sha256
+
+
+def test_no_pin_means_no_transport():
+    assert httpx_client_kwargs(None, asynchronous=True) == {}
+    assert httpx_client_kwargs(None, asynchronous=False) == {}
+
+
+def test_unreadable_presented_certificate_uses_the_fallback_wording(tls_certs):
+    # Nothing listens on this port by the time the lookup runs.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    assert presented_certificate_sha256("127.0.0.1", port, timeout=1) is None
+    err = CertificateChangedError("127.0.0.1", port, _pin(tls_certs.leaf).sha256, None)
+    assert str(err) == (
+        f"TLS certificate changed for 127.0.0.1:{port}: pinned SHA-256 "
+        f"{_pin(tls_certs.leaf).sha256}, server presents a different "
+        "certificate. An admin must re-trust it in Admin \u2192 Models."
+    )
+
+
+@pytest.mark.asyncio
+async def test_presented_certificate_lookup_sends_nothing(tls_certs):
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        want = _pin(tls_certs.swap).sha256
+        assert presented_certificate_sha256("127.0.0.1", srv.port) == want
+        assert await apresented_certificate_sha256("127.0.0.1", srv.port) == want
+        assert srv.requests == []
+
+
+@pytest.mark.asyncio
+async def test_openai_sdk_through_the_pin_and_the_error_cause(tls_certs):
+    pin = _pin(tls_certs.leaf)
+
+    def client(url):
+        return openai.AsyncOpenAI(
+            base_url=url,
+            api_key="k",
+            max_retries=0,
+            http_client=openai.DefaultAsyncHttpxClient(
+                **httpx_client_kwargs(pin, asynchronous=True)
+            ),
+        )
+
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        c = client(srv.url)
+        assert [m.id async for m in c.models.list()] == ["m1"]
+        emb = await c.embeddings.create(model="m1", input="x")
+        assert emb.data[0].embedding == [0.1, 0.2]
+        await c.close()
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        with pytest.raises(openai.APIConnectionError) as e:
+            bad = client(srv.url)
+            try:
+                await bad.models.list()
+            finally:
+                await bad.close()
+        assert isinstance(e.value.__cause__, CertificateChangedError)
+        assert srv.requests == []
+
+
+@pytest.mark.asyncio
+async def test_chat_openai_invoke_and_ainvoke_through_the_pin(tls_certs):
+    pin = _pin(tls_certs.leaf)
+
+    def llm(url):
+        sync = httpx.Client(**httpx_client_kwargs(pin, asynchronous=False))
+        asyn = httpx.AsyncClient(**httpx_client_kwargs(pin, asynchronous=True))
+        model = ChatOpenAI(
+            base_url=url,
+            api_key="k",
+            model="m1",
+            max_retries=0,
+            http_client=sync,
+            http_async_client=asyn,
+        )
+        return model, sync, asyn
+
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        m, sync, asyn = llm(srv.url)
+        try:
+            assert m.invoke("hi").content == "ok"
+            assert (await m.ainvoke("hi")).content == "ok"
+        finally:
+            sync.close()
+            await asyn.aclose()
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        m, sync, asyn = llm(srv.url)
+        try:
+            with pytest.raises(openai.APIConnectionError) as e:
+                m.invoke("hi")
+            assert isinstance(e.value.__cause__, CertificateChangedError)
+            with pytest.raises(openai.APIConnectionError) as e2:
+                await m.ainvoke("hi")
+            assert isinstance(e2.value.__cause__, CertificateChangedError)
+        finally:
+            sync.close()
+            await asyn.aclose()
+        assert srv.requests == []
+
+
+def test_a_refused_connection_is_not_certificate_changed(tls_certs):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    pin = _pin(tls_certs.leaf)
+    with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
+        with pytest.raises(httpx.ConnectError) as e:
+            c.get(f"https://127.0.0.1:{port}/v1/models")
+    assert not isinstance(e.value, CertificateChangedError)
