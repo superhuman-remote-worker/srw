@@ -28,8 +28,10 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import openai
 from openai import AsyncOpenAI
 
+from shared.tls_pinning import TlsPin, pin_failure_in, pinned_sdk_http_client
 from shared.speech_transcript import extract_transcript as _extract_transcript
 
 logger = logging.getLogger(__name__)
@@ -178,6 +180,8 @@ class AudioHelper:
     """
 
     OPENAI_API_URL = "https://api.openai.com/v1"
+    #: Why the configured pin can't be used (no client is built then).
+    pin_error: Optional[str] = None
 
     def __init__(self):
         """Initialize the Audio Helper with configuration from environment."""
@@ -208,15 +212,39 @@ class AudioHelper:
         self.timeout = float(os.getenv("WHISPER_TIMEOUT", "300"))
         self.default_language = os.getenv("WHISPER_LANGUAGE")
 
-        if not self.api_key:
+        # A pin that can't be used means no client and no request: every
+        # transcription reports "not available" with the reason.
+        client_kwargs: dict = {}
+        try:
+            pin = TlsPin.from_env("WHISPER")
+            if pin is not None and not os.getenv("WHISPER_BASE_URL"):
+                raise ValueError(
+                    "WHISPER_TLS_PINNED_CERT is set but WHISPER_BASE_URL is not: "
+                    "a pin needs the https:// endpoint it belongs to"
+                )
+            http_client = pinned_sdk_http_client(
+                openai.DefaultAsyncHttpxClient, pin, self.api_base
+            )
+            if http_client is not None:
+                client_kwargs["http_client"] = http_client
+        except ValueError as exc:
+            self.pin_error = str(exc)
+            logger.error("Transcription is unavailable: %s", exc)
+
+        if not self.api_key and not self.pin_error:
             logger.warning(
                 "No WHISPER_API_KEY or OPENAI_API_KEY configured - transcription will fail"
             )
 
-        self.client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.api_base,
-            timeout=self.timeout,
+        self.client = (
+            None
+            if self.pin_error
+            else AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=self.timeout,
+                **client_kwargs,
+            )
         )
 
         key_source = (
@@ -267,6 +295,9 @@ class AudioHelper:
 
         if file_path.suffix.lower() not in AUDIO_EXTENSIONS:
             return f"[Error: unsupported audio format: {file_path.suffix}]"
+
+        if self.pin_error:
+            return f"[Error: transcription is not available: {self.pin_error}]"
 
         file_size = file_path.stat().st_size
 
@@ -374,7 +405,7 @@ class AudioHelper:
             logger.error(
                 f"Error in chunked transcription of {file_path}: {e}", exc_info=True
             )
-            return f"[Error transcribing audio: {str(e)}]"
+            return f"[Error transcribing audio: {pin_failure_in(e) or e}]"
         finally:
             if temp_dir and Path(temp_dir).exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -568,7 +599,7 @@ class AudioHelper:
 
         except Exception as e:
             logger.error(f"Error transcribing {file_path}: {e}", exc_info=True)
-            return f"[Error transcribing audio: {str(e)}]"
+            return f"[Error transcribing audio: {pin_failure_in(e) or e}]"
 
     # =========================================================================
     # Archiving

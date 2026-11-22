@@ -581,7 +581,7 @@ class TestRerankerTransportBinding:
     def test_explicit_base_url_no_key_gets_no_foreign_env_key(self):
         from agent.services.memory.plugins.reranker import resolve_reranker_transport
 
-        _, base_url, api_key = resolve_reranker_transport(
+        _, base_url, api_key, _ = resolve_reranker_transport(
             self._cfg(base_url=CALLER_HOST),
             env={
                 "RERANK_BASE_URL": "https://rr.internal/v1",
@@ -595,7 +595,7 @@ class TestRerankerTransportBinding:
     def test_explicit_base_url_matching_env_host_uses_that_key(self):
         from agent.services.memory.plugins.reranker import resolve_reranker_transport
 
-        _, base_url, api_key = resolve_reranker_transport(
+        _, base_url, api_key, _ = resolve_reranker_transport(
             self._cfg(base_url="https://rr.internal/v1"),
             env={
                 "RERANK_BASE_URL": "https://rr.internal/v1",
@@ -608,7 +608,7 @@ class TestRerankerTransportBinding:
     def test_explicit_key_wins(self):
         from agent.services.memory.plugins.reranker import resolve_reranker_transport
 
-        _, _, api_key = resolve_reranker_transport(
+        _, _, api_key, _ = resolve_reranker_transport(
             self._cfg(base_url=CALLER_HOST, api_key="cfg-key"),
             env={"EMBEDDING_API_KEY": "emb-key"},
         )

@@ -531,6 +531,39 @@ def pinned_transport_for(client_cls: type, pin: TlsPin, **kwargs: Any) -> Any:
     return transport_cls(pin, **{**_sdk_transport_defaults(client_cls), **kwargs})
 
 
+def pinned_sdk_http_client(
+    client_cls: type, pin: Optional[TlsPin], base_url: Optional[str]
+) -> Any:
+    """The ``http_client`` for an SDK client calling ``base_url``: ``None`` unpinned.
+
+    ``cls = openai.DefaultAsyncHttpxClient`` (or the sync class), built with
+    :func:`pinned_transport_for`: the recipe in :func:`httpx_client_kwargs`. A
+    pin only means something for an ``https://`` URL, so a pin with any other
+    URL (``http://``, or none: the SDK's public default) raises ``ValueError``
+    instead of being ignored.
+    """
+    if pin is None:
+        return None
+    if not pin_applies(base_url):
+        raise ValueError(
+            "a pinned certificate needs an https:// base URL, but this client "
+            f"would call {base_url or 'its public default endpoint'}"
+        )
+    return client_cls(transport=pinned_transport_for(client_cls, pin))
+
+
+def pin_failure_in(exc: BaseException) -> Optional[httpx.ConnectError]:
+    """The pin failure behind ``exc`` (an SDK wraps it), if there is one."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, (CertificateChangedError, PinnedCertificateRejectedError)):
+            return cur
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 # ---- Read-only inspection (endpoint Test and the Trust API) -------------------
 
 #: How long one inspection or pinned handshake may take.

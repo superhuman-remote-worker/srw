@@ -367,7 +367,7 @@ class TestAgentClients:
 
         env_keys = await delivered_env()
         cfg = SimpleNamespace(model=None, base_url=None, api_key=None)
-        model, base_url, api_key = resolve_reranker_transport(cfg, env=env_keys)
+        model, base_url, api_key, _ = resolve_reranker_transport(cfg, env=env_keys)
 
         posted = {}
 

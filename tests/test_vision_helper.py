@@ -9,6 +9,7 @@ The point is to lock in the wire shape so future refactors of the
 shared `image_content` utility cannot silently change what `vision_helper`
 sends to its side-channel vision model.
 """
+# ruff: noqa: F811  (the imported fixture is requested by name as a test argument)
 
 from __future__ import annotations
 
@@ -17,6 +18,9 @@ import base64
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
+from tests.tls_pin_fixtures import tls_certs, tls_server
 
 from agent.services.vision_helper import (
     VISION_FAILURE_PREFIX,
@@ -246,3 +250,112 @@ def test_read_file_never_caches_a_failed_description(tmp_path, monkeypatch):
     second = read_file.invoke({"path": "pic.png"})
     assert "A small blue rectangle." in second
     assert "<untrusted_image_content" in second  # fenced as third-party text
+
+
+# =============================================================================
+# Certificate pinning (A5)
+# =============================================================================
+
+
+def _pin(path) -> TlsPin:
+    return TlsPin.from_pem(path.read_text())
+
+
+def _caused_by(exc, cls) -> bool:
+    seen: set[int] = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, cls):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+@pytest.fixture
+def vision_env(monkeypatch):
+    for name in (
+        "VISION_BASE_URL",
+        "VISION_API_KEY",
+        "VISION_MODEL",
+        "VISION_SERVED_MODEL",
+        "VISION_TLS_PINNED_CERT",
+        "VISION_MAX_EDGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    return monkeypatch
+
+
+class TestVisionPin:
+    @pytest.mark.asyncio
+    async def test_describes_through_the_pin(self, vision_env, tls_certs):
+        with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
+            vision_env.setenv("VISION_BASE_URL", server.url)
+            vision_env.setenv("VISION_API_KEY", "k")
+            vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            helper = VisionHelper()
+            text = await helper.describe_image(b"\x89PNG", "image/png")
+            await helper.client.close()
+        assert text == "ok"
+        assert server.requests[0]["path"] == "/v1/chat/completions"
+
+    @pytest.mark.asyncio
+    async def test_swapped_certificate_sends_nothing(self, vision_env, tls_certs):
+        with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
+            vision_env.setenv("VISION_BASE_URL", server.url)
+            vision_env.setenv("VISION_API_KEY", "secret")
+            vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            helper = VisionHelper()
+            with pytest.raises(Exception) as exc:
+                await helper.client.chat.completions.create(
+                    model="m", messages=[{"role": "user", "content": "x"}]
+                )
+            text = await helper.describe_image(b"\x89PNG", "image/png")
+            await helper.client.close()
+        assert _caused_by(exc.value, CertificateChangedError)
+        assert server.requests == []
+        # the failure text names the change, not just "Connection error."
+        assert vision_failed(text) and "TLS certificate changed" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [UNREADABLE_PIN, "not-base64!"])
+    async def test_a_broken_pin_makes_vision_unavailable(self, vision_env, value):
+        vision_env.setenv("VISION_BASE_URL", "https://vision.example/v1")
+        vision_env.setenv("VISION_API_KEY", "k")
+        vision_env.setenv("VISION_TLS_PINNED_CERT", value)
+        helper = VisionHelper()
+        assert helper.api_key == ""  # "can the agent see?" asks this
+        text = await helper.describe_image(b"\x89PNG", "image/png")
+        assert vision_failed(text) and "VISION_TLS_PINNED_CERT" in text
+        text = await helper.describe_document_page(b"\x89PNG", 1)
+        assert vision_failed(text) and "VISION_TLS_PINNED_CERT" in text
+
+    @pytest.mark.asyncio
+    async def test_a_pin_on_the_default_url_makes_vision_unavailable(
+        self, vision_env, tls_certs
+    ):
+        vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        helper = VisionHelper()
+        assert helper.api_key == ""
+        assert vision_failed(await helper.describe_image(b"\x89PNG", "image/png"))
+
+
+class TestGetVisionHelperRebuilds:
+    def test_rebuilt_when_the_vision_env_changes(self, vision_env, tls_certs):
+        import agent.services.vision_helper as mod
+
+        vision_env.setattr(mod, "_vision_helper", None)
+        vision_env.setenv("VISION_API_KEY", "k")
+        vision_env.setenv("VISION_BASE_URL", "https://a.example/v1")
+        first = mod.get_vision_helper()
+        assert mod.get_vision_helper() is first
+        vision_env.setenv("VISION_BASE_URL", "https://b.example/v1")
+        second = mod.get_vision_helper()
+        assert second is not first
+        assert mod.get_vision_helper() is second
+        vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        third = mod.get_vision_helper()
+        assert third is not second
+        vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.swap).wire)
+        assert mod.get_vision_helper() is not third

@@ -23,7 +23,10 @@ import os
 from typing import List, Mapping, Optional
 from urllib.parse import urlsplit
 
+import openai
 from openai import AsyncOpenAI
+
+from shared.tls_pinning import TlsPin, pinned_sdk_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +34,9 @@ logger = logging.getLogger(__name__)
 _embedding_service: Optional["EmbeddingService"] = None
 _kb_embedding_service: Optional["EmbeddingService"] = None
 _kb_embedding_profile: Optional[
-    tuple[str, str, Optional[str], Optional[str], str, int, Optional[str]]
+    tuple[
+        str, str, Optional[str], Optional[str], str, int, Optional[str], Optional[str]
+    ]
 ] = None
 KB_EMBEDDING_ENV_KEYS = (
     "KB_EMBEDDING_PROVIDER",
@@ -146,6 +151,7 @@ class EmbeddingService:
         expected_dimensions: Optional[int] = None,
         profile_identity: Optional[str] = None,
         served_model: Optional[str] = None,
+        tls_pin: Optional[TlsPin] = None,
     ):
         """Initialize the Embedding Service.
 
@@ -159,8 +165,20 @@ class EmbeddingService:
         its catalog row names, when it names one. ``EMBEDDING_SERVED_MODEL``
         is read only together with ``EMBEDDING_MODEL``: a served string
         belongs to the model it was dispatched with.
+
+        ``tls_pin`` is the certificate the endpoint is pinned to. When the URL
+        comes from ``EMBEDDING_BASE_URL`` the pin comes from
+        ``EMBEDDING_TLS_PINNED_CERT`` (a broken one raises ``ValueError``,
+        never an unpinned client); a caller that passes ``base_url`` passes
+        ``tls_pin`` with it. A pin with a non-``https://`` URL raises too.
         """
         from shared.runtime.core.transport_resolution import served_model_from_env
+
+        if base_url is None and tls_pin is None:
+            _provider = (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()
+            if _provider != "openrouter":
+                tls_pin = TlsPin.from_env("EMBEDDING")
+        self.tls_pin = tls_pin
 
         self.provider = (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()
         if model is None:
@@ -237,9 +255,25 @@ class EmbeddingService:
                 self.provider,
             )
 
+        if (
+            self.tls_pin is not None
+            and self.provider != "openrouter"
+            and not (base_url or os.getenv("EMBEDDING_BASE_URL"))
+        ):
+            raise ValueError(
+                "a pinned certificate needs the https:// endpoint it belongs to, "
+                "but no EMBEDDING_BASE_URL is set (the default is public OpenAI)"
+            )
+        client_kwargs: dict = {}
+        http_client = pinned_sdk_http_client(
+            openai.DefaultAsyncHttpxClient, self.tls_pin, self.base_url
+        )
+        if http_client is not None:
+            client_kwargs["http_client"] = http_client
         self._client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
+            **client_kwargs,
         )
 
         logger.info(
@@ -455,6 +489,13 @@ def get_kb_embedding_service() -> EmbeddingService:
     api_key = os.getenv("KB_EMBEDDING_API_KEY", "")
     dimensions = int(os.getenv("KB_EMBEDDING_DIMENSIONS", "4096"))
     profile_identity = os.getenv("KB_EMBEDDING_PROFILE_ID")
+    # With no KB base URL the service falls back to EMBEDDING_BASE_URL and its
+    # own pin; a KB pin only travels with a KB URL.
+    tls_pin = TlsPin.from_env("KB_EMBEDDING")
+    if tls_pin is not None and not base_url:
+        raise ValueError(
+            "KB_EMBEDDING_TLS_PINNED_CERT is set but KB_EMBEDDING_BASE_URL is not"
+        )
     profile = (
         provider,
         model,
@@ -463,6 +504,7 @@ def get_kb_embedding_service() -> EmbeddingService:
         api_key,
         dimensions,
         profile_identity,
+        tls_pin.sha256 if tls_pin else None,
     )
 
     # Compare the effective profile on every access. Worker pods can process a
@@ -477,6 +519,7 @@ def get_kb_embedding_service() -> EmbeddingService:
             provider=provider,
             expected_dimensions=dimensions,
             profile_identity=profile_identity,
+            tls_pin=tls_pin,
         )
         _kb_embedding_profile = profile
     return _kb_embedding_service

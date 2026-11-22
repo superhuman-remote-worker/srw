@@ -16,9 +16,11 @@ import logging
 import os
 from typing import Optional, Union
 
+import openai
 from openai import AsyncOpenAI
 
 from agent.services.image_content import make_image_content_block_from_b64
+from shared.tls_pinning import TlsPin, pin_failure_in, pinned_sdk_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +40,31 @@ def vision_failed(text: Optional[str]) -> bool:
 
 
 def _failure(what: str, error: Exception) -> str:
+    # The SDK wraps a pin failure as "Connection error."; the admin needs the
+    # certificate message that says what to do.
+    cause = pin_failure_in(error) or error
     return (
         f"{VISION_FAILURE_PREFIX}: the vision model could not describe {what} "
-        f"({type(error).__name__}: {str(error)[:200]}). Do not describe it "
+        f"({type(cause).__name__}: {str(cause)[:200]}). Do not describe it "
         "from its name or from guesses.]"
     )
+
+
+#: The environment a VisionHelper reads its transport from.
+_VISION_ENV_NAMES = (
+    "VISION_BASE_URL",
+    "VISION_API_KEY",
+    "VISION_TLS_PINNED_CERT",
+    "VISION_MODEL",
+    "VISION_SERVED_MODEL",
+    "VISION_TIMEOUT",
+    "VISION_MAX_EDGE",
+    "OPENAI_API_KEY",
+)
+
+
+def _vision_env_signature() -> tuple:
+    return tuple(os.environ.get(name) for name in _VISION_ENV_NAMES)
 
 
 def fit_for_vision(image_b64: str, mime_type: str, max_edge: int) -> tuple[str, str]:
@@ -126,6 +148,8 @@ class VisionHelper:
     OPENAI_API_URL = "https://api.openai.com/v1"
     #: Overridden per instance from VISION_MAX_EDGE.
     max_edge = DEFAULT_VISION_MAX_EDGE
+    #: Why the configured pin can't be used (no client is built then).
+    pin_error: Optional[str] = None
 
     def __init__(self):
         """Initialize the Vision Helper with configuration from environment."""
@@ -144,6 +168,7 @@ class VisionHelper:
         # API key: Use VISION_API_KEY if set, otherwise fall back to
         #          OPENAI_API_KEY — but only when the endpoint IS OpenAI (a key
         #          follows its endpoint).
+        self.env_signature = _vision_env_signature()
         self.api_base = os.getenv("VISION_BASE_URL", self.OPENAI_API_URL)
         primary_key = (
             os.getenv("OPENAI_API_KEY", "")
@@ -164,15 +189,40 @@ class VisionHelper:
         except ValueError:
             self.max_edge = DEFAULT_VISION_MAX_EDGE
 
-        if not self.api_key:
+        # A pin that can't be used means no client and no request: vision is
+        # "not available" (no key) and every call reports why.
+        client_kwargs: dict = {}
+        try:
+            pin = TlsPin.from_env("VISION")
+            if pin is not None and not os.getenv("VISION_BASE_URL"):
+                raise ValueError(
+                    "VISION_TLS_PINNED_CERT is set but VISION_BASE_URL is not: "
+                    "a pin needs the https:// endpoint it belongs to"
+                )
+            http_client = pinned_sdk_http_client(
+                openai.DefaultAsyncHttpxClient, pin, self.api_base
+            )
+            if http_client is not None:
+                client_kwargs["http_client"] = http_client
+        except ValueError as exc:
+            self.pin_error = str(exc)
+            self.api_key = ""
+            logger.error("Vision is unavailable: %s", exc)
+
+        if not self.api_key and not self.pin_error:
             logger.warning(
                 "No VISION_API_KEY or OPENAI_API_KEY configured - vision tasks will fail"
             )
 
-        self.client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.api_base,
-            timeout=self.timeout,
+        self.client = (
+            None
+            if self.pin_error
+            else AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=self.timeout,
+                **client_kwargs,
+            )
         )
 
         # Log configuration (hiding API key)
@@ -219,6 +269,8 @@ class VisionHelper:
         prompt_text = query or default_prompt
 
         try:
+            if self.pin_error:
+                raise ValueError(self.pin_error)
             import time as _time
 
             start = _time.monotonic()
@@ -306,6 +358,8 @@ class VisionHelper:
             )
 
         try:
+            if self.pin_error:
+                raise ValueError(self.pin_error)
             import time as _time
 
             start = _time.monotonic()
@@ -418,12 +472,16 @@ def get_vision_helper() -> VisionHelper:
     """Get or create the VisionHelper singleton instance.
 
     Use this to get a shared VisionHelper instance rather than
-    creating new instances.
+    creating new instances. An agent pod serves one job or Session after
+    another, each exporting its own VISION_* block, so the instance is rebuilt
+    whenever that environment (the pin included) changed.
 
     Returns:
         Shared VisionHelper instance
     """
     global _vision_helper
-    if _vision_helper is None:
+    if _vision_helper is None or _vision_helper.env_signature != (
+        _vision_env_signature()
+    ):
         _vision_helper = VisionHelper()
     return _vision_helper
