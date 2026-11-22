@@ -6,8 +6,9 @@ and ``_async_client`` (cached properties) take their httpx client from an
 unpinned instance on one URL would share one client. This subclass overrides
 both properties to build a fresh client per instance whose transport trusts
 only the pin (``shared/tls_pinning.py``), and never reads or fills that cache.
-Everything else (base URL, timeout, proxy, client class) is built as upstream
-builds it.
+Everything else is built as upstream builds it: base URL, timeout, proxy and
+client class here, the SDK's connection limits and TCP keepalive through
+``pinned_transport_for``.
 
 The transport is of the package the anthropic SDK is built on: httpx up to
 0.x, ``httpx2`` from 1.0, which refuses httpx objects.
@@ -33,7 +34,7 @@ from langchain_anthropic._client_utils import (
 )
 from pydantic import PrivateAttr
 
-from shared.tls_pinning import TlsPin, pinned_transport_for
+from shared.tls_pinning import TlsPin, pinned_transport_class, pinned_transport_for
 
 for _name in ("_client", "_async_client", "_client_params"):
     if not isinstance(ChatAnthropic.__dict__.get(_name), cached_property):
@@ -49,6 +50,10 @@ class PinnedChatAnthropic(ChatAnthropic):
     _tls_pin: TlsPin = PrivateAttr()
 
     def __init__(self, *, tls_pin: TlsPin, **kwargs: Any) -> None:
+        # The clients are built on first use; an SDK client class that can't
+        # take a pinned transport fails here, when create_llm builds the model.
+        for client_cls in (_SyncHttpxClientWrapper, _AsyncHttpxClientWrapper):
+            pinned_transport_class(client_cls)
         super().__init__(**kwargs)
         self._tls_pin = tls_pin
 
@@ -56,7 +61,8 @@ class PinnedChatAnthropic(ChatAnthropic):
         """A new ``client_cls`` whose transport trusts only the pin.
 
         Mirrors ``ChatAnthropic._client``: base URL, timeout and proxy from
-        the same parameters, so only the trust differs.
+        the same parameters, limits and keepalive from the SDK's defaults
+        (``pinned_transport_for``), so only the trust differs.
         """
         client_params = self._client_params
         transport_kwargs: dict[str, Any] = {}

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
@@ -44,7 +45,7 @@ from shared.runtime.core.tool_policy import (
     normalize_tool_policy,
 )
 from shared.runtime.llm.reasoning_chat import ReasoningChatOpenAI
-from shared.tls_pinning import TlsPin, pin_applies
+from shared.tls_pinning import TlsPin, pin_applies, pinned_ssl_context
 from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
@@ -4812,23 +4813,34 @@ def _subscription_proxy_session_headers(
     return {}
 
 
+def _pin_value_present(wire: Any) -> bool:
+    """Whether ``tls_pinned_cert`` holds a pin: ``None`` and blank mean none.
+
+    Anything else counts, a non-string included, so it is refused rather
+    than read as "no pin".
+    """
+    return wire is not None and (not isinstance(wire, str) or bool(wire.strip()))
+
+
 def _endpoint_tls_pin(config: LLMConfig) -> Optional[TlsPin]:
     """The endpoint's pinned certificate (``config.tls_pinned_cert``), or None.
 
     A pin belongs to the https:// endpoint it was trusted for and travels with
     that base URL (dispatch writes both from the endpoint row). One that can't
-    be read (garbage, or the ``UNREADABLE_PIN`` marker), or that comes without
-    an https:// base URL, raises ``ValueError`` naming the model: a broken pin
-    never builds an unpinned client.
+    be read (garbage, the ``UNREADABLE_PIN`` marker, or a certificate OpenSSL
+    won't load as a trust anchor), or that comes without an https:// base URL,
+    raises ``ValueError`` naming the model when the model is built: a broken
+    pin never builds an unpinned client.
     """
     wire = config.tls_pinned_cert
-    if wire is None or (isinstance(wire, str) and not wire.strip()):
+    if not _pin_value_present(wire):
         return None
     try:
         if not isinstance(wire, str):
             raise ValueError(f"expected base64 text, got {type(wire).__name__}")
         pin = TlsPin.from_wire(wire)
-    except ValueError as exc:
+        pinned_ssl_context(pin)  # OpenSSL must accept it as a trust anchor
+    except (ValueError, ssl.SSLError) as exc:
         raise ValueError(
             f"Model {config.model!r} at {config.base_url or '(no base URL)'} "
             f"has an unusable pinned certificate: {exc}"
@@ -4844,8 +4856,7 @@ def _endpoint_tls_pin(config: LLMConfig) -> Optional[TlsPin]:
 
 def _refuse_tls_pin(config: LLMConfig, provider: str) -> None:
     """Refuse a pin in a factory that reaches only its provider's own API."""
-    wire = config.tls_pinned_cert
-    if wire is not None and (not isinstance(wire, str) or wire.strip()):
+    if _pin_value_present(config.tls_pinned_cert):
         raise ValueError(
             "A pinned certificate applies to endpoint-backed models; the "
             f"{provider} factory reaches only its provider's own API."

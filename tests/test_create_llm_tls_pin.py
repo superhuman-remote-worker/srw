@@ -59,6 +59,9 @@ def _config(provider: str, base_url, pin=None, **overrides) -> LLMConfig:
         tls_pinned_cert=pin.wire if isinstance(pin, TlsPin) else pin,
         max_retries=0,
         timeout=20,
+        # No effort for the stand-in model: the default family would send one
+        # through model_kwargs, which langchain-openai warns about.
+        reasoning_level="none",
     )
     fields.update(overrides)
     return LLMConfig(**fields)
@@ -73,6 +76,17 @@ def _caused_by(exc: BaseException, cls: type) -> bool:
         seen.add(id(cur))
         cur = cur.__cause__ or cur.__context__
     return False
+
+
+def _pool_settings(transport) -> tuple:
+    """What the transport's connection pool was configured with (not trust)."""
+    pool = transport._pool
+    return (
+        pool._max_connections,
+        pool._max_keepalive_connections,
+        pool._keepalive_expiry,
+        pool._socket_options,
+    )
 
 
 def _transports(llm):
@@ -214,6 +228,25 @@ def test_pinned_anthropic_differs_from_the_unpinned_only_in_trust(tls_certs, whi
     assert pinned._client.timeout == plain._client.timeout
     assert str(pinned._client.base_url) == str(plain._client.base_url)
     assert pinned._client.follow_redirects == plain._client.follow_redirects
+    # The SDK's connection limits and TCP keepalive, which it sets only on a
+    # transport it builds itself, reach the pinned transport too.
+    assert _pool_settings(pinned._client._transport) == _pool_settings(
+        plain._client._transport
+    )
+    assert pinned._client._transport._pool._socket_options  # keepalive is on
+
+
+def test_an_sdk_client_class_without_pinned_transport_fails_the_build(
+    tls_certs, monkeypatch
+):
+    from shared.runtime.llm import pinned_anthropic
+
+    class NotAnHttpxClient:
+        pass
+
+    monkeypatch.setattr(pinned_anthropic, "_AsyncHttpxClientWrapper", NotAnHttpxClient)
+    with pytest.raises(TypeError, match="not an httpx or httpx2 client class"):
+        create_llm(_config("anthropic", "https://127.0.0.1:9/v1", _pin(tls_certs.leaf)))
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +254,12 @@ def test_pinned_anthropic_differs_from_the_unpinned_only_in_trust(tls_certs, whi
 # ---------------------------------------------------------------------------
 
 
+#: Valid base64 of a truncated DER: it parses, but OpenSSL won't load it.
+TRUNCATED_DER = "MIIBAAAA"
+
+
 @pytest.mark.parametrize("provider", ENDPOINT_PROVIDERS)
-@pytest.mark.parametrize("bad", ["not-base64!", "QUJD", UNREADABLE_PIN])
+@pytest.mark.parametrize("bad", ["not-base64!", "QUJD", UNREADABLE_PIN, TRUNCATED_DER])
 def test_an_unusable_pin_fails_the_build(provider, bad):
     url = "https://model-box.local:8443/v1"
     with pytest.raises(ValueError) as raised:
@@ -302,6 +339,9 @@ CITE_URL = "https://cite.internal:8443/v1"
 
 @pytest.fixture
 def citation_env(monkeypatch):
+    # The verifier is agent code: the orchestrator image can't import the
+    # agent (no aiosqlite there), CI and the agent image can.
+    pytest.importorskip("aiosqlite", reason="agent dependencies not installed")
     for name in CITATION_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CITATION_LLM_MODEL", "cite-model")
@@ -354,6 +394,12 @@ def test_an_unpinned_citation_endpoint_has_no_pin(citation_env):
     assert len(created) == 1 and created[0].tls_pinned_cert is None
 
 
+# The agent builds the citation config at the default reasoning level, which
+# the stand-in model's default family sends through model_kwargs; that warning
+# is the existing factory's, not this test's subject.
+@pytest.mark.filterwarnings(
+    "ignore:Parameters .*reasoning_effort.* should be specified explicitly:UserWarning"
+)
 def test_the_citation_client_is_built_pinned(tls_certs, citation_env):
     pin = _pin(tls_certs.leaf)
     citation_env.setenv("CITATION_LLM_TLS_PINNED_CERT", pin.wire)

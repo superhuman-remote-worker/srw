@@ -28,6 +28,8 @@ from shared.tls_pinning import (
     PinnedCertificateRejectedError,
     PinnedTransport,
     TlsPin,
+    _PinnedAsync,
+    _PinnedSync,
     apresented_certificate_sha256,
     fingerprint_sha256,
     httpx_client_kwargs,
@@ -35,6 +37,7 @@ from shared.tls_pinning import (
     pinned_handshake_error,
     pin_applies,
     pinned_ssl_context,
+    pinned_transport_class,
     pinned_transport_for,
     presented_certificate_sha256,
     read_stored_pin,
@@ -724,6 +727,51 @@ def test_pinned_transport_for_httpx_clients(tls_certs):
         pinned_transport_for(dict, pin)
 
 
+def test_one_pin_failure_mapping_for_every_transport():
+    from shared import tls_pinning
+
+    classes = [(PinnedTransport, httpx.ConnectError, _PinnedSync)]
+    classes.append((AsyncPinnedTransport, httpx.ConnectError, _PinnedAsync))
+    if tls_pinning.httpx2 is not None:
+        httpx2 = tls_pinning.httpx2
+        classes.append(
+            (tls_pinning.Httpx2PinnedTransport, httpx2.ConnectError, _PinnedSync)
+        )
+        classes.append(
+            (tls_pinning.AsyncHttpx2PinnedTransport, httpx2.ConnectError, _PinnedAsync)
+        )
+    for cls, connect_error, mixin in classes:
+        assert issubclass(cls, mixin) and cls._connect_error is connect_error
+        # The mapping lives in the mixin only; no transport overrides it.
+        for name in ("__init__", "handle_request", "handle_async_request"):
+            assert name not in vars(cls)
+
+
+def test_pinned_transport_class_follows_the_client():
+    assert pinned_transport_class(httpx.Client) is PinnedTransport
+    assert pinned_transport_class(httpx.AsyncClient) is AsyncPinnedTransport
+    with pytest.raises(TypeError, match="not an httpx or httpx2 client class"):
+        pinned_transport_class(dict)
+
+
+def test_the_openai_recipe_keeps_the_sdks_pool_settings(tls_certs):
+    # openai's default client gives the transport it builds its own connection
+    # limits; a pinned transport passed in must carry the same.
+    def settings(client):
+        pool = client._transport._pool
+        return (
+            pool._max_connections,
+            pool._max_keepalive_connections,
+            pool._keepalive_expiry,
+            pool._socket_options,
+        )
+
+    cls = openai.DefaultAsyncHttpxClient
+    pinned = _sdk_http_client(cls, _pin(tls_certs.leaf))
+    assert settings(pinned) == settings(cls())
+    assert settings(pinned)[:2] == (1000, 100)
+
+
 def test_pinned_transport_for_keeps_a_proxy(tls_certs):
     transport = pinned_transport_for(
         httpx.Client, _pin(tls_certs.leaf), proxy="http://proxy.local:3128"
@@ -737,6 +785,7 @@ async def test_httpx2_transports_trust_only_the_pin(tls_certs):
     pin = _pin(tls_certs.leaf)
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
         transport = pinned_transport_for(httpx2.AsyncClient, pin)
+        assert type(transport) is pinned_transport_class(httpx2.AsyncClient)
         assert isinstance(transport, httpx2.AsyncHTTPTransport)
         async with httpx2.AsyncClient(transport=transport) as client:
             assert (await client.get(srv.url + "/models")).status_code == 200

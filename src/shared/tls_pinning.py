@@ -22,14 +22,14 @@ Two rules from the spike (vault spec ``endpoint-certificate-pinning-design``):
   ``ssl.create_default_context()``: the latter reads ``SSL_CERT_FILE`` and, on
   recent Pythons, sets ``VERIFY_X509_STRICT``.
 
-Shared by the orchestrator, the agent and the provisioners; the only
-third-party import is httpx (``cryptography`` is imported lazily, and only by
-:func:`inspect_tls`; ``httpx2`` lazily, and only by :func:`pinned_transport_for`
-for an SDK built on it). A pinned client gets an explicit transport, so httpx
-ignores environment proxies and the client's ``limits`` for it. Which helper
-builds which client: :func:`httpx_client_kwargs` for a plain httpx client,
-:func:`pinned_transport_for` for an SDK's own client class (openai,
-anthropic).
+Shared by the orchestrator, the agent and the provisioners; the third-party
+imports are httpx and, when installed, ``httpx2``, which the newer SDKs run on
+(``cryptography`` is imported lazily, and only by :func:`inspect_tls`). A
+pinned client gets an explicit transport, so httpx ignores environment proxies
+and the client's ``limits`` for it. Which helper builds which client:
+:func:`httpx_client_kwargs` for a plain httpx client, :func:`pinned_transport_for`
+for an SDK's own client class (openai, anthropic), which also carries the
+limits and keepalive that SDK gives its own transport.
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ import asyncio
 import base64
 import contextlib
 import binascii
-import functools
 import hashlib
+import importlib
 import os
 import re
 import socket
@@ -50,6 +50,11 @@ from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
 
 import httpx
+
+try:  # anthropic >= 1.0 and openai's Default*HttpxClient >= 3.0 are built on it
+    import httpx2
+except ImportError:  # no SDK on httpx2 in this environment
+    httpx2 = None
 
 #: Env var suffix: the full name is ``{PREFIX}_TLS_PINNED_CERT``.
 TLS_PINNED_CERT_SUFFIX = "TLS_PINNED_CERT"
@@ -339,17 +344,24 @@ def _pin_failure(
     return CertificateChangedError(host, port, pin.sha256, presented, request=request)
 
 
-class PinnedTransport(httpx.HTTPTransport):
-    """Sync transport trusting only ``pin``; a pin failure names the change."""
+class _PinnedSync:
+    """The pin-failure mapping, mixed into an httpx or httpx2 ``HTTPTransport``.
+
+    ``_connect_error`` is that package's ``ConnectError``. A pin failure raises
+    :class:`CertificateChangedError` or :class:`PinnedCertificateRejectedError`
+    (httpx errors) from either package's transport: callers look for one class.
+    """
+
+    _connect_error: type[Exception] = httpx.ConnectError
 
     def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
         self._pin = pin
-        super().__init__(verify=pinned_ssl_context(pin), **kwargs)
+        super().__init__(verify=pinned_ssl_context(pin), **kwargs)  # type: ignore[call-arg]
 
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+    def handle_request(self, request: Any) -> Any:
         try:
-            return super().handle_request(request)
-        except httpx.ConnectError as exc:
+            return super().handle_request(request)  # type: ignore[misc]
+        except self._connect_error as exc:
             verification = _verification_error(exc)
             if verification is None:
                 raise
@@ -360,17 +372,19 @@ class PinnedTransport(httpx.HTTPTransport):
             ) from exc
 
 
-class AsyncPinnedTransport(httpx.AsyncHTTPTransport):
-    """Async transport trusting only ``pin``; a pin failure names the change."""
+class _PinnedAsync:
+    """The async twin of :class:`_PinnedSync`, for an ``AsyncHTTPTransport``."""
+
+    _connect_error: type[Exception] = httpx.ConnectError
 
     def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
         self._pin = pin
-        super().__init__(verify=pinned_ssl_context(pin), **kwargs)
+        super().__init__(verify=pinned_ssl_context(pin), **kwargs)  # type: ignore[call-arg]
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+    async def handle_async_request(self, request: Any) -> Any:
         try:
-            return await super().handle_async_request(request)
-        except httpx.ConnectError as exc:
+            return await super().handle_async_request(request)  # type: ignore[misc]
+        except self._connect_error as exc:
             verification = _verification_error(exc)
             if verification is None:
                 raise
@@ -379,6 +393,27 @@ class AsyncPinnedTransport(httpx.AsyncHTTPTransport):
             raise _pin_failure(
                 verification, request, self._pin, host, port, presented
             ) from exc
+
+
+class PinnedTransport(_PinnedSync, httpx.HTTPTransport):
+    """Sync transport trusting only ``pin``; a pin failure names the change."""
+
+
+class AsyncPinnedTransport(_PinnedAsync, httpx.AsyncHTTPTransport):
+    """Async transport trusting only ``pin``; a pin failure names the change."""
+
+
+if httpx2 is not None:
+
+    class Httpx2PinnedTransport(_PinnedSync, httpx2.HTTPTransport):
+        """:class:`PinnedTransport` for an httpx2 client."""
+
+        _connect_error = httpx2.ConnectError
+
+    class AsyncHttpx2PinnedTransport(_PinnedAsync, httpx2.AsyncHTTPTransport):
+        """:class:`AsyncPinnedTransport` for an httpx2 client."""
+
+        _connect_error = httpx2.ConnectError
 
 
 def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[str, Any]:
@@ -405,82 +440,95 @@ def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[st
     return {"transport": transport}
 
 
-@functools.lru_cache(maxsize=1)
-def _httpx2_transport_classes() -> tuple[type, type]:
-    """:class:`PinnedTransport` and :class:`AsyncPinnedTransport` for httpx2.
+def pinned_transport_class(client_cls: type) -> type:
+    """The pinned transport class for a client of class ``client_cls``.
 
-    Built on first use, so httpx2 is imported only where an SDK runs on it. A
-    pin failure raises the same :class:`CertificateChangedError` (an httpx
-    error, carrying the httpx2 request): callers look for one class.
+    The anthropic SDK from 1.0 (and openai's ``Default*HttpxClient`` from 3.0)
+    is built on ``httpx2``, a fork with httpx's API that refuses httpx objects;
+    older releases are built on httpx. The class follows the client's package
+    and its sync or async flavour. ``TypeError`` for any other class, so a
+    caller can check support when it is built rather than on its first call.
     """
-    import httpx2
+    if issubclass(client_cls, httpx.AsyncClient):
+        return AsyncPinnedTransport
+    if issubclass(client_cls, httpx.Client):
+        return PinnedTransport
+    if httpx2 is not None:
+        if issubclass(client_cls, httpx2.AsyncClient):
+            return AsyncHttpx2PinnedTransport
+        if issubclass(client_cls, httpx2.Client):
+            return Httpx2PinnedTransport
+    raise TypeError(f"{client_cls!r} is not an httpx or httpx2 client class")
 
-    class Httpx2PinnedTransport(httpx2.HTTPTransport):
-        def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
-            self._pin = pin
-            super().__init__(verify=pinned_ssl_context(pin), **kwargs)
 
-        def handle_request(self, request: Any) -> Any:
-            try:
-                return super().handle_request(request)
-            except httpx2.ConnectError as exc:
-                verification = _verification_error(exc)
-                if verification is None:
-                    raise
-                host, port = request.url.host, request.url.port or 443
-                presented = presented_certificate_sha256(host, port)
-                raise _pin_failure(
-                    verification, request, self._pin, host, port, presented
-                ) from exc
+#: The SDKs whose default client class configures the transport it builds.
+_SDK_PACKAGES = ("openai", "anthropic")
 
-    class AsyncHttpx2PinnedTransport(httpx2.AsyncHTTPTransport):
-        def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
-            self._pin = pin
-            super().__init__(verify=pinned_ssl_context(pin), **kwargs)
 
-        async def handle_async_request(self, request: Any) -> Any:
-            try:
-                return await super().handle_async_request(request)
-            except httpx2.ConnectError as exc:
-                verification = _verification_error(exc)
-                if verification is None:
-                    raise
-                host, port = request.url.host, request.url.port or 443
-                presented = await apresented_certificate_sha256(host, port)
-                raise _pin_failure(
-                    verification, request, self._pin, host, port, presented
-                ) from exc
+def _keepalive_socket_options() -> list[tuple[int, int, Any]]:
+    """TCP keepalive as anthropic's ``DefaultHttpxClient`` sets it (Linux).
 
-    return Httpx2PinnedTransport, AsyncHttpx2PinnedTransport
+    Idle 60 s, then a probe every 60 s, 5 probes. The SDK builds these inline,
+    with no constant to import; ``tests/test_create_llm_tls_pin.py`` compares a
+    pinned and an unpinned client's pools, so a change in the SDK shows.
+    """
+    options: list[tuple[int, int, Any]] = [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, True)
+    ]
+    for name, value in (
+        ("TCP_KEEPINTVL", 60),
+        ("TCP_KEEPCNT", 5),
+        ("TCP_KEEPIDLE", 60),
+    ):
+        option = getattr(socket, name, None)
+        if option is not None:
+            options.append((socket.IPPROTO_TCP, option, value))
+    return options
+
+
+def _sdk_transport_defaults(client_cls: type) -> dict[str, Any]:
+    """What an SDK's default client gives the transport it builds itself.
+
+    ``openai`` and ``anthropic`` ``Default*HttpxClient`` set the connection
+    limits (``{sdk}._constants.DEFAULT_CONNECTION_LIMITS``) and, for anthropic,
+    TCP keepalive on their own transport, never on one passed in. A pinned
+    transport gets the same, so it differs from the SDK's own only in trust.
+    Empty for a plain httpx class.
+    """
+    sdk = next(
+        (
+            root
+            for cls in client_cls.__mro__
+            if (root := cls.__module__.split(".")[0]) in _SDK_PACKAGES
+        ),
+        None,
+    )
+    if sdk is None:
+        return {}
+    defaults: dict[str, Any] = {}
+    try:
+        constants = importlib.import_module(f"{sdk}._constants")
+        defaults["limits"] = constants.DEFAULT_CONNECTION_LIMITS
+    except (ImportError, AttributeError):
+        pass  # an SDK release without the constant: the transport's own limits
+    if sdk == "anthropic":
+        defaults["socket_options"] = _keepalive_socket_options()
+    return defaults
 
 
 def pinned_transport_for(client_cls: type, pin: TlsPin, **kwargs: Any) -> Any:
     """A transport trusting only ``pin``, for a client of class ``client_cls``.
 
-    The anthropic SDK from 1.0 (and openai's ``Default*HttpxClient`` from 3.0)
-    is built on ``httpx2``, a fork with httpx's API that refuses httpx objects;
-    older releases are built on httpx. The transport follows the package and
-    the sync or async flavour of ``client_cls``. ``kwargs`` go to the
-    transport (e.g. ``proxy``); ``verify`` is always the pinned context.
-    Pass the SDK's own class and build that class with the result:
+    The class comes from :func:`pinned_transport_class`. For an SDK's default
+    client class it carries the settings that SDK gives its own transport
+    (:func:`_sdk_transport_defaults`). ``kwargs`` go to the transport and win
+    (e.g. ``proxy``); ``verify`` is always the pinned context. Pass the SDK's
+    own class and build that class with the result:
     ``cls(transport=pinned_transport_for(cls, pin))`` (see
     :func:`httpx_client_kwargs` for the full recipe).
     """
-    if issubclass(client_cls, httpx.AsyncClient):
-        return AsyncPinnedTransport(pin, **kwargs)
-    if issubclass(client_cls, httpx.Client):
-        return PinnedTransport(pin, **kwargs)
-    try:
-        import httpx2
-    except ImportError:
-        httpx2 = None
-    if httpx2 is not None:
-        sync_cls, async_cls = _httpx2_transport_classes()
-        if issubclass(client_cls, httpx2.AsyncClient):
-            return async_cls(pin, **kwargs)
-        if issubclass(client_cls, httpx2.Client):
-            return sync_cls(pin, **kwargs)
-    raise TypeError(f"{client_cls!r} is not an httpx or httpx2 client class")
+    transport_cls = pinned_transport_class(client_cls)
+    return transport_cls(pin, **{**_sdk_transport_defaults(client_cls), **kwargs})
 
 
 # ---- Read-only inspection (endpoint Test and the Trust API) -------------------
