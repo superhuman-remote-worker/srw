@@ -4068,13 +4068,17 @@ async def test_ordinary_job_insert_does_not_wait_for_officer_post_lock(db):
                 "WHERE project_id=$1 FOR UPDATE",
                 UUID(seed["project_id"]),
             )
+            # The lock is held until the finally below, so an insert that
+            # waited for it would never finish: the timeout only has to be
+            # longer than a whole create_job on a loaded CI runner, where
+            # 1 s was not.
             result = await asyncio.wait_for(
                 db.create_job(
                     description="ordinary session work",
                     project_id=seed["project_id"],
                     config_name="worker_base",
                 ),
-                timeout=1.0,
+                timeout=15.0,
             )
         finally:
             await transaction.rollback()
