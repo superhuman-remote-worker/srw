@@ -42,11 +42,22 @@ def _orchestrator(documents: list[dict]) -> dict:
     )
 
 
-def test_vm_protocol_defaults_dark_and_rolls_when_other_cutovers_are_dark() -> None:
+def test_vm_protocol_defaults_on_and_recreates() -> None:
+    # Owner, 2026-11-22: VM files on the Canvas are editable out of the box,
+    # so the protocol a VM write needs is on by default.
     values = yaml.safe_load((CHART / "values.yaml").read_text())
-    assert values["orchestrator"]["vmRemoteOperationProtocol"]["enabled"] is False
+    assert values["orchestrator"]["vmRemoteOperationProtocol"]["enabled"] is True
+    deployment = _orchestrator(_render())
+    assert deployment["spec"]["strategy"]["type"] == "Recreate"
+    labels = deployment["spec"]["template"]["metadata"]["labels"]
+    assert labels.get(LABEL) == "v1"
+
+
+def test_vm_protocol_off_rolls_when_other_cutovers_are_dark() -> None:
     deployment = _orchestrator(
         _render(
+            "--set",
+            "orchestrator.vmRemoteOperationProtocol.enabled=false",
             "--set",
             "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
             "--set",
@@ -80,8 +91,10 @@ def test_same_cluster_vm_ingress_preserves_existing_ssh_transport(
         "--set",
         "agent.tailscale.enabled=false",
     ]
-    if enabled:
-        args += ["--set", "orchestrator.vmRemoteOperationProtocol.enabled=true"]
+    args += [
+        "--set",
+        f"orchestrator.vmRemoteOperationProtocol.enabled={str(enabled).lower()}",
+    ]
     documents = _render(*args)
     deployment = _orchestrator(documents)
     labels = deployment["spec"]["template"]["metadata"]["labels"]

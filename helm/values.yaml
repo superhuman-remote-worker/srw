@@ -599,13 +599,16 @@ orchestrator:
   # replacement code can mutate the same deterministic resources.
   workspaceLifecycleServiceAccountGeneration: "0197"
   # -- Enable exact, renewable v1 receipts for orchestrator-originated VM
-  # SSH/SFTP. Enabling switches the orchestrator to Recreate so no pre-v1
-  # replica overlaps activation. Keep false until migration 0199 is present;
-  # after activation never roll back to an image without v1 support. The dark
-  # value intentionally retains same-cluster TCP/22 for existing/read-only VM
-  # paths; mutation admission is fenced by the application + database gate.
+  # SSH/SFTP. On by default: uploads into a VM, Canvas saves of a VM file, IDE
+  # settings and cloud staging into a VM all need it, and with it off they are
+  # refused (VM files on the Canvas show view-only). Enabling switches the
+  # orchestrator to Recreate so no pre-v1 replica overlaps activation (the
+  # default rollout already is Recreate). After activation never roll back to
+  # an image without v1 support (migration 0199). Setting false keeps
+  # same-cluster TCP/22 for read-only VM paths; mutation admission is fenced by
+  # the application + database gate.
   vmRemoteOperationProtocol:
-    enabled: false
+    enabled: true
   vmProvisioning:
     # -- Admit new jobs through the durable creation protocol. Keep disabled
     # until every controller supports the complete creation and cleanup contract.
