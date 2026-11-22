@@ -423,6 +423,20 @@ describe('Canvas pane trusted chrome', () => {
         false,
       );
 
+      // The browser is the presented source but its workspace is cold or
+      // asleep: the pane offers the open flow, which wakes it, instead of an
+      // unsupported source.
+      state.set(canvasState(5, 'auto', {
+        source: {type: 'browser'},
+        source_version: null,
+        status: 'unavailable',
+        capabilities: {can_edit: false, can_pop_out: false, can_take_control: false},
+      }));
+      TestBed.flushEffects();
+      expect(pane.browserEmptyState()).toBe(true);
+      expect(pane.hasVisual()).toBe(false);
+      expect(pane.browserEmptyTextKey()).toBe('canvas.browser.open.explanation');
+
       state.set(null);
       canvas.stateEtag.set(null);
       canvas.browserOpenStatus.set('workspace');

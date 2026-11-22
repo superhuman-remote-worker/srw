@@ -614,11 +614,25 @@ export class CanvasPaneComponent {
   readonly sourceNeedsRefresh = computed(() =>
     this.state()?.status === 'source_changed' || this.contentStatus() === 'source_changed',
   );
-  readonly browserEmptyState = computed(() =>
-    this.canvas.browserCapability()?.feature_enabled === true &&
-    !this.state()?.source &&
-    this.state()?.status !== 'cleared',
-  );
+  /**
+   * Offer the shared-browser open flow: on an empty Canvas, and when the
+   * shared browser is the presented source but cannot stream yet because its
+   * workspace is cold or asleep. Opening wakes the workspace; without this a
+   * sleeping session showed its browser as an unsupported source.
+   */
+  readonly browserEmptyState = computed(() => {
+    const state = this.state();
+    if (
+      this.canvas.browserCapability()?.feature_enabled !== true ||
+      state?.status === 'cleared'
+    ) {
+      return false;
+    }
+    return (
+      !state?.source ||
+      (state.source.type === 'browser' && selectCanvasRenderer(state) !== 'browser')
+    );
+  });
   readonly browserOpenPending = computed(() => {
     const status = this.canvas.browserOpenStatus();
     return status === 'workspace' || status === 'browser';
