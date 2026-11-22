@@ -393,6 +393,9 @@ setInterval(() => { document.getElementById("t").textContent =
             reader,
             lambda item: item["viewport"] == {"width": 1280, "height": 800},
         )
+        # A frame captured before the resize can still be in flight; its size
+        # would briefly move STATE back. Drain to a frame of the new size.
+        await expect_frame_size(reader, 1280, 800)
 
         # Release to browser-use and click its indexed target=_blank link. The
         # ClickElementEvent path owns agent focus; raw CDP clicks intentionally
