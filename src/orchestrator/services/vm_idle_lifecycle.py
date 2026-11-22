@@ -1953,9 +1953,39 @@ class VMIdleLifecycleStore:
             or _uuid(vm.get("vm_uid")) != operation["vm_uid"]
             or _uuid(vm.get("rootdisk_pvc_uid")) != operation["pvc_uid"]
             or vm.get("_suspend_remote_io_closed") != str(operation_id)
-            or vm.get("status") != "suspending"
+            or vm.get("status") not in {"suspending", "deleted"}
         ):
             return False
+        if vm.get("status") == "deleted":
+            # The controller's delete publishes deleted once the VM is gone,
+            # before this physical-stop proof settles, as for a pinned Job.
+            # Only the completed exact idle-release permit for this VM can
+            # bridge that projection; a generic deletion is not authority.
+            from orchestrator.services.vm_workspace_recovery_store import (
+                cleanup_intent_digest,
+            )
+
+            intent = {
+                "owner_kind": "thread",
+                "owner_id": str(owner_id),
+                "provision_generation": str(operation["provision_generation"]),
+                "vm_uid": str(operation["vm_uid"]),
+                "pvc_uid": str(operation["pvc_uid"]),
+                "purge_disk": False,
+                "resource": "vm_workspace",
+                "source": "vm_idle_release",
+            }
+            if not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='thread' AND owner_id=$1 AND pvc_uid=$2 "
+                "AND source='vm_idle_release' AND intent_digest=$3 "
+                "AND parent_admission_id IS NULL "
+                "AND completed_at IS NOT NULL AND outcome='completed')",
+                owner_id,
+                operation["pvc_uid"],
+                cleanup_intent_digest(intent),
+            ):
+                return False
         vm.update(status="suspended", rootdisk="kept")
         metadata["vm"] = vm
         await conn.execute(
@@ -2883,7 +2913,11 @@ class VMIdleLifecycleStore:
             if (
                 thread["status"]
                 not in (
-                    {"suspended", "created"}
+                    # The fresh runtime may already be serving when this
+                    # closes: the ordinary prepare (opening the session, a
+                    # message) can win the race with the wake's own prepare.
+                    # The exact fresh-agent proof below covers every status.
+                    {"suspended", "created", "active", "awaiting_user"}
                     if operation["wake_execution_requested"]
                     else {"suspended"}
                 )
@@ -4432,19 +4466,52 @@ class VMIdleLifecycleService:
             ):
                 return False
             context = _object(thread.get("runtime_retirement_context"))
-            result = await self.thread_retirement.end_thread_flow(
-                owner_id,
-                thread,
-                permanent=False,
-                force=False,
-                settle_status="suspended",
-                require_physical_agent_stop=True,
-                expected_runtime_generation=str(operation["thread_runtime_generation"]),
-                expected_agent_id=str(context.get("agent_id") or ""),
-                expected_attach_token=str(context.get("runtime_attach_token") or ""),
-            )
-            if result.get("status") != "suspended":
-                return False
+
+            async def _settle(current_thread: dict[str, Any]) -> bool:
+                result = await self.thread_retirement.end_thread_flow(
+                    owner_id,
+                    current_thread,
+                    permanent=False,
+                    force=False,
+                    settle_status="suspended",
+                    require_physical_agent_stop=True,
+                    expected_runtime_generation=str(
+                        operation["thread_runtime_generation"]
+                    ),
+                    expected_agent_id=str(context.get("agent_id") or ""),
+                    expected_attach_token=str(
+                        context.get("runtime_attach_token") or ""
+                    ),
+                )
+                return result.get("status") == "suspended"
+
+            if not await _settle(thread):
+                # The funnel waits for process zero of the captured runtime.
+                # A VM Session's agent never proves that itself (VM process
+                # zero belongs to the orchestrator actuator), and it hands
+                # only an End to that actuator, so a suspend would wait for
+                # ever. Drive the same exact actuator here: stop the captured
+                # agent Pod, stop the VM on its kept disk under the idle
+                # cleanup permit, and record the orchestrator's zero proof.
+                if not current():
+                    return False
+                pinned = self.thread_retirement.dependencies.pinned_retirement
+                if not await pinned.recover_captured_process_zero(
+                    {
+                        "generation": str(operation["thread_runtime_generation"]),
+                        "token": str(operation["thread_retirement_token"]),
+                        "permanent": False,
+                        "context": context,
+                    }
+                ):
+                    return False
+                if not current():
+                    return False
+                thread = await self.db.get_thread(owner_id)
+                if not isinstance(thread, dict):
+                    return False
+                if thread.get("status") != "suspended" and not await _settle(thread):
+                    return False
         if not current():
             return False
         if operation["thread_agent_stop_verified_at"] is None:
@@ -4529,6 +4596,13 @@ class VMIdleLifecycleService:
             if fresh.get("status") == "suspended":
                 await self.store.finish_thread_wake(operation_id)
                 fresh = await self.db.get_thread(owner_id)
+            if isinstance(fresh, dict) and fresh.get("status") in {
+                "active",
+                "awaiting_user",
+            }:
+                # The ordinary prepare already opened the fresh runtime; close
+                # the wake on its exact fresh-agent proof.
+                return await self.store.finish_thread_wake(operation_id)
             if not isinstance(fresh, dict) or fresh.get("status") != "created":
                 return False
             # The first finalization CAS opens the fresh runtime only after
