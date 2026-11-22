@@ -738,38 +738,41 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             </div>
 
                             <!-- What the agents in this project are told about
-                                 it: the link's own note, else the connector's
-                                 description. -->
-                            @if (linkNoteEditable(ds)) {
-                              @if (editingLinkNote() === ds.id) {
-                                <app-input
-                                  class="cx-note-input"
-                                  size="sm"
-                                  data-link-note-input
-                                  [value]="ds.project_description || ds.description || ''"
-                                  [placeholder]="'projectDetail.datasources.descriptionPlaceholder' | transloco"
-                                  [ariaLabel]="'projectDetail.datasources.colDescription' | transloco"
-                                  (blurred)="saveLinkNote(ds.id, $any($event.target).value)"
-                                  (keydown.enter)="$any($event.target).blur()"
-                                  (keydown.escape)="editingLinkNote.set(null)"
-                                />
-                              } @else {
-                                <!-- Named by its text (the note itself); the
-                                     tooltip says that a click edits it. -->
-                                <button
-                                  type="button"
-                                  class="cx-note"
-                                  data-link-note
-                                  [class.cx-note--empty]="!(ds.project_description || ds.description)"
-                                  [title]="'projectDetail.datasources.editNote' | transloco"
-                                  (click)="startLinkNoteEdit(ds.id)"
-                                >
-                                  <span class="cx-note-text">{{ ds.project_description || ds.description || ('projectDetail.datasources.descriptionPlaceholder' | transloco) }}</span>
-                                  <app-icon size="xs">edit</app-icon>
-                                </button>
-                              }
-                            } @else if (ds.description) {
+                                 it (their README line): the link's own note,
+                                 else the connector's description. A connector
+                                 SRW keeps tells them only the note; its own
+                                 description is SRW's and shows as text. A
+                                 cloud folder reaches them as a mount, not as a
+                                 connector, so it takes no note. -->
+                            @if (ds.description && (!linkNoteEditable(ds) || (keptLink(ds) && !ds.project_description))) {
                               <p class="cx-desc">{{ ds.description }}</p>
+                            }
+                            @if (linkNoteEditable(ds) && editingLinkNote() === ds.id) {
+                              <app-input
+                                class="cx-note-input"
+                                size="sm"
+                                data-link-note-input
+                                [value]="linkNote(ds)"
+                                [placeholder]="'projectDetail.datasources.descriptionPlaceholder' | transloco"
+                                [ariaLabel]="'projectDetail.datasources.colDescription' | transloco"
+                                (blurred)="saveLinkNote(ds.id, $any($event.target).value)"
+                                (keydown.enter)="$any($event.target).blur()"
+                                (keydown.escape)="editingLinkNote.set(null)"
+                              />
+                            } @else if (linkNoteEditable(ds)) {
+                              <!-- Named by its text (the note itself); the
+                                   tooltip says that a click edits it. -->
+                              <button
+                                type="button"
+                                class="cx-note"
+                                data-link-note
+                                [class.cx-note--empty]="!linkNote(ds)"
+                                [title]="'projectDetail.datasources.editNote' | transloco"
+                                (click)="startLinkNoteEdit(ds.id)"
+                              >
+                                <span class="cx-note-text">{{ linkNote(ds) || ('projectDetail.datasources.descriptionPlaceholder' | transloco) }}</span>
+                                <app-icon size="xs">edit</app-icon>
+                              </button>
                             }
 
                             <!-- What makes the level true (capability matrix).
@@ -884,7 +887,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                                 <app-icon size="sm">lock</app-icon>
                               </span>
                             } @else {
-                              <app-button variant="ghost" size="sm" data-unlink (clicked)="unlinkDatasource(ds.id)">
+                              <app-button variant="ghost" size="sm" data-unlink (clicked)="askUnlink(ds)">
                                 {{ 'projectDetail.datasources.unlink' | transloco }}
                               </app-button>
                             }
@@ -1456,9 +1459,30 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           </app-button>
         </div>
       </app-dialog>
+
+      <!-- Unlink confirmation: the same warning the connector form gives
+           when a project is taken off a connector. -->
+      <app-dialog
+        [open]="pendingUnlink() !== null"
+        size="sm"
+        [title]="'projectDetail.datasources.unlinkDialog.title' | transloco: { name: pendingUnlink()?.name ?? '' }"
+        (closed)="pendingUnlink.set(null)"
+      >
+        <p class="unlink-message">{{ 'projectDetail.datasources.unlinkDialog.message' | transloco }}</p>
+        <div appDialogActions>
+          <app-button variant="secondary" size="sm" (clicked)="pendingUnlink.set(null)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" size="sm" data-unlink-confirm (clicked)="confirmUnlink()">
+            {{ 'projectDetail.datasources.unlink' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
   styles: [`
+    .unlink-message { margin: 0; line-height: 1.5; }
+
     :host { display: block; height: 100%; overflow: auto; overflow-x: hidden; }
 
     .page-container {
@@ -3268,8 +3292,27 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   /** Whether a row's note is written here: every link but a strict one (a
    *  cloud folder), which shows its connector's own description. */
+  /** Whether a row takes a note for the agents: every connector the agent
+   *  receives as one. A cloud folder (and its copy for jobs, an outbox)
+   *  reaches it as a mount instead, which carries no note, so a note there
+   *  would reach nobody. */
   linkNoteEditable(ds: Pick<Datasource, 'type'>): boolean {
-    return !this.strictLink(ds);
+    return !isCloudConnectorType(ds.type);
+  }
+
+  /** Whether SRW keeps this connector for the project (or for a person). */
+  keptLink(ds: Datasource): boolean {
+    return isPlatformOwned(ds);
+  }
+
+  /** What the agents are told about a link, as the note shows it: the
+   *  project's note, else the connector's own description, which reaches
+   *  them too. A connector SRW keeps tells them only the note (the server's
+   *  connector_description_for_agent_sql), so without one its note is empty.
+   *  The list's `description` already is the note where there is one. */
+  linkNote(ds: ProjectDatasource): string {
+    if (this.keptLink(ds)) return ds.project_description ?? '';
+    return ds.project_description || ds.description || '';
   }
 
   startLinkNoteEdit(datasourceId: string): void {
@@ -3291,9 +3334,25 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     this.editingLinkNote.set(null);
     const ds = this.projectDatasources().find((row) => row.id === datasourceId);
     if (!ds) return;
-    const shown = (ds.project_description || ds.description || '').trim();
-    if (value.trim() === shown) return;
+    if (value.trim() === this.linkNote(ds).trim()) return;
     this.updateDatasourceDescription(datasourceId, value);
+  }
+
+  /** The link whose Unlink waits for the user to confirm. */
+  readonly pendingUnlink = signal<ProjectDatasource | null>(null);
+
+  /** Unlink asks first: it drops the link's access setting, its note and
+   *  the project's knowledge entry for the connector, as the connector
+   *  form's own project removal says. */
+  askUnlink(ds: ProjectDatasource): void {
+    if (this.managedLabelKey(ds)) return;
+    this.pendingUnlink.set(ds);
+  }
+
+  confirmUnlink(): void {
+    const ds = this.pendingUnlink();
+    this.pendingUnlink.set(null);
+    if (ds) this.unlinkDatasource(ds.id);
   }
 
   unlinkDatasource(datasourceId: string): void {

@@ -1,4 +1,5 @@
 import {Component, computed, DestroyRef, inject, isDevMode, OnInit, signal} from '@angular/core';
+import {NgTemplateOutlet} from '@angular/common';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -24,7 +25,7 @@ import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppChipComponent} from '../../ui/chip';
-import {AppTabBarComponent, AppTabComponent} from '../../ui/tab-bar';
+import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {AppTextareaComponent} from '../../ui/textarea';
@@ -49,13 +50,24 @@ import {
   publicReadWrite,
 } from '../../core/models/connector-driver.model';
 import {
+  CLOUD_OUTBOX,
   isPlatformOwned,
+  PROJECT_CLOUD,
+  PROJECT_CLOUD_CHECKOUT,
   PROJECT_KB,
+  platformConnectorOwner,
+  platformConnectorOwnerId,
   platformKindLabelKey,
   platformManagedLabelKey,
   platformOwnedKind,
+  USER_CLOUD_ROOT,
 } from '../../core/models/platform-connector';
 import {LiveConnectorWebhookComponent} from './live-connector-webhook.component';
+import {
+  ConnectorFilterBarComponent,
+  ConnectorFilterToken,
+  ConnectorTypeChip,
+} from './connector-filter-bar.component';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
 import {CloudRootCardComponent} from './cloud-root-card.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
@@ -67,8 +79,64 @@ import {
 } from './connector-forms/schema-form';
 
 type McpTransport = 'http' | 'sse';
-/** The catalog's two views. */
-export type CatalogView = 'yours' | 'managed';
+/** One group of the "Kept by SRW" list: a project's connectors, or a
+ *  person's own (My cloud, session outboxes). */
+export interface KeptGroup {
+  key: string;
+  /** The project it belongs to, for the heading's link. */
+  projectId: string | null;
+  /** A project's name, as the heading. */
+  label: string;
+  /** The heading's translation key when there is no project name. */
+  labelKey: string;
+  rows: Datasource[];
+}
+
+/** The order a project's or person's connectors are listed in. */
+const KEPT_KIND_ORDER: readonly string[] = [
+  PROJECT_CLOUD,
+  PROJECT_CLOUD_CHECKOUT,
+  PROJECT_KB,
+  USER_CLOUD_ROOT,
+  CLOUD_OUTBOX,
+];
+
+function keptKindRank(ds: Datasource): number {
+  const at = KEPT_KIND_ORDER.indexOf(platformOwnedKind(ds) ?? '');
+  return at < 0 ? KEPT_KIND_ORDER.length : at;
+}
+
+/** The type strip's order: the types people make, then the ones SRW keeps;
+ *  a type not named here (a registered driver's) goes last, by name. */
+const TYPE_ORDER: readonly string[] = [
+  'credentials',
+  'generic',
+  'repository',
+  'kb',
+  'postgresql',
+  'neo4j',
+  'mongodb',
+  'webdav',
+  'email',
+  'mcp',
+  'kubeconfig',
+  'ssh_key',
+  'generic_file',
+  'gpt_live_sip',
+  'cloud_folder',
+  'cloud_folder_checkout',
+  'cloud_outbox',
+];
+
+function addCounts(target: Record<string, number>, counts: Record<string, number>): void {
+  for (const [type, n] of Object.entries(counts)) target[type] = (target[type] ?? 0) + n;
+}
+
+function countTypes(rows: readonly Datasource[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const ds of rows) counts[ds.type] = (counts[ds.type] ?? 0) + 1;
+  return counts;
+}
 type KeyValueRow = {key: string; value: string};
 
 /** A stored MCP connector's server-questions choice; anything else follows
@@ -92,8 +160,9 @@ export function storedServerQuestions(
     AppIconButtonComponent,
     AppBadgeComponent,
     AppChipComponent,
-    AppTabBarComponent,
-    AppTabComponent,
+    AppCheckboxComponent,
+    ConnectorFilterBarComponent,
+    NgTemplateOutlet,
     AppInputComponent,
     AppSelectComponent,
     AppTextareaComponent,
@@ -148,60 +217,28 @@ export function storedServerQuestions(
            connection is theirs to make, here (main cloud slice 4). -->
       <app-cloud-root-card />
 
-      <!-- Two views of one catalog: the connectors people made, and the ones
-           SRW keeps for a project or a user. Apart, because on an installation
-           with a few projects the second outnumbers the first many times over;
-           both one click away, because every connector an execution receives
-           is one its user can see (main_cloud_as_connectors, direction). -->
-      <div class="catalog-toolbar">
-        <app-tab-bar class="view-tabs" [value]="catalogView()" (valueChange)="onCatalogView($event)">
-          <app-tab [value]="'yours'">{{ 'datasources.view.yours' | transloco }}</app-tab>
-          <app-tab [value]="'managed'">{{ 'datasources.view.managed' | transloco }}</app-tab>
-        </app-tab-bar>
-        <div class="toolbar-filters">
-          @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-            <app-input
-              class="toolbar-search"
-              size="sm"
-              [value]="catalogSearch()"
-              (valueChange)="onCatalogSearch($event)"
-              [placeholder]="'datasources.catalog.search' | transloco"
-              [ariaLabel]="'datasources.catalog.search' | transloco"
-            />
-          }
-          <app-select
-            class="toolbar-type"
-            size="sm"
-            [value]="typeFilter()"
-            [ariaLabel]="'datasources.table.colType' | transloco"
-            (changed)="onTypeFilter($event ?? 'all')"
-          >
-            @for (filter of typeFilters; track filter.value) {
-              <option [value]="filter.value">
-                {{ (filter.value === 'all' ? 'datasources.catalog.anyType' : filter.labelKey) | transloco }}
-              </option>
-            }
-          </app-select>
-          @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-            <app-button
-              variant="secondary"
-              size="sm"
-              data-filters-toggle
-              [attr.aria-expanded]="filtersOpen()"
-              (clicked)="toggleFilters()"
-            >
-              <app-icon size="sm">tune</app-icon>
-              {{ 'datasources.catalog.filters' | transloco }}
-              @if (activeFilterCount(); as count) {
-                <span class="filter-count">{{ count }}</span>
-              }
-            </app-button>
-          }
-        </div>
-      </div>
+      <!-- The filters, shaped like the jobs list's: a type strip with
+           counts, then search, Filters and a token per applied filter. The
+           connectors SRW keeps for projects are hidden by default and say
+           so with a token, like the jobs of archived projects. -->
+      <app-connector-filter-bar
+        class="catalog-toolbar"
+        [chips]="typeChips()"
+        [selectedType]="typeFilter()"
+        [searchable]="capabilities.datasourceScopeAutoAttachAvailable()"
+        [search]="catalogSearch()"
+        [tokens]="filterTokens()"
+        [panelOpen]="filtersOpen()"
+        (typeSelect)="onTypeFilter($event)"
+        (searchInput)="onCatalogSearch($event)"
+        (togglePanel)="toggleFilters()"
+        (removeToken)="removeFilterToken($event)"
+        (clearAll)="clearFilters()"
+      />
 
-      @if (capabilities.datasourceScopeAutoAttachAvailable() && filtersOpen()) {
+      @if (filtersOpen()) {
         <div class="catalog-filter-bar" data-catalog-filters>
+          @if (capabilities.datasourceScopeAutoAttachAvailable()) {
           <div class="catalog-project-filter">
             <app-input
               size="sm"
@@ -250,16 +287,14 @@ export function storedServerQuestions(
             <option value="private">{{ 'datasources.catalog.private' | transloco }}</option>
             <option value="public">{{ 'datasources.catalog.public' | transloco }}</option>
           </app-select>
-          @if (activeFilterCount()) {
-            <app-button size="sm" variant="ghost" data-filters-clear (clicked)="clearFilters()">
-              {{ 'datasources.catalog.clearFilters' | transloco }}
-            </app-button>
           }
+          <div class="kept-toggle">
+            <app-checkbox size="sm" data-show-kept [checked]="showKept()" (changed)="setShowKept($event)">
+              {{ 'datasources.kept.show' | transloco }}
+            </app-checkbox>
+            <p class="kept-toggle__hint">{{ 'datasources.kept.showHint' | transloco }}</p>
+          </div>
         </div>
-      }
-
-      @if (catalogView() === 'managed') {
-        <p class="view-note" data-managed-note>{{ 'datasources.view.managedHint' | transloco }}</p>
       }
 
       <!-- Messages -->
@@ -1540,37 +1575,47 @@ export function storedServerQuestions(
       }
 
       <!-- Loading State -->
-      @if (isLoading() && filteredDatasources().length === 0 && !showForm()) {
+      @if (isLoading() && filteredDatasources().length === 0 && !showForm() && !showKept()) {
         <div class="center-state">
           <app-spinner size="lg" tone="accent" />
           <span>{{ 'datasources.table.loading' | transloco }}</span>
         </div>
       }
 
-      <!-- Empty State: nothing matches the filters, nothing SRW keeps, or
-           nothing made yet (the one case that offers to make the first). -->
+      <!-- Your connectors. With the kept ones shown below, a heading tells
+           the two lists apart and an empty one is a single line. -->
+      @if (showKept() && !showForm()) {
+        <h2 class="list-title" data-own-title>{{ 'datasources.kept.yoursTitle' | transloco }}</h2>
+      }
       @if (!isLoading() && filteredDatasources().length === 0 && !showForm()) {
-        <div class="center-state" data-empty [attr.data-empty-kind]="emptyKind()">
-          <app-icon size="inherit" class="empty-icon">{{ emptyKind() === 'filtered' ? 'filter_alt_off' : 'cable' }}</app-icon>
-          <span class="empty-title">{{ 'datasources.empty.' + emptyKind() + '.title' | transloco }}</span>
-          <span class="hint">{{ 'datasources.empty.' + emptyKind() + '.hint' | transloco }}</span>
-          @if (emptyKind() === 'filtered') {
-            <app-button variant="secondary" size="sm" (clicked)="clearFilters()">
-              {{ 'datasources.catalog.clearFilters' | transloco }}
-            </app-button>
-          } @else if (emptyKind() === 'none') {
-            <app-button variant="primary" size="sm" (clicked)="openCreateForm()">
-              {{ 'datasources.new' | transloco }}
-            </app-button>
-          }
-        </div>
+        @if (showKept()) {
+          <p class="list-empty" data-empty [attr.data-empty-kind]="emptyKind()">
+            {{ 'datasources.empty.' + emptyKind() + '.title' | transloco }}
+          </p>
+        } @else {
+          <!-- Nothing matches the filters, or nothing made yet (the one case
+               that offers to make the first). -->
+          <div class="center-state" data-empty [attr.data-empty-kind]="emptyKind()">
+            <app-icon size="inherit" class="empty-icon">{{ emptyKind() === 'filtered' ? 'filter_alt_off' : 'cable' }}</app-icon>
+            <span class="empty-title">{{ 'datasources.empty.' + emptyKind() + '.title' | transloco }}</span>
+            <span class="hint">{{ 'datasources.empty.' + emptyKind() + '.hint' | transloco }}</span>
+            @if (emptyKind() === 'filtered') {
+              <app-button variant="secondary" size="sm" (clicked)="clearFilters()">
+                {{ 'datasources.catalog.clearFilters' | transloco }}
+              </app-button>
+            } @else {
+              <app-button variant="primary" size="sm" (clicked)="openCreateForm()">
+                {{ 'datasources.new' | transloco }}
+              </app-button>
+            }
+          </div>
+        }
       }
 
-      <!-- Table -->
       @if (filteredDatasources().length > 0) {
         <div class="table-container">
           <div class="table-inner">
-            <table class="ds-table app-table">
+            <table class="ds-table app-table" data-own-table>
               <thead>
                 <tr>
                   <th>{{ 'datasources.table.colName' | transloco }}</th>
@@ -1584,258 +1629,7 @@ export function storedServerQuestions(
               </thead>
               <tbody>
                 @for (ds of filteredDatasources(); track ds.id) {
-                  <tr>
-                    <!-- One cell says what the connector is: its icon, its
-                         name with the type beside it, then what it is for. -->
-                    <td class="name-cell">
-                      <div class="name-row">
-                      <span class="ds-icon" [attr.data-type]="ds.type">
-                        <app-icon size="md">{{ getTypeIcon(ds.type) }}</app-icon>
-                      </span>
-                      <div class="name-text">
-                      <span class="ds-title">
-                        <span class="ds-name">{{ ds.name }}</span>
-                        <span class="ds-type">{{ typeLabelKey(ds) | transloco }}</span>
-                      </span>
-                      @if (ds.description) {
-                        <span class="ds-desc">{{ ds.description }}</span>
-                      }
-                      @if (ds.driver_env_names?.length) {
-                        <span class="ds-desc" data-driver-env>
-                          {{ 'datasources.driverEnvNames' | transloco }}
-                          <code>{{ ds.driver_env_names!.join(', ') }}</code>
-                        </span>
-                      }
-                      @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
-                        <div class="index-status-row">
-                          <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
-                            {{ indexStatusLabel(indexStatus) }}
-                          </app-badge>
-                          @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
-                            <span
-                              class="index-progress"
-                              [title]="
-                                'datasources.table.indexProgressTitle'
-                                  | transloco
-                                    : {
-                                        done: indexStatus.notes_done ?? 0,
-                                        total: indexStatus.notes_total
-                                      }
-                              "
-                            >
-                              <span class="index-progress-count">
-                                {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
-                              </span>
-                              <span class="index-progress-track">
-                                <span
-                                  class="index-progress-fill"
-                                  [style.width.%]="indexProgressPercent(indexStatus)"
-                                ></span>
-                              </span>
-                            </span>
-                          }
-                          @if (indexStatus.last_success_at) {
-                            <span
-                              class="index-status-detail"
-                              [title]="indexStatus.last_success_at"
-                            >
-                              {{ 'datasources.table.lastSuccess' | transloco }}:
-                              {{ formatIndexDate(indexStatus.last_success_at) }}
-                            </span>
-                          }
-                          @if (indexStatus.last_error) {
-                            <span
-                              class="index-status-error"
-                              [title]="redactIndexError(indexStatus.last_error)"
-                            >
-                              {{ redactIndexError(indexStatus.last_error) }}
-                            </span>
-                          }
-                        </div>
-                      }
-                      @if (viewport.isMobile()) {
-                        <!-- Visibility and availability, whose columns a phone hides. -->
-                        <div class="ds-scope-row">
-                        <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
-                          {{ scopeLabelKey(ds) | transloco }}
-                        </app-badge>
-                        @if (ds.is_global && isPublicReadWrite(ds)) {
-                          <app-badge class="ds-scope-inline" tone="warning" size="xs">
-                            {{ 'datasources.table.badgeRw' | transloco }}
-                          </app-badge>
-                        } @else if (isPrivateReadOnly(ds)) {
-                          <app-badge class="ds-scope-inline" tone="info" size="xs" data-creator-read-only>
-                            {{ 'datasources.table.badgeRo' | transloco }}
-                          </app-badge>
-                        }
-                        @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                          <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
-                            {{ availabilityLabel(ds) }}
-                          </app-badge>
-                          @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
-                            <app-badge class="ds-scope-inline" tone="accent" size="xs">
-                              {{ 'datasources.table.badgeAuto' | transloco }}
-                            </app-badge>
-                          }
-                        }
-                        </div>
-                      }
-                      </div>
-                      </div>
-                    </td>
-                    <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
-                    <td class="col-scope">
-                      <app-badge [tone]="scopeTone(ds)" size="xs">
-                        {{ scopeLabelKey(ds) | transloco }}
-                      </app-badge>
-                      @if (ds.is_global && isPublicReadWrite(ds)) {
-                        <app-badge tone="warning" size="xs">
-                          {{ 'datasources.table.badgeRw' | transloco }}
-                        </app-badge>
-                      } @else if (isPrivateReadOnly(ds)) {
-                        <app-badge tone="info" size="xs" data-creator-read-only>
-                          {{ 'datasources.table.badgeRo' | transloco }}
-                        </app-badge>
-                      }
-                    </td>
-                    @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                      <td class="col-availability">
-                        <app-badge [tone]="availabilityTone(ds)" size="xs">
-                          {{ availabilityLabel(ds) }}
-                        </app-badge>
-                        @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
-                          <app-badge tone="accent" size="xs">
-                            {{ 'datasources.table.badgeAuto' | transloco }}
-                          </app-badge>
-                        }
-                      </td>
-                    }
-                    <td class="actions-cell">
-                      @if (canManage(ds) && viewport.isMobile()) {
-                        <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
-                             cell is just the kebab and the table fits without h-scroll
-                             (mirrors the Jobs list). -->
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.moreActions' | transloco"
-                          [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
-                          [appMenuTrigger]="rowMenu"
-                          menuPlacement="bottom-end"
-                        >
-                          <app-icon size="sm">more_vert</app-icon>
-                        </app-icon-button>
-                        <app-menu #rowMenu>
-                          <app-menu-item (activated)="testDatasource(ds.id)">
-                            {{ 'datasources.table.testTooltip' | transloco }}
-                          </app-menu-item>
-                          @if (ds.type === 'kb') {
-                            <app-menu-item (activated)="reindexDatasource(ds)">
-                              {{ 'datasources.table.reindexTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                          @if (ds.type === 'kb') {
-                            <app-menu-item (activated)="reindexDatasource(ds, true)">
-                              {{ 'datasources.table.fullReindexTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                          @if (canEditRow(ds)) {
-                            <app-menu-item (activated)="openEditForm(ds)">
-                              {{ 'datasources.table.editTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                          @if (canDeleteRow(ds)) {
-                            <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
-                              {{ 'datasources.table.deleteTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                        </app-menu>
-                      } @else if (canManage(ds)) {
-                        <!-- Two actions in view, the rest behind one menu: a
-                             knowledge base used to show five icons in a row. -->
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.testTooltip' | transloco"
-                          [tooltip]="'datasources.table.testTooltip' | transloco"
-                          [loading]="testingIds().has(ds.id)"
-                          (clicked)="testDatasource(ds.id)"
-                        >
-                          <app-icon size="sm">cable</app-icon>
-                        </app-icon-button>
-                        @if (canEditRow(ds)) {
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.editTooltip' | transloco"
-                            [tooltip]="'datasources.table.editTooltip' | transloco"
-                            (clicked)="openEditForm(ds)"
-                          >
-                            <app-icon size="sm">edit</app-icon>
-                          </app-icon-button>
-                        }
-                        @if (hasRowMenu(ds)) {
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            data-row-menu
-                            [ariaLabel]="'datasources.table.moreActions' | transloco"
-                            [tooltip]="'datasources.table.moreActions' | transloco"
-                            [loading]="reindexingIds().has(ds.id)"
-                            [appMenuTrigger]="rowMoreMenu"
-                            menuPlacement="bottom-end"
-                          >
-                            <app-icon size="sm">more_vert</app-icon>
-                          </app-icon-button>
-                          <!-- One item per block: a block with two roots is
-                               not projected into the menu. -->
-                          <app-menu #rowMoreMenu>
-                            @if (ds.type === 'kb') {
-                              <app-menu-item (activated)="reindexDatasource(ds)">
-                                {{ 'datasources.table.reindexTooltip' | transloco }}
-                              </app-menu-item>
-                            }
-                            @if (ds.type === 'kb') {
-                              <app-menu-item (activated)="reindexDatasource(ds, true)">
-                                {{ 'datasources.table.fullReindexTooltip' | transloco }}
-                              </app-menu-item>
-                            }
-                            @if (canDeleteRow(ds)) {
-                              <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
-                                {{ 'datasources.table.deleteTooltip' | transloco }}
-                              </app-menu-item>
-                            }
-                          </app-menu>
-                        }
-                      }
-                      <!-- SRW provisions and manages a platform-owned row
-                           (a project's knowledge base or cloud folder, a
-                           user's own): nobody deletes or re-points it here. -->
-                      @if (managedLabelKey(ds); as managedKey) {
-                        <span
-                          class="managed-note"
-                          data-managed
-                          role="img"
-                          [attr.aria-label]="managedKey | transloco"
-                          [title]="managedKey | transloco"
-                        >
-                          <app-icon size="sm">lock</app-icon>
-                        </span>
-                      }
-
-                      @if (canManage(ds) && testResults()[ds.id]; as result) {
-                        <span
-                          class="inline-test"
-                          [class.test-ok]="result.status === 'ok'"
-                          [class.test-error]="result.status === 'error'"
-                          [class.test-unsupported]="result.status === 'unsupported'"
-                          title="{{ result.message }}"
-                        >
-                          <app-icon size="sm">{{ testResultIcon(result) }}</app-icon>
-                        </span>
-                      }
-                    </td>
-                  </tr>
+                  <ng-container *ngTemplateOutlet="connectorRow; context: {$implicit: ds, kept: false}" />
                 }
               </tbody>
             </table>
@@ -1849,7 +1643,340 @@ export function storedServerQuestions(
           </div>
         </div>
       }
+
+      <!-- What SRW keeps for projects and people, one group per project
+           (main_cloud_as_connectors: every folder an execution receives is a
+           connector its user can see). -->
+      @if (showKept() && !showForm()) {
+        <section class="kept-section" data-kept-section>
+          <h2 class="list-title">{{ 'datasources.kept.title' | transloco }}</h2>
+          <p class="list-hint">{{ 'datasources.kept.hint' | transloco }}</p>
+          @if (keptLoading() && keptRows().length === 0) {
+            <div class="list-empty"><app-spinner size="sm" /></div>
+          } @else if (keptGroups().length === 0) {
+            <p class="list-empty" data-kept-empty>{{ 'datasources.kept.none' | transloco }}</p>
+          } @else {
+            <div class="table-container">
+              <div class="table-inner">
+                <table class="ds-table app-table" data-kept-table>
+                  <thead>
+                <tr>
+                  <th>{{ 'datasources.table.colName' | transloco }}</th>
+                  <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
+                  <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
+                  @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                    <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
+                  }
+                  <th class="col-actions"><span class="sr-only">{{ 'datasources.table.colActions' | transloco }}</span></th>
+                </tr>
+              </thead>
+                  @for (group of keptGroups(); track group.key) {
+                    <tbody [attr.data-kept-group]="group.key">
+                      <tr class="group-row">
+                        <th [attr.colspan]="columnCount()" scope="colgroup">
+                          @if (group.projectId) {
+                            <a class="group-link" [routerLink]="['/projects', group.projectId]">{{ group.label }}</a>
+                          } @else {
+                            {{ group.labelKey | transloco }}
+                          }
+                        </th>
+                      </tr>
+                      @for (ds of group.rows; track ds.id) {
+                        <ng-container *ngTemplateOutlet="connectorRow; context: {$implicit: ds, kept: true}" />
+                      }
+                    </tbody>
+                  }
+                </table>
+                @if (capabilities.datasourceScopeAutoAttachAvailable() && keptNextCursor()) {
+                  <div class="load-more-row">
+                    <app-button variant="secondary" size="sm" [loading]="keptLoadingMore()" (clicked)="loadMoreKept()">
+                      {{ 'datasources.catalog.loadMore' | transloco }}
+                    </app-button>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+        </section>
+      }
     </div>
+
+    <!-- One row of either list. -->
+    <ng-template #connectorRow let-ds let-kept="kept">
+      <tr>
+        <!-- One cell says what the connector is: its icon, its
+             name with the type beside it, then what it is for. -->
+        <td class="name-cell">
+          <div class="name-row">
+          <span class="ds-icon" [attr.data-type]="ds.type">
+            <app-icon size="md">{{ getTypeIcon(ds.type) }}</app-icon>
+          </span>
+          <div class="name-text">
+          <span class="ds-title">
+            <!-- A connector SRW keeps is named for what it is to its
+                 project; its stored name repeats the project's and carries
+                 an id. -->
+            @if (kept) {
+              <span class="ds-name" [title]="ds.name">{{ typeLabelKey(ds) | transloco }}</span>
+            } @else {
+              <span class="ds-name">{{ ds.name }}</span>
+              <span class="ds-type">{{ typeLabelKey(ds) | transloco }}</span>
+            }
+          </span>
+          @if (ds.description) {
+            <span class="ds-desc">{{ ds.description }}</span>
+          }
+          @if (ds.driver_env_names?.length) {
+            <span class="ds-desc" data-driver-env>
+              {{ 'datasources.driverEnvNames' | transloco }}
+              <code>{{ ds.driver_env_names!.join(', ') }}</code>
+            </span>
+          }
+          @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
+            <div class="index-status-row">
+              <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
+                {{ indexStatusLabel(indexStatus) }}
+              </app-badge>
+              @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
+                <span
+                  class="index-progress"
+                  [title]="
+                    'datasources.table.indexProgressTitle'
+                      | transloco
+                        : {
+                            done: indexStatus.notes_done ?? 0,
+                            total: indexStatus.notes_total
+                          }
+                  "
+                >
+                  <span class="index-progress-count">
+                    {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
+                  </span>
+                  <span class="index-progress-track">
+                    <span
+                      class="index-progress-fill"
+                      [style.width.%]="indexProgressPercent(indexStatus)"
+                    ></span>
+                  </span>
+                </span>
+              }
+              @if (indexStatus.last_success_at) {
+                <span
+                  class="index-status-detail"
+                  [title]="indexStatus.last_success_at"
+                >
+                  {{ 'datasources.table.lastSuccess' | transloco }}:
+                  {{ formatIndexDate(indexStatus.last_success_at) }}
+                </span>
+              }
+              @if (indexStatus.last_error) {
+                <span
+                  class="index-status-error"
+                  [title]="redactIndexError(indexStatus.last_error)"
+                >
+                  {{ redactIndexError(indexStatus.last_error) }}
+                </span>
+              }
+            </div>
+          }
+          @if (viewport.isMobile()) {
+            <!-- Visibility and availability, whose columns a phone hides. -->
+            <div class="ds-scope-row">
+            <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
+              {{ scopeLabelKey(ds) | transloco }}
+            </app-badge>
+            @if (ds.is_global && isPublicReadWrite(ds)) {
+              <app-badge class="ds-scope-inline" tone="warning" size="xs">
+                {{ 'datasources.table.badgeRw' | transloco }}
+              </app-badge>
+            } @else if (isPrivateReadOnly(ds)) {
+              <app-badge class="ds-scope-inline" tone="info" size="xs" data-creator-read-only>
+                {{ 'datasources.table.badgeRo' | transloco }}
+              </app-badge>
+            }
+            @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+              <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
+                {{ availabilityLabel(ds) }}
+              </app-badge>
+              @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+                <app-badge class="ds-scope-inline" tone="accent" size="xs">
+                  {{ 'datasources.table.badgeAuto' | transloco }}
+                </app-badge>
+              }
+            }
+            </div>
+          }
+          </div>
+          </div>
+        </td>
+        <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
+        <td class="col-scope">
+          <app-badge [tone]="scopeTone(ds)" size="xs">
+            {{ scopeLabelKey(ds) | transloco }}
+          </app-badge>
+          @if (ds.is_global && isPublicReadWrite(ds)) {
+            <app-badge tone="warning" size="xs">
+              {{ 'datasources.table.badgeRw' | transloco }}
+            </app-badge>
+          } @else if (isPrivateReadOnly(ds)) {
+            <app-badge tone="info" size="xs" data-creator-read-only>
+              {{ 'datasources.table.badgeRo' | transloco }}
+            </app-badge>
+          }
+        </td>
+        @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+          <td class="col-availability">
+            <app-badge [tone]="availabilityTone(ds)" size="xs">
+              {{ availabilityLabel(ds) }}
+            </app-badge>
+            @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+              <app-badge tone="accent" size="xs">
+                {{ 'datasources.table.badgeAuto' | transloco }}
+              </app-badge>
+            }
+          </td>
+        }
+        <td class="actions-cell">
+          @if (canManage(ds) && viewport.isMobile()) {
+            <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
+                 cell is just the kebab and the table fits without h-scroll
+                 (mirrors the Jobs list). -->
+            <app-icon-button
+              variant="ghost"
+              size="sm"
+              [ariaLabel]="'datasources.table.moreActions' | transloco"
+              [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
+              [appMenuTrigger]="rowMenu"
+              menuPlacement="bottom-end"
+            >
+              <app-icon size="sm">more_vert</app-icon>
+            </app-icon-button>
+            <app-menu #rowMenu>
+              <app-menu-item (activated)="testDatasource(ds.id)">
+                {{ 'datasources.table.testTooltip' | transloco }}
+              </app-menu-item>
+              @if (ds.type === 'kb') {
+                <app-menu-item (activated)="reindexDatasource(ds)">
+                  {{ 'datasources.table.reindexTooltip' | transloco }}
+                </app-menu-item>
+              }
+              @if (ds.type === 'kb') {
+                <app-menu-item (activated)="reindexDatasource(ds, true)">
+                  {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                </app-menu-item>
+              }
+              @if (canEditRow(ds)) {
+                <app-menu-item (activated)="openEditForm(ds)">
+                  {{ 'datasources.table.editTooltip' | transloco }}
+                </app-menu-item>
+              }
+              @if (canDeleteRow(ds)) {
+                <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                  {{ 'datasources.table.deleteTooltip' | transloco }}
+                </app-menu-item>
+              }
+            </app-menu>
+          } @else if (canManage(ds)) {
+            <!-- Two actions in view, the rest behind one menu: a
+                 knowledge base used to show five icons in a row. -->
+            <app-icon-button
+              variant="ghost"
+              size="sm"
+              [ariaLabel]="'datasources.table.testTooltip' | transloco"
+              [tooltip]="'datasources.table.testTooltip' | transloco"
+              [loading]="testingIds().has(ds.id)"
+              (clicked)="testDatasource(ds.id)"
+            >
+              <app-icon size="sm">cable</app-icon>
+            </app-icon-button>
+            @if (canEditRow(ds)) {
+              <app-icon-button
+                variant="ghost"
+                size="sm"
+                [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                [tooltip]="'datasources.table.editTooltip' | transloco"
+                (clicked)="openEditForm(ds)"
+              >
+                <app-icon size="sm">edit</app-icon>
+              </app-icon-button>
+            }
+            @if (hasRowMenu(ds)) {
+              <app-icon-button
+                variant="ghost"
+                size="sm"
+                data-row-menu
+                [ariaLabel]="'datasources.table.moreActions' | transloco"
+                [tooltip]="'datasources.table.moreActions' | transloco"
+                [loading]="reindexingIds().has(ds.id)"
+                [appMenuTrigger]="rowMoreMenu"
+                menuPlacement="bottom-end"
+              >
+                <app-icon size="sm">more_vert</app-icon>
+              </app-icon-button>
+              <!-- One item per block: a block with two roots is
+                   not projected into the menu. -->
+              <app-menu #rowMoreMenu>
+                @if (ds.type === 'kb') {
+                  <app-menu-item (activated)="reindexDatasource(ds)">
+                    {{ 'datasources.table.reindexTooltip' | transloco }}
+                  </app-menu-item>
+                }
+                @if (ds.type === 'kb') {
+                  <app-menu-item (activated)="reindexDatasource(ds, true)">
+                    {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                  </app-menu-item>
+                }
+                @if (canDeleteRow(ds)) {
+                  <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                    {{ 'datasources.table.deleteTooltip' | transloco }}
+                  </app-menu-item>
+                }
+              </app-menu>
+            }
+          }
+          <!-- SRW provisions and manages a platform-owned row
+               (a project's knowledge base or cloud folder, a
+               user's own): nobody deletes or re-points it here. -->
+          @if (managedLabelKey(ds); as managedKey) {
+            <span
+              class="managed-note"
+              data-managed
+              role="img"
+              [attr.aria-label]="managedKey | transloco"
+              [title]="managedKey | transloco"
+            >
+              <app-icon size="sm">lock</app-icon>
+            </span>
+          }
+
+          @if (canManage(ds) && testResults()[ds.id]; as result) {
+            <span
+              class="inline-test"
+              [class.test-ok]="result.status === 'ok'"
+              [class.test-error]="result.status === 'error'"
+              [class.test-unsupported]="result.status === 'unsupported'"
+              title="{{ result.message }}"
+            >
+              <app-icon size="sm">{{ testResultIcon(result) }}</app-icon>
+            </span>
+          }
+        </td>
+      </tr>
+    </ng-template>
+
+    <!-- Delete confirmation: the name typed, as for a read-write publish. -->
+    <app-confirm-name-dialog
+      [open]="pendingDelete() !== null"
+      [title]="'datasources.deleteDialog.title' | transloco: { name: pendingDelete()?.name ?? '' }"
+      [message]="'datasources.deleteDialog.message' | transloco"
+      [requiredName]="pendingDelete()?.name ?? null"
+      [namePrompt]="'datasources.deleteDialog.namePrompt' | transloco"
+      [confirmLabel]="'datasources.deleteDialog.confirm' | transloco"
+      [cancelLabel]="'datasources.deleteDialog.cancel' | transloco"
+      confirmVariant="danger"
+      (confirmed)="confirmDelete()"
+      (dismissed)="pendingDelete.set(null)"
+    />
 
     <!-- Publish confirmation (two tiers: warn / type-the-name) -->
     <app-confirm-name-dialog
@@ -1998,52 +2125,11 @@ export function storedServerQuestions(
         }
       }
 
-      /* The catalog's two views and its three everyday controls on one row;
-         the filters behind the button take the row under it. */
+      /* The filter bar (connector-filter-bar) on the page gutter. */
       .catalog-toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        flex-wrap: wrap;
-        gap: 10px 16px;
+        display: block;
         padding: 0 var(--ds-gutter) 0.75rem;
         flex-shrink: 0;
-      }
-
-      .toolbar-filters {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex: 1 1 420px;
-        justify-content: flex-end;
-        min-width: 0;
-      }
-
-      .toolbar-search {
-        flex: 1 1 200px;
-        max-width: 320px;
-        min-width: 0;
-      }
-
-      .toolbar-type {
-        flex: 0 1 180px;
-        min-width: 0;
-      }
-
-      .filter-count {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 18px;
-        height: 18px;
-        margin-left: 2px;
-        padding: 0 5px;
-        border-radius: var(--radius-pill);
-        background: var(--accent-color);
-        color: var(--app-bg);
-        font-size: 11px;
-        font-weight: 600;
-        font-variant-numeric: tabular-nums;
       }
 
       /* A grid, so a control left alone on the last row keeps the width of
@@ -2069,18 +2155,83 @@ export function storedServerQuestions(
         min-width: 0;
       }
 
-      .catalog-filter-bar > app-button {
-        justify-self: start;
+      /* The switch for what SRW keeps, under the selects, with its hint. */
+      .kept-toggle {
+        grid-column: 1 / -1;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding-top: 4px;
       }
 
-      .view-note {
+      .kept-toggle__hint {
+        margin: 0 0 0 26px;
+        font-size: 12px;
+        line-height: 1.45;
+        color: var(--text-muted);
+      }
+
+      /* With what SRW keeps shown, each list has a heading. */
+      .list-title {
         margin: 0;
-        padding: 0 var(--ds-gutter) 0.75rem;
+        padding: 0.5rem var(--ds-gutter) 0.5rem;
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text-primary);
+        flex-shrink: 0;
+      }
+
+      .list-hint {
+        margin: -0.25rem 0 0.75rem;
+        padding: 0 var(--ds-gutter);
         max-width: 78ch;
         font-size: 13px;
         line-height: 1.45;
         color: var(--text-muted);
+      }
+
+      .list-empty {
+        margin: 0 0 1rem;
+        padding: 0 var(--ds-gutter);
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      .kept-section {
+        display: flex;
+        flex-direction: column;
         flex-shrink: 0;
+        margin-top: 0.75rem;
+      }
+
+      /* A group of the kept list: the project's name over its rows. Not the
+         column headers' small capitals; it reads as a sub-heading. */
+      .ds-table .group-row th {
+        text-align: left;
+        padding: 14px 12px 6px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: normal;
+        text-transform: none;
+        color: var(--text-primary);
+        background: transparent;
+        border-bottom: 1px solid var(--border-hairline);
+      }
+
+      .group-link {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .group-link:hover {
+        color: var(--accent-color);
+        text-decoration: underline;
+      }
+
+      .group-link:focus-visible {
+        outline: 2px solid var(--accent-color);
+        outline-offset: 2px;
+        border-radius: var(--radius-tag);
       }
 
       /* Authoring: the form has the page. The browse controls filter a list
@@ -2089,7 +2240,6 @@ export function storedServerQuestions(
       .form-open app-cloud-root-card,
       .form-open .catalog-toolbar,
       .form-open .catalog-filter-bar,
-      .form-open .view-note,
       .form-open .table-container {
         display: none;
       }
@@ -2878,22 +3028,6 @@ export function storedServerQuestions(
           grid-template-columns: 1fr 1fr;
         }
 
-        /* The views take the first row, the search and type the second. */
-        .toolbar-filters {
-          flex-basis: 100%;
-          flex-wrap: wrap;
-          justify-content: flex-start;
-        }
-
-        .toolbar-search {
-          flex-basis: 100%;
-          max-width: none;
-        }
-
-        .toolbar-type {
-          flex: 1 1 140px;
-        }
-
         .form-panel {
           width: auto;
         }
@@ -2916,7 +3050,7 @@ export function storedServerQuestions(
           min-width: 0;
         }
 
-        .ds-table th:last-child,
+        .ds-table thead th:last-child,
         .ds-table td:last-child {
           width: 48px;
           padding-inline: 4px;
@@ -3093,9 +3227,21 @@ export class DatasourceListComponent implements OnInit {
   // State signals
   readonly datasources = signal<Datasource[]>([]);
   readonly isLoading = signal(false);
-  /** Which half of the catalog is listed: the connectors people made, or the
-   *  ones SRW keeps for a project or a user. */
-  readonly catalogView = signal<CatalogView>('yours');
+  /** Whether the connectors SRW keeps (a project's folders and knowledge
+   *  base, a person's own cloud) are listed, below the user's own. Off by
+   *  default: on an installation with a few projects they outnumber the
+   *  user's own many times over. */
+  readonly showKept = signal(false);
+  /** The kept connectors, a list of their own with its own paging. */
+  readonly keptDatasources = signal<Datasource[]>([]);
+  readonly keptNextCursor = signal<string | null>(null);
+  readonly keptLoading = signal(false);
+  readonly keptLoadingMore = signal(false);
+  private keptRequestSerial = 0;
+  /** How many connectors of each type there are, under every filter but
+   *  the type: the server's first-page counts, per list. */
+  readonly ownTypeCounts = signal<Record<string, number>>({});
+  readonly keptTypeCounts = signal<Record<string, number>>({});
   /** Whether the less used filters (project, availability, default,
    *  ownership, visibility) are shown. */
   readonly filtersOpen = signal(false);
@@ -3242,34 +3388,152 @@ export class DatasourceListComponent implements OnInit {
   // Computed filtered list
   readonly filteredDatasources = computed(() => {
     const filter = this.typeFilter();
-    // The server splits the catalog (`managed`); the same split here covers
-    // the unpaged legacy list and an orchestrator that predates the filter.
-    const managed = this.catalogView() === 'managed';
-    const all = this.datasources().filter((ds) => isPlatformOwned(ds) === managed);
-    if (filter === 'all') return all;
-    return all.filter((ds) => ds.type === filter);
+    // The server sends the user's own (managed=false); the same split here
+    // covers the unpaged legacy list and an orchestrator that predates it.
+    const own = this.datasources().filter((ds) => !isPlatformOwned(ds));
+    if (filter === 'all') return own;
+    return own.filter((ds) => ds.type === filter);
   });
 
-  /** How many of the filters behind the Filters button are set. */
-  readonly activeFilterCount = computed(
-    () =>
-      [
-        this.catalogProjectId() !== '',
-        this.scopeFilter() !== 'all',
-        this.automaticFilter() !== 'all',
-        this.ownershipFilter() !== 'all',
-        this.visibilityFilter() !== 'all',
-      ].filter(Boolean).length,
-  );
+  /** The kept connectors under the type filter (the server applies the
+   *  others; the legacy list has none). */
+  readonly keptRows = computed(() => {
+    const filter = this.typeFilter();
+    const kept = this.keptDatasources().filter((ds) => isPlatformOwned(ds));
+    return filter === 'all' ? kept : kept.filter((ds) => ds.type === filter);
+  });
 
-  /** Why the list is empty: something narrows it, SRW keeps nothing for this
-   *  user yet, or they have made no connector. */
-  readonly emptyKind = computed<'filtered' | 'managed' | 'none'>(() => {
-    if (this.catalogSearch().trim() || this.typeFilter() !== 'all' || this.activeFilterCount() > 0) {
-      return 'filtered';
+  /** The kept connectors in groups: one per project, named after it, then
+   *  the user's own and (for an administrator) other people's. Groups keep
+   *  the order they first appear in (newest first), rows a fixed order. */
+  readonly keptGroups = computed<KeptGroup[]>(() => {
+    const me = this.userService.currentUser()?.id ?? null;
+    const groups = new Map<string, KeptGroup>();
+    for (const ds of this.keptRows()) {
+      const owner = platformConnectorOwner(ds);
+      const ownerId = platformConnectorOwnerId(ds);
+      let group: Omit<KeptGroup, 'rows'>;
+      if (owner === 'project' && ownerId) {
+        group = {
+          key: `project:${ownerId}`,
+          projectId: ownerId,
+          label: ds.native_project_name?.trim() || '',
+          labelKey: 'datasources.kept.unnamedProject',
+        };
+      } else if (owner === 'user' && ownerId === me) {
+        group = {key: 'yours', projectId: null, label: '', labelKey: 'datasources.kept.yours'};
+      } else {
+        group = {key: 'others', projectId: null, label: '', labelKey: 'datasources.kept.others'};
+      }
+      const existing = groups.get(group.key);
+      if (existing) existing.rows.push(ds);
+      else groups.set(group.key, {...group, rows: [ds]});
     }
-    return this.catalogView() === 'managed' ? 'managed' : 'none';
+    for (const group of groups.values()) {
+      group.rows.sort((a, b) => keptKindRank(a) - keptKindRank(b));
+      // A project the catalog sent no name for: say "Project" and its id.
+      if (group.projectId && !group.label) {
+        group.label = this.transloco.translate(group.labelKey, {id: group.projectId.slice(0, 8)});
+      }
+    }
+    return [...groups.values()];
   });
+
+  /** Columns a group heading spans: the ones on screen. A phone shows the
+   *  name and the menu only; spanning hidden columns too would leave the
+   *  fixed table layout room for columns nobody sees, squeezing the name. */
+  readonly columnCount = computed(() => {
+    if (this.viewport.isMobile()) return 2;
+    return this.capabilities.datasourceScopeAutoAttachAvailable() ? 5 : 4;
+  });
+
+  /** How many connectors of each type the lists hold, under every filter but
+   *  the type. The legacy list counts what it loaded. */
+  readonly typeCounts = computed<Record<string, number>>(() => {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      const rows = this.datasources().filter((ds) => !isPlatformOwned(ds));
+      if (this.showKept()) rows.push(...this.keptDatasources().filter((ds) => isPlatformOwned(ds)));
+      return countTypes(rows);
+    }
+    const counts: Record<string, number> = {};
+    addCounts(counts, this.ownTypeCounts());
+    if (this.showKept()) addCounts(counts, this.keptTypeCounts());
+    return counts;
+  });
+
+  /** The type strip: all, then each type there are connectors of, and the
+   *  selected one even at none (so it can be cleared). */
+  readonly typeChips = computed<ConnectorTypeChip[]>(() => {
+    const counts = this.typeCounts();
+    const selected = this.typeFilter();
+    const types = new Set(Object.keys(counts).filter((type) => counts[type] > 0));
+    if (selected !== 'all') types.add(selected);
+    const rank = (type: string) => {
+      const at = TYPE_ORDER.indexOf(type);
+      return at < 0 ? TYPE_ORDER.length : at;
+    };
+    const ordered = [...types].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+    return [
+      {value: 'all', count: total},
+      ...ordered.map((type) => ({value: type, count: counts[type] ?? 0})),
+    ];
+  });
+
+  /** A removable token for every applied filter but the type (the strip
+   *  shows that one), including the default one that hides what SRW keeps. */
+  readonly filterTokens = computed<ConnectorFilterToken[]>(() => {
+    const t = (key: string) => this.transloco.translate(key);
+    const tokens: ConnectorFilterToken[] = [];
+    const search = this.catalogSearch().trim();
+    if (search) {
+      tokens.push({id: 'search', labelKey: 'datasources.catalog.token.search', labelParams: {term: search}});
+    }
+    const projectId = this.catalogProjectId();
+    if (projectId) {
+      const name = this.catalogProjects().find((project) => project.id === projectId)?.name ?? projectId.slice(0, 8);
+      tokens.push({id: 'project', labelKey: 'datasources.catalog.token.project', labelParams: {name}});
+    }
+    const availability = {
+      'scope-all': 'datasources.catalog.everywhere',
+      projects: 'datasources.catalog.projectScoped',
+      unavailable: 'datasources.catalog.unavailable',
+    }[this.scopeFilter() as string];
+    if (availability) {
+      tokens.push({
+        id: 'availability',
+        labelKey: 'datasources.catalog.token.availability',
+        labelParams: {value: t(availability)},
+      });
+    }
+    if (this.automaticFilter() !== 'all') {
+      tokens.push({id: 'automatic', labelKey: `datasources.catalog.token.${this.automaticFilter()}`});
+    }
+    if (this.ownershipFilter() !== 'all') {
+      tokens.push({id: 'ownership', labelKey: `datasources.catalog.token.${this.ownershipFilter()}`});
+    }
+    if (this.visibilityFilter() !== 'all') {
+      tokens.push({id: 'visibility', labelKey: `datasources.catalog.token.${this.visibilityFilter()}`});
+    }
+    if (!this.showKept()) {
+      tokens.push({id: 'kept', labelKey: 'datasources.catalog.token.keptHidden'});
+    }
+    return tokens;
+  });
+
+  /** Why the user's own list is empty: something narrows it, or they have
+   *  made no connector yet. */
+  readonly emptyKind = computed<'filtered' | 'none'>(() =>
+    this.catalogSearch().trim() ||
+    this.typeFilter() !== 'all' ||
+    this.catalogProjectId() !== '' ||
+    this.scopeFilter() !== 'all' ||
+    this.automaticFilter() !== 'all' ||
+    this.ownershipFilter() !== 'all' ||
+    this.visibilityFilter() !== 'all'
+      ? 'filtered'
+      : 'none',
+  );
 
   // URL placeholder based on type
   readonly urlPlaceholder = computed(() => {
@@ -3644,16 +3908,18 @@ export class DatasourceListComponent implements OnInit {
   refresh(): void {
     const serial = ++this.catalogRequestSerial;
     this.isLoading.set(true);
+    this.indexStatuses.set({});
     if (!this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      // The legacy list is unpaged and unfiltered: it holds both lists, and
+      // the type filter and its counts work on what it loaded.
       this.catalogNextCursor.set(null);
+      this.keptNextCursor.set(null);
       this.isLoadingMore.set(false);
-      const type = this.typeFilter() === 'all'
-        ? undefined
-        : this.typeFilter() as DatasourceType;
-      this.api.getDatasources(undefined, type).subscribe({
+      this.api.getDatasources().subscribe({
         next: (rows) => {
           if (serial !== this.catalogRequestSerial) return;
-          this.applyCatalogRows(rows, false);
+          this.applyCatalogRows(rows.filter((ds) => !isPlatformOwned(ds)), false);
+          this.applyKeptRows(rows.filter((ds) => isPlatformOwned(ds)), false);
           this.isLoading.set(false);
         },
         error: () => {
@@ -3664,11 +3930,13 @@ export class DatasourceListComponent implements OnInit {
       });
       return;
     }
-    this.api.getDatasourceCatalog(this.catalogFilters()).subscribe({
+    this.api.getDatasourceCatalog(this.catalogFilters(false)).subscribe({
       next: (response) => {
         if (serial !== this.catalogRequestSerial) return;
         this.applyCatalogRows(response.items, false);
         this.catalogNextCursor.set(response.next_cursor);
+        // An orchestrator that predates the counts: what this page holds.
+        this.ownTypeCounts.set(response.type_counts ?? countTypes(response.items));
         this.isLoading.set(false);
       },
       error: () => {
@@ -3677,6 +3945,7 @@ export class DatasourceListComponent implements OnInit {
         this.errorMessage.set(this.transloco.translate('datasources.catalog.loadFailed'));
       },
     });
+    if (this.showKept()) this.loadKept();
   }
 
   loadMoreCatalog(): void {
@@ -3685,7 +3954,7 @@ export class DatasourceListComponent implements OnInit {
     if (!cursor || this.isLoadingMore()) return;
     const serial = ++this.catalogRequestSerial;
     this.isLoadingMore.set(true);
-    this.api.getDatasourceCatalog({...this.catalogFilters(), cursor}).subscribe({
+    this.api.getDatasourceCatalog({...this.catalogFilters(false), cursor}).subscribe({
       next: (response) => {
         if (serial !== this.catalogRequestSerial) return;
         this.applyCatalogRows(response.items, true);
@@ -3700,7 +3969,51 @@ export class DatasourceListComponent implements OnInit {
     });
   }
 
-  private catalogFilters(): DatasourceCatalogFilters {
+  /** The first page of what SRW keeps, under the same filters. The legacy
+   *  list loaded it with everything else. */
+  private loadKept(): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+    const serial = ++this.keptRequestSerial;
+    this.keptLoading.set(true);
+    this.keptLoadingMore.set(false);
+    this.api.getDatasourceCatalog(this.catalogFilters(true)).subscribe({
+      next: (response) => {
+        if (serial !== this.keptRequestSerial) return;
+        this.applyKeptRows(response.items, false);
+        this.keptNextCursor.set(response.next_cursor);
+        this.keptTypeCounts.set(response.type_counts ?? countTypes(response.items));
+        this.keptLoading.set(false);
+      },
+      error: () => {
+        if (serial !== this.keptRequestSerial) return;
+        this.keptLoading.set(false);
+        this.errorMessage.set(this.transloco.translate('datasources.catalog.loadFailed'));
+      },
+    });
+  }
+
+  loadMoreKept(): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+    const cursor = this.keptNextCursor();
+    if (!cursor || this.keptLoadingMore()) return;
+    const serial = ++this.keptRequestSerial;
+    this.keptLoadingMore.set(true);
+    this.api.getDatasourceCatalog({...this.catalogFilters(true), cursor}).subscribe({
+      next: (response) => {
+        if (serial !== this.keptRequestSerial) return;
+        this.applyKeptRows(response.items, true);
+        this.keptNextCursor.set(response.next_cursor);
+        this.keptLoadingMore.set(false);
+      },
+      error: () => {
+        if (serial !== this.keptRequestSerial) return;
+        this.keptLoadingMore.set(false);
+        this.errorMessage.set(this.transloco.translate('datasources.catalog.loadMoreFailed'));
+      },
+    });
+  }
+
+  private catalogFilters(managed: boolean): DatasourceCatalogFilters {
     const filters: DatasourceCatalogFilters = {limit: 50};
     const q = this.catalogSearch().trim();
     if (q) filters.q = q;
@@ -3716,7 +4029,7 @@ export class DatasourceListComponent implements OnInit {
     if (ownership !== 'all') filters.ownership = ownership;
     const visibility = this.visibilityFilter();
     if (visibility !== 'all') filters.visibility = visibility;
-    filters.managed = this.catalogView() === 'managed';
+    filters.managed = managed;
     return filters;
   }
 
@@ -3725,30 +4038,74 @@ export class DatasourceListComponent implements OnInit {
       ? [...this.datasources(), ...rows.filter(row => !this.datasources().some(old => old.id === row.id))]
       : rows;
     this.datasources.set(merged);
-    if (!append) this.indexStatuses.set({});
+    for (const ds of rows) {
+      if (ds.type === 'kb') this.loadIndexStatus(ds.id);
+    }
+  }
+
+  private applyKeptRows(rows: Datasource[], append: boolean): void {
+    const current = this.keptDatasources();
+    this.keptDatasources.set(
+      append ? [...current, ...rows.filter((row) => !current.some((old) => old.id === row.id))] : rows,
+    );
     for (const ds of rows) {
       if (ds.type === 'kb') this.loadIndexStatus(ds.id);
     }
   }
 
   onTypeFilter(value: string): void {
+    if (value === this.typeFilter()) return;
     this.typeFilter.set(value);
-    this.refresh();
+    // The legacy list filters what it holds.
+    if (this.capabilities.datasourceScopeAutoAttachAvailable()) this.refresh();
   }
 
-  onCatalogView(value: CatalogView | null): void {
-    const view: CatalogView = value === 'managed' ? 'managed' : 'yours';
-    if (view === this.catalogView()) return;
-    this.catalogView.set(view);
-    this.refresh();
+  /** Show or hide what SRW keeps. Showing loads it; the user's own list is
+   *  not touched either way. */
+  setShowKept(show: boolean): void {
+    if (show === this.showKept()) return;
+    this.showKept.set(show);
+    if (show) this.loadKept();
   }
 
   toggleFilters(): void {
     this.filtersOpen.update((open) => !open);
   }
 
-  /** Back to the whole view: the search, the type and every filter behind
-   *  the Filters button. One request, not one per filter. */
+  /** Remove one applied filter, the way its token says. */
+  removeFilterToken(id: string): void {
+    switch (id) {
+      case 'kept':
+        this.setShowKept(true);
+        return;
+      case 'search':
+        if (this.catalogSearchTimer) clearTimeout(this.catalogSearchTimer);
+        this.catalogSearch.set('');
+        break;
+      case 'project':
+        this.catalogProjectId.set('');
+        break;
+      case 'availability':
+        this.scopeFilter.set('all');
+        break;
+      case 'automatic':
+        this.automaticFilter.set('all');
+        break;
+      case 'ownership':
+        this.ownershipFilter.set('all');
+        break;
+      case 'visibility':
+        this.visibilityFilter.set('all');
+        break;
+      default:
+        return;
+    }
+    this.refresh();
+  }
+
+  /** Back to the defaults: no search, every type, no filter, and what SRW
+   *  keeps hidden again (as the jobs list's "Clear all" hides archived
+   *  projects again). One request, not one per filter. */
   clearFilters(): void {
     if (this.catalogSearchTimer) clearTimeout(this.catalogSearchTimer);
     this.catalogSearch.set('');
@@ -3758,6 +4115,7 @@ export class DatasourceListComponent implements OnInit {
     this.automaticFilter.set('all');
     this.ownershipFilter.set('all');
     this.visibilityFilter.set('all');
+    this.showKept.set(false);
     this.refresh();
   }
 
@@ -4780,7 +5138,23 @@ export class DatasourceListComponent implements OnInit {
     });
   }
 
+  /** The connector whose Delete waits for the user to type its name. */
+  readonly pendingDelete = signal<Datasource | null>(null);
+
+  /** Delete asks first: it removes the connector, its stored credentials
+   *  and every project's link to it, and cannot be undone. */
   deleteDatasource(ds: Datasource): void {
+    if (!this.canDeleteRow(ds)) return;
+    this.pendingDelete.set(ds);
+  }
+
+  confirmDelete(): void {
+    const ds = this.pendingDelete();
+    this.pendingDelete.set(null);
+    if (ds) this.performDelete(ds);
+  }
+
+  private performDelete(ds: Datasource): void {
     this.clearMessages();
     this.api.deleteDatasource(ds.id).subscribe({
       next: (result) => {

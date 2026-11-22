@@ -2028,7 +2028,7 @@
       "editNote": "Bearbeiten, was die Agenten in diesem Projekt über diesen Konnektor erfahren",
       "groups": {
         "included": {
-          "title": "Im Projekt enthalten",
+          "title": "Von SRW verwaltet",
           "hint": "SRW hat diese mit dem Projekt angelegt und verwaltet sie. Der Standardzugriff eines Ordners gilt, sofern eine Sitzung beim Start keine andere Stufe wählt."
         },
         "linked": {
@@ -2047,11 +2047,15 @@
       "accessReadOnly": "Nur lesen",
       "accessReadWrite": "Lesen/Schreiben",
       "accessKbReadOnlyHint": "Externe OKF Knowledge Bases sind in dieser Version für Agenten schreibgeschützt.",
-      "accessEnforcedBy": "Durchgesetzt durch:",
+      "accessEnforcedBy": "So begrenzt SRW den Zugriff:",
       "accessAdvisory": "Nur ein Hinweis:",
       "githubAppReadOnly": "das GitHub-App-Token, das SRW für jede Ausführung erzeugt, hat contents: read, daher lehnt GitHub Pushes mit diesem Token ab.",
       "accessCreatorReadOnly": "Nur Lesen für alle, die ihn nutzen: Sein Ersteller hat ihn so markiert, und ein Projekt-Link kann das nicht aufheben.",
       "unlink": "Trennen",
+      "unlinkDialog": {
+        "title": "{{name}} trennen?",
+        "message": "Neue Jobs und Sitzungen dieses Projekts erhalten ihn dann nicht mehr. Seine Zugriffseinstellung, sein Hinweis und sein Eintrag im Wissen des Projekts werden mit der Verknüpfung entfernt; eine neue Verknüpfung beginnt mit den Standardwerten."
+      },
       "cloudFolders": {
         "colAccess": "Standardzugriff",
         "defaultOption": "Standard ({{level}})",
@@ -2112,7 +2116,7 @@
       "shareMemoriesDesc": "Wenn aktiviert, sind automatische Erinnerungen aus beliebigen Aufträgen dieses Projekts für alle anderen Aufträge sichtbar.",
       "cloudStorage": "Cloud-Speicher",
       "folder": "Ordner",
-      "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Im Projekt enthalten (oder der für eine Session gewählten).",
+      "cloudAccessHint": "Agenten erhalten diesen Ordner über seinen Konnektor, mit der Stufe aus Konnektoren → Von SRW verwaltet (oder der für eine Session gewählten).",
       "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
       "cloudFolderFailed": {
         "nameTaken": "Dieses Projekt hat keinen Cloud-Ordner: In der Cloud gibt es schon Ordner mit seinem Namen und seinem Ausweichnamen. Benennen Sie das Projekt um; SRW versucht es erneut, wenn es geöffnet wird, höchstens einmal pro Stunde.",
@@ -3359,19 +3363,28 @@
     }
   },
   "datasources": {
-    "view": {
-      "yours": "Deine Konnektoren",
-      "managed": "Von SRW verwaltet",
-      "managedHint": "Ordner und Knowledge Bases, die SRW für deine Projekte angelegt hat, und deine eigene Cloud. SRW verwaltet sie: Sie werden hier weder bearbeitet noch gelöscht. Die eines Projekts richtest du in dessen Tab „Konnektoren“ ein."
+    "kept": {
+      "title": "Von SRW verwaltet",
+      "hint": "Ordner und Knowledge Bases, die SRW für deine Projekte angelegt hat, und deine eigene Cloud. SRW verwaltet sie: Sie werden hier weder bearbeitet noch gelöscht. Die eines Projekts richtest du in dessen Tab „Konnektoren“ ein.",
+      "yoursTitle": "Deine Konnektoren",
+      "show": "Von SRW verwaltete Konnektoren zeigen",
+      "showHint": "Die Ordner und Knowledge Bases, die SRW für deine Projekte verwaltet, und deine eigene Cloud. Standardmäßig ausgeblendet.",
+      "none": "Nichts von SRW Verwaltetes passt.",
+      "yours": "Deine",
+      "others": "Die anderer Personen",
+      "unnamedProject": "Projekt {{id}}"
+    },
+    "deleteDialog": {
+      "title": "{{name}} löschen?",
+      "message": "Damit werden der Konnektor, seine gespeicherten Zugangsdaten und seine Verknüpfung mit jedem Projekt samt deren Einstellungen entfernt. Das lässt sich nicht rückgängig machen.",
+      "namePrompt": "Gib den Namen des Konnektors ein, um ihn zu löschen.",
+      "confirm": "Konnektor löschen",
+      "cancel": "Abbrechen"
     },
     "empty": {
       "none": {
         "title": "Noch keine Konnektoren",
         "hint": "Ein Konnektor gibt Agenten eine Datenbank, ein Repository, ein Postfach oder einen anderen Dienst, mit dem sie arbeiten können."
-      },
-      "managed": {
-        "title": "Noch nichts von SRW verwaltet",
-        "hint": "Die Ordner und die Knowledge Base eines Projekts erscheinen hier, sobald das Projekt besteht."
       },
       "filtered": {
         "title": "Kein Konnektor passt",
@@ -3445,7 +3458,7 @@
         "userCloudRoot": "Meine Cloud",
         "cloudOutbox": "Session-Outbox"
       },
-      "managedByProject": "Vom Projekt verwaltet",
+      "managedByProject": "Von SRW für dieses Projekt verwaltet",
       "managedForYou": "Von SRW für dich verwaltet",
       "managedForItsUser": "Von SRW für seinen Benutzer verwaltet",
       "managedBySrw": "Von SRW verwaltet"
@@ -3477,9 +3490,23 @@
       "loadMore": "Mehr laden",
       "loadFailed": "Der Konnektoren-Katalog konnte nicht geladen werden. Bitte erneut versuchen.",
       "loadMoreFailed": "Weitere Konnektoren konnten nicht geladen werden.",
-      "anyType": "Alle Typen",
       "filters": "Filter",
-      "clearFilters": "Filter zurücksetzen"
+      "clearFilters": "Alle zurücksetzen",
+      "typeGroup": "Konnektortypen",
+      "appliedGroup": "Gesetzte Filter",
+      "removeToken": "Filter entfernen: {{filter}}",
+      "token": {
+        "search": "Suche: {{term}}",
+        "project": "Projekt: {{name}}",
+        "availability": "Verfügbarkeit: {{value}}",
+        "automatic": "Standardmäßig angehängt",
+        "manual": "Nicht standardmäßig angehängt",
+        "mine": "Nur meine",
+        "shared": "Nur mit mir geteilte",
+        "private": "Nur private",
+        "public": "Nur öffentliche",
+        "keptHidden": "Von SRW verwaltete ausgeblendet"
+      }
     },
     "form": {
       "editTitle": "Konnektor bearbeiten",
@@ -3783,7 +3810,7 @@
     "advisory": "Hinweis",
     "enforced": "Durchgesetzt",
     "defaultLevel": "Standard",
-    "enforcedBy": "Durchgesetzt durch",
+    "enforcedBy": "So begrenzt SRW den Zugriff",
     "toolsDiscovered": "Jedes Tool, das der Server anbietet",
     "toolsNone": "Keine eingebauten Tools",
     "plane": "Läuft",

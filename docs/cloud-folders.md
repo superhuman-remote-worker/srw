@@ -24,10 +24,12 @@ WebDAV connector, and nothing on this page applies to it.
 | **Session outbox** | `cloud_outbox` | A folder SRW creates for the execution and shares with you. A Session mounts it at `cloud/outbox`; a Job's deliverables are copied into it when the Job finishes. Every approved user has one. | Sessions and Jobs |
 | **Project folder copy (jobs)** | `cloud_folder_checkout` | The project's folder copied into the Job's repository under `projects/<slug>/` before it starts (see [Jobs](#jobs)). | Jobs |
 
-These are platform-owned. **Customize → Connectors** shows them as managed
-("Managed by its project", "Managed by SRW for you"), and nobody can create,
-edit, re-point, link, unlink or delete one; a project owner only sets its
-default level. A project's go with the project, a user's with their
+These are platform-owned. **Customize → Connectors** lists them under **Kept
+by SRW** (hidden until **Show connectors kept by SRW** is ticked under
+**Filters**), with a lock that says who they are kept for ("Kept by SRW for
+this project", "Kept by SRW for you"). Nobody can create, edit, re-point,
+link, unlink or delete one; a project owner only sets its default level, on
+the project's **Connectors** tab under **Kept by SRW**. A project's go with the project, a user's with their
 account. None reaches the agent as a connector or a
 credential: the mount, or the copy, is the delivery. The agent is told every
 folder it has, whose it is, its level and what is missing, and

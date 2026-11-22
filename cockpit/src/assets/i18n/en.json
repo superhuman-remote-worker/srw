@@ -2028,7 +2028,7 @@
       "editNote": "Edit what the agents in this project are told about this connector",
       "groups": {
         "included": {
-          "title": "Included with the project",
+          "title": "Kept by SRW",
           "hint": "SRW created these with the project and keeps them. A folder's default access applies unless a session chooses another level when it starts."
         },
         "linked": {
@@ -2047,11 +2047,15 @@
       "accessReadOnly": "Read-only",
       "accessReadWrite": "Read-write",
       "accessKbReadOnlyHint": "External OKF Knowledge Bases are read-only to agents in this release.",
-      "accessEnforcedBy": "Enforced by:",
+      "accessEnforcedBy": "How SRW limits it:",
       "accessAdvisory": "Advisory only:",
       "githubAppReadOnly": "the GitHub App token SRW mints for each execution has contents: read, so GitHub refuses pushes made with that token.",
       "accessCreatorReadOnly": "Read-only for everyone who uses it: its creator tagged it so, and a project link cannot lift that.",
       "unlink": "Unlink",
+      "unlinkDialog": {
+        "title": "Unlink {{name}}?",
+        "message": "This project's new jobs and sessions will no longer get it. Its access setting, its note and its entry in the project's knowledge are removed with the link; linking it again starts from the defaults."
+      },
       "cloudFolders": {
         "colAccess": "Default access",
         "defaultOption": "Default ({{level}})",
@@ -2112,7 +2116,7 @@
       "shareMemoriesDesc": "When enabled, automatic memories from any job in this project are visible to all other jobs.",
       "cloudStorage": "Cloud Storage",
       "folder": "Folder",
-      "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Included with the project (or chosen for a session).",
+      "cloudAccessHint": "Agents get this folder through its connector, at the level set under Connectors → Kept by SRW (or chosen for a session).",
       "cloudUnavailable": "Cloud storage unavailable — not configured.",
       "cloudFolderFailed": {
         "nameTaken": "This project has no cloud folder: the cloud already has folders with its name and its fallback name. Rename the project; SRW retries when it is opened, at most once an hour.",
@@ -3359,19 +3363,28 @@
     }
   },
   "datasources": {
-    "view": {
-      "yours": "Your connectors",
-      "managed": "Kept by SRW",
-      "managedHint": "Folders and knowledge bases SRW created for your projects, and your own cloud. SRW keeps them: they are not edited or deleted here. A project's are set up on its Connectors tab."
+    "kept": {
+      "title": "Kept by SRW",
+      "hint": "Folders and knowledge bases SRW created for your projects, and your own cloud. SRW keeps them: they are not edited or deleted here. A project's are set up on its Connectors tab.",
+      "yoursTitle": "Your connectors",
+      "show": "Show connectors kept by SRW",
+      "showHint": "The folders and knowledge bases SRW keeps for your projects, and your own cloud. Hidden by default.",
+      "none": "Nothing kept by SRW matches.",
+      "yours": "Yours",
+      "others": "Other people's",
+      "unnamedProject": "Project {{id}}"
+    },
+    "deleteDialog": {
+      "title": "Delete {{name}}?",
+      "message": "This removes the connector, its stored credentials and its link to every project, with each link's settings. It cannot be undone.",
+      "namePrompt": "Type the connector's name to delete it.",
+      "confirm": "Delete connector",
+      "cancel": "Cancel"
     },
     "empty": {
       "none": {
         "title": "No connectors yet",
         "hint": "A connector gives agents a database, a repository, a mailbox or another service to work with."
-      },
-      "managed": {
-        "title": "Nothing kept by SRW yet",
-        "hint": "A project's folders and knowledge base appear here once the project exists."
       },
       "filtered": {
         "title": "No connector matches",
@@ -3445,10 +3458,10 @@
         "userCloudRoot": "My cloud",
         "cloudOutbox": "Session outbox"
       },
-      "managedByProject": "Managed by its project",
-      "managedForYou": "Managed by SRW for you",
-      "managedForItsUser": "Managed by SRW for its user",
-      "managedBySrw": "Managed by SRW"
+      "managedByProject": "Kept by SRW for this project",
+      "managedForYou": "Kept by SRW for you",
+      "managedForItsUser": "Kept by SRW for its user",
+      "managedBySrw": "Kept by SRW"
     },
     "accessLevel": {
       "read_only": "Read-only",
@@ -3477,9 +3490,23 @@
       "loadMore": "Load more",
       "loadFailed": "Could not load the connector catalog. Try again.",
       "loadMoreFailed": "Could not load more connectors.",
-      "anyType": "All types",
       "filters": "Filters",
-      "clearFilters": "Clear filters"
+      "clearFilters": "Clear all",
+      "typeGroup": "Connector types",
+      "appliedGroup": "Applied filters",
+      "removeToken": "Remove filter: {{filter}}",
+      "token": {
+        "search": "Search: {{term}}",
+        "project": "Project: {{name}}",
+        "availability": "Availability: {{value}}",
+        "automatic": "Attached by default",
+        "manual": "Not attached by default",
+        "mine": "Only mine",
+        "shared": "Only shared with me",
+        "private": "Only private",
+        "public": "Only public",
+        "keptHidden": "Kept by SRW hidden"
+      }
     },
     "form": {
       "editTitle": "Edit Connector",
@@ -3783,7 +3810,7 @@
     "advisory": "Advisory",
     "enforced": "Enforced",
     "defaultLevel": "Default",
-    "enforcedBy": "Enforced by",
+    "enforcedBy": "How SRW limits it",
     "toolsDiscovered": "Every tool the server lists",
     "toolsNone": "No built-in tools",
     "plane": "Runs",

@@ -1294,6 +1294,66 @@ describe('ProjectDetailPageComponent connectors tab', () => {
     expect(updateProjectDatasource).toHaveBeenLastCalledWith('project-a', 'pg', {description: null});
   });
 
+  it("shows a kept knowledge base's own wording as text, and only the project's note as the note", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    // SRW's description reaches no agent (the server sends only the note).
+    expect(component.keptLink(KB)).toBe(true);
+    expect(component.linkNote({...KB, description: "This project's knowledge base"})).toBe('');
+    expect(
+      component.linkNote({...KB, description: 'Decisions only', project_description: 'Decisions only'}),
+    ).toBe('Decisions only');
+    // A connector its members linked: the note, else its own description.
+    expect(component.linkNote(linked('pg', {description: 'Bookings'}))).toBe('Bookings');
+  });
+
+  it("saves the first note on a kept knowledge base, though SRW's wording is shown", () => {
+    const {component, updateProjectDatasource} = withUpdate();
+    const kb = {...KB, description: "This project's knowledge base"};
+    component.projectDatasources.set([kb]);
+    // Left empty: nothing.
+    component.editingLinkNote.set('kb');
+    component.saveLinkNote('kb', '');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+    // Written: saved.
+    component.editingLinkNote.set('kb');
+    component.saveLinkNote('kb', 'Decisions only');
+    expect(updateProjectDatasource).toHaveBeenLastCalledWith('project-a', 'kb', {
+      description: 'Decisions only',
+    });
+  });
+
+  it('asks before unlinking, and unlinks only once the user confirms', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const unlink = vi.fn().mockReturnValue(of({status: 'unlinked'}));
+    (api as unknown as {unlinkProjectDatasource: unknown}).unlinkProjectDatasource = unlink;
+    const pg = linked('pg');
+
+    component.askUnlink(pg);
+    expect(component.pendingUnlink()).toBe(pg);
+    expect(unlink).not.toHaveBeenCalled();
+
+    component.confirmUnlink();
+    expect(unlink).toHaveBeenCalledWith('project-a', 'pg');
+    expect(component.pendingUnlink()).toBeNull();
+  });
+
+  it('never offers to unlink what SRW keeps, and a dismissed dialog unlinks nothing', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const unlink = vi.fn().mockReturnValue(of({status: 'unlinked'}));
+    (api as unknown as {unlinkProjectDatasource: unknown}).unlinkProjectDatasource = unlink;
+
+    component.askUnlink(FOLDER);
+    expect(component.pendingUnlink()).toBeNull();
+    component.askUnlink(linked('pg'));
+    component.pendingUnlink.set(null);
+    component.confirmUnlink();
+    expect(unlink).not.toHaveBeenCalled();
+    for (const bundle of [en, de]) {
+      expect(bundle.projectDetail.datasources.unlinkDialog.title).toBeTruthy();
+      expect(bundle.projectDetail.datasources.unlinkDialog.message).toBeTruthy();
+    }
+  });
+
   it('saves nothing once Escape has closed the editor', () => {
     const {component, updateProjectDatasource} = withUpdate();
     component.projectDatasources.set([linked('pg')]);
@@ -1350,6 +1410,11 @@ describe('ProjectDetailPageComponent connectors tab', () => {
     // config/skills/app-guide names these two; tests/test_app_guide_content.py
     // holds the guide to them.
     expect(en.projectDetail.datasources.cloudFolders.colAccess).toBe('Default access');
-    expect(en.projectDetail.datasources.groups.included.title).toBe('Included with the project');
+    // One name for what SRW keeps, here and on Customize → Connectors.
+    expect(en.projectDetail.datasources.groups.included.title).toBe('Kept by SRW');
+    expect(en.projectDetail.datasources.groups.included.title).toBe(en.datasources.kept.title);
+    expect(de.projectDetail.datasources.groups.included.title).toBe(de.datasources.kept.title);
+    expect(en.datasources.platform.managedByProject).toContain('Kept by SRW');
+    expect(en.projectDetail.datasources.accessEnforcedBy).toBe('How SRW limits it:');
   });
 });

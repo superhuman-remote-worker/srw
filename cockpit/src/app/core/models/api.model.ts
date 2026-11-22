@@ -477,6 +477,9 @@ export interface Datasource {
   id: string;
   name: string;
   description: string | null;
+  /** The catalog's: the name of the project a connector SRW keeps belongs
+   *  to; null for any other connector. */
+  native_project_name?: string | null;
   type: DatasourceType;
   connection_url: string | null;
   /** True when REST returned only a sanitized display URL. Editors must omit
@@ -595,6 +598,9 @@ export interface EligibleDatasource extends Datasource {
 export interface DatasourceCatalogResponse {
   items: Datasource[];
   next_cursor: string | null;
+  /** First page only: how many connectors of each type there are under
+   *  every filter but the type. */
+  type_counts?: Record<string, number>;
 }
 
 export interface DatasourceCatalogFilters {
