@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import asyncio
+import datetime
 import pickle
 import shutil
 import socket
@@ -18,12 +21,15 @@ from langchain_openai import ChatOpenAI
 
 from shared.tls_pinning import (
     NO_CHECK_TIME,
+    REASON_BY_VERIFY_CODE,
     CertificateChangedError,
     PinnedCertificateRejectedError,
     TlsPin,
     apresented_certificate_sha256,
     fingerprint_sha256,
     httpx_client_kwargs,
+    inspect_tls,
+    pinned_handshake_error,
     pinned_ssl_context,
     presented_certificate_sha256,
 )
@@ -291,9 +297,12 @@ def test_a_refused_connection_is_not_certificate_changed(tls_certs):
     assert not isinstance(e.value, CertificateChangedError)
 
 
-def test_a_pin_the_server_presents_but_openssl_rejects_is_not_reported_as_changed(
-    tmp_path,
-):
+@contextlib.contextmanager
+def _weak_cert_server(tmp_path):
+    """Serve a 1024-bit self-signed certificate; yields ``(pin, port, completed)``.
+
+    ``completed`` collects any application byte a client sends after the handshake.
+    """
     if shutil.which("openssl") is None:
         pytest.skip("openssl CLI not available")
     subprocess.run(
@@ -313,7 +322,7 @@ def test_a_pin_the_server_presents_but_openssl_rejects_is_not_reported_as_change
     listener.bind(("127.0.0.1", 0))
     listener.listen(5)
     port = listener.getsockname()[1]
-    completed: list[int] = []
+    completed: list[bytes] = []
 
     def serve() -> None:
         while True:
@@ -334,15 +343,22 @@ def test_a_pin_the_server_presents_but_openssl_rejects_is_not_reported_as_change
     th = threading.Thread(target=serve, daemon=True)
     th.start()
     try:
+        yield pin, port, completed
+    finally:
+        listener.close()
+        th.join(timeout=5)
+
+
+def test_a_pin_the_server_presents_but_openssl_rejects_is_not_reported_as_changed(
+    tmp_path,
+):
+    with _weak_cert_server(tmp_path) as (pin, port, completed):
         with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
             with pytest.raises(PinnedCertificateRejectedError) as e:
                 c.get(
                     f"https://127.0.0.1:{port}/v1/models",
                     headers={"Authorization": "Bearer S"},
                 )
-    finally:
-        listener.close()
-        th.join(timeout=5)
     assert completed == []
     assert not isinstance(e.value, CertificateChangedError)
     assert e.value.sha256 == pin.sha256
@@ -417,3 +433,158 @@ def test_a_non_verification_tls_failure_stays_a_plain_connect_error(tls_certs):
         srv.shutdown()
         srv.server_close()
         th.join(timeout=5)
+
+
+# ---- inspect_tls / pinned_handshake_error -------------------------------------
+
+
+def _der(path) -> bytes:
+    return _pin(path).der
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "served,trust_ca,reason",
+    [
+        ("leaf", False, "unknown_issuer"),
+        ("leaf", True, "address_mismatch"),
+        ("self_signed", False, "self_signed"),
+        ("good", True, None),
+    ],
+)
+async def test_inspect_classifies(tls_certs, monkeypatch, served, trust_ca, reason):
+    if trust_ca:
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_certs.ca))
+    cert = getattr(tls_certs, served)
+    key = getattr(
+        tls_certs,
+        {"leaf": "leaf_key", "self_signed": "self_key"}.get(served, served + "_key"),
+    )
+    with tls_server(cert, key) as srv:
+        r = await inspect_tls(srv.url)
+    assert r.verified is (reason is None)
+    assert r.reason == reason
+    assert r.error is None
+    assert r.certificate.sha256 == fingerprint_sha256(_der(cert))
+    assert (r.message is None) is (reason is None)
+
+
+@pytest.mark.asyncio
+async def test_inspect_formats_names_like_openssl(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        r = await inspect_tls(srv.url)
+    c = r.certificate
+    assert c.subject == "CN=127.0.0.1, emailAddress=jfink@example.org"
+    assert c.issuer == "CN=pin test CA" and c.version == 1
+    assert c.san == [] and c.expired is False
+    assert c.pem == _pin(tls_certs.leaf).pem
+    pub = c.to_public()
+    assert "pem" not in pub
+    assert pub["sha256"] == c.sha256
+    assert pub["not_after"] == c.not_after.isoformat()
+    assert pub["not_before"] == c.not_before.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_inspect_reads_san_entries(tls_certs, monkeypatch):
+    monkeypatch.setenv("SSL_CERT_FILE", str(tls_certs.ca))
+    with tls_server(tls_certs.good, tls_certs.good_key) as srv:
+        r = await inspect_tls(srv.url)
+    assert r.certificate.version == 3
+    assert any(x.startswith(("IP:", "DNS:")) for x in r.certificate.san)
+    assert "IP:127.0.0.1" in r.certificate.san
+
+
+@pytest.mark.asyncio
+async def test_expired_reported_from_the_dates(tls_certs):
+    with tls_server(tls_certs.expired, tls_certs.leaf_key) as srv:
+        r = await inspect_tls(srv.url)
+    assert r.reason == "unknown_issuer"
+    assert r.certificate.expired is True
+    assert r.certificate.not_after < datetime.datetime.now(datetime.timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_pin_match_and_mismatch(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        assert (await inspect_tls(srv.url)).pin_matches is None
+        assert (
+            await inspect_tls(srv.url, pin=_pin(tls_certs.leaf))
+        ).pin_matches is True
+        assert (
+            await inspect_tls(srv.url, pin=_pin(tls_certs.swap))
+        ).pin_matches is False
+
+
+@pytest.mark.asyncio
+async def test_inspect_sends_no_application_data(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        await inspect_tls(srv.url)
+        await asyncio.sleep(0.2)
+        assert srv.requests == []
+
+
+@pytest.mark.asyncio
+async def test_not_tls_and_refused_are_errors():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        closed = s.getsockname()[1]
+    r = await inspect_tls(f"https://127.0.0.1:{closed}/v1")
+    assert r.error and r.certificate is None and r.reason is None and not r.verified
+
+    plain = socket.socket()
+    plain.bind(("127.0.0.1", 0))
+    plain.listen(5)
+    port = plain.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            conn, _ = plain.accept()
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            conn.close()
+        except OSError:
+            pass
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        r = await inspect_tls(f"https://127.0.0.1:{port}/v1")
+    finally:
+        plain.close()
+        th.join(timeout=5)
+    assert r.error and r.certificate is None and r.reason is None and not r.verified
+
+
+@pytest.mark.asyncio
+async def test_http_url_is_rejected():
+    with pytest.raises(ValueError, match="inspect_tls needs an https:// URL"):
+        await inspect_tls("http://127.0.0.1:1/v1")
+
+
+def test_reason_table_is_verbatim():
+    assert REASON_BY_VERIFY_CODE == {
+        18: "self_signed", 19: "self_signed", 2: "unknown_issuer",
+        20: "unknown_issuer", 21: "unknown_issuer", 62: "address_mismatch",
+        64: "address_mismatch", 10: "expired", 9: "not_yet_valid",
+    }  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_pinned_handshake_error_none_on_match_and_text_on_swap(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        assert await pinned_handshake_error(srv.url, _pin(tls_certs.leaf)) is None
+        await asyncio.sleep(0.2)
+        assert srv.requests == []
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        err = await pinned_handshake_error(srv.url, _pin(tls_certs.leaf))
+        assert isinstance(err, str) and err
+        await asyncio.sleep(0.2)
+        assert srv.requests == []
+
+
+@pytest.mark.asyncio
+async def test_pinned_handshake_error_names_a_weak_certificate(tmp_path):
+    with _weak_cert_server(tmp_path) as (pin, port, completed):
+        err = await pinned_handshake_error(f"https://127.0.0.1:{port}/v1", pin)
+    assert err is not None and "too weak" in err
+    assert completed == []

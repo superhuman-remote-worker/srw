@@ -23,7 +23,8 @@ Two rules from the spike (vault spec ``endpoint-certificate-pinning-design``):
   recent Pythons, sets ``VERIFY_X509_STRICT``.
 
 Shared by the orchestrator, the agent and the provisioners; the only
-third-party import is httpx. A pinned client gets an explicit transport, so
+third-party import is httpx (``cryptography`` is imported lazily, and only by
+:func:`inspect_tls`). A pinned client gets an explicit transport, so
 httpx ignores environment proxies and the client's ``limits`` for it.
 """
 
@@ -39,7 +40,9 @@ import re
 import socket
 import ssl
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -335,3 +338,221 @@ def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[st
         return {}
     transport = AsyncPinnedTransport(pin) if asynchronous else PinnedTransport(pin)
     return {"transport": transport}
+
+
+# ---- Read-only inspection (endpoint Test and the Trust API) -------------------
+
+#: How long one inspection or pinned handshake may take.
+INSPECT_TIMEOUT = 10.0
+
+#: OpenSSL ``X509_V_ERR_*`` code -> the reason the admin UI shows.
+REASON_BY_VERIFY_CODE = {
+    18: "self_signed",
+    19: "self_signed",
+    2: "unknown_issuer",
+    20: "unknown_issuer",
+    21: "unknown_issuer",
+    62: "address_mismatch",
+    64: "address_mismatch",
+    10: "expired",
+    9: "not_yet_valid",
+}
+
+
+@dataclass(frozen=True)
+class CertificateDetails:
+    """What an admin needs to decide whether to trust a certificate."""
+
+    sha256: str
+    subject: str
+    issuer: str
+    not_before: datetime
+    not_after: datetime
+    expired: bool
+    san: list[str]
+    version: int
+    pem: str
+
+    def to_public(self) -> dict:
+        """JSON-ready form: ISO dates, no PEM."""
+        return {
+            "sha256": self.sha256,
+            "subject": self.subject,
+            "issuer": self.issuer,
+            "not_before": self.not_before.isoformat(),
+            "not_after": self.not_after.isoformat(),
+            "expired": self.expired,
+            "san": list(self.san),
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True)
+class TlsInspection:
+    """Result of :func:`inspect_tls`.
+
+    ``verified`` means the certificate passes the verification SRW's httpx
+    clients apply; ``reason``/``message`` say why not. ``error`` is set (and
+    ``certificate`` is ``None``) when no certificate could be read at all.
+    """
+
+    verified: bool
+    reason: Optional[str]
+    message: Optional[str]
+    certificate: Optional[CertificateDetails]
+    pin_matches: Optional[bool]
+    error: Optional[str]
+
+
+def _https_target(base_url: str) -> tuple[str, int]:
+    parts = urlsplit(base_url)
+    if parts.scheme != "https":
+        raise ValueError("inspect_tls needs an https:// URL")
+    host = parts.hostname
+    if not host:
+        raise ValueError("inspect_tls needs an https:// URL with a host")
+    return host, parts.port or 443
+
+
+async def _handshake_der(
+    host: str, port: int, ctx: ssl.SSLContext, timeout: float
+) -> Optional[bytes]:
+    """Complete a handshake, return the peer certificate (DER), send nothing."""
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),
+            timeout,
+        )
+        ssl_object = writer.get_extra_info("ssl_object")
+        return ssl_object.getpeercert(binary_form=True) if ssl_object else None
+    finally:
+        if writer is not None:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+
+_NAME_SHORT = {
+    "commonName": "CN",
+    "organizationName": "O",
+    "organizationalUnitName": "OU",
+    "countryName": "C",
+    "stateOrProvinceName": "ST",
+    "localityName": "L",
+    "emailAddress": "emailAddress",
+    "domainComponent": "DC",
+    "serialNumber": "serialNumber",
+}
+
+
+def _format_name(name: Any) -> str:
+    parts = []
+    for attr in name:
+        long = getattr(attr.oid, "_name", "")
+        parts.append(
+            f"{_NAME_SHORT.get(long) or long or attr.oid.dotted_string}={attr.value}"
+        )
+    return ", ".join(parts)
+
+
+def _certificate_details(der: bytes) -> CertificateDetails:
+    from cryptography import x509  # lazy: only inspection needs it
+
+    cert = x509.load_der_x509_certificate(der)
+    san: list[str] = []
+    try:
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    except x509.ExtensionNotFound:
+        pass
+    else:
+        for entry in ext.value:
+            if isinstance(entry, x509.IPAddress):
+                san.append(f"IP:{entry.value}")
+            elif isinstance(entry, x509.DNSName):
+                san.append(f"DNS:{entry.value}")
+            else:
+                san.append(f"{type(entry).__name__}:{entry.value}")
+    not_after = cert.not_valid_after_utc
+    return CertificateDetails(
+        sha256=fingerprint_sha256(der),
+        subject=_format_name(cert.subject),
+        issuer=_format_name(cert.issuer),
+        not_before=cert.not_valid_before_utc,
+        not_after=not_after,
+        expired=not_after < datetime.now(timezone.utc),
+        san=san,
+        version=cert.version.value + 1,
+        pem=ssl.DER_cert_to_PEM_cert(der),
+    )
+
+
+async def inspect_tls(
+    base_url: str,
+    *,
+    pin: Optional[TlsPin] = None,
+    timeout: float = INSPECT_TIMEOUT,
+) -> TlsInspection:
+    """Read the certificate ``base_url`` presents; sends no application data.
+
+    The first handshake verifies exactly as SRW's httpx clients do. If that
+    fails on the certificate, a second handshake without verification reads it,
+    so the admin can see what they would be trusting.
+    """
+    host, port = _https_target(base_url)
+    reason: Optional[str] = None
+    message: Optional[str] = None
+    try:
+        der = await _handshake_der(host, port, httpx.create_ssl_context(), timeout)
+    except Exception as exc:
+        verification = _verification_error(exc)
+        if verification is None:
+            return TlsInspection(False, None, None, None, None, _error_text(exc))
+        code = getattr(verification, "verify_code", None)
+        reason = REASON_BY_VERIFY_CODE.get(code, "other")
+        message = getattr(verification, "verify_message", None) or str(verification)
+        try:
+            der = await _handshake_der(host, port, _lookup_context(), timeout)
+        except Exception as exc2:
+            return TlsInspection(False, None, None, None, None, _error_text(exc2))
+    if not der:
+        return TlsInspection(False, None, None, None, None, "no certificate presented")
+    try:
+        details = _certificate_details(der)
+    except Exception as exc:
+        return TlsInspection(
+            False, None, None, None, None, f"unreadable certificate: {exc}"
+        )
+    return TlsInspection(
+        verified=reason is None,
+        reason=reason,
+        message=message,
+        certificate=details,
+        pin_matches=None if pin is None else details.sha256 == pin.sha256,
+        error=None,
+    )
+
+
+def _error_text(exc: BaseException) -> str:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timed out"
+    return str(exc) or type(exc).__name__
+
+
+async def pinned_handshake_error(
+    base_url: str, pin: TlsPin, *, timeout: float = INSPECT_TIMEOUT
+) -> Optional[str]:
+    """One handshake under ``pin``: ``None`` if SRW can use it, else why not.
+
+    Lets the Trust API refuse a certificate OpenSSL would reject (a weak key,
+    say) before storing it. Sends no application data.
+    """
+    host, port = _https_target(base_url)
+    try:
+        await _handshake_der(host, port, pinned_ssl_context(pin), timeout)
+    except Exception as exc:
+        verification = _verification_error(exc)
+        if verification is not None:
+            return getattr(verification, "verify_message", None) or str(verification)
+        return _error_text(exc)
+    return None
