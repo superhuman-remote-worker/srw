@@ -11,6 +11,10 @@ A server with no model list (TEI) answers that probe 404; both Tests then
 judge an embedding or rerank row by :func:`probe_endpoint_capability`, one
 minimal call of that capability.
 
+Both probes take the endpoint's pinned certificate (``tls_pin``): the client
+then trusts exactly that certificate, checked in the handshake before any
+request byte. Without a pin they verify as before.
+
 The capability hint is a name-based heuristic, not authoritative — users
 are expected to override it at import time when the provider's naming
 convention doesn't line up (e.g., ``text-embedding-3-*`` → embedding, but
@@ -28,6 +32,7 @@ import httpx
 
 from shared.runtime.core.model_registry import family_of
 from shared.runtime.core.transport_resolution import wire_model_id
+from shared.tls_pinning import TlsPin, httpx_client_kwargs
 
 
 @dataclass
@@ -161,11 +166,14 @@ async def probe_endpoint_models(
     api_key: str | None,
     *,
     timeout: float = 10.0,
+    tls_pin: TlsPin | None = None,
 ) -> ProbeResult:
     """Probe ``{base_url}/models`` and return the parsed model list.
 
     Does not raise. Transport errors land in ``ProbeResult.error`` so both
-    the test and discover handlers can surface them without wrapping.
+    the test and discover handlers can surface them without wrapping; a
+    server that does not present ``tls_pin`` is one of them, and receives
+    no request.
     """
     probe_url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {}
@@ -173,7 +181,9 @@ async def probe_endpoint_models(
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, **httpx_client_kwargs(tls_pin, asynchronous=True)
+        ) as client:
             resp = await client.get(probe_url, headers=headers)
     except httpx.HTTPError as e:
         return ProbeResult(
@@ -317,14 +327,15 @@ async def probe_endpoint_capability(
     capability: str,
     model: str,
     timeout: float = 10.0,
+    tls_pin: TlsPin | None = None,
 ) -> ProbeResult:
     """Make one minimal ``capability`` call against ``{base_url}``.
 
     ``model`` is the row's upstream name (its served id, else its catalog id);
     a routing prefix the provider rejects is dropped as SRW's embedding and
     rerank clients drop it. Same client settings as the model-list probe
-    (timeout, default TLS verification, Bearer key only when set) and the same
-    host. Does not raise.
+    (timeout, ``tls_pin`` or else default TLS verification, Bearer key only
+    when set) and the same host. Does not raise.
     """
     path, body, result_field = _capability_probe_request(
         capability, wire_model_id(model, base_url)
@@ -335,7 +346,9 @@ async def probe_endpoint_capability(
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, **httpx_client_kwargs(tls_pin, asynchronous=True)
+        ) as client:
             resp = await client.post(probe_url, headers=headers, json=body)
     except httpx.HTTPError as e:
         return ProbeResult(False, None, f"{type(e).__name__}: {e}", probe_url)

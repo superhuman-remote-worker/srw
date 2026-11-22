@@ -1,10 +1,13 @@
-"""``GET {base_url}/models`` probe error reporting."""
+"""``GET {base_url}/models`` probe error reporting and its pinned client."""
+# ruff: noqa: F811  (the imported fixtures are requested by name as test arguments)
 
 import httpx
 import pytest
 
 from orchestrator.services import llm_endpoint_probe
 from orchestrator.services.llm_endpoint_probe import probe_endpoint_models
+from shared.tls_pinning import TlsPin
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 SEARXNG_404 = (
     '<!DOCTYPE html>\n<html class="no-js theme-auto" lang="en-EN" >\n<head>\n'
@@ -104,3 +107,45 @@ async def test_a_declared_live_voice_model_needs_no_name_hint(serve):
         "llava-13b": ["chat", "auxiliary"],
         "gpt-live-1": ["live_voice"],
     }
+
+
+# --- Through a pinned certificate (real TLS server) ---------------------------
+
+
+def _pin(path) -> TlsPin:
+    return TlsPin.from_pem(path.read_text())
+
+
+@pytest.mark.asyncio
+async def test_models_probe_goes_through_the_pin(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        result = await probe_endpoint_models(srv.url, "k", tls_pin=_pin(tls_certs.leaf))
+
+    assert result.ok is True
+    assert [model["id"] for model in result.models] == ["m1"]
+    assert srv.requests == [
+        {"method": "GET", "path": "/v1/models", "authorization": "Bearer k"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_models_probe_with_another_pin_sends_nothing(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        result = await probe_endpoint_models(srv.url, "k", tls_pin=_pin(tls_certs.swap))
+
+    assert srv.requests == []
+    assert result.ok is False
+    assert result.status is None
+    assert result.error.startswith(
+        f"CertificateChangedError: TLS certificate changed for 127.0.0.1:{srv.port}:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_models_probe_without_a_pin_keeps_normal_verification(tls_certs):
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        result = await probe_endpoint_models(srv.url, "k")
+
+    assert srv.requests == []
+    assert result.ok is False
+    assert "CERTIFICATE_VERIFY_FAILED" in result.error

@@ -3,8 +3,10 @@
 Hugging Face TEI serves ``POST /embeddings`` (or ``/rerank``) but has no
 ``GET /models``. The Test route must not report such an endpoint as failing
 when the capability call it exists for succeeds. Requests go to a fake server
-standing in for the endpoint's host; no network is used.
+standing in for the endpoint's host; no network is used. The pinned cases
+run against a local TLS server.
 """
+# ruff: noqa: F811  (the imported fixtures are requested by name as test arguments)
 
 import json
 from datetime import datetime, timezone
@@ -14,7 +16,9 @@ from uuid import UUID
 import httpx
 import pytest
 
+from shared.tls_pinning import TlsInspection, TlsPin
 from tests._mounted_router import mount_router
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 REAL_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -152,6 +156,7 @@ async def test_tei_embedding_endpoint_without_model_list_tests_ok(serve, store):
         "status": 200,
         "error": None,
         "probe_url": f"{BASE_URL}/embeddings",
+        "tls": None,
     }
     assert server.calls() == [
         ("GET", f"{BASE_URL}/models"),
@@ -185,6 +190,7 @@ async def test_rerank_endpoint_is_probed_with_the_rerank_clients_shape(serve, st
         "status": 200,
         "error": None,
         "probe_url": f"{BASE_URL}/rerank",
+        "tls": None,
     }
     rerank = server.requests[-1]
     assert (rerank.method, str(rerank.url)) == ("POST", f"{BASE_URL}/rerank")
@@ -208,6 +214,7 @@ async def test_failing_capability_call_reports_its_own_failure(serve, store):
         "status": 401,
         "error": '{"error":"bad key"}',
         "probe_url": f"{BASE_URL}/embeddings",
+        "tls": None,
     }
     assert len(server.requests) == 2
 
@@ -260,6 +267,7 @@ async def test_embedding_endpoint_with_a_model_list_costs_no_extra_call(serve, s
         "status": 200,
         "error": None,
         "probe_url": f"{BASE_URL}/models",
+        "tls": None,
     }
     assert server.calls() == [("GET", f"{BASE_URL}/models")]
 
@@ -324,6 +332,7 @@ async def test_tei_embedding_row_without_model_list_tests_ok(serve, store):
         "status": 200,
         "error": None,
         "probe_url": f"{BASE_URL}/embeddings",
+        "tls": None,
     }
     assert server.calls() == [
         ("GET", f"{BASE_URL}/models"),
@@ -353,6 +362,7 @@ async def test_rerank_row_is_probed_by_its_own_capability(serve, store):
         "status": 200,
         "error": None,
         "probe_url": f"{BASE_URL}/rerank",
+        "tls": None,
     }
     assert json.loads(server.requests[-1].content)["model"] == "bge-reranker-v2-m3"
     store.list_models.assert_not_awaited()
@@ -373,8 +383,20 @@ async def test_chat_row_keeps_the_model_list_result(serve, store):
     assert server.calls() == [("GET", f"{BASE_URL}/models")]
 
 
+@pytest.fixture
+def certificate_verifies(monkeypatch):
+    """An https:// endpoint's certificate verifies normally (no handshake)."""
+    from orchestrator.services import endpoint_tls
+
+    inspect = AsyncMock(return_value=TlsInspection(True, None, None, None, None, None))
+    monkeypatch.setattr(endpoint_tls, "inspect_tls", inspect)
+    return inspect
+
+
 @pytest.mark.asyncio
-async def test_row_probe_drops_the_routing_prefix_its_provider_rejects(serve, store):
+async def test_row_probe_drops_the_routing_prefix_its_provider_rejects(
+    serve, store, certificate_verifies
+):
     # Same wire_model_id rule as the embedding client: the provider's own API
     # names the model without the ``openrouter/`` routing prefix.
     store.get_system_llm_endpoint.return_value = endpoint_row(
@@ -411,3 +433,74 @@ async def test_capability_probe_reports_a_transport_error_without_raising(serve)
     assert result.status is None
     assert result.error == "ConnectError: connection refused"
     assert result.probe_url == f"{BASE_URL}/embeddings"
+
+
+# --- Through a pinned certificate (real TLS server) ---------------------------
+
+
+def _pin(path) -> TlsPin:
+    return TlsPin.from_pem(path.read_text())
+
+
+def _pinned(path) -> dict:
+    pin = _pin(path)
+    return {
+        "tls_pin_sha256": pin.sha256,
+        "tls_pin_cert": path.read_text(),
+        "tls_pin_subject": "CN=127.0.0.1",
+        "tls_pin_issuer": "CN=pin test CA",
+        "tls_pin_not_after": datetime(2036, 1, 1, tzinfo=timezone.utc),
+        "tls_pinned_at": datetime(2026, 11, 22, tzinfo=timezone.utc),
+        "tls_pinned_by": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_goes_through_the_pin(tls_certs):
+    from orchestrator.services.llm_endpoint_probe import probe_endpoint_capability
+
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        result = await probe_endpoint_capability(
+            base_url=srv.url,
+            api_key=API_KEY,
+            capability="embedding",
+            model="m1",
+            tls_pin=_pin(tls_certs.leaf),
+        )
+        wrong = await probe_endpoint_capability(
+            base_url=srv.url,
+            api_key=API_KEY,
+            capability="embedding",
+            model="m1",
+            tls_pin=_pin(tls_certs.swap),
+        )
+
+    assert result.ok is True
+    assert wrong.ok is False
+    assert wrong.error.startswith("CertificateChangedError: TLS certificate changed")
+    # Only the pinned call reached the server.
+    assert srv.requests == [
+        {
+            "method": "POST",
+            "path": "/v1/embeddings",
+            "authorization": f"Bearer {API_KEY}",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tei_fallback_goes_through_the_pin(tls_certs, store):
+    no_model_list = {("GET", "/v1/models"): lambda body: (404, {"error": "Not Found"})}
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key, no_model_list) as srv:
+        store.get_system_llm_endpoint.return_value = endpoint_row(
+            base_url=srv.url, **_pinned(tls_certs.leaf)
+        )
+        body = (await post_test(store)).json()
+
+    assert body["ok"] is True
+    assert body["probe_url"] == f"{srv.url}/embeddings"
+    assert body["tls"]["pin_matches"] is True
+    assert [(r["method"], r["path"], r["authorization"]) for r in srv.requests] == [
+        ("GET", "/v1/models", f"Bearer {API_KEY}"),
+        ("POST", "/v1/embeddings", f"Bearer {API_KEY}"),
+    ]

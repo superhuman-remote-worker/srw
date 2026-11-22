@@ -222,7 +222,10 @@ async def discover_subscription_models(
     """
     from orchestrator.services.llm_endpoint_probe import probe_endpoint_models
 
-    probe = await probe_endpoint_models(base_url=base_url, api_key=api_key)
+    # The proxy is an in-cluster http:// Service and is never pinned.
+    probe = await probe_endpoint_models(
+        base_url=base_url, api_key=api_key, tls_pin=None
+    )
     if not probe.ok:
         return DiscoveryResult(
             ok=False, probe_url=probe.probe_url, error=probe.error, candidates=[]

@@ -31,6 +31,7 @@ from orchestrator.schemas.provider_catalog import (
     VALID_DEFAULT_MODEL_KINDS,
     VALID_SYSTEM_API_KEY_PROVIDERS,
 )
+from orchestrator.services import endpoint_tls
 from orchestrator.services.provider_catalog import EndpointProbe
 from orchestrator.services.readiness import try_auto_pin_required_defaults
 from shared.runtime.core.model_registry import served_model_problem
@@ -611,13 +612,16 @@ class ModelCatalogService:
     async def test_catalog_model(self, catalog_id: str) -> dict[str, Any]:
         """Probe a catalog row's transport.
 
-        For ``provider_kind='endpoint'``, calls ``GET {endpoint.base_url}/models``
-        via the existing endpoint-probe helper; on a 404 there (TEI has no
-        model list) an embedding or rerank row is judged by one minimal call
-        of its own capability instead. For ``provider_kind='system'``,
-        confirms the ``system_api_keys`` row exists and returns ``ok=True``
-        without round-tripping the provider — vendor-specific health probes
-        are out of scope for v1.
+        For ``provider_kind='endpoint'``, reads an ``https://`` endpoint's
+        certificate first and answers with the endpoint Test's ``tls`` block
+        (nothing is sent when it fails normal verification without a pin, or
+        fails the pin), then calls ``GET {endpoint.base_url}/models`` via the
+        existing endpoint-probe helper, through the pin when there is one; on
+        a 404 there (TEI has no model list) an embedding or rerank row is
+        judged by one minimal call of its own capability instead. For
+        ``provider_kind='system'``, confirms the ``system_api_keys`` row
+        exists and returns ``ok=True`` without round-tripping the provider —
+        vendor-specific health probes are out of scope for v1.
         """
         row = await self.store.get_model(catalog_id)
         if row is None:
@@ -633,8 +637,26 @@ class ModelCatalogService:
                         f"'{row['provider_ref']}' — repoint or delete."
                     ),
                 )
+            # The endpoint's rows decide only whether Trust is offered, which
+            # matters only for an https:// endpoint.
+            rows = (
+                await self.store.list_models(
+                    provider_kind="endpoint", provider_ref=str(endpoint["id"])
+                )
+                if endpoint_tls.inspects(endpoint)
+                else []
+            )
+            tls, may_probe = await endpoint_tls.preflight(
+                endpoint,
+                trustable=endpoint_tls.endpoint_trust_refusal(endpoint, rows) is None,
+            )
+            if not may_probe:
+                return endpoint_tls.blocked_test_response(endpoint, tls or {})
+            pin = endpoint_tls.probe_pin(endpoint)
             result = await self.probe(
-                base_url=endpoint["base_url"], api_key=endpoint.get("api_key")
+                base_url=endpoint["base_url"],
+                api_key=endpoint.get("api_key"),
+                tls_pin=pin,
             )
             if result.status == 404:
                 from orchestrator.services.llm_endpoint_probe import (
@@ -649,12 +671,14 @@ class ModelCatalogService:
                         api_key=endpoint.get("api_key"),
                         capability=capability,
                         model=row.get("served_model_id") or row["model_id"],
+                        tls_pin=pin,
                     )
             return {
                 "ok": result.ok,
                 "status": result.status,
                 "error": result.error,
                 "probe_url": result.probe_url,
+                "tls": tls,
             }
 
         key = await self.store.get_system_api_key(row["provider_ref"])
@@ -666,8 +690,15 @@ class ModelCatalogService:
                     f"No system_api_keys row for provider '{row['provider_ref']}'."
                 ),
                 "probe_url": None,
+                "tls": None,
             }
-        return {"ok": True, "status": 200, "error": None, "probe_url": None}
+        return {
+            "ok": True,
+            "status": 200,
+            "error": None,
+            "probe_url": None,
+            "tls": None,
+        }
 
     async def list_families(self) -> dict[str, Any]:
         """Return the family keys defined in ``model_config_matrix.yaml`` plus each

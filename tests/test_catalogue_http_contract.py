@@ -129,6 +129,16 @@ def catalogue(monkeypatch, tmp_path):
     monkeypatch.setattr(
         subscription_discovery, "discover_subscription_models", subscription_discover
     )
+    # Discover and Test read an https:// endpoint's certificate first; here it
+    # verifies normally, without a handshake.
+    from orchestrator.services import endpoint_tls
+    from shared.tls_pinning import TlsInspection
+
+    monkeypatch.setattr(
+        endpoint_tls,
+        "inspect_tls",
+        AsyncMock(return_value=TlsInspection(True, None, None, None, None, None)),
+    )
     monkeypatch.setattr(
         subscription_discovery, "import_candidates", subscription_import
     )
@@ -480,6 +490,7 @@ async def test_plain_discovery_keeps_plain_shape_and_refuses_bulk_import(catalog
     catalogue.probe.assert_awaited_once_with(
         base_url="https://models.invalid/v1",
         api_key="test-secret-that-must-not-be-on-the-wire",
+        tls_pin=None,
     )
     response = await catalogue.request(
         "POST", f"/api/admin/providers/endpoints/{ROW_ID}/models/import", json={}

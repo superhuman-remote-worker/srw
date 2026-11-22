@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         ImportOutcome,
         ModelCandidate,
     )
+    from shared.tls_pinning import TlsPin
 
 
 class ProviderCatalogStore(Protocol):
@@ -125,7 +126,9 @@ class ProviderCatalogStore(Protocol):
 
 
 class EndpointProbe(Protocol):
-    async def __call__(self, *, base_url: str, api_key: str | None) -> ProbeResult: ...
+    async def __call__(
+        self, *, base_url: str, api_key: str | None, tls_pin: TlsPin | None = None
+    ) -> ProbeResult: ...
 
 
 class ProviderDiscovery(Protocol):
@@ -512,24 +515,36 @@ class ProviderCatalogService:
     async def test_provider_endpoint(self, endpoint_id: str) -> dict[str, Any]:
         """Probe a system endpoint server-side.
 
-        ``GET {base_url}/models`` first. A 404 there only means the server has
-        no model list (TEI): an endpoint with an embedding or rerank row is
-        then judged by one minimal call of that capability instead.
+        An ``https://`` endpoint's certificate is read first (``tls``): when it
+        fails normal verification without a pin, or fails the pin, nothing is
+        sent. Then ``GET {base_url}/models``, through the pin when there is
+        one. A 404 there only means the server has no model list (TEI): an
+        endpoint with an embedding or rerank row is then judged by one minimal
+        call of that capability instead.
         """
+        from orchestrator.services import endpoint_tls
+
         endpoint = await self.store.get_system_llm_endpoint(endpoint_id)
         if endpoint is None:
             raise HTTPException(status_code=404, detail="System endpoint not found")
 
+        rows = await self.store.list_models(
+            provider_kind="endpoint", provider_ref=str(endpoint["id"])
+        )
+        tls, may_probe = await endpoint_tls.preflight(
+            endpoint,
+            trustable=endpoint_tls.endpoint_trust_refusal(endpoint, rows) is None,
+        )
+        if not may_probe:
+            return endpoint_tls.blocked_test_response(endpoint, tls or {})
+        pin = endpoint_tls.probe_pin(endpoint)
         result = await self.probe(
             base_url=endpoint["base_url"],
             api_key=endpoint.get("api_key"),
+            tls_pin=pin,
         )
         if result.status == 404:
-            target = _capability_probe_target(
-                await self.store.list_models(
-                    provider_kind="endpoint", provider_ref=str(endpoint["id"])
-                )
-            )
+            target = _capability_probe_target(rows)
             if target is not None:
                 from orchestrator.services.llm_endpoint_probe import (
                     probe_endpoint_capability,
@@ -541,12 +556,14 @@ class ProviderCatalogService:
                     api_key=endpoint.get("api_key"),
                     capability=capability,
                     model=model,
+                    tls_pin=pin,
                 )
         return {
             "ok": result.ok,
             "status": result.status,
             "error": result.error,
             "probe_url": result.probe_url,
+            "tls": tls,
         }
 
     async def _subscription_discovery(
@@ -607,9 +624,24 @@ class ProviderCatalogService:
                 "models": [],
             }
 
+        # The certificate first, as in Test: nothing is sent to a server that
+        # fails normal verification without a pin, or fails its pin.
+        from orchestrator.services import endpoint_tls
+
+        tls, may_probe = await endpoint_tls.preflight(endpoint, trustable=False)
+        if not may_probe:
+            return {
+                "subscription": False,
+                "ok": False,
+                "status": None,
+                "error": endpoint_tls.blocked_discover_error(tls or {}),
+                "probe_url": endpoint_tls.models_url(endpoint),
+                "models": [],
+            }
         result = await self.probe(
             base_url=endpoint["base_url"],
             api_key=endpoint.get("api_key"),
+            tls_pin=endpoint_tls.probe_pin(endpoint),
         )
 
         return {
