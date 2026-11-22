@@ -8145,13 +8145,18 @@ class TestHandleConfigUpdateEnrichmentGate:
         """A served model string belongs to the model it came with: the swap
         clears the old one of every slot the block touches before applying."""
         from inspect import getsource
-        from agent.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import (
+            _apply_live_embedding_env,
+            _handle_config_update,
+        )
 
         src = getsource(_handle_config_update)
         assert "EMBEDDING_SERVED_MODEL" in src
         assert "RERANK_SERVED_MODEL" in src
-        assert src.index("clear_served_model_env(") < src.index(
-            "os.environ[k] = str(new_env_block[k])"
+        assert "_apply_live_embedding_env(new_env_block, embedding_env_keys)" in src
+        helper = getsource(_apply_live_embedding_env)
+        assert helper.index("clear_served_model_env(") < helper.index(
+            "os.environ.update(applied)"
         )
 
     def test_gate_checks_tool_updates_before_local_reload(self):
@@ -8308,16 +8313,18 @@ class TestHandleConfigUpdateEnrichmentGate:
         src = getsource(_handle_config_update)
         assert "_session.auxiliary_llm = AuxiliaryLLM(" in src
 
-    def test_resets_embedding_singleton(self):
+    def test_resets_embedding_singleton(self, monkeypatch):
         """Embedding hot-swap must clear ``embedding_service._embedding_service``
         so the next get_embedding_service() call rebuilds with the new
         env. Without this the process-wide singleton sticks at the
         boot-time base_url and 401s on api.openai.com."""
-        from inspect import getsource
-        from agent.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _apply_live_embedding_env
+        from shared.runtime.services import embedding_service
 
-        src = getsource(_handle_config_update)
-        assert "_embedding_module._embedding_service = None" in src
+        monkeypatch.setattr(embedding_service, "_embedding_service", object())
+        monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+        assert _apply_live_embedding_env({"EMBEDDING_MODEL": "e2"})
+        assert embedding_service._embedding_service is None
 
 
 class TestSessionArchiveModelName:

@@ -369,6 +369,58 @@ def ensure_job_branch(
         return None
 
 
+def export_job_env_keys(env_keys: Optional[Dict[str, Any]]) -> None:
+    """Apply one job's dispatched ``env_keys`` block to this process.
+
+    The pod is reused (pool, loop and dual pods serve job after job, and a
+    dual pod may have served a Session before), so each block is applied
+    against whatever the previous one left. KB embedding transport is
+    authoritative per dispatch and replaced as a whole; every other name in
+    the dispatch allow-list is set from the block, and anything else (an
+    arbitrary SDK variable) is dropped.
+    """
+    from shared.runtime.core.transport_resolution import (
+        clear_replaced_endpoint_pins,
+        clear_served_model_env,
+        exportable_env_keys,
+    )
+    from shared.runtime.services.embedding_service import (
+        KB_EMBEDDING_ENV_KEYS,
+        apply_kb_embedding_env,
+    )
+
+    exportable, dropped = exportable_env_keys(env_keys)
+    # A served model string belongs to the block that named it: a later job
+    # that pins its own {PREFIX}_MODEL must not inherit the previous job's
+    # upstream name.
+    clear_served_model_env()
+    # A pin belongs to the URL it came with: a block with a new, unpinned URL
+    # for a slot names no pin, so the previous block's pin is dropped here. A
+    # slot the block leaves alone keeps its URL and pin together.
+    clear_replaced_endpoint_pins(exportable)
+    # Clear every old KB field before applying the new in-flight block: an
+    # omitted BASE_URL/API_KEY must not pair a new model with the previous
+    # endpoint/credential.
+    apply_kb_embedding_env(env_keys)
+    if not env_keys:
+        return
+    if dropped:
+        logger.warning(
+            "Ignored %d env key(s) outside the dispatch allow-list: %s",
+            len(dropped),
+            dropped,
+        )
+    for k, v in exportable.items():
+        if k not in KB_EMBEDDING_ENV_KEYS:
+            os.environ[k] = v
+    # Log the key NAMES (never values) so a missing credential — e.g.
+    # EMBEDDING_API_KEY, which silently disables memory + KB — is greppable
+    # in the agent log.
+    logger.info(
+        f"Applied {len(env_keys)} env key override(s): {sorted(env_keys.keys())}"
+    )
+
+
 class UniversalAgent:
     """
     Configurable autonomous agent using workspace-centric architecture.
@@ -2211,6 +2263,15 @@ class UniversalAgent:
                 "env_keys"
             )
         keys = set(env_keys) if isinstance(env_keys, dict) else set()
+        if keys:
+            from shared.runtime.core.transport_resolution import (
+                endpoint_pins_replaced_by,
+                exportable_env_keys,
+            )
+
+            # The export drops the pin of every endpoint the block replaces,
+            # though the block need not name it: restore that one as well.
+            keys.update(endpoint_pins_replaced_by(exportable_env_keys(env_keys)[0]))
         self._worker_env_restore = {key: os.environ.get(key) for key in keys}
 
     def _restore_worker_environment(self) -> None:
@@ -3596,45 +3657,9 @@ class UniversalAgent:
             env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
                 "env_keys"
             )
-        # KB embedding transport is authoritative per dispatch. Pool/loop agents
-        # can process a later job after the system profile changes (or a job with
-        # no knowledge scope), so clear every old field before applying the new
-        # in-flight block. Otherwise an omitted BASE_URL/API_KEY can survive and
-        # pair a new model with the previous endpoint/credential.
-        import os as _os
-        from shared.runtime.core.transport_resolution import clear_served_model_env
-        from shared.runtime.services.embedding_service import (
-            KB_EMBEDDING_ENV_KEYS,
-            apply_kb_embedding_env,
-        )
-
-        # A served model string belongs to the block that named it: a later
-        # job that pins its own {PREFIX}_MODEL must not inherit the previous
-        # job's upstream name (this pod is reused).
-        clear_served_model_env()
-        apply_kb_embedding_env(env_keys)
-        if env_keys:
-            from shared.runtime.core.transport_resolution import exportable_env_keys
-
-            # Only the names the orchestrator's dispatch injectors write reach
-            # os.environ; any other name (an arbitrary SDK variable) is dropped.
-            exportable, dropped = exportable_env_keys(env_keys)
-            if dropped:
-                logger.warning(
-                    "Ignored %d env key(s) outside the dispatch allow-list: %s",
-                    len(dropped),
-                    dropped,
-                )
-            for k, v in exportable.items():
-                if k not in KB_EMBEDDING_ENV_KEYS:
-                    _os.environ[k] = v
-            # Log the key NAMES (never values) so a missing credential — e.g.
-            # EMBEDDING_API_KEY, which silently disables memory + KB — is
-            # greppable in the agent log.
-            logger.info(
-                f"Applied {len(env_keys)} env key override(s): "
-                f"{sorted(env_keys.keys())}"
-            )
+        # The pod is reused: export_job_env_keys applies this block against
+        # whatever the previous job (or Session) left in os.environ.
+        export_job_env_keys(env_keys)
 
         # Recreate LLMs if config was modified for this job. On resume we
         # always recreate when frozen config was loaded — frozen config has

@@ -48,6 +48,7 @@ from agent.api.native_workspace_first_use import (
 )
 from agent.api import session_workspace as _session_workspace
 from agent.api.session_attach import (
+    MEMORY_EMBEDDING_ENV_KEYS,
     SessionAttachCoordinator,
     SessionAttachPorts,
 )
@@ -11136,6 +11137,42 @@ async def _model_swap_fit_ladder(new_config: Any) -> Optional[str]:
     return None
 
 
+def _apply_live_embedding_env(
+    new_env_block: Dict[str, Any], names: tuple = MEMORY_EMBEDDING_ENV_KEYS
+) -> bool:
+    """Apply a live config update's embedding and rerank env keys.
+
+    Returns whether the block names any of ``names``; only then is anything
+    changed. A ``None`` value is not applied. The memory-embedding singleton
+    is reset so the next call builds its client from the new values.
+    """
+    if not any(k in new_env_block for k in names):
+        return False
+    from shared.runtime.core.transport_resolution import (
+        clear_replaced_endpoint_pins,
+        clear_served_model_env,
+    )
+
+    # A served string belongs to the model it came with: drop the old one of
+    # every slot this block touches before applying it.
+    clear_served_model_env(
+        sorted({k.split("_", 1)[0] for k in names if k in new_env_block})
+    )
+    applied = {
+        k: str(new_env_block[k])
+        for k in names
+        if k in new_env_block and new_env_block[k] is not None
+    }
+    # A pin belongs to the URL it came with: a new, unpinned URL names no pin,
+    # so the old one is dropped. A slot whose URL stays keeps its pin.
+    clear_replaced_endpoint_pins(applied)
+    os.environ.update(applied)
+    from shared.runtime.services import embedding_service as _embedding_module
+
+    _embedding_module._embedding_service = None
+    return True
+
+
 async def _handle_config_update(
     ws: WebSocket,
     config_override: Dict[str, Any],
@@ -11509,28 +11546,7 @@ async def _handle_config_update(
 
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}
-        if any(k in new_env_block for k in embedding_env_keys):
-            from shared.runtime.core.transport_resolution import (
-                clear_served_model_env,
-            )
-
-            # A served string belongs to the model it came with: drop the old
-            # one of every slot this block touches before applying it.
-            clear_served_model_env(
-                sorted(
-                    {
-                        k.split("_", 1)[0]
-                        for k in embedding_env_keys
-                        if k in new_env_block
-                    }
-                )
-            )
-            for k in embedding_env_keys:
-                if k in new_env_block and new_env_block[k] is not None:
-                    os.environ[k] = str(new_env_block[k])
-            from shared.runtime.services import embedding_service as _embedding_module
-
-            _embedding_module._embedding_service = None
+        if _apply_live_embedding_env(new_env_block, embedding_env_keys):
             logger.info(
                 "Embedding hot-swapped: provider=%s, model=%s, base_url=%s",
                 new_env_block.get(

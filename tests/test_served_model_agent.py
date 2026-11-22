@@ -580,10 +580,13 @@ class TestJobExportSeam:
         with the next job's {PREFIX}_MODEL."""
         from inspect import getsource
 
-        from agent.agent import UniversalAgent
+        from agent.agent import UniversalAgent, export_job_env_keys
 
-        src = getsource(UniversalAgent._setup_job_workspace)
+        assert "export_job_env_keys(env_keys)" in getsource(
+            UniversalAgent._setup_job_workspace
+        )
+        src = getsource(export_job_env_keys)
         assert src.index("clear_served_model_env()") < src.index(
             "apply_kb_embedding_env(env_keys)"
         )
-        assert src.index("clear_served_model_env()") < src.index("_os.environ[k] = v")
+        assert src.index("clear_served_model_env()") < src.index("os.environ[k] = v")
