@@ -1,4 +1,5 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
+import {tlsView} from '../providers/admin-providers.tls-pin';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminModelsService, catalogErrorDetail} from '../../../core/services/admin-models.service';
@@ -450,6 +451,16 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                             <span class="test-result-text">{{ result.ok ? 'OK' : (result.error || 'failed') }}</span>
                           </app-badge>
                         </span>
+                        @if (tlsView(result.tls); as tv) {
+                          @if (tv.show) {
+                            <span class="tls-note" data-testid="tls-note">
+                              {{ tv.reasonKey ? (tv.reasonKey | transloco) : result.tls?.message }}
+                              @if (tv.trust) {
+                                {{ 'admin.providers.endpoints.tls.catalogHint' | transloco }}
+                              }
+                            </span>
+                          }
+                        }
                       }
                     </span>
                   </div>
@@ -1186,6 +1197,10 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     .test-result app-badge {
       max-width: 100%;
     }
+    .tls-note {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
     .test-result-text {
       min-width: 0;
       overflow: hidden;
@@ -1603,6 +1618,7 @@ export class AdminCatalogComponent implements OnInit {
   readonly pricingSaving = signal(false);
   readonly pricingError = signal<string | null>(null);
   // Exposed for the template (pure helpers, unit-tested in admin-models.pricing.spec.ts).
+  protected readonly tlsView = tlsView;
   protected readonly pricingModeOf = pricingModeOf;
   protected readonly pricingLabelOf = pricingLabelOf;
 

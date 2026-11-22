@@ -15,6 +15,7 @@ import {
   LlmEndpointUpdateRequest,
 } from '../../../core/models/api.model';
 import {timer} from 'rxjs';
+import {pinBadge, tlsView} from './admin-providers.tls-pin';
 import {filter, switchMap, take} from 'rxjs/operators';
 import {AppButtonComponent} from '../../../ui/button';
 import {AppInputComponent} from '../../../ui/input';
@@ -332,6 +333,18 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                       </app-badge>
                     }
                     <span class="endpoint-url mono">{{ endpoint.base_url }}</span>
+                    @if (pinBadge(endpoint.tls_pin); as pb) {
+                      @if (pb.show) {
+                        <app-badge tone="info" size="sm" shape="pill" [title]="pb.title">
+                          {{ 'admin.providers.endpoints.tls.pinnedBadge' | transloco }}
+                        </app-badge>
+                        @if (pb.expired) {
+                          <app-badge tone="warning" size="sm" shape="pill">
+                            {{ 'admin.providers.endpoints.tls.expiredBadge' | transloco: {date: pb.expiredDate} }}
+                          </app-badge>
+                        }
+                      }
+                    }
                     @if (endpoint.key_prefix) {
                       <span class="endpoint-key mono">key {{ endpoint.key_prefix }}...</span>
                     } @else {
@@ -367,6 +380,15 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                         {{ 'common.edit' | transloco }}
                       </app-button>
                     }
+                    @if (endpoint.tls_pin) {
+                      <app-button
+                        variant="secondary"
+                        size="sm"
+                        (clicked)="removePin(endpoint.id)"
+                      >
+                        {{ 'admin.providers.endpoints.tls.removePin' | transloco }}
+                      </app-button>
+                    }
                     <app-button
                       variant="danger"
                       size="sm"
@@ -391,6 +413,64 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                          error: result.error ?? ''} }}
                     }
                   </div>
+                  @if (tlsView(result.tls); as tv) {
+                    @if (tv.show) {
+                      <div class="tls-block" data-testid="tls-block">
+                        <p class="tls-reason">
+                          @if (tv.reasonKey) {
+                            {{ tv.reasonKey | transloco }}
+                          } @else {
+                            {{ result.tls?.message }}
+                          }
+                        </p>
+                        @if (tv.verifiesNormally) {
+                          <p>{{ 'admin.providers.endpoints.tls.verifiesNormally' | transloco }}</p>
+                        }
+                        @if (tv.showCertificate && result.tls?.certificate; as c) {
+                          @if (tv.sideBySide && result.tls?.pin; as p) {
+                            <dl class="tls-facts">
+                              <dt>{{ 'admin.providers.endpoints.tls.oldFingerprint' | transloco }}</dt>
+                              <dd class="mono tls-fp">{{ p.sha256 }}</dd>
+                              <dt>{{ 'admin.providers.endpoints.tls.newFingerprint' | transloco }}</dt>
+                              <dd class="mono tls-fp">{{ c.sha256 }}</dd>
+                            </dl>
+                          } @else {
+                            <dl class="tls-facts">
+                              <dt>{{ 'admin.providers.endpoints.tls.fingerprint' | transloco }}</dt>
+                              <dd class="mono tls-fp">{{ c.sha256 }}</dd>
+                            </dl>
+                          }
+                          <dl class="tls-facts">
+                            <dt>{{ 'admin.providers.endpoints.tls.subject' | transloco }}</dt>
+                            <dd>{{ c.subject }}</dd>
+                            <dt>{{ 'admin.providers.endpoints.tls.issuer' | transloco }}</dt>
+                            <dd>{{ c.issuer }}</dd>
+                            <dt>{{ 'admin.providers.endpoints.tls.validity' | transloco }}</dt>
+                            <dd>{{ c.not_before }} – {{ c.not_after }}</dd>
+                          </dl>
+                        }
+                        @if (tv.trust && result.tls?.certificate; as c) {
+                          <app-button
+                            variant="primary"
+                            size="sm"
+                            (clicked)="trustCertificate(endpoint.id, endpoint.label)"
+                          >
+                            {{ (tv.trust === 'trustNew'
+                                ? 'admin.providers.endpoints.tls.trustNew'
+                                : 'admin.providers.endpoints.tls.trust') | transloco }}
+                          </app-button>
+                        }
+                        @if (tv.showRemove) {
+                          <app-button variant="secondary" size="sm" (clicked)="removePin(endpoint.id)">
+                            {{ 'admin.providers.endpoints.tls.removePin' | transloco }}
+                          </app-button>
+                        }
+                      </div>
+                    }
+                  }
+                }
+                @if (tlsErrors()[endpoint.id]; as tlsErr) {
+                  <p class="form-error" data-testid="tls-error">{{ tlsErr }}</p>
                 }
 
                 @if (editingEndpointId() === endpoint.id) {
@@ -398,6 +478,11 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                     <h4 class="form-title">
                       {{ 'admin.providers.endpoints.editTitle' | transloco }}
                     </h4>
+                    @if (endpoint.tls_pin) {
+                      <p class="form-hint" data-testid="tls-edit-note">
+                        {{ 'admin.providers.endpoints.tls.editNote' | transloco }}
+                      </p>
+                    }
                     <div class="form-row two-col">
                       <app-form-field>
                         <app-input
@@ -622,6 +707,23 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       background: var(--danger-tint);
       color: var(--danger);
     }
+    .tls-block {
+      margin: 8px 0;
+      padding: 8px 12px;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-control);
+      font-size: 12px;
+    }
+    .tls-reason { margin: 0 0 6px; font-weight: 600; }
+    .tls-facts {
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 2px 12px;
+      margin: 0 0 8px;
+    }
+    .tls-facts dt { color: var(--text-muted); }
+    .tls-facts dd { margin: 0; word-break: break-all; }
+    .tls-fp { user-select: all; }
     .empty-state {
       font-size: 13px;
       color: var(--text-muted);
@@ -905,6 +1007,11 @@ export class AdminProvidersComponent implements OnInit {
   readonly endpointFormError = signal<string>('');
   readonly testingEndpointId = signal<string | null>(null);
   readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
+  /** Trust / Remove-pin failures per endpoint, in the server's words. */
+  readonly tlsErrors = signal<Record<string, string>>({});
+  // Pure decisions for the template (unit-tested in admin-providers.tls-pin.spec.ts).
+  readonly pinBadge = pinBadge;
+  readonly tlsView = tlsView;
 
   // Endpoint edit form. Active for at most one row at a time; opens
   // pre-filled with the row's current values. The actual API key is
@@ -1252,6 +1359,41 @@ export class AdminProvidersComponent implements OnInit {
         this.testingEndpointId.set(null);
       },
       error: () => this.testingEndpointId.set(null),
+    });
+  }
+
+  /** Pin the certificate the last Test showed (never one re-read now). */
+  trustCertificate(endpointId: string, label: string): void {
+    const sha256 = this.testResults()[endpointId]?.tls?.certificate?.sha256;
+    if (!sha256) return;
+    if (!confirm(this.transloco.translate('admin.providers.endpoints.tls.confirmTrust', {label}))) return;
+    this.setTlsError(endpointId, null);
+    this.admin.trustSystemEndpointCertificate(endpointId, sha256).subscribe({
+      next: () => this.dropTestResult(endpointId),
+      error: (err) => this.setTlsError(endpointId, err?.error?.detail ?? String(err)),
+    });
+  }
+
+  removePin(endpointId: string): void {
+    if (!confirm(this.transloco.translate('admin.providers.endpoints.tls.confirmRemove'))) return;
+    this.setTlsError(endpointId, null);
+    this.admin.removeSystemEndpointPin(endpointId).subscribe({
+      next: () => this.dropTestResult(endpointId),
+      error: (err) => this.setTlsError(endpointId, err?.error?.detail ?? String(err)),
+    });
+  }
+
+  private dropTestResult(endpointId: string): void {
+    this.testResults.update((r) => {
+      const {[endpointId]: _gone, ...rest} = r;
+      return rest;
+    });
+  }
+
+  private setTlsError(endpointId: string, detail: string | null): void {
+    this.tlsErrors.update((e) => {
+      const {[endpointId]: _gone, ...rest} = e;
+      return detail ? {...rest, [endpointId]: detail} : rest;
     });
   }
 

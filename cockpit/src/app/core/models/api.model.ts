@@ -878,6 +878,55 @@ export interface LlmEndpoint {
   managed_by_helm?: boolean;
   /** Managed, but last edited in the Cockpit: the next upgrade reverts it. */
   helm_drift?: boolean;
+  /** The one certificate SRW accepts for this endpoint, or null (normal verification). */
+  tls_pin?: LlmEndpointTlsPin | null;
+}
+
+/** A pinned endpoint certificate. `sha256` is `AA:BB:…` upper-case hex pairs. */
+export interface LlmEndpointTlsPin {
+  sha256: string;
+  subject: string | null;
+  issuer: string | null;
+  not_after: string | null;
+  expired: boolean;
+  trusted_at: string | null;
+}
+
+/** The certificate a server presented during Test. */
+export interface LlmEndpointCertificate {
+  sha256: string;
+  subject: string | null;
+  issuer: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  expired: boolean;
+  san: string[];
+}
+
+export type LlmEndpointTlsReason =
+  | 'self_signed'
+  | 'unknown_issuer'
+  | 'address_mismatch'
+  | 'expired'
+  | 'not_yet_valid'
+  | 'certificate_changed'
+  | 'other';
+
+/**
+ * Certificate report attached to Test results; null for http:// or a
+ * certificate that verifies normally on an unpinned endpoint. Decide what to
+ * render from `certificate` / `reason` / `can_trust`, not from `verified`
+ * (an unreachable host is `verified: false` with neither).
+ */
+export interface LlmEndpointTlsReport {
+  verified: boolean;
+  reason: LlmEndpointTlsReason | null;
+  message: string;
+  certificate: LlmEndpointCertificate | null;
+  pin: LlmEndpointTlsPin | null;
+  pin_matches: boolean;
+  publicly_valid: boolean;
+  can_trust: boolean;
 }
 
 /** `source` column shared by the Helm-reconciled provider tables. */
@@ -907,6 +956,7 @@ export interface LlmEndpointTestResult {
   status: number | null;
   error: string | null;
   probe_url: string;
+  tls?: LlmEndpointTlsReport | null;
 }
 
 /**
@@ -1075,6 +1125,7 @@ export interface CatalogModelTestResult {
   status: number | null;
   error: string | null;
   probe_url: string | null;
+  tls?: LlmEndpointTlsReport | null;
 }
 
 export interface CatalogModelDeleteResult {

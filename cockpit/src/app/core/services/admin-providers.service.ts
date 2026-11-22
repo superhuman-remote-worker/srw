@@ -286,6 +286,25 @@ export class AdminProvidersService {
       );
   }
 
+  /** Pin the certificate the admin was shown (`sha256` as displayed by Test). */
+  trustSystemEndpointCertificate(endpointId: string, sha256: string): Observable<LlmEndpoint> {
+    return this.http
+      .put<LlmEndpoint>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}/tls-pin`, {sha256})
+      .pipe(tap(() => this.reloadAfterEndpointChange()));
+  }
+
+  removeSystemEndpointPin(endpointId: string): Observable<LlmEndpoint> {
+    return this.http
+      .delete<LlmEndpoint>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}/tls-pin`)
+      .pipe(tap(() => this.reloadAfterEndpointChange()));
+  }
+
+  private reloadAfterEndpointChange(): void {
+    this.loadSystemEndpoints();
+    this.readiness.load();
+    this.modelService.load(undefined, true);
+  }
+
   deleteSystemEndpoint(endpointId: string): Observable<{status: string}> {
     return this.http
       .delete<{status: string}>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}`)
