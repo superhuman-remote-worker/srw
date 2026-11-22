@@ -22434,6 +22434,7 @@ CREATE FUNCTION public.valid_vm_thread_nonquota_cleanup_source(a public.vm_resou
        AND ((source.thread_runtime_generation=a.runtime_generation
              AND source.thread_agent_id IS NOT DISTINCT FROM a.agent_id
              AND source.thread_attach_token IS NOT DISTINCT FROM a.attach_token)
+            OR public.valid_vm_thread_wake_cleanup_source(a,source)
             OR public.vm_thread_creation_pre_setup_abort_path_evidence(
                 json_populate_record(NULL::public.threads,json_build_object(
                     'id',a.thread_id,'runtime_generation',a.runtime_generation,
@@ -22446,7 +22447,8 @@ CREATE FUNCTION public.valid_vm_thread_nonquota_cleanup_source(a public.vm_resou
             OR public.valid_vm_thread_retained_cleanup_source(a,source))
        AND source.boot_counted
        AND (source.origin='initial' AND source.expected_pvc_uid IS NULL
-            OR public.valid_vm_thread_retained_resume_source(source))
+            OR public.valid_vm_thread_retained_resume_source(source)
+            OR public.valid_vm_thread_wake_cleanup_source(a,source))
        AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
            WHERE e.request_id=source.request_id AND e.state='issued')
        AND EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
@@ -22641,6 +22643,48 @@ CREATE FUNCTION public.valid_vm_thread_retained_source_capture(source public.vm_
              AND (op.runtime_generation<>target_generation OR (
                  context->>'agent_id'=source.thread_agent_id::text
                  AND context->>'runtime_attach_token'=source.thread_attach_token::text)));
+$$;
+
+
+--
+-- Name: valid_vm_thread_wake_cleanup_source(public.vm_resource_thread_cleanup_authorities, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_wake_cleanup_source(a public.vm_resource_thread_cleanup_authorities, source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (source.owner_kind='thread' AND source.origin='initial'
+       AND source.thread_id=a.thread_id
+       AND source.thread_retained_resume_id IS NULL
+       AND source.thread_wake_operation_id IS NOT NULL
+       AND source.thread_agent_id IS NULL AND source.thread_attach_token IS NULL
+       AND source.thread_runtime_generation=a.runtime_generation
+       AND source.provision_generation=a.provision_generation
+       AND source.expected_pvc_uid=source.observed_pvc_uid
+       AND source.observed_vm_uid=a.vm_uid AND source.observed_pvc_uid=a.pvc_uid
+       AND EXISTS (SELECT 1 FROM public.vm_idle_operations op
+           WHERE op.id=source.thread_wake_operation_id
+             AND op.owner_kind='thread' AND op.owner_id=a.thread_id
+             AND op.release_kind='pinned_thread' AND op.retained_kind='rootdisk'
+             AND op.wake_generation=source.provision_generation
+             AND op.wake_request_id=source.request_id
+             AND op.pvc_uid=source.expected_pvc_uid
+             AND op.phase='ready' AND op.closed_at IS NOT NULL AND op.wake_ready_at IS NOT NULL
+             AND op.thread_wake_ready_identity->>'generation'=source.provision_generation::text
+             AND op.thread_wake_ready_identity->>'vm_uid'=source.observed_vm_uid::text
+             AND op.thread_wake_ready_identity->>'pvc_uid'=source.observed_pvc_uid::text
+             AND ((a.agent_id IS NULL AND a.attach_token IS NULL)
+                  OR (a.agent_id IS NOT NULL AND a.attach_token IS NOT NULL
+                      AND a.retirement_context->>'agent_id'=a.agent_id::text
+                      AND a.retirement_context->>'runtime_attach_token'=a.attach_token::text
+                      AND a.retirement_context->'agent'->>'id'=a.agent_id::text
+                      AND a.retirement_context->'agent'->>'thread_id'=a.thread_id::text
+                      AND a.retirement_context->'agent_pod'->>'protection_protocol'='finalizer_v1'
+                      AND a.retirement_context->'agent_pod'->>'pod_name'=a.retirement_context->'agent'->>'hostname'
+                      AND a.retirement_context->'agent_pod'->>'pod_uid'=a.retirement_context->'agent'->>'pod_uid'
+                      AND a.retirement_context->'agent_pod'->>'pod_uid'
+                          IS DISTINCT FROM op.thread_agent_pod_identity->>'pod_uid')))
+    ) IS TRUE;
 $$;
 
 
@@ -23781,7 +23825,7 @@ BEGIN
        OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
        OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT terminal_handoff)
        OR (terminal_handoff AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
-       OR (NOT terminal_handoff AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
+       OR (NOT terminal_handoff AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND NOT public.valid_vm_thread_wake_cleanup_source(a,source) AND (
            source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
            OR source.thread_agent_id IS DISTINCT FROM a.agent_id
            OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
@@ -24159,8 +24203,9 @@ BEGIN
     END IF;
     IF source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
        OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
-       OR source.thread_wake_operation_id IS NOT NULL
+       OR (source.thread_wake_operation_id IS NOT NULL AND NOT public.valid_vm_thread_wake_cleanup_source(a,source))
        OR NOT (source.origin='initial' AND source.expected_pvc_uid IS NULL
+           OR public.valid_vm_thread_wake_cleanup_source(a,source)
            OR source.origin='resume' AND EXISTS (
                SELECT 1 FROM public.vm_thread_retained_resumes op
                JOIN public.vm_resource_thread_cleanup_authorities prior ON prior.cleanup_admission_id=op.compute_cleanup_admission_id
@@ -24168,7 +24213,7 @@ BEGIN
                  AND op.runtime_generation=source.thread_runtime_generation
                  AND op.request_id=source.request_id AND op.provision_generation=source.provision_generation
                  AND prior.pvc_uid=source.expected_pvc_uid AND prior.pvc_uid=a.pvc_uid))
-       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND NOT public.valid_vm_thread_wake_cleanup_source(a,source) AND (
            source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
            OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
@@ -24311,8 +24356,8 @@ BEGIN
        OR (NOT early_end AND terminal.id IS NULL AND d.runtime_generation IS DISTINCT FROM a.runtime_generation)
        OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
        OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
-       OR NOT (source.origin='initial' OR public.valid_vm_thread_retained_resume_source(source)) OR source.thread_wake_operation_id IS NOT NULL
-       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
+       OR NOT (source.origin='initial' OR public.valid_vm_thread_retained_resume_source(source)) OR (source.thread_wake_operation_id IS NOT NULL AND NOT public.valid_vm_thread_wake_cleanup_source(a,source))
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND NOT public.valid_vm_thread_wake_cleanup_source(a,source) AND (
            source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
            OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation

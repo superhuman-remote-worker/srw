@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0574_validate_llm_endpoint_tls_pin.sql"
+    / "src/orchestrator/database/migrations/app/0575_vm_thread_end_after_idle_wake.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
