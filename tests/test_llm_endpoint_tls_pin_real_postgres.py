@@ -247,6 +247,29 @@ async def test_trust_accepts_no_admin_id(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("admin_id", ["admin", "not-a-uuid", 42])
+async def test_a_malformed_admin_id_is_recorded_as_null(db, admin_id):
+    # Like record_security_event: a non-UUID admin id must not turn a Trust or
+    # Remove into a 500; the pin and its audit row are written without it.
+    endpoint_id = await _endpoint(db)
+    row = await db.set_llm_endpoint_tls_pin(
+        endpoint_id, details=_details(), admin_user_id=admin_id, method="PUT", path="/x"
+    )
+    assert row["tls_pin_sha256"] == FINGERPRINT
+    assert row["tls_pinned_by"] is None
+    cleared = await db.clear_llm_endpoint_tls_pin(
+        endpoint_id, admin_user_id=admin_id, method="DELETE", path="/x"
+    )
+    assert cleared is not None and cleared["tls_pin_sha256"] is None
+    events = await _events(db, endpoint_id)
+    assert [e["event_type"] for e in events] == [
+        "endpoint_certificate_trusted",
+        "endpoint_certificate_pin_removed",
+    ]
+    assert all(e["user_id"] is None for e in events)
+
+
+@pytest.mark.asyncio
 async def test_trust_unknown_or_user_scoped_row_writes_nothing(db):
     assert await _trust(db, str(uuid4())) is None
     user_id = str(uuid4())

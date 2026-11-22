@@ -58499,7 +58499,20 @@ class PostgresDB:
         return " ".join(parts)
 
     @staticmethod
+    def _tls_pin_admin_uuid(admin_user_id: Any) -> UUID | None:
+        """The admin's id as a UUID; a malformed one degrades to NULL, as in
+        ``record_security_event``: the pin change and its audit row are still
+        worth writing, and must not fail as a 500."""
+        if not admin_user_id:
+            return None
+        try:
+            return UUID(str(admin_user_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    @classmethod
     async def _insert_tls_pin_audit(
+        cls,
         conn: Any,
         *,
         event_type: str,
@@ -58517,7 +58530,7 @@ class PostgresDB:
             VALUES ($1, $2, NULL, TRUE, FALSE, 'llm_endpoint', $3, $4, $5, $6, NULL)
             """,
             event_type,
-            UUID(str(admin_user_id)) if admin_user_id else None,
+            cls._tls_pin_admin_uuid(admin_user_id),
             endpoint_id,
             method,
             path,
@@ -58566,7 +58579,7 @@ class PostgresDB:
                     details.subject,
                     details.issuer,
                     details.not_after,
-                    UUID(str(admin_user_id)) if admin_user_id else None,
+                    self._tls_pin_admin_uuid(admin_user_id),
                 )
                 extra: Dict[str, str] = {}
                 if previous:
