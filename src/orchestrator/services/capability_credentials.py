@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,9 @@ from shared.runtime.core.model_registry import (
     UnknownModelError,
     resolve_model as _resolve_model,
 )
+from shared.tls_pinning import TlsPin, pin_applies, read_stored_pin
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,11 +33,41 @@ class CapabilityCredentials:
     # that treat subscription traffic differently (image generation, D7/D10).
     transport_kind: str | None = field(default=None, compare=False)
     provider_ref: str | None = field(default=None, compare=False)
+    # The endpoint row's pinned certificate, for an ``https://`` base URL.
+    # Callers build their client from it (``pinned_sdk_http_client`` /
+    # ``httpx_client_kwargs``); ``None`` means the row stores no pin.
+    tls_pin: TlsPin | None = None
 
     @property
     def wire_model(self) -> str:
         """The model name to send to the provider."""
         return self.served_model or self.model
+
+
+def _endpoint_pin(
+    base_url: Any, pem: Any, sha256: Any, *, model_id: str
+) -> tuple[TlsPin | None, bool]:
+    """``(pin, readable)`` for an endpoint row's stored pin.
+
+    A pin only means something for an ``https://`` URL, so another URL gives
+    ``(None, True)`` as dispatch does. A stored pin that can't be read gives
+    ``(None, False)``: the caller must not use the row, because credentials
+    without the pin would verify the endpoint against the CA list instead.
+    """
+    if not pin_applies(base_url):
+        return None, True
+    try:
+        return read_stored_pin(pem, sha256), True
+    except ValueError as exc:
+        logger.error(
+            "Capability model %r not resolved: its endpoint (%s) has a pinned "
+            "TLS certificate that can't be read (%s); an admin must trust it "
+            "again or remove the pin in Admin \u2192 Models.",
+            model_id,
+            base_url,
+            exc,
+        )
+        return None, False
 
 
 async def resolve_capability_credentials(
@@ -52,6 +86,10 @@ async def resolve_capability_credentials(
     is normalized by ``postgres._row_to_model`` before provider selection.
     ``setting_key`` lets a second slot reuse this exact chain without inventing
     another credential mechanism.
+
+    An endpoint row's pinned certificate comes back as ``tls_pin``. A stored
+    pin that can't be read resolves to ``None`` (the model is unusable, like an
+    unconfigured one), never to credentials without the pin.
     """
 
     user_key = setting_key or f"default_{capability}_model"
@@ -83,10 +121,20 @@ async def resolve_capability_credentials(
         if row.get("provider_kind") == "system" and provider_ref:
             api_key = resolved_keys.get(str(provider_ref), api_key)
 
+        tls_pin, readable = _endpoint_pin(
+            base_url,
+            row.get("endpoint_tls_pin_cert"),
+            row.get("endpoint_tls_pin_sha256"),
+            model_id=str(model_id),
+        )
+        if not readable:
+            return None
+
         return CapabilityCredentials(
             model=str(model_id),
             base_url=str(base_url) if base_url else None,
             api_key=str(api_key) if api_key else None,
+            tls_pin=tls_pin,
             provider=provider,
             params=params,
             catalog_id=str(row["catalog_id"]) if row.get("catalog_id") else None,
@@ -110,6 +158,7 @@ async def resolve_capability_credentials(
     base_url = None
     api_key = None
     provider = None
+    tls_pin = None
     if meta is not None:
         provider = meta.api_key_ref or meta.provider
         if meta.endpoint_id:
@@ -117,6 +166,14 @@ async def resolve_capability_credentials(
             if endpoint_row:
                 base_url = endpoint_row.get("base_url")
                 api_key = endpoint_row.get("api_key")
+                tls_pin, readable = _endpoint_pin(
+                    base_url,
+                    endpoint_row.get("tls_pin_cert"),
+                    endpoint_row.get("tls_pin_sha256"),
+                    model_id=str(model_id),
+                )
+                if not readable:
+                    return None
         elif meta.api_key_ref:
             api_key = resolved_keys.get(meta.api_key_ref)
 
@@ -124,6 +181,7 @@ async def resolve_capability_credentials(
         model=str(model_id),
         base_url=str(base_url) if base_url else None,
         api_key=str(api_key) if api_key else None,
+        tls_pin=tls_pin,
         provider=provider,
         served_model=meta.served_model_id if meta is not None else None,
     )

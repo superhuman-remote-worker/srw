@@ -874,6 +874,14 @@ async def inject_image_credentials(
         "catalog_model": creds.model,
         "ops": ops,
         "billing": "subscription" if subscription else "api",
+        # The endpoint row's pinned certificate, in flight only (stripped by
+        # redaction like the key); written after the entry strip, so a planted
+        # value never survives. ``None`` unpinned or for a non-https URL.
+        "tls_pinned_cert": (
+            creds.tls_pin.wire
+            if creds.tls_pin is not None and pin_applies(creds.base_url)
+            else None
+        ),
     }
     defaults = creds.params.get("image_defaults")
     if isinstance(defaults, dict):

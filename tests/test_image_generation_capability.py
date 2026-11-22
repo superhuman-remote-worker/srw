@@ -260,6 +260,7 @@ def test_injects_the_pinned_proxy_row_as_a_subscription_image_section():
         "catalog_model": "gpt-image-2",
         "ops": ["generate", "edit"],
         "billing": "subscription",
+        "tls_pinned_cert": None,
         "max_paid_images": 20,
     }
 

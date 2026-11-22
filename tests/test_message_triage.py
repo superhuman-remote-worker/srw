@@ -60,9 +60,12 @@ class TestResolveFromDB:
                 return_value={"base_url": "http://vllm.svc/v1"}
             ),
         )
-        model, base_url, api_key = await message_triage._resolve_triage_config(db)
+        model, base_url, api_key, tls_pin = await message_triage._resolve_triage_config(
+            db
+        )
         assert base_url == "http://vllm.svc/v1"
         assert api_key == "sk-sys"
+        assert tls_pin is None
         assert model == "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
     @pytest.mark.asyncio
@@ -73,10 +76,13 @@ class TestResolveFromDB:
             list_models=AsyncMock(return_value=[]),
             get_system_llm_endpoint=AsyncMock(return_value=None),
         )
-        model, base_url, api_key = await message_triage._resolve_triage_config(db)
+        model, base_url, api_key, tls_pin = await message_triage._resolve_triage_config(
+            db
+        )
         assert model == "gpt-4o"
         assert base_url == "https://api.openai.com/v1"
         assert api_key == "sk-sys"
+        assert tls_pin is None
         db.get_system_api_key.assert_awaited_once_with("openai")
 
     @pytest.mark.asyncio

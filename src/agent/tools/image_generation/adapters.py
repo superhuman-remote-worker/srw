@@ -27,6 +27,8 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
+from shared.tls_pinning import TlsPin, httpx_client_kwargs, pin_failure_in
+
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 GEMINI_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -250,10 +252,34 @@ async def _post(
             f"the image provider did not answer within {CALL_TIMEOUT_SECONDS:.0f}s",
         ) from exc
     except httpx.HTTPError as exc:
+        pin_failure = pin_failure_in(exc)
+        if pin_failure is not None:
+            raise ImageProviderError("unavailable", str(pin_failure)) from exc
         raise ImageProviderError(
             "unavailable",
             f"the image provider could not be reached ({type(exc).__name__})",
         ) from exc
+
+
+def _default_client(section: Mapping[str, Any]) -> httpx.AsyncClient:
+    """The client an adapter builds when it is not handed one.
+
+    An endpoint's pinned certificate (``section["tls_pinned_cert"]``, written by
+    dispatch) is the only trust anchor. A pin that can't be read fails the call:
+    it is never sent without the pin.
+    """
+    wire = section.get("tls_pinned_cert")
+    try:
+        pin = TlsPin.from_wire(str(wire)) if wire else None
+    except ValueError as exc:
+        raise ImageProviderError(
+            "unavailable",
+            f"the image endpoint's pinned certificate can't be used ({exc})",
+        ) from exc
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(CALL_TIMEOUT_SECONDS, connect=15.0),
+        **httpx_client_kwargs(pin, asynchronous=True),
+    )
 
 
 async def call_openai_images(
@@ -288,9 +314,7 @@ async def call_openai_images(
     if section.get("api_key"):
         headers["Authorization"] = f"Bearer {section['api_key']}"
     owns = client is None
-    client = client or httpx.AsyncClient(
-        timeout=httpx.Timeout(CALL_TIMEOUT_SECONDS, connect=15.0)
-    )
+    client = client or _default_client(section)
     try:
         response = await _post(client, base + path, payload, headers)
     finally:
@@ -469,9 +493,7 @@ async def call_gemini(
 ) -> ImageCallResult:
     """``n`` sequential ``generateContent`` calls (Gemini returns one image each)."""
     owns = client is None
-    client = client or httpx.AsyncClient(
-        timeout=httpx.Timeout(CALL_TIMEOUT_SECONDS, connect=15.0)
-    )
+    client = client or _default_client(section)
     try:
         merged = ImageCallResult(images=[])
         wanted = max(1, int(request.n))

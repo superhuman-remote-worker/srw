@@ -21,9 +21,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from shared.speech_transcript import extract_transcript as _extract_transcript
+from shared.tls_pinning import pin_failure_in, pinned_sdk_http_client
 
 from orchestrator.services.capability_credentials import resolve_capability_credentials
 from orchestrator.services.usage_ledger import UsageEvent, UsageLedger
@@ -103,11 +104,16 @@ async def transcribe_thread_audio(
 
     # max_retries=0 (fail fast, honest error not a multi-minute backoff) + a
     # size-scaled timeout so long-but-valid clips aren't spuriously killed.
+    # The endpoint's pinned certificate, when it has one, is the only trust
+    # anchor: the handshake fails before any byte (the key) is sent.
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
         timeout=_stt_timeout(len(audio_bytes)),
         max_retries=0,
+        http_client=pinned_sdk_http_client(
+            DefaultAsyncHttpxClient, creds.tls_pin, base_url
+        ),
     )
     try:
         # The OpenAI SDK infers the audio format from the filename extension,
@@ -130,6 +136,9 @@ async def transcribe_thread_audio(
         )
         # A configured model that failed is "broken", not "off" — raise so the
         # endpoint answers 502 and the composer surfaces an honest error.
+        pin_failure = pin_failure_in(exc)
+        if pin_failure is not None:
+            raise TranscriptionError(str(pin_failure)) from exc
         raise TranscriptionError(f"Transcription failed for model {model}") from exc
     finally:
         await client.close()
