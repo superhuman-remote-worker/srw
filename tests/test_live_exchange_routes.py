@@ -37,6 +37,7 @@ from orchestrator.services.live.exchange import (
     LiveOutcome,
     LivePod,
     StateBody,
+    LivePinnedEndpoint,
     live_engine,
     ws_base_for,
 )
@@ -607,6 +608,81 @@ class TestLiveCredential:
         db.resolve_catalog_model.return_value = model
         outcome = await LiveExchange(db=db).credential(POD)
         assert outcome == LiveOutcome(409, {"error": "no_live_voice_model"})
+
+
+SENTENCE = (
+    "Live voice does not support pinned certificates yet; give the endpoint a "
+    "certificate that verifies."
+)
+
+
+class TestLiveVoiceRefusesPinnedEndpoints:
+    def _row(self, **over):
+        row = {
+            "api_key": "sk-live",
+            "provider_kind": "endpoint",
+            "endpoint_base_url": "https://llm.example.test/v1",
+            "model_id": "gpt-live-1",
+        }
+        row.update(over)
+        return row
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "pin",
+        [
+            {"endpoint_tls_pin_cert": "-----BEGIN CERTIFICATE-----\nx\n"},
+            {"endpoint_tls_pin_sha256": "AA:BB"},
+            {"endpoint_tls_pin_cert": "not a cert", "endpoint_tls_pin_sha256": "AA"},
+        ],
+    )
+    async def test_live_engine_raises_the_sentence(self, pin):
+        db = SimpleNamespace(
+            resolve_catalog_model=AsyncMock(return_value=self._row(**pin))
+        )
+        with pytest.raises(LivePinnedEndpoint) as raised:
+            await live_engine(db, "gpt-live-1")
+        assert str(raised.value) == SENTENCE
+
+    @pytest.mark.asyncio
+    async def test_the_credential_route_answers_400_and_hands_out_no_key(self):
+        db = _DB(None, _line())
+        db.resolve_catalog_model.return_value = self._row(
+            endpoint_tls_pin_cert="-----BEGIN CERTIFICATE-----\nx\n"
+        )
+        outcome = await LiveExchange(db=db).credential(POD)
+        assert outcome.status == 400
+        assert outcome.body == {"detail": SENTENCE}
+        assert "sk-live" not in str(outcome.body)
+
+    @pytest.mark.asyncio
+    async def test_an_unpinned_endpoint_is_served_as_before(self):
+        db = _DB(None, _line())
+        db.resolve_catalog_model.return_value = self._row(
+            endpoint_tls_pin_cert=None, endpoint_tls_pin_sha256=None
+        )
+        assert (await LiveExchange(db=db).credential(POD)).status == 200
+
+    @pytest.mark.asyncio
+    async def test_the_sip_connector_refuses_with_the_sentence(self):
+        from fastapi import HTTPException
+
+        from orchestrator.services.connector_drivers.gpt_live_sip import (
+            GptLiveSipDriver,
+        )
+
+        db = SimpleNamespace(
+            resolve_catalog_model=AsyncMock(
+                return_value=self._row(endpoint_tls_pin_sha256="AA")
+            )
+        )
+        ctx = SimpleNamespace(store=db)
+        with pytest.raises(HTTPException) as raised:
+            await GptLiveSipDriver(image_reference="img")._engine_host(
+                "gpt-live-1", ctx
+            )
+        assert raised.value.status_code == 400
+        assert raised.value.detail == SENTENCE
 
 
 class TestLiveEngine:

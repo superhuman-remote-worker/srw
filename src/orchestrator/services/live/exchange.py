@@ -28,6 +28,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from orchestrator.services.endpoint_tls import LIVE_VOICE_REFUSAL
 from orchestrator.services.live.ledger import record_session_usage
 from orchestrator.services.live.store import (
     MAX_EVENTS_PER_WRITE,
@@ -41,6 +42,7 @@ from shared.connectors.leases import (
     token_shape_valid,
 )
 from shared.runtime.live.contract import JOURNAL_KINDS
+from shared.tls_pinning import pin_applies
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +115,19 @@ def ws_base_for(api_base: str) -> str:
     return urlunsplit((scheme, parts.netloc, parts.path, "", ""))
 
 
+class LivePinnedEndpoint(Exception):
+    """The model's endpoint carries a pinned certificate; live voice can't use it.
+
+    ``str(exc)`` is the sentence the routes show verbatim. Raised for any
+    stored pin, readable or not: the Go driver verifies against the CA list,
+    so handing it this endpoint's key would send it to an unverified server.
+    """
+
+
 async def live_engine(db: Any, model: str) -> dict[str, Any] | None:
     """``{api_key, api_base, ws_base, model}`` for a live voice catalog
-    model, or ``None`` when the catalog has no usable row for it."""
+    model, or ``None`` when the catalog has no usable row for it. Raises
+    :class:`LivePinnedEndpoint` for an endpoint with a pinned certificate."""
     row = await db.resolve_catalog_model(model, capability="live_voice")
     if row is None or not row.get("api_key"):
         return None
@@ -126,6 +138,11 @@ async def live_engine(db: Any, model: str) -> dict[str, Any] | None:
     if not api_base:
         return None
     api_base = str(api_base).rstrip("/")
+    if row.get("provider_kind") != "system" and (
+        row.get("endpoint_tls_pin_cert") or row.get("endpoint_tls_pin_sha256")
+    ):
+        if pin_applies(api_base):
+            raise LivePinnedEndpoint(LIVE_VOICE_REFUSAL)
     return {
         "api_key": row["api_key"],
         "api_base": api_base,
@@ -180,7 +197,11 @@ class LiveExchange:
     async def credential(self, pod: LivePod) -> LiveOutcome:
         connector = await self.db.get_datasource(pod.connector_id)
         model = (connector or {}).get("config", {}).get("model")
-        engine = await live_engine(self.db, str(model)) if model else None
+        try:
+            engine = await live_engine(self.db, str(model)) if model else None
+        except LivePinnedEndpoint as refusal:
+            logger.warning("Live connector %s: %s", pod.connector_id, refusal)
+            return LiveOutcome(400, {"detail": str(refusal)})
         if engine is None:
             logger.warning(
                 "Live connector %s: no usable live_voice model for its pod",
@@ -282,6 +303,7 @@ __all__ = [
     "LiveOutcome",
     "LivePod",
     "StateBody",
+    "LivePinnedEndpoint",
     "live_engine",
     "session_view",
     "ws_base_for",

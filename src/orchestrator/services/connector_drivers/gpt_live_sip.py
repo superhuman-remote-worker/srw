@@ -140,12 +140,18 @@ class GptLiveSipDriver(DatasourceDriver):
 
     async def _engine_host(self, model: str, ctx: ValidationContext) -> dict[str, Any]:
         """The pod's egress: the host and port of the model's endpoint."""
-        from orchestrator.services.live.exchange import live_engine
+        from orchestrator.services.live.exchange import (
+            LivePinnedEndpoint,
+            live_engine,
+        )
 
         store = getattr(ctx, "store", None)
         if store is None:
             raise HTTPException(503, "The model catalog is unavailable")
-        engine = await live_engine(store, model)
+        try:
+            engine = await live_engine(store, model)
+        except LivePinnedEndpoint as refusal:
+            raise HTTPException(400, str(refusal)) from refusal
         if engine is None:
             raise HTTPException(
                 400,

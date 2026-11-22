@@ -1,4 +1,5 @@
 """Focused contracts for the strict session-turn memory executor."""
+# ruff: noqa: F811  (the imported fixture is requested by name as a test argument)
 
 from __future__ import annotations
 
@@ -19,8 +20,11 @@ from orchestrator.services.session_memory_effects import (
 )
 from orchestrator.services.session_memory_executor import (
     SessionMemoryEffectExecutor,
+    _build_auxiliary_llm,
     _build_embedding_service,
 )
+from shared.tls_pinning import TlsPin
+from tests.tls_pin_fixtures import tls_certs  # noqa: F401
 
 PRODUCER_ID = UUID("11111111-aaaa-4111-8111-111111111111")
 THREAD_ID = UUID("22222222-bbbb-4222-8222-222222222222")
@@ -678,6 +682,7 @@ def test_embedding_profile_is_explicit_and_does_not_touch_process_env() -> None:
         "provider": "openrouter",
         "expected_dimensions": 4096,
         "profile_identity": "tenant:endpoint",
+        "tls_pin": None,
     }
     assert os.environ == before
 
@@ -701,3 +706,96 @@ def test_embedding_profile_carries_the_rows_served_model() -> None:
     assert service.catalog_model == "qwen/qwen3-embedding-8b-local"
     assert service.model == "qwen/qwen3-embedding-8b"
     assert os.environ == before
+
+
+# ---------------------------------------------------------------------------
+# Endpoint certificate pins reach the memory drain's models
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_service_carries_the_endpoint_pin(tls_certs) -> None:
+    wire = TlsPin.from_pem(tls_certs.leaf.read_text()).wire
+    config = SimpleNamespace(
+        extra={
+            "env_keys": {
+                "EMBEDDING_PROVIDER": "local",
+                "EMBEDDING_MODEL": "m",
+                "EMBEDDING_BASE_URL": "https://tenant.invalid/v1",
+                "EMBEDDING_API_KEY": "tenant-secret",
+                "EMBEDDING_TLS_PINNED_CERT": wire,
+            }
+        }
+    )
+    service = _build_embedding_service(config)
+    assert service.tls_pin == TlsPin.from_wire(wire)
+
+
+def test_embedding_service_without_a_pin_is_unpinned() -> None:
+    config = SimpleNamespace(
+        extra={
+            "env_keys": {
+                "EMBEDDING_MODEL": "m",
+                "EMBEDDING_BASE_URL": "https://tenant.invalid/v1",
+                "EMBEDDING_API_KEY": "k",
+            }
+        }
+    )
+    assert _build_embedding_service(config).tls_pin is None
+
+
+@pytest.mark.parametrize("bad", ["unreadable", "!!not-a-cert!!"])
+def test_a_broken_embedding_pin_fails_the_build_not_unpinned(bad: str) -> None:
+    config = SimpleNamespace(
+        extra={
+            "env_keys": {
+                "EMBEDDING_MODEL": "m",
+                "EMBEDDING_BASE_URL": "https://tenant.invalid/v1",
+                "EMBEDDING_API_KEY": "k",
+                "EMBEDDING_TLS_PINNED_CERT": bad,
+            }
+        }
+    )
+    with patch(
+        "orchestrator.services.session_memory_executor.EmbeddingService"
+    ) as service_cls:
+        with pytest.raises(RuntimeError, match="EMBEDDING_TLS_PINNED_CERT"):
+            _build_embedding_service(config)
+    service_cls.assert_not_called()
+
+
+@pytest.mark.filterwarnings(
+    # The stand-in auxiliary family sends a default effort through model_kwargs.
+    "ignore:Parameters {'reasoning_effort'}:UserWarning"
+)
+def test_both_auxiliary_models_carry_the_pin_from_the_session_config(
+    tls_certs,
+) -> None:
+    from shared.runtime.core.loader import AuxiliaryConfig, LimitsConfig, LLMConfig
+
+    wire = TlsPin.from_pem(tls_certs.leaf.read_text()).wire
+    main = LLMConfig(
+        model="main-m",
+        provider="openai",
+        base_url="https://main.invalid/v1",
+        api_key="k1",
+        tls_pinned_cert=wire,
+        reasoning_level="none",
+    )
+    config = SimpleNamespace(
+        llm=SimpleNamespace(get_phase_config=lambda phase: main),
+        limits=LimitsConfig(),
+        _deployment_dir=None,
+        auxiliary=AuxiliaryConfig(
+            enabled=True,
+            model="aux-m",
+            provider="openai",
+            base_url="https://aux.invalid/v1",
+            api_key="k2",
+            tls_pinned_cert=wire,
+        ),
+    )
+    aux = _build_auxiliary_llm(config)
+    pin = TlsPin.from_wire(wire)
+    for llm in (aux.llm, aux.fallback_llm):
+        assert llm._reasoning_client._transport._pin == pin
+        assert llm._async_reasoning_client._transport._pin == pin

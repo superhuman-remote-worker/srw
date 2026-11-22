@@ -52,10 +52,25 @@ async def build_kb_embedding_service(
     """
     from shared.runtime.core.transport_resolution import served_model_from_env
     from shared.runtime.services.embedding_service import EmbeddingService
+    from shared.tls_pinning import TlsPin
 
     env: dict[str, Any] = {}
     await dependencies.inject_system_kb_embedding_profile(env)
     if env.get("KB_EMBEDDING_API_KEY"):
+        # The pin belongs to the KB_EMBEDDING_BASE_URL dispatch wrote beside
+        # it. One that can't be read skips indexing, like a missing key: the
+        # service is never built unpinned, so no request (or key) goes out.
+        try:
+            tls_pin = (
+                TlsPin.from_env("KB_EMBEDDING", env)
+                if env.get("KB_EMBEDDING_BASE_URL")
+                else None
+            )
+        except ValueError as exc:
+            dependencies.logger.error(
+                "KB indexing skipped: the embedding endpoint's pin: %s", exc
+            )
+            return None
         return EmbeddingService(
             model=env.get("KB_EMBEDDING_MODEL"),
             served_model=served_model_from_env("KB_EMBEDDING", env),
@@ -64,6 +79,7 @@ async def build_kb_embedding_service(
             provider=env.get("KB_EMBEDDING_PROVIDER"),
             expected_dimensions=int(env.get("KB_EMBEDDING_DIMENSIONS", "4096")),
             profile_identity=env.get("KB_EMBEDDING_PROFILE_ID"),
+            tls_pin=tls_pin,
         )
     # `_inject_system_kb_embedding_profile` already materializes the dev/env
     # fallback when (and only when) there is no catalog pin. Reaching here means
