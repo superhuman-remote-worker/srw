@@ -56935,7 +56935,9 @@ class PostgresDB:
         """
         query = """
             SELECT id, user_id, label, base_url, api_key, key_prefix,
-                   transport_kind, created_at, updated_at
+                   transport_kind, created_at, updated_at,
+                   tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer,
+                   tls_pin_not_after, tls_pinned_at, tls_pinned_by
             FROM llm_endpoints
             WHERE id = $1
         """
@@ -58318,7 +58320,9 @@ class PostgresDB:
                 """
                 SELECT id, label, base_url, key_prefix, transport_kind,
                        source, helm_value_hash, source_updated_at,
-                       created_at, updated_at
+                       created_at, updated_at,
+                       tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer,
+                       tls_pin_not_after, tls_pinned_at, tls_pinned_by
                 FROM llm_endpoints
                 WHERE user_id IS NULL
                 ORDER BY label
@@ -58336,7 +58340,9 @@ class PostgresDB:
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
                        transport_kind, source, helm_value_hash,
-                       source_updated_at, created_at, updated_at
+                       source_updated_at, created_at, updated_at,
+                       tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer,
+                       tls_pin_not_after, tls_pinned_at, tls_pinned_by
                 FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
@@ -58827,7 +58833,9 @@ class PostgresDB:
                     ule.label    AS endpoint_label,
                     ule.base_url AS endpoint_base_url,
                     ule.api_key  AS endpoint_api_key,
-                    ule.transport_kind AS endpoint_transport_kind
+                    ule.transport_kind AS endpoint_transport_kind,
+                    ule.tls_pin_cert AS endpoint_tls_pin_cert,
+                    ule.tls_pin_sha256 AS endpoint_tls_pin_sha256
                 FROM models m
                 LEFT JOIN system_api_keys ska
                     ON m.provider_kind = 'system' AND m.provider_ref = ska.provider

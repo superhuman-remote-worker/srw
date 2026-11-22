@@ -29811,7 +29811,16 @@ CREATE TABLE public.llm_endpoints (
     source text DEFAULT 'ui'::text NOT NULL,
     helm_value_hash text,
     source_updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    CONSTRAINT llm_endpoints_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text])))
+    tls_pin_sha256 text,
+    tls_pin_cert text,
+    tls_pin_subject text,
+    tls_pin_issuer text,
+    tls_pin_not_after timestamp with time zone,
+    tls_pinned_at timestamp with time zone,
+    tls_pinned_by uuid,
+    CONSTRAINT llm_endpoints_source_check CHECK ((source = ANY (ARRAY['default'::text, 'helm'::text, 'ui'::text]))),
+    CONSTRAINT llm_endpoints_tls_pin_pair CHECK (((tls_pin_sha256 IS NULL) = (tls_pin_cert IS NULL))),
+    CONSTRAINT llm_endpoints_tls_pin_sha256_format CHECK (((tls_pin_sha256 IS NULL) OR (tls_pin_sha256 ~ '^([0-9A-F]{2}:){31}[0-9A-F]{2}$'::text)))
 );
 
 
@@ -29820,6 +29829,55 @@ CREATE TABLE public.llm_endpoints (
 --
 
 COMMENT ON COLUMN public.llm_endpoints.transport_kind IS 'Stable transport marker, independent of label/base_url. ''subscription-proxy'' = the shared CLIProxyAPI deployment fronting connected subscription accounts. NULL = an ordinary OpenAI-compatible endpoint.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pin_sha256; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pin_sha256 IS 'SHA-256 fingerprint (upper-case, colon-separated) of the pinned leaf certificate; NULL = not pinned.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pin_cert; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pin_cert IS 'The pinned leaf certificate, PEM. Set and cleared together with tls_pin_sha256.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pin_subject; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pin_subject IS 'Subject of the pinned certificate, as the admin saw it when trusting it.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pin_issuer; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pin_issuer IS 'Issuer of the pinned certificate.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pin_not_after; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pin_not_after IS 'Expiry of the pinned certificate; drives the expired warning.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pinned_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pinned_at IS 'When the admin trusted the pinned certificate.';
+
+
+--
+-- Name: COLUMN llm_endpoints.tls_pinned_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.llm_endpoints.tls_pinned_by IS 'The admin who trusted it. No FK, like security_events.user_id.';
 
 
 --
