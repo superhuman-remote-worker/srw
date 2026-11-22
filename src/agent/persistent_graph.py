@@ -65,6 +65,7 @@ from shared.runtime.core.message_markers import (
 from agent.core.summarizer import count_text_tokens
 from agent.core.tool_output_redaction import redact_tool_result
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.tls_pinning import pin_failure_in
 from shared.tool_arg_coercion import coerce_tool_args
 from shared.tool_result_state import (
     RESULT_NOT_RUN,
@@ -297,6 +298,11 @@ def _user_facing_turn_error(e: BaseException) -> str:
     (session_silent_failure_audit.md #3), or — defensively — as a typed
     ContextOverflowError.
     """
+    pin_failure = pin_failure_in(e)
+    if pin_failure is not None:
+        # The SDK reports it as "Connection error."; the pin sentence says
+        # which host and that an admin must re-trust it.
+        return str(pin_failure)
     cause = getattr(e, "__cause__", None)
     if isinstance(e, WorkspaceUnavailableError) or isinstance(
         cause, WorkspaceUnavailableError
@@ -3651,6 +3657,11 @@ async def _execute_turn(
                     getattr(stream_err, "__cause__", None), ContextOverflowError
                 ):
                     raise stream_err.__cause__ from None
+                # A failed certificate pin is just as deterministic: the SDK
+                # names it APIConnectionError, but ainvoke would only repeat
+                # the doomed handshake. Surface the pin message.
+                if pin_failure_in(stream_err) is not None:
+                    raise
                 if "ResponseNotRead" in err_name or "APIConnectionError" in err_name:
                     logger.info(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"

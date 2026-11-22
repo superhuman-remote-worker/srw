@@ -190,3 +190,68 @@ class TestInvokeWithRetry:
         policy = RetryPolicy(max_attempts=3, base_delay=2.0, max_delay=100.0)
         assert await invoke_with_retry(fn, policy=policy) == "ok"
         assert slept == [2.0, 4.0]
+
+
+# ---- A certificate-pin failure is permanent and says why --------------------
+
+
+def _pin_chain(pin_error, *, langchain_layer=False):
+    """An openai connection error with ``pin_error`` in its cause chain."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://llm.example/v1/chat/completions")
+    inner = httpx.ConnectError("handshake failed", request=request)
+    inner.__cause__ = pin_error
+    sdk = openai.APIConnectionError(request=request)
+    sdk.__cause__ = inner
+    if not langchain_layer:
+        return sdk
+    outer = RuntimeError("langchain wrapper")
+    outer.__cause__ = sdk
+    return outer
+
+
+def _pin_errors():
+    from shared.tls_pinning import (
+        CertificateChangedError,
+        PinnedCertificateRejectedError,
+    )
+
+    return [
+        CertificateChangedError("llm.example", 443, "AA:BB:CC", "DD:EE:FF"),
+        CertificateChangedError("llm.example", 443, "AA:BB:CC", None),
+        PinnedCertificateRejectedError(
+            "llm.example", 443, "AA:BB:CC", "certificate has expired"
+        ),
+    ]
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["sdk", "sdk-in-wrapper"])
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_pin_failure_is_permanent_and_described_whole(index, wrapped):
+    from shared.runtime.core.llm_retry import (
+        _classify_llm_error,
+        _describe_llm_rejection,
+        _summarize_llm_error,
+    )
+
+    pin_error = _pin_errors()[index]
+    err = _pin_chain(pin_error, langchain_layer=wrapped)
+
+    assert _classify_llm_error(err) == "permanent"
+    assert _describe_llm_rejection(err, "some-model") == str(pin_error)
+    assert _summarize_llm_error(err, "some-model") == str(pin_error)
+    assert "Connection error." not in _describe_llm_rejection(err)
+
+
+def test_plain_connection_error_stays_transient():
+    import httpx
+    import openai
+
+    from shared.runtime.core.llm_retry import _classify_llm_error
+
+    err = openai.APIConnectionError(
+        request=httpx.Request("POST", "https://llm.example/v1")
+    )
+    assert _classify_llm_error(err) == "transient"
