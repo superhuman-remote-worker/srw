@@ -71,7 +71,7 @@ import {
 import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 import {newRequestId} from '../../core/util/request-id';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
-import {JOB_TITLE_MAX_LENGTH, jobDisplayName, jobNameSuggestion} from '../../core/util/job-name';
+import {JOB_TITLE_MAX_LENGTH, jobDisplayName, jobMayStillBeNamed, jobNameSuggestion} from '../../core/util/job-name';
 import {plansInPhases} from '../../core/util/phases';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 
@@ -1421,6 +1421,9 @@ export class JobListComponent implements OnInit, OnDestroy {
     if (this.refreshInterval) {
       clearInterval(this.refreshInterval);
     }
+    if (this.nameWatch) {
+      clearTimeout(this.nameWatch);
+    }
     if (this.searchDebounce) {
       clearTimeout(this.searchDebounce);
     }
@@ -1521,6 +1524,7 @@ export class JobListComponent implements OnInit, OnDestroy {
         this.pendingNewCount.set(0);
         this.lastUpdatedAt.set(Date.now());
         this.isLoading.set(false);
+        this.watchForNewNames();
       },
       error: () => {
         if (serial === this.requestSerial) this.isLoading.set(false);
@@ -1573,6 +1577,24 @@ export class JobListComponent implements OnInit, OnDestroy {
         });
       }
     });
+  }
+
+  // The server names a new job a few seconds after it is created. The 30 s
+  // poll would show that name up to half a minute late, right when someone
+  // has just come back from New Job and is looking at the row. So a load that
+  // shows a row still waiting for its name looks again twice, soon.
+  private static readonly NAME_WATCH_DELAYS_MS = [4000, 10000];
+  private nameWatch: ReturnType<typeof setTimeout> | null = null;
+
+  private watchForNewNames(attempt = 0): void {
+    if (this.nameWatch) return;
+    const delay = JobListComponent.NAME_WATCH_DELAYS_MS[attempt];
+    if (delay === undefined || !this.jobs().some((job) => jobMayStillBeNamed(job))) return;
+    this.nameWatch = setTimeout(() => {
+      this.nameWatch = null;
+      if (this.canPoll()) this.pollForChanges();
+      this.watchForNewNames(attempt + 1);
+    }, delay);
   }
 
   readonly jobName = jobDisplayName;

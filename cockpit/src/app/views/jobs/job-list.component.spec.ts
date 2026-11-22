@@ -1550,3 +1550,83 @@ describe('a job is listed by its name and renamed from its row', () => {
     expect(component.jobName(component.jobs()[0])).toBe('Summarise the attached contract');
   });
 });
+
+describe('JobListComponent — a new job gets its name without a reload', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  const TASK = 'Read every pull request merged this week and write the release notes';
+  const secondsAgo = (seconds: number) => new Date(Date.now() - seconds * 1000).toISOString();
+
+  function mountWithServerRow(row: Partial<JobSummary>) {
+    const server = {row};
+    const getJobsPage = vi.fn(() => of(page([server.row])));
+    const ctx = mountLogic({api: {getJobsPage} as Partial<ApiService>});
+    ctx.fixture.detectChanges();
+    return {...ctx, server, getJobsPage, afterLoad: getJobsPage.mock.calls.length};
+  }
+
+  it('shows the name seconds after the server stored it, not at the next 30 s poll', async () => {
+    const created_at = secondsAgo(2);
+    const {component, server} = mountWithServerRow(job('new', {description: TASK, title: null, created_at}));
+    expect(component.jobName(component.jobs()[0])).toBe(TASK);
+
+    // The auxiliary model has answered by now.
+    server.row = job('new', {description: TASK, title: 'Weekly release notes', created_at});
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(component.jobName(component.jobs()[0])).toBe('Weekly release notes');
+    expect(component.jobs()[0].description).toBe(TASK);
+  });
+
+  it('looks twice and then leaves it to the ordinary poll', async () => {
+    const {getJobsPage, afterLoad} = mountWithServerRow(
+      job('new', {description: TASK, title: null, created_at: secondsAgo(2)}),
+    );
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad + 1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad + 2);
+    // Nothing more until the 30 s poll.
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad + 2);
+  });
+
+  it('does not look again when no row is waiting for a name', async () => {
+    const {getJobsPage, afterLoad} = mountWithServerRow(
+      job('old', {description: TASK, title: null, created_at: secondsAgo(600)}),
+    );
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad);
+  });
+
+  it('does not look again for a job that already has its name', async () => {
+    const {getJobsPage, afterLoad} = mountWithServerRow(
+      job('named', {description: TASK, title: 'Weekly release notes', created_at: secondsAgo(2)}),
+    );
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad);
+  });
+
+  it('respects the pause switch like every other refresh', async () => {
+    const {component, getJobsPage, afterLoad} = mountWithServerRow(
+      job('new', {description: TASK, title: null, created_at: secondsAgo(2)}),
+    );
+    component.toggleLive();
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad);
+  });
+});
