@@ -27,6 +27,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
 from orchestrator.services.dispatch_credentials import endpoint_tls_pin_wire
 from orchestrator.services.live.dispatch import live_session_config
 from orchestrator.services.model_availability import (
@@ -170,6 +171,10 @@ async def inject_dispatch_credentials(
         user_settings = await postgres_db.get_user_settings(user_id_str) or {}
 
     config_override = config_override or {}
+    # Every pin in the dispatched config comes from an endpoint row: drop any
+    # the override brought before an injector runs (the image injector last
+    # among them), so a slot no injector touches cannot carry one.
+    strip_in_flight_only_keys(config_override)
     llm_over = config_override.setdefault("llm", {})
     model_id = llm_over.get("model")
     meta = None

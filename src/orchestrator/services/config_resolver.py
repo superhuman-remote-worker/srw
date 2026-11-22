@@ -17,6 +17,7 @@ import copy
 import logging
 from typing import Awaitable, Callable, Optional
 
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
 from shared.job_phases import PHASES_KEY, plans_in_phases
 from shared.runtime.core.loader import (
     INHERIT_MODEL,
@@ -496,6 +497,11 @@ async def inject_blob_credentials(
     injector routes credentials for the *resolved* model, not the YAML default.
     """
     delivered = copy.deepcopy(blob)
+    # Every pin in the delivered config comes from an endpoint row. Drop any
+    # the blob brought, here and not only in the injector's copy below: the
+    # merge back adds keys and never removes one, and most of the blob never
+    # reaches the injector.
+    strip_in_flight_only_keys(delivered)
     agent = delivered.setdefault("agent", {})
 
     co: dict = {"llm": dict(agent.get("llm") or {})}

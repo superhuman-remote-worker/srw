@@ -31,20 +31,27 @@ override never goes out without its pin (``TlsPin.from_env`` refuses it).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import pickle
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fastapi import HTTPException
 
-from orchestrator.security.config_redaction import redact_config_override
+from orchestrator.security.config_redaction import (
+    redact_config_override,
+    strip_in_flight_only_keys,
+)
+from orchestrator.services import config_resolver
 from orchestrator.services import dispatch_credentials as dc
 from orchestrator.services import job_dispatch_credentials as jdc
 from orchestrator.services import model_availability as ma
 from orchestrator.services import session_resolved_config
+from orchestrator.services import thread_config_update as tcu
 from orchestrator.services.config_overrides import refuse_caller_transport_keys
 from shared.orch_surface.jobs._utils import transport_key_paths
 from shared.runtime.core.model_registry import ModelMeta, UnknownModelError
@@ -985,3 +992,203 @@ class TestCallerBoundary:
                 "memory": {"enabled": True},
             }
         }
+
+
+# ---------------------------------------------------------------------------
+# Every pin in a dispatched config comes from an endpoint row
+# ---------------------------------------------------------------------------
+
+#: A pin an override brought: a project or Expert default, a caller's fragment.
+PLANTED = "cGxhbnRlZC1ieS1hLXByb2plY3Qtb3ItZXhwZXJ0"
+
+
+def _planted_override(model_id: str) -> dict:
+    """A project/Expert-default-shaped override with a pin in every place no
+    injector writes one: sections with no model of their own (or the
+    ``inherit`` sentinel), ``image``, an env slot whose model never resolves,
+    and another flat env block."""
+    return {
+        "llm": {
+            "model": model_id,
+            "tls_pinned_cert": PLANTED,
+            "summarization": {"temperature": 0.1, "tls_pinned_cert": PLANTED},
+        },
+        "subagents": {
+            "llm": {"temperature": 0.2, "tls_pinned_cert": PLANTED},
+            "roster": {
+                "helper": {"llm": {"model": "inherit", "tls_pinned_cert": PLANTED}}
+            },
+        },
+        "image": {"tls_pinned_cert": PLANTED},
+        "env_keys": {"EMBEDDING_TLS_PINNED_CERT": PLANTED},
+        "mcp_servers": [{"name": "x", "env": {"X_TLS_PINNED_CERT": PLANTED}}],
+    }
+
+
+def _row_image_pin_injector(seen: list):
+    """Stands in for Task 16's image injector: records the ``image`` section
+    it is handed and writes the image endpoint row's pin."""
+
+    async def inject(config_override, **_kwargs):
+        seen.append(copy.deepcopy(config_override.get("image")))
+        config_override["image"] = {"model": "img", "tls_pinned_cert": "ROW-IMAGE-PIN"}
+        return config_override
+
+    return inject
+
+
+class TestEveryPinComesFromAnEndpointRow:
+    """A pin is a trust anchor: only an admin sets one, on the endpoint row.
+    Each dispatch chain drops every pin its input brought before an injector
+    runs; the injectors then write only the row's."""
+
+    @pytest.mark.parametrize("value", [{}, [], "x", None])
+    def test_the_strip_leaves_other_values_alone(self, value):
+        before = copy.deepcopy(value)
+        strip_in_flight_only_keys(value)
+        assert value == before
+
+    def test_the_strip_uses_the_redaction_rule(self):
+        co = _planted_override("m")
+        co["llm"]["base_url"] = PINNED_URL
+        co["env_keys"]["EMBEDDING_BASE_URL"] = PINNED_URL
+        expected = redact_config_override(co)
+        strip_in_flight_only_keys(co)
+        assert co == expected
+        assert PLANTED not in repr(co)
+
+    @pytest.mark.asyncio
+    async def test_job_path_drops_every_planted_pin(self, rows):
+        # No embedding model resolves: no injector touches that slot.
+        store = _Store(rows)
+        out = await _job(_planted_override("provider-model"), store)
+        assert PLANTED not in repr(out)
+        assert out["llm"]["tls_pinned_cert"] is None
+
+    @pytest.mark.asyncio
+    async def test_job_path_still_carries_the_rows_pin(self, rows, pins):
+        store = _Store(rows)
+        out = await _job(_planted_override("pinned-model"), store)
+        assert PLANTED not in repr(out)
+        assert out["llm"]["tls_pinned_cert"] == pins["leaf"].wire
+        assert out["llm"]["base_url"] == PINNED_URL
+
+    @pytest.mark.asyncio
+    async def test_job_path_strips_before_the_image_injector(self, rows):
+        seen: list = []
+        deps = _job_deps(_Store(rows))
+        deps = jdc.DispatchCredentialDependencies(
+            **{
+                **deps.__dict__,
+                "inject_image_credentials": _row_image_pin_injector(seen),
+            }
+        )
+        out = await jdc.inject_dispatch_credentials(
+            JOB, _planted_override("provider-model"), dependencies=deps
+        )
+        assert seen == [{}]
+        assert out["image"]["tls_pinned_cert"] == "ROW-IMAGE-PIN"
+
+    async def _session(self, co: dict, store: _Store) -> dict:
+        return await dc.inject_thread_dispatch_credentials(
+            co, user_id="u", include_kb_profile=True, dependencies=_deps(store)
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_path_drops_every_planted_pin(self, rows, monkeypatch):
+        # Keep `image` (the stub writes none) so its planted pin is visible.
+        monkeypatch.setattr(dc, "inject_image_credentials", AsyncMock())
+        out = await self._session(_planted_override("provider-model"), _Store(rows))
+        assert PLANTED not in repr(out)
+        assert out["image"] == {}
+        assert out["llm"]["tls_pinned_cert"] is None
+
+    @pytest.mark.asyncio
+    async def test_session_path_still_carries_the_rows_pin(self, rows, pins):
+        out = await self._session(_planted_override("pinned-model"), _Store(rows))
+        assert PLANTED not in repr(out)
+        assert out["llm"]["tls_pinned_cert"] == pins["leaf"].wire
+
+    @pytest.mark.asyncio
+    async def test_session_path_strips_before_the_image_injector(
+        self, rows, monkeypatch
+    ):
+        seen: list = []
+        monkeypatch.setattr(
+            dc, "inject_image_credentials", _row_image_pin_injector(seen)
+        )
+        out = await self._session(_planted_override("provider-model"), _Store(rows))
+        assert seen == [{}]
+        assert out["image"]["tls_pinned_cert"] == "ROW-IMAGE-PIN"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["job", "session"])
+    async def test_a_delivered_blob_keeps_no_planted_pin(self, rows, pins, path):
+        """``inject_blob_credentials`` merges the injector's copy back by
+        adding keys, and most of the blob never reaches the injector: the
+        delivered copy is stripped itself."""
+        store = _Store(rows)
+        agent = _planted_override("pinned-model")
+        agent["subagents"]["roster"]["helper"]["env_keys"] = {
+            "RERANK_TLS_PINNED_CERT": PLANTED
+        }
+        blob = {"agent": agent, "prompts": {"persona": "p"}}
+        before = copy.deepcopy(blob)
+
+        if path == "job":
+
+            def injector(co):
+                return jdc.inject_dispatch_credentials(
+                    JOB, co, dependencies=_job_deps(store)
+                )
+
+        else:
+
+            def injector(co):
+                return dc.inject_thread_dispatch_credentials(
+                    co, user_id="u", dependencies=_deps(store)
+                )
+
+        delivered = await config_resolver.inject_blob_credentials(blob, injector)
+        assert PLANTED not in repr(delivered)
+        assert delivered["agent"]["llm"]["tls_pinned_cert"] == pins["leaf"].wire
+        assert blob == before  # the persistable copy is never mutated
+
+    @pytest.mark.asyncio
+    async def test_a_session_settings_patch_drops_a_planted_pin(self, monkeypatch):
+        """The settings PATCH returns its fragment to the agent: a pin in it
+        is dropped before validation, enrichment and persistence."""
+        core = AsyncMock(return_value=({"llm": {"model": "m"}}, None))
+        monkeypatch.setattr(tcu, "apply_thread_config_update_locked", core)
+
+        @contextlib.asynccontextmanager
+        async def transaction(_thread_id):
+            yield SimpleNamespace(fetchrow=AsyncMock(return_value={"id": "t"}))
+
+        store = SimpleNamespace(
+            thread_configuration_transaction=transaction,
+            refresh_session_execution=AsyncMock(
+                return_value={"delivery_override": {"llm": {"model": "m"}}}
+            ),
+        )
+        fragment = {
+            "llm": {
+                "model": "m",
+                "tls_pinned_cert": PLANTED,
+                "summarization": {"tls_pinned_cert": PLANTED},
+            },
+            "image": {"tls_pinned_cert": PLANTED},
+            "env_keys": {"VISION_TLS_PINNED_CERT": PLANTED},
+        }
+        await tcu.apply_thread_config_update(
+            "00000000-0000-4000-8000-000000000001",
+            None,
+            fragment,
+            None,
+            request=MagicMock(),
+            actor=None,
+            dependencies=SimpleNamespace(store=store),
+        )
+        handed = core.await_args.args[2]
+        assert PLANTED not in repr(handed)
+        assert handed["llm"] == {"model": "m", "summarization": {}}

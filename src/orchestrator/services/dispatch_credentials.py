@@ -49,6 +49,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
 from orchestrator.services.model_availability import (
     EndpointPinUnreadable,
     ModelUnavailable,
@@ -1022,6 +1023,10 @@ async def inject_thread_dispatch_credentials(
     model choices.
     """
     user_settings = user_settings or {}
+    # Every pin in the dispatched config comes from an endpoint row: drop any
+    # the override brought before an injector runs (the image injector last
+    # among them), so a slot no injector touches cannot carry one.
+    strip_in_flight_only_keys(config_override)
 
     # Drop None-valued keys in the model sections before injecting. A prior
     # hot-swap persists explicit ``provider/base_url/api_key = None`` sentinels

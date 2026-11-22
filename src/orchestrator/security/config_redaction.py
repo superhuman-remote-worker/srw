@@ -43,6 +43,29 @@ def _is_in_flight_only_key(key: str) -> bool:
     return k == _IN_FLIGHT_ONLY_KEY or k.endswith(_IN_FLIGHT_ONLY_SUFFIX)
 
 
+def strip_in_flight_only_keys(value: Any) -> None:
+    """Remove every in-flight-only key from ``value`` IN PLACE, at any depth.
+
+    Run at the entry of every dispatch chain, before its injectors. A pin is a
+    trust anchor, so the only pin that may reach an agent is one dispatch
+    writes from the endpoint row an admin trusted. Whatever the override
+    brought is dropped: a project or Expert default, a caller's fragment, or a
+    copy stored before redaction stripped it. That holds wherever it sits: a
+    model section with no model of its own, ``image``, ``env_keys`` or any
+    other flat env block. The key rule is :func:`redact_config_override`'s.
+    """
+    if isinstance(value, dict):
+        for key in [
+            k for k in value if isinstance(k, str) and _is_in_flight_only_key(k)
+        ]:
+            del value[key]
+        for nested in value.values():
+            strip_in_flight_only_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            strip_in_flight_only_keys(nested)
+
+
 def redact_config_override(co: Any) -> Any:
     """Return a deep copy of a ``config_override`` with credential fields removed.
 

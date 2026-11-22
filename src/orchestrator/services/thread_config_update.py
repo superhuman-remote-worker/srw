@@ -66,6 +66,7 @@ from orchestrator.schemas.thread_config import (
     ThreadWorkspaceUpgradeRequest,
 )
 from orchestrator.security.access import redact_config_override
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
 from orchestrator.services import connector_bind_time, connector_credential_leases
 from orchestrator.services.cloud_connector_mounts import (
     ATTACHED_LIVE_KEY,
@@ -342,6 +343,10 @@ async def apply_thread_config_update(
     dependencies: ThreadConfigUpdateDependencies,
 ) -> tuple[dict[str, Any], list[str] | None]:
     """Commit accepted settings, connector selection and one spec generation."""
+    # The fragment returns to the agent as its delivery override, so every pin
+    # in it must come from an endpoint row (the model-swap enrichment below):
+    # drop any the fragment brought before anything reads it.
+    strip_in_flight_only_keys(config_override)
     if thread_row is not None:
         require_srw_runtime(thread_row)
     from shared.runtime.core.session_config_patch import validate_session_settings_patch
