@@ -52,8 +52,14 @@ from orchestrator.services import job_dispatch_credentials as jdc
 from orchestrator.services import model_availability as ma
 from orchestrator.services import session_resolved_config
 from orchestrator.services import thread_config_update as tcu
+from orchestrator.services.manifest_execution_snapshot import (
+    prepare_srw_session_patch,
+    rendered_srw_snapshot,
+    srw_snapshot_config,
+)
 from orchestrator.services.config_overrides import refuse_caller_transport_keys
 from shared.orch_surface.jobs._utils import transport_key_paths
+from shared.runtime.core.session_config_patch import patch_frozen_session
 from shared.runtime.core.model_registry import ModelMeta, UnknownModelError
 from shared.runtime.core.transport_resolution import (
     NO_KEY_SENTINEL,
@@ -113,6 +119,7 @@ def _endpoint_meta(model_id: str, endpoint_id: str) -> ModelMeta:
 
 METAS = {
     "pinned-model": _endpoint_meta("pinned-model", PINNED_ID),
+    "pinned-model-2": _endpoint_meta("pinned-model-2", PINNED_ID),
     "keyless-model": _endpoint_meta("keyless-model", KEYLESS_ID),
     "broken-key-model": _endpoint_meta("broken-key-model", BROKEN_KEY_ID),
     "http-model": _endpoint_meta("http-model", HTTP_ID),
@@ -1192,3 +1199,160 @@ class TestEveryPinComesFromAnEndpointRow:
         handed = core.await_args.args[2]
         assert PLANTED not in repr(handed)
         assert handed["llm"] == {"model": "m", "summarization": {}}
+
+
+# ---------------------------------------------------------------------------
+# A Session's model swap clears the pin the agent held (Review Focus 1)
+# ---------------------------------------------------------------------------
+
+SESSION_ID = "12121212-3434-4565-8787-909090909090"
+
+
+def _session_started_on_the_pinned_endpoint(wire: str) -> dict:
+    """The Session's frozen snapshot: rendered (so redacted) from a config the
+    agent got with the pinned endpoint's transport. The base URL survives the
+    redaction, the key and the pin do not; the agent still holds both."""
+    llm = {
+        "model": "pinned-model",
+        "provider": "openai",
+        "base_url": PINNED_URL,
+        "api_key": PINNED_KEY,
+        "tls_pinned_cert": wire,
+    }
+    agent = {"agent_id": "session", "display_name": "Session", "llm": llm}
+    snapshot = rendered_srw_snapshot(
+        {"agent": agent, "prompts": {"persona": "p"}},
+        {"llm": dict(llm)},
+        work_kind="Session",
+        work_id=SESSION_ID,
+        owner_id=None,
+        project_ids=[],
+        config_name="session_base",
+        description="Session",
+        datasource_ids=[],
+        policy_revisions={},
+        image="srw:original",
+        dependencies=[],
+    )
+    snapshot["generation"] = 1
+    return snapshot
+
+
+class TestASessionModelSwapClearsTheAgentsPin:
+    def test_the_patch_delta_clears_what_the_request_clears(self, pins):
+        """``patch_frozen_session`` on a model change: a key the request
+        clears (``None``) stays cleared in the delta the agent merges, even
+        when the redacted frozen section never held it."""
+        current = _session_started_on_the_pinned_endpoint(pins["leaf"].wire)
+        blob, policy = srw_snapshot_config(current)
+        assert "tls_pinned_cert" not in blob["agent"]["llm"]
+        assert "api_key" not in blob["agent"]["llm"]
+        # What the swap enrichment sends for a keyless endpoint without a pin.
+        override = {
+            "llm": {
+                "model": "keyless-model",
+                "provider": "openai",
+                "base_url": KEYLESS_URL,
+                "api_key": None,
+                "tls_pinned_cert": None,
+            }
+        }
+        updated, _, delta = patch_frozen_session(blob, policy, override)
+        assert delta["llm"]["tls_pinned_cert"] is None
+        assert delta["llm"]["api_key"] is None
+        assert delta["llm"]["base_url"] == KEYLESS_URL
+        # The snapshot itself holds neither (deep_merge reads None as clear).
+        assert "tls_pinned_cert" not in updated["agent"]["llm"]
+        assert "api_key" not in updated["agent"]["llm"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "target, expected_pin, expected_key",
+        [
+            # Off the pinned endpoint onto a provider key: no pin.
+            ("provider-model", None, SYSTEM_OPENAI_KEY),
+            # Onto an unpinned endpoint: no pin, the row's key.
+            ("unpinned-model", None, PINNED_KEY),
+            # Onto a keyless pinned endpoint: the row's pin, and the previous
+            # endpoint's key cleared rather than sent to the new host.
+            ("keyless-model", "leaf", None),
+            # Onto another model on the same pinned endpoint: the row's pin.
+            ("pinned-model-2", "leaf", PINNED_KEY),
+        ],
+    )
+    async def test_the_delivery_override_the_agent_merges(
+        self, rows, pins, target, expected_pin, expected_key
+    ):
+        """End to end in the orchestrator: the settings PATCH (strip, real
+        model enrichment, persistence) and the real session patch
+        (``prepare_srw_session_patch``) produce the delivery override the
+        agent deep-merges. A planted pin in the fragment never reaches it."""
+        dispatch_store = _Store(rows)
+        current = _session_started_on_the_pinned_endpoint(pins["leaf"].wire)
+        settings = SimpleNamespace(
+            get_system_setting=AsyncMock(return_value={"value": {"enabled": False}})
+        )
+        persisted: list = []
+
+        async def refresh_session_execution(thread_id, *, conn, config_override):
+            _, delivery = await prepare_srw_session_patch(
+                settings, current, {"id": thread_id}, {}, [], config_override
+            )
+            return {"delivery_override": delivery}
+
+        async def merge_thread_config_override(thread_id, config_override):
+            persisted.append(config_override)
+            return True
+
+        @contextlib.asynccontextmanager
+        async def transaction(_thread_id):
+            yield SimpleNamespace(
+                fetchrow=AsyncMock(
+                    return_value={
+                        "id": SESSION_ID,
+                        "user_id": None,
+                        "project_id": None,
+                        "execution_lane": "pinned",
+                        "metadata": {},
+                    }
+                )
+            )
+
+        async def inject_model_credentials(**kwargs):
+            return await dc.inject_model_credentials(
+                **kwargs, dependencies=_deps(dispatch_store)
+            )
+
+        deps = SimpleNamespace(
+            store=SimpleNamespace(
+                thread_configuration_transaction=transaction,
+                resolve_api_keys_for_job=AsyncMock(
+                    return_value={"openai": SYSTEM_OPENAI_KEY}
+                ),
+                merge_thread_config_override=merge_thread_config_override,
+                refresh_session_execution=refresh_session_execution,
+            ),
+            enforce_session_create_grants=AsyncMock(),
+            inject_model_credentials=inject_model_credentials,
+            log_security_event=AsyncMock(),
+        )
+        delivery, _ = await tcu.apply_thread_config_update(
+            SESSION_ID,
+            None,
+            {"llm": {"model": target, "tls_pinned_cert": PLANTED}},
+            None,
+            request=MagicMock(),
+            actor=None,
+            dependencies=deps,
+        )
+        llm = delivery["llm"]
+        assert llm["model"] == target
+        assert "tls_pinned_cert" in llm
+        expected = pins["leaf"].wire if expected_pin else None
+        assert llm["tls_pinned_cert"] == expected
+        assert "api_key" in llm
+        assert llm["api_key"] == expected_key
+        assert PLANTED not in repr(delivery)
+        # Persisted without the pin or a key (in flight only).
+        assert "tls_pinned_cert" not in repr(persisted).lower()
+        assert pins["leaf"].wire not in repr(persisted)

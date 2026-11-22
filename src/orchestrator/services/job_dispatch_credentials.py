@@ -529,7 +529,8 @@ async def inject_dispatch_credentials(
             if f"{_prefix}_MODEL" in env_keys_block:
                 # No injector runs for a slot an override already named, so
                 # nothing here vouches for a pin next to it: only an endpoint
-                # row's injection writes one.
+                # row's injection writes one. A backstop: the strip at this
+                # function's entry already removed any pin the override brought.
                 env_keys_block.pop(f"{_prefix}_{TLS_PINNED_CERT_SUFFIX}", None)
                 continue
             await dependencies.inject_env_key_credentials(

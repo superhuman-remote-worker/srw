@@ -62,6 +62,14 @@ def patch_frozen_session(blob, policy, override, *, deployment_dir=None):
             source="thread-override",
         )
     )
+    # The keys each section of the request clears explicitly (`None`). The
+    # merge below drops them, and a model change replaces the delta's section
+    # with that merge, so they are recorded first.
+    requested_clears = {
+        section: {key for key, value in delta[section].items() if value is None}
+        for section in ("llm", "limits", "shell")
+        if isinstance(delta.get(section), dict)
+    }
     agent = deep_merge(deepcopy(blob["agent"]), delta)
     if (delta.get("llm") or {}).get("model") and (
         delta["llm"]["model"] != (blob["agent"].get("llm") or {}).get("model")
@@ -72,10 +80,17 @@ def patch_frozen_session(blob, policy, override, *, deployment_dir=None):
                 continue
             delta[section] = deepcopy(agent.get(section, {}))
             # A model swap can remove the old transport. Keep its explicit
-            # deletion in the pinned-runtime delta as well as the snapshot.
-            for key in (blob["agent"].get(section) or {}).keys() - delta[
-                section
-            ].keys():
+            # deletion in the pinned-runtime delta as well as the snapshot:
+            # every key the frozen section held, and every key the request
+            # cleared that the frozen section never held. The running agent
+            # may still hold such a key: an endpoint's TLS pin and its API key
+            # are delivered in flight only, so the redacted snapshot has
+            # neither, and a swap that did not clear them would keep the
+            # previous model's pin and key.
+            cleared = (blob["agent"].get(section) or {}).keys() | requested_clears.get(
+                section, set()
+            )
+            for key in cleared - delta[section].keys():
                 delta[section][key] = None
         # The session delegation cap has a per-family slot the matrix just
         # re-derived (or removed). Carry only that slot: the rest of the
