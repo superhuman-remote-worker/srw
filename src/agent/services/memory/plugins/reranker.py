@@ -243,22 +243,28 @@ def resolve_reranker_transport(
     The pin follows the URL the scorer actually calls: ``RERANK_BASE_URL``
     takes ``RERANK_TLS_PINNED_CERT``, the embedding fallback takes
     ``EMBEDDING_TLS_PINNED_CERT``, and an explicit ``memory.reranker.base_url``
-    takes the pin of the paired prefix whose endpoint it lies within (else
-    none: another origin is not the pinned endpoint). A pin that is set but
-    unusable raises ``ValueError``; it is never read as "no pin".
+    takes the pin of the paired prefix on the same origin, whatever the path
+    (else none: another origin is not the pinned server). A pin that is set
+    but unusable raises ``ValueError``; it is never read as "no pin".
     """
     if env is None:
         env = os.environ
     model = cfg.model or env.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL
     tls_pin: Optional[TlsPin] = None
     if cfg.base_url:
-        from shared.runtime.core.transport_resolution import endpoint_within
+        from shared.runtime.core.transport_resolution import (
+            endpoint_within,
+            same_endpoint,
+        )
 
         base_url = cfg.base_url
         api_key = cfg.api_key
+        # The pin is the server's identity, which is per origin: any path on
+        # a paired endpoint's origin is that server. The key below follows
+        # its endpoint by path (a shared host tenants by path).
         for prefix in ("RERANK", "EMBEDDING"):
             paired = env.get(f"{prefix}_BASE_URL")
-            if paired and endpoint_within(base_url, paired):
+            if paired and same_endpoint(base_url, paired):
                 tls_pin = TlsPin.from_env(prefix, env)
                 break
         if not api_key:

@@ -98,6 +98,24 @@ class TestPinFollowsTheUrlTheRerankerCalls:
         )
         assert got[3] == rr
 
+    def test_explicit_url_on_a_sibling_path_of_a_pinned_origin_gets_its_pin(
+        self, two_pins
+    ):
+        # TLS identity is per origin: another path on the pinned server is
+        # still that server, so it is called through the pin, never unpinned.
+        emb, rr = two_pins
+        env = {
+            "RERANK_BASE_URL": "https://rr.example/tenant-a/v1",
+            "RERANK_TLS_PINNED_CERT": rr.wire,
+            "EMBEDDING_BASE_URL": "https://emb.example/v1",
+            "EMBEDDING_TLS_PINNED_CERT": emb.wire,
+        }
+        cfg = _cfg(base_url="https://rr.example/tenant-b/v1")
+        assert resolve_reranker_transport(cfg, env=env)[3] == rr
+        # The key still follows its endpoint by path: none is borrowed here.
+        env["RERANK_API_KEY"] = "rr-key"
+        assert resolve_reranker_transport(cfg, env=env)[2] is None
+
     def test_no_pin_set_is_none(self):
         env = {"EMBEDDING_BASE_URL": "https://emb.example/v1"}
         assert resolve_reranker_transport(_cfg(), env=env)[3] is None
