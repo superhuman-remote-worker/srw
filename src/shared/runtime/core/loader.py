@@ -567,6 +567,7 @@ LLM_INHERITED_KEYS = (
     "api_key",
     "model_max_context_tokens",
     "served_model",
+    "tls_pinned_cert",
 )
 
 
@@ -2094,6 +2095,8 @@ class PhaseLLMOverride:
     extra_headers: Optional[Dict[str, str]] = None
     # The string this phase's catalog row sends upstream (LLMConfig.served_model).
     served_model: Optional[str] = None
+    # The endpoint's pinned certificate (LLMConfig.tls_pinned_cert).
+    tls_pinned_cert: Optional[str] = None
 
 
 @dataclass
@@ -2160,6 +2163,12 @@ class LLMConfig:
     # None = send ``model`` (minus a routing prefix), and a dispatch writes
     # None to clear it on a session model switch. See ``wire_model_name``.
     served_model: Optional[str] = None
+    # The endpoint's pinned certificate as ``TlsPin.wire`` (one-line base64
+    # DER), injected at DISPATCH next to ``base_url`` from the endpoint row —
+    # never set from YAML. Kept opaque here; the chat factories parse it and
+    # verify the server against it. None = ordinary verification, and a
+    # dispatch writes None to clear it on a session model switch.
+    tls_pinned_cert: Optional[str] = None
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
@@ -2217,7 +2226,10 @@ class LLMConfig:
         # A key follows its endpoint: when the overlay moves the call to a
         # different base_url without bringing its own key, the parent's key
         # must not ride along to the new host.
-        from shared.runtime.core.transport_resolution import endpoint_within
+        from shared.runtime.core.transport_resolution import (
+            endpoint_within,
+            same_endpoint,
+        )
 
         if override.api_key is not None:
             api_key = override.api_key
@@ -2236,6 +2248,16 @@ class LLMConfig:
             served_model = override.served_model
         else:
             served_model = self.served_model
+
+        # A pin belongs to its endpoint, like the key: it follows the base URL.
+        if override.tls_pinned_cert is not None:
+            tls_pinned_cert = override.tls_pinned_cert
+        elif override.base_url is not None and not same_endpoint(
+            override.base_url, self.base_url
+        ):
+            tls_pinned_cert = None
+        else:
+            tls_pinned_cert = self.tls_pinned_cert
 
         # Create new config with overrides applied (don't copy phase fields)
         return LLMConfig(
@@ -2281,6 +2303,7 @@ class LLMConfig:
             if override.extra_headers is not None
             else self.extra_headers,
             served_model=served_model,
+            tls_pinned_cert=tls_pinned_cert,
             replay_reasoning_content=self.replay_reasoning_content,
             compaction=self.compaction,
             # Phase overrides not inherited to resolved config
@@ -2856,6 +2879,8 @@ class AuxiliaryConfig:
     # The aux row's upstream model string (LLMConfig.served_model), injected
     # at dispatch; threaded for the same reason as ``extra_headers``.
     served_model: Optional[str] = None
+    # The aux row's endpoint pin (LLMConfig.tls_pinned_cert), injected at dispatch.
+    tls_pinned_cert: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -3106,6 +3131,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         extra_body=data.get("extra_body"),
         extra_headers=data.get("extra_headers"),
         served_model=data.get("served_model"),
+        tls_pinned_cert=data.get("tls_pinned_cert"),
     )
 
 
@@ -3146,6 +3172,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         extra_body=llm_data.get("extra_body"),
         extra_headers=llm_data.get("extra_headers"),
         served_model=llm_data.get("served_model"),
+        tls_pinned_cert=llm_data.get("tls_pinned_cert"),
         replay_reasoning_content=llm_data.get("replay_reasoning_content"),
         compaction=llm_data.get("compaction"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
@@ -3470,6 +3497,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         provider=data.get("provider"),
         extra_headers=data.get("extra_headers"),
         served_model=data.get("served_model"),
+        tls_pinned_cert=data.get("tls_pinned_cert"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -4575,6 +4603,7 @@ def build_auxiliary_llm_config(
         provider=aux.provider,
         extra_headers=aux.extra_headers,
         served_model=aux.served_model,
+        tls_pinned_cert=aux.tls_pinned_cert,
         temperature=aux.temperature,
         top_p=model_settings.get("top_p"),
         top_k=model_settings.get("top_k"),

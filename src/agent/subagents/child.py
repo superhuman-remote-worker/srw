@@ -525,6 +525,7 @@ def overlay_live_llm(child_llm: Any, live: Any) -> Any:
         "api_key",
         "model_max_context_tokens",
         "served_model",
+        "tls_pinned_cert",
     ):
         value = getattr(live, key, None)
         if value is not None or changed:
