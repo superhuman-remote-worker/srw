@@ -11233,6 +11233,7 @@ async def _handle_config_update(
             "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
+            "EMBEDDING_TLS_PINNED_CERT",
             # The rerank slot is credential-bearing too; a change must round-
             # trip through the orchestrator for base_url/api_key enrichment.
             # The bound scorer keeps its attach-time transport until re-attach.
@@ -11240,6 +11241,7 @@ async def _handle_config_update(
             "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
+            "RERANK_TLS_PINNED_CERT",
         )
         ds_update = datasource_ids is not None
         tools_update = bool(config_override.get("tools"))

@@ -8664,10 +8664,12 @@ class TestAttachSessionRebinds:
             "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
+            "EMBEDDING_TLS_PINNED_CERT",
             "RERANK_MODEL",
             "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
+            "RERANK_TLS_PINNED_CERT",
         }
         # Pop-first: the scrub precedes any re-application of new env values.
         assert helper_src.index("os.environ.pop") < helper_src.index(

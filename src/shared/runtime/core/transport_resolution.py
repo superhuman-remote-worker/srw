@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
+from shared.tls_pinning import TlsPin
+
 # Providers whose create_llm factory RAISES when no api_key resolves.
 KEY_REQUIRED_PROVIDERS = frozenset(
     {"openrouter", "mistral", "anthropic", "google", "groq"}
@@ -333,6 +335,7 @@ _DISPATCH_ENV_SUFFIXES = (
     "PROVIDER",
     "PROFILE_ID",
     "DIMENSIONS",
+    "TLS_PINNED_CERT",
 )
 # Non-secret tuning an owner may set through a project override's env_keys.
 # Each carries neither a key nor a URL, so it cannot move a credential.
@@ -474,6 +477,7 @@ class CitationTransport:
     base_url: Optional[str]
     api_key: Optional[str]
     key_source: str
+    tls_pin: Optional[TlsPin] = None
 
 
 def is_openai_default_endpoint(base_url: Optional[str]) -> bool:
@@ -519,10 +523,20 @@ def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTranspo
     names = env_endpoint_names("CITATION_LLM")
     url_var = next((name for name in names if env.get(name)), names[-1])
     base_url = env.get(url_var) or None
+    # The pin belongs to the endpoint whichever spelling names it. An
+    # unreadable or malformed pin is refused like any other unusable transport
+    # (the agent degrades the citation client); it never becomes "no pin".
+    try:
+        tls_pin = TlsPin.from_env("CITATION_LLM", env)
+    except ValueError as exc:
+        raise CitationTransportError(str(exc)) from exc
     dedicated = env.get("CITATION_LLM_API_KEY") or None
     if dedicated:
         return CitationTransport(
-            base_url=base_url, api_key=dedicated, key_source="CITATION_LLM_API_KEY"
+            base_url=base_url,
+            api_key=dedicated,
+            key_source="CITATION_LLM_API_KEY",
+            tls_pin=tls_pin,
         )
     if not is_openai_default_endpoint(base_url):
         raise CitationTransportError(
@@ -537,4 +551,5 @@ def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTranspo
         base_url=base_url,
         api_key=shared,
         key_source="OPENAI_API_KEY" if shared else "none",
+        tls_pin=tls_pin,
     )
