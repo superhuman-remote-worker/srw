@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import asyncio
@@ -139,9 +140,22 @@ def test_from_wire_refuses_the_unreadable_marker():
         TlsPin.from_wire(f"  {UNREADABLE_PIN}\n")
 
 
-#: Valid PEM armour around a truncated DER: it parses, but OpenSSL can't load
-#: it as a trust anchor.
+#: Valid PEM armour around a truncated DER: the armour and base64 parse, but
+#: OpenSSL can't load it as a trust anchor.
 _TRUNCATED = "-----BEGIN CERTIFICATE-----\nMIIBAAAA\n-----END CERTIFICATE-----\n"
+_TRUNCATED_SHA256 = fingerprint_sha256(base64.b64decode("MIIBAAAA"))
+
+
+def test_a_pin_openssl_cannot_load_is_refused_when_it_is_read():
+    # "MAA=" is a DER SEQUENCE byte and nothing else: it passes a first-byte
+    # check, so only loading it tells it is not a certificate. Every reader
+    # catches ValueError; none may see ssl.SSLError or a pin that fails later.
+    with pytest.raises(ValueError):
+        TlsPin.from_wire("MAA=")
+    with pytest.raises(ValueError, match="EMBEDDING_TLS_PINNED_CERT"):
+        TlsPin.from_env("EMBEDDING", {"EMBEDDING_TLS_PINNED_CERT": "MAA="})
+    with pytest.raises(ValueError):
+        TlsPin.from_pem(_TRUNCATED)
 
 
 def test_read_stored_pin_reads_a_row_pin(tls_certs):
@@ -161,7 +175,7 @@ def test_read_stored_pin_never_reads_a_broken_pin_as_no_pin(tls_certs, kind):
         "fingerprint_only": (None, leaf.sha256),
         "not_pem": ("not a certificate", leaf.sha256),
         "other_fingerprint": (_pin(tls_certs.swap).pem, leaf.sha256),
-        "truncated_der": (_TRUNCATED, TlsPin.from_pem(_TRUNCATED).sha256),
+        "truncated_der": (_TRUNCATED, _TRUNCATED_SHA256),
     }[kind]
     with pytest.raises(ValueError):
         read_stored_pin(pem, sha256)

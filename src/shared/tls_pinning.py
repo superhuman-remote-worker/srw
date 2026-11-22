@@ -152,10 +152,24 @@ class TlsPin:
 
     @classmethod
     def _checked(cls, der: bytes) -> "TlsPin":
+        """The pin for ``der``, once OpenSSL has loaded it as a trust anchor.
+
+        The one "is this a usable certificate" check: every parse
+        (``from_pem``, ``from_wire``, ``from_env``) runs it, so a reader that
+        catches ``ValueError`` never holds a pin that fails later, when a
+        client is built from it.
+        """
         # A certificate is a DER SEQUENCE (0x30); anything else is not one.
         if not der or der[0] != 0x30:
             raise ValueError("not a DER-encoded certificate")
-        return cls(der)
+        pin = cls(der)
+        try:
+            pinned_ssl_context(pin)
+        except ssl.SSLError as exc:
+            raise ValueError(
+                f"OpenSSL can't use it as a pinned certificate: {exc}"
+            ) from exc
+        return pin
 
 
 def pinned_ssl_context(pin: TlsPin) -> ssl.SSLContext:
@@ -178,9 +192,10 @@ def read_stored_pin(pem: Optional[str], sha256: Optional[str]) -> Optional[TlsPi
 
     ``None`` when the row stores no pin. A stored pin that can't be used
     raises ``ValueError``: a fingerprint without its certificate, a PEM that
-    doesn't parse, a certificate that isn't the stored fingerprint's, or one
-    OpenSSL can't load as a trust anchor. A pin that can't be read is never
-    "no pin". The Test probe and dispatch both read pins through this.
+    doesn't parse or that OpenSSL can't load as a trust anchor
+    (:meth:`TlsPin.from_pem`), or a certificate that isn't the stored
+    fingerprint's. A pin that can't be read is never "no pin". The Test probe
+    and dispatch both read pins through this.
     """
     if not pem and not sha256:
         return None
@@ -189,10 +204,6 @@ def read_stored_pin(pem: Optional[str], sha256: Optional[str]) -> Optional[TlsPi
     pin = TlsPin.from_pem(pem)
     if sha256 and sha256 != pin.sha256:
         raise ValueError(f"the stored fingerprint is {sha256}")
-    try:
-        pinned_ssl_context(pin)  # OpenSSL must accept it as a trust anchor
-    except ssl.SSLError as exc:
-        raise ValueError(str(exc)) from exc
     return pin
 
 

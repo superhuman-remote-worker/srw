@@ -31,6 +31,7 @@ override never goes out without its pin (``TlsPin.from_env`` refuses it).
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import logging
@@ -65,7 +66,7 @@ from shared.runtime.core.transport_resolution import (
     NO_KEY_SENTINEL,
     env_endpoint_names,
 )
-from shared.tls_pinning import UNREADABLE_PIN, TlsPin
+from shared.tls_pinning import UNREADABLE_PIN, TlsPin, fingerprint_sha256
 from tests.tls_pin_fixtures import tls_certs  # noqa: F401
 
 LOGGER = logging.getLogger("test.dispatch-tls-pin")
@@ -388,7 +389,7 @@ class TestUnreadablePinIsRefused:
             # Valid PEM armour around a truncated DER: it parses, but OpenSSL
             # can't load it as a trust anchor (the Test probe's third check).
             row["tls_pin_cert"] = TRUNCATED_PEM
-            row["tls_pin_sha256"] = TlsPin.from_pem(TRUNCATED_PEM).sha256
+            row["tls_pin_sha256"] = fingerprint_sha256(base64.b64decode("MIIBAAAA"))
         return request.param
 
     @pytest.mark.asyncio

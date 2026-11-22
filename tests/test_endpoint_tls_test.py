@@ -11,6 +11,7 @@ the last cases run end to end against a real TLS server.
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
@@ -22,7 +23,12 @@ from orchestrator.services import endpoint_tls, llm_endpoint_probe
 from orchestrator.services.llm_endpoint_probe import ProbeResult
 from shared import tls_pinning
 from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
-from shared.tls_pinning import CertificateDetails, TlsInspection, TlsPin
+from shared.tls_pinning import (
+    CertificateDetails,
+    TlsInspection,
+    TlsPin,
+    fingerprint_sha256,
+)
 from tests._mounted_router import mount_router
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
@@ -607,7 +613,7 @@ def broken_pin(kind, certs) -> dict:
         return {"tls_pin_cert": certs.swap.read_text()}
     return {
         "tls_pin_cert": TRUNCATED,
-        "tls_pin_sha256": TlsPin.from_pem(TRUNCATED).sha256,
+        "tls_pin_sha256": fingerprint_sha256(base64.b64decode("MIIBAAAA")),
     }
 
 

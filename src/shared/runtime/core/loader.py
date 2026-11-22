@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import re
-import ssl
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
@@ -45,7 +44,7 @@ from shared.runtime.core.tool_policy import (
     normalize_tool_policy,
 )
 from shared.runtime.llm.reasoning_chat import ReasoningChatOpenAI
-from shared.tls_pinning import TlsPin, pin_applies, pinned_ssl_context
+from shared.tls_pinning import TlsPin, pin_applies
 from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
@@ -4838,9 +4837,8 @@ def _endpoint_tls_pin(config: LLMConfig) -> Optional[TlsPin]:
     try:
         if not isinstance(wire, str):
             raise ValueError(f"expected base64 text, got {type(wire).__name__}")
-        pin = TlsPin.from_wire(wire)
-        pinned_ssl_context(pin)  # OpenSSL must accept it as a trust anchor
-    except (ValueError, ssl.SSLError) as exc:
+        pin = TlsPin.from_wire(wire)  # OpenSSL must load it as a trust anchor
+    except ValueError as exc:
         raise ValueError(
             f"Model {config.model!r} at {config.base_url or '(no base URL)'} "
             f"has an unusable pinned certificate: {exc}"
