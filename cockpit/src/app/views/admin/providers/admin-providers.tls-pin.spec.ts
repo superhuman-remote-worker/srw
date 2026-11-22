@@ -74,6 +74,19 @@ describe('pinBadge', () => {
     expect(b.expired).toBe(true);
     expect(b.expiredDate).toBe('2026-10-01');
   });
+
+  it('is active on an https:// endpoint', () => {
+    expect(pinBadge(pin(), 'https://gpu.lan/v1').active).toBe(true);
+    expect(pinBadge(pin(), 'HTTPS://gpu.lan/v1').active).toBe(true);
+  });
+
+  it('shows a kept pin as inactive on an http:// endpoint, without the expired badge', () => {
+    // An edit to http:// keeps the pin (decision 4), but it applies to https only.
+    const b = pinBadge(pin({expired: true}), 'http://gpu.lan:8000/v1');
+    expect(b.show).toBe(true);
+    expect(b.active).toBe(false);
+    expect(b.expired).toBe(false);
+  });
 });
 
 describe('tlsReasonKey', () => {
@@ -142,6 +155,33 @@ describe('tlsView', () => {
     expect(v.showRemove).toBe(true);
   });
 
+  it('matching pin says the server presents the pinned certificate', () => {
+    const v = tlsView(tls({verified: true, reason: null, pin: pin(), pin_matches: true, can_trust: false}));
+    expect(v.reasonKey).toBeNull();
+    expect(v.showMessage).toBe(false);
+    expect(v.pinMatches).toBe(true);
+  });
+
+  it('a certificate problem is never read as a matching pin', () => {
+    expect(tlsView(tls()).pinMatches).toBe(false);
+    expect(
+      tlsView(tls({reason: 'certificate_changed', pin: pin(), pin_matches: false})).pinMatches,
+    ).toBe(false);
+  });
+
+  it('shows why Trust is not offered when the endpoint cannot be pinned', () => {
+    const refusal = 'The subscription proxy can\'t be pinned.';
+    const v = tlsView(tls({can_trust: false, refusal}));
+    expect(v.trust).toBeNull();
+    expect(v.refusal).toBe(refusal);
+    expect(tlsView(tls()).refusal).toBeNull();
+    expect(tlsView(tls({refusal: undefined})).refusal).toBeNull();
+  });
+
+  it('an empty server message renders no line', () => {
+    expect(tlsView(tls({reason: 'other', message: ''})).showMessage).toBe(false);
+  });
+
   it('unreadable pin (other + message, no certificate) still renders the message', () => {
     const v = tlsView(
       tls({reason: 'other', message: 'stored pin unreadable', certificate: null, can_trust: false, pin: pin()}),
@@ -166,6 +206,7 @@ describe('tlsView extras', () => {
     );
     expect(v.show).toBe(true);
     expect(v.expiredPinDate).toBe('2026-10-01');
+    expect(v.pinMatches).toBe(true);
     expect(v.trust).toBeNull();
   });
 

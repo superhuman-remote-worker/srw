@@ -454,9 +454,20 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         @if (tlsView(result.tls); as tv) {
                           @if (tv.show) {
                             <span class="tls-note" data-testid="tls-note">
-                              {{ tv.reasonKey ? (tv.reasonKey | transloco) : (tv.showMessage ? result.tls?.message : '') }}
+                              @if (tv.reasonKey) {
+                                {{ tv.reasonKey | transloco }}
+                              } @else if (tv.showMessage) {
+                                {{ result.tls?.message }}
+                              } @else if (tv.pinMatches) {
+                                {{ 'admin.providers.endpoints.tls.pinMatches' | transloco }}
+                              }
+                              @if (tv.expiredPinDate) {
+                                {{ 'admin.providers.endpoints.tls.expiredStillTrusted' | transloco: {date: tv.expiredPinDate} }}
+                              }
                               @if (tv.trust) {
                                 {{ 'admin.providers.endpoints.tls.catalogHint' | transloco }}
+                              } @else if (tv.refusal) {
+                                {{ tv.refusal }}
                               }
                             </span>
                           }

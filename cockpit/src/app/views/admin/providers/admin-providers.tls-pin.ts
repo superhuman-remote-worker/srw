@@ -21,18 +21,25 @@ export function tlsReasonKey(reason: LlmEndpointTlsReason | null | undefined): s
 
 export interface PinBadge {
   show: boolean;
+  /** False on an http:// URL: an edit keeps the pin, but it applies to https only. */
+  active: boolean;
   title: string;
   expired: boolean;
   expiredDate: string;
 }
 
 /** Card-head badges for an endpoint's stored pin. */
-export function pinBadge(pin: LlmEndpointTlsPin | null | undefined): PinBadge {
-  if (!pin) return {show: false, title: '', expired: false, expiredDate: ''};
+export function pinBadge(
+  pin: LlmEndpointTlsPin | null | undefined,
+  baseUrl?: string | null,
+): PinBadge {
+  if (!pin) return {show: false, active: false, title: '', expired: false, expiredDate: ''};
+  const active = !baseUrl || /^https:\/\//i.test(baseUrl.trim());
   return {
     show: true,
+    active,
     title: pin.sha256,
-    expired: pin.expired,
+    expired: active && pin.expired,
     expiredDate: dateOnly(pin.not_after),
   };
 }
@@ -60,8 +67,12 @@ export function errorDetailText(err: unknown): string | null {
 
 export interface TlsView {
   show: boolean;
-  /** The server's own `message`: only for reason `other`. */
+  /** The server's own `message`: only for reason `other`, and only when there is one. */
   showMessage: boolean;
+  /** The server presents the pinned certificate ("Pinned, matches"). */
+  pinMatches: boolean;
+  /** Why Trust is not offered although the certificate would be trustable. */
+  refusal: string | null;
   /** Matching pin whose certificate has expired: date to print (still trusted). */
   expiredPinDate: string | null;
   reasonKey: string | null;
@@ -78,6 +89,8 @@ export interface TlsView {
 const HIDDEN: TlsView = {
   show: false,
   showMessage: false,
+  pinMatches: false,
+  refusal: null,
   expiredPinDate: null,
   reasonKey: null,
   showCertificate: false,
@@ -104,7 +117,9 @@ export function tlsView(tls: LlmEndpointTlsReport | null | undefined): TlsView {
     : null;
   return {
     show: true,
-    showMessage: tls.reason === 'other',
+    showMessage: tls.reason === 'other' && !!tls.message,
+    pinMatches: tls.pin_matches === true,
+    refusal: tls.refusal || null,
     expiredPinDate,
     reasonKey: tlsReasonKey(tls.reason),
     showCertificate: tls.certificate !== null,

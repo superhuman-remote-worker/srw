@@ -927,6 +927,8 @@ export interface LlmEndpointTlsReport {
   pin_matches: boolean;
   publicly_valid: boolean;
   can_trust: boolean;
+  /** Why Trust is not offered for a certificate it would otherwise offer (the endpoint can't be pinned). */
+  refusal?: string | null;
 }
 
 /** `source` column shared by the Helm-reconciled provider tables. */

@@ -333,16 +333,20 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                       </app-badge>
                     }
                     <span class="endpoint-url mono">{{ endpoint.base_url }}</span>
-                    @if (pinBadge(endpoint.tls_pin); as pb) {
-                      @if (pb.show) {
+                    @if (pinBadge(endpoint.tls_pin, endpoint.base_url); as pb) {
+                      @if (pb.show && pb.active) {
                         <app-badge tone="info" size="sm" shape="pill" [title]="pb.title">
                           {{ 'admin.providers.endpoints.tls.pinnedBadge' | transloco }}
                         </app-badge>
-                        @if (pb.expired) {
-                          <app-badge tone="warning" size="sm" shape="pill">
-                            {{ 'admin.providers.endpoints.tls.expiredBadge' | transloco: {date: pb.expiredDate} }}
-                          </app-badge>
-                        }
+                      } @else if (pb.show) {
+                        <app-badge tone="neutral" size="sm" shape="pill" [title]="pb.title">
+                          {{ 'admin.providers.endpoints.tls.pinnedInactiveBadge' | transloco }}
+                        </app-badge>
+                      }
+                      @if (pb.expired) {
+                        <app-badge tone="warning" size="sm" shape="pill">
+                          {{ 'admin.providers.endpoints.tls.expiredBadge' | transloco: {date: pb.expiredDate} }}
+                        </app-badge>
                       }
                     }
                     @if (endpoint.key_prefix) {
@@ -416,13 +420,16 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                   @if (tlsView(result.tls); as tv) {
                     @if (tv.show) {
                       <div class="tls-block" data-testid="tls-block">
-                        <p class="tls-reason">
-                          @if (tv.reasonKey) {
-                            {{ tv.reasonKey | transloco }}
-                          } @else if (tv.showMessage) {
-                            {{ result.tls?.message }}
-                          }
-                        </p>
+                        @if (tv.reasonKey) {
+                          <p class="tls-reason">{{ tv.reasonKey | transloco }}</p>
+                        } @else if (tv.showMessage) {
+                          <p class="tls-reason">{{ result.tls?.message }}</p>
+                        } @else if (tv.pinMatches) {
+                          <p class="tls-reason">{{ 'admin.providers.endpoints.tls.pinMatches' | transloco }}</p>
+                        }
+                        @if (tv.refusal) {
+                          <p data-testid="tls-refusal">{{ tv.refusal }}</p>
+                        }
                         @if (tv.expiredPinDate) {
                           <p>{{ 'admin.providers.endpoints.tls.expiredStillTrusted' | transloco: {date: tv.expiredPinDate} }}</p>
                         }
