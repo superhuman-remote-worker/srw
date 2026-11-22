@@ -15,7 +15,7 @@ import {
   LlmEndpointUpdateRequest,
 } from '../../../core/models/api.model';
 import {timer} from 'rxjs';
-import {pinBadge, tlsView} from './admin-providers.tls-pin';
+import {dateOnly, errorDetailText, pinBadge, tlsView} from './admin-providers.tls-pin';
 import {filter, switchMap, take} from 'rxjs/operators';
 import {AppButtonComponent} from '../../../ui/button';
 import {AppInputComponent} from '../../../ui/input';
@@ -380,7 +380,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                         {{ 'common.edit' | transloco }}
                       </app-button>
                     }
-                    @if (endpoint.tls_pin) {
+                    @if (endpoint.tls_pin && !tlsView(testResults()[endpoint.id]?.tls).showRemove) {
                       <app-button
                         variant="secondary"
                         size="sm"
@@ -419,10 +419,13 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                         <p class="tls-reason">
                           @if (tv.reasonKey) {
                             {{ tv.reasonKey | transloco }}
-                          } @else {
+                          } @else if (tv.showMessage) {
                             {{ result.tls?.message }}
                           }
                         </p>
+                        @if (tv.expiredPinDate) {
+                          <p>{{ 'admin.providers.endpoints.tls.expiredStillTrusted' | transloco: {date: tv.expiredPinDate} }}</p>
+                        }
                         @if (tv.verifiesNormally) {
                           <p>{{ 'admin.providers.endpoints.tls.verifiesNormally' | transloco }}</p>
                         }
@@ -441,12 +444,16 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                             </dl>
                           }
                           <dl class="tls-facts">
-                            <dt>{{ 'admin.providers.endpoints.tls.subject' | transloco }}</dt>
-                            <dd>{{ c.subject }}</dd>
-                            <dt>{{ 'admin.providers.endpoints.tls.issuer' | transloco }}</dt>
-                            <dd>{{ c.issuer }}</dd>
+                            @if (c.subject) {
+                              <dt>{{ 'admin.providers.endpoints.tls.subject' | transloco }}</dt>
+                              <dd>{{ c.subject }}</dd>
+                            }
+                            @if (c.issuer) {
+                              <dt>{{ 'admin.providers.endpoints.tls.issuer' | transloco }}</dt>
+                              <dd>{{ c.issuer }}</dd>
+                            }
                             <dt>{{ 'admin.providers.endpoints.tls.validity' | transloco }}</dt>
-                            <dd>{{ c.not_before }} – {{ c.not_after }}</dd>
+                            <dd>{{ dateOnly(c.not_before) }} – {{ dateOnly(c.not_after) }}</dd>
                           </dl>
                         }
                         @if (tv.trust && result.tls?.certificate; as c) {
@@ -1012,6 +1019,7 @@ export class AdminProvidersComponent implements OnInit {
   // Pure decisions for the template (unit-tested in admin-providers.tls-pin.spec.ts).
   readonly pinBadge = pinBadge;
   readonly tlsView = tlsView;
+  readonly dateOnly = dateOnly;
 
   // Endpoint edit form. Active for at most one row at a time; opens
   // pre-filled with the row's current values. The actual API key is
@@ -1353,6 +1361,7 @@ export class AdminProvidersComponent implements OnInit {
 
   testEndpoint(endpointId: string): void {
     this.testingEndpointId.set(endpointId);
+    this.setTlsError(endpointId, null);
     this.admin.testSystemEndpoint(endpointId).subscribe({
       next: (result) => {
         this.testResults.update((r) => ({...r, [endpointId]: result}));
@@ -1370,7 +1379,7 @@ export class AdminProvidersComponent implements OnInit {
     this.setTlsError(endpointId, null);
     this.admin.trustSystemEndpointCertificate(endpointId, sha256).subscribe({
       next: () => this.dropTestResult(endpointId),
-      error: (err) => this.setTlsError(endpointId, err?.error?.detail ?? String(err)),
+      error: (err) => this.setTlsError(endpointId, this.tlsErrorText(err)),
     });
   }
 
@@ -1379,8 +1388,12 @@ export class AdminProvidersComponent implements OnInit {
     this.setTlsError(endpointId, null);
     this.admin.removeSystemEndpointPin(endpointId).subscribe({
       next: () => this.dropTestResult(endpointId),
-      error: (err) => this.setTlsError(endpointId, err?.error?.detail ?? String(err)),
+      error: (err) => this.setTlsError(endpointId, this.tlsErrorText(err)),
     });
+  }
+
+  private tlsErrorText(err: unknown): string {
+    return errorDetailText(err) ?? this.transloco.translate('admin.providers.endpoints.tls.errorGeneric');
   }
 
   private dropTestResult(endpointId: string): void {

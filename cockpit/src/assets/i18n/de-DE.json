@@ -1396,6 +1396,8 @@
         "empty": "Keine System-Endpunkte. Unten hinzufügen oder über helm.llm.seed.systemEndpoints einspielen.",
         "noKey": "kein Key",
         "tls": {
+          "expiredStillTrusted": "Zertifikat am {{date}} abgelaufen, wird weiterhin vertraut (fixiert).",
+          "errorGeneric": "Etwas ist schiefgelaufen. Bitte erneut versuchen.",
           "pinnedBadge": "fixiertes Zertifikat",
           "expiredBadge": "Zertifikat abgelaufen am {{date}}",
           "removePin": "Fixierung entfernen",

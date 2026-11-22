@@ -12,7 +12,7 @@ import {
   LlmEndpointTlsPin,
   LlmEndpointTlsReport,
 } from '../../../core/models/api.model';
-import {pinBadge, tlsReasonKey, tlsView} from './admin-providers.tls-pin';
+import {dateOnly, errorDetailText, pinBadge, tlsReasonKey, tlsView} from './admin-providers.tls-pin';
 
 const FP_OLD = 'AA:BB:CC';
 const FP_NEW = '11:22:33';
@@ -153,9 +153,55 @@ describe('tlsView', () => {
   });
 });
 
+describe('tlsView extras', () => {
+  it('matching but expired pin: still-trusted date, no Trust', () => {
+    const v = tlsView(
+      tls({
+        verified: true,
+        reason: null,
+        pin: pin({expired: true, not_after: '2026-10-01T00:00:00Z'}),
+        pin_matches: true,
+        can_trust: false,
+      }),
+    );
+    expect(v.show).toBe(true);
+    expect(v.expiredPinDate).toBe('2026-10-01');
+    expect(v.trust).toBeNull();
+  });
+
+  it('matching live pin has no expired line', () => {
+    const v = tlsView(tls({verified: true, reason: null, pin: pin(), pin_matches: true, can_trust: false}));
+    expect(v.expiredPinDate).toBeNull();
+  });
+
+  it('shows the server message only for reason other', () => {
+    expect(tlsView(tls({reason: 'other'})).showMessage).toBe(true);
+    expect(tlsView(tls({reason: 'self_signed'})).showMessage).toBe(false);
+  });
+});
+
+describe('dateOnly / errorDetailText', () => {
+  it('formats dates', () => {
+    expect(dateOnly('2027-01-01T00:00:00Z')).toBe('2027-01-01');
+    expect(dateOnly(null)).toBe('');
+  });
+  it('string detail as is', () => {
+    expect(errorDetailText({error: {detail: 'nope'}})).toBe('nope');
+  });
+  it('422 list joins the msgs', () => {
+    expect(errorDetailText({error: {detail: [{msg: 'a'}, {msg: 'b'}]}})).toBe('a; b');
+  });
+  it('anything else is null', () => {
+    expect(errorDetailText({error: {detail: {x: 1}}})).toBeNull();
+    expect(errorDetailText(new Error('x'))).toBeNull();
+    expect(errorDetailText(null)).toBeNull();
+  });
+});
+
 // ---- component wiring ------------------------------------------------
 const trust = vi.fn();
 const removePin = vi.fn();
+const testFn = vi.fn();
 const confirmFn = vi.fn();
 const endpoints = signal<LlmEndpoint[]>([]);
 
@@ -176,6 +222,7 @@ function setup(): AdminProvidersComponent {
           loadSystemEndpoints: vi.fn(),
           trustSystemEndpointCertificate: trust,
           removeSystemEndpointPin: removePin,
+          testSystemEndpoint: testFn,
         },
       },
       {provide: AdminModelsCoordinatorService, useValue: {}},
@@ -218,6 +265,23 @@ describe('AdminProvidersComponent — trusting a certificate', () => {
     c.testResults.set({e1: {ok: false, status: null, error: 'x', probe_url: 'u', tls: tls()}});
     c.trustCertificate('e1', 'gpu');
     expect(c.tlsErrors()['e1']).toBe('It already verifies normally.');
+  });
+
+  it('a non-string detail gives the generic message, not [object Object]', () => {
+    confirmFn.mockReturnValue(true);
+    trust.mockReturnValue(throwError(() => ({status: 422, error: {detail: {x: 1}}})));
+    const c = setup();
+    c.testResults.set({e1: {ok: false, status: null, error: 'x', probe_url: 'u', tls: tls()}});
+    c.trustCertificate('e1', 'gpu');
+    expect(c.tlsErrors()['e1']).toBe('admin.providers.endpoints.tls.errorGeneric');
+  });
+
+  it('re-testing clears a stale error', () => {
+    testFn.mockReturnValue(of({ok: true, status: 200, error: null, probe_url: 'u', tls: null}));
+    const c = setup();
+    c.tlsErrors.set({e1: 'old 409'});
+    c.testEndpoint('e1');
+    expect(c.tlsErrors()['e1']).toBeUndefined();
   });
 
   it('a successful trust drops the stale test result', () => {

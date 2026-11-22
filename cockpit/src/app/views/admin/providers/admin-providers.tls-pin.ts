@@ -33,12 +33,37 @@ export function pinBadge(pin: LlmEndpointTlsPin | null | undefined): PinBadge {
     show: true,
     title: pin.sha256,
     expired: pin.expired,
-    expiredDate: (pin.not_after ?? '').slice(0, 10),
+    expiredDate: dateOnly(pin.not_after),
   };
+}
+
+/** `YYYY-MM-DD` of an ISO timestamp; '' when absent. */
+export function dateOnly(iso: string | null | undefined): string {
+  return (iso ?? '').slice(0, 10);
+}
+
+/**
+ * Text of an HTTP error's `detail`: a string as is; a FastAPI 422 list of
+ * `{msg}` joined; anything else null (the caller shows a generic message).
+ */
+export function errorDetailText(err: unknown): string | null {
+  const detail = (err as {error?: {detail?: unknown}} | null)?.error?.detail;
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((d) => (typeof d === 'string' ? d : (d as {msg?: unknown} | null)?.msg))
+      .filter((m): m is string => typeof m === 'string' && m.length > 0);
+    if (msgs.length) return msgs.join('; ');
+  }
+  return null;
 }
 
 export interface TlsView {
   show: boolean;
+  /** The server's own `message`: only for reason `other`. */
+  showMessage: boolean;
+  /** Matching pin whose certificate has expired: date to print (still trusted). */
+  expiredPinDate: string | null;
   reasonKey: string | null;
   showCertificate: boolean;
   /** Which Trust button to offer; the Catalog row never offers one. */
@@ -52,6 +77,8 @@ export interface TlsView {
 
 const HIDDEN: TlsView = {
   show: false,
+  showMessage: false,
+  expiredPinDate: null,
   reasonKey: null,
   showCertificate: false,
   trust: null,
@@ -66,7 +93,10 @@ const HIDDEN: TlsView = {
  * with no certificate and no reason, and must not read as a certificate fault.
  */
 export function tlsView(tls: LlmEndpointTlsReport | null | undefined): TlsView {
-  if (!tls || (tls.certificate === null && tls.reason === null)) return HIDDEN;
+  if (!tls) return HIDDEN;
+  const expiredPinDate =
+    tls.pin_matches && tls.pin?.expired ? dateOnly(tls.pin.not_after) : null;
+  if (tls.certificate === null && tls.reason === null && expiredPinDate === null) return HIDDEN;
   const trust = tls.can_trust && tls.certificate
     ? tls.reason === 'certificate_changed'
       ? 'trustNew'
@@ -74,6 +104,8 @@ export function tlsView(tls: LlmEndpointTlsReport | null | undefined): TlsView {
     : null;
   return {
     show: true,
+    showMessage: tls.reason === 'other',
+    expiredPinDate,
     reasonKey: tlsReasonKey(tls.reason),
     showCertificate: tls.certificate !== null,
     trust,

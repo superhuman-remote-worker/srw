@@ -454,7 +454,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         @if (tlsView(result.tls); as tv) {
                           @if (tv.show) {
                             <span class="tls-note" data-testid="tls-note">
-                              {{ tv.reasonKey ? (tv.reasonKey | transloco) : result.tls?.message }}
+                              {{ tv.reasonKey ? (tv.reasonKey | transloco) : (tv.showMessage ? result.tls?.message : '') }}
                               @if (tv.trust) {
                                 {{ 'admin.providers.endpoints.tls.catalogHint' | transloco }}
                               }

@@ -1396,6 +1396,8 @@
         "empty": "No system endpoints. Add one below, or seed via helm.llm.seed.systemEndpoints.",
         "noKey": "no key",
         "tls": {
+          "expiredStillTrusted": "Certificate expired on {{date}}, still trusted (pinned).",
+          "errorGeneric": "Something went wrong. Try again.",
           "pinnedBadge": "pinned certificate",
           "expiredBadge": "certificate expired {{date}}",
           "removePin": "Remove pin",
