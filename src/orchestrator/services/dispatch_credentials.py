@@ -501,8 +501,9 @@ async def inject_env_key_credentials(
     endpoint branch, next to the row's base URL (:func:`endpoint_tls_pin_wire`):
     a caller's BYO pair and a provider-key row never carry a pin. A row whose
     pin can't be read gets no base URL or key, like one whose key did not
-    decrypt, and its pin is ``tls_pinning.UNREADABLE_PIN``: a base URL that
-    survived in a stored override then never goes out without its pin, since
+    decrypt, and its pin is ``tls_pinning.UNREADABLE_PIN``. A row whose key
+    did not decrypt still writes its pin (or that marker). Either way a base
+    URL that survived in a stored override never goes out without its pin;
     ``TlsPin.from_env`` refuses the marker.
     """
     pin_name = f"{prefix}_{TLS_PINNED_CERT_SUFFIX}"
@@ -558,6 +559,17 @@ async def inject_env_key_credentials(
                 # know — the citation client refuses a custom host with no key
                 # of its own — so every flat-env slot reaches the endpoint.
                 api_key = NO_KEY_SENTINEL
+            # A pinned endpoint's base URL never travels without its pin. A
+            # refusal below writes no base URL or key from the row, but one may
+            # survive from a stored override (redaction keeps base URLs), so
+            # the pin slot still carries the row's pin, or, for a pin that
+            # can't be read, the marker the agent refuses. Popping the URL
+            # instead would send the client to its default host.
+            try:
+                pin_wire = endpoint_tls_pin_wire(endpoint_row)
+                pin_error = None
+            except ValueError as exc:
+                pin_wire, pin_error = UNREADABLE_PIN, exc
             if base_url and not api_key:
                 # The endpoint is configured but its stored key didn't decrypt
                 # (get_user_llm_endpoint -> _decrypt_stored already logged the
@@ -565,6 +577,8 @@ async def inject_env_key_credentials(
                 # half-credential (base_url without api_key) that silently
                 # degrades the agent to a keyless 'local' provider — the failure
                 # mode in knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+                if pin_wire:
+                    env_keys[pin_name] = pin_wire
                 dependencies.logger.error(
                     "Dispatch: %s endpoint %s resolved a base_url but no usable "
                     "api_key (decrypt failed or empty) — not injecting "
@@ -574,15 +588,10 @@ async def inject_env_key_credentials(
                     prefix,
                 )
                 return
-            try:
-                pin_wire = endpoint_tls_pin_wire(endpoint_row)
-            except ValueError as exc:
+            if pin_error is not None:
                 # A pin that can't be read is never treated as no pin: like a
                 # key that did not decrypt, the slot gets no transport from
-                # the row. A base URL may survive from a stored override
-                # (redaction keeps base URLs), so the pin slot carries the
-                # marker the agent refuses rather than nothing; popping the
-                # URL instead would send the client to its default host.
+                # the row, and its pin slot carries the marker.
                 env_keys[pin_name] = UNREADABLE_PIN
                 dependencies.logger.error(
                     "Dispatch: %s endpoint %s has a pinned TLS certificate that "
@@ -591,7 +600,7 @@ async def inject_env_key_credentials(
                     "Models.",
                     prefix,
                     meta.endpoint_id,
-                    exc,
+                    pin_error,
                     prefix,
                 )
                 return

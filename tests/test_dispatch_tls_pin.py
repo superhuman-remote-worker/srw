@@ -467,11 +467,41 @@ class TestFlatEnv:
         assert env[_pin_env(prefix)] == pins["leaf"].wire
 
     @pytest.mark.asyncio
-    async def test_decrypt_failure_gets_no_base_url_and_no_pin(self, store, prefix):
-        env = await _env(
-            {_pin_env(prefix): STALE_PIN}, prefix, "broken-key-model", store
-        )
-        assert env == {f"{prefix}_MODEL": "broken-key-model"}
+    @pytest.mark.parametrize(
+        "pin_state", ["pinned", "unpinned", "unreadable", "http", "fresh-block"]
+    )
+    async def test_decrypt_failure_keeps_a_pinned_base_url_pinned(
+        self, store, rows, pins, prefix, pin_state
+    ):
+        """A key that won't decrypt gets no base URL or key from the row; a
+        base URL that survived in the stored override keeps the row's pin."""
+        row = rows[BROKEN_KEY_ID]
+        expected = pins["leaf"].wire
+        if pin_state == "unpinned":
+            row.update(_pin_columns(None))
+            expected = None
+        elif pin_state == "unreadable":
+            row["tls_pin_cert"] = "not a certificate"
+            expected = UNREADABLE_PIN
+        elif pin_state == "http":
+            row["base_url"] = HTTP_URL  # R9: a pin never rides http://
+            expected = None
+        url_name = env_endpoint_names(prefix)[0]
+        # The redacted stored-override shape: base URL kept, key stripped.
+        stored = {f"{prefix}_MODEL": "broken-key-model", url_name: row["base_url"]}
+        if pin_state == "fresh-block":
+            stored = {_pin_env(prefix): STALE_PIN}
+        env = await _env(stored, prefix, "broken-key-model", store)
+        assert f"{prefix}_API_KEY" not in env
+        assert env.get(_pin_env(prefix)) == expected
+        if pin_state == "fresh-block":
+            # Nothing written from the row but the pin.
+            assert env == {
+                f"{prefix}_MODEL": "broken-key-model",
+                _pin_env(prefix): expected,
+            }
+        else:
+            assert env[url_name] == row["base_url"]
 
     @pytest.mark.asyncio
     async def test_byo_pair_gets_no_pin(self, store, prefix):
