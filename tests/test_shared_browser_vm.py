@@ -206,3 +206,28 @@ async def test_viewer_access_failures_are_best_effort(access_store):
     assert access.held is False
     await access.close()
     assert [event[0] for event in access_store.last.events] == ["acquire"]
+
+
+def test_a_ready_vm_waiting_for_its_probe_is_coming_up(monkeypatch):
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    thread = vm_thread(vm_context(ssh_ready_source="daemon_registration"))
+
+    assert browser_vm.vm_browser_wake_state(thread) == "coming_up"
+    assert browser_vm.vm_browser_wake_state(vm_thread(vm_context())) is None
+    monkeypatch.setenv("VM_MODE", "external")
+    assert browser_vm.vm_browser_wake_state(thread) is None
+
+
+def test_a_woken_vm_before_its_wake_is_marked_ready_is_coming_up(monkeypatch):
+    # The successor is ready and probed, but keeps the sleep's remote-I/O
+    # closure until the idle lifecycle marks its wake ready.
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    woken = vm_thread(
+        vm_context(_suspend_remote_io_closed="op-1", idle_wake_operation_id="op-1")
+    )
+    other = vm_thread(
+        vm_context(_suspend_remote_io_closed="op-1", idle_wake_operation_id="op-2")
+    )
+
+    assert browser_vm.vm_browser_wake_state(woken) == "coming_up"
+    assert browser_vm.vm_browser_wake_state(other) is None

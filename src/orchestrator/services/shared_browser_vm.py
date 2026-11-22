@@ -70,6 +70,27 @@ def vm_idle_release_enabled() -> bool:
     return os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "").strip().lower() == "true"
 
 
+def vm_ready_but_coming_up(vm: dict[str, Any]) -> bool:
+    """A same-cluster VM reported ready that cannot be used for a moment yet.
+
+    Every boot and every wake pass through this: the guest daemon registers
+    ready a few seconds before the provisioner's own probe proves it, and a
+    VM woken from idle keeps the sleep's remote-I/O closure until the idle
+    lifecycle marks its wake ready (one reconcile pass later). Until then its
+    identity is not attested, yet it is still coming up, not untrusted, so
+    Open browser waits for it.
+    """
+
+    from shared.workspace_contract import vm_mode_from_env
+
+    if vm.get("status") != "ready" or vm_mode_from_env() != "same-cluster":
+        return False
+    if vm.get("ssh_ready_source") != "provisioner_probe":
+        return True
+    marker = vm.get("_suspend_remote_io_closed")
+    return bool(marker) and marker == vm.get("idle_wake_operation_id")
+
+
 def vm_browser_wake_state(thread: dict[str, Any]) -> VMWakeState | None:
     """Whether Open browser can wait for this Session's VM, and why.
 
@@ -84,6 +105,8 @@ def vm_browser_wake_state(thread: dict[str, Any]) -> VMWakeState | None:
     vm = _mapping(_mapping(thread.get("metadata")).get("vm"))
     status = vm.get("status")
     if status in VM_COMING_UP_STATUSES:
+        return "coming_up"
+    if vm_ready_but_coming_up(vm):
         return "coming_up"
     if (
         status in VM_ASLEEP_STATUSES
@@ -250,4 +273,5 @@ __all__ = [
     "thread_uses_vm_workspace",
     "vm_browser_wake_state",
     "vm_idle_release_enabled",
+    "vm_ready_but_coming_up",
 ]

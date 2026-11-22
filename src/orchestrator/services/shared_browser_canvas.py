@@ -44,6 +44,7 @@ from orchestrator.services.shared_browser_vm import (
     request_vm_browser_wake,
     thread_uses_vm_workspace,
     vm_browser_wake_state,
+    vm_ready_but_coming_up,
 )
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
 from orchestrator.services.workspace_binding import remote_canvas_presentation_available
@@ -149,8 +150,10 @@ def _vm_browser_capability(
     """
 
     vm = _mapping(_mapping(thread.get("metadata")).get("vm"))
-    ready = vm.get("status") == "ready"
     mode = vm_mode_from_env()
+    # Reported ready but not usable yet (not yet probed by the provisioner, or
+    # woken but not yet marked ready): still coming up, so open waits.
+    ready = vm.get("status") == "ready" and not vm_ready_but_coming_up(vm)
     if not ready:
         if mode == "external":
             # DEFERRED, not forgotten: tailnet VM routing for the Canvas and

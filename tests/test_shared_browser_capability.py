@@ -619,3 +619,45 @@ def test_open_on_a_vm_coming_up_waits_without_a_wake(monkeypatch, same_cluster):
     # Joining an open wake (none here) is harmless; the container kick is not
     # used for a VM (_vm_route_client fails the test if it is).
     assert len(wakes.calls) == 1
+
+
+def test_vm_ready_before_its_provisioner_probe_is_still_coming_up(
+    same_cluster, monkeypatch
+):
+    # The guest daemon reports ready a few seconds before the provisioner's
+    # own probe after every boot and wake. Open must keep waiting then, not
+    # report the workspace as untrusted (that stopped a woken VM's open).
+    _no_network(monkeypatch)
+    vm = vm_context(ssh_ready_source="daemon_registration")
+
+    capability = browser_canvas.browser_capability(vm_thread(vm))
+
+    assert capability.model_dump(mode="json") == {
+        "feature_enabled": True,
+        "can_open_browser": True,
+        "workspace_ready": False,
+        "reason": None,
+    }
+
+
+def test_woken_vm_not_yet_marked_ready_is_still_coming_up(same_cluster, monkeypatch):
+    _no_network(monkeypatch)
+    vm = vm_context(_suspend_remote_io_closed="op-1", idle_wake_operation_id="op-1")
+
+    capability = browser_canvas.browser_capability(vm_thread(vm))
+
+    assert capability.can_open_browser is True
+    assert capability.workspace_ready is False
+    assert capability.reason is None
+
+
+def test_open_on_a_vm_before_its_probe_waits(monkeypatch, same_cluster):
+    _Wakes(None).install(monkeypatch)
+    client = _vm_route_client(
+        monkeypatch, vm_thread(vm_context(ssh_ready_source="daemon_registration"))
+    )
+
+    opened = client.post(f"/api/persistent/threads/{_THREAD_ID}/browser/open", json={})
+
+    assert opened.status_code == 202
+    assert opened.headers["retry-after"] == "3"
