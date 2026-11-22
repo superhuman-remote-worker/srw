@@ -2431,3 +2431,29 @@ describe('DatasourceListComponent catalog lists and filters', () => {
     }
   });
 });
+
+describe('DatasourceListComponent editing a description', () => {
+  it('clears a description emptied on edit, instead of keeping the old one', () => {
+    const {api, component} = createComponent(false);
+    const ds = kbDatasource({id: 'pg', name: 'Bookings', type: 'postgresql', description: 'Bearer abc'});
+    component.openEditForm(ds);
+    component.formData.description = '   ';
+    component.saveForm();
+    // An omitted field means "unchanged" to the server.
+    expect(api.updateDatasource.mock.calls[0][1].description).toBe('');
+  });
+
+  it('clears the CLI hint of an environment connector, and leaves other types\' alone', () => {
+    const {api, component} = createComponent(false);
+    component.openEditForm(kbDatasource({id: 'env', name: 'Billing API', type: 'generic', description: 'Invoices', cli_hint: 'curl $API'}));
+    component.formData.cli_hint = '';
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].cli_hint).toBe('');
+
+    api.updateDatasource.mockClear();
+    component.openEditForm(kbDatasource({id: 'pg', name: 'Bookings', type: 'postgresql'}));
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].cli_hint).toBeUndefined();
+  });
+});
+

@@ -4896,9 +4896,12 @@ export class DatasourceListComponent implements OnInit {
         [...previousProjectIds].some(id => !currentProjectIds.has(id));
       const update: DatasourceUpdateRequest = {
         name: this.formData.name,
-        description: this.formData.description || undefined,
+        // Sent as typed, an empty field included: undefined would mean
+        // "unchanged", and a description or hint could never be cleared
+        // (the description is what the agent's README says it is for).
+        description: (this.formData.description ?? '').trim(),
         credentials: creds,
-        cli_hint: this.formData.cli_hint || undefined,
+        cli_hint: this.isEnvType() ? (this.formData.cli_hint ?? '').trim() : undefined,
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
