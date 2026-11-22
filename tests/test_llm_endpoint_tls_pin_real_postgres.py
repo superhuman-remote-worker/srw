@@ -4,6 +4,7 @@ Pins: the format and pair CHECKs, and that the three endpoint reads plus
 resolve_catalog_model return the pin (NULL for an unpinned row).
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from shared.tls_pinning import CertificateDetails
 
 ROOT = Path(__file__).resolve().parents[1]
 FINGERPRINT = ":".join(["AB"] * 32)
@@ -147,3 +149,238 @@ async def test_resolve_catalog_model_returns_the_pin(db):
     resolved = await db.resolve_catalog_model("pin-model")
     assert resolved["endpoint_tls_pin_sha256"] == FINGERPRINT
     assert resolved["endpoint_tls_pin_cert"] == "PEM"
+
+
+# ---------------------------------------------------------------------------
+# set / clear (Task 5)
+# ---------------------------------------------------------------------------
+
+SECOND_FP = ":".join(["CD"] * 32)
+ADMIN = str(uuid4())
+
+
+def _details(
+    sha=FINGERPRINT, pem="-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n"
+):
+    return CertificateDetails(
+        sha256=sha,
+        subject="CN=gpu-box",
+        issuer="CN=Private CA",
+        not_before=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        not_after=datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        expired=False,
+        san=[],
+        version=1,
+        pem=pem,
+    )
+
+
+async def _events(db, endpoint_id):
+    return await db.fetch(
+        "SELECT * FROM security_events WHERE resource_id = $1 ORDER BY created_at",
+        endpoint_id,
+    )
+
+
+async def _trust(db, endpoint_id, details=None):
+    return await db.set_llm_endpoint_tls_pin(
+        endpoint_id,
+        details=details or _details(),
+        admin_user_id=ADMIN,
+        method="PUT",
+        path=f"/api/admin/providers/endpoints/{endpoint_id}/tls-pin",
+    )
+
+
+@pytest.mark.asyncio
+async def test_trust_writes_pin_and_one_trusted_event(db):
+    endpoint_id = await _endpoint(db)
+    row = await _trust(db, endpoint_id)
+    assert row["tls_pin_sha256"] == FINGERPRINT
+    assert row["tls_pin_cert"].startswith("-----BEGIN CERTIFICATE-----")
+    assert row["tls_pin_subject"] == "CN=gpu-box"
+    assert row["tls_pin_issuer"] == "CN=Private CA"
+    assert row["tls_pin_not_after"] == datetime(
+        2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc
+    )
+    assert row["tls_pinned_at"] is not None
+    assert str(row["tls_pinned_by"]) == ADMIN
+    events = await _events(db, endpoint_id)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["event_type"] == "endpoint_certificate_trusted"
+    assert ev["resource_type"] == "llm_endpoint"
+    assert ev["real_is_admin"] is True and ev["view_as"] is False
+    assert str(ev["user_id"]) == ADMIN
+    assert ev["method"] == "PUT"
+    assert f"sha256={FINGERPRINT}" in ev["detail"]
+    assert "label=Pinned" in ev["detail"]
+    assert "origin=https://10.0.0.1:8090" in ev["detail"]
+    assert "subject=CN=gpu-box" in ev["detail"]
+    assert "not_after=2030-01-02T03:04:05+00:00" in ev["detail"]
+    assert "previous=" not in ev["detail"]
+
+
+@pytest.mark.asyncio
+async def test_second_trust_is_retrusted_with_previous(db):
+    endpoint_id = await _endpoint(db)
+    await _trust(db, endpoint_id)
+    row = await _trust(db, endpoint_id, _details(sha=SECOND_FP))
+    assert row["tls_pin_sha256"] == SECOND_FP
+    events = await _events(db, endpoint_id)
+    assert [e["event_type"] for e in events] == [
+        "endpoint_certificate_trusted",
+        "endpoint_certificate_retrusted",
+    ]
+    assert f"previous={FINGERPRINT}" in events[1]["detail"]
+    assert f"sha256={SECOND_FP}" in events[1]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_trust_accepts_no_admin_id(db):
+    endpoint_id = await _endpoint(db)
+    row = await db.set_llm_endpoint_tls_pin(
+        endpoint_id, details=_details(), admin_user_id=None, method=None, path=None
+    )
+    assert row["tls_pinned_by"] is None
+    assert len(await _events(db, endpoint_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_trust_unknown_or_user_scoped_row_writes_nothing(db):
+    assert await _trust(db, str(uuid4())) is None
+    user_id = str(uuid4())
+    await db.execute(
+        "INSERT INTO users (id, display_name, email) VALUES ($1::uuid, 'owner', $2)",
+        user_id,
+        f"{user_id}@example.test",
+    )
+    scoped = await db.fetchval(
+        "INSERT INTO llm_endpoints (user_id, label, base_url)"
+        " VALUES ($1::uuid, 'mine', 'https://u/v1') RETURNING id::text",
+        user_id,
+    )
+    assert await _trust(db, scoped) is None
+    assert await _events(db, scoped) == []
+    assert (
+        await db.fetchval(
+            "SELECT tls_pin_sha256 FROM llm_endpoints WHERE id = $1::uuid", scoped
+        )
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_clear_removes_pin_and_audits(db):
+    endpoint_id = await _endpoint(db)
+    await _trust(db, endpoint_id)
+    row = await db.clear_llm_endpoint_tls_pin(
+        endpoint_id, admin_user_id=ADMIN, method="DELETE", path="/x"
+    )
+    assert row is not None
+    for key in PIN_KEYS:
+        assert row[key] is None
+    events = await _events(db, endpoint_id)
+    assert events[-1]["event_type"] == "endpoint_certificate_pin_removed"
+    assert f"sha256={FINGERPRINT}" in events[-1]["detail"]
+    assert events[-1]["real_is_admin"] is True
+
+
+@pytest.mark.asyncio
+async def test_clear_on_unpinned_row_returns_none_and_writes_nothing(db):
+    endpoint_id = await _endpoint(db)
+    assert (
+        await db.clear_llm_endpoint_tls_pin(
+            endpoint_id, admin_user_id=ADMIN, method="DELETE", path="/x"
+        )
+        is None
+    )
+    assert await _events(db, endpoint_id) == []
+    assert (
+        await db.clear_llm_endpoint_tls_pin(
+            str(uuid4()), admin_user_id=ADMIN, method="DELETE", path="/x"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_insert_rolls_back_the_pin(db, monkeypatch):
+    endpoint_id = await _endpoint(db)
+    await _trust(db, endpoint_id)
+    original = asyncpg.Connection.fetchrow
+
+    async def broken(self, query, *args, **kw):
+        if "INSERT INTO security_events" in query:
+            raise RuntimeError("audit down")
+        return await original(self, query, *args, **kw)
+
+    real_execute = asyncpg.Connection.execute
+
+    async def broken_execute(self, query, *args, **kw):
+        if "INSERT INTO security_events" in query:
+            raise RuntimeError("audit down")
+        return await real_execute(self, query, *args, **kw)
+
+    monkeypatch.setattr(asyncpg.Connection, "fetchrow", broken)
+    monkeypatch.setattr(asyncpg.Connection, "execute", broken_execute)
+    with pytest.raises(RuntimeError):
+        await _trust(db, endpoint_id, _details(sha=SECOND_FP))
+    with pytest.raises(RuntimeError):
+        await db.clear_llm_endpoint_tls_pin(
+            endpoint_id, admin_user_id=ADMIN, method="DELETE", path="/x"
+        )
+    monkeypatch.undo()
+    row = await db.get_system_llm_endpoint(endpoint_id)
+    assert row["tls_pin_sha256"] == FINGERPRINT
+    assert len(await _events(db, endpoint_id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_url", ["https://h:443/v1/", "https://h:8443/v1"])
+async def test_base_url_edit_keeps_the_pin(db, new_url):
+    endpoint_id = str(
+        (
+            await db.create_system_llm_endpoint(
+                label=f"Edit {new_url}",
+                base_url="https://h/v1",
+                api_key=None,
+                key_prefix=None,
+            )
+        )["id"]
+    )
+    await _trust(db, endpoint_id)
+    before = await db.get_system_llm_endpoint(endpoint_id)
+    events_before = len(await _events(db, endpoint_id))
+    await db.update_system_llm_endpoint(endpoint_id, base_url=new_url, source="ui")
+    after = await db.get_system_llm_endpoint(endpoint_id)
+    assert after["base_url"] == new_url
+    for key in PIN_KEYS:
+        assert after[key] == before[key] and after[key] is not None
+    assert len(await _events(db, endpoint_id)) == events_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_url", ["https://h/v1", "https://other-host/v1"])
+async def test_helm_reconcile_keeps_the_pin(db, new_url):
+    from orchestrator.seed.llm_config import SeedReport, _seed_endpoints
+
+    endpoint_id = str(
+        (
+            await db.create_system_llm_endpoint(
+                label="Helm EP", base_url="https://h/v1", api_key=None, key_prefix=None
+            )
+        )["id"]
+    )
+    await _trust(db, endpoint_id)
+    before = await db.get_system_llm_endpoint(endpoint_id)
+    events_before = len(await _events(db, endpoint_id))
+    await _seed_endpoints(
+        db,
+        [{"label": "Helm EP", "baseUrl": new_url, "reconcile": True, "models": []}],
+        SeedReport(),
+    )
+    after = await db.get_system_llm_endpoint(endpoint_id)
+    assert after["base_url"] == new_url
+    for key in PIN_KEYS:
+        assert after[key] == before[key] and after[key] is not None
+    assert len(await _events(db, endpoint_id)) == events_before

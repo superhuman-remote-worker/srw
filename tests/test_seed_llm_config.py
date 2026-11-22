@@ -64,6 +64,8 @@ def _fake_db(
     )
     db.upsert_system_api_key = AsyncMock()
     db.update_system_llm_endpoint = AsyncMock(return_value={})
+    db.set_llm_endpoint_tls_pin = AsyncMock()
+    db.clear_llm_endpoint_tls_pin = AsyncMock()
 
     async def _create_endpoint(
         *,
@@ -1731,3 +1733,45 @@ class TestOneRowPerModelId:
         }
         await seed(db, {"systemModels": [entry]})
         assert db.update_model.await_args.kwargs["served_model_id"] is None
+
+
+class TestReconcileNeverWritesThePin:
+    """Decision 4: a Helm reconcile keeps an endpoint's pinned certificate.
+
+    The store call is mocked here, so this pins the contract at the call
+    site (no pin field is ever passed); the real-Postgres proof that a
+    reconcile of a pinned row leaves all seven columns is in
+    test_llm_endpoint_tls_pin_real_postgres.py.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("new_url", ["https://h/v1", "https://other/v1"])
+    async def test_reconcile_passes_no_pin_field(self, new_url):
+        existing = {
+            "id": "ep-1",
+            "label": "Pinned",
+            "base_url": "https://h/v1",
+            "source": "ui",
+            "helm_value_hash": None,
+            "tls_pin_sha256": ":".join(["AB"] * 32),
+            "tls_pin_cert": "PEM",
+        }
+        db = _fake_db(existing_endpoints=[existing])
+        await seed(
+            db,
+            {
+                "systemEndpoints": [
+                    {
+                        "label": "Pinned",
+                        "baseUrl": new_url,
+                        "reconcile": True,
+                        "models": [],
+                    }
+                ]
+            },
+        )
+        kwargs = db.update_system_llm_endpoint.await_args.kwargs
+        assert kwargs["base_url"] == new_url
+        assert not [k for k in kwargs if "tls" in k or "pin" in k]
+        db.set_llm_endpoint_tls_pin.assert_not_called()
+        db.clear_llm_endpoint_tls_pin.assert_not_called()

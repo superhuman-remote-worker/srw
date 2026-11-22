@@ -58482,6 +58482,168 @@ class PostgresDB:
             row = await conn.fetchrow(query, *args)
             return dict(row) if row else None
 
+    _TLS_PIN_COLUMNS = (
+        "id, label, base_url, key_prefix, transport_kind, source, "
+        "helm_value_hash, source_updated_at, created_at, updated_at, "
+        "tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer, "
+        "tls_pin_not_after, tls_pinned_at, tls_pinned_by"
+    )
+
+    @staticmethod
+    def _tls_pin_audit_detail(row: Any, *, sha256: str, **extra: str) -> str:
+        """``label=… origin=… sha256=… [previous=…] subject=… not_after=…``."""
+        from shared.runtime.core.transport_resolution import endpoint_origin
+
+        origin = endpoint_origin(row["base_url"])
+        origin_text = f"{origin[0]}://{origin[1]}:{origin[2]}" if origin else ""
+        parts = [f"label={row['label']}", f"origin={origin_text}", f"sha256={sha256}"]
+        parts.extend(f"{k}={v}" for k, v in extra.items())
+        return " ".join(parts)
+
+    @staticmethod
+    async def _insert_tls_pin_audit(
+        conn: Any,
+        *,
+        event_type: str,
+        endpoint_id: str,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+        detail: str,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO security_events
+                (event_type, user_id, auth_method, real_is_admin, view_as,
+                 resource_type, resource_id, method, path, detail, client_ip)
+            VALUES ($1, $2, NULL, TRUE, FALSE, 'llm_endpoint', $3, $4, $5, $6, NULL)
+            """,
+            event_type,
+            UUID(str(admin_user_id)) if admin_user_id else None,
+            endpoint_id,
+            method,
+            path,
+            detail,
+        )
+
+    async def set_llm_endpoint_tls_pin(
+        self,
+        endpoint_id: str,
+        *,
+        details: Any,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+    ) -> Dict[str, Any] | None:
+        """Pin ``details`` (a ``shared.tls_pinning.CertificateDetails``) on a
+        system endpoint and write its audit row in the same transaction.
+
+        ``endpoint_certificate_retrusted`` (detail names ``previous=``) when a
+        pin already existed, else ``endpoint_certificate_trusted``. Returns
+        the updated row, or None (nothing written) when no system row matches.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    "SELECT label, base_url, tls_pin_sha256 FROM llm_endpoints"
+                    " WHERE id = $1 AND user_id IS NULL FOR UPDATE",
+                    UUID(endpoint_id),
+                )
+                if current is None:
+                    return None
+                previous = current["tls_pin_sha256"]
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE llm_endpoints
+                    SET tls_pin_sha256 = $2, tls_pin_cert = $3,
+                        tls_pin_subject = $4, tls_pin_issuer = $5,
+                        tls_pin_not_after = $6, tls_pinned_at = CURRENT_TIMESTAMP,
+                        tls_pinned_by = $7
+                    WHERE id = $1 AND user_id IS NULL
+                    RETURNING {self._TLS_PIN_COLUMNS}
+                    """,
+                    UUID(endpoint_id),
+                    details.sha256,
+                    details.pem,
+                    details.subject,
+                    details.issuer,
+                    details.not_after,
+                    UUID(str(admin_user_id)) if admin_user_id else None,
+                )
+                extra: Dict[str, str] = {}
+                if previous:
+                    extra["previous"] = previous
+                extra["subject"] = details.subject
+                extra["not_after"] = details.not_after.isoformat()
+                await self._insert_tls_pin_audit(
+                    conn,
+                    event_type=(
+                        "endpoint_certificate_retrusted"
+                        if previous
+                        else "endpoint_certificate_trusted"
+                    ),
+                    endpoint_id=endpoint_id,
+                    admin_user_id=admin_user_id,
+                    method=method,
+                    path=path,
+                    detail=self._tls_pin_audit_detail(
+                        current, sha256=details.sha256, **extra
+                    ),
+                )
+                return dict(row)
+
+    async def clear_llm_endpoint_tls_pin(
+        self,
+        endpoint_id: str,
+        *,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+        event_type: str = "endpoint_certificate_pin_removed",
+    ) -> Dict[str, Any] | None:
+        """Remove a system endpoint's pin and audit it in the same
+        transaction. Returns the updated row, or None (nothing written) when
+        the endpoint has no pin or is not a system row."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    "SELECT label, base_url, tls_pin_sha256, tls_pin_subject,"
+                    " tls_pin_not_after FROM llm_endpoints"
+                    " WHERE id = $1 AND user_id IS NULL FOR UPDATE",
+                    UUID(endpoint_id),
+                )
+                if current is None or not current["tls_pin_sha256"]:
+                    return None
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE llm_endpoints
+                    SET tls_pin_sha256 = NULL, tls_pin_cert = NULL,
+                        tls_pin_subject = NULL, tls_pin_issuer = NULL,
+                        tls_pin_not_after = NULL, tls_pinned_at = NULL,
+                        tls_pinned_by = NULL
+                    WHERE id = $1 AND user_id IS NULL
+                    RETURNING {self._TLS_PIN_COLUMNS}
+                    """,
+                    UUID(endpoint_id),
+                )
+                extra: Dict[str, str] = {}
+                if current["tls_pin_subject"]:
+                    extra["subject"] = current["tls_pin_subject"]
+                if current["tls_pin_not_after"]:
+                    extra["not_after"] = current["tls_pin_not_after"].isoformat()
+                await self._insert_tls_pin_audit(
+                    conn,
+                    event_type=event_type,
+                    endpoint_id=endpoint_id,
+                    admin_user_id=admin_user_id,
+                    method=method,
+                    path=path,
+                    detail=self._tls_pin_audit_detail(
+                        current, sha256=current["tls_pin_sha256"], **extra
+                    ),
+                )
+                return dict(row)
+
     async def delete_system_llm_endpoint(self, endpoint_id: str) -> bool:
         """Delete a system endpoint (cascades to model rows)."""
         async with self.acquire() as conn:
