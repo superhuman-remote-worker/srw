@@ -254,15 +254,37 @@ Plain `http://` endpoints still need **Allow http**; pinning applies only to
    server's operator gives you.
 3. Select **Trust this certificate** and confirm.
 
-SRW checks again that the server still presents that fingerprint (otherwise
-the request fails with `409`) and that it can use the certificate as a pin
-(otherwise `400`; a key that is too weak is refused). It also refuses a
-certificate that already verifies normally.
+SRW refuses Trust, and stores nothing, when:
+
+- the endpoint's address is `http://` (`400` "Pinning applies to https://
+  endpoints.");
+- the endpoint is the subscription proxy (`400` "The subscription proxy can't
+  be pinned.");
+- every model on the endpoint is served by a search, fetch or text-to-speech
+  adapter, which doesn't use a pin (`400`);
+- a model on the endpoint has the live voice capability (`400` "Live voice
+  does not support pinned certificates yet; …");
+- the certificate already verifies normally (`400` "This certificate verifies
+  normally; no pin is needed.");
+- the server, read again at that moment, presents a different certificate
+  than the one you reviewed (`409` "The server now presents a different
+  certificate (SHA-256 …). Test again and compare.");
+- SRW can't use the certificate as a pin, for example because its key is too
+  weak (`400` "SRW can't use this certificate even when pinned: …").
+
+When the endpoint can't be pinned (the subscription proxy, adapters only, or
+live voice), Test shows that reason where it would otherwise offer **Trust**.
 
 From then on SRW accepts exactly that certificate for that endpoint, wherever
 the endpoint is used: Test and Discover, chat in sessions and jobs, embedding,
 rerank, vision, speech to text, text to speech, message triage, image
 generation, knowledge-base indexing and memory.
+
+Jobs and Sessions read the pin when they are dispatched, so trusting,
+re-trusting or removing a pin reaches them like a rotated API key: a running
+job keeps the pin it started with until it is resumed, a stateless Session
+uses the new pin from its next turn, and an open Session on a pinned agent
+(`agent.stateless.enabled: false`) keeps its old pin until it resumes.
 
 ### When the certificate changes
 
@@ -272,9 +294,11 @@ SHA-256 …, server presents …. An admin must re-trust it in Admin → Models.
 Test then shows the old and the new fingerprint, and **Trust the new
 certificate** replaces the pin.
 
-- **Expired.** A pinned certificate keeps working after it expires. The
-  endpoint shows "certificate expired" with the date, so you can renew it in
-  time.
+- **Expired.** A pinned certificate keeps working after its expiry date:
+  SRW trusts that exact certificate, not its validity period. The endpoint
+  shows "certificate expired" with the date as a reminder that the server's
+  operator should replace it. When they do, calls fail as "certificate
+  changed" until you trust the new certificate.
 - **Publicly valid later.** If the server gets a certificate that verifies
   normally, calls still fail as "certificate changed", because the pinned one
   is no longer presented. Test offers **Remove pin**, which returns the
@@ -298,11 +322,17 @@ These fail closed, so a pinned endpoint is never reached unverified:
 
 ### Audit
 
-Trusting, re-trusting and removing a pin are recorded as the security events
-`endpoint_certificate_trusted`, `endpoint_certificate_retrusted` and
-`endpoint_certificate_pin_removed`. List them with
-`GET /api/admin/security-events?event_type=endpoint_certificate_trusted`.
-Security events are kept for 90 days.
+Trusting, re-trusting and removing a pin are recorded as security events,
+one type each. List them with:
+
+```
+GET /api/admin/security-events?event_type=endpoint_certificate_trusted
+GET /api/admin/security-events?event_type=endpoint_certificate_retrusted
+GET /api/admin/security-events?event_type=endpoint_certificate_pin_removed
+```
+
+Each event names the admin, the endpoint and the fingerprint (and, for a
+re-trust, the previous one). Security events are kept for 90 days.
 
 ## Upgraded installations
 
