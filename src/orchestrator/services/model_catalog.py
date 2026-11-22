@@ -646,9 +646,11 @@ class ModelCatalogService:
                 if endpoint_tls.inspects(endpoint)
                 else []
             )
+            refusal = endpoint_tls.endpoint_trust_refusal(endpoint, rows)
             tls, may_probe = await endpoint_tls.preflight(
                 endpoint,
-                trustable=endpoint_tls.endpoint_trust_refusal(endpoint, rows) is None,
+                trustable=refusal is None,
+                refusal=refusal,
             )
             if not may_probe:
                 return endpoint_tls.blocked_test_response(endpoint, tls or {})

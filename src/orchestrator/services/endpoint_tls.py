@@ -161,14 +161,21 @@ def _host_port(base_url: str) -> tuple[str, int]:
 
 
 def tls_block(
-    inspection: TlsInspection, endpoint: Mapping[str, Any], *, trustable: bool
+    inspection: TlsInspection,
+    endpoint: Mapping[str, Any],
+    *,
+    trustable: bool,
+    refusal: str | None = None,
 ) -> dict[str, Any] | None:
     """The Test response's ``tls`` object; ``None`` when there is nothing to show.
 
     Nothing to show: no pin and a certificate that verifies normally. With a
     pin, ``verified`` means the presented certificate is the pinned one; a
     different one is ``certificate_changed`` even when it verifies normally
-    (owner decision 1). ``can_trust`` drives the Trust button.
+    (owner decision 1). ``can_trust`` drives the Trust button. ``refusal``
+    (:func:`endpoint_trust_refusal`'s sentence) is shown only where it is
+    why Trust is not offered: a certificate that would otherwise be
+    trustable, on an endpoint that can't be pinned.
     """
     pin, problem = _read_pin(endpoint)
     if pin is None and inspection.verified:
@@ -188,6 +195,9 @@ def tls_block(
             message = str(
                 CertificateChangedError(host, port, pin.sha256, certificate.sha256)
             )
+    would_trust = (
+        certificate is not None and not inspection.verified and pin_matches is not True
+    )
     return {
         "verified": pin_matches is True if pin is not None else inspection.verified,
         "reason": reason,
@@ -196,17 +206,13 @@ def tls_block(
         "pin": pin_public(endpoint),
         "pin_matches": pin_matches,
         "publicly_valid": inspection.verified,
-        "can_trust": (
-            trustable
-            and certificate is not None
-            and not inspection.verified
-            and pin_matches is not True
-        ),
+        "can_trust": trustable and would_trust,
+        "refusal": refusal if would_trust and not trustable else None,
     }
 
 
 async def preflight(
-    endpoint: Mapping[str, Any], *, trustable: bool
+    endpoint: Mapping[str, Any], *, trustable: bool, refusal: str | None = None
 ) -> tuple[dict[str, Any] | None, bool]:
     """Inspect an ``https://`` endpoint's certificate before any request.
 
@@ -225,7 +231,7 @@ async def preflight(
         )
     except ValueError:  # an https:// URL without a host: the probe reports it
         return None, problem is None
-    block = tls_block(inspection, endpoint, trustable=trustable)
+    block = tls_block(inspection, endpoint, trustable=trustable, refusal=refusal)
     if problem is not None:
         return block, False
     if inspection.certificate is None:

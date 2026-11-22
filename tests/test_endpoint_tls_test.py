@@ -254,6 +254,7 @@ async def test_unpinned_certificate_that_fails_is_explained_and_never_probed(
         "pin_matches": None,
         "publicly_valid": False,
         "can_trust": True,
+        "refusal": None,
     }
 
 
@@ -279,6 +280,7 @@ async def test_matching_pin_is_probed_through_the_pin(tls_certs, inspect, store)
         "pin_matches": True,
         "publicly_valid": False,
         "can_trust": False,
+        "refusal": None,
     }
 
 
@@ -327,6 +329,7 @@ async def test_changed_certificate_that_fails_verification_offers_a_retrust(
         "pin_matches": False,
         "publicly_valid": False,
         "can_trust": True,
+        "refusal": None,
     }
 
 
@@ -566,15 +569,24 @@ def test_pinnable_endpoints_have_no_refusal(rows):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "updates,rows",
+    "updates,rows,refusal",
     [
-        ({"transport_kind": SUBSCRIPTION_PROXY_TRANSPORT}, [model_row()]),
-        ({}, [SEARXNG]),
-        ({}, [model_row(), LIVE_VOICE]),
+        (
+            {"transport_kind": SUBSCRIPTION_PROXY_TRANSPORT},
+            [model_row()],
+            endpoint_tls.SUBSCRIPTION_PROXY_REFUSAL,
+        ),
+        (
+            {"label": "SearXNG"},
+            [SEARXNG],
+            "SearXNG is served by the searxng adapter, which doesn't use a "
+            "pinned certificate.",
+        ),
+        ({}, [model_row(), LIVE_VOICE], endpoint_tls.LIVE_VOICE_REFUSAL),
     ],
 )
 async def test_untrustable_endpoint_explains_but_offers_no_trust(
-    tls_certs, inspect, store, updates, rows
+    tls_certs, inspect, store, updates, rows, refusal
 ):
     store.get_system_llm_endpoint.return_value = endpoint_row(**updates)
     store.list_models.return_value = rows
@@ -586,6 +598,43 @@ async def test_untrustable_endpoint_explains_but_offers_no_trust(
     assert probe.calls == []
     assert body["tls"]["reason"] == "address_mismatch"
     assert body["tls"]["can_trust"] is False
+    # Why Trust is not offered: the Trust API's 400 sentence, verbatim.
+    assert body["tls"]["refusal"] == refusal
+
+
+@pytest.mark.asyncio
+async def test_a_changed_pin_on_an_untrustable_endpoint_says_why_no_retrust(
+    tls_certs, inspect, store
+):
+    store.get_system_llm_endpoint.return_value = endpoint_row(pin=tls_certs.leaf)
+    store.list_models.return_value = [model_row(), LIVE_VOICE]
+    inspect(unverified(tls_certs.swap, "unknown_issuer", "unable to get"))
+
+    body = await endpoint_test(store, FakeProbe())
+
+    assert body["tls"]["reason"] == "certificate_changed"
+    assert body["tls"]["can_trust"] is False
+    assert body["tls"]["refusal"] == endpoint_tls.LIVE_VOICE_REFUSAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["pin_matches", "verifies_normally", "unreachable"])
+async def test_no_refusal_where_trust_would_not_be_offered_anyway(
+    tls_certs, inspect, store, case
+):
+    store.list_models.return_value = [model_row(), LIVE_VOICE]
+    if case == "pin_matches":
+        store.get_system_llm_endpoint.return_value = endpoint_row(pin=tls_certs.leaf)
+        inspect(unverified(tls_certs.leaf, "unknown_issuer", "unable to get"))
+    elif case == "verifies_normally":
+        store.get_system_llm_endpoint.return_value = endpoint_row(pin=tls_certs.leaf)
+        inspect(verified(tls_certs.good))
+    else:
+        inspect(REFUSED)
+
+    body = await endpoint_test(store, FakeProbe())
+
+    assert (body["tls"] or {}).get("refusal") is None
 
 
 @pytest.mark.asyncio
@@ -709,6 +758,7 @@ async def test_model_row_test_offers_no_trust_on_an_untrustable_endpoint(
     body = await row_test(store, FakeProbe())
 
     assert body["tls"]["can_trust"] is False
+    assert body["tls"]["refusal"] == endpoint_tls.LIVE_VOICE_REFUSAL
 
 
 @pytest.mark.asyncio
