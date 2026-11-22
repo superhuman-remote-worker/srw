@@ -23,8 +23,10 @@ from shared.tls_pinning import (
     NO_CHECK_TIME,
     REASON_BY_VERIFY_CODE,
     UNREADABLE_PIN,
+    AsyncPinnedTransport,
     CertificateChangedError,
     PinnedCertificateRejectedError,
+    PinnedTransport,
     TlsPin,
     apresented_certificate_sha256,
     fingerprint_sha256,
@@ -33,6 +35,7 @@ from shared.tls_pinning import (
     pinned_handshake_error,
     pin_applies,
     pinned_ssl_context,
+    pinned_transport_for,
     presented_certificate_sha256,
     read_stored_pin,
 )
@@ -118,6 +121,19 @@ def test_from_env_refuses_the_unreadable_marker():
         "can't be read; an admin must trust it again or remove the pin in "
         "Admin → Models."
     )
+
+
+def test_from_wire_refuses_the_unreadable_marker():
+    # A model section carries the wire value as ``tls_pinned_cert``; the
+    # marker must never parse into, or fall back to, "no pin" there either.
+    with pytest.raises(ValueError) as raised:
+        TlsPin.from_wire(UNREADABLE_PIN)
+    assert str(raised.value) == (
+        "the pinned certificate for this endpoint can't be read; an admin "
+        "must trust it again or remove the pin in Admin → Models."
+    )
+    with pytest.raises(ValueError):
+        TlsPin.from_wire(f"  {UNREADABLE_PIN}\n")
 
 
 #: Valid PEM armour around a truncated DER: it parses, but OpenSSL can't load
@@ -645,3 +661,51 @@ async def test_pinned_handshake_error_names_a_weak_certificate(tmp_path):
         err = await pinned_handshake_error(f"https://127.0.0.1:{port}/v1", pin)
     assert err is not None and "too weak" in err
     assert completed == []
+
+
+# ---- pinned_transport_for: the transport of the SDK's own httpx package -------
+
+
+def test_pinned_transport_for_httpx_clients(tls_certs):
+    pin = _pin(tls_certs.leaf)
+    sync_transport = pinned_transport_for(httpx.Client, pin)
+    async_transport = pinned_transport_for(openai.DefaultAsyncHttpxClient, pin)
+    assert type(sync_transport) is PinnedTransport and sync_transport._pin == pin
+    if issubclass(openai.DefaultAsyncHttpxClient, httpx.AsyncClient):
+        assert type(async_transport) is AsyncPinnedTransport
+    assert async_transport._pin == pin
+    with pytest.raises(TypeError):
+        pinned_transport_for(dict, pin)
+
+
+def test_pinned_transport_for_keeps_a_proxy(tls_certs):
+    transport = pinned_transport_for(
+        httpx.Client, _pin(tls_certs.leaf), proxy="http://proxy.local:3128"
+    )
+    assert "Proxy" in type(transport._pool).__name__
+
+
+@pytest.mark.asyncio
+async def test_httpx2_transports_trust_only_the_pin(tls_certs):
+    httpx2 = pytest.importorskip("httpx2")
+    pin = _pin(tls_certs.leaf)
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        transport = pinned_transport_for(httpx2.AsyncClient, pin)
+        assert isinstance(transport, httpx2.AsyncHTTPTransport)
+        async with httpx2.AsyncClient(transport=transport) as client:
+            assert (await client.get(srv.url + "/models")).status_code == 200
+        sync = pinned_transport_for(httpx2.Client, pin)
+        assert isinstance(sync, httpx2.HTTPTransport)
+        with httpx2.Client(transport=sync) as client:
+            assert client.get(srv.url + "/models").status_code == 200
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        async with httpx2.AsyncClient(
+            transport=pinned_transport_for(httpx2.AsyncClient, pin)
+        ) as client:
+            with pytest.raises(CertificateChangedError) as raised:
+                await client.get(srv.url + "/models")
+        assert raised.value.presented_sha256 == _pin(tls_certs.swap).sha256
+        with httpx2.Client(transport=pinned_transport_for(httpx2.Client, pin)) as c:
+            with pytest.raises(CertificateChangedError):
+                c.get(srv.url + "/models")
+        assert srv.requests == []

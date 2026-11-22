@@ -44,6 +44,7 @@ from shared.runtime.core.tool_policy import (
     normalize_tool_policy,
 )
 from shared.runtime.llm.reasoning_chat import ReasoningChatOpenAI
+from shared.tls_pinning import TlsPin, pin_applies
 from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
@@ -4811,6 +4812,51 @@ def _subscription_proxy_session_headers(
     return {}
 
 
+def _endpoint_tls_pin(config: LLMConfig) -> Optional[TlsPin]:
+    """The endpoint's pinned certificate (``config.tls_pinned_cert``), or None.
+
+    A pin belongs to the https:// endpoint it was trusted for and travels with
+    that base URL (dispatch writes both from the endpoint row). One that can't
+    be read (garbage, or the ``UNREADABLE_PIN`` marker), or that comes without
+    an https:// base URL, raises ``ValueError`` naming the model: a broken pin
+    never builds an unpinned client.
+    """
+    wire = config.tls_pinned_cert
+    if wire is None or (isinstance(wire, str) and not wire.strip()):
+        return None
+    try:
+        if not isinstance(wire, str):
+            raise ValueError(f"expected base64 text, got {type(wire).__name__}")
+        pin = TlsPin.from_wire(wire)
+    except ValueError as exc:
+        raise ValueError(
+            f"Model {config.model!r} at {config.base_url or '(no base URL)'} "
+            f"has an unusable pinned certificate: {exc}"
+        ) from exc
+    if not pin_applies(config.base_url):
+        raise ValueError(
+            f"Model {config.model!r} has a pinned certificate, but its base URL "
+            f"{config.base_url or '(none)'} is not https://; a pin applies only "
+            "to the https:// endpoint it was trusted for."
+        )
+    return pin
+
+
+def _refuse_tls_pin(config: LLMConfig, provider: str) -> None:
+    """Refuse a pin in a factory that reaches only its provider's own API."""
+    wire = config.tls_pinned_cert
+    if wire is not None and (not isinstance(wire, str) or wire.strip()):
+        raise ValueError(
+            "A pinned certificate applies to endpoint-backed models; the "
+            f"{provider} factory reaches only its provider's own API."
+        )
+
+
+def _tls_pin_note(pin: Optional[TlsPin]) -> str:
+    """The factory log's pin field: empty without a pin."""
+    return f", tls_pin={pin.sha256}" if pin is not None else ""
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -4829,6 +4875,8 @@ def _create_openai_llm(
     rotate through them on auth/quota failures.
     """
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    tls_pin = _endpoint_tls_pin(config)
 
     # Parse API keys (supports comma-separated list for fallback)
     raw_key = config.api_key or _env_fallback_key(
@@ -5077,6 +5125,9 @@ def _create_openai_llm(
             config.model,
         )
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
@@ -5088,6 +5139,7 @@ def _create_openai_llm(
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
         f"headers={sorted(config.extra_headers) if config.extra_headers else 'none'}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5162,6 +5214,7 @@ def _create_anthropic_llm(
     from langchain_anthropic import ChatAnthropic
     from shared.runtime.llm.key_ring import parse_key_string
 
+    tls_pin = _endpoint_tls_pin(config)
     via_proxy = bool(config.base_url and _is_codex_proxy_url(config.base_url))
     raw_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
     if not raw_key and via_proxy:
@@ -5238,7 +5291,14 @@ def _create_anthropic_llm(
     if headers:
         llm_kwargs["default_headers"] = headers
 
-    llm = ChatAnthropic(**llm_kwargs)
+    if tls_pin is not None:
+        # langchain-anthropic takes no http_client and shares one per base URL
+        # (lru_cache); the subclass builds its own client on the pin.
+        from shared.runtime.llm.pinned_anthropic import PinnedChatAnthropic
+
+        llm = PinnedChatAnthropic(tls_pin=tls_pin, **llm_kwargs)
+    else:
+        llm = ChatAnthropic(**llm_kwargs)
 
     logger.info(
         f"Created Anthropic LLM: model={config.model}, "
@@ -5247,6 +5307,7 @@ def _create_anthropic_llm(
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={llm_kwargs['max_tokens']}, reasoning={reasoning_mode}, "
         f"betas={betas}, headers={sorted(headers) if headers else 'none'}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5295,6 +5356,8 @@ def _create_google_llm(
 
     Requires GOOGLE_API_KEY environment variable or config.api_key.
     """
+    # Google ignores base_url: no endpoint row routes here, so no pin can apply.
+    _refuse_tls_pin(config, "google")
     # Lazy import to avoid requiring the package when not used
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -5381,6 +5444,8 @@ def _create_groq_llm(
     Requires GROQ_API_KEY environment variable or config.api_key.
     Groq hosts open models (Llama, Mixtral, Gemma) with fast inference.
     """
+    # Provider-key rows only: no endpoint row routes here, so no pin applies.
+    _refuse_tls_pin(config, "groq")
     # Lazy import to avoid requiring the package when not used
     from langchain_groq import ChatGroq
 
@@ -5460,6 +5525,8 @@ def _create_openrouter_llm(
     - OPENROUTER_TITLE: Your app name
     """
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    tls_pin = _endpoint_tls_pin(config)
 
     # Parse API keys (supports comma-separated list for fallback)
     raw_key = config.api_key or _env_fallback_key(
@@ -5613,6 +5680,9 @@ def _create_openrouter_llm(
     ):
         llm_kwargs["replay_reasoning_content"] = True
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
@@ -5629,6 +5699,7 @@ def _create_openrouter_llm(
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
         f"prompt_cache={'requested' if 'cache_control' in extra_body else 'provider'}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5662,6 +5733,7 @@ def _create_mistral_llm(
     mistral-small-latest, codestral-latest, …). A defensive ``mistral/`` prefix
     is stripped if present; the API expects the bare id.
     """
+    tls_pin = _endpoint_tls_pin(config)
     api_key = config.api_key or _env_fallback_key(
         config, "MISTRAL_API_KEY", canonical_base_url="https://api.mistral.ai/v1"
     )
@@ -5715,6 +5787,9 @@ def _create_mistral_llm(
     # persistent path gets turn metrics — same as the openrouter factory.
     llm_kwargs["stream_usage"] = True
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
@@ -5723,6 +5798,7 @@ def _create_mistral_llm(
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, "
         f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5754,6 +5830,8 @@ def _create_codex_llm(
     not needed as CLIProxyAPI handles auth).
     """
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    tls_pin = _endpoint_tls_pin(config)
 
     # Parse API keys — CLIProxyAPI handles OAuth, so "not-needed" is the default
     raw_key = config.api_key or _env_fallback_key(
@@ -5858,6 +5936,9 @@ def _create_codex_llm(
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
@@ -5867,6 +5948,7 @@ def _create_codex_llm(
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm

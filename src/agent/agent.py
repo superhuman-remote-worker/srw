@@ -798,6 +798,10 @@ class UniversalAgent:
                     served_model=served_model_from_env("CITATION_LLM"),
                     base_url=transport.base_url,
                     api_key=transport.api_key,
+                    # The endpoint's pinned certificate travels with its URL.
+                    tls_pinned_cert=(
+                        transport.tls_pin.wire if transport.tls_pin else None
+                    ),
                     temperature=0.0,
                     top_p=model_settings.get("top_p"),
                     top_k=model_settings.get("top_k"),

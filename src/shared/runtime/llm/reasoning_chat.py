@@ -40,9 +40,11 @@ from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
 
 from shared.runtime.llm.exceptions import ContextOverflowError
+from shared.tls_pinning import httpx_client_kwargs
 
 if TYPE_CHECKING:
     from shared.runtime.llm.key_ring import KeyRing
+    from shared.tls_pinning import TlsPin
 
 logger = logging.getLogger(__name__)
 
@@ -1393,18 +1395,24 @@ class ReasoningChatOpenAI(ChatOpenAI):
         self,
         max_context_tokens: Optional[int] = None,
         key_ring: Optional["KeyRing"] = None,
+        tls_pin: Optional["TlsPin"] = None,
         **kwargs,
     ):
         # Extract config for our custom client
         timeout = kwargs.get("timeout")
         model = kwargs.get("model", "gpt-4")
 
+        # The endpoint's pinned certificate: both clients then trust exactly
+        # it (shared/tls_pinning.py). The pin lives in the transport, under
+        # send(), so the wire record, key rotation and the overflow check
+        # see a pinned request like any other.
         # Create sync client (used by invoke/_generate)
         reasoning_client = ReasoningCapturingClient(
             timeout=timeout,
             max_context_tokens=max_context_tokens,
             model=model,
             key_ring=key_ring,
+            **httpx_client_kwargs(tls_pin, asynchronous=False),
         )
         # Create async client (used by ainvoke/_agenerate — the actual production path)
         async_reasoning_client = AsyncReasoningCapturingClient(
@@ -1412,6 +1420,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
             max_context_tokens=max_context_tokens,
             model=model,
             key_ring=key_ring,
+            **httpx_client_kwargs(tls_pin, asynchronous=True),
         )
         kwargs["http_client"] = reasoning_client
         kwargs["http_async_client"] = async_reasoning_client

@@ -424,6 +424,7 @@ class TestCodexLaneSessionKey:
         config.extra_body = None
         config.extra_headers = None
         config.prompt_cache_key = overrides.get("prompt_cache_key")
+        config.tls_pinned_cert = None
         return config
 
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")

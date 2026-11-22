@@ -24,8 +24,9 @@ Two rules from the spike (vault spec ``endpoint-certificate-pinning-design``):
 
 Shared by the orchestrator, the agent and the provisioners; the only
 third-party import is httpx (``cryptography`` is imported lazily, and only by
-:func:`inspect_tls`). A pinned client gets an explicit transport, so
-httpx ignores environment proxies and the client's ``limits`` for it.
+:func:`inspect_tls`; ``httpx2`` lazily, and only by :func:`pinned_transport_for`
+for an SDK built on it). A pinned client gets an explicit transport, so httpx
+ignores environment proxies and the client's ``limits`` for it.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import asyncio
 import base64
 import contextlib
 import binascii
+import functools
 import hashlib
 import os
 import re
@@ -53,6 +55,11 @@ TLS_PINNED_CERT_SUFFIX = "TLS_PINNED_CERT"
 #: stored pin can't be read: :meth:`TlsPin.from_env` refuses it, so a base URL
 #: that survived in a stored override never goes out without its pin.
 UNREADABLE_PIN = "unreadable"
+
+_UNREADABLE_MESSAGE = (
+    "the pinned certificate for this endpoint can't be read; an admin must "
+    "trust it again or remove the pin in Admin \u2192 Models."
+)
 
 #: OpenSSL's ``X509_V_FLAG_NO_CHECK_TIME``; Python has no name for it.
 NO_CHECK_TIME = 0x200000
@@ -103,6 +110,9 @@ class TlsPin:
 
     @classmethod
     def from_wire(cls, value: str) -> "TlsPin":
+        """Parse the one-line base64 DER; the :data:`UNREADABLE_PIN` marker raises."""
+        if value.strip() == UNREADABLE_PIN:
+            raise ValueError(_UNREADABLE_MESSAGE)
         try:
             der = base64.b64decode(value.strip(), validate=True)
         except (binascii.Error, ValueError) as exc:
@@ -124,11 +134,7 @@ class TlsPin:
         if not value.strip():
             return None
         if value.strip() == UNREADABLE_PIN:
-            raise ValueError(
-                f"{name}: the pinned certificate for this endpoint can't be "
-                "read; an admin must trust it again or remove the pin in "
-                "Admin → Models."
-            )
+            raise ValueError(f"{name}: {_UNREADABLE_MESSAGE}")
         try:
             return cls.from_wire(value)
         except ValueError as exc:
@@ -378,6 +384,81 @@ def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[st
         return {}
     transport = AsyncPinnedTransport(pin) if asynchronous else PinnedTransport(pin)
     return {"transport": transport}
+
+
+@functools.lru_cache(maxsize=1)
+def _httpx2_transport_classes() -> tuple[type, type]:
+    """:class:`PinnedTransport` and :class:`AsyncPinnedTransport` for httpx2.
+
+    Built on first use, so httpx2 is imported only where an SDK runs on it. A
+    pin failure raises the same :class:`CertificateChangedError` (an httpx
+    error, carrying the httpx2 request): callers look for one class.
+    """
+    import httpx2
+
+    class Httpx2PinnedTransport(httpx2.HTTPTransport):
+        def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
+            self._pin = pin
+            super().__init__(verify=pinned_ssl_context(pin), **kwargs)
+
+        def handle_request(self, request: Any) -> Any:
+            try:
+                return super().handle_request(request)
+            except httpx2.ConnectError as exc:
+                verification = _verification_error(exc)
+                if verification is None:
+                    raise
+                host, port = request.url.host, request.url.port or 443
+                presented = presented_certificate_sha256(host, port)
+                raise _pin_failure(
+                    verification, request, self._pin, host, port, presented
+                ) from exc
+
+    class AsyncHttpx2PinnedTransport(httpx2.AsyncHTTPTransport):
+        def __init__(self, pin: TlsPin, **kwargs: Any) -> None:
+            self._pin = pin
+            super().__init__(verify=pinned_ssl_context(pin), **kwargs)
+
+        async def handle_async_request(self, request: Any) -> Any:
+            try:
+                return await super().handle_async_request(request)
+            except httpx2.ConnectError as exc:
+                verification = _verification_error(exc)
+                if verification is None:
+                    raise
+                host, port = request.url.host, request.url.port or 443
+                presented = await apresented_certificate_sha256(host, port)
+                raise _pin_failure(
+                    verification, request, self._pin, host, port, presented
+                ) from exc
+
+    return Httpx2PinnedTransport, AsyncHttpx2PinnedTransport
+
+
+def pinned_transport_for(client_cls: type, pin: TlsPin, **kwargs: Any) -> Any:
+    """A transport trusting only ``pin``, for a client of class ``client_cls``.
+
+    The anthropic SDK from 1.0 (and openai's ``Default*HttpxClient`` from 3.0)
+    is built on ``httpx2``, a fork with httpx's API that refuses httpx objects;
+    older releases are built on httpx. The transport follows the package and
+    the sync or async flavour of ``client_cls``. ``kwargs`` go to the
+    transport (e.g. ``proxy``); ``verify`` is always the pinned context.
+    """
+    if issubclass(client_cls, httpx.AsyncClient):
+        return AsyncPinnedTransport(pin, **kwargs)
+    if issubclass(client_cls, httpx.Client):
+        return PinnedTransport(pin, **kwargs)
+    try:
+        import httpx2
+    except ImportError:
+        httpx2 = None
+    if httpx2 is not None:
+        sync_cls, async_cls = _httpx2_transport_classes()
+        if issubclass(client_cls, httpx2.AsyncClient):
+            return async_cls(pin, **kwargs)
+        if issubclass(client_cls, httpx2.Client):
+            return sync_cls(pin, **kwargs)
+    raise TypeError(f"{client_cls!r} is not an httpx or httpx2 client class")
 
 
 # ---- Read-only inspection (endpoint Test and the Trust API) -------------------
