@@ -45,11 +45,13 @@ invocation by a main factory — never captured at import (R1.B05 §P1).
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from orchestrator.services.model_availability import (
+    EndpointPinUnreadable,
     ModelUnavailable,
     UnavailableModel,
     endpoint_key_unreadable,
@@ -75,6 +77,7 @@ from shared.runtime.core.transport_resolution import (
     same_endpoint,
 )
 from shared.subscription_routing import subscription_request_headers
+from shared.tls_pinning import TLS_PINNED_CERT_SUFFIX, TlsPin
 
 
 @dataclass(frozen=True)
@@ -129,6 +132,32 @@ def provider_of_model(model: str) -> str | None:
     if name.startswith(("gpt-", "o1", "o3", "o4", "text-embedding-")):
         return "openai"
     return None
+
+
+def endpoint_tls_pin_wire(endpoint_row: Mapping[str, Any]) -> str | None:
+    """The endpoint row's pinned certificate as it travels next to the row's
+    base URL (``TlsPin.wire``: base64 DER on one line), or ``None``.
+
+    ``None`` when the row has no pin, and when its base URL is not
+    ``https://``: a pin applies only to TLS, and an admin may edit a pinned
+    endpoint's URL to ``http://`` (an edit keeps the pin, decision 4). A stored
+    pin that can't be read (a certificate that doesn't parse, a fingerprint
+    stored without its certificate or not matching it) raises ``ValueError``:
+    it is never treated as no pin. Same reading as the Test probe's
+    (``services/endpoint_tls.py``).
+    """
+    if urlsplit(str(endpoint_row.get("base_url") or "")).scheme != "https":
+        return None
+    pem = endpoint_row.get("tls_pin_cert")
+    sha256 = endpoint_row.get("tls_pin_sha256")
+    if not pem and not sha256:
+        return None
+    if not pem:
+        raise ValueError("a fingerprint is stored without its certificate")
+    pin = TlsPin.from_pem(pem)
+    if sha256 and sha256 != pin.sha256:
+        raise ValueError(f"the stored fingerprint is {sha256}, not the certificate's")
+    return pin.wire
 
 
 def nested_model_slots(
@@ -269,7 +298,11 @@ async def inject_model_credentials(
     stored key did not decrypt is refused with
     ``model_availability.EndpointKeyUnreadable`` (and an ERROR) rather than
     sent keyless; a row registered without a key (``api_key_stored`` false)
-    gets its ``base_url`` alone, as before.
+    gets its ``base_url`` alone, as before. The row's pinned TLS certificate
+    travels next to its ``base_url`` as ``tls_pinned_cert``
+    (:func:`endpoint_tls_pin_wire`); one that can't be read refuses the slot
+    with ``model_availability.EndpointPinUnreadable``. Every other path writes
+    ``tls_pinned_cert: None``.
 
     For system-anchored catalog rows: injects the row's provider key from
     ``resolved_keys`` (the user > project > env resolution chain).
@@ -356,6 +389,10 @@ async def inject_model_credentials(
     section["client_protocol"] = (
         effective_client_protocol(meta) if meta is not None else None
     )
+    # The endpoint's pinned TLS certificate. Only the endpoint branch below
+    # writes one, next to the row's base_url; `None` clears a previous model's
+    # pin on a session hot swap, like `served_model` above. Never a caller's.
+    section["tls_pinned_cert"] = None
 
     if transport_complete and not (meta is not None and meta.endpoint_id):
         return None
@@ -382,8 +419,28 @@ async def inject_model_credentials(
             )
             return unreadable
         if endpoint_row:
+            try:
+                pin_wire = endpoint_tls_pin_wire(endpoint_row)
+            except ValueError as exc:
+                # Sent without its pin, the base URL would be verified against
+                # the CA list instead: a pin that can't be read is never
+                # treated as no pin. Refuse, naming the endpoint.
+                dependencies.logger.error(
+                    "Dispatch: %s model %r refused: endpoint %r (%s) has a "
+                    "pinned TLS certificate that can't be read (%s); trust its "
+                    "certificate again or remove the pin in Admin → Models.",
+                    capability,
+                    model_id,
+                    endpoint_row.get("label"),
+                    meta.endpoint_id,
+                    exc,
+                )
+                return EndpointPinUnreadable(
+                    endpoint_row.get("label") or meta.endpoint_id
+                )
             if endpoint_row.get("base_url"):
                 section["base_url"] = endpoint_row["base_url"]
+                section["tls_pinned_cert"] = pin_wire
             if endpoint_row.get("api_key"):
                 section["api_key"] = endpoint_row["api_key"]
         return None
@@ -441,7 +498,14 @@ async def inject_env_key_credentials(
     OpenAI-compatible base URL (``transport_resolution.provider_base_url``).
     The key is withheld when an endpoint name for the prefix is already set to
     another host, or when the provider has no such API.
+
+    ``{PREFIX}_TLS_PINNED_CERT`` is popped on entry and written only by the
+    endpoint branch, next to the row's base URL (:func:`endpoint_tls_pin_wire`):
+    a caller's BYO pair and a provider-key row never carry a pin. A row whose
+    pin can't be read gets no transport, like one whose key did not decrypt.
     """
+    pin_name = f"{prefix}_{TLS_PINNED_CERT_SUFFIX}"
+    env_keys.pop(pin_name, None)
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
 
     # A complete caller-supplied pair (an endpoint name AND its key, e.g. a
@@ -509,15 +573,33 @@ async def inject_env_key_credentials(
                     prefix,
                 )
                 return
+            try:
+                pin_wire = endpoint_tls_pin_wire(endpoint_row)
+            except ValueError as exc:
+                # A pin that can't be read is never treated as no pin: like a
+                # key that did not decrypt, the slot gets no transport.
+                dependencies.logger.error(
+                    "Dispatch: %s endpoint %s has a pinned TLS certificate that "
+                    "can't be read (%s) — not injecting %s_BASE_URL/_API_KEY; "
+                    "trust its certificate again or remove the pin in Admin → "
+                    "Models.",
+                    prefix,
+                    meta.endpoint_id,
+                    exc,
+                    prefix,
+                )
+                return
             # The endpoint row is authoritative for its own transport, exactly
             # like the model-section branch: overwrite, never setdefault, so a
             # pre-set endpoint name (under any alias a reader consults) cannot
-            # survive next to this row's key.
+            # survive next to this row's key. Its pin travels with it.
             if base_url:
                 names = env_endpoint_names(prefix)
                 for alias in names[1:]:
                     env_keys.pop(alias, None)
                 env_keys[names[0]] = base_url
+                if pin_wire:
+                    env_keys[pin_name] = pin_wire
             if api_key:
                 env_keys[f"{prefix}_API_KEY"] = api_key
         return
@@ -839,6 +921,8 @@ async def inject_system_kb_embedding_profile(
         fallback = EmbeddingService()
         if not fallback.api_key:
             return None
+        # No KB_EMBEDDING_TLS_PINNED_CERT: this profile has no endpoint row,
+        # so no pin (the wipe on entry removed any earlier one).
         env_keys.update(
             {
                 "KB_EMBEDDING_PROVIDER": fallback.provider,
@@ -1159,6 +1243,7 @@ async def inject_thread_dispatch_credentials(
 __all__ = [
     "DispatchCredentialDependencies",
     "dispatch_llm_provider_fallback",
+    "endpoint_tls_pin_wire",
     "inject_env_key_credentials",
     "inject_image_credentials",
     "inject_model_credentials",

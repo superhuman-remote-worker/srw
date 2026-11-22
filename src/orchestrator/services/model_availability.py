@@ -41,6 +41,12 @@ REASON_UNKNOWN = "unknown"
 # another installation). Carried as :class:`EndpointKeyUnreadable`, which
 # names the endpoint for the message.
 REASON_ENDPOINT_KEY = "endpoint_key"
+# ``endpoint_pin``: the model resolves, but the TLS certificate pinned for its
+# endpoint can't be read. A pin that can't be read is never treated as no pin.
+# Carried as :class:`EndpointPinUnreadable`, which names the endpoint.
+REASON_ENDPOINT_PIN = "endpoint_pin"
+#: The refusals that name an endpoint: the fix is there, not another model.
+_ENDPOINT_REASONS = (REASON_ENDPOINT_KEY, REASON_ENDPOINT_PIN)
 
 MODEL_UNAVAILABLE_CODE = "model.unavailable"
 
@@ -150,6 +156,21 @@ class EndpointKeyUnreadable(str):
         return (self.endpoint,)
 
 
+class EndpointPinUnreadable(str):
+    """:data:`REASON_ENDPOINT_PIN`, naming the endpoint whose pinned
+    certificate can't be read; carried like :class:`EndpointKeyUnreadable`."""
+
+    endpoint: str
+
+    def __new__(cls, endpoint: str) -> "EndpointPinUnreadable":
+        reason = super().__new__(cls, REASON_ENDPOINT_PIN)
+        reason.endpoint = str(endpoint)
+        return reason
+
+    def __getnewargs__(self) -> tuple[str]:  # copy / pickle keep the endpoint
+        return (self.endpoint,)
+
+
 def endpoint_key_unreadable(
     endpoint_row: dict[str, Any] | None, endpoint_id: str
 ) -> EndpointKeyUnreadable | None:
@@ -249,15 +270,19 @@ def render_unavailable_message(
 ) -> str:
     """The § Messages text of the design note, for one or more entries.
 
-    An endpoint whose stored key did not decrypt is named first, once however
-    many slots use it: choosing another model is not the fix, re-adding the
-    key is. Any other entries follow in their own wording.
+    An endpoint whose stored key did not decrypt, or whose pinned certificate
+    can't be read, is named first, once however many slots use it: choosing
+    another model is not the fix, repairing the endpoint is. Any other entries
+    follow in their own wording.
     """
     key_entries = [e for e in entries if e.reason == REASON_ENDPOINT_KEY]
-    model_entries = [e for e in entries if e.reason != REASON_ENDPOINT_KEY]
+    pin_entries = [e for e in entries if e.reason == REASON_ENDPOINT_PIN]
+    model_entries = [e for e in entries if e.reason not in _ENDPOINT_REASONS]
     parts: list[str] = []
     if key_entries:
         parts.append(_endpoint_key_text(key_entries))
+    if pin_entries:
+        parts.append(_endpoint_pin_text(pin_entries))
     if model_entries:
         parts.append(_model_text(model_entries, where=where))
     text = " ".join(parts)
@@ -266,12 +291,33 @@ def render_unavailable_message(
     return _clip(text)
 
 
-def _endpoint_key_text(entries: list[UnavailableModel]) -> str:
+def _endpoint_labels(entries: list[UnavailableModel]) -> list[str]:
     labels: list[str] = []
     for entry in entries:
         label = getattr(entry.reason, "endpoint", None) or entry.model
         if label not in labels:
             labels.append(label)
+    return labels
+
+
+def _endpoint_pin_text(entries: list[UnavailableModel]) -> str:
+    labels = _endpoint_labels(entries)
+    if len(labels) == 1:
+        return (
+            f"The certificate pinned for the model endpoint '{labels[0]}' can't "
+            "be read. Trust its certificate again or remove the pin in "
+            "Admin → Models."
+        )
+    listed = ", ".join(f"'{label}'" for label in labels)
+    return (
+        f"The certificates pinned for the model endpoints {listed} can't be "
+        "read. Trust their certificates again or remove the pins in "
+        "Admin → Models."
+    )
+
+
+def _endpoint_key_text(entries: list[UnavailableModel]) -> str:
+    labels = _endpoint_labels(entries)
     if len(labels) == 1:
         return (
             f"The model endpoint '{labels[0]}' has a stored API key that can't "
@@ -439,11 +485,13 @@ __all__ = [
     "REASON_CAPABILITY",
     "REASON_DISABLED",
     "REASON_ENDPOINT_KEY",
+    "REASON_ENDPOINT_PIN",
     "REASON_UNKNOWN",
     "WHERE_ACCOUNT",
     "WHERE_JOB",
     "WHERE_SESSION",
     "EndpointKeyUnreadable",
+    "EndpointPinUnreadable",
     "ModelSlot",
     "ModelUnavailable",
     "UnavailableModel",
