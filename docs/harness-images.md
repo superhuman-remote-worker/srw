@@ -210,6 +210,7 @@ What you read from the request:
 | --- | --- |
 | `job_id`, `description`, `instructions` | The Job and its task text |
 | `resolved_config.agent.llm` | `model`, `provider`, `client_protocol`, `base_url`, `api_key` for the model to call |
+| `resolved_config.agent.llm.tls_pinned_cert` | The endpoint's pinned certificate as one line of base64 DER, or absent or `null`. Accept only that certificate for `base_url`. A harness that does not verify it must leave normal verification on, so the call fails closed |
 | `resolved_config.agent.workspace.remote` | `host`, `port`, `username`, `key_path`, `workspace_path` of the workspace to work in over SSH |
 | `workspace_ssh_host_key_fingerprint` | The workspace's host key as `SHA256:<base64>` |
 | `resolved_config.agent.autonomy` | The Job's autonomy level; `full` or another (`partial` when absent) |

@@ -1923,6 +1923,8 @@ secrets:
 # orchestrator, every agent pod and every container workspace (whose
 # entrypoint adds it to the system store). Certificate verification is never
 # switched off; without this, such an endpoint fails its TLS handshake.
+# For one self-signed certificate that cannot be verified for its address, trust
+# it per endpoint in Admin → Models instead (see docs/models.md).
 trust:
   # -- PEM, one or more certificates (-----BEGIN CERTIFICATE----- …). The chart
   # puts it into the ConfigMap <fullname>-trust-ca.
