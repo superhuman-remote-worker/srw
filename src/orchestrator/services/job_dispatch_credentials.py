@@ -28,7 +28,10 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
 from orchestrator.security.config_redaction import strip_in_flight_only_keys
-from orchestrator.services.dispatch_credentials import endpoint_tls_pin_wire
+from orchestrator.services.dispatch_credentials import (
+    endpoint_tls_pin_wire,
+    refused_endpoint_pin,
+)
 from orchestrator.services.live.dispatch import live_session_config
 from orchestrator.services.model_availability import (
     EndpointPinUnreadable,
@@ -46,7 +49,7 @@ from shared.runtime.core.model_registry import (
 )
 from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
-from shared.tls_pinning import TLS_PINNED_CERT_SUFFIX
+from shared.tls_pinning import TLS_PINNED_CERT_SUFFIX, UNREADABLE_PIN
 
 
 class DispatchCredentialStore(Protocol):
@@ -197,8 +200,9 @@ async def inject_dispatch_credentials(
     # caller had named that route.
     no_model_route: dict[str, Any] = {}
     # The endpoint row's pinned TLS certificate, written next to its base_url
-    # by the endpoint branch below; every other route sends `None` (see the
-    # `served_model` sentinel).
+    # by the endpoint branch below (a refused row's too, or the marker, for a
+    # base URL a stored override kept); every other route sends `None` (see
+    # the `served_model` sentinel).
     main_pin: str | None = None
 
     if (
@@ -232,6 +236,8 @@ async def inject_dispatch_credentials(
             unavailable.append(
                 UnavailableModel(slot="llm", model=str(model_id), reason=unreadable)
             )
+            # A base URL kept in a stored override keeps the row's pin.
+            main_pin = refused_endpoint_pin(endpoint_row)
         elif endpoint_row:
             try:
                 pin_wire = endpoint_tls_pin_wire(endpoint_row)
@@ -259,6 +265,9 @@ async def inject_dispatch_credentials(
                         ),
                     )
                 )
+                # A base URL kept in a stored override gets the marker the
+                # agent refuses, never "no pin".
+                main_pin = UNREADABLE_PIN
             else:
                 if endpoint_row.get("base_url"):
                     llm_over["base_url"] = endpoint_row["base_url"]

@@ -158,6 +158,9 @@ class _Store:
     async def resolve_default_for_capability(self, capability):
         return self.defaults.get(capability)
 
+    async def list_system_llm_endpoints(self):
+        return [dict(row) for row in self.rows.values()]
+
 
 async def _resolve(model_id, user_id=None, capability="chat"):
     try:
@@ -350,7 +353,11 @@ class TestModelSection:
         assert swap["tls_pinned_cert"] is None
 
     @pytest.mark.asyncio
-    async def test_refused_undecryptable_row_carries_no_pin(self, store, caplog):
+    async def test_refused_undecryptable_row_still_carries_its_pin(
+        self, store, pins, caplog
+    ):
+        """Like the flat env (D2): no base URL or key from the row, but the
+        pin slot carries the row's pin, for a base URL a stored config kept."""
         caplog.set_level(logging.DEBUG)
         section = {"model": "broken-key-model", "tls_pinned_cert": STALE_PIN}
         reason = await _section(section, store)
@@ -358,7 +365,32 @@ class TestModelSection:
         assert reason.endpoint == "broken"
         assert "base_url" not in section
         assert "api_key" not in section
-        assert section["tls_pinned_cert"] is None
+        assert section["tls_pinned_cert"] == pins["leaf"].wire
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pin_state", ["pinned", "unpinned", "unreadable", "http"])
+    async def test_a_refused_section_never_sends_a_kept_base_url_unpinned(
+        self, store, rows, pins, pin_state
+    ):
+        """M1: the stored (redacted) section of a Session keeps the endpoint's
+        base URL; when the row is refused, that URL keeps the row's pin, or
+        the marker the loader refuses."""
+        row = rows[BROKEN_KEY_ID]
+        expected = pins["leaf"].wire
+        if pin_state == "unpinned":
+            row.update(_pin_columns(None))
+            expected = None
+        elif pin_state == "unreadable":
+            row["tls_pin_cert"] = "not a certificate"
+            expected = UNREADABLE_PIN
+        elif pin_state == "http":
+            row["base_url"] = HTTP_URL  # R9: a pin never rides http://
+            expected = None
+        section = {"model": "broken-key-model", "base_url": row["base_url"]}
+        assert await _section(section, store) == ma.REASON_ENDPOINT_KEY
+        assert section["base_url"] == row["base_url"]
+        assert "api_key" not in section
+        assert section["tls_pinned_cert"] == expected
 
     @pytest.mark.asyncio
     async def test_http_base_url_never_carries_a_pin(self, store):
@@ -401,15 +433,35 @@ class TestUnreadablePinIsRefused:
         reason = await _section(section, store)
         assert reason == ma.REASON_ENDPOINT_PIN
         assert reason.endpoint == "corrupt-pin"
-        # No transport at all: neither the base URL without its pin nor the key.
+        # No transport from the row: neither the base URL nor the key. The pin
+        # slot carries the marker, as in the flat env (D2).
         assert "base_url" not in section
         assert "api_key" not in section
-        assert section["tls_pinned_cert"] is None
+        assert section["tls_pinned_cert"] == UNREADABLE_PIN
         errors = _errors(caplog)
         assert len(errors) == 1
         assert "corrupt-pin" in errors[0]
         assert CORRUPT_ID in errors[0]
         assert PINNED_KEY not in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_a_kept_section_base_url_never_goes_out_without_its_pin(
+        self, store, corrupt
+    ):
+        from shared.runtime.core.loader import LLMConfig, _endpoint_tls_pin
+
+        section = {"model": "corrupt-pin-model", "base_url": CORRUPT_URL}
+        assert await _section(section, store) == ma.REASON_ENDPOINT_PIN
+        assert section["base_url"] == CORRUPT_URL
+        assert section["tls_pinned_cert"] == UNREADABLE_PIN
+        config = LLMConfig(
+            model="corrupt-pin-model",
+            provider="openai",
+            base_url=section["base_url"],
+            tls_pinned_cert=section["tls_pinned_cert"],
+        )
+        with pytest.raises(ValueError, match="can't be read"):
+            _endpoint_tls_pin(config)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("prefix", FLAT_PREFIXES)
@@ -553,6 +605,43 @@ class TestFlatEnv:
         env = await _env({_pin_env(prefix): STALE_PIN}, prefix, "provider-model", store)
         assert env[f"{prefix}_API_KEY"] == SYSTEM_OPENAI_KEY
         assert _pin_env(prefix) not in env
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kept_url, pin_state, expected",
+        [
+            # The stale URL is a pinned endpoint's (another path on its origin
+            # too): it keeps that endpoint's pin.
+            (PINNED_URL, "pinned", "leaf"),
+            (PINNED_URL.rstrip("/") + "/other", "pinned", "leaf"),
+            (PINNED_URL, "unreadable", UNREADABLE_PIN),
+            # No pinned endpoint at that origin, or not https: no pin.
+            ("https://byo.example/v1", "pinned", None),
+            (UNPINNED_URL, "pinned", None),
+            (PINNED_URL, "unpinned", None),
+        ],
+    )
+    async def test_a_foreign_url_of_a_pinned_endpoint_keeps_its_pin(
+        self, store, rows, pins, prefix, kept_url, pin_state, expected
+    ):
+        """M1: a provider-key row withholds its key from a URL the block
+        already names; when that URL is a pinned endpoint's (left over from an
+        earlier resolution), it never goes out without that endpoint's pin."""
+        if pin_state == "unreadable":
+            rows[PINNED_ID]["tls_pin_cert"] = "not a certificate"
+        elif pin_state == "unpinned":
+            rows[PINNED_ID].update(_pin_columns(None))
+        url_name = env_endpoint_names(prefix)[0]
+        env = await _env(
+            {url_name: kept_url, _pin_env(prefix): STALE_PIN},
+            prefix,
+            "provider-model",
+            store,
+        )
+        assert env[url_name] == kept_url
+        assert f"{prefix}_API_KEY" not in env
+        want = pins["leaf"].wire if expected == "leaf" else expected
+        assert env.get(_pin_env(prefix)) == want
 
     @pytest.mark.asyncio
     async def test_endpoint_without_a_pin_pops_a_stale_one(self, store, prefix):
@@ -867,10 +956,10 @@ class TestJobPath:
         )
         assert "base_url" not in out["llm"]
         assert "api_key" not in out["llm"]
-        assert out["llm"]["tls_pinned_cert"] is None
+        assert out["llm"]["tls_pinned_cert"] == UNREADABLE_PIN
 
     @pytest.mark.asyncio
-    async def test_an_undecryptable_key_refuses_with_no_pin(self, rows):
+    async def test_an_undecryptable_key_refuses_but_keeps_the_pin(self, rows, pins):
         store = _Store(rows)
         out = await _job(
             {"llm": {"model": "broken-key-model", "tls_pinned_cert": STALE_PIN}},
@@ -878,7 +967,27 @@ class TestJobPath:
             strict=False,
         )
         assert "base_url" not in out["llm"]
-        assert out["llm"]["tls_pinned_cert"] is None
+        assert out["llm"]["tls_pinned_cert"] == pins["leaf"].wire
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model_id, expected",
+        [("broken-key-model", "leaf"), ("corrupt-pin-model", UNREADABLE_PIN)],
+    )
+    async def test_a_refused_main_model_never_sends_a_kept_base_url_unpinned(
+        self, rows, pins, model_id, expected
+    ):
+        """M1 on the job path: a stored base URL (a resumed job's redacted
+        override) keeps the refused row's pin, or the marker."""
+        store = _Store(rows)
+        url = rows[METAS[model_id].endpoint_id]["base_url"]
+        out = await _job(
+            {"llm": {"model": model_id, "base_url": url}}, store, strict=False
+        )
+        assert out["llm"]["base_url"] == url
+        assert "api_key" not in out["llm"]
+        want = pins["leaf"].wire if expected == "leaf" else expected
+        assert out["llm"]["tls_pinned_cert"] == want
 
 
 # ---------------------------------------------------------------------------

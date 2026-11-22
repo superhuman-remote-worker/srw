@@ -158,6 +158,45 @@ def endpoint_tls_pin_wire(endpoint_row: Mapping[str, Any]) -> str | None:
     return pin.wire if pin is not None else None
 
 
+def refused_endpoint_pin(endpoint_row: Mapping[str, Any] | None) -> str | None:
+    """The pin slot of a slot whose endpoint row is refused.
+
+    A refused row writes no base URL or key, but one may survive in a stored
+    config (redaction keeps base URLs), so the pin slot still carries the
+    row's pin (:func:`endpoint_tls_pin_wire`), or ``tls_pinning.UNREADABLE_PIN``
+    for a pin that can't be read, which the agent refuses. ``None`` when the
+    row has no pin that applies.
+    """
+    if not endpoint_row:
+        return None
+    try:
+        return endpoint_tls_pin_wire(endpoint_row)
+    except ValueError:
+        return UNREADABLE_PIN
+
+
+async def kept_url_pin(store: Any, url: str | None) -> str | None:
+    """The pin a base URL no endpoint row resolved in this dispatch keeps.
+
+    Such a URL (left in a stored block by an earlier resolution, or a
+    caller's) is still a pinned endpoint's when a system endpoint on its
+    origin stores a pin: it never goes out without that pin, or
+    ``tls_pinning.UNREADABLE_PIN`` for one that can't be read. ``None``
+    otherwise, and for a URL a pin can't apply to. Pins are stored on system
+    endpoints only.
+    """
+    if not pin_applies(url):
+        return None
+    for row in await store.list_system_llm_endpoints():
+        if not (row.get("tls_pin_sha256") or row.get("tls_pin_cert")):
+            continue
+        if same_endpoint(row.get("base_url"), url):
+            pin = refused_endpoint_pin(row)
+            if pin:
+                return pin
+    return None
+
+
 def nested_model_slots(
     config_override: dict[str, Any],
 ) -> list[tuple[str, dict[str, Any], str]]:
@@ -299,9 +338,13 @@ async def inject_model_credentials(
     gets its ``base_url`` alone, as before. The row's pinned TLS certificate
     travels next to its ``base_url`` as ``tls_pinned_cert``
     (:func:`endpoint_tls_pin_wire`); one that can't be read refuses the slot
-    with ``model_availability.EndpointPinUnreadable``. Every other path that
-    resolves the model writes ``tls_pinned_cert: None``; a model the registry
-    can't resolve is refused before that and leaves the section untouched.
+    with ``model_availability.EndpointPinUnreadable``. A refused row writes no
+    base URL or key, but its pin slot still carries the row's pin, or
+    ``tls_pinning.UNREADABLE_PIN`` (:func:`refused_endpoint_pin`), as the flat
+    env does: a base URL kept in a stored section never goes out without its
+    pin. Every other path that resolves the model writes
+    ``tls_pinned_cert: None``; a model the registry can't resolve is refused
+    before that and leaves the section untouched.
 
     For system-anchored catalog rows: injects the row's provider key from
     ``resolved_keys`` (the user > project > env resolution chain).
@@ -416,6 +459,8 @@ async def inject_model_credentials(
                 unreadable.endpoint,
                 meta.endpoint_id,
             )
+            # A base URL kept in a stored section keeps the row's pin.
+            section["tls_pinned_cert"] = refused_endpoint_pin(endpoint_row)
             return unreadable
         if endpoint_row:
             try:
@@ -423,7 +468,9 @@ async def inject_model_credentials(
             except ValueError as exc:
                 # Sent without its pin, the base URL would be verified against
                 # the CA list instead: a pin that can't be read is never
-                # treated as no pin. Refuse, naming the endpoint.
+                # treated as no pin. Refuse, naming the endpoint; a base URL
+                # kept in a stored section gets the marker the agent refuses.
+                section["tls_pinned_cert"] = UNREADABLE_PIN
                 dependencies.logger.error(
                     "Dispatch: %s model %r refused: endpoint %r (%s) has a "
                     "pinned TLS certificate that can't be read (%s); trust its "
@@ -496,7 +543,8 @@ async def inject_env_key_credentials(
     ``resolved_keys[provider]`` (setdefault) together with the provider's own
     OpenAI-compatible base URL (``transport_resolution.provider_base_url``).
     The key is withheld when an endpoint name for the prefix is already set to
-    another host, or when the provider has no such API.
+    another host, or when the provider has no such API; such a kept URL that
+    is a pinned endpoint's keeps that endpoint's pin (:func:`kept_url_pin`).
 
     ``{PREFIX}_TLS_PINNED_CERT`` is popped on entry and written only by the
     endpoint branch, next to the row's base URL (:func:`endpoint_tls_pin_wire`):
@@ -647,6 +695,11 @@ async def inject_env_key_credentials(
                 ", ".join(foreign),
                 provider,
             )
+            # The URL the agent will call stays; when it is a pinned
+            # endpoint's (an earlier resolution's), it keeps that pin.
+            kept = next(env_keys[name] for name in names if env_keys.get(name))
+            if kept_pin := await kept_url_pin(dependencies.store, kept):
+                env_keys[pin_name] = kept_pin
         elif canonical is None:
             dependencies.logger.error(
                 "Dispatch: %s model %r routes on the %s provider key, but that "

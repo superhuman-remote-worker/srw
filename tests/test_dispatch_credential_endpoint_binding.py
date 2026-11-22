@@ -80,6 +80,9 @@ class _Store:
     async def resolve_default_for_capability(self, capability):
         return None
 
+    async def list_system_llm_endpoints(self):
+        return []  # no pinned endpoint: a kept URL carries no pin
+
 
 def _resolver(metas):
     async def resolve(model_id, user_id=None, capability="chat"):
