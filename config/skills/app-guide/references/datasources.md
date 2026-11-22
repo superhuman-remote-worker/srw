@@ -55,6 +55,11 @@ automatically gets the matching access:
 - Repository and credential-file connectors prepare the workspace and
   credentials the agent needs.
 
+The workspace README lists every attached connector with a **Description**
+line: the note the project gives it on its **Connectors** tab, or else the
+connector's own description. Write there what an agent should know before it
+uses the connector, such as which tables matter or what must not change.
+
 ## MCP servers: the token and Test Connection
 
 An MCP server's credential goes in **Bearer Token** (the token alone; SRW

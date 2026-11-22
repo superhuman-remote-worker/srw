@@ -69,7 +69,7 @@ can write.
    `connector_access_not_selected` for a connector the Session doesn't
    attach.
 2. **Otherwise the project's default.** A project owner sets each cloud
-   folder's default access in the project's **Connectors → Cloud folders**
+   folder's default access in the project's **Connectors → Kept by SRW**
    list (`PATCH /api/projects/<project>/datasources/<connector>` with
    `{"access": "protected"}`; `null` restores the driver's default, the
    highest level offered). It is a default, not a ceiling. A default the
