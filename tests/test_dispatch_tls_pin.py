@@ -14,8 +14,10 @@ section, so the agent's deep-merge clears a previous model's pin) or pops it
 * D4 ``inject_system_kb_embedding_profile``: via D2 with ``KB_EMBEDDING``.
 
 A pin that can't be read is never treated as no pin: the model slot is
-refused (``model_availability.REASON_ENDPOINT_PIN``) and a flat-env slot gets
-no transport, like a stored key that did not decrypt.
+refused (``model_availability.REASON_ENDPOINT_PIN``); a flat-env slot gets no
+base URL or key from the row, like a stored key that did not decrypt, and its
+pin is the ``UNREADABLE_PIN`` marker, so a base URL that survived in a stored
+override never goes out without its pin (``TlsPin.from_env`` refuses it).
 """
 
 # ruff: noqa: F811  (pytest fixtures are requested by parameter name)
@@ -37,7 +39,7 @@ from shared.runtime.core.transport_resolution import (
     NO_KEY_SENTINEL,
     env_endpoint_names,
 )
-from shared.tls_pinning import TlsPin
+from shared.tls_pinning import UNREADABLE_PIN, TlsPin
 from tests.tls_pin_fixtures import tls_certs  # noqa: F401
 
 LOGGER = logging.getLogger("test.dispatch-tls-pin")
@@ -59,6 +61,7 @@ UNPINNED_URL = "https://gateway.internal/v1"
 PINNED_KEY = "sk-pinned-endpoint"
 SYSTEM_OPENAI_KEY = "sk-system-openai"
 STALE_PIN = "c3RhbGUtcGluLWZyb20tYW5vdGhlci1yb3c="
+TRUNCATED_PEM = "-----BEGIN CERTIFICATE-----\nMIIBAAAA\n-----END CERTIFICATE-----\n"
 
 #: Every flat-env slot that rides ``inject_env_key_credentials``.
 FLAT_PREFIXES = [
@@ -341,7 +344,12 @@ class TestUnreadablePinIsRefused:
     """A stored pin that can't be read fails closed, never as "no pin"."""
 
     @pytest.fixture(
-        params=["not-a-certificate", "fingerprint-without-certificate", "mismatch"]
+        params=[
+            "not-a-certificate",
+            "fingerprint-without-certificate",
+            "mismatch",
+            "not-a-trust-anchor",
+        ]
     )
     def corrupt(self, request, rows, pins):
         row = rows[CORRUPT_ID]
@@ -349,6 +357,11 @@ class TestUnreadablePinIsRefused:
             row["tls_pin_cert"] = None
         elif request.param == "mismatch":
             row["tls_pin_cert"] = pins["swap"].pem
+        elif request.param == "not-a-trust-anchor":
+            # Valid PEM armour around a truncated DER: it parses, but OpenSSL
+            # can't load it as a trust anchor (the Test probe's third check).
+            row["tls_pin_cert"] = TRUNCATED_PEM
+            row["tls_pin_sha256"] = TlsPin.from_pem(TRUNCATED_PEM).sha256
         return request.param
 
     @pytest.mark.asyncio
@@ -379,10 +392,33 @@ class TestUnreadablePinIsRefused:
         env = await _env(
             {_pin_env(prefix): STALE_PIN}, prefix, "corrupt-pin-model", store
         )
-        assert env == {f"{prefix}_MODEL": "corrupt-pin-model"}
+        assert env == {
+            f"{prefix}_MODEL": "corrupt-pin-model",
+            _pin_env(prefix): UNREADABLE_PIN,
+        }
         errors = _errors(caplog)
         assert len(errors) == 1
         assert CORRUPT_ID in errors[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prefix", FLAT_PREFIXES)
+    async def test_a_stored_base_url_never_goes_out_without_its_pin(
+        self, store, corrupt, prefix
+    ):
+        # The redacted stored-override shape a Session re-injects: the base
+        # URL survives redaction, the key does not.
+        url_name = env_endpoint_names(prefix)[0]
+        env = await _env(
+            {f"{prefix}_MODEL": "corrupt-pin-model", url_name: CORRUPT_URL},
+            prefix,
+            "corrupt-pin-model",
+            store,
+        )
+        assert env[url_name] == CORRUPT_URL
+        assert f"{prefix}_API_KEY" not in env
+        assert env[_pin_env(prefix)] == UNREADABLE_PIN
+        with pytest.raises(ValueError, match="can't be read"):
+            TlsPin.from_env(prefix, env)
 
     def test_the_refusal_message_names_the_endpoint(self):
         entry = ma.UnavailableModel(
@@ -528,6 +564,25 @@ class TestSessionReinjection:
         for prefix in ("EMBEDDING", "RERANK", "WHISPER", "KB_EMBEDDING"):
             assert again["env_keys"].get(_pin_env(prefix)) == expected, prefix
             assert again["env_keys"][f"{prefix}_BASE_URL"] == PINNED_URL
+
+    @pytest.mark.asyncio
+    async def test_a_pin_that_turns_unreadable_reaches_the_session_as_the_marker(
+        self, rows
+    ):
+        store = self._store(rows)
+        co = {"llm": {"model": "provider-model"}}
+        stored = redact_config_override(await self._inject(co, store))
+        assert stored["env_keys"]["EMBEDDING_BASE_URL"] == PINNED_URL
+
+        rows[PINNED_ID]["tls_pin_cert"] = "not a certificate"
+        again = await self._inject(stored, store)
+        env = again["env_keys"]
+        for prefix in ("EMBEDDING", "RERANK", "WHISPER", "KB_EMBEDDING"):
+            assert env[_pin_env(prefix)] == UNREADABLE_PIN, prefix
+            assert f"{prefix}_API_KEY" not in env, prefix
+            with pytest.raises(ValueError, match="can't be read"):
+                TlsPin.from_env(prefix, env)
+        assert env["EMBEDDING_BASE_URL"] == PINNED_URL
 
     @pytest.mark.asyncio
     async def test_kb_profile_on_a_provider_key_default_drops_a_stale_pin(self, rows):

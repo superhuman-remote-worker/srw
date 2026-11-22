@@ -48,7 +48,6 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 from orchestrator.services.model_availability import (
     EndpointPinUnreadable,
@@ -77,7 +76,12 @@ from shared.runtime.core.transport_resolution import (
     same_endpoint,
 )
 from shared.subscription_routing import subscription_request_headers
-from shared.tls_pinning import TLS_PINNED_CERT_SUFFIX, TlsPin
+from shared.tls_pinning import (
+    TLS_PINNED_CERT_SUFFIX,
+    UNREADABLE_PIN,
+    pin_applies,
+    read_stored_pin,
+)
 
 
 @dataclass(frozen=True)
@@ -141,23 +145,16 @@ def endpoint_tls_pin_wire(endpoint_row: Mapping[str, Any]) -> str | None:
     ``None`` when the row has no pin, and when its base URL is not
     ``https://``: a pin applies only to TLS, and an admin may edit a pinned
     endpoint's URL to ``http://`` (an edit keeps the pin, decision 4). A stored
-    pin that can't be read (a certificate that doesn't parse, a fingerprint
-    stored without its certificate or not matching it) raises ``ValueError``:
-    it is never treated as no pin. Same reading as the Test probe's
-    (``services/endpoint_tls.py``).
+    pin that can't be read raises ``ValueError``: it is never treated as no
+    pin. "Can't be read" is :func:`shared.tls_pinning.read_stored_pin`'s, the
+    same reading the Test probe uses (``services/endpoint_tls.py``).
     """
-    if urlsplit(str(endpoint_row.get("base_url") or "")).scheme != "https":
+    if not pin_applies(endpoint_row.get("base_url")):
         return None
-    pem = endpoint_row.get("tls_pin_cert")
-    sha256 = endpoint_row.get("tls_pin_sha256")
-    if not pem and not sha256:
-        return None
-    if not pem:
-        raise ValueError("a fingerprint is stored without its certificate")
-    pin = TlsPin.from_pem(pem)
-    if sha256 and sha256 != pin.sha256:
-        raise ValueError(f"the stored fingerprint is {sha256}, not the certificate's")
-    return pin.wire
+    pin = read_stored_pin(
+        endpoint_row.get("tls_pin_cert"), endpoint_row.get("tls_pin_sha256")
+    )
+    return pin.wire if pin is not None else None
 
 
 def nested_model_slots(
@@ -301,8 +298,9 @@ async def inject_model_credentials(
     gets its ``base_url`` alone, as before. The row's pinned TLS certificate
     travels next to its ``base_url`` as ``tls_pinned_cert``
     (:func:`endpoint_tls_pin_wire`); one that can't be read refuses the slot
-    with ``model_availability.EndpointPinUnreadable``. Every other path writes
-    ``tls_pinned_cert: None``.
+    with ``model_availability.EndpointPinUnreadable``. Every other path that
+    resolves the model writes ``tls_pinned_cert: None``; a model the registry
+    can't resolve is refused before that and leaves the section untouched.
 
     For system-anchored catalog rows: injects the row's provider key from
     ``resolved_keys`` (the user > project > env resolution chain).
@@ -502,7 +500,10 @@ async def inject_env_key_credentials(
     ``{PREFIX}_TLS_PINNED_CERT`` is popped on entry and written only by the
     endpoint branch, next to the row's base URL (:func:`endpoint_tls_pin_wire`):
     a caller's BYO pair and a provider-key row never carry a pin. A row whose
-    pin can't be read gets no transport, like one whose key did not decrypt.
+    pin can't be read gets no base URL or key, like one whose key did not
+    decrypt, and its pin is ``tls_pinning.UNREADABLE_PIN``: a base URL that
+    survived in a stored override then never goes out without its pin, since
+    ``TlsPin.from_env`` refuses the marker.
     """
     pin_name = f"{prefix}_{TLS_PINNED_CERT_SUFFIX}"
     env_keys.pop(pin_name, None)
@@ -577,7 +578,12 @@ async def inject_env_key_credentials(
                 pin_wire = endpoint_tls_pin_wire(endpoint_row)
             except ValueError as exc:
                 # A pin that can't be read is never treated as no pin: like a
-                # key that did not decrypt, the slot gets no transport.
+                # key that did not decrypt, the slot gets no transport from
+                # the row. A base URL may survive from a stored override
+                # (redaction keeps base URLs), so the pin slot carries the
+                # marker the agent refuses rather than nothing; popping the
+                # URL instead would send the client to its default host.
+                env_keys[pin_name] = UNREADABLE_PIN
                 dependencies.logger.error(
                     "Dispatch: %s endpoint %s has a pinned TLS certificate that "
                     "can't be read (%s) — not injecting %s_BASE_URL/_API_KEY; "

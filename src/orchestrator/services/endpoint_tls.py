@@ -29,8 +29,9 @@ from shared.tls_pinning import (
     TlsInspection,
     TlsPin,
     inspect_tls,
+    pin_applies,
     pinned_handshake_error,  # noqa: F401 (the Trust API calls it through this module)
-    pinned_ssl_context,
+    read_stored_pin,
 )
 
 HTTP_REFUSAL = "Pinning applies to https:// endpoints."
@@ -58,22 +59,19 @@ UNUSABLE_PIN = TlsPin(b"")
 
 def inspects(endpoint: Mapping[str, Any]) -> bool:
     """Whether Test reads this endpoint's certificate: an ``https://`` URL."""
-    return urlsplit(str(endpoint.get("base_url") or "")).scheme == "https"
+    return pin_applies(endpoint.get("base_url"))
 
 
 def _read_pin(endpoint: Mapping[str, Any]) -> tuple[TlsPin | None, str | None]:
-    """The stored pin and, when it can't be used, why (with UNUSABLE_PIN)."""
-    pem = endpoint.get("tls_pin_cert")
-    sha256 = endpoint.get("tls_pin_sha256")
-    if not pem and not sha256:
-        return None, None
+    """The stored pin and, when it can't be used, why (with UNUSABLE_PIN).
+
+    What "can't be used" means is :func:`shared.tls_pinning.read_stored_pin`'s,
+    which dispatch uses too.
+    """
     try:
-        if not pem:
-            raise ValueError("no certificate stored with the fingerprint")
-        pin = TlsPin.from_pem(pem)
-        if sha256 and sha256 != pin.sha256:
-            raise ValueError(f"the stored fingerprint is {sha256}")
-        pinned_ssl_context(pin)  # OpenSSL must accept it as a trust anchor
+        pin = read_stored_pin(
+            endpoint.get("tls_pin_cert"), endpoint.get("tls_pin_sha256")
+        )
     except Exception as exc:
         return UNUSABLE_PIN, UNREADABLE_PIN.format(error=exc)
     return pin, None

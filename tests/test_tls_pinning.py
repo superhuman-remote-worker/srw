@@ -22,6 +22,7 @@ from langchain_openai import ChatOpenAI
 from shared.tls_pinning import (
     NO_CHECK_TIME,
     REASON_BY_VERIFY_CODE,
+    UNREADABLE_PIN,
     CertificateChangedError,
     PinnedCertificateRejectedError,
     TlsPin,
@@ -30,8 +31,10 @@ from shared.tls_pinning import (
     httpx_client_kwargs,
     inspect_tls,
     pinned_handshake_error,
+    pin_applies,
     pinned_ssl_context,
     presented_certificate_sha256,
+    read_stored_pin,
 )
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
@@ -103,6 +106,60 @@ def test_from_env_reads_the_prefix_and_rejects_garbage(tls_certs):
         TlsPin.from_env("EMBEDDING", {"EMBEDDING_TLS_PINNED_CERT": "not-base64!"})
     with pytest.raises(ValueError, match="EMBEDDING_TLS_PINNED_CERT"):
         TlsPin.from_env("EMBEDDING", {"EMBEDDING_TLS_PINNED_CERT": "QUJD"})
+
+
+def test_from_env_refuses_the_unreadable_marker():
+    # Dispatch writes the marker when the endpoint's stored pin can't be read,
+    # so a base URL that survived in a stored override never goes out unpinned.
+    with pytest.raises(ValueError) as raised:
+        TlsPin.from_env("EMBEDDING", {"EMBEDDING_TLS_PINNED_CERT": UNREADABLE_PIN})
+    assert str(raised.value) == (
+        "EMBEDDING_TLS_PINNED_CERT: the pinned certificate for this endpoint "
+        "can't be read; an admin must trust it again or remove the pin in "
+        "Admin → Models."
+    )
+
+
+#: Valid PEM armour around a truncated DER: it parses, but OpenSSL can't load
+#: it as a trust anchor.
+_TRUNCATED = "-----BEGIN CERTIFICATE-----\nMIIBAAAA\n-----END CERTIFICATE-----\n"
+
+
+def test_read_stored_pin_reads_a_row_pin(tls_certs):
+    pin = _pin(tls_certs.leaf)
+    assert read_stored_pin(None, None) is None
+    assert read_stored_pin("", None) is None
+    assert read_stored_pin(pin.pem, None) == pin
+    assert read_stored_pin(pin.pem, pin.sha256) == pin
+
+
+@pytest.mark.parametrize(
+    "kind", ["fingerprint_only", "not_pem", "other_fingerprint", "truncated_der"]
+)
+def test_read_stored_pin_never_reads_a_broken_pin_as_no_pin(tls_certs, kind):
+    leaf = _pin(tls_certs.leaf)
+    pem, sha256 = {
+        "fingerprint_only": (None, leaf.sha256),
+        "not_pem": ("not a certificate", leaf.sha256),
+        "other_fingerprint": (_pin(tls_certs.swap).pem, leaf.sha256),
+        "truncated_der": (_TRUNCATED, TlsPin.from_pem(_TRUNCATED).sha256),
+    }[kind]
+    with pytest.raises(ValueError):
+        read_stored_pin(pem, sha256)
+
+
+@pytest.mark.parametrize(
+    "url,applies",
+    [
+        ("https://h/v1", True),
+        ("HTTPS://h:8443/v1", True),
+        ("http://h/v1", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_pin_applies_only_to_https(url, applies):
+    assert pin_applies(url) is applies
 
 
 @pytest.mark.parametrize(

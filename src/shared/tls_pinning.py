@@ -49,6 +49,11 @@ import httpx
 #: Env var suffix: the full name is ``{PREFIX}_TLS_PINNED_CERT``.
 TLS_PINNED_CERT_SUFFIX = "TLS_PINNED_CERT"
 
+#: The ``{PREFIX}_TLS_PINNED_CERT`` value dispatch writes when the endpoint's
+#: stored pin can't be read: :meth:`TlsPin.from_env` refuses it, so a base URL
+#: that survived in a stored override never goes out without its pin.
+UNREADABLE_PIN = "unreadable"
+
 #: OpenSSL's ``X509_V_FLAG_NO_CHECK_TIME``; Python has no name for it.
 NO_CHECK_TIME = 0x200000
 
@@ -110,13 +115,20 @@ class TlsPin:
     ) -> "Optional[TlsPin]":
         """Read ``{prefix}_TLS_PINNED_CERT``; empty or unset means no pin.
 
-        A value that is set but unparsable raises ``ValueError`` naming the
-        variable: a broken pin must never silently become "no pin".
+        A value that is set but unparsable, or the :data:`UNREADABLE_PIN`
+        marker, raises ``ValueError`` naming the variable: a broken pin must
+        never silently become "no pin".
         """
         name = f"{prefix}_{TLS_PINNED_CERT_SUFFIX}"
         value = (os.environ if env is None else env).get(name, "")
         if not value.strip():
             return None
+        if value.strip() == UNREADABLE_PIN:
+            raise ValueError(
+                f"{name}: the pinned certificate for this endpoint can't be "
+                "read; an admin must trust it again or remove the pin in "
+                "Admin → Models."
+            )
         try:
             return cls.from_wire(value)
         except ValueError as exc:
@@ -140,6 +152,34 @@ def pinned_ssl_context(pin: TlsPin) -> ssl.SSLContext:
     ctx.load_verify_locations(cadata=pin.pem)
     ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | NO_CHECK_TIME
     return ctx
+
+
+def pin_applies(base_url: Optional[str]) -> bool:
+    """Whether a pin can apply to ``base_url``: an ``https://`` URL only."""
+    return urlsplit(str(base_url or "")).scheme == "https"
+
+
+def read_stored_pin(pem: Optional[str], sha256: Optional[str]) -> Optional[TlsPin]:
+    """The pin an endpoint row stores (``tls_pin_cert``, ``tls_pin_sha256``).
+
+    ``None`` when the row stores no pin. A stored pin that can't be used
+    raises ``ValueError``: a fingerprint without its certificate, a PEM that
+    doesn't parse, a certificate that isn't the stored fingerprint's, or one
+    OpenSSL can't load as a trust anchor. A pin that can't be read is never
+    "no pin". The Test probe and dispatch both read pins through this.
+    """
+    if not pem and not sha256:
+        return None
+    if not pem:
+        raise ValueError("no certificate stored with the fingerprint")
+    pin = TlsPin.from_pem(pem)
+    if sha256 and sha256 != pin.sha256:
+        raise ValueError(f"the stored fingerprint is {sha256}")
+    try:
+        pinned_ssl_context(pin)  # OpenSSL must accept it as a trust anchor
+    except ssl.SSLError as exc:
+        raise ValueError(str(exc)) from exc
+    return pin
 
 
 #: How long the lookup of the certificate a server presents may take.
