@@ -46,7 +46,7 @@ LIVE_VOICE_REFUSAL = (
 DISCOVER_UNTRUSTED = (
     "The endpoint's certificate is not trusted. Test the endpoint to review it."
 )
-UNREADABLE_PIN = (
+STORED_PIN_UNREADABLE = (
     "The pinned certificate stored for this endpoint can't be read ({error}). "
     "Trust the server's certificate again or remove the pin."
 )
@@ -73,7 +73,7 @@ def _read_pin(endpoint: Mapping[str, Any]) -> tuple[TlsPin | None, str | None]:
             endpoint.get("tls_pin_cert"), endpoint.get("tls_pin_sha256")
         )
     except Exception as exc:
-        return UNUSABLE_PIN, UNREADABLE_PIN.format(error=exc)
+        return UNUSABLE_PIN, STORED_PIN_UNREADABLE.format(error=exc)
     return pin, None
 
 
