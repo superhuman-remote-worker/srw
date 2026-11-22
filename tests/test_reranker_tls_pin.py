@@ -19,7 +19,7 @@ from agent.services.memory.plugins.reranker import (
     resolve_reranker_transport,
 )
 from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
-from tests.tls_pin_fixtures import tls_certs, tls_server
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 
 def _pin(path) -> TlsPin:

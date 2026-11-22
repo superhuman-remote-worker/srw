@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
-from tests.tls_pin_fixtures import tls_certs, tls_server
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 from agent.services.vision_helper import (
     VISION_FAILURE_PREFIX,
