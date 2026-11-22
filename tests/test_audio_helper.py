@@ -938,6 +938,7 @@ class TestWhisperPin:
         assert _caused_by(exc.value, CertificateChangedError)
         assert server.requests == []
         assert text.startswith("[Error") and "TLS certificate changed" in text
+        assert "An admin must re-trust it in Admin" in text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", [UNREADABLE_PIN, "not-base64!"])

@@ -317,6 +317,7 @@ class TestVisionPin:
         assert server.requests == []
         # the failure text names the change, not just "Connection error."
         assert vision_failed(text) and "TLS certificate changed" in text
+        assert "An admin must re-trust it in Admin" in text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", [UNREADABLE_PIN, "not-base64!"])

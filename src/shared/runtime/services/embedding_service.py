@@ -174,10 +174,18 @@ class EmbeddingService:
         """
         from shared.runtime.core.transport_resolution import served_model_from_env
 
-        if base_url is None and tls_pin is None:
-            _provider = (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()
-            if _provider != "openrouter":
-                tls_pin = TlsPin.from_env("EMBEDDING")
+        if not base_url and tls_pin is None:
+            # The URL comes from the env (or a default): so does the pin.
+            tls_pin = TlsPin.from_env("EMBEDDING")
+            if (
+                tls_pin is not None
+                and (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()
+                == "openrouter"
+            ):
+                raise ValueError(
+                    "EMBEDDING_TLS_PINNED_CERT is set but the openrouter provider "
+                    "calls its public endpoint, which has no pin"
+                )
         self.tls_pin = tls_pin
 
         self.provider = (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()

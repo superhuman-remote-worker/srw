@@ -151,9 +151,8 @@ class TestScorerVerifiesThePin:
             with pytest.raises(Exception) as exc:
                 await scorer._rerank("q", ["a"])
             await scorer._client.aclose()
-        assert isinstance(exc.value, CertificateChangedError) or _caused_by(
-            exc.value, CertificateChangedError
-        )
+        # raised as is, not retried into a TransientScorerError
+        assert type(exc.value) is CertificateChangedError
         assert server.requests == []
 
     def test_a_pin_on_an_http_url_is_refused(self, tls_certs):

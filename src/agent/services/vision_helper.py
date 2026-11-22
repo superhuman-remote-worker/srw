@@ -42,10 +42,13 @@ def vision_failed(text: Optional[str]) -> bool:
 def _failure(what: str, error: Exception) -> str:
     # The SDK wraps a pin failure as "Connection error."; the admin needs the
     # certificate message that says what to do.
-    cause = pin_failure_in(error) or error
+    pin_failure = pin_failure_in(error)
+    cause = pin_failure or error
+    # The pin message says what the admin must do: never cut it short.
+    detail = str(cause) if pin_failure else str(cause)[:200]
     return (
         f"{VISION_FAILURE_PREFIX}: the vision model could not describe {what} "
-        f"({type(cause).__name__}: {str(cause)[:200]}). Do not describe it "
+        f"({type(cause).__name__}: {detail}). Do not describe it "
         "from its name or from guesses.]"
     )
 
