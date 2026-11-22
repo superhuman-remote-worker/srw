@@ -26,7 +26,10 @@ Shared by the orchestrator, the agent and the provisioners; the only
 third-party import is httpx (``cryptography`` is imported lazily, and only by
 :func:`inspect_tls`; ``httpx2`` lazily, and only by :func:`pinned_transport_for`
 for an SDK built on it). A pinned client gets an explicit transport, so httpx
-ignores environment proxies and the client's ``limits`` for it.
+ignores environment proxies and the client's ``limits`` for it. Which helper
+builds which client: :func:`httpx_client_kwargs` for a plain httpx client,
+:func:`pinned_transport_for` for an SDK's own client class (openai,
+anthropic).
 """
 
 from __future__ import annotations
@@ -379,7 +382,23 @@ class AsyncPinnedTransport(httpx.AsyncHTTPTransport):
 
 
 def httpx_client_kwargs(pin: Optional[TlsPin], *, asynchronous: bool) -> dict[str, Any]:
-    """Keyword arguments for an httpx client: ``{}`` without a pin."""
+    """Keyword arguments for a plain ``httpx`` client: ``{}`` without a pin.
+
+    Only for a client built from the ``httpx`` package itself:
+    ``httpx.Client(**httpx_client_kwargs(pin, asynchronous=False))`` for SRW's
+    own httpx calls, or langchain-openai's ``http_client`` /
+    ``http_async_client`` (openai 3.x still accepts a legacy httpx client).
+
+    Not for an SDK's default client class. ``openai.DefaultHttpxClient`` /
+    ``DefaultAsyncHttpxClient`` from openai 3.0, and every anthropic client
+    from 1.0, are built on ``httpx2``: an httpx transport breaks inside the
+    request (openai) or is refused (anthropic). For an SDK client, use that
+    SDK's class with :func:`pinned_transport_for`, which picks the package::
+
+        cls = openai.DefaultAsyncHttpxClient  # or anthropic.DefaultAsyncHttpxClient
+        http_client = cls(transport=pinned_transport_for(cls, pin)) if pin else None
+        client = openai.AsyncOpenAI(base_url=..., api_key=..., http_client=http_client)
+    """
     if pin is None:
         return {}
     transport = AsyncPinnedTransport(pin) if asynchronous else PinnedTransport(pin)
@@ -443,6 +462,9 @@ def pinned_transport_for(client_cls: type, pin: TlsPin, **kwargs: Any) -> Any:
     older releases are built on httpx. The transport follows the package and
     the sync or async flavour of ``client_cls``. ``kwargs`` go to the
     transport (e.g. ``proxy``); ``verify`` is always the pinned context.
+    Pass the SDK's own class and build that class with the result:
+    ``cls(transport=pinned_transport_for(cls, pin))`` (see
+    :func:`httpx_client_kwargs` for the full recipe).
     """
     if issubclass(client_cls, httpx.AsyncClient):
         return AsyncPinnedTransport(pin, **kwargs)

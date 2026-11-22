@@ -288,6 +288,31 @@ async def test_presented_certificate_lookup_sends_nothing(tls_certs):
         assert srv.requests == []
 
 
+def _caused_by(exc: BaseException, cls: type) -> bool:
+    """Whether ``cls`` is anywhere in ``exc``'s cause/context chain.
+
+    SDK and LangChain releases add wrapper layers (langchain-openai 1.6+ wraps
+    openai's ``APIConnectionError`` once more), so never pin a chain's depth.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, cls):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _sdk_http_client(cls: type, pin: TlsPin | None):
+    """The recipe for an SDK client on a pinned endpoint (httpx_client_kwargs doc).
+
+    The SDK's own default client class with a transport of its own httpx
+    package: httpx for openai 2.x, httpx2 for openai 3.x and anthropic >= 1.
+    """
+    return cls(transport=pinned_transport_for(cls, pin)) if pin else None
+
+
 @pytest.mark.asyncio
 async def test_openai_sdk_through_the_pin_and_the_error_cause(tls_certs):
     pin = _pin(tls_certs.leaf)
@@ -297,9 +322,7 @@ async def test_openai_sdk_through_the_pin_and_the_error_cause(tls_certs):
             base_url=url,
             api_key="k",
             max_retries=0,
-            http_client=openai.DefaultAsyncHttpxClient(
-                **httpx_client_kwargs(pin, asynchronous=True)
-            ),
+            http_client=_sdk_http_client(openai.DefaultAsyncHttpxClient, pin),
         )
 
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
@@ -315,7 +338,30 @@ async def test_openai_sdk_through_the_pin_and_the_error_cause(tls_certs):
                 await bad.models.list()
             finally:
                 await bad.close()
-        assert isinstance(e.value.__cause__, CertificateChangedError)
+        assert _caused_by(e.value, CertificateChangedError)
+        assert srv.requests == []
+
+
+def test_openai_sync_sdk_through_the_pin(tls_certs):
+    pin = _pin(tls_certs.leaf)
+    assert _sdk_http_client(openai.DefaultHttpxClient, None) is None
+
+    def client(url):
+        return openai.OpenAI(
+            base_url=url,
+            api_key="k",
+            max_retries=0,
+            http_client=_sdk_http_client(openai.DefaultHttpxClient, pin),
+        )
+
+    with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
+        with client(srv.url) as c:
+            assert [m.id for m in c.models.list()] == ["m1"]
+    with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
+        with client(srv.url) as c:
+            with pytest.raises(openai.APIConnectionError) as e:
+                c.models.list()
+        assert _caused_by(e.value, CertificateChangedError)
         assert srv.requests == []
 
 
@@ -349,10 +395,10 @@ async def test_chat_openai_invoke_and_ainvoke_through_the_pin(tls_certs):
         try:
             with pytest.raises(openai.APIConnectionError) as e:
                 m.invoke("hi")
-            assert isinstance(e.value.__cause__, CertificateChangedError)
+            assert _caused_by(e.value, CertificateChangedError)
             with pytest.raises(openai.APIConnectionError) as e2:
                 await m.ainvoke("hi")
-            assert isinstance(e2.value.__cause__, CertificateChangedError)
+            assert _caused_by(e2.value, CertificateChangedError)
         finally:
             sync.close()
             await asyn.aclose()
