@@ -13,8 +13,10 @@ from shared.orch_surface.jobs.envelope import friendly_reason, http_status_of
 
 logger = logging.getLogger(__name__)
 
-_TRANSPORT_DENY = frozenset({"api_key", "base_url", "env_keys"})
-_TRANSPORT_DENY_SUFFIX = "_api_key"
+# ``tls_pinned_cert``: an endpoint's pinned certificate is transport too. Only
+# dispatch writes one, from the endpoint row an admin trusted.
+_TRANSPORT_DENY = frozenset({"api_key", "base_url", "env_keys", "tls_pinned_cert"})
+_TRANSPORT_DENY_SUFFIX = ("_api_key", "_tls_pinned_cert")
 
 
 def transport_key_paths(value: Any, prefix: str = "") -> list[str]:

@@ -12,6 +12,13 @@ section, so the agent's deep-merge clears a previous model's pin) or pops it
 * D3 ``inject_thread_dispatch_credentials``: via D1 and D2, re-read from the
   endpoint row on every injection, so a re-trust reaches an open Session.
 * D4 ``inject_system_kb_embedding_profile``: via D2 with ``KB_EMBEDDING``.
+* D5 ``job_dispatch_credentials.inject_dispatch_credentials``: the job path.
+  Its main ``llm`` branch writes the pin itself; nested slots via D1, env
+  slots via D2; a slot whose ``{PREFIX}_MODEL`` is already set pops it.
+
+The pin travels in flight only: ``redact_config_override`` strips it like a
+key, so no stored override outlives a re-trust, and a caller can never set it
+(``transport_key_paths``, the 422 at every caller-authored write boundary).
 
 A pin that can't be read is never treated as no pin: the model slot is
 refused (``model_availability.REASON_ENDPOINT_PIN``); a flat-env slot gets no
@@ -31,9 +38,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from fastapi import HTTPException
+
 from orchestrator.security.config_redaction import redact_config_override
 from orchestrator.services import dispatch_credentials as dc
+from orchestrator.services import job_dispatch_credentials as jdc
 from orchestrator.services import model_availability as ma
+from orchestrator.services import session_resolved_config
+from orchestrator.services.config_overrides import refuse_caller_transport_keys
+from shared.orch_surface.jobs._utils import transport_key_paths
 from shared.runtime.core.model_registry import ModelMeta, UnknownModelError
 from shared.runtime.core.transport_resolution import (
     NO_KEY_SENTINEL,
@@ -629,3 +642,346 @@ class TestSessionReinjection:
         await dc.inject_system_kb_embedding_profile(env, dependencies=_deps(store))
         assert env["KB_EMBEDDING_BASE_URL"] == PINNED_URL
         assert env[_pin_env("KB_EMBEDDING")] == pins["leaf"].wire
+
+
+# ---------------------------------------------------------------------------
+# D5: the job path
+# ---------------------------------------------------------------------------
+
+JOB = {
+    "id": "00000000-0000-0000-0000-000000000010",
+    "user_id": "00000000-0000-0000-0000-0000000000aa",
+    "project_id": None,
+    "config_name": "worker_base",
+}
+
+#: The flat slots the job's env-slot loop credentials, by capability default.
+JOB_LOOP_SLOTS = [
+    ("vision", "VISION"),
+    ("whisper", "WHISPER"),
+    ("tts", "TTS"),
+    ("rerank", "RERANK"),
+    ("citation", "CITATION_LLM"),
+]
+
+
+def _job_deps(store: _Store) -> jdc.DispatchCredentialDependencies:
+    service = _deps(store)
+
+    async def model_creds(**kwargs):
+        return await dc.inject_model_credentials(**kwargs, dependencies=service)
+
+    async def env_creds(**kwargs):
+        return await dc.inject_env_key_credentials(**kwargs, dependencies=service)
+
+    async def kb_profile(env_keys):
+        return await dc.inject_system_kb_embedding_profile(
+            env_keys, dependencies=service
+        )
+
+    return jdc.DispatchCredentialDependencies(
+        store=store,
+        logger=LOGGER,
+        resolve_model=service.resolve_model,
+        inject_model_credentials=model_creds,
+        inject_env_key_credentials=env_creds,
+        inject_search_credentials=AsyncMock(),
+        inject_system_kb_embedding_profile=kb_profile,
+        dispatch_llm_provider_fallback=dc.dispatch_llm_provider_fallback,
+        nested_model_slots=dc.nested_model_slots,
+    )
+
+
+def _defaults(model_id: str) -> dict[str, str]:
+    """Every capability default on one model."""
+    kinds = ["auxiliary", "embedding", *(kind for kind, _ in JOB_LOOP_SLOTS)]
+    return {kind: model_id for kind in kinds}
+
+
+async def _job(co: dict, store: _Store, **kwargs) -> dict:
+    return await jdc.inject_dispatch_credentials(
+        JOB, co, include_kb_profile=True, dependencies=_job_deps(store), **kwargs
+    )
+
+
+class TestJobPath:
+    @pytest.mark.asyncio
+    async def test_a_job_on_a_pinned_endpoint_carries_the_pin_in_every_slot(
+        self, rows, pins
+    ):
+        store = _Store(rows, defaults=_defaults("pinned-model"))
+        out = await _job(
+            {
+                "llm": {"model": "pinned-model"},
+                "subagents": {"llm": {"model": "pinned-model"}},
+            },
+            store,
+        )
+        wire = pins["leaf"].wire
+        assert out["llm"]["base_url"] == PINNED_URL
+        assert out["llm"]["api_key"] == PINNED_KEY
+        assert out["llm"]["tls_pinned_cert"] == wire
+        assert out["auxiliary"]["tls_pinned_cert"] == wire
+        assert out["subagents"]["llm"]["tls_pinned_cert"] == wire
+        env = out["env_keys"]
+        prefixes = [prefix for _, prefix in JOB_LOOP_SLOTS]
+        for prefix in [*prefixes, "EMBEDDING", "KB_EMBEDDING"]:
+            assert env[env_endpoint_names(prefix)[0]] == PINNED_URL, prefix
+            assert env[_pin_env(prefix)] == wire, prefix
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_id", ["provider-model", "unpinned-model"])
+    async def test_a_job_off_a_pinned_endpoint_carries_no_pin(self, rows, model_id):
+        store = _Store(rows, defaults=_defaults(model_id))
+        co = {
+            "llm": {"model": model_id, "tls_pinned_cert": STALE_PIN},
+            "env_keys": {_pin_env("VISION"): STALE_PIN},
+        }
+        out = await _job(co, store)
+        # Present and None, like `served_model`: never a caller's, never kept.
+        assert "tls_pinned_cert" in out["llm"]
+        assert out["llm"]["tls_pinned_cert"] is None
+        assert out["auxiliary"]["tls_pinned_cert"] is None
+        assert not [key for key in out["env_keys"] if key.endswith("_TLS_PINNED_CERT")]
+
+    @pytest.mark.asyncio
+    async def test_the_main_slot_never_carries_a_pin_to_http(self, rows):
+        """R9: an endpoint edited to http:// keeps its pin; dispatch never
+        attaches it there."""
+        store = _Store(rows)
+        out = await _job({"llm": {"model": "http-model"}}, store)
+        assert out["llm"]["base_url"] == HTTP_URL
+        assert out["llm"]["tls_pinned_cert"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_job_with_no_model_of_its_own_gets_the_defaults_pin(
+        self, rows, pins
+    ):
+        store = _Store(rows, defaults={"chat": "pinned-model"})
+        out = await _job({}, store)
+        assert out["llm"]["model"] == "pinned-model"
+        assert out["llm"]["tls_pinned_cert"] == pins["leaf"].wire
+
+    @pytest.mark.asyncio
+    async def test_redispatch_reads_the_rows_current_pin(self, rows, pins):
+        """A re-trust reaches the job's next dispatch (a resume): the endpoint
+        row is read again, never a stored override."""
+        store = _Store(rows)
+        first = await _job({"llm": {"model": "pinned-model"}}, store)
+        assert first["llm"]["tls_pinned_cert"] == pins["leaf"].wire
+
+        rows[PINNED_ID].update(_pin_columns(pins["swap"]))
+        again = await _job(redact_config_override(first), store)
+        assert again["llm"]["tls_pinned_cert"] == pins["swap"].wire
+
+        rows[PINNED_ID].update(_pin_columns(None))
+        removed = await _job(redact_config_override(again), store)
+        assert "tls_pinned_cert" in removed["llm"]
+        assert removed["llm"]["tls_pinned_cert"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind, prefix", JOB_LOOP_SLOTS)
+    async def test_a_project_pinned_slot_model_keeps_no_stale_pin(
+        self, rows, kind, prefix
+    ):
+        """The loop's `continue` for an already-set ``{PREFIX}_MODEL`` (a
+        project or expert override) pops the pin: no injector ran for it."""
+        store = _Store(rows, defaults={kind: "pinned-model"})
+        co = {
+            "llm": {"model": "provider-model"},
+            "env_keys": {
+                f"{prefix}_MODEL": "project-model",
+                _pin_env(prefix): STALE_PIN,
+            },
+        }
+        out = await _job(co, store)
+        env = out["env_keys"]
+        assert env[f"{prefix}_MODEL"] == "project-model"
+        assert _pin_env(prefix) not in env
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "preset", [None, "CITATION_LLM_BASE_URL", "CITATION_LLM_URL"]
+    )
+    async def test_the_citation_slot_carries_its_pin_under_either_url_name(
+        self, rows, pins, preset
+    ):
+        """The citation package reads ``CITATION_LLM_URL``, the agent's
+        transport ``CITATION_LLM_BASE_URL``: both name the pinned endpoint and
+        the pin rides ``CITATION_LLM_TLS_PINNED_CERT`` for either."""
+        store = _Store(rows, defaults={"citation": "pinned-model"})
+        env: dict = {_pin_env("CITATION_LLM"): STALE_PIN}
+        if preset:
+            env[preset] = "https://stale.example/v1"
+        out = await _job({"llm": {"model": "provider-model"}, "env_keys": env}, store)
+        env = out["env_keys"]
+        assert env["CITATION_LLM_BASE_URL"] == PINNED_URL
+        assert env["CITATION_LLM_URL"] == PINNED_URL
+        assert env[_pin_env("CITATION_LLM")] == pins["leaf"].wire
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_pin_refuses_the_jobs_own_model(
+        self, rows, pins, caplog
+    ):
+        """R10: never dispatched without its pin; refused like D1, naming the
+        endpoint."""
+        caplog.set_level(logging.DEBUG)
+        rows[CORRUPT_ID]["tls_pin_cert"] = pins["swap"].pem  # fingerprint mismatch
+        store = _Store(rows)
+        with pytest.raises(ma.ModelUnavailable) as raised:
+            await _job({"llm": {"model": "corrupt-pin-model"}}, store)
+        entries = raised.value.entries
+        assert [(e.slot, e.reason) for e in entries] == [("llm", "endpoint_pin")]
+        assert entries[0].reason.endpoint == "corrupt-pin"
+        assert raised.value.message(where=ma.WHERE_JOB) == (
+            "The certificate pinned for the model endpoint 'corrupt-pin' can't "
+            "be read. Trust its certificate again or remove the pin in "
+            "Admin → Models."
+        )
+        errors = _errors(caplog)
+        assert any("corrupt-pin" in m and JOB["id"] in m for m in errors)
+        assert not any(PINNED_KEY in m for m in errors)
+
+    @pytest.mark.asyncio
+    async def test_a_flat_copy_with_an_unreadable_pin_gets_no_transport(self, rows):
+        store = _Store(rows)
+        out = await _job(
+            {"llm": {"model": "corrupt-pin-model", "tls_pinned_cert": STALE_PIN}},
+            store,
+            strict=False,
+        )
+        assert "base_url" not in out["llm"]
+        assert "api_key" not in out["llm"]
+        assert out["llm"]["tls_pinned_cert"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_undecryptable_key_refuses_with_no_pin(self, rows):
+        store = _Store(rows)
+        out = await _job(
+            {"llm": {"model": "broken-key-model", "tls_pinned_cert": STALE_PIN}},
+            store,
+            strict=False,
+        )
+        assert "base_url" not in out["llm"]
+        assert out["llm"]["tls_pinned_cert"] is None
+
+
+# ---------------------------------------------------------------------------
+# In flight only: redaction
+# ---------------------------------------------------------------------------
+
+
+class TestRedaction:
+    """The pin is public, but a stored one would outlive a re-trust: it is
+    stripped wherever it appears, like a key, and re-injected from the row."""
+
+    def test_every_pin_is_stripped_and_every_base_url_kept(self):
+        co = {
+            "llm": {
+                "model": "m",
+                "base_url": PINNED_URL,
+                "tls_pinned_cert": STALE_PIN,
+                "summarization": {"model": "s", "tls_pinned_cert": STALE_PIN},
+            },
+            "auxiliary": {"model": "a", "tls_pinned_cert": STALE_PIN},
+            "image": {"model": "i", "tls_pinned_cert": STALE_PIN},
+            "subagents": {
+                "llm": {"model": "r", "tls_pinned_cert": STALE_PIN},
+                "roster": [{"name": "x", "llm": {"tls_pinned_cert": STALE_PIN}}],
+            },
+            "env_keys": {
+                "EMBEDDING_BASE_URL": PINNED_URL,
+                "EMBEDDING_TLS_PINNED_CERT": STALE_PIN,
+                "VISION_TLS_PINNED_CERT": UNREADABLE_PIN,
+                "Citation_Llm_Tls_Pinned_Cert": STALE_PIN,
+            },
+        }
+        out = redact_config_override(co)
+        assert out == {
+            "llm": {
+                "model": "m",
+                "base_url": PINNED_URL,
+                "summarization": {"model": "s"},
+            },
+            "auxiliary": {"model": "a"},
+            "image": {"model": "i"},
+            "subagents": {"llm": {"model": "r"}, "roster": [{"name": "x", "llm": {}}]},
+            "env_keys": {"EMBEDDING_BASE_URL": PINNED_URL},
+        }
+        assert co["llm"]["tls_pinned_cert"] == STALE_PIN  # not mutated
+
+    def test_case_insensitive(self):
+        out = redact_config_override({"llm": {"TLS_PINNED_CERT": "x", "model": "m"}})
+        assert out == {"llm": {"model": "m"}}
+
+    def test_unrelated_keys_that_mention_tls_are_kept(self):
+        co = {"llm": {"tls_pinned": "x", "pinned_cert_note": "y", "tls": {"a": 1}}}
+        assert redact_config_override(co) == co
+
+    @pytest.mark.asyncio
+    async def test_a_dispatched_job_stores_no_pin(self, rows, pins):
+        store = _Store(rows, defaults=_defaults("pinned-model"))
+        out = await _job({"llm": {"model": "pinned-model"}}, store)
+        stored = redact_config_override(out)
+        assert pins["leaf"].wire not in repr(stored)
+        assert "tls_pinned_cert" not in repr(stored).lower()
+        assert stored["llm"]["base_url"] == PINNED_URL
+        assert stored["env_keys"]["EMBEDDING_BASE_URL"] == PINNED_URL
+
+
+# ---------------------------------------------------------------------------
+# Never a caller's: the write boundary and the resolved-config read
+# ---------------------------------------------------------------------------
+
+
+class TestCallerBoundary:
+    @pytest.mark.parametrize(
+        "override, paths",
+        [
+            ({"llm": {"model": "m", "tls_pinned_cert": "x"}}, ["llm.tls_pinned_cert"]),
+            ({"auxiliary": {"TLS_PINNED_CERT": "x"}}, ["auxiliary.TLS_PINNED_CERT"]),
+            ({"image": {"tls_pinned_cert": "x"}}, ["image.tls_pinned_cert"]),
+            (
+                {"llm": {"summarization": {"tls_pinned_cert": "x"}}},
+                ["llm.summarization.tls_pinned_cert"],
+            ),
+            (
+                {"subagents": {"roster": [{"llm": {"tls_pinned_cert": "x"}}]}},
+                ["subagents.roster[0].llm.tls_pinned_cert"],
+            ),
+            (
+                {"memory": {"RERANK_TLS_PINNED_CERT": "x"}},
+                ["memory.RERANK_TLS_PINNED_CERT"],
+            ),
+            # env_keys is refused whole, the pin included.
+            ({"env_keys": {"EMBEDDING_TLS_PINNED_CERT": "x"}}, ["env_keys"]),
+        ],
+    )
+    def test_a_caller_pin_is_a_transport_key(self, override, paths):
+        assert transport_key_paths(override) == paths
+
+    def test_a_caller_pin_is_refused_with_422_naming_the_path(self):
+        with pytest.raises(HTTPException) as raised:
+            refuse_caller_transport_keys(
+                {"llm": {"model": "m", "tls_pinned_cert": STALE_PIN}}
+            )
+        assert raised.value.status_code == 422
+        assert "llm.tls_pinned_cert" in raised.value.detail
+
+    def test_the_resolved_config_read_hides_the_pin_even_unredacted(self):
+        """``_TRANSPORT_KEYS``: where a request goes, never shown, on its own
+        and not only through the redaction it runs after."""
+        blob = {
+            "agent": {
+                "llm": {"model": "m", "tls_pinned_cert": STALE_PIN},
+                "image": {"model": "i", "tls_pinned_cert": STALE_PIN},
+                "memory": {"RERANK_TLS_PINNED_CERT": STALE_PIN, "enabled": True},
+            }
+        }
+        assert session_resolved_config._without_transport(blob) == {
+            "agent": {
+                "llm": {"model": "m"},
+                "image": {"model": "i"},
+                "memory": {"enabled": True},
+            }
+        }

@@ -36,6 +36,7 @@ def _full_config_override() -> dict:
             "base_url": "https://ai.h4ll.app/v1",
             "temperature": 0.0,
             "api_key": "sk-llm-SECRET",
+            "tls_pinned_cert": "MIIB-llm-PIN",
             "strategic": {"model": "opus", "api_key": "sk-strategic-SECRET"},
             "tactical": {"model": "sonnet", "api_key": "sk-tactical-SECRET"},
             "summarization": {"model": "haiku", "api_key": "sk-sum-SECRET"},
@@ -55,6 +56,7 @@ def _full_config_override() -> dict:
             "VISION_API_KEY": "sk-vis-SECRET",
             "CITATION_LLM_API_KEY": "sk-cit-SECRET",
             "CITATION_LLM_MODEL": "gpt-4o",
+            "EMBEDDING_TLS_PINNED_CERT": "MIIB-emb-PIN",
         },
         "workspace": {
             "backend": "virtual",
@@ -88,6 +90,18 @@ class TestRedactConfigOverride:
         assert env["EMBEDDING_BASE_URL"] == "https://ai.h4ll.app/v1"
         assert env["EMBEDDING_PROVIDER"] == "openai"
         assert env["CITATION_LLM_MODEL"] == "gpt-4o"
+
+    def test_strips_the_in_flight_only_pin(self):
+        """An endpoint's pinned certificate is public but injected in flight
+        only: a stored copy would outlive a re-trust. Its base URL stays."""
+        import json
+
+        out = access.redact_config_override(_full_config_override())
+        assert "tls_pinned_cert" not in out["llm"]
+        assert "EMBEDDING_TLS_PINNED_CERT" not in out["env_keys"]
+        assert "PIN" not in json.dumps(out)
+        assert out["llm"]["base_url"] == "https://ai.h4ll.app/v1"
+        assert out["env_keys"]["EMBEDDING_BASE_URL"] == "https://ai.h4ll.app/v1"
 
     def test_strips_rclone_spec_in_list(self):
         out = access.redact_config_override(_full_config_override())

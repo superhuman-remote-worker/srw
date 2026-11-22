@@ -1832,6 +1832,14 @@ async def test_bench_readiness_refusal_precedes_fresh_creator_lookup(wire, monke
         ),
         ({"llm": {"model": "m", "api_key": "sk-caller"}}, "llm.api_key"),
         ({"env_keys": {"EMBEDDING_BASE_URL": "https://evil.example/v1"}}, "env_keys"),
+        # A pinned certificate is transport too: only dispatch writes one,
+        # from the endpoint row an admin trusted.
+        (
+            {"llm": {"model": "m", "tls_pinned_cert": "MIIBcaller"}},
+            "llm.tls_pinned_cert",
+        ),
+        ({"image": {"tls_pinned_cert": "MIIBcaller"}}, "image.tls_pinned_cert"),
+        ({"env_keys": {"EMBEDDING_TLS_PINNED_CERT": "MIIBcaller"}}, "env_keys"),
     ],
 )
 @pytest.mark.asyncio
