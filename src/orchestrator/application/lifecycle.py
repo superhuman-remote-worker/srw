@@ -771,7 +771,9 @@ async def stop_application(
     6. protected-cloud engages and cloud stages (``cloud_task_registry``),
        then "Connect your cloud" flows (``cloud_root_connect_flows``);
     7. background project repairs (``project_repair_state``);
-    8. provider mints still running (C5,
+    8. job naming calls (``job_naming_tasks``); a cancelled call wrote nothing
+       and the job keeps its task text as its name;
+    9. provider mints still running (C5,
        ``connector_minted_credentials.settle_background_mints``), waited for
        a bounded time so what a provider minted is recorded for its revoke.
 
@@ -823,6 +825,7 @@ async def stop_application(
             lambda: resources.cloud_root_connect_flows.drain(),
         ),
         ("background project repairs", lambda: resources.project_repair_state.drain()),
+        ("job naming calls", lambda: resources.job_naming_tasks.drain()),
         (
             "provider mints",
             lambda: connector_minted_credentials.settle_background_mints(

@@ -357,6 +357,7 @@ class _RegistryTasks:
         "protected_engage",
         "cloud_stage",
         "project_repair",
+        "job_naming",
     )
 
     def __init__(self, log: list[str]) -> None:
@@ -402,6 +403,7 @@ class _RegistryTasks:
             self.tasks["cloud_stage"]
         )
         resources.project_repair_state.bg_repair_tasks.add(self.tasks["project_repair"])
+        resources.job_naming_tasks.track(self.tasks["job_naming"])
         await _settle()
 
     async def cleanup(self) -> None:
@@ -453,6 +455,7 @@ async def test_shutdown_cancels_every_registry_task_before_any_client_closes(
         assert resources.cloud_task_registry.protected_engage_tasks == {}
         assert resources.cloud_task_registry.cloud_stage_tasks == {}
         assert resources.project_repair_state.bg_repair_tasks == set()
+        assert resources.job_naming_tasks.pending() == []
         assert _closure(recorder) == SHUTDOWN_CLOSURE
     finally:
         await placed.cleanup()

@@ -745,3 +745,43 @@ async def test_the_installed_harness_adds_no_image_and_keeps_the_lane(inputs, de
     kwargs = deps.store.create_job.await_args.kwargs
     assert "harness_image" not in kwargs
     assert kwargs["execution_lane"] == "stateless"
+
+
+@pytest.mark.asyncio
+async def test_naming_starts_with_the_created_row_once_dispatch_was_triggered(
+    inputs, deps
+):
+    """The namer decides itself whether the job wants a name; creation only
+    hands it the row, after everything admission owes the job is done."""
+    name_job = Mock()
+    deps = replace(deps, name_job=name_job)
+    order = order_for(deps)
+    order.attach_mock(name_job, "name")
+
+    result = await create(inputs, deps)
+
+    name_job.assert_called_once_with(result)
+    calls = [call[0] for call in order.mock_calls]
+    assert calls.index("dispatch") < calls.index("name")
+
+
+@pytest.mark.asyncio
+async def test_a_namer_that_cannot_start_never_fails_the_creation(inputs, deps, caplog):
+    deps = replace(deps, name_job=Mock(side_effect=RuntimeError("no running loop")))
+
+    with caplog.at_level("WARNING", logger=LOGGER):
+        result = await create(inputs, deps)
+
+    assert result["id"] == UUID(JOB)
+    deps.trigger_dispatch.assert_called_once_with()
+    assert "Could not start naming job" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_officer_job_is_handed_to_the_namer_like_any_other(officer, deps):
+    """Whether a job is named is the namer's rule (its origin), not creation's."""
+    name_job = Mock()
+
+    result = await create(officer, replace(deps, name_job=name_job))
+
+    name_job.assert_called_once_with(result)

@@ -112,7 +112,7 @@ The fields most integrations use:
 
 | Field | Meaning |
 |---|---|
-| `description` | Required. What the agent should do. It is also how the job is listed until someone names it. |
+| `description` | Required. What the agent should do. It is also how the job is listed until it has a name. A job you start with a longer task is named by your auxiliary model a few seconds after it is created; `PATCH /api/jobs/{id}` sets a name of your own. |
 | `expert` | The expert that runs the job: a bundled expert name such as `scholar` or `developer`, or the ID of an expert from the Cockpit. `GET /api/experts` lists what you can use. Leave it out to use the installation's default worker expert. |
 | `project_id` | Run the job in a project. You need at least the editor role on it. |
 | `priority` | 0 to 10, default 5. |

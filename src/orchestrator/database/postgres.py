@@ -12452,6 +12452,27 @@ class PostgresDB:
             )
         return result == "UPDATE 1"
 
+    async def set_job_title_if_unnamed(self, job_id: str, title: str) -> bool:
+        """Store a generated title unless the job has a name by now.
+
+        The ``title IS NULL`` guard is what lets a person's rename win over
+        the auxiliary model, in either order: a name set first is kept, and a
+        later rename replaces the generated one like any other.
+
+        Returns True if this call named the job.
+        """
+        try:
+            uuid_val = UUID(str(job_id))
+        except (ValueError, AttributeError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE jobs SET title = $2 WHERE id = $1 AND title IS NULL",
+                uuid_val,
+                title,
+            )
+        return result == "UPDATE 1"
+
     async def store_resolved_config(
         self, job_id: str, resolved_config: Dict[str, Any]
     ) -> bool:

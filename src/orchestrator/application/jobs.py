@@ -42,6 +42,7 @@ from orchestrator.services import (
     container_provisioner as container_provisioner_module,
     default_experts,
     deployment_gates,
+    dispatch_credentials,
     docker_provisioner as docker_provisioner_module,
     grant_enforcement,
     job_admission,
@@ -51,6 +52,7 @@ from orchestrator.services import (
     job_dispatcher,
     job_evidence as job_evidence_operations,
     job_inspection as job_inspection_operations,
+    job_naming,
     job_projection,
     job_queries,
     job_reads,
@@ -624,6 +626,27 @@ def job_admission_creation_dependencies(
             job_dispatcher.trigger_dispatch, job_dispatch_dependencies, resources
         ),
         stamp_cloud_connectors=stamp_cloud_connectors,
+        name_job=functools.partial(
+            job_naming.schedule_job_naming,
+            tasks=resources.job_naming_tasks,
+            dependencies=functools.partial(job_naming_dependencies, resources),
+        ),
+    )
+
+
+def job_naming_dependencies(
+    resources: ApplicationResources,
+) -> job_naming.JobNamingDependencies:
+    """Built per naming call. The route is dispatch's own injector, so a job
+    is named by the auxiliary model its own dispatch would be given."""
+    return job_naming.JobNamingDependencies(
+        store=resources.postgres_db,
+        inject_model_credentials=bound(
+            dispatch_credentials.inject_model_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            resources,
+        ),
+        ledger=resources.usage_ledger,
     )
 
 

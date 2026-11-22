@@ -110,6 +110,10 @@ class JobAdmissionCreationDependencies:
     # The main cloud's checkout and outbox for a root job, decided before the
     # row exists (services.job_cloud_checkout.admission_stamp). None: none.
     stamp_cloud_connectors: StampCloudConnectors | None = None
+    # Starts naming the new job in the background (services.job_naming); it
+    # decides itself whether the job wants a name. None: jobs keep their task
+    # text as their name.
+    name_job: Callable[[dict[str, Any]], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -290,5 +294,13 @@ async def create_admitted_job(
     # only after provisioning and the best-effort scholar attempt have settled.
     if inputs.officer_preparation is None:
         dependencies.trigger_dispatch()
+
+    # A name is a convenience, never part of admission: whatever goes wrong
+    # here, the job exists and is listed by its task text.
+    if dependencies.name_job is not None:
+        try:
+            dependencies.name_job(result)
+        except Exception as e:
+            logger.warning(f"Could not start naming job {result.get('id')}: {e}")
 
     return result

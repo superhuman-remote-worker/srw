@@ -45,9 +45,13 @@ those tools. The form includes:
   custom instructions, memory, quality helpers, and limits.
 - **Workspace** — see below.
 
-A new job is listed by its task text. To give it a shorter name, hover its row
-in **Jobs** and use the pencil. The task text does not change, and search
-finds the job by either.
+A new job is listed by its task text. When that text is long, the user's
+auxiliary model gives the job a short name a few seconds after it is created;
+a short one-line task stays its own name, and jobs that loops, officers and
+automations start keep the description they were given. To set a name
+yourself, hover the job's row in **Jobs** and use the pencil; a name you set
+is never replaced. The task text does not change, and search finds the job by
+either.
 
 ### Choosing a workspace
 

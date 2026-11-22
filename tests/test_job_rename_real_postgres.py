@@ -159,3 +159,44 @@ class TestSearchMatchesTheTitle:
         found = await db.query_jobs(search="contract", limit=25)
 
         assert [str(r["id"]) for r in found.jobs] == [named]
+
+
+class TestAGeneratedTitleNeverReplacesAName:
+    """``set_job_title_if_unnamed`` is how the auxiliary model names a job.
+
+    The model answers seconds after creation, and a person may have renamed
+    the job by then. The guard is in the statement, so the two cannot race.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unnamed_job_takes_the_generated_title(self, db):
+        job = await _job(db, description="Summarise the attached contract")
+
+        assert await db.set_job_title_if_unnamed(job, "Contract summary") is True
+
+        stored = await db.get_job(job)
+        assert stored["title"] == "Contract summary"
+        assert stored["description"] == "Summarise the attached contract"
+
+    @pytest.mark.asyncio
+    async def test_a_name_a_person_gave_is_kept(self, db):
+        job = await _job(db, description="Summarise the attached contract")
+        await db.update_job_title(job, "Lease review")
+
+        assert await db.set_job_title_if_unnamed(job, "Contract summary") is False
+
+        assert (await db.get_job(job))["title"] == "Lease review"
+
+    @pytest.mark.asyncio
+    async def test_a_person_can_rename_a_generated_title(self, db):
+        job = await _job(db, description="Summarise the attached contract")
+        await db.set_job_title_if_unnamed(job, "Contract summary")
+
+        assert await db.update_job_title(job, "Lease review") is True
+
+        assert (await db.get_job(job))["title"] == "Lease review"
+
+    @pytest.mark.asyncio
+    async def test_a_job_that_is_gone_or_malformed_is_not_named(self, db):
+        assert await db.set_job_title_if_unnamed(str(uuid.uuid4()), "Name") is False
+        assert await db.set_job_title_if_unnamed("not-a-uuid", "Name") is False
