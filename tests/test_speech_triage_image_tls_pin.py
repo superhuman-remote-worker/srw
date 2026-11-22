@@ -554,3 +554,182 @@ class TestImageAdapters:
             with pytest.raises(adapters.ImageProviderError):
                 await adapters.call_openai_images(_section("https://h/v1", None), REQ)
         assert "transport" not in cls.call_args.kwargs
+
+
+class TestImageAdapterEdges:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call", ["call_openai_images", "call_gemini"])
+    async def test_a_pin_that_openssl_cannot_load_has_the_certificate_kind(self, call):
+        # base64 of one NUL byte-ish: not a DER certificate
+        with pytest.raises(adapters.ImageProviderError) as err:
+            await getattr(adapters, call)(_section("https://h/v1", "MAA="), REQ)
+        assert err.value.kind == "certificate"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call", ["call_openai_images", "call_gemini"])
+    async def test_a_pin_with_a_plain_http_url_is_refused(self, pins, call):
+        with pytest.raises(adapters.ImageProviderError) as err:
+            await getattr(adapters, call)(
+                _section("http://h/v1", pins["leaf"].wire), REQ
+            )
+        assert err.value.kind == "certificate"
+        assert "https" in str(err.value)
+
+    @pytest.mark.asyncio
+    async def test_a_pin_failure_has_the_certificate_kind(self, tls_certs, pins):
+        with tls_server(tls_certs.swap, tls_certs.swap_key, ROUTES) as srv:
+            with pytest.raises(adapters.ImageProviderError) as err:
+                await adapters.call_openai_images(
+                    _section(srv.url, pins["leaf"].wire), REQ
+                )
+        assert err.value.kind == "certificate"
+
+
+# --- the image tool ---------------------------------------------------------------
+
+
+class TestImageTool:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pin", ["garbage!", "MAA="])
+    async def test_a_pin_failure_returns_the_paid_images_and_says_what_to_do(self, pin):
+        from agent.tools.image_generation.tool import create_image_generation_tools
+
+        store = MagicMock()
+        store.reserve_image_generation = AsyncMock(return_value=(True, 0))
+        store.release_image_generation = AsyncMock()
+        context = MagicMock()
+        context.config = {
+            "image": {
+                **_section("https://127.0.0.1:1/v1", pin),
+                "billing": "api",
+                "max_paid_images": 10,
+            }
+        }
+        context.get_phase_multimodal.return_value = True
+        context.has_workspace.return_value = True
+        context.thread_id = "t1"
+        context.postgres_db = store
+        (generate_image,) = create_image_generation_tools(context)
+        out = await generate_image.ainvoke({"prompt": "a cat", "n": 2})
+        assert "(certificate)" in out
+        assert "re-trust it in Admin" in out and "do not retry" in out.lower()
+        assert ".." not in out
+        store.release_image_generation.assert_awaited_once_with("thread", "t1", 2)
+
+
+# --- the transcription route --------------------------------------------------------
+
+
+class TestVoiceRoute:
+    @pytest.mark.asyncio
+    async def test_a_pin_failure_reaches_the_user(self):
+        from fastapi import HTTPException
+
+        from orchestrator.services import voice
+
+        pin_error = CertificateChangedError("h", 443, "AA", "BB")
+        err = transcribe.TranscriptionError(str(pin_error))
+        err.__cause__ = pin_error
+        deps = SimpleNamespace(store=MagicMock(), ledger=None)
+        with patch.object(
+            transcribe, "transcribe_thread_audio", AsyncMock(side_effect=err)
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await voice.transcribe_audio(
+                    thread_id=None, user_id="u", data=b"abc", filename="v.webm",
+                    dependencies=deps,
+                )  # fmt: skip
+        assert caught.value.status_code == 502
+        assert "TLS certificate changed" in caught.value.detail
+
+    @pytest.mark.asyncio
+    async def test_other_failures_stay_generic(self):
+        from fastapi import HTTPException
+
+        from orchestrator.services import voice
+
+        deps = SimpleNamespace(store=MagicMock(), ledger=None)
+        with patch.object(
+            transcribe,
+            "transcribe_thread_audio",
+            AsyncMock(side_effect=transcribe.TranscriptionError("x")),
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await voice.transcribe_audio(
+                    thread_id=None, user_id="u", data=b"abc", filename="v.webm",
+                    dependencies=deps,
+                )  # fmt: skip
+        assert caught.value.detail == "Transcription failed"
+
+
+# --- search and fetch fail closed on a pinned endpoint ---------------------------------
+
+
+async def _inject_search(by_capability, config=None, fallback=None):
+    deps = SimpleNamespace(store=MagicMock(), logger=MagicMock())
+
+    async def resolver(**kw):
+        if kw.get("setting_key") == "default_search_fallback_model":
+            return fallback
+        return by_capability.get(kw["capability"])
+
+    with patch(
+        "orchestrator.services.capability_credentials.resolve_capability_credentials",
+        resolver,
+    ):
+        out = await dc.inject_search_credentials(
+            {} if config is None else config,
+            user_settings={}, user_id="u", resolved_keys={}, dependencies=deps,
+        )  # fmt: skip
+    return out, deps
+
+
+def _search_creds(catalog_id="c", **over):
+    base = dict(
+        model="s", base_url="https://127.0.0.1:1/v1", api_key="k",
+        provider="tavily", params={"ops": ["search", "fetch"]}, catalog_id=catalog_id,
+    )  # fmt: skip
+    base.update(over)
+    return CapabilityCredentials(**base)
+
+
+class TestSearchFailsClosed:
+    @pytest.mark.asyncio
+    async def test_a_pinned_search_and_fetch_row_is_dropped_and_logged(self, pins):
+        pinned = _search_creds(tls_pin=pins["leaf"])
+        out, deps = await _inject_search(
+            {"search": pinned, "fetch": pinned},
+            {"research": {"search": {"api_key": "stale"}}},
+        )
+        assert "search" not in out.get("research", {}) and "fetch" not in out.get(
+            "research", {}
+        )
+        assert deps.logger.error.call_count == 2
+        assert "pinned" in deps.logger.error.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_an_unpinned_row_is_still_injected(self):
+        plain = _search_creds()
+        out, _ = await _inject_search({"search": plain, "fetch": plain})
+        assert out["research"]["search"]["provider"] == "tavily"
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_fallback_is_dropped(self, pins):
+        out, deps = await _inject_search(
+            {"search": _search_creds("a")},
+            fallback=_search_creds("b", tls_pin=pins["leaf"]),
+        )
+        assert "search_fallback" not in out.get("research", {})
+        deps.logger.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_pin_resolves_nothing_so_nothing_is_injected(self):
+        out, _ = await _inject_search({"search": None, "fetch": None})
+        assert "search" not in out.get("research", {})
+
+
+class TestHelpersRequireThePin:
+    @pytest.mark.asyncio
+    async def test_a_missed_caller_fails_with_type_error(self):
+        with pytest.raises(TypeError):
+            await tts._formulate_for_speech("t", model="m", base_url=None, api_key="k")

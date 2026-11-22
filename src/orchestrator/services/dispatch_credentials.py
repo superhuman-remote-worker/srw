@@ -715,6 +715,22 @@ async def inject_search_credentials(
             )
             continue
 
+        if creds.tls_pin is not None:
+            # The search and fetch adapters build their own clients and do not
+            # verify a pinned certificate; sending them with normal CA trust
+            # would let a server that now presents a publicly valid
+            # certificate pass for the pinned one. Fail closed.
+            research.pop(capability, None)
+            dependencies.logger.error(
+                "Dispatch: %s model %r is on an endpoint with a pinned TLS "
+                "certificate; search/fetch adapters don't support pinned "
+                "certificates yet, so %s is disabled for it",
+                capability,
+                creds.model,
+                capability,
+            )
+            continue
+
         resolved[capability] = creds
         research[capability] = {
             "provider": creds.provider,
@@ -759,6 +775,14 @@ async def inject_search_credentials(
         or "search" not in fallback_ops
     ):
         research.pop("search_fallback", None)
+    elif fallback.tls_pin is not None:
+        research.pop("search_fallback", None)
+        dependencies.logger.error(
+            "Dispatch: search fallback model %r is on an endpoint with a pinned "
+            "TLS certificate; search/fetch adapters don't support pinned "
+            "certificates yet, so the fallback is disabled",
+            fallback.model,
+        )
     else:
         research["search_fallback"] = {
             "provider": fallback.provider,

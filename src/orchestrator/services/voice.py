@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from orchestrator.services import transcribe as transcribe_service
 from orchestrator.services import tts as tts_service
+from shared.tls_pinning import pin_failure_in
 
 #: The ElevenLabs Voice Library add gate's system-settings key.
 TTS_LIBRARY_SETTING_KEY = "tts.elevenlabs_library_enabled"
@@ -405,7 +406,11 @@ async def transcribe_audio(
             ref_id=thread_id,
         )
     except transcribe_service.TranscriptionError as exc:
-        raise HTTPException(status_code=502, detail="Transcription failed") from exc
+        # A pinned certificate that no longer matches says so (an admin must
+        # re-trust it); every other failure stays generic.
+        pin_failure = pin_failure_in(exc)
+        detail = str(pin_failure) if pin_failure is not None else "Transcription failed"
+        raise HTTPException(status_code=502, detail=detail) from exc
 
     if text is None:
         # 204: no STT model configured. The cockpit treats this as "attach

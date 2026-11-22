@@ -22,12 +22,18 @@ the key.
 from __future__ import annotations
 
 import base64
+import ssl
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import httpx
 
-from shared.tls_pinning import TlsPin, httpx_client_kwargs, pin_failure_in
+from shared.tls_pinning import (
+    TlsPin,
+    httpx_client_kwargs,
+    pin_applies,
+    pin_failure_in,
+)
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 GEMINI_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -254,31 +260,37 @@ async def _post(
     except httpx.HTTPError as exc:
         pin_failure = pin_failure_in(exc)
         if pin_failure is not None:
-            raise ImageProviderError("unavailable", str(pin_failure)) from exc
+            raise ImageProviderError("certificate", str(pin_failure)) from exc
         raise ImageProviderError(
             "unavailable",
             f"the image provider could not be reached ({type(exc).__name__})",
         ) from exc
 
 
-def _default_client(section: Mapping[str, Any]) -> httpx.AsyncClient:
+def _default_client(section: Mapping[str, Any], base_url: str) -> httpx.AsyncClient:
     """The client an adapter builds when it is not handed one.
 
     An endpoint's pinned certificate (``section["tls_pinned_cert"]``, written by
-    dispatch) is the only trust anchor. A pin that can't be read fails the call:
-    it is never sent without the pin.
+    dispatch) is the only trust anchor. A pin that can't be used (unreadable,
+    not loadable by OpenSSL, or with a base URL that isn't ``https://``) fails
+    the call with kind ``certificate``: it is never sent without the pin.
     """
     wire = section.get("tls_pinned_cert")
     try:
         pin = TlsPin.from_wire(str(wire)) if wire else None
-    except ValueError as exc:
+        if pin is not None and not pin_applies(base_url):
+            raise ValueError(
+                f"a pinned certificate needs an https:// base URL, not {base_url}"
+            )
+        kwargs = httpx_client_kwargs(pin, asynchronous=True)
+    except (ValueError, ssl.SSLError) as exc:
         raise ImageProviderError(
-            "unavailable",
-            f"the image endpoint's pinned certificate can't be used ({exc})",
+            "certificate",
+            f"the image endpoint's pinned certificate can't be used ({exc}). "
+            "An admin must re-trust it in Admin \u2192 Models",
         ) from exc
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(CALL_TIMEOUT_SECONDS, connect=15.0),
-        **httpx_client_kwargs(pin, asynchronous=True),
+        timeout=httpx.Timeout(CALL_TIMEOUT_SECONDS, connect=15.0), **kwargs
     )
 
 
@@ -314,7 +326,7 @@ async def call_openai_images(
     if section.get("api_key"):
         headers["Authorization"] = f"Bearer {section['api_key']}"
     owns = client is None
-    client = client or _default_client(section)
+    client = client or _default_client(section, base)
     try:
         response = await _post(client, base + path, payload, headers)
     finally:
@@ -493,7 +505,8 @@ async def call_gemini(
 ) -> ImageCallResult:
     """``n`` sequential ``generateContent`` calls (Gemini returns one image each)."""
     owns = client is None
-    client = client or _default_client(section)
+    base = (section.get("base_url") or GEMINI_DEFAULT_BASE_URL).rstrip("/")
+    client = client or _default_client(section, base)
     try:
         merged = ImageCallResult(images=[])
         wanted = max(1, int(request.n))

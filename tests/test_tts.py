@@ -1680,6 +1680,7 @@ class TestElevenLabsAdapter:
                 voice="v",
                 base_url=None,
                 api_key="xi-key",
+                tls_pin=None,
             )
         assert audio == b"MP3"
         el.assert_awaited_once()
@@ -1703,6 +1704,7 @@ class TestElevenLabsAdapter:
                 voice="v",
                 base_url=None,
                 api_key="xi-key",
+                tls_pin=None,
                 provider="elevenlabs",
             )
         el.assert_awaited_once()
@@ -2299,6 +2301,7 @@ class TestTtsErrorSurfacing:
                     voice="v1",
                     base_url=None,
                     api_key="k",
+                    tls_pin=None,
                     provider="elevenlabs",
                 )
         assert exc.value.code == "payment_required"

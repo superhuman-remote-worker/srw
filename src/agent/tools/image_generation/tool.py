@@ -72,7 +72,9 @@ REFERENCE_MAX_EDGE = 2048
 _proxy_lock: asyncio.Lock | None = None
 
 #: Provider errors raised before anything was generated (nothing billed).
-_NOT_BILLED_KINDS = frozenset({"no_plan", "auth", "quota", "rate_limit", "bad_request"})
+_NOT_BILLED_KINDS = frozenset(
+    {"no_plan", "auth", "quota", "rate_limit", "bad_request", "certificate"}
+)
 
 _EXT = {
     "image/png": ".png",
@@ -429,9 +431,10 @@ def create_image_generation_tools(context: ToolContext) -> List[Any]:
                 "auth": " The image model's key or login is not valid.",
                 "quota": " The provider's quota or credit is used up.",
                 "rate_limit": " The provider is rate-limiting; try again later.",
+                "certificate": " Do not retry; an admin must re-trust it in Admin \u2192 Models.",
                 "timeout": " The call timed out; the image may still have been billed.",
             }.get(exc.kind, "")
-            return f"Error: no image was generated ({exc.kind}): {exc}.{hint}"
+            return f"Error: no image was generated ({exc.kind}): {str(exc).rstrip('.')}.{hint}"
         latency_ms = int((time.monotonic() - started) * 1000)
         images = result.images
         if reservation is not None and len(images) < count:
