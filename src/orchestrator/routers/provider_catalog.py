@@ -12,6 +12,7 @@ from orchestrator.schemas.provider_catalog import (
     AdminDefaultModelSet,
     ApiKeySet,
     LlmEndpointCreate,
+    LlmEndpointTlsPinSet,
     LlmEndpointUpdate,
     SubscriptionModelImport,
 )
@@ -178,6 +179,43 @@ async def admin_delete_provider_endpoint(
 ) -> dict[str, str]:
     await dependencies.require_admin(request)
     return await dependencies.service.delete_provider_endpoint(endpoint_id=endpoint_id)
+
+
+@router.put("/api/admin/providers/endpoints/{endpoint_id}/tls-pin")
+async def admin_trust_endpoint_certificate(
+    request: Request,
+    endpoint_id: str,
+    body: LlmEndpointTlsPinSet,
+    *,
+    dependencies: ProviderCatalogDependencies = Depends(
+        get_provider_catalog_dependencies
+    ),
+) -> dict[str, Any]:
+    """Trust (or re-trust) the certificate the endpoint presents now."""
+    admin = await dependencies.require_admin(request)
+    return await dependencies.service.trust_endpoint_certificate(
+        endpoint_id,
+        body,
+        admin=admin,
+        method=request.method,
+        path=request.url.path,
+    )
+
+
+@router.delete("/api/admin/providers/endpoints/{endpoint_id}/tls-pin")
+async def admin_remove_endpoint_certificate_pin(
+    request: Request,
+    endpoint_id: str,
+    *,
+    dependencies: ProviderCatalogDependencies = Depends(
+        get_provider_catalog_dependencies
+    ),
+) -> dict[str, Any]:
+    """Remove the endpoint's pinned certificate."""
+    admin = await dependencies.require_admin(request)
+    return await dependencies.service.remove_endpoint_certificate_pin(
+        endpoint_id, admin=admin, method=request.method, path=request.url.path
+    )
 
 
 @router.post("/api/admin/providers/endpoints/{endpoint_id}/test")

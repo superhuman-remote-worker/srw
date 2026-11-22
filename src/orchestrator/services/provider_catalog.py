@@ -26,6 +26,7 @@ from orchestrator.schemas.provider_catalog import (
     AdminDefaultModelSet,
     ApiKeySet,
     LlmEndpointCreate,
+    LlmEndpointTlsPinSet,
     LlmEndpointUpdate,
     SubscriptionModelImport,
     VALID_DEFAULT_MODEL_KINDS,
@@ -89,6 +90,23 @@ class ProviderCatalogStore(Protocol):
         transport_kind: str | None = None,
     ) -> dict[str, Any] | None: ...
     async def delete_system_llm_endpoint(self, endpoint_id: str) -> bool: ...
+    async def set_llm_endpoint_tls_pin(
+        self,
+        endpoint_id: str,
+        *,
+        details: Any,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+    ) -> dict[str, Any] | None: ...
+    async def clear_llm_endpoint_tls_pin(
+        self,
+        endpoint_id: str,
+        *,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+    ) -> dict[str, Any] | None: ...
     async def get_default_llm_model(self, kind: str) -> str | None: ...
     async def set_default_llm_model(
         self, kind: str, model: str | None, *, updated_by: str | None = None
@@ -207,6 +225,12 @@ def _service_adapter(row: Mapping[str, Any]) -> str | None:
     return provider
 
 
+def _pin_public(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    from orchestrator.services.endpoint_tls import pin_public
+
+    return pin_public(row)
+
+
 def _serialize_endpoint(
     row: dict[str, Any], *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -229,6 +253,7 @@ def _serialize_endpoint(
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
         "models": [],
         "source": row.get("source"),
+        "tls_pin": _pin_public(row),
     }
     return annotate(
         out, manifest=manifest, section="systemEndpoints", identity=row["label"]
@@ -511,6 +536,101 @@ class ProviderCatalogService:
         if not deleted:
             raise HTTPException(status_code=404, detail="System endpoint not found")
         return {"status": "deleted"}
+
+    async def trust_endpoint_certificate(
+        self,
+        endpoint_id: str,
+        body: LlmEndpointTlsPinSet,
+        *,
+        admin: Mapping[str, Any],
+        method: str,
+        path: str,
+    ) -> dict[str, Any]:
+        """Pin the certificate the endpoint presents now (Trust / re-trust).
+
+        Refused for an endpoint that can't be pinned and for a certificate that
+        verifies normally. The admin's fingerprint must equal what the server
+        presents at this moment, and OpenSSL must accept it as a pinned anchor.
+        """
+        from orchestrator.services import endpoint_tls
+        from shared.tls_pinning import TlsPin
+
+        endpoint = await self.store.get_system_llm_endpoint(endpoint_id)
+        if endpoint is None:
+            raise HTTPException(status_code=404, detail="System endpoint not found")
+        rows = await self.store.list_models(
+            provider_kind="endpoint", provider_ref=str(endpoint["id"])
+        )
+        refusal = endpoint_tls.endpoint_trust_refusal(endpoint, rows)
+        if refusal is not None:
+            raise HTTPException(status_code=400, detail=refusal)
+        pin = endpoint_tls.stored_pin(endpoint)
+        try:
+            inspection = await endpoint_tls.inspect_tls(
+                str(endpoint["base_url"]), pin=pin
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        certificate = inspection.certificate
+        if certificate is None:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not read the server's certificate: {inspection.error}",
+            )
+        if inspection.verified:
+            detail = "This certificate verifies normally; no pin is needed."
+            if pin is not None:
+                detail += " Remove the pin instead."
+            raise HTTPException(status_code=400, detail=detail)
+        if certificate.sha256.upper() != body.sha256:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The server now presents a different certificate "
+                    f"(SHA-256 {certificate.sha256}). Test again and compare."
+                ),
+            )
+        reason = await endpoint_tls.pinned_handshake_error(
+            str(endpoint["base_url"]), TlsPin.from_pem(certificate.pem)
+        )
+        if reason:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SRW can't use this certificate even when pinned: {reason}",
+            )
+        row = await self.store.set_llm_endpoint_tls_pin(
+            endpoint_id,
+            details=certificate,
+            admin_user_id=str(admin["id"]) if admin.get("id") else None,
+            method=method,
+            path=path,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="System endpoint not found")
+        row["models"] = []
+        return _serialize_endpoint(row, manifest=await self._reconcile_manifest())
+
+    async def remove_endpoint_certificate_pin(
+        self,
+        endpoint_id: str,
+        *,
+        admin: Mapping[str, Any],
+        method: str,
+        path: str,
+    ) -> dict[str, Any]:
+        """Remove an endpoint's pinned certificate (audited)."""
+        row = await self.store.clear_llm_endpoint_tls_pin(
+            endpoint_id,
+            admin_user_id=str(admin["id"]) if admin.get("id") else None,
+            method=method,
+            path=path,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail="This endpoint has no pinned certificate."
+            )
+        row["models"] = []
+        return _serialize_endpoint(row, manifest=await self._reconcile_manifest())
 
     async def test_provider_endpoint(self, endpoint_id: str) -> dict[str, Any]:
         """Probe a system endpoint server-side.

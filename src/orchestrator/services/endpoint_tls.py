@@ -29,6 +29,7 @@ from shared.tls_pinning import (
     TlsInspection,
     TlsPin,
     inspect_tls,
+    pinned_handshake_error,  # noqa: F401 (the Trust API calls it through this module)
     pinned_ssl_context,
 )
 
