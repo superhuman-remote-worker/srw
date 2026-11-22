@@ -944,6 +944,115 @@ class VMCreationRetryStore:
         ):
             return None
 
+    async def thread_idle_wake_access_scope_on_conn(
+        self,
+        conn,
+        *,
+        owner_id,
+        pvc_uid,
+        reservation_request_id,
+        intent_digest,
+    ):
+        """The VM Session counterpart of ``idle_wake_access_scope_on_conn``.
+
+        An access-only or joined wake (the VM IDE, SSH gateway or shared
+        browser) records its access lease bound to the wake and to the stopped
+        VM before the successor exists. That lease waits for the successor; it
+        cannot use the old compute, which the exact idle stop proved absent.
+        Prove this creation is that one successor of the open ``pinned_thread``
+        wake and return the scope whose leases it may ignore. The caller owns
+        the thread row and the owner/PVC locks; every check reads persisted
+        rows, never a source label.
+        """
+
+        if pvc_uid is None:
+            return None
+        try:
+            rows = await conn.fetch(
+                "SELECT * FROM vm_creation_retries WHERE owner_kind='thread' "
+                "AND thread_id=$1 AND state='reconciling' "
+                "AND thread_wake_operation_id IS NOT NULL",
+                owner_id,
+            )
+            now = await conn.fetchval("SELECT clock_timestamp()")
+            for raw in rows:
+                row = _record(raw)
+                if (
+                    reservation_request_id
+                    != uuid5(NAMESPACE_URL, "vm-create:" + str(row["request_id"]))
+                    or cleanup_intent_digest(_creation_intent(row)) != intent_digest
+                ):
+                    continue
+                if (
+                    row["claim_token"] is None
+                    or row["claim_expires_at"] is None
+                    or row["claim_expires_at"] <= now
+                    or row["expected_pvc_uid"] != pvc_uid
+                    or canonical_request_digest(row["canonical_request"])
+                    != row["request_digest"]
+                    or canonical_configuration_digest(row["controller_configuration"])
+                    != row["controller_configuration_digest"]
+                ):
+                    return None
+                operation = await conn.fetchrow(
+                    "SELECT * FROM vm_idle_operations WHERE id=$1",
+                    row["thread_wake_operation_id"],
+                )
+                thread = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id=$1", owner_id
+                )
+                if operation is None or thread is None:
+                    return None
+                vm = (_json(thread["metadata"]) or {}).get("vm") or {}
+                evidence = _json(operation["stop_evidence"]) or {}
+                expected = {
+                    "operation_id": str(operation["id"]),
+                    "generation": str(operation["provision_generation"]),
+                    "vm_uid": str(operation["vm_uid"]),
+                    "vmi_uid": str(operation["vmi_uid"]),
+                    "launcher_uid": str(operation["launcher_uid"]),
+                    "pvc_uid": str(operation["pvc_uid"]),
+                }
+                if (
+                    operation["owner_kind"] != "thread"
+                    or operation["owner_id"] != owner_id
+                    or operation["release_kind"] != "pinned_thread"
+                    or operation["closed_at"] is not None
+                    or operation["phase"] not in {"waking", "wake_held"}
+                    or operation["wake_id"] is None
+                    or operation["wake_generation"] != row["provision_generation"]
+                    or operation["wake_ready_at"] is not None
+                    or operation["pvc_uid"] != pvc_uid
+                    or operation["retained_kind"] != "rootdisk"
+                    or operation["stop_verified_at"] is None
+                    or str(vm.get("provision_generation") or "")
+                    != str(row["provision_generation"])
+                    or evidence.get("version") != 1
+                    or evidence.get("kind") != "vm_idle_physical_stop"
+                    or any(
+                        evidence.get(key) != value for key, value in expected.items()
+                    )
+                    or any(
+                        evidence.get(key) is not True
+                        for key in (
+                            "vm_absent",
+                            "vmi_absent",
+                            "launcher_absent",
+                            "retained_pvc",
+                            "controller_authenticated",
+                        )
+                    )
+                    or evidence.get("same_generation_replacement") is not False
+                ):
+                    return None
+                return {
+                    key: operation[key]
+                    for key in ("wake_id", "provision_generation", "vm_uid")
+                }
+            return None
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     async def authorize_controller(
         self, *, request_id: str, claim_token: str, observed: dict
     ) -> dict:
