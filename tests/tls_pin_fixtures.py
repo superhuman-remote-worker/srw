@@ -4,7 +4,8 @@ The certificates are made with the ``openssl`` CLI, using the commands of the
 2026-11-06 spike: ``leaf`` is a true X.509 v1 certificate without extensions
 (like the university router's), so no CA-based hostname check can pass it.
 Import ``tls_certs`` and ``tls_server`` into the test module:
-``from tests.tls_pin_fixtures import tls_certs, tls_server``.
+``from tests.tls_pin_fixtures import tls_certs, tls_server``. The helpers
+:func:`pin_of` and :func:`caused_by` are shared by the pin suites.
 """
 
 from __future__ import annotations
@@ -21,6 +22,30 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 import pytest
+
+from shared.tls_pinning import TlsPin
+
+
+def pin_of(path: Path) -> TlsPin:
+    """The pin of the PEM certificate file at ``path``."""
+    return TlsPin.from_pem(path.read_text())
+
+
+def caused_by(exc: BaseException | None, cls: type) -> bool:
+    """Whether ``cls`` is anywhere in ``exc``'s cause/context chain.
+
+    SDK and LangChain releases add wrapper layers (langchain-openai 1.6+ wraps
+    openai's ``APIConnectionError`` once more), so never pin a chain's depth.
+    """
+    seen: set[int] = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, cls):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
 
 _MIN_CNF = """[req]
 distinguished_name = dn

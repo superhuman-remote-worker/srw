@@ -26,6 +26,7 @@ from shared.tls_pinning import (
     TlsPin,
     pinned_transport_for,
 )
+from tests.tls_pin_fixtures import caused_by, pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 #: Providers whose factory builds a ReasoningChatOpenAI (OpenAI wire format).
@@ -46,10 +47,6 @@ ANTHROPIC_REPLY = {
 MESSAGES_ROUTE = {("POST", "/v1/messages"): ANTHROPIC_REPLY}
 
 
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
-
-
 def _config(provider: str, base_url, pin=None, **overrides) -> LLMConfig:
     fields = dict(
         model="m1",
@@ -65,17 +62,6 @@ def _config(provider: str, base_url, pin=None, **overrides) -> LLMConfig:
     )
     fields.update(overrides)
     return LLMConfig(**fields)
-
-
-def _caused_by(exc: BaseException, cls: type) -> bool:
-    seen: set[int] = set()
-    cur = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, cls):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
 
 
 def _pool_settings(transport) -> tuple:
@@ -104,7 +90,7 @@ def _transports(llm):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", OPENAI_SHAPED)
 async def test_openai_shaped_model_answers_through_the_pin(tls_certs, provider):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
         llm = create_llm(_config(provider, server.url, pin))
         assert isinstance(llm, ReasoningChatOpenAI)
@@ -118,7 +104,7 @@ async def test_openai_shaped_model_answers_through_the_pin(tls_certs, provider):
 
 
 def test_the_sync_client_answers_through_the_pin(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
         reply = create_llm(_config("openai", server.url, pin)).invoke("hi")
     assert reply.content == "ok"
@@ -127,13 +113,13 @@ def test_the_sync_client_answers_through_the_pin(tls_certs):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ENDPOINT_PROVIDERS)
 async def test_a_changed_certificate_fails_and_sends_nothing(tls_certs, provider):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.swap, tls_certs.swap_key, MESSAGES_ROUTE) as server:
         llm = create_llm(_config(provider, server.url, pin))
         with pytest.raises(Exception) as raised:
             await llm.ainvoke("hi")
 
-    assert _caused_by(raised.value, CertificateChangedError), repr(raised.value)
+    assert caused_by(raised.value, CertificateChangedError), repr(raised.value)
     assert server.requests == []  # no request, so no key, reached the impostor
 
 
@@ -144,7 +130,7 @@ async def test_a_changed_certificate_fails_and_sends_nothing(tls_certs, provider
 
 @pytest.mark.asyncio
 async def test_anthropic_builds_a_pinned_client_and_answers(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.leaf, tls_certs.leaf_key, MESSAGES_ROUTE) as server:
         llm = create_llm(_config("anthropic", server.url, pin))
         assert type(llm) is PinnedChatAnthropic
@@ -165,7 +151,7 @@ async def test_anthropic_builds_a_pinned_client_and_answers(tls_certs):
 def test_anthropic_client_is_pinned_in_the_installed_sdk(tls_certs):
     # On anthropic>=1 the SDK runs on httpx2 and refuses httpx transports; the
     # pinned transport must be of the SDK's own package.
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     llm = create_llm(_config("anthropic", "https://127.0.0.1:9/v1", pin))
     _, async_transport = _transports(llm)
     if issubclass(anthropic.DefaultAsyncHttpxClient, httpx.AsyncClient):
@@ -179,7 +165,7 @@ def test_anthropic_client_is_pinned_in_the_installed_sdk(tls_certs):
 
 
 def test_pinned_and_unpinned_anthropic_on_one_url_share_no_client(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     url = "https://127.0.0.1:9/v1"
     pinned = create_llm(_config("anthropic", url, pin))
     pinned_async = pinned._async_client._client
@@ -200,7 +186,7 @@ def test_pinned_anthropic_keeps_an_anthropic_proxy(tls_certs, monkeypatch):
     # Upstream routes through ANTHROPIC_PROXY; the pinned client does too, and
     # the TLS to the endpoint through the tunnel is still the pinned context.
     monkeypatch.setenv("ANTHROPIC_PROXY", "http://proxy.local:3128")
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     llm = create_llm(_config("anthropic", "https://127.0.0.1:9/v1", pin))
     for transport in _transports(llm):
         assert transport._pin == pin
@@ -211,7 +197,7 @@ def test_pinned_anthropic_keeps_an_anthropic_proxy(tls_certs, monkeypatch):
 def test_pinned_anthropic_differs_from_the_unpinned_only_in_trust(tls_certs, which):
     url = "https://127.0.0.1:9/v1"
     headers = {"X-Route": "r1"}
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     pinned = getattr(
         create_llm(_config("anthropic", url, pin, extra_headers=headers)), which
     )
@@ -246,7 +232,9 @@ def test_an_sdk_client_class_without_pinned_transport_fails_the_build(
 
     monkeypatch.setattr(pinned_anthropic, "_AsyncHttpxClientWrapper", NotAnHttpxClient)
     with pytest.raises(TypeError, match="not an httpx or httpx2 client class"):
-        create_llm(_config("anthropic", "https://127.0.0.1:9/v1", _pin(tls_certs.leaf)))
+        create_llm(
+            _config("anthropic", "https://127.0.0.1:9/v1", pin_of(tls_certs.leaf))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +266,7 @@ def test_the_unreadable_marker_names_the_admin_fix():
 def test_a_pin_on_an_http_url_fails_the_build(tls_certs, provider):
     url = "http://model-box.local:8080/v1"
     with pytest.raises(ValueError) as raised:
-        create_llm(_config(provider, url, _pin(tls_certs.leaf)))
+        create_llm(_config(provider, url, pin_of(tls_certs.leaf)))
     assert url in str(raised.value) and "https://" in str(raised.value)
 
 
@@ -287,13 +275,13 @@ def test_a_pin_without_a_base_url_fails_the_build(tls_certs, provider):
     # A pin travels with its endpoint's base URL; alone it would be put on the
     # provider's own default host (or codex's http proxy default).
     with pytest.raises(ValueError, match="pinned certificate"):
-        create_llm(_config(provider, None, _pin(tls_certs.leaf)))
+        create_llm(_config(provider, None, pin_of(tls_certs.leaf)))
 
 
 @pytest.mark.parametrize("provider", ["google", "groq"])
 def test_provider_key_factories_refuse_a_pin(tls_certs, provider):
     with pytest.raises(ValueError) as raised:
-        create_llm(_config(provider, "https://h/v1", _pin(tls_certs.leaf)))
+        create_llm(_config(provider, "https://h/v1", pin_of(tls_certs.leaf)))
     assert str(raised.value) == (
         "A pinned certificate applies to endpoint-backed models; the "
         f"{provider} factory reaches only its provider's own API."
@@ -379,7 +367,7 @@ def _captured_citation_configs(agent) -> list[LLMConfig]:
 
 
 def test_the_citation_config_carries_the_transport_pin(tls_certs, citation_env):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     citation_env.setenv("CITATION_LLM_TLS_PINNED_CERT", pin.wire)
 
     created = _captured_citation_configs(_citation_agent())
@@ -401,7 +389,7 @@ def test_an_unpinned_citation_endpoint_has_no_pin(citation_env):
     "ignore:Parameters .*reasoning_effort.* should be specified explicitly:UserWarning"
 )
 def test_the_citation_client_is_built_pinned(tls_certs, citation_env):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     citation_env.setenv("CITATION_LLM_TLS_PINNED_CERT", pin.wire)
     agent = _citation_agent()
 

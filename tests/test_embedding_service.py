@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError
+from tests.tls_pin_fixtures import caused_by, pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 
@@ -574,21 +575,6 @@ class TestExplicitConfigOverrides:
 # ---------------------------------------------------------------------------
 
 
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
-
-
-def _caused_by(exc: BaseException, cls: type) -> bool:
-    seen: set[int] = set()
-    cur = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, cls):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
-
-
 class TestEmbeddingPin:
     @pytest.mark.asyncio
     async def test_env_url_takes_the_env_pin(self, mock_env, monkeypatch, tls_certs):
@@ -597,7 +583,7 @@ class TestEmbeddingPin:
         with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
             monkeypatch.setenv("EMBEDDING_BASE_URL", server.url)
             monkeypatch.setenv("EMBEDDING_API_KEY", "k")
-            monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
             service = EmbeddingService(model="m1", expected_dimensions=2)
             assert await service.embed("hi") == [0.1, 0.2]
             await service._client.close()
@@ -612,13 +598,13 @@ class TestEmbeddingPin:
                 model="m1",
                 base_url=server.url,
                 api_key="secret",
-                tls_pin=_pin(tls_certs.leaf),
+                tls_pin=pin_of(tls_certs.leaf),
                 expected_dimensions=2,
             )
             with pytest.raises(Exception) as exc:
                 await service.embed("hi")
             await service._client.close()
-        assert _caused_by(exc.value, CertificateChangedError)
+        assert caused_by(exc.value, CertificateChangedError)
         assert server.requests == []
 
     def test_an_explicit_url_ignores_the_env_pin(
@@ -652,7 +638,7 @@ class TestEmbeddingPin:
             EmbeddingService(
                 model="m1",
                 base_url="http://emb.example/v1",
-                tls_pin=_pin(tls_certs.leaf),
+                tls_pin=pin_of(tls_certs.leaf),
             )
 
     def test_an_empty_base_url_still_takes_the_env_pin(
@@ -663,9 +649,9 @@ class TestEmbeddingPin:
 
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
         monkeypatch.setenv("EMBEDDING_API_KEY", "k")
-        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         service = EmbeddingService(model="m1", base_url="")
-        assert service.tls_pin == _pin(tls_certs.leaf)
+        assert service.tls_pin == pin_of(tls_certs.leaf)
 
     def test_the_openrouter_provider_refuses_an_env_pin(
         self, mock_env, monkeypatch, mock_openai_client, tls_certs
@@ -674,7 +660,7 @@ class TestEmbeddingPin:
 
         _, cls = mock_openai_client
         monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
-        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         with pytest.raises(ValueError, match="openrouter"):
             EmbeddingService(model="m1", api_key="k")
         cls.assert_not_called()
@@ -684,7 +670,7 @@ class TestEmbeddingPin:
     ):
         from shared.runtime.services.embedding_service import EmbeddingService
 
-        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         with pytest.raises(ValueError, match="https"):
             EmbeddingService(model="m1")
 
@@ -693,7 +679,7 @@ class TestEmbeddingPin:
         from shared.runtime.services.embedding_service import EmbeddingService
 
         with pytest.raises(ValueError, match="https"):
-            EmbeddingService(model="m1", tls_pin=_pin(tls_certs.leaf))
+            EmbeddingService(model="m1", tls_pin=pin_of(tls_certs.leaf))
 
 
 class TestKbEmbeddingPin:
@@ -713,10 +699,10 @@ class TestKbEmbeddingPin:
             get_kb_embedding_service,
         )
 
-        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         first = get_kb_embedding_service()
         assert get_kb_embedding_service() is first
-        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.swap).wire)
+        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.swap).wire)
         assert get_kb_embedding_service() is not first
 
     @pytest.mark.asyncio
@@ -731,7 +717,7 @@ class TestKbEmbeddingPin:
             monkeypatch.setenv("KB_EMBEDDING_BASE_URL", server.url)
             monkeypatch.setenv("KB_EMBEDDING_DIMENSIONS", "2")
             monkeypatch.setenv(
-                "KB_EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire
+                "KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire
             )
             service = get_kb_embedding_service()
             assert await service.embed("hi") == [0.1, 0.2]
@@ -748,13 +734,13 @@ class TestKbEmbeddingPin:
             monkeypatch.setenv("KB_EMBEDDING_BASE_URL", server.url)
             monkeypatch.setenv("KB_EMBEDDING_DIMENSIONS", "2")
             monkeypatch.setenv(
-                "KB_EMBEDDING_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire
+                "KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire
             )
             service = get_kb_embedding_service()
             with pytest.raises(Exception) as exc:
                 await service.embed("hi")
             await service._client.close()
-        assert _caused_by(exc.value, CertificateChangedError)
+        assert caused_by(exc.value, CertificateChangedError)
         assert server.requests == []
 
     def test_the_unreadable_marker_builds_no_service(self, monkeypatch):

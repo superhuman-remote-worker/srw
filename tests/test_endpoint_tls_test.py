@@ -30,6 +30,7 @@ from shared.tls_pinning import (
     fingerprint_sha256,
 )
 from tests._mounted_router import mount_router
+from tests.tls_pin_fixtures import pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -49,10 +50,6 @@ MISMATCH = "IP address mismatch, certificate is not valid for '10.18.2.105'."
 
 def details(path) -> CertificateDetails:
     return tls_pinning._certificate_details(TlsPin.from_pem(path.read_text()).der)
-
-
-def pin_of(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
 
 
 def pin_columns(path, **updates) -> dict:

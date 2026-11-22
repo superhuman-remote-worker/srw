@@ -18,32 +18,18 @@ from agent.services.memory.plugins.reranker import (
     RerankerScorer,
     resolve_reranker_transport,
 )
-from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError
+from tests.tls_pin_fixtures import pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
-
-
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
 
 
 def _cfg(**kw):
     return SimpleNamespace(**{"model": None, "base_url": None, "api_key": None, **kw})
 
 
-def _caused_by(exc: BaseException, cls: type) -> bool:
-    seen: set[int] = set()
-    cur = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, cls):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
-
-
 @pytest.fixture
 def two_pins(tls_certs):
-    return _pin(tls_certs.leaf), _pin(tls_certs.swap)
+    return pin_of(tls_certs.leaf), pin_of(tls_certs.swap)
 
 
 class TestPinFollowsTheUrlTheRerankerCalls:
@@ -148,7 +134,7 @@ class TestScorerVerifiesThePin:
                 model="m",
                 base_url=server.url,
                 api_key="k",
-                tls_pin=_pin(tls_certs.leaf),
+                tls_pin=pin_of(tls_certs.leaf),
             )
             ranked = await scorer._rerank("q", ["a"])
             await scorer._client.aclose()
@@ -162,7 +148,7 @@ class TestScorerVerifiesThePin:
                 model="m",
                 base_url=server.url,
                 api_key="secret",
-                tls_pin=_pin(tls_certs.leaf),
+                tls_pin=pin_of(tls_certs.leaf),
                 retries=2,
                 retry_backoff=0,
             )
@@ -179,7 +165,7 @@ class TestScorerVerifiesThePin:
                 model="m",
                 base_url="http://rr.example/v1",
                 api_key="k",
-                tls_pin=_pin(tls_certs.leaf),
+                tls_pin=pin_of(tls_certs.leaf),
             )
 
     def test_build_with_the_unreadable_marker_builds_no_scorer(self, monkeypatch):

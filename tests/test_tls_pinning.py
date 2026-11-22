@@ -43,11 +43,8 @@ from shared.tls_pinning import (
     presented_certificate_sha256,
     read_stored_pin,
 )
+from tests.tls_pin_fixtures import caused_by, pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
-
-
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
 
 
 def _handshake(pin: TlsPin, port: int) -> bool:
@@ -79,7 +76,7 @@ def test_fingerprint_matches_openssl(tls_certs):
         .stdout.strip()
         .split("=", 1)[1]
     )
-    got = _pin(tls_certs.leaf).sha256
+    got = pin_of(tls_certs.leaf).sha256
     assert got == want and len(got) == 95
 
 
@@ -91,7 +88,7 @@ def test_fingerprint_format():
 
 
 def test_wire_round_trip_is_one_line(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     assert "\n" not in pin.wire and TlsPin.from_wire(pin.wire) == pin
     assert TlsPin.from_pem(pin.pem) == pin
 
@@ -105,7 +102,7 @@ def test_from_pem_accepts_exactly_one_certificate(tls_certs):
 
 
 def test_from_env_reads_the_prefix_and_rejects_garbage(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     assert TlsPin.from_env("EMBEDDING", {"EMBEDDING_TLS_PINNED_CERT": pin.wire}) == pin
     assert TlsPin.from_env("EMBEDDING", {"EMBEDDING_TLS_PINNED_CERT": ""}) is None
     assert TlsPin.from_env("EMBEDDING", {}) is None
@@ -159,7 +156,7 @@ def test_a_pin_openssl_cannot_load_is_refused_when_it_is_read():
 
 
 def test_read_stored_pin_reads_a_row_pin(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     assert read_stored_pin(None, None) is None
     assert read_stored_pin("", None) is None
     assert read_stored_pin(pin.pem, None) == pin
@@ -170,11 +167,11 @@ def test_read_stored_pin_reads_a_row_pin(tls_certs):
     "kind", ["fingerprint_only", "not_pem", "other_fingerprint", "truncated_der"]
 )
 def test_read_stored_pin_never_reads_a_broken_pin_as_no_pin(tls_certs, kind):
-    leaf = _pin(tls_certs.leaf)
+    leaf = pin_of(tls_certs.leaf)
     pem, sha256 = {
         "fingerprint_only": (None, leaf.sha256),
         "not_pem": ("not a certificate", leaf.sha256),
-        "other_fingerprint": (_pin(tls_certs.swap).pem, leaf.sha256),
+        "other_fingerprint": (pin_of(tls_certs.swap).pem, leaf.sha256),
         "truncated_der": (_TRUNCATED, _TRUNCATED_SHA256),
     }[kind]
     with pytest.raises(ValueError):
@@ -200,7 +197,7 @@ def test_pin_applies_only_to_https(url, applies):
     [("leaf", True), ("swap", False), ("good", False), ("self_signed", False)],
 )
 def test_pinned_context_accepts_only_the_pinned_leaf(tls_certs, served, accepted):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     cert = getattr(tls_certs, served)
     key = getattr(tls_certs, {"self_signed": "self_key"}.get(served, f"{served}_key"))
     with tls_server(cert, key) as server:
@@ -208,20 +205,20 @@ def test_pinned_context_accepts_only_the_pinned_leaf(tls_certs, served, accepted
 
 
 def test_expired_pin_still_connects(tls_certs):
-    pin = _pin(tls_certs.expired)
+    pin = pin_of(tls_certs.expired)
     with tls_server(tls_certs.expired, tls_certs.leaf_key) as server:
         assert _handshake(pin, server.port) is True
 
 
 def test_pinned_context_ignores_ssl_cert_file(tls_certs, monkeypatch):
     monkeypatch.setenv("SSL_CERT_FILE", str(tls_certs.ca))
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.good, tls_certs.good_key) as server:
         assert _handshake(pin, server.port) is False
 
 
 def test_pinned_context_has_no_hostname_check_and_partial_chain(tls_certs):
-    ctx = pinned_ssl_context(_pin(tls_certs.leaf))
+    ctx = pinned_ssl_context(pin_of(tls_certs.leaf))
     assert ctx.check_hostname is False and ctx.verify_mode == ssl.CERT_REQUIRED
     assert int(ctx.verify_flags) & ssl.VERIFY_X509_PARTIAL_CHAIN
     assert int(ctx.verify_flags) & NO_CHECK_TIME == NO_CHECK_TIME
@@ -229,20 +226,20 @@ def test_pinned_context_has_no_hostname_check_and_partial_chain(tls_certs):
 
 
 def test_each_call_builds_a_fresh_context(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     assert pinned_ssl_context(pin) is not pinned_ssl_context(pin)
 
 
 def test_refused_handshake_leaves_no_request_and_server_survives(tls_certs):
     with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
-        assert _handshake(_pin(tls_certs.leaf), server.port) is False
+        assert _handshake(pin_of(tls_certs.leaf), server.port) is False
         assert server.requests == []
-        assert _handshake(_pin(tls_certs.swap), server.port) is True
+        assert _handshake(pin_of(tls_certs.swap), server.port) is True
 
 
 @pytest.mark.asyncio
 async def test_async_transport_maps_a_swap_to_certificate_changed(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
         async with httpx.AsyncClient(
             **httpx_client_kwargs(pin, asynchronous=True)
@@ -253,19 +250,19 @@ async def test_async_transport_maps_a_swap_to_certificate_changed(tls_certs):
                 )
         assert srv.requests == []
     assert e.value.pinned_sha256 == pin.sha256
-    assert e.value.presented_sha256 == _pin(tls_certs.swap).sha256
+    assert e.value.presented_sha256 == pin_of(tls_certs.swap).sha256
     assert e.value.host == "127.0.0.1"
     assert e.value.port == srv.port
     assert str(e.value) == (
         f"TLS certificate changed for 127.0.0.1:{srv.port}: pinned SHA-256 "
-        f"{pin.sha256}, server presents {_pin(tls_certs.swap).sha256}. "
+        f"{pin.sha256}, server presents {pin_of(tls_certs.swap).sha256}. "
         "An admin must re-trust it in Admin \u2192 Models."
     )
     assert isinstance(e.value.__cause__, httpx.ConnectError)
 
 
 def test_sync_transport_works_and_maps_too(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
         with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
             assert c.get(srv.url + "/models").status_code == 200
@@ -274,7 +271,7 @@ def test_sync_transport_works_and_maps_too(tls_certs):
             with pytest.raises(CertificateChangedError) as e:
                 c.get(srv.url + "/models", headers={"Authorization": "Bearer S"})
         assert srv.requests == []
-    assert e.value.presented_sha256 == _pin(tls_certs.swap).sha256
+    assert e.value.presented_sha256 == pin_of(tls_certs.swap).sha256
 
 
 def test_no_pin_means_no_transport():
@@ -288,10 +285,12 @@ def test_unreadable_presented_certificate_uses_the_fallback_wording(tls_certs):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     assert presented_certificate_sha256("127.0.0.1", port, timeout=1) is None
-    err = CertificateChangedError("127.0.0.1", port, _pin(tls_certs.leaf).sha256, None)
+    err = CertificateChangedError(
+        "127.0.0.1", port, pin_of(tls_certs.leaf).sha256, None
+    )
     assert str(err) == (
         f"TLS certificate changed for 127.0.0.1:{port}: pinned SHA-256 "
-        f"{_pin(tls_certs.leaf).sha256}, server presents a different "
+        f"{pin_of(tls_certs.leaf).sha256}, server presents a different "
         "certificate. An admin must re-trust it in Admin \u2192 Models."
     )
 
@@ -299,26 +298,10 @@ def test_unreadable_presented_certificate_uses_the_fallback_wording(tls_certs):
 @pytest.mark.asyncio
 async def test_presented_certificate_lookup_sends_nothing(tls_certs):
     with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
-        want = _pin(tls_certs.swap).sha256
+        want = pin_of(tls_certs.swap).sha256
         assert presented_certificate_sha256("127.0.0.1", srv.port) == want
         assert await apresented_certificate_sha256("127.0.0.1", srv.port) == want
         assert srv.requests == []
-
-
-def _caused_by(exc: BaseException, cls: type) -> bool:
-    """Whether ``cls`` is anywhere in ``exc``'s cause/context chain.
-
-    SDK and LangChain releases add wrapper layers (langchain-openai 1.6+ wraps
-    openai's ``APIConnectionError`` once more), so never pin a chain's depth.
-    """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, cls):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
 
 
 def _sdk_http_client(cls: type, pin: TlsPin | None):
@@ -332,7 +315,7 @@ def _sdk_http_client(cls: type, pin: TlsPin | None):
 
 @pytest.mark.asyncio
 async def test_openai_sdk_through_the_pin_and_the_error_cause(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
 
     def client(url):
         return openai.AsyncOpenAI(
@@ -355,12 +338,12 @@ async def test_openai_sdk_through_the_pin_and_the_error_cause(tls_certs):
                 await bad.models.list()
             finally:
                 await bad.close()
-        assert _caused_by(e.value, CertificateChangedError)
+        assert caused_by(e.value, CertificateChangedError)
         assert srv.requests == []
 
 
 def test_openai_sync_sdk_through_the_pin(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     assert _sdk_http_client(openai.DefaultHttpxClient, None) is None
 
     def client(url):
@@ -378,13 +361,13 @@ def test_openai_sync_sdk_through_the_pin(tls_certs):
         with client(srv.url) as c:
             with pytest.raises(openai.APIConnectionError) as e:
                 c.models.list()
-        assert _caused_by(e.value, CertificateChangedError)
+        assert caused_by(e.value, CertificateChangedError)
         assert srv.requests == []
 
 
 @pytest.mark.asyncio
 async def test_chat_openai_invoke_and_ainvoke_through_the_pin(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
 
     def llm(url):
         sync = httpx.Client(**httpx_client_kwargs(pin, asynchronous=False))
@@ -412,10 +395,10 @@ async def test_chat_openai_invoke_and_ainvoke_through_the_pin(tls_certs):
         try:
             with pytest.raises(openai.APIConnectionError) as e:
                 m.invoke("hi")
-            assert _caused_by(e.value, CertificateChangedError)
+            assert caused_by(e.value, CertificateChangedError)
             with pytest.raises(openai.APIConnectionError) as e2:
                 await m.ainvoke("hi")
-            assert _caused_by(e2.value, CertificateChangedError)
+            assert caused_by(e2.value, CertificateChangedError)
         finally:
             sync.close()
             await asyn.aclose()
@@ -426,7 +409,7 @@ def test_a_refused_connection_is_not_certificate_changed(tls_certs):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
         with pytest.raises(httpx.ConnectError) as e:
             c.get(f"https://127.0.0.1:{port}/v1/models")
@@ -449,7 +432,7 @@ def _weak_cert_server(tmp_path):
         ],
         cwd=tmp_path, check=True, capture_output=True,
     )  # fmt: skip
-    pin = _pin(tmp_path / "weak.pem")
+    pin = pin_of(tmp_path / "weak.pem")
     # The shared fixture server cannot load a weak key, so lower its level here.
     sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     sctx.set_ciphers("DEFAULT:@SECLEVEL=0")
@@ -537,7 +520,7 @@ async def test_an_async_refused_connection_is_not_certificate_changed(tls_certs)
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     async with httpx.AsyncClient(**httpx_client_kwargs(pin, asynchronous=True)) as c:
         with pytest.raises(httpx.ConnectError) as e:
             await c.get(f"https://127.0.0.1:{port}/v1/models")
@@ -560,7 +543,7 @@ def test_a_non_verification_tls_failure_stays_a_plain_connect_error(tls_certs):
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     try:
-        pin = _pin(tls_certs.leaf)
+        pin = pin_of(tls_certs.leaf)
         with httpx.Client(**httpx_client_kwargs(pin, asynchronous=False)) as c:
             with pytest.raises(httpx.ConnectError) as e:
                 c.get(f"https://127.0.0.1:{srv.server_port}/v1/models")
@@ -575,7 +558,7 @@ def test_a_non_verification_tls_failure_stays_a_plain_connect_error(tls_certs):
 
 
 def _der(path) -> bytes:
-    return _pin(path).der
+    return pin_of(path).der
 
 
 @pytest.mark.asyncio
@@ -613,7 +596,7 @@ async def test_inspect_formats_names_like_openssl(tls_certs):
     assert c.subject == "CN=127.0.0.1, emailAddress=jfink@example.org"
     assert c.issuer == "CN=pin test CA" and c.version == 1
     assert c.san == [] and c.expired is False
-    assert c.pem == _pin(tls_certs.leaf).pem
+    assert c.pem == pin_of(tls_certs.leaf).pem
     pub = c.to_public()
     assert "pem" not in pub
     assert pub["sha256"] == c.sha256
@@ -645,10 +628,10 @@ async def test_pin_match_and_mismatch(tls_certs):
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
         assert (await inspect_tls(srv.url)).pin_matches is None
         assert (
-            await inspect_tls(srv.url, pin=_pin(tls_certs.leaf))
+            await inspect_tls(srv.url, pin=pin_of(tls_certs.leaf))
         ).pin_matches is True
         assert (
-            await inspect_tls(srv.url, pin=_pin(tls_certs.swap))
+            await inspect_tls(srv.url, pin=pin_of(tls_certs.swap))
         ).pin_matches is False
 
 
@@ -708,11 +691,11 @@ def test_reason_table_is_verbatim():
 @pytest.mark.asyncio
 async def test_pinned_handshake_error_none_on_match_and_text_on_swap(tls_certs):
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
-        assert await pinned_handshake_error(srv.url, _pin(tls_certs.leaf)) is None
+        assert await pinned_handshake_error(srv.url, pin_of(tls_certs.leaf)) is None
         await asyncio.sleep(0.2)
         assert srv.requests == []
     with tls_server(tls_certs.swap, tls_certs.swap_key) as srv:
-        err = await pinned_handshake_error(srv.url, _pin(tls_certs.leaf))
+        err = await pinned_handshake_error(srv.url, pin_of(tls_certs.leaf))
         assert isinstance(err, str) and err
         await asyncio.sleep(0.2)
         assert srv.requests == []
@@ -730,7 +713,7 @@ async def test_pinned_handshake_error_names_a_weak_certificate(tmp_path):
 
 
 def test_pinned_transport_for_httpx_clients(tls_certs):
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     sync_transport = pinned_transport_for(httpx.Client, pin)
     async_transport = pinned_transport_for(openai.DefaultAsyncHttpxClient, pin)
     assert type(sync_transport) is PinnedTransport and sync_transport._pin == pin
@@ -780,15 +763,22 @@ def test_the_openai_recipe_keeps_the_sdks_pool_settings(tls_certs):
             pool._socket_options,
         )
 
+    from openai._constants import DEFAULT_CONNECTION_LIMITS
+
     cls = openai.DefaultAsyncHttpxClient
-    pinned = _sdk_http_client(cls, _pin(tls_certs.leaf))
+    pinned = _sdk_http_client(cls, pin_of(tls_certs.leaf))
     assert settings(pinned) == settings(cls())
-    assert settings(pinned)[:2] == (1000, 100)
+    # The SDK's own limits, whatever this openai release sets them to.
+    assert settings(pinned)[:3] == (
+        DEFAULT_CONNECTION_LIMITS.max_connections,
+        DEFAULT_CONNECTION_LIMITS.max_keepalive_connections,
+        DEFAULT_CONNECTION_LIMITS.keepalive_expiry,
+    )
 
 
 def test_pinned_transport_for_keeps_a_proxy(tls_certs):
     transport = pinned_transport_for(
-        httpx.Client, _pin(tls_certs.leaf), proxy="http://proxy.local:3128"
+        httpx.Client, pin_of(tls_certs.leaf), proxy="http://proxy.local:3128"
     )
     assert "Proxy" in type(transport._pool).__name__
 
@@ -796,7 +786,7 @@ def test_pinned_transport_for_keeps_a_proxy(tls_certs):
 @pytest.mark.asyncio
 async def test_httpx2_transports_trust_only_the_pin(tls_certs):
     httpx2 = pytest.importorskip("httpx2")
-    pin = _pin(tls_certs.leaf)
+    pin = pin_of(tls_certs.leaf)
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
         transport = pinned_transport_for(httpx2.AsyncClient, pin)
         assert type(transport) is pinned_transport_class(httpx2.AsyncClient)
@@ -813,7 +803,7 @@ async def test_httpx2_transports_trust_only_the_pin(tls_certs):
         ) as client:
             with pytest.raises(CertificateChangedError) as raised:
                 await client.get(srv.url + "/models")
-        assert raised.value.presented_sha256 == _pin(tls_certs.swap).sha256
+        assert raised.value.presented_sha256 == pin_of(tls_certs.swap).sha256
         with httpx2.Client(transport=pinned_transport_for(httpx2.Client, pin)) as c:
             with pytest.raises(CertificateChangedError):
                 c.get(srv.url + "/models")

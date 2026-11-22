@@ -19,7 +19,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError
+from tests.tls_pin_fixtures import caused_by, pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 from agent.services.vision_helper import (
@@ -257,21 +258,6 @@ def test_read_file_never_caches_a_failed_description(tmp_path, monkeypatch):
 # =============================================================================
 
 
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
-
-
-def _caused_by(exc, cls) -> bool:
-    seen: set[int] = set()
-    cur = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, cls):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
-
-
 @pytest.fixture
 def vision_env(monkeypatch):
     for name in (
@@ -293,7 +279,7 @@ class TestVisionPin:
         with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
             vision_env.setenv("VISION_BASE_URL", server.url)
             vision_env.setenv("VISION_API_KEY", "k")
-            vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            vision_env.setenv("VISION_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
             helper = VisionHelper()
             text = await helper.describe_image(b"\x89PNG", "image/png")
             await helper.client.close()
@@ -305,7 +291,7 @@ class TestVisionPin:
         with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
             vision_env.setenv("VISION_BASE_URL", server.url)
             vision_env.setenv("VISION_API_KEY", "secret")
-            vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            vision_env.setenv("VISION_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
             helper = VisionHelper()
             with pytest.raises(Exception) as exc:
                 await helper.client.chat.completions.create(
@@ -313,7 +299,7 @@ class TestVisionPin:
                 )
             text = await helper.describe_image(b"\x89PNG", "image/png")
             await helper.client.close()
-        assert _caused_by(exc.value, CertificateChangedError)
+        assert caused_by(exc.value, CertificateChangedError)
         assert server.requests == []
         # the failure text names the change, not just "Connection error."
         assert vision_failed(text) and "TLS certificate changed" in text
@@ -336,7 +322,7 @@ class TestVisionPin:
     async def test_a_pin_on_the_default_url_makes_vision_unavailable(
         self, vision_env, tls_certs
     ):
-        vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        vision_env.setenv("VISION_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         helper = VisionHelper()
         assert helper.api_key == ""
         assert vision_failed(await helper.describe_image(b"\x89PNG", "image/png"))
@@ -355,8 +341,8 @@ class TestGetVisionHelperRebuilds:
         second = mod.get_vision_helper()
         assert second is not first
         assert mod.get_vision_helper() is second
-        vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        vision_env.setenv("VISION_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         third = mod.get_vision_helper()
         assert third is not second
-        vision_env.setenv("VISION_TLS_PINNED_CERT", _pin(tls_certs.swap).wire)
+        vision_env.setenv("VISION_TLS_PINNED_CERT", pin_of(tls_certs.swap).wire)
         assert mod.get_vision_helper() is not third

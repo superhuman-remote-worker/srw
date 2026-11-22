@@ -16,8 +16,9 @@ from uuid import UUID
 import httpx
 import pytest
 
-from shared.tls_pinning import TlsInspection, TlsPin
+from shared.tls_pinning import TlsInspection
 from tests._mounted_router import mount_router
+from tests.tls_pin_fixtures import pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 REAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -438,12 +439,8 @@ async def test_capability_probe_reports_a_transport_error_without_raising(serve)
 # --- Through a pinned certificate (real TLS server) ---------------------------
 
 
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
-
-
 def _pinned(path) -> dict:
-    pin = _pin(path)
+    pin = pin_of(path)
     return {
         "tls_pin_sha256": pin.sha256,
         "tls_pin_cert": path.read_text(),
@@ -465,14 +462,14 @@ async def test_capability_probe_goes_through_the_pin(tls_certs):
             api_key=API_KEY,
             capability="embedding",
             model="m1",
-            tls_pin=_pin(tls_certs.leaf),
+            tls_pin=pin_of(tls_certs.leaf),
         )
         wrong = await probe_endpoint_capability(
             base_url=srv.url,
             api_key=API_KEY,
             capability="embedding",
             model="m1",
-            tls_pin=_pin(tls_certs.swap),
+            tls_pin=pin_of(tls_certs.swap),
         )
 
     assert result.ok is True

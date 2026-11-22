@@ -6,7 +6,7 @@ import pytest
 
 from orchestrator.services import llm_endpoint_probe
 from orchestrator.services.llm_endpoint_probe import probe_endpoint_models
-from shared.tls_pinning import TlsPin
+from tests.tls_pin_fixtures import pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 SEARXNG_404 = (
@@ -112,14 +112,12 @@ async def test_a_declared_live_voice_model_needs_no_name_hint(serve):
 # --- Through a pinned certificate (real TLS server) ---------------------------
 
 
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
-
-
 @pytest.mark.asyncio
 async def test_models_probe_goes_through_the_pin(tls_certs):
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
-        result = await probe_endpoint_models(srv.url, "k", tls_pin=_pin(tls_certs.leaf))
+        result = await probe_endpoint_models(
+            srv.url, "k", tls_pin=pin_of(tls_certs.leaf)
+        )
 
     assert result.ok is True
     assert [model["id"] for model in result.models] == ["m1"]
@@ -131,7 +129,9 @@ async def test_models_probe_goes_through_the_pin(tls_certs):
 @pytest.mark.asyncio
 async def test_models_probe_with_another_pin_sends_nothing(tls_certs):
     with tls_server(tls_certs.leaf, tls_certs.leaf_key) as srv:
-        result = await probe_endpoint_models(srv.url, "k", tls_pin=_pin(tls_certs.swap))
+        result = await probe_endpoint_models(
+            srv.url, "k", tls_pin=pin_of(tls_certs.swap)
+        )
 
     assert srv.requests == []
     assert result.ok is False

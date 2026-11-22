@@ -33,6 +33,7 @@ from shared.tls_pinning import (
     PinnedTransport,
     TlsPin,
 )
+from tests.tls_pin_fixtures import caused_by
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 
@@ -725,16 +726,6 @@ class TestInstallStreamingReasoningTap:
 # =============================================================================
 
 
-def _caused_by(exc, cls) -> bool:
-    seen = set()
-    while exc is not None and id(exc) not in seen:
-        if isinstance(exc, cls):
-            return True
-        seen.add(id(exc))
-        exc = exc.__cause__ or exc.__context__
-    return False
-
-
 class TestPinnedCertificate:
     def _llm(self, base_url, pin=None, **kwargs):
         return ReasoningChatOpenAI(
@@ -783,7 +774,7 @@ class TestPinnedCertificate:
             with record_wire_attempts() as mine:
                 with pytest.raises(Exception) as raised:
                     await llm.ainvoke("hi")
-        assert _caused_by(raised.value, CertificateChangedError)
+        assert caused_by(raised.value, CertificateChangedError)
         assert [a["error"] for a in mine] == ["CertificateChangedError"]
         assert "TLS certificate changed" in mine[0]["error_message"]
         assert server.requests == []
@@ -795,5 +786,5 @@ class TestPinnedCertificate:
         with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
             with pytest.raises(Exception) as raised:
                 self._llm(server.url, pin).invoke("hi")
-        assert _caused_by(raised.value, CertificateChangedError)
+        assert caused_by(raised.value, CertificateChangedError)
         assert server.requests == []

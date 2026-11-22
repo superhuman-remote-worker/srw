@@ -19,7 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError, TlsPin
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError
+from tests.tls_pin_fixtures import caused_by, pin_of
 from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 from agent.services.audio_helper import (
@@ -885,21 +886,6 @@ class TestChunkedTranscription:
 # =============================================================================
 
 
-def _pin(path) -> TlsPin:
-    return TlsPin.from_pem(path.read_text())
-
-
-def _caused_by(exc, cls) -> bool:
-    seen: set[int] = set()
-    cur = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, cls):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
-
-
 _TRANSCRIPT = {("POST", "/v1/audio/transcriptions"): {"text": "hello there"}}
 
 
@@ -913,7 +899,7 @@ class TestWhisperPin:
         with tls_server(tls_certs.leaf, tls_certs.leaf_key, _TRANSCRIPT) as server:
             monkeypatch.setenv("WHISPER_BASE_URL", server.url)
             monkeypatch.setenv("WHISPER_API_KEY", "k")
-            monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
             helper = AudioHelper()
             text = await helper.transcribe(tmp_audio)
             await helper.client.close()
@@ -926,7 +912,7 @@ class TestWhisperPin:
         with tls_server(tls_certs.swap, tls_certs.swap_key, _TRANSCRIPT) as server:
             monkeypatch.setenv("WHISPER_BASE_URL", server.url)
             monkeypatch.setenv("WHISPER_API_KEY", "secret")
-            monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+            monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
             helper = AudioHelper()
             with pytest.raises(Exception) as exc:
                 with open(tmp_audio, "rb") as f:
@@ -935,7 +921,7 @@ class TestWhisperPin:
                     )
             text = await helper.transcribe(tmp_audio)
             await helper.client.close()
-        assert _caused_by(exc.value, CertificateChangedError)
+        assert caused_by(exc.value, CertificateChangedError)
         assert server.requests == []
         assert text.startswith("[Error") and "TLS certificate changed" in text
         assert "An admin must re-trust it in Admin" in text
@@ -958,7 +944,7 @@ class TestWhisperPin:
         self, monkeypatch, tmp_audio, tls_certs
     ):
         monkeypatch.setenv("WHISPER_BASE_URL", "http://stt.example/v1")
-        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         with patch("agent.services.audio_helper.AsyncOpenAI") as cls:
             text = await AudioHelper().transcribe(tmp_audio)
         cls.assert_not_called()
@@ -971,8 +957,8 @@ class TestWhisperPin:
 
         monkeypatch.setattr(mod, "_audio_helper", None)
         monkeypatch.setenv("WHISPER_BASE_URL", "https://stt.example/v1")
-        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", _pin(tls_certs.leaf).wire)
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
         first = mod.get_audio_helper()
         assert mod.get_audio_helper() is first
-        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", _pin(tls_certs.swap).wire)
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.swap).wire)
         assert mod.get_audio_helper() is not first
