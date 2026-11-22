@@ -58454,14 +58454,14 @@ class PostgresDB:
                 args.append(key_prefix)
                 param_idx += 1
 
+        # The returned row carries the pin columns: an edit keeps the pin
+        # (decision 4), and the response is serialized from this row.
         if not sets:
             # No-op patch — just return current row for parity with user variant.
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT id, label, base_url, key_prefix, transport_kind,
-                           source, helm_value_hash, source_updated_at,
-                           created_at, updated_at
+                    f"""
+                    SELECT {self._TLS_PIN_COLUMNS}
                     FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
                     """,
@@ -58474,9 +58474,7 @@ class PostgresDB:
             UPDATE llm_endpoints
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
-            RETURNING id, label, base_url, key_prefix, transport_kind,
-                      source, helm_value_hash, source_updated_at,
-                      created_at, updated_at
+            RETURNING {self._TLS_PIN_COLUMNS}
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)

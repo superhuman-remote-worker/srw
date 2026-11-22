@@ -351,12 +351,27 @@ async def test_base_url_edit_keeps_the_pin(db, new_url):
     await _trust(db, endpoint_id)
     before = await db.get_system_llm_endpoint(endpoint_id)
     events_before = len(await _events(db, endpoint_id))
-    await db.update_system_llm_endpoint(endpoint_id, base_url=new_url, source="ui")
+    returned = await db.update_system_llm_endpoint(
+        endpoint_id, base_url=new_url, source="ui"
+    )
     after = await db.get_system_llm_endpoint(endpoint_id)
     assert after["base_url"] == new_url
     for key in PIN_KEYS:
         assert after[key] == before[key] and after[key] is not None
+        # The PATCH response is serialized from the returned row: it must show
+        # the pin the edit kept, not ``tls_pin: null``.
+        assert returned[key] == before[key], key
     assert len(await _events(db, endpoint_id)) == events_before
+
+
+@pytest.mark.asyncio
+async def test_noop_edit_returns_the_pin(db):
+    endpoint_id = await _endpoint(db)
+    await _trust(db, endpoint_id)
+    before = await db.get_system_llm_endpoint(endpoint_id)
+    returned = await db.update_system_llm_endpoint(endpoint_id)
+    for key in PIN_KEYS:
+        assert returned[key] == before[key] and returned[key] is not None, key
 
 
 @pytest.mark.asyncio
