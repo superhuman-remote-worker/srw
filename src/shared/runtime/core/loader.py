@@ -17,6 +17,7 @@ from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import urlsplit
 
 import yaml
 from langchain_core.language_models import BaseChatModel
@@ -5028,7 +5029,9 @@ def _create_openai_llm(
     # OpenAI only: an explicit base_url means an OpenAI-compatible endpoint,
     # which may reject unknown body fields and prefix-caches without a key.
     # setdefault so an explicitly declared value keeps winning.
-    if config.prompt_cache_key and (not base_url or "api.openai.com" in base_url):
+    if config.prompt_cache_key and (
+        not base_url or urlsplit(base_url).hostname == "api.openai.com"
+    ):
         extra_body.setdefault("prompt_cache_key", config.prompt_cache_key)
 
     claude_via_proxy = bool(
