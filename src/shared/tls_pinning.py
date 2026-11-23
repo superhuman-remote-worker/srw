@@ -175,6 +175,7 @@ class TlsPin:
 def pinned_ssl_context(pin: TlsPin) -> ssl.SSLContext:
     """Return a new client context that trusts exactly ``pin`` and nothing else."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(cadata=pin.pem)
@@ -282,6 +283,7 @@ def _rebuild_rejected(host, port, sha256, reason):
 
 def _lookup_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
