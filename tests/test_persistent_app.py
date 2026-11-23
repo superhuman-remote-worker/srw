@@ -8127,16 +8127,24 @@ class TestHandleConfigUpdateEnrichmentGate:
 
     def test_gate_checks_embedding_env_keys(self):
         from inspect import getsource
-        from agent.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import (
+            _LIVE_EMBEDDING_ENV_KEYS,
+            _handle_config_update,
+        )
+
+        from agent.api.session_attach import MEMORY_EMBEDDING_ENV_KEYS
 
         src = getsource(_handle_config_update)
+        assert "embedding_env_keys = _LIVE_EMBEDDING_ENV_KEYS" in src
+        # A live update changes exactly the keys an attach applies.
+        assert set(_LIVE_EMBEDDING_ENV_KEYS) == set(MEMORY_EMBEDDING_ENV_KEYS)
         for key in (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
         ):
-            assert key in src, (
+            assert key in _LIVE_EMBEDDING_ENV_KEYS, (
                 f"Embedding env key {key} must be in the gate's "
                 "credential-bearing-keys tuple."
             )
@@ -8146,13 +8154,14 @@ class TestHandleConfigUpdateEnrichmentGate:
         clears the old one of every slot the block touches before applying."""
         from inspect import getsource
         from agent.api.persistent_app import (
+            _LIVE_EMBEDDING_ENV_KEYS,
             _apply_live_embedding_env,
             _handle_config_update,
         )
 
         src = getsource(_handle_config_update)
-        assert "EMBEDDING_SERVED_MODEL" in src
-        assert "RERANK_SERVED_MODEL" in src
+        assert "EMBEDDING_SERVED_MODEL" in _LIVE_EMBEDDING_ENV_KEYS
+        assert "RERANK_SERVED_MODEL" in _LIVE_EMBEDDING_ENV_KEYS
         assert "_apply_live_embedding_env(new_env_block, embedding_env_keys)" in src
         helper = getsource(_apply_live_embedding_env)
         assert helper.index("clear_served_model_env(") < helper.index(

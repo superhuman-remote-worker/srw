@@ -48,7 +48,6 @@ from agent.api.native_workspace_first_use import (
 )
 from agent.api import session_workspace as _session_workspace
 from agent.api.session_attach import (
-    MEMORY_EMBEDDING_ENV_KEYS,
     SessionAttachCoordinator,
     SessionAttachPorts,
 )
@@ -11137,8 +11136,27 @@ async def _model_swap_fit_ladder(new_config: Any) -> Optional[str]:
     return None
 
 
+# The embedding and rerank env keys a live config update may change.
+_LIVE_EMBEDDING_ENV_KEYS = (
+    "EMBEDDING_PROVIDER",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_SERVED_MODEL",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+    "EMBEDDING_TLS_PINNED_CERT",
+    # The rerank slot is credential-bearing too; a change must round-trip
+    # through the orchestrator for base_url/api_key enrichment. The bound
+    # scorer keeps its attach-time transport until re-attach.
+    "RERANK_MODEL",
+    "RERANK_SERVED_MODEL",
+    "RERANK_BASE_URL",
+    "RERANK_API_KEY",
+    "RERANK_TLS_PINNED_CERT",
+)
+
+
 def _apply_live_embedding_env(
-    new_env_block: Dict[str, Any], names: tuple = MEMORY_EMBEDDING_ENV_KEYS
+    new_env_block: Dict[str, Any], names: tuple = _LIVE_EMBEDDING_ENV_KEYS
 ) -> bool:
     """Apply a live config update's embedding and rerank env keys.
 
@@ -11264,22 +11282,7 @@ async def _handle_config_update(
         # with the right base_url + api_key (custom/system endpoint or
         # built-in provider key) and returns the merged dict. Every managed
         # change must commit its generation before any local mutation.
-        embedding_env_keys = (
-            "EMBEDDING_PROVIDER",
-            "EMBEDDING_MODEL",
-            "EMBEDDING_SERVED_MODEL",
-            "EMBEDDING_BASE_URL",
-            "EMBEDDING_API_KEY",
-            "EMBEDDING_TLS_PINNED_CERT",
-            # The rerank slot is credential-bearing too; a change must round-
-            # trip through the orchestrator for base_url/api_key enrichment.
-            # The bound scorer keeps its attach-time transport until re-attach.
-            "RERANK_MODEL",
-            "RERANK_SERVED_MODEL",
-            "RERANK_BASE_URL",
-            "RERANK_API_KEY",
-            "RERANK_TLS_PINNED_CERT",
-        )
+        embedding_env_keys = _LIVE_EMBEDDING_ENV_KEYS
         ds_update = datasource_ids is not None
         tools_update = bool(config_override.get("tools"))
         authorization_update = tools_update or ds_update or security_runtime_update
