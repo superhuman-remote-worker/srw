@@ -56,6 +56,8 @@ PATCH  /api/admin/providers/endpoints/{endpoint_id}                             
 POST   /api/admin/providers/endpoints/{endpoint_id}/discover                            pat=admin           admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/models/import                       pat=admin           admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/test                                pat=admin           admin:_require_admin
+DELETE /api/admin/providers/endpoints/{endpoint_id}/tls-pin                             pat=admin           admin:_require_admin
+PUT    /api/admin/providers/endpoints/{endpoint_id}/tls-pin                             pat=admin           admin:_require_admin
 GET    /api/admin/providers/keys                                                        pat=admin           admin:_require_admin
 DELETE /api/admin/providers/keys/{provider}                                             pat=admin           admin:_require_admin
 PUT    /api/admin/providers/keys/{provider}                                             pat=admin           admin:_require_admin
