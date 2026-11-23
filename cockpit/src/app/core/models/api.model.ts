@@ -2761,8 +2761,6 @@ export interface JobCreateRequest {
   upload_id?: string;
   config_upload_id?: string;
   instructions_upload_id?: string;
-  document_path?: string;
-  document_dir?: string;
   /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default.
    *  Or a complete inline Expert (`{inline: ExpertSpec}`) when the form changed a template —
    *  creation_ui_expert_workspace_connectors.md D2. */

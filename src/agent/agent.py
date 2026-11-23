@@ -4381,38 +4381,19 @@ class UniversalAgent:
                 updated_metadata["document_path"] = copied_paths[0]
                 updated_metadata["original_document_path"] = original_paths[0]
 
-        # Handle single document (document_path) - backwards compatibility
-        elif metadata.get("document_path"):
-            source_path = Path(metadata["document_path"])
-            if source_path.exists():
-                # Ensure documents directory exists (use backend for remote compat)
-                backend = self._workspace_manager.backend
-                backend.mkdir("documents")
-
-                # Check if zip - extract instead of copy
-                if source_path.suffix.lower() == ".zip":
-                    extracted = self._extract_zip(source_path, "documents", logger)
-                    if extracted:
-                        updated_metadata["document_paths"] = extracted
-                        updated_metadata["original_document_paths"] = [
-                            str(source_path)
-                        ] * len(extracted)
-                        updated_metadata["document_path"] = extracted[0]
-                        updated_metadata["original_document_path"] = str(source_path)
-                    logger.info(
-                        f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)"
-                    )
-                else:
-                    # Regular file - copy via backend to documents/ folder
-                    dest_relative = f"documents/{source_path.name}"
-                    backend.write_file(dest_relative, source_path.read_bytes())
-                    logger.info(f"Copied document to workspace: {dest_relative}")
-
-                    # Update metadata to use workspace-relative path
-                    updated_metadata["document_path"] = dest_relative
-                    updated_metadata["original_document_path"] = str(source_path)
-            else:
-                logger.warning(f"Document not found: {source_path}")
+        # A job's documents arrive only as an upload. The agent never reads a
+        # path a job names on its own filesystem: the agent pod is not the
+        # workspace, and copying a caller-chosen path from it put the agent's
+        # own files (its environment, its tokens) into a workspace the
+        # caller can read. ``context`` reaches this metadata too, so the
+        # orchestrator refusing the fields is not enough on its own.
+        elif metadata.get("document_path") or metadata.get("document_dir"):
+            logger.warning(
+                "Ignoring document_path/document_dir: a job's documents "
+                "arrive as an upload (upload_id)"
+            )
+            updated_metadata.pop("document_path", None)
+            updated_metadata.pop("document_dir", None)
 
         # Write requirement data to workspace if provided (for validator agent)
         if metadata.get("requirement_data"):

@@ -177,8 +177,6 @@ async def test_normal_insert_gets_exact_prepared_authority_and_original_referenc
 ):
     command = JobCreate(
         description="Exact description",
-        document_path="document.pdf",
-        document_dir="documents",
         config_name="ignored-request-profile",
         expert_id="ignored-request-expert",
         config_override={"llm": {"model": "ignored-request-model"}},
@@ -194,8 +192,8 @@ async def test_normal_insert_gets_exact_prepared_authority_and_original_referenc
     result = await create(inputs, deps, command)
     assert deps.store.create_job.await_args.kwargs == {
         "description": "Exact description",
-        "document_path": "document.pdf",
-        "document_dir": "documents",
+        "document_path": None,
+        "document_dir": None,
         "config_name": inputs.config_name,
         "expert_id": inputs.expert_id,
         "config_override": inputs.config_override,

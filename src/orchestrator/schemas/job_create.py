@@ -44,10 +44,16 @@ class JobCreate(BaseModel):
         None, description="Upload ID for instructions markdown"
     )
     document_path: str | None = Field(
-        None, description="Path to a document (deprecated, use upload_id)"
+        None,
+        description=(
+            "Refused. Upload the file with POST /api/uploads and pass upload_id."
+        ),
     )
     document_dir: str | None = Field(
-        None, description="Directory containing documents (deprecated)"
+        None,
+        description=(
+            "Refused. Upload the files with POST /api/uploads and pass upload_id."
+        ),
     )
     expert: str | InlineExpertSelection | None = Field(
         None,
@@ -256,6 +262,13 @@ class JobCreate(BaseModel):
             )
         if isinstance(self.config_override, dict):
             self.config_override = _strip_raw_repository_authority(self.config_override)
+        if self.document_path is not None or self.document_dir is not None:
+            # These named a path on the agent's own filesystem, which the
+            # agent copied into the workspace; it reads none any more.
+            raise ValueError(
+                "document_path and document_dir are no longer supported; upload "
+                "the files with POST /api/uploads and pass upload_id"
+            )
         if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
             raise ValueError("datasource_ids may be omitted or an array, not null")
         if self.use_datasource_defaults and "datasource_ids" in self.model_fields_set:
@@ -273,8 +286,6 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "upload_id",
     "config_upload_id",
     "instructions_upload_id",
-    "document_path",
-    "document_dir",
     "expert",
     "expert_based_on",
     "config_name",
@@ -336,7 +347,7 @@ def public_job_create_schema() -> dict[str, Any]:
     schema["required"] = [
         key for key in schema["required"] if key in PUBLIC_JOB_CREATE_FIELDS
     ]
-    for key in ("config_name", "expert_id", "document_path", "document_dir", "user_id"):
+    for key in ("config_name", "expert_id", "user_id"):
         schema["properties"][key]["deprecated"] = True
     schema["properties"]["user_id"]["description"] = (
         "Ignored compatibility input. The authenticated caller always owns the job."
