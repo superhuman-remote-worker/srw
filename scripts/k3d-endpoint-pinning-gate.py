@@ -48,6 +48,11 @@ is ever on a command line; the certificates are throwaway test material.
   ... logs --since 2026-11-23T00:30:00Z              # the stand-in's log
   ... --confirm LOCAL-K3D-DISPOSABLE cleanup         # remove everything
 
+A command that stops early (an error, not a FAIL line) runs cleanup before it
+exits, so nothing is left behind; --keep skips that to inspect the state.
+Cleanup attempts every step and removes the stand-in last whatever failed
+before it. A FAIL line doesn't clean up: later checks build on the state.
+
 Checks 1b (address mismatch) and 7 (a certificate that verifies normally)
 need the stand-in's CA in ``trust.extraCaCertificates`` (``ca-pem`` prints
 it); that is a Helm values change the operator makes and reverts. Evidence
@@ -59,6 +64,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import functools
 import json
 from pathlib import Path
 import re
@@ -737,13 +743,23 @@ class Gate:
             timeout=90,
         )
 
-    def down(self) -> None:
+    def down(self) -> list[str]:
+        """Delete the stand-in's objects, each one attempted. Returns the errors."""
+        errors: list[str] = []
         for kind in ("deploy", "svc", "secret", "configmap"):
             name = {"secret": NAME + "-certs", "configmap": NAME + "-code"}.get(
                 kind, NAME
             )
-            self.kubectl("delete", kind, name, "--ignore-not-found")
-        print("stand-in removed")
+            try:
+                self.kubectl("delete", kind, name, "--ignore-not-found")
+            except Exception as error:
+                errors.append(f"delete {kind}/{name}: {error}")
+        print(
+            "stand-in removed"
+            if not errors
+            else "stand-in NOT fully removed: " + "; ".join(errors)
+        )
+        return errors
 
     # -- catalog ------------------------------------------------------------
 
@@ -972,7 +988,9 @@ class Gate:
         now = self.psql(
             f"SELECT COALESCE(settings::text, 'null') FROM users WHERE id = '{self.admin_id()}';"
         ).strip()
-        self.check("test user settings restored", now == backup, now)
+        if self.check("test user settings restored", now == backup, now):
+            self.state.pop("settings_backup")
+            self.save()
 
     # jobs and sessions ----------------------------------------------------
 
@@ -1388,16 +1406,48 @@ class Gate:
 
     # -- cleanup ------------------------------------------------------------
 
-    def cleanup(self) -> None:
-        for model_id, catalog_id in (self.state.get("model_ids") or {}).items():
-            status, _ = self.api("DELETE", f"/api/admin/providers/models/{catalog_id}")
-            print(f"  delete model {model_id}: http {status}")
+    def cleanup(self) -> list[str]:
+        """Undo everything the gate made. Every step is attempted, and the
+        stand-in goes last whatever failed before it. Returns the errors."""
+        errors: list[str] = []
+
+        def attempt(label: str, step: Any) -> bool:
+            try:
+                step()
+            except Exception as error:
+                errors.append(f"{label}: {type(error).__name__}: {error}")
+                print(f"  cleanup step failed: {label}: {error}")
+                return False
+            return True
+
+        for model_id, catalog_id in dict(self.state.get("model_ids") or {}).items():
+            path = f"/api/admin/providers/models/{catalog_id}"
+            step = functools.partial(self.delete_row, f"model {model_id}", path)
+            if attempt(f"delete model {model_id}", step):
+                self.state["model_ids"].pop(model_id)
+                self.save()
         if self.state.get("endpoint_id"):
-            status, _ = self.api(
-                "DELETE", f"/api/admin/providers/endpoints/{self.endpoint_id()}"
-            )
-            print(f"  delete endpoint: http {status}")
-        self.restore_user_defaults()
+            path = f"/api/admin/providers/endpoints/{self.endpoint_id()}"
+            if attempt(
+                "delete endpoint", functools.partial(self.delete_row, "endpoint", path)
+            ):
+                self.state.pop("endpoint_id")
+                self.save()
+        attempt("restore test user settings", self.restore_user_defaults)
+        attempt("delete gate memories", self.delete_memories)
+        attempt("save stand-in logs", self.save_standin_logs)
+        errors.extend(self.down())
+        if errors:
+            print(f"cleanup INCOMPLETE ({len(errors)}): " + "; ".join(errors))
+        return errors
+
+    def delete_row(self, what: str, path: str) -> None:
+        status, body = self.api("DELETE", path)
+        print(f"  delete {what}: http {status}")
+        if status not in (200, 204, 404):
+            raise GateError(f"delete {what}: {status} {body}")
+
+    def delete_memories(self) -> None:
         # The two fixed memories every extraction stored (see STANDIN).
         removed = self.kubectl(
             "exec",
@@ -1419,7 +1469,9 @@ class Gate:
             "'The pin gate checks that every model client verifies the pinned certificate.');\n",
         )
         print(f"  memories: {removed.strip()}")
-        old = self.kubectl(
+
+    def save_standin_logs(self) -> None:
+        pods = self.kubectl(
             "get",
             "pod",
             "-l",
@@ -1427,13 +1479,12 @@ class Gate:
             "-o",
             "jsonpath={.items[*].metadata.name}",
         ).split()
-        for pod in old:
+        for pod in pods:
             (
                 self.work
                 / "evidence"
                 / f"standin-{self.state.get('cert', 'x')}-{pod}.log"
             ).write_text(self.kubectl("logs", pod))
-        self.down()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1442,6 +1493,11 @@ def parser() -> argparse.ArgumentParser:
         "--confirm", default="", help=f"must be {LOCAL_CONFIRMATION} to change anything"
     )
     p.add_argument("--admin", default="admin@localhost", help="admin and test user")
+    p.add_argument(
+        "--keep",
+        action="store_true",
+        help="when a command stops early, leave everything in place (no cleanup)",
+    )
     p.add_argument(
         "--workdir", default=str(Path(tempfile.gettempdir()) / "srw-pingate")
     )
@@ -1466,6 +1522,9 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("down", help="remove only the stand-in objects")
     return p
 
+
+# The commands that, when they stop early, clean up before exiting.
+CLEAN_UP_ON_STOP = {"up", "cert", "check", "session-turn", "session-turn-fail"}
 
 MUTATING = {
     "up",
@@ -1495,6 +1554,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     sys.stdout.reconfigure(line_buffering=True)
     gate = Gate(args)
+    stopped = True
     try:
         if args.command == "up":
             gate.up()
@@ -1523,12 +1583,23 @@ def main(argv: list[str] | None = None) -> int:
             for e in turn["errors"][-1:]:
                 print("  error row:", json.dumps(e)[:600])
         elif args.command == "cleanup":
-            gate.cleanup()
+            if gate.cleanup():
+                return 1
         elif args.command == "down":
-            gate.down()
+            if gate.down():
+                return 1
+        stopped = False
     except GateError as error:
         print(f"  FAIL  stopped: {error}")
         return 1
+    finally:
+        # Any early stop (GateError, another exception, Ctrl-C) lands here.
+        if stopped and args.command in CLEAN_UP_ON_STOP:
+            if args.keep:
+                print("stopped early; --keep leaves everything in place")
+            else:
+                print("stopped early; cleaning up (--keep skips this)")
+                gate.cleanup()
     if gate.failed:
         print(f"FAILED: {len(gate.failed)}: " + "; ".join(gate.failed))
         return 1
