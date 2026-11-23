@@ -223,7 +223,12 @@ async def test_public_triage_keeps_action_defaults_and_advisory_fallback(
         message_triage,
         "_resolve_triage_config",
         AsyncMock(
-            return_value=("fixture-model", "https://fixture.invalid", "fixture-key")
+            return_value=(
+                "fixture-model",
+                "https://fixture.invalid",
+                "fixture-key",
+                None,
+            )
         ),
     )
     assert (
