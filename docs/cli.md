@@ -36,10 +36,11 @@ To install by hand, download `srw_<os>_<arch>.tar.gz` (`linux` or `darwin`,
 `amd64` or `arm64`) and `checksums.txt` from the
 [release](https://github.com/superhuman-remote-worker/srw/releases/latest),
 check the archive with `sha256sum -c checksums.txt --ignore-missing`, and
-unpack `srw` into a directory on your `PATH`. To check who built the files:
+unpack `srw` into a directory on your `PATH`. To check who built the
+archive, name the one you downloaded:
 
 ```bash
-gh attestation verify checksums.txt --repo superhuman-remote-worker/srw
+gh attestation verify srw_linux_amd64.tar.gz --repo superhuman-remote-worker/srw
 ```
 
 On Windows, download `srw_windows_amd64.zip`, unpack `srw.exe` into a
@@ -47,8 +48,20 @@ directory on your `PATH`, and run it from PowerShell. The program is not
 signed, so Windows may ask before the first start.
 
 In a pipeline you can use the image instead:
-`ghcr.io/superhuman-remote-worker/srw-cli`, tagged `vX.Y.Z` and `latest`. It
-has a shell, so it works as a job image in GitHub Actions and GitLab CI.
+`ghcr.io/superhuman-remote-worker/srw-cli`, tagged `vX.Y.Z` and `latest`. Its
+entrypoint is `srw`, so `docker run --rm -e SRW_API_URL -e SRW_TOKEN
+ghcr.io/superhuman-remote-worker/srw-cli get jobs` runs one command. It has a
+shell, so it also works as a job image. GitHub Actions starts a `container:`
+with a command of its own; GitLab CI needs the entrypoint cleared:
+
+```yaml
+deploy-experts:
+  image:
+    name: ghcr.io/superhuman-remote-worker/srw-cli:v0.3.0
+    entrypoint: [""]
+  script:
+    - srw apply -f experts/
+```
 
 Use the `srw` of your installation's version. `srw version` shows both and
 warns when they differ.

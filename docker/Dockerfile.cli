@@ -3,8 +3,10 @@
 # =============================================================================
 # One static Go binary on Alpine with the CA bundle. Alpine and not scratch,
 # as the driver images are: a GitHub `container:` job starts its image with
-# `tail -f /dev/null`, and a GitLab `image:` needs sh and grep. The default
-# user is root, which is what both expect of a job image.
+# `tail -f /dev/null`, and a GitLab `image:` needs sh and grep. GitLab keeps
+# the image's entrypoint and passes `sh` to it, so a GitLab job clears it
+# (`entrypoint: [""]`, docs/cli.md). The default user is root, which is what
+# both expect of a job image.
 #
 #   docker build -f docker/Dockerfile.cli -t srw-cli .
 #   docker run --rm -e SRW_API_URL -e SRW_TOKEN srw-cli get jobs
