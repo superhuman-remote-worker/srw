@@ -138,10 +138,17 @@ def test_whisper_signature_notices_a_pin_change(pin, monkeypatch):
 
 @pytest.fixture
 def scratch_env(monkeypatch):
-    """Every dispatch env name restored after the test, whatever it sets."""
+    """Every dispatch env name unset, and restored after the test whatever the
+    code under test sets (monkeypatch.delenv of an unset name restores nothing)."""
+    saved = {name: os.environ.get(name) for name in DISPATCH_ENV_KEY_NAMES}
     for name in DISPATCH_ENV_KEY_NAMES:
-        monkeypatch.delenv(name, raising=False)
-    return monkeypatch
+        os.environ.pop(name, None)
+    yield monkeypatch
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 # The prefixes a job block exports name by name (KB_EMBEDDING is replaced as

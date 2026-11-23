@@ -8322,7 +8322,9 @@ class TestHandleConfigUpdateEnrichmentGate:
         from shared.runtime.services import embedding_service
 
         monkeypatch.setattr(embedding_service, "_embedding_service", object())
-        monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+        # setenv, not delenv: the helper sets EMBEDDING_MODEL and monkeypatch
+        # must restore it afterwards.
+        monkeypatch.setenv("EMBEDDING_MODEL", "e1")
         assert _apply_live_embedding_env({"EMBEDDING_MODEL": "e2"})
         assert embedding_service._embedding_service is None
 
