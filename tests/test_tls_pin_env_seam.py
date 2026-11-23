@@ -151,6 +151,13 @@ def scratch_env(monkeypatch):
             os.environ[name] = value
 
 
+@pytest.fixture
+def agent_runtime():
+    # The job and live-update seams are agent code: the orchestrator image
+    # can't import the agent (no aiosqlite there), CI and the agent image can.
+    pytest.importorskip("aiosqlite", reason="agent dependencies not installed")
+
+
 # The prefixes a job block exports name by name (KB_EMBEDDING is replaced as
 # a whole by apply_kb_embedding_env).
 EXPORTED = ("EMBEDDING", "RERANK", "VISION", "WHISPER", "TTS", "CITATION_LLM")
@@ -208,7 +215,9 @@ def test_the_citation_alias_replaces_only_the_url_the_reader_picks(scratch_env, 
 
 
 @pytest.mark.parametrize("prefix", EXPORTED)
-def test_job_after_a_pinned_job_carries_no_stale_pin(scratch_env, pin, prefix):
+def test_job_after_a_pinned_job_carries_no_stale_pin(
+    agent_runtime, scratch_env, pin, prefix
+):
     from agent.agent import export_job_env_keys
 
     export_job_env_keys(_pinned_block(prefix, pin))
@@ -219,7 +228,9 @@ def test_job_after_a_pinned_job_carries_no_stale_pin(scratch_env, pin, prefix):
 
 
 @pytest.mark.parametrize("prefix", EXPORTED)
-def test_job_without_the_slot_keeps_url_and_pin_together(scratch_env, pin, prefix):
+def test_job_without_the_slot_keeps_url_and_pin_together(
+    agent_runtime, scratch_env, pin, prefix
+):
     from agent.agent import export_job_env_keys
 
     export_job_env_keys(_pinned_block(prefix, pin))
@@ -228,7 +239,7 @@ def test_job_without_the_slot_keeps_url_and_pin_together(scratch_env, pin, prefi
     assert os.environ[f"{prefix}_TLS_PINNED_CERT"] == pin.wire
 
 
-def test_kb_embedding_is_replaced_as_a_whole(scratch_env, pin):
+def test_kb_embedding_is_replaced_as_a_whole(agent_runtime, scratch_env, pin):
     from agent.agent import export_job_env_keys
 
     export_job_env_keys(_pinned_block("KB_EMBEDDING", pin))
@@ -238,7 +249,7 @@ def test_kb_embedding_is_replaced_as_a_whole(scratch_env, pin):
     assert "KB_EMBEDDING_TLS_PINNED_CERT" not in os.environ
 
 
-def test_stateless_restore_gives_back_the_baseline_pin(scratch_env, pin):
+def test_stateless_restore_gives_back_the_baseline_pin(agent_runtime, scratch_env, pin):
     from agent.agent import UniversalAgent, export_job_env_keys
 
     scratch_env.setenv("VISION_BASE_URL", "https://base.example/v1")
@@ -258,7 +269,7 @@ def test_stateless_restore_gives_back_the_baseline_pin(scratch_env, pin):
 
 @pytest.mark.parametrize("prefix", ["EMBEDDING", "RERANK"])
 def test_live_update_after_a_pinned_endpoint_carries_no_stale_pin(
-    scratch_env, pin, prefix
+    agent_runtime, scratch_env, pin, prefix
 ):
     from agent.api.persistent_app import _apply_live_embedding_env
 
@@ -278,7 +289,7 @@ def test_live_update_after_a_pinned_endpoint_carries_no_stale_pin(
     ],
 )
 def test_live_update_without_the_url_keeps_url_and_pin_together(
-    scratch_env, pin, update
+    agent_runtime, scratch_env, pin, update
 ):
     from agent.api.persistent_app import _apply_live_embedding_env
 
@@ -288,7 +299,9 @@ def test_live_update_without_the_url_keeps_url_and_pin_together(
     assert os.environ["EMBEDDING_TLS_PINNED_CERT"] == pin.wire
 
 
-def test_live_update_without_embedding_keys_changes_nothing(scratch_env, pin):
+def test_live_update_without_embedding_keys_changes_nothing(
+    agent_runtime, scratch_env, pin
+):
     from agent.api.persistent_app import _apply_live_embedding_env
 
     _apply_live_embedding_env(_pinned_block("EMBEDDING", pin))
